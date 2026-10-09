@@ -32,10 +32,35 @@ class BatchContract(unittest.TestCase):
     def test_offline_strict_prepares_every_stage_without_credentials_or_network(self):
         code, plan = self.invoke(["--prepare-only", "--require-a11y"])
         self.assertEqual(code, 0)
-        self.assertEqual(len(plan), 21)
-        self.assertEqual(sum(p["kind"] == "e2e" for p in plan), 20)
+        self.assertEqual(len(plan), 31)
+        self.assertEqual(sum(p["kind"] == "e2e" for p in plan), 30)
         self.assertEqual(len({p["exe_name"] for p in plan}), 4)
         self.assertTrue(all(p["blocking"] for p in plan))
+
+    def test_complete_gallery_suite_covers_texture_replacement_without_filter(self):
+        full = [s for s in batch.stages(True) if s.get("suite_source") == "e2e/windows-image-render.test.ts" and not s.get("filter")]
+        self.assertEqual(len(full), 1, "texture replacement must run in the complete gallery suite")
+        self.assertEqual(full[0]["exe_name"], batch.queue.E2E_APPS["render-gallery"])
+        self.assertTrue(full[0]["blocking"])
+        self.assertGreaterEqual(full[0]["minimum_cases"], 27)
+
+    def test_automated_native_feature_suites_are_required_and_unfiltered(self):
+        expected = {
+            "glass-render": ("render-gallery", 1), "visual-fallback": ("storybook", 4),
+            "submitted-screenshot": ("storybook", 1), "local-frame-action": ("storybook", 1),
+            "timed-frame": ("storybook", 1), "textarea-edit-stress": ("text-input", 1),
+            "recording": ("text-input", 2), "frame-timing": ("storybook", 1),
+            "shared-timing": ("storybook", 1),
+        }
+        stages = {s["suite_source"]: s for s in batch.stages(True) if s.get("suite_source")}
+        for name, (app, cases) in expected.items():
+            with self.subTest(suite=name):
+                stage = stages.get(f"e2e/windows-{name}.test.ts")
+                self.assertIsNotNone(stage, "automated native contract is missing from the batch")
+                self.assertEqual(stage["exe_name"], batch.queue.E2E_APPS[app])
+                self.assertGreaterEqual(stage["minimum_cases"], cases)
+                self.assertTrue(stage["blocking"])
+                self.assertFalse(stage.get("filter"))
 
     def test_accessibility_suites_target_their_actual_application(self):
         plan = batch.stages(True)

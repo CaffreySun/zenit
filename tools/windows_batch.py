@@ -42,6 +42,21 @@ def stages(include_a11y: bool) -> list[dict]:
                     "minimum_cases": minimum, "blocking": True, "filter": shared.STAGE_FILTERS.get(name, ""),
                     "capture_frames": modal or "--capture-frames" in extra, "trace_frames": modal,
                     "audit": "modal" if modal else {"sheet-frames": "sheet", "notification-frames": "notification"}.get(name)})
+    # The shared retained phase filters this suite to one case. Run the full
+    # suite too, including texture replacement, geometry, compositing and menus.
+    out.append({"name": "gallery-images", "kind": "e2e", "exe_name": queue.E2E_APPS["render-gallery"],
+                "suite_source": "e2e/windows-image-render.test.ts", "minimum_cases": 27,
+                "blocking": True, "filter": ""})
+    for name, app, cases in (
+        ("glass-render", "render-gallery", 1), ("visual-fallback", "storybook", 4),
+        ("submitted-screenshot", "storybook", 1), ("local-frame-action", "storybook", 1),
+        ("timed-frame", "storybook", 1), ("textarea-edit-stress", "text-input", 1),
+        ("recording", "text-input", 2), ("frame-timing", "storybook", 1),
+        ("shared-timing", "storybook", 1),
+    ):
+        out.append({"name": name, "kind": "e2e", "exe_name": queue.E2E_APPS[app],
+                    "suite_source": f"e2e/windows-{name}.test.ts", "minimum_cases": cases,
+                    "blocking": True, "filter": ""})
     out.append({"name": "gpu-contracts", "kind": "probe", "exe_name": GPU_PROBE, "blocking": True})
     if include_a11y:
         for suite in sorted((REPO / "e2e").glob("windows-accessibility*.test.ts")):

@@ -17,7 +17,7 @@ python3 tools/windows_batch.py --arch aarch64 --skip-build \
   --prepare-only --output-dir /tmp/zenit-windows-payload
 ```
 
-The prepared payload contains four PE executables, 20 bundled suites, a stage
+The prepared payload contains four PE executables, 30 bundled suites, a stage
 manifest and a matching Windows x64 baseline Bun runtime (usable under Windows
 on Arm emulation). No queue token or VM contact is needed for preparation.
 For an x64 guest, use `x86_64` consistently in build and batch commands.
@@ -39,8 +39,11 @@ completion status and every row of `batch-report.json` to pass. Install the work
 and host queue from the same revision; batch evidence uses the part-upload
 protocol rather than the legacy whole-file upload endpoint.
 
-The 21-stage plan covers 13 shared render/input gates, the complete native GPU
-contract probe, and seven UI Automation suites. Modal, Sheet and Notification
+The 31-stage plan covers 13 shared render/input gates, the complete render-gallery
+suite (including texture replacement), nine native feature suites, the complete
+native GPU contract probe, and seven UI Automation suites. Native feature suites
+check optical glass, quality fallback, submitted screenshots, local frame actions,
+timed capture, repeated text editing, recording, and CPU/GPU timing contracts. Modal, Sheet and Notification
 submitted-frame archives receive separate audits. This plan excludes manual
 hardware/foreground experiments and does not establish real GPU hardware acceptance
 when run in a VM. Without `--require-a11y`, accessibility failures are only reported;

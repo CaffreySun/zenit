@@ -136,6 +136,9 @@ def judge(stage: dict, stage_dir: Path) -> tuple[bool, str]:
     if not stage_dir.is_dir():
         return False, "no evidence returned"
     result = json.loads((stage_dir / "stage-result.json").read_text(encoding="utf-8-sig"))
+    error = (result.get("error") or "").strip()
+    if error:
+        return False, f"stage error (exit {result['exit_code']}): {error[:300]}"
     if stage["kind"] == "probe":
         try:
             queue.validate_gpu_scope(stage_dir, "all")
@@ -237,9 +240,12 @@ def main() -> int:
         print(f"  {mark:16} {stage['name']:22} {detail}", flush=True)
     (folder / "batch-report.json").write_text(json.dumps(report, indent=2) + "\n")
     blocking_failed = [r["stage"] for r in report if r["blocking"] and not r["passed"]]
-    print(f"==> {'PASSED' if not blocking_failed else 'FAILED: ' + ', '.join(blocking_failed)} "
+    # Passing stage evidence does not override a failed batch finalization.
+    passed = state["status"] == "passed" and not blocking_failed
+    failures = blocking_failed + ([] if state["status"] == "passed" else ["batch finalization"])
+    print(f"==> {'PASSED' if passed else 'FAILED: ' + ', '.join(failures)} "
           f"in {time.monotonic() - started:.0f}s; report {folder / 'batch-report.json'}", flush=True)
-    return 0 if not blocking_failed else 1
+    return 0 if passed else 1
 
 
 if __name__ == "__main__":

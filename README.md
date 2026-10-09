@@ -14,7 +14,7 @@ validation commands and protocol limits.
 | | |
 |---|---|
 | **Maturity** | Alpha (`0.1.0-alpha`). The API will break before v1, so pin a revision. |
-| **Platforms** | macOS (Metal); experimental Windows (D3D12). See [Windows acceptance](docs/WINDOWS_ACCEPTANCE.md). |
+| **Platforms** | macOS (Metal); experimental Windows x64/ARM64 (D3D12), see [Windows build](docs/WINDOWS_BUILD.md). |
 | **Accessibility** | Not supported. See [Accessibility](#accessibility). |
 | **Zig** | `0.17.0` |
 
@@ -44,10 +44,12 @@ useful thing you can send.
 
 ## Prerequisites
 
-- macOS, Apple Silicon recommended
-- Zig `0.17.0` on `PATH` (or `ZIG=/path/to/zig` for repo scripts)
-- Xcode Command Line Tools: `xcode-select --install`
+- macOS (Apple Silicon recommended), or Windows for the dedicated Windows build targets
+- [Zig `0.17.0`](https://ziglang.org/download/) on `PATH` (or `ZIG=/path/to/zig` for repo scripts)
+- macOS: Xcode Command Line Tools, `xcode-select --install`
 - `bun`, only if you run the E2E suite
+
+Windows commands: [WINDOWS_BUILD.md](docs/WINDOWS_BUILD.md). Yix/Yss workflow: [YIX_YSS_GUIDE.md](docs/YIX_YSS_GUIDE.md).
 
 ## Quick start
 
@@ -103,6 +105,15 @@ The full example, with a derived `Memo`, conditional styles and `show` /
 zig build counter-reactive       # .app bundle, ad-hoc signed
 zig build run-counter-reactive   # run unbundled
 ```
+
+To explore components and DevTools on macOS:
+
+```sh
+zig build run-storybook
+```
+
+See [all examples and probes](examples/README.md) for the complete command list.
+On Windows, use the [dedicated Storybook target](docs/WINDOWS_BUILD.md).
 
 ### The view tree (`ui.view`)
 

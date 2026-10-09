@@ -38,7 +38,9 @@ pub fn main(init: std.process.Init) !void {
             std.debug.print("yix {s}: {d} problem(s){s}\n", .{ args[1], problems, if (check) "; run `zig build gen-yix`" else "" });
             std.process.exit(1);
         }
-        if (!check) std.debug.print("yix gen: {d} file(s)\n", .{count});
+        // Build steps with an output stamp capture stderr as diagnostics.
+        // Keep successful stamped generation quiet; manual progress is stdout.
+        if (!check and stamp == null) try std.Io.File.stdout().writeStreamingAll(io, try std.fmt.allocPrint(a, "yix gen: {d} file(s)\n", .{count}));
         if (stamp) |path| try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = try std.fmt.allocPrint(a, "{d}\n", .{count}) });
         return;
     }

@@ -191,8 +191,12 @@ pub fn bundleApp(b: *std.Build, spec: BundleSpec) BundleResult {
     const bundle_abs: std.Build.LazyPath = .{ .relative = .{ .base = .install_prefix, .sub_path = bundle_dirname } };
 
     var last_step: *std.Build.Step = blk: {
-        const agg = b.step(b.fmt("bundle-installs-{s}", .{spec.display_name}), "Install application bundle resources");
-        for (resource_steps.items) |s| agg.dependOn(s);
+        // Use the PkgInfo install as the resource join. A top-level aggregate
+        // is advertised by Zig 0.17 even when omitted from b.top_level_steps.
+        const agg = &install_pkginfo.step;
+        for (resource_steps.items) |s| {
+            if (s != agg) agg.dependOn(s);
+        }
         break :blk agg;
     };
 

@@ -12,16 +12,52 @@ LSP 代理 + 仓库内固定版本 ZLS + VS Code 扩展。语言本身见 [YIX_R
 
 ## 使用
 
+先确认 `zig version` 为 **0.17.0**。以下命令在仓库根目录执行。
+macOS shell 打包安装：
+
 ```sh
-zig build dev-tools   # 安装 yix-lsp 与 zenit-zls
-cd editors/vscode-yix && npm install && npx @vscode/vsce package
-code --install-extension editors/vscode-yix/zenit-yix-0.5.3.vsix
+zig build dev-tools
+(cd editors/vscode-yix && npm ci && npx @vscode/vsce package --out zenit-yix.vsix)
+code --install-extension editors/vscode-yix/zenit-yix.vsix
 ```
 
-打开仓库目录即可；`yix-lsp` 默认在 `<工作区>/zig-out/bin/yix-lsp`，也可设 `yix.lsp.path`。
-Windows 使用 `yix-lsp.exe` 和 `zenit-zls.exe`。`zig build yix-lsp` 同样安装两个工具，
-`zig build zls` 只安装 `zenit-zls`。
-Cursor 等 VS Code 衍生编辑器同样可装。
+Windows PowerShell：
+
+```powershell
+zig build dev-tools
+if ($LASTEXITCODE -ne 0) { throw 'Development tools build failed' }
+Push-Location editors/vscode-yix
+try {
+    npm ci
+    if ($LASTEXITCODE -ne 0) { throw 'npm ci failed' }
+    npx @vscode/vsce package --out zenit-yix.vsix
+    if ($LASTEXITCODE -ne 0) { throw 'Extension packaging failed' }
+} finally { Pop-Location }
+code --install-extension .\editors\vscode-yix\zenit-yix.vsix
+```
+
+打开仓库根目录，`yix-lsp` 默认在 `zig-out/bin/yix-lsp`；Windows 自动查找
+`yix-lsp.exe` 和 `zenit-zls.exe`。`zig build yix-lsp` 同样安装两个工具，
+`zig build zls` 只安装 `zenit-zls`。Node/npm 仅用于扩展打包，不是 GUI 运行依赖。
+Cursor 等 VS Code 衍生编辑器使用自己的 install-extension 命令安装相同 VSIX。
+
+在其他消费项目中，工作区可能没有这两个工具，可在 VS Code workspace 设置中给绝对路径：
+
+```json
+{
+  "yix.lsp.path": "C:/work/zenit/zig-out/bin/yix-lsp.exe",
+  "yix.zls.path": "C:/work/zenit/zig-out/bin/zenit-zls.exe",
+  "zig.zls.path": "C:/work/zenit/zig-out/bin/zenit-zls.exe",
+  "yix.buildOnSave": ["zig", "build", "windows-arm64-storybook", "-Dwindows-arch=x86_64", "-Dgpu-backend=d3d12", "-Doptimize=fast"]
+}
+```
+
+路径需要替换为本机 checkout。上述保存命令用于 **Zenit 仓库自身**；消费项目应改为
+自己项目的构建命令。macOS 开发可用 `["zig", "build", "hello-button"]`。
+编辑器进程的 PATH 也必须能找到 Zig 0.17.0。跨编译的 GUI 在 Windows 运行，LSP
+仍在本机运行；不能把 Mac 上的 `yix-lsp` 二进制复制到 Windows 当 `.exe` 使用。
+
+组件与样式的入门示例见 [YIX_YSS_GUIDE.md](YIX_YSS_GUIDE.md)。
 
 ### Zig 0.17 的 ZLS 配置
 
@@ -59,7 +95,7 @@ yix-lsp 在保存 `.yix` / `.yss` 后在工作区根目录跑一次构建（后�
 - 命令：VS Code 设置 `yix.buildOnSave`（字符串数组，例如 `["zig", "build", "test-yix"]`；`[]` 关闭）；
   其他编辑器用 initializationOptions `buildOnSave` 或环境变量 `YIX_BUILD_ON_SAVE`（空格分隔，`off` 关闭）。
   都没设时，工作区根目录有 `build.zig` 就跑 `zig build`。
-- 命令行同样的换算：`zig build 2>&1 | zig-out/bin/yix map-errors`。
+- 命令行同样的换算：`zig build 2>&1 | zig-out/bin/yix map-errors`；Windows 使用 `zig-out/bin/yix.exe`。流水线最终退出状态不等于构建退出状态，CI 应另外检查构建是否成功。
 
 ## 验证
 
@@ -70,16 +106,7 @@ yix-lsp 在保存 `.yix` / `.yss` 后在工作区根目录跑一次构建（后�
 - `python3 tests/yix/lsp/review_versions.py zig-out/bin/yix-lsp`：用 ZLS stub 复现并验证跨编辑的请求回包、合并通知的诊断、显式过期诊断和磁盘双胞胎与源码不一致时的跳转。
 - `cd editors/vscode-yix && npm test`：语法分词（标签 / 组件 / 属性 / 字符串值 / 子元素文本 / 插值 / 控制流里的标签 / `a < b` 不是标签；.yss 的条件含 `:focus-visible`、8 位十六进制颜色、`rgba()`）；工具发现回归实际执行扩展的 resolver 与启动逻辑，覆盖显式配置、工作区优先级、PATH / 扩展缓存回退和 Windows `.exe`。
 
-## 线程与健壮性
-
-- 三个线程：主线程读编辑器；ZLS 读线程**只分帧入队、从不拿服务器锁**，保证 ZLS 的输出一直被排空；处理线程持锁处理 ZLS 消息。
-  否则「编辑器线程持锁往 ZLS 写大消息被管道顶住 + ZLS 写诊断被顶住 + 读线程等锁」会三方死锁。
-- ZLS 失联（找不到、启动失败、中途崩溃、协议损坏）时降级：initialize 由代理回应，Yix 诊断与模板补全照常，其余请求立即回 null；
-  等待中的请求统一回应；读线程遇到协议错误标记失联并结束 ZLS，写入在同一把锁里检查失联，不会写到已关闭的 fd。
-- 退出：关闭 ZLS stdin 后看门狗 3 秒内等不到就结束它，join 不会永久阻塞；忽略 SIGPIPE，断开的管道写入得到 EPIPE。
-- 以上经 GLM 交叉审查（线程模型、Inbox、退出路径），坐实的问题均已修。
-
-## 已知限制（后续）
+## 已知限制
 
 1. **正在输入的容错有限**：编译失败时在光标后试一组闭合串（`}`、`)}`、`/>` …）修补后服务请求，覆盖「属性值 / 插值写到一半」；
    光标之外别处的语法错误仍会让请求回空。

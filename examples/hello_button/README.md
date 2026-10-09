@@ -2,6 +2,8 @@
 
 一个原生 macOS 窗口 + 一个 Button + 一个计数器。点击 Button 计数 +1。
 
+需要 Zig **0.17.0**。UI 在 `view.yix`，样式在 `styles.yss`，生成文件入库。完整开发流程见 [YIX_YSS_GUIDE.md](../../docs/YIX_YSS_GUIDE.md)；Windows 示例使用 [专用 Windows 构建目标](../../docs/WINDOWS_BUILD.md)。
+
 ```
 ┌──────────────────────────┐
 │                          │
@@ -24,14 +26,16 @@ open "zig-out/Hello Button.app"
 
 ## 完整代码
 
-`main.zig` 一共 **81 行**。`main()` 只有 8 行，再加上一个 `mountUI(cx, scope) -> *Node` 回调：
+`main.zig` 导入 `_view.yix.zig` 的 `HelloButton`，挂载回调通过
+`ui.view.render(scope, cx, HelloButton(.{}))` 创建视图。Zig 0.17 启动入口：
 
 ```zig
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+pub fn main(init: std.process.Init) !void {
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
 
     const app = try App.init(gpa.allocator(), .{
+        .io = init.io,
         .window = .{ .width = 640, .height = 480, .title = "Hello Button" },
     });
     defer app.deinit();
@@ -67,7 +71,7 @@ W.Button(.{ .label = "Submit", .on_click = ui.on.call(form, FormState.submit) })
 
 ## 构建依赖
 
-`hello_button` 的 `build.zig` 只 import 2 个 module：
+应用入口使用 `ui` 与 `zenit_app` 两个命名 module；构建另绑定主题 provider：
 
 ```zig
 hello_mod.addImport("ui", ui_module);
@@ -82,13 +86,7 @@ hello_mod.addImport("zenit_app", app_module);
 zig build hello-button --verbose 2>&1 | grep -oE '\-M[a-z_]+=' | sort -u
 ```
 
-输出应只有：gpu, icon_ir, platform, render, root, system_sdk, text, text_core, trace, ui, zenit_app — 11 项。没有别的。
-
-## 二进制大小
-
-`hello_button.app`: **5.5 MB**。
-
-包含完整的窗口、布局引擎、Metal 渲染、字体回退链、IME 处理。没有语言工具链、没有编辑器内核 —— 这就是开源边界的实际价值。
+此命令用于检查应用依赖边界；实际模块名包含主题 provider、样式值及 Zig 0.17 的兼容模块，以当前构建输出为准。生成器与 LSP 是开发工具，不链接到 GUI 运行时。
 
 ## 进阶用法
 

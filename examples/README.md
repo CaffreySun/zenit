@@ -2,7 +2,7 @@
 
 Twelve applications demonstrating different facets of the framework. **Every one uses the public `ui` and `zenit_app` APIs through `build.zig` (Yix examples also import their generated view module)** — they double as the build-time fence that enforces the [open-source boundary](../docs/UI_OSS_BOUNDARY.md).
 
-Most examples write their UI in Yix: `view.yix` holds the components and their styles, `main.zig` only starts the app (and runs smoke assertions for the probes). `main.zig` imports its generated twin, `@import("_view.yix.zig")` (checked in; `zig build gen-yix` regenerates it). Exceptions: `zig_native` deliberately uses no Yix / YSS (components, controlled values, slots and recipes written in plain Zig with `ui.view` — the path for people who prefer Zig only), `counter_reactive` stays hand-written as the pixel reference for `yix_counter`, `interop_probe` wires raw node events below the template layer, and `storybook` has not been ported yet.
+Most examples write their UI in Yix: `view.yix` holds the components and `styles.yss` holds their styles, `main.zig` only starts the app (and runs smoke assertions for the probes). `main.zig` imports its generated twin, `@import("_view.yix.zig")` (checked in; `zig build gen-yix` regenerates it). Exceptions: `zig_native` deliberately uses no Yix / YSS (components, controlled values, slots and recipes written in plain Zig with `ui.view` — the path for people who prefer Zig only), `counter_reactive` stays hand-written as the pixel reference for `yix_counter`, `interop_probe` wires raw node events below the template layer; Storybook uses a mix of Zig and Yix views.
 
 | example | what it shows |
 |---|---|
@@ -19,13 +19,18 @@ Most examples write their UI in Yix: `view.yix` holds the components and their s
 | [`design_probe/`](design_probe/) | Pixel-accurate rebuild of a pencil design node, for numeric design-diff verification |
 | [`yix_counter/`](yix_counter/) | Yix version of the reactive counter (styles in `styles.yss`) |
 
+Requires [Zig **0.17.0**](https://ziglang.org/download/). Yix/Yss workflow: [developer guide](../docs/YIX_YSS_GUIDE.md).
+
 ## Run them
+
+The following commands run on macOS. For Windows x64/ARM64 executables, use [WINDOWS_BUILD.md](../docs/WINDOWS_BUILD.md).
 
 ```bash
 zig build hello-button         # build .app bundle (ad-hoc signed)
 zig build run-hello-button     # run unbundled
 
 zig build yix-counter
+zig build run-yix-counter
 zig build zig-native
 zig build run-zig-native
 zig build counter-reactive
@@ -42,6 +47,15 @@ zig build run-multi-window
 
 zig build storybook
 zig build run-storybook
+
+zig build console-probe
+zig build run-console-probe
+zig build devtools-probe
+zig build run-devtools-probe
+zig build interop-probe
+zig build run-interop-probe
+zig build design-probe
+zig build run-design-probe
 ```
 
 After building, each example produces `zig-out/<Display Name>.app` you can double-click.
@@ -55,11 +69,14 @@ After building, each example produces `zig-out/<Display Name>.app` you can doubl
 All single-window examples follow the same skeleton:
 
 ```zig
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+pub fn main(init: std.process.Init) !void {
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
 
-    const app = try App.init(gpa.allocator(), .{ .window = .{ ... } });
+    const app = try App.init(gpa.allocator(), .{
+        .io = init.io,
+        .window = .{ .title = "Example", .width = 640, .height = 480 },
+    });
     defer app.deinit();
 
     try app.runWith(mountUI); // mountUI: fn(*ui.Cx, *ui.Scope) !*ui.Node
@@ -95,7 +112,7 @@ Imports must stay limited to `@import("ui")` and `@import("zenit_app")`. If an e
 
 All examples share [`theme.json`](theme.json), compiled automatically into a
 provider for their own UI/App module graph. Library defaults use a separate
-provider. No generated Zig file needs to be checked in.
+provider. The generated theme provider lives in the build cache. Yix/Yss generated twins (`_*.yix.zig`, `_*.yss.zig`) are checked in alongside their source files.
 
 ```zig
 const TOKENS = ui.theme.refs;

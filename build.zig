@@ -1245,6 +1245,12 @@ pub fn build(b: *std.Build) void {
     yix_zls_selection.addArtifactArg(yix_lsp_exe);
     yix_zls_selection.has_side_effects = true;
     test_yix_step.dependOn(&yix_zls_selection.step);
+    const yix_cli_output = b.addSystemCommand(&.{ "python3", "tests/yix/cli_output.py" });
+    yix_cli_output.addArtifactArg(yix_exe);
+    yix_cli_output.setCwd(b.path("."));
+    yix_cli_output.has_side_effects = true;
+    test_yix_step.dependOn(&yix_cli_output.step);
+
     const yix_cli_tests = b.addRunArtifact(b.addTest(.{ .root_module = yix_exe.root_module }));
     yix_cli_tests.setCwd(b.path("."));
     test_yix_step.dependOn(&yix_cli_tests.step);

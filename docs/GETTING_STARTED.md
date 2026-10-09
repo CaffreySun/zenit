@@ -6,6 +6,10 @@ fresh project, independent of the zenit repository.
 If you only want to play with the bundled examples, skip ahead to the
 "Running the bundled examples" section at the end.
 
+Prerequisite: Zig **0.17.0**. This guide's `.app` commands target macOS.
+For Windows x64/ARM64 builds and batch acceptance, use [WINDOWS_BUILD.md](WINDOWS_BUILD.md).
+For Yix components and Yss styles, use [YIX_YSS_GUIDE.md](YIX_YSS_GUIDE.md).
+
 ## 1. Create a project
 
 ```bash

@@ -51,6 +51,14 @@ publishing a source snapshot.
 
 ## Performance gate
 
+Benchmarks are compared against `src/bench/baselines/main.json` with a 15%
+regression threshold. The baseline uses Zig 0.15.2 / `CLOCK_REALTIME`; this branch
+uses Zig 0.17.0 / `CLOCK_UPTIME_RAW` through `std.Io.Clock.awake`. Timings depend
+on the host and are not universal performance guarantees.
+
+The Select benchmark measures the navigation state machine and open-dropdown
+frame workload. Full keyboard dispatch is covered separately by window tests.
+
 ```sh
 ZENIT_BENCH_COMMIT="$(git rev-parse HEAD)" \
 ZENIT_BENCH_HOST="$(uname -m)-$(sw_vers -productVersion)" \

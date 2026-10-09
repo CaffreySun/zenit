@@ -37,6 +37,10 @@ with tempfile.TemporaryDirectory(prefix='zenit-public-contract-') as temp:
  check('private icon pack',lambda d:write(d,'private/icons/a.svg'),False)
  check('internal audit',lambda d:write(d,'docs/reviews/findings.md'),False)
  check('calibration capture',lambda d:write(d,'scripts/glass_native_model/capture.json'),False)
+ check('research notes',lambda d:write(d,'docs/research/glass.md'),False)
+ check('material calibration',lambda d:write(d,'e2e/glass-material-calibrate.ts'),False)
+ check('research report',lambda d:write(d,'e2e/glass-review-report.ts'),False)
+ check('native comparison',lambda d:write(d,'e2e/native_liquid_glass.swift'),False)
  check('cache in archive',lambda d:write(d,'zig-pkg/dependency/build.zig'),False)
  check('symlink',lambda d:(d/'linked').symlink_to(d/'LICENSE'),False)
  check('credential',lambda d:write(d,'config.txt','gh'+'p_'+'A'*36),False)
@@ -46,5 +50,5 @@ with tempfile.TemporaryDirectory(prefix='zenit-public-contract-') as temp:
   write(d,'.env','gh'+'p_'+'A'*36)
   subprocess.run(['git','-C',str(d),'add','-f','.env'],check=True)
  check('force-staged secret',staged_secret,False,git=True)
- print('Public source contract: 11/11 PASS')
+ print('Public source contract: 15/15 PASS')
 PY

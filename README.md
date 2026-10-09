@@ -14,7 +14,7 @@ validation commands and protocol limits.
 | | |
 |---|---|
 | **Maturity** | Alpha (`0.1.0-alpha`). The API will break before v1, so pin a revision. |
-| **Platforms** | macOS only, tested on Apple Silicon. Linux/Windows backends are compile-only stubs. |
+| **Platforms** | macOS (Metal); experimental Windows (D3D12). See [Windows acceptance](docs/WINDOWS_ACCEPTANCE.md). |
 | **Accessibility** | Not supported. See [Accessibility](#accessibility). |
 | **Zig** | `0.17.0` |
 

@@ -1,5 +1,7 @@
 # Zenit Design System Tokens v1
 
+生成器的使用方法、接口和支持范围见 [TOOLING.md](design-system/TOOLING.md)。
+
 本方案面向现有 `ui.css / ui.cva / ui.sva / styles.zig / Yix`。JSON 负责声明设计材料，Zig 负责组件、计算和状态选择。配套的 [theme.example.json](design-system/theme.example.json) 是完整语法示例，[theme.schema.json](design-system/theme.schema.json) 提供编辑器结构校验；引用解析、循环检查等仍由生成器完成。
 
 示例展示声明和消费规则，数值不是现有默认主题的替代品。
@@ -392,4 +394,3 @@ expected font_size reference, found duration: tokens.duration.fast
 - [Panda Responsive variants](https://panda-css.com/docs/recipes/responsive-variants)
 - [Panda Dynamic styling](https://panda-css.com/docs/styling/dynamic-styling)
 - [Panda composite token regression tests](https://github.com/chakra-ui/panda/blob/802eb61ba7955f00a755401ff2ddbfac39a7c385/crates/pandacss_tokens/tests/from_config.rs#L387)
-

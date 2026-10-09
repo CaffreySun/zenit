@@ -39,8 +39,11 @@ __pycache__/
 # being recorded. These are uploaded/archived separately, never source inputs.
 .ci-evidence/
 release-evidence/
-# Internal documentation
+# Internal documentation and research
 docs/internal/
+docs/reviews/
+docs/research/
+scripts/glass_native_model/
 .zig-lib-*/
 .zig-local-cache/
 .zig-global-cache/

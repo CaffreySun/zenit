@@ -17,7 +17,7 @@ details, and a maintainer will reach out with a private channel.
 
 Please include:
 
-- macOS version and chip (Apple Silicon / Intel)
+- Operating system version, CPU architecture and GPU/backend
 - `zig version`
 - What an attacker gains, and what they need to start (a local user? a crafted
   file the app opens? attacker-controlled text?)
@@ -53,7 +53,6 @@ real finding, and we would rather hear about it.
   exhausting memory)
 - Findings in an application that merely *uses* zenit, unless the root cause is
   in this repo
-- The stubbed Linux/Windows backends: they do not run applications yet
 
 ## Disclosure
 

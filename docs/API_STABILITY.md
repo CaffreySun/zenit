@@ -1,9 +1,8 @@
-# zenit API Stability (v1.0 Freeze Audit)
+# zenit API Stability
 
-**Semantics**: `v0.14.x` is the current pre-1.0 semver development track; minor versions
-may still break (must be recorded in `MIGRATION.md`). This document describes the API
-surface planned to be frozen at `v1.0.0`; it does not mean the existing tag already
-carries a v1 compatibility promise.
+zenit is pre-1.0. Breaking changes are recorded in [MIGRATION.md](MIGRATION.md).
+The tiers below describe the proposed v1 surface, not a compatibility guarantee
+for the current development version.
 
 ## Tiers
 
@@ -56,15 +55,12 @@ the returned struct**.
 ## Unstable (explicitly exempted in v1)
 
 - `ui.hit` (hit-test queries): bound to internal index structures
-- `ui.path` (path geometry): ~~pipeline Phase C unfinished~~ Phase C (cross-frame mesh
-  cache: keyed by geometry hash + scale + stroke params; on a hit it skips
-  flatten/earclip/stroke expand) landed on 2026-07-30; the API stays labeled Unstable
-  for one more release of observation
+- `ui.path` (path geometry and mesh caching)
 - `ui.devtools` / `ui.Inspector`
 - `ui.a11y_tree` / `ui.a11y_router` / `ui.a11y_macos_bridge`
 - `ui.gesture`
 - The slot-customization surface of `ui.select_headless` (`render_trigger` / `render_item` ctx structs)
-- The `FrameStats` **field set** (observability is still expanding: encode/flush breakdown, draw counts added on 2026-07-30)
+- The `FrameStats` field set
 - DevTools presentation helpers, the recipe system (`ConditionalStyle` parsing details)
 - `ui.fx`, `GlassParams / GlassSurface` (Liquid Glass is still iterating)
 - `ui.control_flow` (exports beyond `Show/For/Match`)
@@ -73,9 +69,7 @@ the returned struct**.
   TypeScript client API, and the file-RPC protocol (`-Dtest-mode=true` only; may evolve
   per minor; production builds do not provide this capability)
 - Icon provider build entry points: the `icon-set` dependency option, `IconProvider`,
-  `attachWithOptions`. Shipping Lucide as the public default is the stable direction,
-  but until the private-package split is done, the provider injection structure may
-  still converge across minors.
+  `attachWithOptions`. Lucide is the public default; provider injection may evolve.
 
 ## Internal
 
@@ -84,19 +78,24 @@ the returned struct**.
 - The `test_harness` Zig module and its queue/executor implementation (externally you
   only use the TypeScript facade above)
 
+## Application API
+
+Use `ui.view` to compose widgets and scope-owned signals for reactive state.
+See [Signal-first props](SIGNAL_API_DESIGN.md) and [migration notes](MIGRATION.md)
+for controlled values and callback conventions.
+
+String payloads passed through `invokeWithStr` are valid only during the callback;
+copy them if they must outlive it.
+
 ## Escape hatch
 
 `Node.style.ensureExt()` and writing `behavior.events.*` directly are escape hatches
 kept deliberately. What is Stable is the **existence** of the fields; deep
 customization done through them is not protected by semver.
 
-## Known not supported (explicitly not promised in v1)
+## Capabilities and limitations
 
-This is written down so users can judge "can this framework build my project" up front,
-instead of finding out only after stepping in. Everything below is an
-**architectural gap**, not a bug waiting to be fixed.
-
-### ~~RTL / bidirectional text editing~~: **the deterministic path is supported as of 2026-08-01**
+### Bidirectional text editing (macOS)
 
 The macOS configuration path hands the whole text to a single CoreText `CTLine`.
 Static drawing, visual caret order in Input and Textarea, click hit-testing, cross-line
@@ -122,7 +121,7 @@ Arabic/Hebrew/CJK input sources, VoiceOver editing, and the storybook RTL pixel 
 are still `NOT RUN` at the current release revision. The degraded path without a Font provider is still usable, but its
 estimated coordinates are not part of the macOS production correctness claim.
 
-### ~~Grapheme cluster~~: **supported as of 2026-07-31**
+### Grapheme clusters
 
 `src/text_core/grapheme.zig` implements UAX #29 extended grapheme clusters
 (GB1-GB999: CRLF / Hangul syllables / Extend / ZWJ / SpacingMark / Prepend /
@@ -135,7 +134,7 @@ UCD: SpacingMark / Prepend for rare scripts may be missing, degrading to "one ex
 break" (the caret stops one extra cell; it does not crash).
 No legacy grapheme cluster definition and no ICU-style tailoring.
 
-### ~~Color emoji~~: **supported as of 2026-07-31**
+### Color emoji (macOS)
 
 Color glyphs are detected from the font tables (sbix / COLR / CBDT +
 `kCTFontTraitColorGlyphs`) and rasterized as BGRA premultiplied; the atlas gains BGRA8
@@ -195,11 +194,6 @@ scenarios.
 
 ### Platforms
 
-macOS only. The RHI migration is mid-flight: renderer orchestration uses the typed
-resource/pass/binding contract of `gpu.Backend`, Renderer Core's native Metal references
-are locked to zero by the boundary gate, and a standalone Null RHI covers resources,
-surfaces, and the pass state machine. But `gpu.zig` still selects the single Metal
-production backend at compile time; the Null RHI is not yet a swappable, complete render
-backend, and non-macOS hits `@compileError`.
-`platform/linux.zig` and `windows.zig` are mock scaffolding only; do not claim
-portability from them.
+macOS uses Metal. This development branch also provides a Windows D3D12 backend;
+see [Windows acceptance](WINDOWS_ACCEPTANCE.md) for build and runtime checks.
+Linux remains experimental.

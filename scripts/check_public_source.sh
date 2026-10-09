@@ -16,7 +16,8 @@ if os.environ.get('ZENIT_PUBLIC_SOURCE_ARCHIVE') != '1' and git_root.returncode 
     files = sorted(set(os.fsdecode(p) for p in raw.split(b'\0') if p))
 else:
     files = [str(p.relative_to(root)) for p in root.rglob('*') if p.is_file() or p.is_symlink()]
-forbidden_roots = ('private/', 'docs/internal/', 'docs/reviews/', 'scripts/glass_native_model/')
+forbidden_roots = ('private/', 'docs/internal/', 'docs/reviews/', 'docs/research/', 'scripts/glass_native_model/')
+research_path = re.compile(r'(?:^|/)(?:[^/]*calibrat[^/]*|glass-review-report\.[^/]+)$|^e2e/native_(?:liquid_glass|glass_motion)\.swift$')
 forbidden_names = {'.git', '.DS_Store', '.zig-cache', 'zig-cache', 'zig-pkg', 'zig-out', '__pycache__',
                    'node_modules', '.claude', '.codex', '.agents', '.ci-evidence', 'release-evidence',
                    '.zig-local-cache', '.zig-global-cache', '.bench-output', '.codex-worktrees'}
@@ -30,7 +31,7 @@ for name in files:
         continue  # tracked deletion
     parts = pathlib.PurePosixPath(name).parts
     if file.is_symlink(): problems.append((name, 'symbolic link')); continue
-    if any(name.startswith(p) for p in forbidden_roots) or any(p in forbidden_names for p in parts):
+    if any(name.startswith(p) for p in forbidden_roots) or research_path.search(name) or any(p in forbidden_names for p in parts):
         problems.append((name, 'private/cache path')); continue
     if any(p.startswith('.env') or p.startswith('._') or p.endswith(('.app', '.dSYM')) for p in parts) or file.suffix in artifact_suffixes:
         problems.append((name, 'secret/build artifact path')); continue

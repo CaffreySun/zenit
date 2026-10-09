@@ -44,6 +44,13 @@
         "LICENSING.md",
         "CLA.md",
         "README.md",
+        "SKILL.md",
+        "CLAUDE.md",
+        "AGENTS.md",
+        "docs/skill/zenit-app-development/references/build-validation.md",
+        "docs/skill/zenit-app-development/references/app-patterns.md",
+        "docs/skill/zenit-app-development/references/yix-yss.md",
+
         "CONTRIBUTING.md",
         "SECURITY.md",
         "CODE_OF_CONDUCT.md",

@@ -42,6 +42,14 @@ If you find a bug, a design problem or a security issue, please
 [`SECURITY.md`](SECURITY.md) for security). Concrete reports are the most
 useful thing you can send.
 
+## Developing with AI agents
+
+Start with [SKILL.md](SKILL.md) for Zenit application development. It is a
+repository-local guide for Claude, Codex and other coding agents, with current
+API rules and references for Yix/Yss, lifecycle, platform builds and E2E.
+When using Zenit as a dependency, point your project's agent instructions to
+that checkout's `SKILL.md`.
+
 ## Prerequisites
 
 - macOS (Apple Silicon recommended), or Windows for the dedicated Windows build targets

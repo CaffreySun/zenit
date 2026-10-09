@@ -99,7 +99,7 @@ fn assembleCacheCommands(
     cx: *RenderContext,
     node: *Node,
     content_slices: NodeContentSlices,
-    exec_state: NodeExecutionState,
+    exec_state: *const NodeExecutionState,
 ) !Assembly {
     const allocator = cx.frame_allocator;
 
@@ -147,7 +147,7 @@ fn assembleCacheCommands(
 
     // node's own overflow clip wrapping children (same token pair as paint pass emits).
     if (clip_band != 0) {
-        buf[idx] = render_engine.scrollClipPushToken(exec_state);
+        buf[idx] = render_engine.scrollClipPushTokenBorrowed(exec_state);
         idx += 1;
     }
 
@@ -178,7 +178,7 @@ fn assembleCacheCommands(
     }
 
     if (clip_band != 0) {
-        buf[idx] = .{ .pop_clip = .{ .header = render_engine.scrollClipTokenHeader(exec_state) } };
+        buf[idx] = .{ .pop_clip = .{ .header = render_engine.scrollClipTokenHeaderBorrowed(exec_state) } };
         idx += 1;
     }
 
@@ -227,7 +227,7 @@ fn assembleCacheCommands(
 fn writeDescendantScopedPromotedCache(
     cx: *RenderContext,
     node: *Node,
-    exec_state: NodeExecutionState,
+    exec_state: *const NodeExecutionState,
     asm_: Assembly,
 ) void {
     const node_rect = ComputedRect{
@@ -320,7 +320,7 @@ fn writeDescendantScopedPromotedCache(
 fn writePromotedCache(
     cx: *RenderContext,
     node: *Node,
-    exec_state: NodeExecutionState,
+    exec_state: *const NodeExecutionState,
     asm_: Assembly,
 ) void {
     const descendant_count = asm_.regular_count + asm_.sticky_count + asm_.overlay_count + asm_.tail_count + asm_.clip_open_count + asm_.clip_close_count;
@@ -348,7 +348,7 @@ fn writePromotedCache(
 }
 
 /// after writing promoted cache update scene_runtime + compositor_plan state
-fn markPromotedCacheRebuilt(cx: *RenderContext, node: *Node, exec_state: NodeExecutionState) void {
+fn markPromotedCacheRebuilt(cx: *RenderContext, node: *Node, exec_state: *const NodeExecutionState) void {
     // record property-tree root id of written frame: compare before replay, prevent stale
     // frame-local id indexing errors/bounds of transform/effect nodes (see CachedRenderSlice field
     // comment).
@@ -381,6 +381,17 @@ pub fn finalizeNodeCaches(
     _: usize,
     content_slices: NodeContentSlices,
     exec_state: NodeExecutionState,
+    exec_plan: NodeExecutionPlan,
+) void {
+    finalizeNodeCachesBorrowed(cx, node, 0, content_slices, &exec_state, exec_plan);
+}
+
+pub fn finalizeNodeCachesBorrowed(
+    cx: *RenderContext,
+    node: *Node,
+    _: usize,
+    content_slices: NodeContentSlices,
+    exec_state: *const NodeExecutionState,
     exec_plan: NodeExecutionPlan,
 ) void {
     if (exec_plan.should_write_promoted_cache) {

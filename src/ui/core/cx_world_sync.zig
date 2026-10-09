@@ -223,29 +223,118 @@ fn syncPaintNodeRecursive(self: *Cx, node: *Node) void {
 /// letting PaintTable cache invalidation cover more real-world change scenarios.
 fn paintContentHash(node: *const Node, rect: ComputedRect) u64 {
     var h = std.hash.Wyhash.init(0);
-    const bg = node.getBackground();
-    h.update(std.mem.asBytes(&bg));
-    h.update(std.mem.asBytes(&node.style.border.color));
-    h.update(std.mem.asBytes(&node.style.border.width));
-    h.update(std.mem.asBytes(&node.getOpacity()));
-    const w = rect.w;
-    const ht = rect.h;
-    h.update(std.mem.asBytes(&w));
-    h.update(std.mem.asBytes(&ht));
+    // Concatenate field bytes, not a struct's memory: preserve the existing
+    // invalidation key exactly without introducing inter-field padding.
+    const visual_bytes = std.mem.toBytes(node.getBackground()) ++
+        std.mem.toBytes(node.style.border.color) ++
+        std.mem.toBytes(node.style.border.width) ++
+        std.mem.toBytes(node.getOpacity()) ++
+        std.mem.toBytes(rect.w) ++ std.mem.toBytes(rect.h);
+    h.update(&visual_bytes);
     if (node.getText()) |t| {
         h.update(t.content);
-        h.update(std.mem.asBytes(&t.font_size));
-        h.update(std.mem.asBytes(&t.color));
+        const text_bytes = std.mem.toBytes(t.font_size) ++ std.mem.toBytes(t.color);
+        h.update(&text_bytes);
     }
     if (node.getImage()) |im| {
-        h.update(std.mem.asBytes(&im.texture_id));
-        h.update(std.mem.asBytes(&im.tint));
+        const image_bytes = std.mem.toBytes(im.texture_id) ++ std.mem.toBytes(im.tint);
+        h.update(&image_bytes);
     }
     if (node.getIcon()) |ic| {
-        h.update(std.mem.asBytes(&ic.icon_id));
-        h.update(std.mem.asBytes(&ic.tint));
+        const icon_bytes = std.mem.toBytes(ic.icon_id) ++ std.mem.toBytes(ic.tint);
+        h.update(&icon_bytes);
     }
     return h.final();
+}
+
+test "paint content hash preserves incremental keys and each visual field" {
+    const Fixture = struct {
+        // The pre-batching implementation is the cache-key compatibility oracle.
+        fn incremental(node: *const Node, rect: ComputedRect) u64 {
+            var h = std.hash.Wyhash.init(0);
+            const bg = node.getBackground();
+            h.update(std.mem.asBytes(&bg));
+            h.update(std.mem.asBytes(&node.style.border.color));
+            h.update(std.mem.asBytes(&node.style.border.width));
+            h.update(std.mem.asBytes(&node.getOpacity()));
+            h.update(std.mem.asBytes(&rect.w));
+            h.update(std.mem.asBytes(&rect.h));
+            if (node.getText()) |t| {
+                h.update(t.content);
+                h.update(std.mem.asBytes(&t.font_size));
+                h.update(std.mem.asBytes(&t.color));
+            }
+            if (node.getImage()) |im| {
+                h.update(std.mem.asBytes(&im.texture_id));
+                h.update(std.mem.asBytes(&im.tint));
+            }
+            if (node.getIcon()) |ic| {
+                h.update(std.mem.asBytes(&ic.icon_id));
+                h.update(std.mem.asBytes(&ic.tint));
+            }
+            return h.final();
+        }
+
+        fn changed(previous: *u64, node: *const Node, rect: ComputedRect) !void {
+            const next = paintContentHash(node, rect);
+            try std.testing.expectEqual(incremental(node, rect), next);
+            try std.testing.expect(previous.* != next);
+            previous.* = next;
+        }
+    };
+    const cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    const node = try core.box(cx, .{}, .{});
+    cx.root = node;
+    var rect = ComputedRect{ .x = 7, .y = 9, .w = 100, .h = 80 };
+    var previous = paintContentHash(node, rect);
+    try std.testing.expectEqual(Fixture.incremental(node, rect), previous);
+
+    node.setBackgroundRaw(core.Color.rgba(10, 20, 30, 255));
+    try Fixture.changed(&previous, node, rect);
+    node.style.border.color = core.Color.rgba(40, 50, 60, 255);
+    try Fixture.changed(&previous, node, rect);
+    node.style.border.width = 2;
+    try Fixture.changed(&previous, node, rect);
+    node.setOpacityRaw(0.5);
+    try Fixture.changed(&previous, node, rect);
+    rect.w = 120;
+    try Fixture.changed(&previous, node, rect);
+    rect.h = 90;
+    try Fixture.changed(&previous, node, rect);
+
+    // Exercise strings across Wyhash block boundaries and its buffered tail,
+    // followed by every optional payload in the original order.
+    node.setText(.{ .content = "Label", .font_size = 14, .color = core.Color.WHITE });
+    try Fixture.changed(&previous, node, rect);
+    var text = node.getText().?;
+    text.content = "A longer label crossing the hash block boundary and buffered tail";
+    node.setText(text);
+    try Fixture.changed(&previous, node, rect);
+    text.font_size = 18;
+    node.setText(text);
+    try Fixture.changed(&previous, node, rect);
+    text.color = core.Color.rgba(80, 90, 100, 255);
+    node.setText(text);
+    try Fixture.changed(&previous, node, rect);
+    node.setImage(.{ .texture_id = 17 });
+    try Fixture.changed(&previous, node, rect);
+    var image = node.getImage().?;
+    image.texture_id = 23;
+    node.setImage(image);
+    try Fixture.changed(&previous, node, rect);
+    image.tint = core.Color.rgba(110, 120, 130, 255);
+    node.setImage(image);
+    try Fixture.changed(&previous, node, rect);
+    node.setIcon(.{ .icon_id = 31, .rep = .{ .size = 24, .shapes = &.{} } });
+    try Fixture.changed(&previous, node, rect);
+    var icon = node.getIcon().?;
+    icon.icon_id = 37;
+    node.setIcon(icon);
+    try Fixture.changed(&previous, node, rect);
+    icon.tint = core.Color.rgba(140, 150, 160, 255);
+    node.setIcon(icon);
+    try Fixture.changed(&previous, node, rect);
 }
 
 pub fn syncInteractionToTable(self: *Cx, root: *Node) void {

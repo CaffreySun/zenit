@@ -16,14 +16,15 @@ pub fn buildNodeLocalTransform(node: *const Node, options: TransformBuildOptions
     // syncScrollbarFrame).
     // Even epoch==0 fallback can't fully guarantee behavior equivalence here. session 27 + session
     // 29 both tried and reverted.
-    // Keep node.rect direct read.
-    const origin = node.style.transform_origin().resolve(node.rectFromWorldOrFallback().w, node.rectFromWorldOrFallback().h);
+    // Preserve the owner World read and its epoch fallback.
+    const rect = node.rectFromWorldOrFallback();
+    const origin = node.style.transform_origin().resolve(rect.w, rect.h);
 
     var transform = Transform2D.fromRectWithOrigin(
-        node.rectFromWorldOrFallback().x + node.style.translate_x + node.frame_state.frame_local.runtime.sticky.x,
-        node.rectFromWorldOrFallback().y + node.style.translate_y + node.frame_state.frame_local.runtime.sticky.y,
-        node.rectFromWorldOrFallback().w,
-        node.rectFromWorldOrFallback().h,
+        rect.x + node.style.translate_x + node.frame_state.frame_local.runtime.sticky.x,
+        rect.y + node.style.translate_y + node.frame_state.frame_local.runtime.sticky.y,
+        rect.w,
+        rect.h,
         if (options.include_scale) node.style.scale_x() else 1.0,
         if (options.include_scale) node.style.scale_y() else 1.0,
         origin.x,

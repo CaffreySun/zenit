@@ -662,6 +662,24 @@ fn project(tree: *AccessibilityTree, list: *FakeList, bound: []const u32) !void 
     try tree.finishProjection();
 }
 
+test "collection: children sorts prefilled synthetic rows with projected nodes" {
+    var tree = AccessibilityTree.init(testing.allocator);
+    defer tree.deinit();
+    var list = FakeList{};
+    try project(&tree, &list, &.{});
+    const row = tree.childAt(TABLE, 3).?;
+    const child = AXId.node(.{ .index = 30, .generation = 0 });
+    const prefilled = AXId.node(.{ .index = 31, .generation = 0 });
+    try tree.upsert(.{ .element = child, .parent = TABLE, .sibling_index = 1 });
+    try tree.upsert(.{ .element = prefilled, .sibling_index = 9 });
+    var out: std.ArrayListUnmanaged(AXId) = .empty;
+    defer out.deinit(testing.allocator);
+    try out.appendSlice(testing.allocator, &.{ prefilled, row });
+    try tree.children(TABLE, &out, testing.allocator);
+    try testing.expectEqualSlices(AXId, &.{ row, child, prefilled }, out.items);
+    try testing.expectEqual(AXId.Kind.row, tree.get(out.items[0]).?.element.kind);
+}
+
 test "collection: 表格暴露全部数据行，行 > 单元格 > 文字的父链与 frame" {
     var tree = AccessibilityTree.init(testing.allocator);
     defer tree.deinit();

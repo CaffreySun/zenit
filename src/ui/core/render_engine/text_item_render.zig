@@ -1071,7 +1071,17 @@ pub fn appendDisplayTextItem(
     t: *const types.TextProps,
     tl: ?text_layout.TextLayout,
 ) !void {
-    const header = style_render.makeDisplayItemHeader(exec_state);
+    try appendDisplayTextItemBorrowed(cx, node, &exec_state, t, tl);
+}
+
+pub fn appendDisplayTextItemBorrowed(
+    cx: *RenderContext,
+    node: *Node,
+    exec_state: *const NodeExecutionState,
+    t: *const types.TextProps,
+    tl: ?text_layout.TextLayout,
+) !void {
+    const header = style_render.makeDisplayItemHeaderBorrowed(exec_state);
     const raster_policy: text_blob_mod.TextRasterPolicy = if (exec_state.subtree_force_linear_text)
         .animated_stable
     else if (exec_state.is_promoted_layer)

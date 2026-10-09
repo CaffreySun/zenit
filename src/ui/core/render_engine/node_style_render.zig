@@ -13,6 +13,12 @@ const Node = node_mod.Node;
 const NodeExecutionState = node_state.NodeExecutionState;
 
 pub fn makeDisplayItemHeader(exec_state: NodeExecutionState) display_list_mod.ItemHeader {
+    return makeDisplayItemHeaderBorrowed(&exec_state);
+}
+
+// Keep the value entry points for callers; the render pipeline borrows its
+// stack-owned state synchronously instead of copying its large clip buffers.
+pub fn makeDisplayItemHeaderBorrowed(exec_state: *const NodeExecutionState) display_list_mod.ItemHeader {
     return .{
         .transform_id = exec_state.retained_ids.transform_id,
         .clip_id = exec_state.retained_ids.clip_id,
@@ -20,6 +26,24 @@ pub fn makeDisplayItemHeader(exec_state: NodeExecutionState) display_list_mod.It
         .node_id = exec_state.retained_runtime.node_id,
         .paint_order = exec_state.retained_runtime.paint_order,
     };
+}
+
+test "borrowed display headers preserve value API and own their snapshot" {
+    // Header construction consumes only the identity fields of the render state.
+    var state: NodeExecutionState = undefined;
+    state.retained_ids = .{ .transform_id = 3, .clip_id = 7, .effect_id = 11 };
+    state.retained_runtime.node_id = 13;
+    state.retained_runtime.paint_order = 17;
+    const header = makeDisplayItemHeaderBorrowed(&state);
+    try std.testing.expectEqualDeep(makeDisplayItemHeader(state), header);
+    state.retained_ids = .{ .transform_id = 19, .clip_id = 23, .effect_id = 29 };
+    state.retained_runtime.node_id = 31;
+    state.retained_runtime.paint_order = 37;
+    try std.testing.expectEqual(@as(u32, 3), header.transform_id);
+    try std.testing.expectEqual(@as(u32, 7), header.clip_id);
+    try std.testing.expectEqual(@as(u32, 11), header.effect_id);
+    try std.testing.expectEqual(@as(u32, 13), header.node_id);
+    try std.testing.expectEqual(@as(u64, 17), header.paint_order);
 }
 
 pub fn scaleLocalRadii(radii: [4]f32, scale: f32) [4]f32 {
@@ -72,7 +96,15 @@ pub fn appendNodeShadowAndBackground(
     node: *Node,
     exec_state: NodeExecutionState,
 ) !void {
-    const header = makeDisplayItemHeader(exec_state);
+    try appendNodeShadowAndBackgroundBorrowed(cx, node, &exec_state);
+}
+
+pub fn appendNodeShadowAndBackgroundBorrowed(
+    cx: *render_context_mod.RenderContext,
+    node: *Node,
+    exec_state: *const NodeExecutionState,
+) !void {
+    const header = makeDisplayItemHeaderBorrowed(exec_state);
     const local_radii = node.style.effectiveRadii();
     // read rect from World.LayoutTable (shadow-sync guarantees match node.rect).
     const local_rect = cx.rectFromWorld(node);
@@ -373,7 +405,15 @@ pub fn appendNodeBorder(
     node: *Node,
     exec_state: NodeExecutionState,
 ) !void {
-    const header = makeDisplayItemHeader(exec_state);
+    try appendNodeBorderBorrowed(cx, node, &exec_state);
+}
+
+pub fn appendNodeBorderBorrowed(
+    cx: *render_context_mod.RenderContext,
+    node: *Node,
+    exec_state: *const NodeExecutionState,
+) !void {
+    const header = makeDisplayItemHeaderBorrowed(exec_state);
     const local_radii = node.style.effectiveRadii();
     // read rect from World.LayoutTable.
     const local_rect = cx.rectFromWorld(node);
@@ -529,8 +569,16 @@ pub fn appendNodeOutline(
     node: *Node,
     exec_state: NodeExecutionState,
 ) !void {
+    try appendNodeOutlineBorrowed(cx, node, &exec_state);
+}
+
+pub fn appendNodeOutlineBorrowed(
+    cx: *render_context_mod.RenderContext,
+    node: *Node,
+    exec_state: *const NodeExecutionState,
+) !void {
     const out = node.style.outline() orelse return;
-    const header = makeDisplayItemHeader(exec_state);
+    const header = makeDisplayItemHeaderBorrowed(exec_state);
     const local_radii = node.style.effectiveRadii();
     // read rect from World.LayoutTable.
     const local_rect = cx.rectFromWorld(node);
@@ -575,7 +623,18 @@ pub fn appendNodeMedia(
     node: *Node,
     exec_state: NodeExecutionState,
 ) !void {
-    const header = makeDisplayItemHeader(exec_state);
+    try appendNodeMediaBorrowed(cx, node, &exec_state);
+}
+
+pub fn appendNodeMediaBorrowed(
+    cx: *render_context_mod.RenderContext,
+    node: *Node,
+    exec_state: *const NodeExecutionState,
+) !void {
+    const image = node.getImage();
+    const icon = node.getIcon();
+    if (image == null and icon == null) return;
+    const header = makeDisplayItemHeaderBorrowed(exec_state);
     // read rect from World.LayoutTable.
     const local_rect = cx.rectFromWorld(node);
     const render_x = exec_state.render_x;
@@ -590,7 +649,7 @@ pub fn appendNodeMedia(
     _ = radius;
     const draw_opacity = if (exec_state.use_opacity_layer) 1.0 else exec_state.node_opacity;
 
-    if (node.getImage()) |im| {
+    if (image) |im| {
         const image_x = render_x + pad_left;
         const image_y = render_y + pad_top;
         const image_w = @max(0, render_w - pad_left - pad_right);
@@ -614,7 +673,7 @@ pub fn appendNodeMedia(
         }
     }
 
-    if (node.getIcon()) |ic| {
+    if (icon) |ic| {
         const icon_x = render_x + pad_left;
         const icon_y = render_y + pad_top;
         _ = icon_x;

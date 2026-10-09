@@ -150,6 +150,10 @@ fn appendDisplayItemsToRenderListInternal(
     replay_exec_state: ?*const NodeExecutionState,
 ) !void {
     const slice = cx.display_list.items.items[start..@min(end, cx.display_list.items.items.len)];
+    // This switch is invariant during a synchronous lowering pass. Resolve it
+    // only if an effect group needs it, rather than locking the process
+    // environment for every item group (including passes without structure).
+    var emit_in_effect: ?bool = null;
     const replay_base_inverse = if (replay_exec_state) |exec_state|
         exec_state.world_transform.invert()
     else
@@ -247,8 +251,10 @@ fn appendDisplayItemsToRenderListInternal(
         // Set ZENIT_ENABLE_EFFECT_CLIP_BRIDGE=1 explicitly to continue investigation.
         const innermost_effect_for_clip: u32 =
             if (open_count > 0) open_ids[open_count - 1] else active_parent_effect_id;
-        const emit_in_effect = @import("zenit_environment").has("ZENIT_ENABLE_EFFECT_CLIP_BRIDGE");
-        const want_clip = include_structure and (chain_len == 0 or emit_in_effect);
+        const want_clip = include_structure and (chain_len == 0 or blk: {
+            if (emit_in_effect == null) emit_in_effect = @import("zenit_environment").has("ZENIT_ENABLE_EFFECT_CLIP_BRIDGE");
+            break :blk emit_in_effect.?;
+        });
 
         // On effect scope change clip must fully reopen: clip coordinates relative to
         // `innermost_effect_for_clip` projection (see

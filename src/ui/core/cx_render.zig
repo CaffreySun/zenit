@@ -30,6 +30,56 @@ const renderDirtyDebugEnabled = debug_env.renderDirtyDebugEnabled;
 const render_engine = core.render_engine;
 const text = core.text;
 
+fn startPerfTimer(self: *const Cx) @import("zenit_time").Timer {
+    // Cx.init validated this I/O clock when creating deferred_epoch. A frame
+    // only needs a fresh sample; querying its resolution again adds a syscall
+    // to every measured phase and used to leave an undefined timer on failure.
+    var timer: @import("zenit_time").Timer = .{ .io = self.io, .started = self.deferred_epoch };
+    timer.reset();
+    return timer;
+}
+
+test "frame timers reuse clock validation and keep window I/O independent" {
+    const Clock = struct {
+        value: i96,
+        resolutions: usize = 0,
+        fn now(raw: ?*anyopaque, _: std.Io.Clock) std.Io.Timestamp {
+            const clock: *@This() = @ptrCast(@alignCast(raw.?));
+            return .{ .nanoseconds = clock.value };
+        }
+        fn resolution(raw: ?*anyopaque, _: std.Io.Clock) std.Io.Clock.ResolutionError!std.Io.Duration {
+            const clock: *@This() = @ptrCast(@alignCast(raw.?));
+            clock.resolutions += 1;
+            return .{ .nanoseconds = 1 };
+        }
+    };
+    var a: Clock = .{ .value = 100 };
+    var b: Clock = .{ .value = 1000 };
+    var vtable = std.testing.io.vtable.*;
+    vtable.now = Clock.now;
+    vtable.clockResolution = Clock.resolution;
+    // Only the two clock fields are consumed by this private helper.
+    var ca: Cx = undefined;
+    ca.io = .{ .userdata = &a, .vtable = &vtable };
+    ca.deferred_epoch = try @import("zenit_time").Instant.now(ca.io);
+    var cb: Cx = undefined;
+    cb.io = .{ .userdata = &b, .vtable = &vtable };
+    cb.deferred_epoch = try @import("zenit_time").Instant.now(cb.io);
+    a.value = 200;
+    b.value = 2000;
+    var ta = startPerfTimer(&ca);
+    var tb = startPerfTimer(&cb);
+    a.value = 225;
+    b.value = 2075;
+    try std.testing.expectEqual(@as(u64, 25), ta.read());
+    try std.testing.expectEqual(@as(u64, 75), tb.read());
+    ta = startPerfTimer(&ca);
+    a.value = 250;
+    try std.testing.expectEqual(@as(u64, 25), ta.read());
+    try std.testing.expectEqual(@as(usize, 1), a.resolutions);
+    try std.testing.expectEqual(@as(usize, 1), b.resolutions);
+}
+
 pub fn render(self: *Cx) []const display_list_mod.DisplayItem {
     // system a11y pref change (reduce motion / lower transparency): whole tree invalidate must
     // ahead of zero-dirty fast-path.
@@ -82,7 +132,9 @@ pub fn render(self: *Cx) []const display_list_mod.DisplayItem {
     // gesture_arena tick, long_press time-related recognizer advance by this.
     // must call before render pass; else long_press began emit then dispatch
     // render (one-frame extra delay, user feel lag).
-    self.gesture_arena.tick(@import("zenit_time").nanoTimestamp(self.io));
+    if (self.gesture_arena.recognizers.items.len != 0) {
+        self.gesture_arena.tick(@import("zenit_time").nanoTimestamp(self.io));
+    }
     // advance ShapingCache epoch; prior-frame unreached entry driven out at config threshold
     // frames. GlyphRun pipeline inherit old measure path so text measure
     // single cache layer.
@@ -105,7 +157,7 @@ pub fn render(self: *Cx) []const display_list_mod.DisplayItem {
         tick_mod.g_slow_hook_name_len = 0;
         tick_mod.g_debug_frame = self.frame_count;
         tick_mod.g_debug_dirty_hooks = 0;
-        var bt = @import("zenit_time").Timer.start(self.io) catch undefined;
+        var bt = startPerfTimer(self);
         ensureBeforeRenderTicked(self);
         self.perf.before_render_us = bt.read() / 1000;
         self.perf.tick_nodes = tick_mod.g_tick_node_count;
@@ -126,7 +178,10 @@ pub fn render(self: *Cx) []const display_list_mod.DisplayItem {
         self.overlay_stack.updateAnchors(self.viewport.width, self.viewport.height);
 
         // Pass 1.5: incremental layout
-        var inner_timer = @import("zenit_time").Timer.start(self.io) catch undefined;
+        // Cx.init already validated this clock. Reuse bt's I/O binding and
+        // sample a new epoch without querying clock resolution a second time.
+        var inner_timer = bt;
+        inner_timer.reset();
         if (r.frame_state.state_bits.dirty.core.layout or r.frame_state.state_bits.dirty.core.subtree_layout) {
             layout_engine.layoutNode(r, self.viewport, LayoutContext{ .frame_allocator = self.frame_arena.allocator(), .shaping_cache = &self.text.shaping_cache, .font_system = self.text.font_system });
             self.syncLayoutToTable(r);
@@ -497,7 +552,7 @@ fn ensureBeforeRenderTicked(self: *Cx) void {
         }
         // These four attribution points were deleted as write-but-zero-read, making before_render
         // a black box measured at 4.7ms constant (571 nodes) with no way to drill down. Restored.
-        var br_timer = @import("zenit_time").Timer.start(self.io) catch undefined;
+        var br_timer = startPerfTimer(self);
         if (had_initial_layout_dirty) {
             layout_engine.layoutNode(r, self.viewport, LayoutContext{ .frame_allocator = self.frame_arena.allocator(), .shaping_cache = &self.text.shaping_cache, .font_system = self.text.font_system });
             self.syncLayoutToTable(r);

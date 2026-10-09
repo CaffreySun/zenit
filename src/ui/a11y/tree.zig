@@ -467,7 +467,9 @@ pub const AccessibilityTree = struct {
             try self.seen_epochs.append(self.allocator, 0);
         }
         if (self.projection_active) self.seen_epochs.items[idx] = self.projection_epoch;
-        const old = self.nodes.items[idx];
+        // Compare in place: the retained semantic snapshot is large, and the
+        // slot is not overwritten until all dirty flags have been derived.
+        const old = if (self.nodes.items[idx]) |*value| value else null;
         var flag: A11yDirtyFlag = .{};
         if (old == null or !old.?.element.eql(node.element)) {
             flag.structure_changed = true;
@@ -534,7 +536,7 @@ pub const AccessibilityTree = struct {
                 if (old_editable.visible_start != new_editable.visible_start or
                     old_editable.visible_end != new_editable.visible_end) flag.geometry_changed = true;
             }
-            if ((announcementHash(o) != announcementHash(node) or o.live != node.live) and
+            if ((announcementHash(o.*) != announcementHash(node) or o.live != node.live) and
                 !node.state.hidden and node.live != .off and announcementHash(node) != 0) flag.live_announce = true;
             if (o.state.focused != node.state.focused) flag.focus_changed = true;
             if (!o.active_descendant.eql(node.active_descendant)) flag.active_descendant_changed = true;
@@ -694,6 +696,29 @@ pub const AccessibilityTree = struct {
         return eid.index;
     }
 
+    /// Projected identity lookup without collection synthesis or dynamic geometry.
+    /// Ordering only needs stored identity/parent/sibling fields; public get()
+    /// additionally resolves the current collection frame.
+    fn projectedNode(self: *const AccessibilityTree, id: AXId) ?*const A11yNode {
+        const idx = denseIndex(id) orelse return null;
+        if (idx >= self.nodes.items.len) return null;
+        const node = if (self.nodes.items[idx]) |*node| node else return null;
+        return if (node.element.eql(id)) node else null;
+    }
+
+    const ChildOrderKey = struct { sibling_index: u32, element: AXId };
+
+    fn childOrderKey(self: *const AccessibilityTree, id: AXId) ?ChildOrderKey {
+        if (id.kind == .node) {
+            const node = self.projectedNode(id) orelse return null;
+            return .{ .sibling_index = node.sibling_index, .element = node.element };
+        }
+        // children() also sorts IDs already in the caller's output. Preserve
+        // synthetic entry lookup and its provider behavior on that path.
+        const node = self.get(id) orelse return null;
+        return .{ .sibling_index = node.sibling_index, .element = node.element };
+    }
+
     fn slotPtr(self: *AccessibilityTree, id: AXId) ?*?A11yNode {
         const idx = denseIndex(id) orelse return null;
         if (idx >= self.nodes.items.len) return null;
@@ -778,16 +803,16 @@ pub const AccessibilityTree = struct {
     fn rebuildChildIndex(self: *AccessibilityTree) !void {
         self.child_order.clearRetainingCapacity();
         self.child_spans.clearRetainingCapacity();
-        for (self.nodes.items) |maybe| {
-            const node = maybe orelse continue;
+        for (self.nodes.items) |*maybe| {
+            const node = if (maybe.*) |*value| value else continue;
             if (node.state.hidden) continue;
             try self.child_order.append(self.allocator, node.element);
         }
         const Ctx = struct {
             tree: *const AccessibilityTree,
             fn lessThan(ctx: @This(), a: AXId, b: AXId) bool {
-                const na = ctx.tree.get(a).?;
-                const nb = ctx.tree.get(b).?;
+                const na = ctx.tree.projectedNode(a).?;
+                const nb = ctx.tree.projectedNode(b).?;
                 if (na.parent.raw() != nb.parent.raw()) return na.parent.raw() < nb.parent.raw();
                 if (na.sibling_index != nb.sibling_index) return na.sibling_index < nb.sibling_index;
                 return na.element.raw() < nb.element.raw();
@@ -796,10 +821,10 @@ pub const AccessibilityTree = struct {
         std.sort.pdq(AXId, self.child_order.items, Ctx{ .tree = self }, Ctx.lessThan);
         var start: usize = 0;
         while (start < self.child_order.items.len) {
-            const parent_raw = self.get(self.child_order.items[start]).?.parent.raw();
+            const parent_raw = self.projectedNode(self.child_order.items[start]).?.parent.raw();
             var end = start + 1;
             while (end < self.child_order.items.len and
-                self.get(self.child_order.items[end]).?.parent.raw() == parent_raw) end += 1;
+                self.projectedNode(self.child_order.items[end]).?.parent.raw() == parent_raw) end += 1;
             try self.child_spans.put(self.allocator, parent_raw, .{ .start = @intCast(start), .len = @intCast(end - start) });
             start = end;
         }
@@ -812,13 +837,23 @@ pub const AccessibilityTree = struct {
         out: *std.ArrayListUnmanaged(AXId),
         allocator: std.mem.Allocator,
     ) !void {
-        for (self.nodes.items) |maybe| {
-            if (maybe) |n| {
+        // Dense projection often already has sibling order. Detect that while
+        // collecting instead of looking every identity up again to verify it.
+        var ordered = out.items.len == 0;
+        var previous: ?ChildOrderKey = null;
+        for (self.nodes.items) |*maybe| {
+            if (maybe.*) |*n| {
                 if (n.parent.eql(parent) and !n.state.hidden) {
                     try out.append(allocator, n.element);
+                    if (previous) |left| {
+                        if (n.sibling_index < left.sibling_index or
+                            (n.sibling_index == left.sibling_index and n.element.raw() < left.element.raw())) ordered = false;
+                    }
+                    previous = .{ .sibling_index = n.sibling_index, .element = n.element };
                 }
             }
         }
+        if (ordered) return;
         // Keep this helper's documented order identical to the native pull
         // bridge. Stable raw-handle tie-breaking makes malformed duplicate
         // sibling indices deterministic instead of dense-slot dependent.
@@ -826,8 +861,8 @@ pub const AccessibilityTree = struct {
         while (i < out.items.len) : (i += 1) {
             var j = i;
             while (j > 0) : (j -= 1) {
-                const left = self.get(out.items[j - 1]) orelse break;
-                const right = self.get(out.items[j]) orelse break;
+                const left = self.childOrderKey(out.items[j - 1]) orelse break;
+                const right = self.childOrderKey(out.items[j]) orelse break;
                 const right_before = right.sibling_index < left.sibling_index or
                     (right.sibling_index == left.sibling_index and right.element.raw() < left.element.raw());
                 if (!right_before) break;
@@ -1054,6 +1089,56 @@ test "AccessibilityTree: children lookup" {
     try testing.expectEqual(@as(usize, 2), out.items.len);
     try testing.expect(out.items[0].eql(c2));
     try testing.expect(out.items[1].eql(c1));
+}
+
+test "AccessibilityTree: children preserves hidden filtering, ties, and appended output order" {
+    var tree = AccessibilityTree.init(testing.allocator);
+    defer tree.deinit();
+    const root = AXId.node(.{ .index = 0, .generation = 0 });
+    const first = AXId.node(.{ .index = 9, .generation = 0 });
+    const tie_low = AXId.node(.{ .index = 3, .generation = 0 });
+    const tie_high = AXId.node(.{ .index = 7, .generation = 0 });
+    const hidden = AXId.node(.{ .index = 2, .generation = 0 });
+    const unrelated = AXId.node(.{ .index = 11, .generation = 0 });
+    try tree.upsert(.{ .element = root, .role = .group });
+    try tree.upsert(.{ .element = first, .parent = root, .sibling_index = 0 });
+    try tree.upsert(.{ .element = tie_low, .parent = root, .sibling_index = 2 });
+    try tree.upsert(.{ .element = tie_high, .parent = root, .sibling_index = 2 });
+    try tree.upsert(.{ .element = hidden, .parent = root, .sibling_index = 0, .state = .{ .hidden = true } });
+    try tree.upsert(.{ .element = unrelated, .sibling_index = 1 });
+    var out: std.ArrayListUnmanaged(AXId) = .empty;
+    defer out.deinit(testing.allocator);
+    try tree.children(root, &out, testing.allocator);
+    try testing.expectEqualSlices(AXId, &.{ first, tie_low, tie_high }, out.items);
+    try testing.expectEqualSlices(AXId, out.items, tree.exposedChildren(root));
+    out.clearRetainingCapacity();
+    // Existing output participates in sorting even when it is not a child.
+    try out.append(testing.allocator, unrelated);
+    try tree.children(root, &out, testing.allocator);
+    try testing.expectEqualSlices(AXId, &.{ first, unrelated, tie_low, tie_high }, out.items);
+}
+
+test "AccessibilityTree: children keeps stale identity barriers in prefilled output" {
+    var tree = AccessibilityTree.init(testing.allocator);
+    defer tree.deinit();
+    const root = AXId.node(.{ .index = 0, .generation = 0 });
+    const child = AXId.node(.{ .index = 2, .generation = 1 });
+    const stale = AXId.node(.{ .index = 2, .generation = 0 });
+    const other = AXId.node(.{ .index = 5, .generation = 0 });
+    try tree.upsert(.{ .element = root });
+    try tree.upsert(.{ .element = child, .parent = root, .sibling_index = 0 });
+    try tree.upsert(.{ .element = other, .sibling_index = 9 });
+    var out: std.ArrayListUnmanaged(AXId) = .empty;
+    defer out.deinit(testing.allocator);
+    try out.appendSlice(testing.allocator, &.{ other, stale });
+    try tree.children(root, &out, testing.allocator);
+    // Identity mismatch stops each insertion, rather than sorting using the
+    // replacement generation's node metadata.
+    try testing.expectEqualSlices(AXId, &.{ other, stale, child }, out.items);
+    try testing.expect(tree.projectedNode(stale) == null);
+    try testing.expect(tree.projectedNode(AXId.NULL) == null);
+    try testing.expect(tree.projectedNode(AXId.node(.{ .index = 90, .generation = 0 })) == null);
+    try testing.expect(tree.projectedNode(.{ .payload = 2, .kind = .row }) == null);
 }
 
 test "State / A11yDirtyFlag are properly sized" {

@@ -1,8 +1,8 @@
-/// 动画预设库，常用动画效果的一键封装
+/// Animation preset library: one-shot wrappers for common animation effects
 ///
-/// 类似 GSAP registerEffect，每个预设内部调用 animateNode()。
+/// Similar to GSAP registerEffect; each preset calls animateNode() internally.
 ///
-/// 用法:
+/// Usage:
 /// ```zig
 /// const presets = @import("animation/presets.zig");
 ///
@@ -25,7 +25,7 @@ pub const FadeOpts = struct {
     delay: f32 = 0,
 };
 
-/// 淡入：opacity 0 -> 1
+/// Fade in: opacity 0 -> 1
 pub fn fadeIn(node: anytype, allocator: Allocator, opts: FadeOpts) void {
     animateNode(node, allocator, .{
         .prop = .opacity,
@@ -47,7 +47,7 @@ pub const SlideOpts = struct {
     fade: bool = true,
 };
 
-/// 从下方滑入
+/// Slide up from bottom
 pub fn slideInUp(node: anytype, allocator: Allocator, opts: SlideOpts) void {
     animateNode(node, allocator, .{
         .prop = .translate_y,
@@ -69,7 +69,7 @@ pub fn slideInUp(node: anytype, allocator: Allocator, opts: SlideOpts) void {
     }
 }
 
-/// 从上方滑入
+/// Slide down from top
 pub fn slideInDown(node: anytype, allocator: Allocator, opts: SlideOpts) void {
     animateNode(node, allocator, .{
         .prop = .translate_y,
@@ -101,7 +101,7 @@ pub const ScaleOpts = struct {
     fade: bool = true,
 };
 
-/// 缩放进入（从小到大）
+/// Scale in (small to large)
 pub fn scaleIn(node: anytype, allocator: Allocator, opts: ScaleOpts) void {
     animateNode(node, allocator, .{
         .prop = .scale_x,
@@ -139,7 +139,7 @@ pub const ShakeOpts = struct {
     delay: f32 = 0,
 };
 
-/// 摇晃效果（用 elastic 缓动模拟 spring）
+/// Shake effect (simulate spring with elastic easing)
 pub fn shake(node: anytype, allocator: Allocator, opts: ShakeOpts) void {
     animateNode(node, allocator, .{
         .prop = .translate_x,

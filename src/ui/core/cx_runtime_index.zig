@@ -1,6 +1,6 @@
-//! Cx 运行时索引重建：interaction index / node registry / focus order 的
-//! 全量与增量（partial root）重建，以及重建后的焦点对账。从 core.zig 拆出，
-//! Cx 上保留同名 thin delegate。
+//! Cx runtime index rebuild: interaction index / node registry / focus order full
+//! and partial-root rebuild, plus post-rebuild focus reconciliation. Split from
+//! core.zig; thin delegate left on Cx.
 
 const std = @import("std");
 const core = @import("../core.zig");
@@ -26,9 +26,10 @@ pub fn collectPartialInteractionRoots(self: *Cx, node: *Node, roots: *PartialInt
         collectPartialInteractionRoots(self, child, roots);
         if (roots.overflow) return;
     }
-    // 孤立脏标记修复：subtree_interaction_dirty 冒泡上来后，源头的 interaction_dirty
-    // 被 partial rebuild 的 clearInteractionDirtyRecursive 清除，但祖先的
-    // subtree_interaction_dirty 没有被清。清除孤立标记防止每帧 full rebuild。
+    // Orphaned dirty flag fix: subtree_interaction_dirty bubbles up; partial rebuild
+    // clears source interaction_dirty via clearInteractionDirtyRecursive, but ancestor
+    // subtree_interaction_dirty stays set. Clear orphaned flag to prevent full rebuild
+    // every frame.
     if (roots.len == roots_before and node.frame_state.state_bits.dirty.pipeline.subtree_interaction and !node.frame_state.state_bits.dirty.core.subtree_layout) {
         node.frame_state.state_bits.dirty.pipeline.subtree_interaction = false;
     }
@@ -81,35 +82,33 @@ pub fn rebuildInteractionIndexWithPartialRoots(self: *Cx, roots: PartialInteract
         self.perf.interaction_partial_rebuild_count += 1;
         clearInteractionDirtyRecursive(self, node);
     }
-    // partial rebuild 完成后，清理祖先链上残留的 subtree_interaction_dirty。
-    // clearInteractionDirtyRecursive 只清了 partial root 子树，祖先的 subtree 标记
-    // 仍为 true，会导致下一帧再次触发无效的 full rebuild。
+    // After partial rebuild, clear orphaned subtree_interaction_dirty on ancestor
+    // chain. clearInteractionDirtyRecursive only clears partial-root subtree;
+    // ancestor's subtree flag still true, triggering invalid full rebuild next frame.
     if (self.root) |root| {
         clearStaleSubtreeInteractionDirty(self, root);
     }
-    // partial rebuild 完成后重建空间 grid
+    // After partial rebuild, rebuild spatial grid.
 }
 
 fn partialInteractionRootForLayoutNode(node: *Node) ?*Node {
-    // 一个 in-flow 子节点的盒子尺寸变化（如 Accordion content 展开高度变化）会让
-    // **父容器重跑 layoutChildren**，从而把它**后面的兄弟节点整体位移**。若 partial
-    // interaction 重建只覆盖这个变化节点自己的子树，被位移的兄弟（及其后代）的命中
-    // 区域仍停在旧位置 -> hit-test 命中旧布局（用户报的 Accordion 展开后点下方 item
-    // 命中错位/落空 bug）。所以把重建根上提到**父节点**，覆盖所有被 reflow 的兄弟。
-    //
-    // 仅 in-flow 节点这么做：absolute/out-of-flow 节点的尺寸变化不影响兄弟排布，
-    // 上提反而无谓扩大重建范围。无父节点（根）退回自身。
+    // An in-flow child size change (e.g., Accordion content expand) **relayouts the
+    // parent** and shifts **all following siblings**. Rebuilding only the changed
+    // node's subtree leaves shifted siblings' hit areas at old positions, so hit-test
+    // uses the old layout. Hence the rebuild root is raised to the **parent**, covering
+    // all reflowed siblings. Only for in-flow: absolute/out-of-flow size changes don't
+    // affect sibling layout, so raising would waste coverage. No parent (root) -> self.
     if (node.style.position != .absolute) {
         if (node.parent) |parent| return parent;
     }
     return node;
 }
 
-/// loose 三位（pipeline.interaction/hit.geometry/hit.semantics）不冒泡，
-/// 只能全树扫，曾是帧结构采样最大单项（每帧最多 6 个调用点）。按
-/// (root, node_dirty.g_loose_interaction_gen) 记忆：所有置位/清位点都
-/// bump 代数（见 node_dirty.bumpLooseInteractionGen 注释的约定），
-/// 代数不变 ⇒ 位集不变 ⇒ 结果不变，语义与逐次扫描精确等价。
+/// The loose bits (pipeline.interaction / hit.geometry / hit.semantics) don't
+/// bubble, so they need a whole-tree scan (up to 6 callsites per frame). Memoized
+/// by (root, node_dirty.g_loose_interaction_gen): all set/clear sites bump gen
+/// (see node_dirty.bumpLooseInteractionGen contract); unchanged gen => unchanged
+/// bits => same result as scanning each time.
 pub fn subtreeHasLooseInteractionDirty(node: *Node) bool {
     const LooseMemo = struct {
         var root: ?*Node = null;
@@ -144,11 +143,11 @@ fn isDescendantNode(node: *Node, ancestor: *Node) bool {
 
 pub fn rebuildRuntimeIndexes(self: *Cx) !void {
     const root = self.root orelse return;
-    // 诊断阀：ZENIT_FULL_RUNTIME_REBUILD=1 强制每次全量重建 runtime
-    // index（排查 partial 重排 paint order 与静止子树交错的问题）
+    // Diagnostic flag: ZENIT_FULL_RUNTIME_REBUILD=1 forces full runtime index
+    // rebuild every time (debug partial repaint order with still-subtree interleave).
     const needs_full_rebuild = self.node_registry.entries.count() == 0 or
         root.frame_state.state_bits.dirty.runtime.subtree_full_rebuild or
-        std.posix.getenv("ZENIT_FULL_RUNTIME_REBUILD") != null;
+        @import("zenit_environment").has("ZENIT_FULL_RUNTIME_REBUILD");
     if (needs_full_rebuild) {
         try fullRebuildRuntimeIndexes(self, root);
     } else {
@@ -199,11 +198,11 @@ pub fn fullRebuildRuntimeIndexes(self: *Cx, root: *Node) !void {
 fn rebuildDirtyRuntimeSubtrees(self: *Cx, node: *Node) !void {
     if (!node.frame_state.state_bits.dirty.runtime.subtree_dirty) return;
     if (node.frame_state.state_bits.dirty.runtime.dirty) {
-        // 增量重建只是把这棵子树从 registry/focus_order 摘掉再重灌,
-        // 节点本身不销毁。unregisterFocusableSubtree 会顺手把落在子树内的
-        // current_focus 清空（对"子树将被释放"的调用方是正确的），这里
-        // 必须在重灌后把焦点还回去，否则任何"重绘当前焦点行"的组件
-        //（如 VirtualList 行选中态刷新）都会静默丢键盘焦点。
+        // Partial rebuild only removes/re-adds this subtree from registry/focus_order;
+        // it doesn't destroy nodes. unregisterFocusableSubtree clears current_focus if it
+        // lands in the subtree (correct for subtrees about to be freed), so focus must be
+        // restored after re-adding; otherwise any "refresh current-focus row" component
+        // (e.g., VirtualList row selection) silently loses keyboard focus.
         const focused_before = self.focus_manager.current_focus;
         const focus_was_inside = if (focused_before) |f| isDescendantNode(f, node) else false;
         self.node_registry.detachSubtree(node);
@@ -211,8 +210,9 @@ fn rebuildDirtyRuntimeSubtrees(self: *Cx, node: *Node) !void {
         try rebuildRuntimeStateRecursive(self, node);
         if (focus_was_inside) {
             if (focused_before) |f| {
-                // 仅当节点确实随 rebuild 重新注册（同 id 同指针）才恢复；
-                // 若它在标脏与重建之间被从树上摘掉，维持清空语义。
+                // Restore focus only if node re-registers with partial rebuild (same id, same
+                // pointer); if detached from tree between mark-dirty and rebuild, maintain clear
+                // semantics.
                 if (self.node_registry.entries.get(f.id)) |entry| {
                     if (entry.ptr == f) {
                         self.focus_manager.restoreFocusAfterSubtreeRebuild(f);
@@ -258,7 +258,7 @@ pub fn rebuildOrderIndexes(self: *Cx) !void {
     if (!(try rebuildDirtyInteractionSubtrees(self, root))) {
         try rebuildInteractionIndex(self);
     } else {
-        // 增量 subtree rebuild 成功后也要重建空间 grid
+        // After partial subtree rebuild succeeds, rebuild spatial grid.
     }
     clearOrderDirtyRecursive(self, root);
 }
@@ -283,15 +283,15 @@ fn clearInteractionDirtyRecursive(self: *Cx, node: *Node) void {
     }
 }
 
-/// 自底向上清理 subtree_interaction_dirty：如果节点的所有子节点都已清洁，
-/// 则节点自身的 subtree_interaction_dirty 也应清除。
+/// Bottom-up clear subtree_interaction_dirty: if all children are clean, node's
+/// own subtree_interaction_dirty should clear too.
 fn clearStaleSubtreeInteractionDirty(self: *Cx, node: *Node) void {
     if (!node.frame_state.state_bits.dirty.pipeline.subtree_interaction) return;
-    if (node.frame_state.state_bits.dirty.pipeline.interaction) return; // 自身脏，不清
+    if (node.frame_state.state_bits.dirty.pipeline.interaction) return; // Node itself is dirty, don't clear.
     for (node.children.items) |child| {
         clearStaleSubtreeInteractionDirty(self, child);
     }
-    // 检查所有子节点是否已清洁
+    // Check all children are clean.
     for (node.children.items) |child| {
         if (child.frame_state.state_bits.dirty.pipeline.interaction or child.frame_state.state_bits.dirty.pipeline.subtree_interaction) return;
     }
@@ -381,25 +381,24 @@ fn subtreeSupportsIncrementalFocusRepair(node: *Node) bool {
 fn reconcileFocusedAfterRuntimeRebuild(self: *Cx) void {
     if (self.focus_manager.getFocused()) |focused| {
         if (!self.node_registry.entries.contains(focused.id)) {
-            // partial 重建对未覆盖子树的收录有缺口：entries 缺席 ≠ 节点已死。
-            // 只有 generations 判死（noteNodeFreed 置 last_ptr=null / 指针
-            // 已换代）才清焦点；活着但暂未入索引的节点保持焦点，下一次
-            // full rebuild 自然收录。实弹：焦点在 sidebar 行上时，编辑器
-            // syntax prewarm 完成触发的 partial 重建曾借此把焦点清成 null
-            // （面板整体失焦灰），且随机器时序忽现忽隐。
+            // Partial rebuild leaves index coverage gaps: missing entries != dead nodes. Only
+            // generations (noteNodeFreed sets last_ptr=null / pointer generation advanced)
+            // clear focus; live nodes temporarily out of the index retain focus, and the next
+            // full rebuild re-indexes them. Otherwise a partial rebuild clears focus on a live
+            // node (e.g., sidebar row focus lost when editor syntax prewarm rebuilds).
             const alive = if (self.node_registry.generations.get(focused.id)) |g|
                 g.last_ptr == focused
             else
                 false;
             if (!alive) {
-                // clearFocus 走 setFocusWithReason -> on_focus_settled 已
-                // 刷过原生闸，这里不必重复。
+                // clearFocus goes through setFocusWithReason -> on_focus_settled already
+                // flushed native gate; no need to repeat.
                 self.focus_manager.clearFocus();
                 self.focused_node = null;
                 self.focused_handle = null;
                 return;
             }
-            // handle 保持旧值：entries 回来后 resolve 自然恢复。
+            // Handle keeps old value: entries return and resolve naturally restores.
             self.focused_node = focused;
             self.refreshTextInputSession();
             return;

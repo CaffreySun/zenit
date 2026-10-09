@@ -1,65 +1,67 @@
-/// Info.plist 生成器，把 BundleSpec 渲染为 XML
+/// Info.plist generator, render BundleSpec to XML.
 ///
-/// 之所以代码生成而不是模板替换：CFBundleDocumentTypes / UTExportedTypeDeclarations 是数组结构，
-/// 数量由调用方决定，模板字符串处理这种嵌套结构不舒服。
+/// Code generation not template substitution: CFBundleDocumentTypes / UTExportedTypeDeclarations
+/// are array structures, count caller-determined, template strings unwieldy with nesting.
 const std = @import("std");
 
 pub const FileType = struct {
-    /// 用户可见名称（Finder 里显示）
+    /// User-visible name (shown in Finder).
     name: []const u8,
-    /// 文件扩展名（不含点）
+    /// File extension (no dot).
     extensions: []const []const u8,
-    /// UTI 标识符。如 "com.acme.myapp.document"。
+    /// UTI identifier. E.g., "com.acme.myapp.document".
     uti: []const u8,
     /// "Editor" / "Viewer" / "Shell" / "None"
     role: []const u8 = "Editor",
     /// "Owner" / "Default" / "Alternate" / "None"
     handler_rank: []const u8 = "Owner",
-    /// UTType 是否由本 app 定义（exported）。false 表示只是引用（imported，如 markdown）。
+    /// Whether UTType defined by this app (exported). false means just referenced (imported, e.g.,
+    /// markdown).
     exported: bool = true,
-    /// UTI 继承的父 type。imported 时常用 ["public.plain-text"]，
-    /// exported 文档型常用 ["public.data", "public.content"]。
+    /// Parent type inherited by UTI. Imported typically ["public.plain-text"]; exported documents
+    /// typically ["public.data", "public.content"].
     conforms_to: []const []const u8 = &.{ "public.data", "public.content" },
 };
 
 pub const BundleSpec = struct {
-    /// CFBundleDisplayName / CFBundleName，用户可见名称
+    /// CFBundleDisplayName / CFBundleName, user-visible name.
     display_name: []const u8,
-    /// CFBundleIdentifier，反向 DNS，如 "com.acme.myapp"
+    /// CFBundleIdentifier, reverse DNS. E.g., "com.acme.myapp".
     bundle_id: []const u8,
-    /// CFBundleExecutable, Contents/MacOS/<name> 的文件名
+    /// CFBundleExecutable, filename in Contents/MacOS/<name>.
     executable: []const u8,
     /// CFBundleShortVersionString + CFBundleVersion
     version: []const u8 = "0.1.0",
-    /// 4 字符 OSType signature。约定：APPL = 应用、????
-    /// 用于 PkgInfo 文件 + CFBundleSignature
+    /// 4-character OSType signature. Convention: APPL = application, ???? for other. Used in
+    /// PkgInfo file + CFBundleSignature.
     signature: []const u8 = "????",
-    /// LSMinimumSystemVersion，如 "12.0"
+    /// LSMinimumSystemVersion. E.g., "12.0".
     min_macos: []const u8 = "12.0",
-    /// CFBundleIconFile, Resources/<icon_file>.icns 的文件名（不含扩展）
+    /// CFBundleIconFile, filename in Resources/<icon_file>.icns (no extension).
     icon_file: ?[]const u8 = null,
     /// LSApplicationCategoryType
     category: []const u8 = "public.app-category.developer-tools",
-    /// 版权字符串（NSHumanReadableCopyright）
+    /// Copyright string (NSHumanReadableCopyright).
     copyright: ?[]const u8 = null,
-    /// 文件类型注册（CFBundleDocumentTypes + UT*TypeDeclarations）。
+    /// File type registration (CFBundleDocumentTypes + UT*TypeDeclarations).
     file_types: []const FileType = &.{},
-    /// NSAppTransportSecurity.NSAllowsArbitraryLoads，默认 false（安全），
-    /// 如果应用要拉任意 HTTP 图片/链接，调用方显式打开。
+    /// NSAppTransportSecurity.NSAllowsArbitraryLoads, default false (secure). Callers explicitly
+    /// enable if app needs arbitrary HTTP images/links.
     allow_arbitrary_loads: bool = false,
-    /// CADisableMinimumFrameDuration，解锁 ProMotion 120Hz。默认 true（编辑器场景值得）。
+    /// CADisableMinimumFrameDuration, unlock ProMotion 120Hz. Default true (editor scenes worth
+    /// it).
     disable_min_frame_duration: bool = true,
-    /// NSSupportsAutomaticGraphicsSwitching，默认 true（笔记本省电）。
+    /// NSSupportsAutomaticGraphicsSwitching, default true (laptop power saving).
     auto_graphics_switching: bool = true,
-    /// NSHighResolutionCapable, Retina 必开。
+    /// NSHighResolutionCapable, Retina required.
     high_resolution: bool = true,
 };
 
-/// 把 BundleSpec 渲染为完整的 Info.plist XML 字符串。
+/// Render BundleSpec as complete Info.plist XML string.
 pub fn render(allocator: std.mem.Allocator, spec: BundleSpec) ![]u8 {
-    var buf = std.ArrayList(u8){};
-    defer buf.deinit(allocator);
-    const w = buf.writer(allocator);
+    var buf: std.Io.Writer.Allocating = .init(allocator);
+    defer buf.deinit();
+    const w = &buf.writer;
 
     try w.writeAll(
         \\<?xml version="1.0" encoding="UTF-8"?>
@@ -150,7 +152,7 @@ pub fn render(allocator: std.mem.Allocator, spec: BundleSpec) ![]u8 {
 
     try w.writeAll("</dict>\n</plist>\n");
 
-    return buf.toOwnedSlice(allocator);
+    return buf.toOwnedSlice();
 }
 
 fn writeKVString(w: anytype, key: []const u8, value: []const u8) !void {

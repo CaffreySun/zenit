@@ -1,16 +1,15 @@
-/// Display List, paint pass 内部 IR。
+/// Display List: internal IR of the paint pass.
 ///
-/// **v0.9-§c c4 (2026-05-13): 此文件仅 core/ 内部使用，外部不应直接 import。**
-/// encoder 主路径已切到 paint_table.DisplayItem (struct, 非 union)。本文件保留
-/// 为 paint pass -> display_list_lowering 之间的中转 IR；snapshot.zig 跨帧持有
-/// 也使用此 union (Snapshot.commands)。所有 .zig 模块若需 paint 数据，应 import
-/// `paint_table.zig` 而非此文件。
-/// `grep -rn "@import.*display_list.zig" src/` 应只命中 src/ui/core/ 子树。
+/// **core/ internal only; external code must not import it directly.**
+/// The encoder main path uses paint_table.DisplayItem (struct, not union). This file remains as
+/// the IR bridge between paint pass -> display_list_lowering; snapshot.zig also holds this union
+/// across frames (Snapshot.commands). Modules needing paint data should import `paint_table.zig`.
+/// `grep -rn "@import.*display_list.zig" src/` should only hit the src/ui/core/ subtree.
 ///
-/// DisplayItem 是 paint pass -> encoder 之间的唯一 IR。每个 item 通过 ItemHeader
-/// 关联到 PropertyTree 中的 transform/clip/effect。paint pass emit local 坐标，
-/// display_list_lowering 在 lowering 时 apply transform 得 world 坐标，encoder 直
-/// 消费 lowered DisplayItem。
+/// DisplayItem is the unique IR between paint pass -> encoder. Each item associates via ItemHeader
+/// with transform/clip/effect in PropertyTree. The paint pass emits local coordinates;
+/// display_list_lowering applies the transform to get world coordinates, and the encoder directly
+/// consumes the lowered DisplayItem.
 const std = @import("std");
 const types = @import("types.zig");
 const icon_ir = @import("icon_ir");
@@ -25,13 +24,14 @@ const TextSpan = types.TextSpan;
 const GradientDirection = types.GradientDirection;
 pub const INVALID_ID = property_tree.INVALID_ID;
 
-/// Clip primitive 类型 (R3f 后定义在 display_list)，与 ClipNode/clip token 共享。
-/// PathFillRule 沿用 types.PathFillRule (跨模块共享，非本文件定义)。
+/// Clip primitive type (R3f defined in display_list), shared with ClipNode/clip token. PathFillRule
+/// reused from types.PathFillRule (cross-module shared, not defined here).
 pub const max_clip_polygon_points: usize = 32;
 pub const max_clip_polygon_contours: usize = 8;
 
-/// `begin_opacity_layer.surface_stable_id` 的哨兵：不参与 GPU retained 合成。
-/// 语义上是"没有稳定身份"，encoder 见到它必须走每帧重画的老路径。
+/// Sentinel in `begin_opacity_layer.surface_stable_id`: doesn't participate in GPU retained
+/// composite. Semantically 'no stable identity', encoder seeing it must take old
+/// every-frame-repaint path.
 pub const INVALID_SURFACE_ID: u32 = std.math.maxInt(u32);
 
 pub const ClipShapeKind = enum(u8) {
@@ -45,15 +45,15 @@ pub const ClipPolygon = struct {
     point_count: u8 = 0,
     contour_count: u8 = 0,
     fill_rule: types.PathFillRule = .evenodd,
-    contour_end_points: [max_clip_polygon_contours]u8 = [_]u8{0} ** max_clip_polygon_contours,
-    points: [max_clip_polygon_points][2]f32 = [_][2]f32{.{ 0, 0 }} ** max_clip_polygon_points,
+    contour_end_points: [max_clip_polygon_contours]u8 = @as([max_clip_polygon_contours]u8, @splat(0)),
+    points: [max_clip_polygon_points][2]f32 = @as([max_clip_polygon_points][2]f32, @splat(.{ 0, 0 })),
 
     pub fn empty() ClipPolygon {
         return .{};
     }
 };
 
-/// 每个 DisplayItem 的公共关联头（PropertyTree 引用）
+/// Common associating header for each DisplayItem (PropertyTree reference)
 pub const ItemHeader = struct {
     /// Frozen snapshot geometry has no dependency on the current property tree.
     already_lowered: bool = false,
@@ -73,8 +73,8 @@ pub const DisplayItem = union(enum) {
         h: f32,
         color: Color,
         radius: [4]f32 = .{ 0, 0, 0, 0 },
-        /// 绘制形状（0 = rounded_rect, 1 = ellipse）。与 types.ShapeSpec 同序。
-        /// ellipse 时 radius 被忽略（SDF 由半轴决定）。
+        /// Draw shape (0 = rounded_rect, 1 = ellipse). Same sequence as types.ShapeSpec. Radius
+        /// ignored when ellipse (SDF determined by semi-axes).
         shape: u8 = 0,
     },
     stroke_rect: struct {
@@ -86,7 +86,7 @@ pub const DisplayItem = union(enum) {
         color: Color,
         width: f32,
         radius: [4]f32 = .{ 0, 0, 0, 0 },
-        /// 见 fill_rect.shape
+        /// See fill_rect.shape
         shape: u8 = 0,
     },
     border_side: struct {
@@ -106,7 +106,7 @@ pub const DisplayItem = union(enum) {
         clip_shape_kind: ClipShapeKind = .rect,
         clip_polygon: ClipPolygon = .{},
     },
-    /// Per-side border: shader 内计算内轮廓，无需 clip
+    /// Per-side border: shader computes inner outline, no clip needed
     border_per_side: struct {
         header: ItemHeader,
         x: f32,
@@ -131,7 +131,7 @@ pub const DisplayItem = union(enum) {
         radial_center_y: f32 = 0,
         conic_start_angle: f32 = 0,
         extend_mode: types.GradientExtendMode = .pad,
-        /// 见 fill_rect.shape
+        /// See fill_rect.shape
         shape: u8 = 0,
     },
     shadow_rect: struct {
@@ -144,7 +144,8 @@ pub const DisplayItem = union(enum) {
         blur: f32,
         offset_x: f32 = 0,
         offset_y: f32 = 0,
-        /// CSS spread（正外扩 / 负收缩阴影形状；本体下方始终挖空）。
+        /// CSS spread (positive outer expand / negative shrink shadow shape; body always hollowed
+        /// below).
         spread: f32 = 0,
         radius: [4]f32 = .{ 0, 0, 0, 0 },
     },
@@ -168,30 +169,36 @@ pub const DisplayItem = union(enum) {
         blob_byte_start: u32 = 0,
         blob_byte_end: u32 = 0,
         color: Color,
-        /// 逻辑字号（不乘 scale！）
+        /// Logical font size (not multiplied by scale!)
         font_size: f32,
         font_weight: u16 = 400,
-        /// 字体族 id(见 TextProps.font_family)。0 = 默认族。
+        /// Font family id (see TextProps.font_family). 0 = default family.
         font_family: u16 = 0,
         use_symbols_font: bool = false,
         use_monospace_font: bool = false,
         monospace_char_width: f32 = 0,
         use_italic_font: bool = false,
+        /// TextProps.font_smoothing
+        font_smoothing: bool = true,
         spans: ?[]const TextSpan = null,
-        /// Phase L3: 关联的 TextLayoutBlob（INVALID_ID = 无）
+        /// Phase L3: associated TextLayoutBlob (INVALID_ID = none)
         blob_id: u32 = INVALID_ID,
-        /// 该 blob 的 content_hash 快照，用于校验 blob_id 是否仍指向同一段文本。
+        /// Snapshot of this blob's content_hash, used to verify blob_id still points to the same
+        /// text.
         ///
-        /// blob_id 是**帧内序号**，text_blob_store 每帧 clear 后重新分配。
-        /// 保留（replay/cache）下来的 item 若跨帧存活，同一序号可能已被别的
-        /// 控件占用，于是终端会按自己的字节偏移去切状态栏的 "plaintext"，
-        /// 画出 "plainte"（实测截图）。带上 hash 就能识破并回退到 content。
+        /// blob_id is a **frame-local sequence number**; text_blob_store is cleared and
+        /// re-allocated each
+        /// frame. A persisted item (replay/cache) holding an old number may find it claimed by
+        /// another
+        /// widget this frame, then slices that widget's bytes by its own offset (e.g. state bar
+        /// "plaintext" drawn as "plainte"). The hash detects the misidentity and falls back to
+        /// content.
         blob_content_hash: u64 = 0,
-        /// Phase L3: 光栅化策略
+        /// Phase L3: rasterization strategy
         raster_policy: TextRasterPolicy = .static_crisp,
-        /// 右端淡出遮罩窗口，**相对 run 起点 x 的偏移**（0/0 = 关闭）。
-        /// 相对量在 lowering 只需乘 scale、snapshot 平移天然免改。
-        /// 见 TextProps.fade_right。
+        /// Right-edge fade-out mask window, **offset relative to run start x** (0/0 = off).
+        /// Relative quantity during lowering only needs scale multiply; snapshot translation
+        /// naturally avoids change. See TextProps.fade_right.
         fade_dx0: f32 = 0,
         fade_dx1: f32 = 0,
     },
@@ -220,6 +227,10 @@ pub const DisplayItem = union(enum) {
         corner_clip_radius: f32 = 0,
         opacity: f32 = 1,
         rotate: f32 = 0,
+        /// Snap the quad to device pixels (static icons, like static_crisp text).
+        /// The mask is rasterized at whole physical pixels; drawn at a fractional
+        /// offset, bilinear sampling smears each stroke over two pixels.
+        snap: bool = true,
     },
     arc: struct {
         header: ItemHeader,
@@ -231,7 +242,7 @@ pub const DisplayItem = union(enum) {
         end_angle: f32,
         color: Color,
     },
-    /// 多色渐变（多 stop）
+    /// Multi-color gradient (multiple stops)
     multi_gradient_rect: struct {
         header: ItemHeader,
         x: f32,
@@ -240,21 +251,21 @@ pub const DisplayItem = union(enum) {
         h: f32,
         direction: GradientDirection = .vertical,
         radius: [4]f32 = .{ 0, 0, 0, 0 },
-        stop_colors: [16]Color = [_]Color{Color.rgba(0, 0, 0, 0)} ** 16,
-        stop_positions: [16]f32 = [_]f32{0} ** 16,
+        stop_colors: [16]Color = @as([16]Color, @splat(Color.rgba(0, 0, 0, 0))),
+        stop_positions: [16]f32 = @as([16]f32, @splat(0)),
         stop_count: u8 = 0,
         radial_center_x: f32 = 0,
         radial_center_y: f32 = 0,
-        /// 径向椭圆半径（UV 单位；0.5 = 内切）。
+        /// Radial ellipse radii (UV units; 0.5 = inscribed).
         radial_radius_x: f32 = 0.5,
         radial_radius_y: f32 = 0.5,
         conic_start_angle: f32 = 0,
         extend_mode: types.GradientExtendMode = .pad,
-        /// 见 fill_rect.shape（0 = rounded_rect, 1 = ellipse）。
-        /// 渐变也必须服从形状，否则椭圆的渐变会铺满整个包围盒。
+        /// See fill_rect.shape (0 = rounded_rect, 1 = ellipse). Gradient must also obey shape, else
+        /// ellipse gradient fills entire bounding box.
         shape: u8 = 0,
     },
-    /// 程序性噪声纹理
+    /// Procedural noise texture
     noise_rect: struct {
         header: ItemHeader,
         x: f32,
@@ -268,7 +279,7 @@ pub const DisplayItem = union(enum) {
         seed: u8 = 0,
         radius: [4]f32 = .{ 0, 0, 0, 0 },
     },
-    /// Inset Shadow 内阴影
+    /// Inset Shadow inner shadow
     inset_shadow_rect: struct {
         header: ItemHeader,
         x: f32,
@@ -282,7 +293,7 @@ pub const DisplayItem = union(enum) {
         offset_y: f32 = 0,
         radius: [4]f32 = .{ 0, 0, 0, 0 },
     },
-    /// 双外阴影
+    /// Double outer shadow
     shadow_dual_rect: struct {
         header: ItemHeader,
         x: f32,
@@ -300,27 +311,27 @@ pub const DisplayItem = union(enum) {
         shadow2_offset_y: f32 = 0,
         radius: [4]f32 = .{ 0, 0, 0, 0 },
     },
-    /// 矢量路径填充（局部坐标，offset 相对节点左上角）
+    /// Vector path fill (local coordinates, offset relative to node top-left)
     fill_path: struct {
         header: ItemHeader,
-        /// PathGeometry 生命周期由调用方（scene runtime）管理
+        /// PathGeometry lifetime managed by caller (scene runtime)
         geometry: *const types.PathGeometry,
         color: Color,
         offset_x: f32 = 0,
         offset_y: f32 = 0,
         opacity: f32 = 1.0,
-        /// 渐变填充（可选）。`gradient_direction == 0` 即纯色走 `color`。
-        /// 逐顶点着色由 path_renderer 完成（GPU 侧 PathVertex.color 早已支持），
-        /// 多边形（三角/星形）的渐变填充靠这条，否则只能退化成纯色。
+        /// Optional gradient fill. `gradient_direction == 0` means pure color via `color`.
+        /// Per-vertex coloring done by path_renderer (GPU PathVertex.color already supported),
+        /// polygon gradient fill (triangle/star) via this, else degrades to pure color.
         gradient_direction: u8 = 0,
-        gradient_stop_colors: [16]Color = [_]Color{Color.rgba(0, 0, 0, 0)} ** 16,
-        gradient_stop_positions: [16]f32 = [_]f32{0} ** 16,
+        gradient_stop_colors: [16]Color = @as([16]Color, @splat(Color.rgba(0, 0, 0, 0))),
+        gradient_stop_positions: [16]f32 = @as([16]f32, @splat(0)),
         gradient_stop_count: u8 = 0,
         gradient_center_x: f32 = 0.5,
         gradient_center_y: f32 = 0.5,
         gradient_start_angle: f32 = 0,
     },
-    /// 矢量路径描边（局部坐标，offset 相对节点左上角）
+    /// Vector path stroke (local coordinates, offset relative to node top-left)
     stroke_path: struct {
         header: ItemHeader,
         geometry: *const types.PathGeometry,
@@ -332,9 +343,9 @@ pub const DisplayItem = union(enum) {
         opacity: f32 = 1.0,
     },
 
-    // ─── Effect/clip 字面 token variant ───
-    // Effect bridge tokens are already lowered to the active content frame.
-    // Node-owned push_clip is the exception: node_local requests the same
+    // ─── Effect/clip literal token variant ───
+    // Effect bridge tokens already lowered to active content frame.
+    // Node-owned push_clip is exception: node_local requests same
     // property-tree/replay transform as paint items before encoder dispatch.
 
     push_clip: struct {
@@ -360,8 +371,9 @@ pub const DisplayItem = union(enum) {
         w: f32,
         h: f32,
         opacity: f32,
-        /// Stage 3 rounded-clip fold: 同节点 rounded_clip 合并进 opacity layer 时
-        /// 由 composite blit 施加的圆角 mask 半径（0 = 无圆角，语义同 begin_blur_layer）。
+        /// Stage 3 rounded-clip fold: when same-node rounded_clip folds into opacity layer, rounded
+        /// mask radius applied by composite blit (0 = no radius, semantics same as
+        /// begin_blur_layer).
         corner_radius: f32 = 0,
         rotate: f32 = 0,
         draw_x: f32 = std.math.nan(f32),
@@ -371,15 +383,21 @@ pub const DisplayItem = union(enum) {
         use_draw_transform: bool = false,
         draw_transform: types.Transform2D = types.Transform2D.identity(),
         blend_mode: types.BlendMode = .normal,
-        /// GPU retained 合成的缓存键（Stage 1 起）。
+        /// Lens warp of the layer surface at composite (see types.ContentWarp; {cap, edge,
+        /// fade_start, fade_width} logical px; all zero = none).
+        warp: [4]f32 = .{ 0, 0, 0, 0 },
+        /// GPU retained composite cache key.
         ///
-        /// `surface_stable_id` = 该 layer 的跨帧稳定身份（retained LayerId 的
-        /// packed raw，含 generation ABA 防护）；`surface_content_version` =
-        /// 内容版本，内容变一次涨一次。encoder 侧据此判断"同一个 layer 且内容
-        /// 没变" -> 可以直接复用上一帧光栅化好的离屏纹理，跳过内容 pass。
+        /// `surface_stable_id` = this layer's cross-frame stable identity (packed raw of retained
+        /// LayerId,
+        /// includes generation ABA guard); `surface_content_version` = content version, incremented
+        /// once
+        /// per content change. Encoder: same layer and unchanged content -> reuse last frame's
+        /// rasterized offscreen texture and skip the content pass.
         ///
-        /// INVALID(= std.math.maxInt(u32)) 表示本 layer 不参与 GPU retained
-        /// （非 promoted / 无稳定身份），encoder 必须每帧重画，这是安全默认值。
+        /// INVALID (= std.math.maxInt(u32)) means the layer doesn't participate in GPU retained
+        /// (non-promoted / no stable identity); the encoder must repaint every frame (safe
+        /// default).
         surface_stable_id: u32 = INVALID_SURFACE_ID,
         surface_content_version: u32 = 0,
     },
@@ -394,7 +412,10 @@ pub const DisplayItem = union(enum) {
         w: f32,
         h: f32,
         corner_radius: f32 = 0,
-        /// glass 拥有者 node id（亮度区域槽的稳定 key；header 是 CONTROL 不携带）
+        /// Four-corner radii TL/TR/BR/BL (x<0 = uniform corner_radius): ConcentricRectangle glass's
+        /// corners differ
+        corner_radii: [4]f32 = .{ -1, -1, -1, -1 },
+        /// glass owner node id (stable key for luminance region slot; header is CONTROL without it)
         owner_node: u32 = std.math.maxInt(u32),
         glass: types.ResolvedGlassParams = .{},
         rotate: f32 = 0,
@@ -428,20 +449,20 @@ pub const DisplayItem = union(enum) {
         header: ItemHeader,
     },
 
-    /// 返回所有变体共有的 ItemHeader（消灭调用方的重复 switch）
+    /// Return common ItemHeader of all variants (eliminate caller's switch repetition)
     pub fn header(self: DisplayItem) ItemHeader {
         return switch (self) {
             inline else => |it| it.header,
         };
     }
 
-    /// 可变 header 访问：跨帧缓存 splice 时按 node_id 把写入帧的帧内序号
-    /// (transform/clip/effect_id) 改写为本帧值（见 render_engine
-    /// rewriteSplicedItemHeaders）。
-    /// 控制类 item（层 begin/end、push/pop clip）：只做分组/状态切换，不含几何。
-    /// 起 scroll-clip token 带的是**真实 header**（node_id = 发它的节点），
-    /// 凡按 node_id 归属"子树内容"的扫描（bulk quad 插入点、z 归并）都必须跳过它们，
-    /// 否则 token 会被当成该节点的最后一条内容。
+    /// Mutable header access: cross-frame cache splice rewrites frame-local
+    /// transform/clip/effect_id to this frame's values by node_id (see render_engine
+    /// rewriteSplicedItemHeaders).
+    /// Control items (layer begin/end, push/pop clip) only group/toggle state, no geometry.
+    /// The scroll-clip token carries a **real header** (node_id = the node that sent it); any scan
+    /// by node_id attributing "child subtree content" must skip it, else the token is treated as
+    /// that node's last content.
     pub fn isControl(self: DisplayItem) bool {
         return switch (self) {
             .begin_opacity_layer,
@@ -477,7 +498,7 @@ pub const DisplayList = struct {
     pub fn init(allocator: Allocator) DisplayList {
         return .{
             .allocator = allocator,
-            .items = .{},
+            .items = .empty,
             .payload_arena = std.heap.ArenaAllocator.init(allocator),
         };
     }
@@ -536,11 +557,14 @@ pub fn resolveTextRunContent(
 ) []const u8 {
     if (run.blob_id != INVALID_ID) {
         if (blob_store.get(run.blob_id)) |blob| {
-            // ⚠️ 身份校验：blob_id 是帧内序号，store 每帧 clear 后重新分配。
-            // 跨帧存活的 item（replay/cache 路径）拿着旧序号，可能落在别的
-            // 控件本帧新建的 blob 上，不校验就会按自己的偏移切别人的字节
-            // （实测：终端行画出状态栏 "plaintext" 的切片 "plainte"）。
-            // hash 不匹配说明这个序号已经易主，退回 item 自带的 content。
+            // WARNING: identity check: blob_id is a frame-local sequence number; the store is
+            // cleared and
+            // re-allocated each frame. A persisted item (replay/cache path) holds an old number
+            // that may land
+            // on another widget's new blob this frame; unchecked, it would slice by its own offset
+            // into
+            // others' bytes (e.g. terminal state bar "plaintext" drawn as "plainte").
+            // Hash mismatch signals the number changed owners; fall back to the item's own content.
             const identity_ok = run.blob_content_hash == 0 or
                 run.blob_content_hash == blob.content_hash;
             if (identity_ok and
@@ -555,17 +579,19 @@ pub fn resolveTextRunContent(
 }
 
 test "resolveTextRunContent: blob_id 易主时回退到 item 自带文本" {
-    // 回归：blob_id 是**帧内序号**，text_blob_store 每帧 clear 后重新分配。
-    // 跨帧存活的 item（replay / 命令缓存）拿着旧序号，可能落在别的控件
-    // 本帧新建的 blob 上，不校验身份就会按自己的字节偏移去切别人的字节。
+    // Regression: blob_id is a **frame-local sequence number**; text_blob_store is cleared and
+    // re-allocated each frame. A persisted item (replay / command cache) holds an old number that
+    // may
+    // land on another widget's new blob this frame; without an identity check it slices by its own
+    // byte offset into others' bytes.
     //
-    // 实测线上表现：终端行画出状态栏 "plaintext" 的切片 "plainte"、
-    // 编辑器 tab 名 "hello.txt" 的切片 "hello.t"（截图实证）。
+    // Symptoms: terminal state bar "plaintext" drawn as "plainte", editor tab name "hello.txt"
+    // drawn as "hello.t".
     const testing = std.testing;
     var store = text_blob_mod.BlobStore.init(testing.allocator);
     defer store.deinit();
 
-    // 本帧 0 号 blob 属于状态栏
+    // This frame's 0th blob belongs to status bar
     var other = text_blob_mod.TextLayoutBlob{
         .style_key = .{ .font_size = 13, .font_weight = 400, .line_height = 1.35 },
         .content_hash = std.hash.Wyhash.hash(0, "plaintext"),
@@ -575,7 +601,7 @@ test "resolveTextRunContent: blob_id 易主时回退到 item 自带文本" {
     other.lines[0] = .{ .byte_start = 0, .byte_end = 9, .width = 70 };
     const other_id = try store.append(other);
 
-    // 上一帧的终端行 item：同样指向 0 号，但内容 hash 是自己的
+    // Last frame's terminal-line item: also points to 0th, but content hash is its own
     const stale_run = TextRunItem{
         .header = .{ .transform_id = 0, .node_id = 0 },
         .x = 0,
@@ -589,10 +615,11 @@ test "resolveTextRunContent: blob_id 易主时回退到 item 自带文本" {
         .blob_content_hash = std.hash.Wyhash.hash(0, "(base) "),
     };
 
-    // 必须识破并回退，而不是切出 "plainte"
+    // Must detect and fall back, not draw 'plainte'
     try testing.expectEqualStrings("(base) ", resolveTextRunContent(&store, stale_run));
 
-    // 同一序号、hash 匹配时仍走 blob 间接路径（不能因为加校验就退化）
+    // Same sequence number, hash match, still use blob indirect path (can't degrade just because we
+    // added validation)
     const live_run = TextRunItem{
         .header = .{ .transform_id = 0, .node_id = 0 },
         .x = 0,
@@ -609,16 +636,17 @@ test "resolveTextRunContent: blob_id 易主时回退到 item 自带文本" {
 }
 
 test "resolveTextRunContent: 漏传 blob_content_hash 会让身份校验退化成永真" {
-    // 回归（下游编辑器状态栏 "3 × 4" -> "4 × 5" 画成 "4 × 4"）：
-    // display_list_lowering 的 re-lower 分支逐字段重建 TextRunItem 时，曾经
-    // 只抄 blob_id 而**漏抄 blob_content_hash**。漏抄后该字段取默认 0，
-    // resolveTextRunContent 的 `run.blob_content_hash == 0` 短路把身份校验
-    // 变成永真，item 拿着上一帧的帧内序号，去切本帧**别的 blob** 的字节。
+    // Regression (downstream editor status bar '3 × 4' -> '4 × 5' draws as '4 × 4'):
+    // display_list_lowering's re-lower branch rebuilding TextRunItem field-by-field, only copied
+    // blob_id but **omitted blob_content_hash**. Omit makes field default 0,
+    // resolveTextRunContent's `run.blob_content_hash == 0` short-circuits identity check into
+    // always-true, item with last-frame frame-local sequence number cuts **another blob's** bytes
+    // this frame.
     //
-    // 这个测试用「同序号 + 不同内容」的构造把两种取值摆在一起：带 hash 的
-    // 必须识破并回退到自带文本，hash=0 的则会取到冒名 blob 的字节。后者正是
-    // 漏抄字段时的实际行为，钉住它是为了让任何新增的 re-lower 站点若忘记
-    // 成对透传，就在这里失败而不是在用户的屏幕上。
+    // This test uses 'same sequence + different content' construction to lay out both values:
+    // hashed must detect and fall back to own text, hash=0 does take imposter blob's bytes. Latter
+    // is actual behavior when field omitted, pinning it makes any new re-lower site failing here
+    // rather than on user's screen if it forgets paired forwarding.
     const testing = std.testing;
     var store = text_blob_mod.BlobStore.init(testing.allocator);
     defer store.deinit();
@@ -644,11 +672,13 @@ test "resolveTextRunContent: 漏传 blob_content_hash 会让身份校验退化�
         .blob_id = impostor_id,
     };
 
-    // 正确透传：hash 不匹配 -> 识破易主，回退到 item 自带的本帧文本。
+    // Correct passthrough: hash mismatch -> detect ownership change, fall back to item's own
+    // current-frame text.
     var carried = base;
     carried.blob_content_hash = std.hash.Wyhash.hash(0, "4 \xc3\x97 5");
     try testing.expectEqualStrings("4 \xc3\x97 5", resolveTextRunContent(&store, carried));
 
-    // 漏传（=0）：校验被短路，切到冒名 blob 的字节，正是屏幕上的陈旧字形。
+    // Omitted (=0): validation bypassed, cuts into imposter blob's bytes—exactly the stale glyphs
+    // on screen.
     try testing.expectEqualStrings("3 \xc3\x97 4", resolveTextRunContent(&store, base));
 }

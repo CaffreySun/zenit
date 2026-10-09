@@ -10,9 +10,9 @@ test "real native queue checked allocation preserves head metadata and all UTF8 
         const ptr = zenit_test_text_window_create() orelse return error.OutOfMemory;
         defer zenit_test_text_window_destroy(ptr);
         var window: Window = .{ .window_ptr = ptr, .view_ptr = undefined, .width = 0, .height = 0 };
-        const text = "漢" ** 2000 ++ "\x00tail";
-        const first_seq = zenit_test_text_enqueue(ptr, @intFromEnum(kind), text.ptr, text.len, 2005);
-        const second_seq = zenit_test_text_enqueue(ptr, @intFromEnum(kind), "tail".ptr, 4, 4);
+        const text = (@as([("漢").len * (2000)]u8, @bitCast(@as([2000][("漢").len]u8, @splat(("漢").*)))) ++ "") ++ "\x00tail";
+        const first_seq = zenit_test_text_enqueue(ptr, @backingInt(kind), text.ptr, text.len, 2005);
+        const second_seq = zenit_test_text_enqueue(ptr, @backingInt(kind), "tail".ptr, 4, 4);
         var failing = t.FailingAllocator.init(t.allocator, .{ .fail_index = 0 });
         try t.expectError(error.OutOfMemory, window.readTextEventAllocChecked(failing.allocator(), kind));
         failing.fail_index = std.math.maxInt(usize);

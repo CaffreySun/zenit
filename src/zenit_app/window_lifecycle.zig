@@ -10,9 +10,9 @@ pub const WindowId = u64;
 pub const MAX_WINDOWS: usize = 16;
 
 pub const State = struct {
-    ids: [MAX_WINDOWS]WindowId = [_]WindowId{0} ** MAX_WINDOWS,
+    ids: [MAX_WINDOWS]WindowId = @as([MAX_WINDOWS]WindowId, @splat(0)),
     len: usize = 0,
-    pending_close: [MAX_WINDOWS]WindowId = [_]WindowId{0} ** MAX_WINDOWS,
+    pending_close: [MAX_WINDOWS]WindowId = @as([MAX_WINDOWS]WindowId, @splat(0)),
     pending_close_len: usize = 0,
     active_window_id: ?WindowId = null,
     quit_requested: bool = false,

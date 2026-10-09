@@ -1,10 +1,10 @@
-/// macOS .app bundle 构建 helper
+/// macOS .app bundle build helper
 ///
-/// 调用方（任意 build.zig）：
+/// Caller (any build.zig):
 ///
 ///   const macos_bundle = @import("system_sdk/bundle/macos_app.zig");
 ///
-///   // 1) 装 .app（开发期 ad-hoc 签名）
+///   // 1) bundle .app (dev ad-hoc signing)
 ///   const result = macos_bundle.bundleApp(b, .{
 ///       .exe = my_exe,
 ///       .display_name = "My App",
@@ -12,7 +12,7 @@
 ///       .signing = .ad_hoc,
 ///   });
 ///
-///   // 2) 分发版（Developer ID 签 + entitlements + hardened runtime）
+///   // 2) distribution release (Developer ID signature + entitlements + hardened runtime)
 ///   _ = macos_bundle.bundleApp(b, .{
 ///       .exe = my_exe,
 ///       .display_name = "My App",
@@ -23,105 +23,107 @@
 ///       }},
 ///   });
 ///
-///   // 3) 公证（独立 step，因为是网络 + 几分钟的事，不该堵在 build 主路径上）
+///   // 3) notarization (separate step: network operation, minutes; shouldn't block the main build)
 ///   const notarize_step = macos_bundle.notarizeBundle(b, .{
 ///       .bundle_path = result.bundle_path,
-///       .keychain_profile = "AC_PASSWORD",  // 见 notarytool store-credentials
+///       .keychain_profile = "AC_PASSWORD",  // see notarytool store-credentials
 ///   });
 ///   notarize_step.dependOn(result.final_step);
 ///   _ = b.step("notarize", "Submit .app to Apple notarization service")
 ///       .dependOn(notarize_step);
 ///
-/// 产物路径：<install_path>/<display_name>.app
+/// Output path: <install_path>/<display_name>.app
 const std = @import("std");
 const info_plist_mod = @import("info_plist.zig");
 
 pub const FileType = info_plist_mod.FileType;
 
-/// 资源拷贝项，src 是源文件，dst 是 Resources/ 内的相对路径
+/// Resource copy item, src is source file, dst is relative path in Resources/.
 pub const ResourceCopy = struct {
     src: std.Build.LazyPath,
-    /// 相对于 bundle 的 Contents/Resources/ 目录。
-    /// 例如 dst = "fonts/Inter.ttf" -> Contents/Resources/fonts/Inter.ttf
+    /// Relative to bundle's Contents/Resources/ directory. Example: dst = "fonts/Inter.ttf" ->
+    /// Contents/Resources/fonts/Inter.ttf.
     dst: []const u8,
 };
 
-/// Developer ID 签名配置，用于分发到外部用户。
-/// 签名后的 .app 还需要走 notarizeBundle() 经过 Apple 公证才能默认免警告打开。
+/// Developer ID signing config for distribution to external users. Signed .app must also go through
+/// notarizeBundle() for Apple notarization to open without warning by default.
 pub const DeveloperIdSigning = struct {
-    /// `codesign --sign` 接受的标识。可以是：
-    ///   - 完整字符串："Developer ID Application: ACME Corp (TEAM12345)"
-    ///   - Team ID："TEAM12345"（codesign 自动选最匹配证书）
-    ///   - 证书 SHA-1：40 位 hex
-    /// 使用前须确保本机 keychain 里有该证书 + 私钥。
+    /// Identifier accepted by `codesign --sign`. Can be:
+    ///   - Full string: "Developer ID Application: ACME Corp (TEAM12345)"
+    ///   - Team ID: "TEAM12345" (codesign auto-selects best matching cert)
+    ///   - Cert SHA-1: 40 hex digits
+    /// The keychain must hold this cert + private key.
     identity: []const u8,
-    /// Entitlements .plist 路径。如果开了 hardened runtime，
-    /// 通常需要至少声明 com.apple.security.cs.* 系列 entitlements。
-    /// null = 不传 --entitlements 参数（仅适合极简场景）。
+    /// Entitlements .plist path. If hardened runtime enabled, typically need at least
+    /// com.apple.security.cs.* entitlements.
+    /// null = omit --entitlements parameter (minimal scenarios only).
     entitlements: ?std.Build.LazyPath = null,
-    /// 启用 hardened runtime, Apple 公证强制要求。默认 true。
+    /// Enable hardened runtime, required by Apple notarization. Default true.
     hardened_runtime: bool = true,
-    /// 加 secure timestamp, Apple 公证强制要求。默认 true。
-    /// 需要 codesign 进程能联网。CI 离线时关掉这个，但产物就过不了 notarize。
+    /// Add secure timestamp, required by Apple notarization. Requires codesign process internet
+    /// access. Disable for offline CI, but artifact won't pass notarize.
     timestamp: bool = true,
-    /// 是否在 codesign 时加 --deep（递归签 Frameworks/ Plugins/ 等）。默认 true。
-    /// 注意：Apple 已经标记 --deep 为 deprecated，但对 zenit 这种简单 .app
-    /// 没有嵌套 framework 的情况依然好使。
+    /// Add --deep to codesign (recursively sign Frameworks/ Plugins/). Default true. Note: Apple
+    /// marked --deep deprecated, but works for simple .apps like zenit without nested frameworks.
     deep: bool = true,
 };
 
 pub const Signing = union(enum) {
-    /// 不签名，产物会被 macOS Gatekeeper 拦。
+    /// No signing, artifact blocked by macOS Gatekeeper.
     none,
-    /// Ad-hoc 签名，开发期常用。本机能跑；分发到别人电脑上仍会被 Gatekeeper 拦
-    /// 除非用户右键 Open。`codesign --sign -`
+    /// Ad-hoc signing, common during development. Runs locally; distributed to other machines still
+    /// blocked by Gatekeeper unless user right-click Open. `codesign --sign -`
     ad_hoc,
-    /// Developer ID 签名，用于分发到外部用户。需要 Apple Developer 账号 + keychain 里有证书。
-    /// 仍需走 notarizeBundle() 公证才能默认免警告打开。
+    /// Developer ID signing for distribution to external users. Requires Apple Developer account +
+    /// certificate in keychain. Still needs notarizeBundle() notarization to open without warning
+    /// by default.
     developer_id: DeveloperIdSigning,
 };
 
 pub const BundleSpec = struct {
-    /// 已构建好的可执行文件，bundleApp 会把它装到 Contents/MacOS/<executable>
+    /// Built executable, bundleApp places it at Contents/MacOS/<executable>.
     exe: *std.Build.Step.Compile,
-    /// 应用显示名（会决定 .app 目录名 + Info.plist 的 CFBundle{Display,}Name）
+    /// App display name (determines .app directory name + CFBundle{Display,}Name in Info.plist).
     display_name: []const u8,
-    /// 反向 DNS bundle id
+    /// Reverse DNS bundle id.
     bundle_id: []const u8,
-    /// .app/Contents/MacOS/<executable> 的文件名。默认等于 exe.name。
+    /// Filename for .app/Contents/MacOS/<executable>. Default equals exe.name.
     executable: ?[]const u8 = null,
     version: []const u8 = "0.1.0",
-    /// 4 字符 OSType。决定 PkgInfo 内容 "APPL<signature>" 和 CFBundleSignature。
-    /// 默认 "????"，无 signature 是合法的。
+    /// 4-char OSType. Determines PkgInfo content "APPL<signature>" and CFBundleSignature. Default
+    /// "????", no signature is valid.
     signature: []const u8 = "????",
     min_macos: []const u8 = "12.0",
-    /// 图标文件（.icns）。可选，不传则不带图标（使用系统默认）。
+    /// Icon file (.icns). Optional, omit for no icon (system default).
     icon: ?std.Build.LazyPath = null,
     category: []const u8 = "public.app-category.utilities",
     copyright: ?[]const u8 = null,
-    /// 文件类型注册（CFBundleDocumentTypes + UT*TypeDeclarations）
+    /// File type registration (CFBundleDocumentTypes + UT*TypeDeclarations).
     file_types: []const FileType = &.{},
-    /// 额外资源（字体、图片等），都装到 Contents/Resources/<dst>
+    /// Additional resources (fonts, images, etc), placed at Contents/Resources/<dst>.
     resources: []const ResourceCopy = &.{},
-    /// NSAppTransportSecurity.NSAllowsArbitraryLoads，默认 false
+    /// NSAppTransportSecurity.NSAllowsArbitraryLoads, default false.
     allow_arbitrary_loads: bool = false,
     disable_min_frame_duration: bool = true,
     auto_graphics_switching: bool = true,
     high_resolution: bool = true,
-    /// 签名策略
+    /// Signing policy.
     signing: Signing = .ad_hoc,
-    /// 是否清理 quarantine 属性。开发期建议 true（避免 LaunchServices 拒绝资源）。
+    /// Clear quarantine attribute. Recommended true during development (prevents LaunchServices
+    /// rejection).
     clear_quarantine: bool = true,
 };
 
 pub const BundleResult = struct {
-    /// 最终 step（用户用 `app_step.dependOn(result.final_step)` 把 bundle 接入自己的 build graph）
+    /// Final step (user connects bundle to own build graph with
+    /// `app_step.dependOn(result.final_step)`).
     final_step: *std.Build.Step,
-    /// .app 目录绝对路径（用于后续的额外步骤，如 dmg 打包 / notarize）
-    bundle_path: []const u8,
+    /// .app directory absolute path (for follow-up steps like dmg packaging / notarize).
+    bundle_path: std.Build.LazyPath,
 };
 
-/// 主入口，构建一个 macOS .app bundle，返回最终 step。
+/// Main entry, build macOS .app bundle, return final step.
 pub fn bundleApp(b: *std.Build, spec: BundleSpec) BundleResult {
     const exe_name = spec.executable orelse spec.exe.name;
     const bundle_dirname = b.fmt("{s}.app", .{spec.display_name});
@@ -129,12 +131,12 @@ pub fn bundleApp(b: *std.Build, spec: BundleSpec) BundleResult {
     const macos_rel = b.fmt("{s}/MacOS", .{contents_rel});
     const resources_rel = b.fmt("{s}/Resources", .{contents_rel});
 
-    // 1) 装 exe 到 Contents/MacOS/<executable>
+    // 1) Place exe at Contents/MacOS/<executable>.
     const install_exe = b.addInstallArtifact(spec.exe, .{
         .dest_dir = .{ .override = .{ .custom = macos_rel } },
     });
 
-    // 2) 渲染 Info.plist
+    // 2) Render Info.plist.
     const plist_xml = info_plist_mod.render(b.allocator, .{
         .display_name = spec.display_name,
         .bundle_id = spec.bundle_id,
@@ -156,14 +158,14 @@ pub fn bundleApp(b: *std.Build, spec: BundleSpec) BundleResult {
     const plist_path = plist_wf.add("Info.plist", plist_xml);
     const install_plist = b.addInstallFile(plist_path, b.fmt("{s}/Info.plist", .{contents_rel}));
 
-    // 3) PkgInfo（8 字节："APPL" + 4字符 signature）
+    // 3) PkgInfo (8 bytes: "APPL" + 4-char signature).
     const pkginfo_content = b.fmt("APPL{s}", .{spec.signature});
     const pkginfo_wf = b.addWriteFiles();
     const pkginfo_path = pkginfo_wf.add("PkgInfo", pkginfo_content);
     const install_pkginfo = b.addInstallFile(pkginfo_path, b.fmt("{s}/PkgInfo", .{contents_rel}));
 
-    // 4) 图标（如果有）
-    var resource_steps = std.ArrayList(*std.Build.Step){};
+    // 4) Icon (if present).
+    var resource_steps: std.ArrayList(*std.Build.Step) = .empty;
     resource_steps.append(b.allocator, &install_exe.step) catch @panic("OOM");
     resource_steps.append(b.allocator, &install_plist.step) catch @panic("OOM");
     resource_steps.append(b.allocator, &install_pkginfo.step) catch @panic("OOM");
@@ -177,7 +179,7 @@ pub fn bundleApp(b: *std.Build, spec: BundleSpec) BundleResult {
         resource_steps.append(b.allocator, &install_icon.step) catch @panic("OOM");
     }
 
-    // 5) 额外资源
+    // 5) Additional resources.
     for (spec.resources) |res| {
         const install_res = b.addInstallFile(
             res.src,
@@ -186,23 +188,17 @@ pub fn bundleApp(b: *std.Build, spec: BundleSpec) BundleResult {
         resource_steps.append(b.allocator, &install_res.step) catch @panic("OOM");
     }
 
-    const bundle_abs = b.fmt("{s}/{s}", .{ b.install_path, bundle_dirname });
+    const bundle_abs: std.Build.LazyPath = .{ .relative = .{ .base = .install_prefix, .sub_path = bundle_dirname } };
 
     var last_step: *std.Build.Step = blk: {
-        const agg = b.allocator.create(std.Build.Step) catch @panic("OOM");
-        agg.* = std.Build.Step.init(.{
-            .id = .custom,
-            .name = b.fmt("bundle-installs-{s}", .{spec.display_name}),
-            .owner = b,
-            .makeFn = noopMake,
-        });
+        const agg = b.step(b.fmt("bundle-installs-{s}", .{spec.display_name}), "Install application bundle resources");
         for (resource_steps.items) |s| agg.dependOn(s);
         break :blk agg;
     };
 
     if (spec.clear_quarantine) {
         const xattr = b.addSystemCommand(&.{ "xattr", "-dr", "com.apple.quarantine" });
-        xattr.addArg(bundle_abs);
+        xattr.addDirectoryArg2(bundle_abs, .{});
         xattr.step.dependOn(last_step);
         last_step = &xattr.step;
     }
@@ -211,7 +207,7 @@ pub fn bundleApp(b: *std.Build, spec: BundleSpec) BundleResult {
         .none => {},
         .ad_hoc => {
             const codesign = b.addSystemCommand(&.{ "codesign", "--force", "--sign", "-", "--deep" });
-            codesign.addArg(bundle_abs);
+            codesign.addDirectoryArg2(bundle_abs, .{});
             codesign.step.dependOn(last_step);
             last_step = &codesign.step;
         },
@@ -228,7 +224,7 @@ pub fn bundleApp(b: *std.Build, spec: BundleSpec) BundleResult {
                 codesign.addArg("--entitlements");
                 codesign.addFileArg(ent);
             }
-            codesign.addArg(bundle_abs);
+            codesign.addDirectoryArg2(bundle_abs, .{});
             codesign.step.dependOn(last_step);
             last_step = &codesign.step;
         },
@@ -244,15 +240,14 @@ pub fn bundleApp(b: *std.Build, spec: BundleSpec) BundleResult {
 // Notarization
 // ============================================================================
 
-/// 公证认证方式，必须二选一。
+/// Notarization auth method, choose one.
 pub const NotaryAuth = union(enum) {
-    /// 推荐，用 `xcrun notarytool store-credentials <profile> --apple-id ... --team-id ...
-    ///                                                       --password <app_specific_pwd>`
-    /// 把凭据存进 keychain 后，这里只引用 profile name。
+    /// Recommended: store credentials in the keychain once with `xcrun notarytool
+    /// store-credentials <profile> --apple-id ... --team-id ... --password <app_specific_pwd>`,
+    /// then only reference the profile name here.
     keychain_profile: []const u8,
-    /// 直接传 Apple ID + team ID + app-specific password。
-    /// **不推荐**，密码在命令行里裸奔，会被 ps / shell history 抓到。CI 时考虑把
-    /// password 放环境变量然后从那里读。
+    /// Pass Apple ID + team ID + app-specific password directly. **Not recommended**, password
+    /// exposed in command line, captured by ps / shell history. For CI, consider env var.
     inline_credentials: struct {
         apple_id: []const u8,
         team_id: []const u8,
@@ -261,44 +256,41 @@ pub const NotaryAuth = union(enum) {
 };
 
 pub const NotarizeSpec = struct {
-    /// 来自 bundleApp 返回的 BundleResult.bundle_path
-    bundle_path: []const u8,
-    /// 产出「已签名、可提交」的那个 step，通常是 bundleApp 的 final_step，
-    /// 或调用方在其之后自己接的重签 step。
-    ///
-    /// **必须传**，否则 zip 与签名之间没有依赖边：Zig 可以在签名完成前就打包，
-    /// 也可以在 staple 之后重新跑一次签名，把票据连同签名一起覆盖掉。
-    /// 症状是 staple 报 `Record not found`，公证明明 Accepted，
-    /// 但磁盘上那份 app 的 cdhash 已经和上传时不是同一个了。
-    /// （只把 notarizeBundle 的返回 step dependOn 签名步骤是不够的：
-    /// 那只约束了链尾，管不住链首的 zip。）
+    /// From bundleApp return's BundleResult.bundle_path.
+    bundle_path: std.Build.LazyPath,
+    /// Step producing 'signed, submittable' output, usually bundleApp's final_step or custom
+    /// re-sign step after it. **Must pass**, otherwise no dependency between zip and signing: Zig
+    /// can zip before signing finishes, or re-sign after staple, overwriting ticket with signature.
+    /// Symptom: staple reports `Record not found`, notarization says Accepted, but disk app's
+    /// cdhash changed since upload. (Just making notarizeBundle's return step dependOn signing step
+    /// is insufficient: only constrains chain tail, can't control chain head zip.)
     depends_on: ?*std.Build.Step = null,
-    /// Apple Developer 账号凭据
+    /// Apple Developer account credentials.
     auth: NotaryAuth,
-    /// 公证完成后是否 staple 票据进 .app（这样离线分发也能验证）。默认 true。
+    /// Staple ticket into .app after notarization (enables offline distribution verification).
+    /// Default true.
     staple: bool = true,
-    /// notarytool submit 默认是异步的。这里强制 --wait（最多 2 小时），
-    /// 失败时 step 会失败。CI 友好。默认 true。
+    /// notarytool submit is async by default. Force --wait here (max 2 hours), step fails on error.
+    /// CI-friendly. Default true.
     wait: bool = true,
 };
 
-/// 提交 .app 到 Apple 公证服务，返回最终 step。
-/// 调用方需要自己挂到 build graph：
+/// Submit .app to Apple notarization service, return final step. Caller must connect to build
+/// graph:
 ///   const step = b.step("notarize", "...");
 ///   step.dependOn(notarizeBundle(b, ...));
-///   notarize_inner_step.dependOn(bundle_result.final_step);  // 先 bundle 再 notarize
+///   notarize_inner_step.dependOn(bundle_result.final_step);  // bundle first, then notarize
 pub fn notarizeBundle(b: *std.Build, spec: NotarizeSpec) *std.Build.Step {
-    // 1) 把 .app 打成 .zip, Apple notarytool 接 zip 或 dmg/pkg，对裸 .app 不收。
-    const zip_path = b.fmt("{s}.zip", .{spec.bundle_path});
+    // 1) Zip .app, Apple notarytool accepts zip or dmg/pkg, not bare .app.
     const zip_cmd = b.addSystemCommand(&.{ "ditto", "-c", "-k", "--keepParent" });
-    zip_cmd.addArg(spec.bundle_path);
-    zip_cmd.addArg(zip_path);
-    // 打包必须排在签名之后，见 NotarizeSpec.depends_on。
+    zip_cmd.addDirectoryArg2(spec.bundle_path, .{});
+    const zip_path = zip_cmd.addOutputFileArg("bundle.zip");
+    // Zipping must happen after signing, see NotarizeSpec.depends_on.
     if (spec.depends_on) |dep| zip_cmd.step.dependOn(dep);
 
-    // 2) 提交公证
+    // 2) Submit for notarization.
     const submit_cmd = b.addSystemCommand(&.{ "xcrun", "notarytool", "submit" });
-    submit_cmd.addArg(zip_path);
+    submit_cmd.addFileArg(zip_path);
     switch (spec.auth) {
         .keychain_profile => |profile| {
             submit_cmd.addArg("--keychain-profile");
@@ -318,16 +310,16 @@ pub fn notarizeBundle(b: *std.Build, spec: NotarizeSpec) *std.Build.Step {
 
     var last: *std.Build.Step = &submit_cmd.step;
 
-    // 3) Staple 公证票据进 .app
+    // 3) Staple notarization ticket into .app.
     if (spec.staple) {
         const staple_cmd = b.addSystemCommand(&.{ "xcrun", "stapler", "staple" });
-        staple_cmd.addArg(spec.bundle_path);
+        staple_cmd.addDirectoryArg2(spec.bundle_path, .{});
         staple_cmd.step.dependOn(last);
         last = &staple_cmd.step;
 
-        // 验证 staple 成功（spctl 检查 Gatekeeper 视角）
+        // Verify staple success (spctl checks Gatekeeper perspective).
         const verify_cmd = b.addSystemCommand(&.{ "spctl", "--assess", "--verbose=2", "--type", "execute" });
-        verify_cmd.addArg(spec.bundle_path);
+        verify_cmd.addDirectoryArg2(spec.bundle_path, .{});
         verify_cmd.step.dependOn(last);
         last = &verify_cmd.step;
     }
@@ -335,16 +327,18 @@ pub fn notarizeBundle(b: *std.Build, spec: NotarizeSpec) *std.Build.Step {
     return last;
 }
 
-fn noopMake(_: *std.Build.Step, _: std.Build.Step.MakeOptions) anyerror!void {}
-
-/// 从 LazyPath 抽出文件名（"icon.icns" 等）。仅支持 b.path() 形态。
+/// Extract filename from LazyPath ("icon.icns" etc). Only supports b.path() form.
 fn iconBasename(b: *std.Build, lp: std.Build.LazyPath) []const u8 {
-    const full = lp.getPath2(b, null);
+    _ = b;
+    const full = switch (lp) {
+        .src_path => |sp| sp.sub_path,
+        else => @panic("bundle icon must use b.path()"),
+    };
     const slash = std.mem.lastIndexOfScalar(u8, full, '/');
     return if (slash) |i| full[i + 1 ..] else full;
 }
 
-/// 抽出图标文件名（不含扩展），用于 CFBundleIconFile。
+/// Extract icon filename (without extension) for CFBundleIconFile.
 fn iconStem(b: *std.Build, lp: std.Build.LazyPath) []const u8 {
     const base = iconBasename(b, lp);
     const dot = std.mem.lastIndexOfScalar(u8, base, '.');

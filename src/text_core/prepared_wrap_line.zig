@@ -17,8 +17,8 @@ pub const Segment = struct {
 
 pub const PreparedWrapLine = struct {
     segments: []Segment,
-    /// u32：u16 上限 65535，超长单行（~64K 码点）会让 @intCast 在
-    /// Debug/ReleaseSafe panic、ReleaseFast UB（静默截断后切片越界）
+    /// u32: u16 max 65535, overlong single line (~64K codepoints) causes @intCast
+    /// panic in Debug/ReleaseSafe, UB in ReleaseFast (silent truncation then slice out-of-bounds)
     segment_count: u32,
     content_hash: u64,
 
@@ -36,7 +36,7 @@ pub const PreparedWrapLine = struct {
 
         var stack_breaks: [256]u32 = undefined;
         var stack_count: usize = 0;
-        var heap_breaks: std.ArrayListUnmanaged(u32) = .{};
+        var heap_breaks: std.ArrayListUnmanaged(u32) = .empty;
         var use_heap = false;
         defer if (use_heap) heap_breaks.deinit(allocator);
 
@@ -105,7 +105,7 @@ pub const PreparedWrapLine = struct {
 
 pub const Builder = struct {
     allocator: Allocator,
-    segments: std.ArrayListUnmanaged(Segment) = .{},
+    segments: std.ArrayListUnmanaged(Segment) = .empty,
     content_hasher: std.hash.Wyhash = std.hash.Wyhash.init(0),
     pending_kind: enum { none, spaces } = .none,
     pending_start: usize = 0,
@@ -190,7 +190,7 @@ pub const Builder = struct {
             .segment_count = seg_count,
             .content_hash = self.content_hasher.final(),
         };
-        self.segments = .{};
+        self.segments = .empty;
         return prepared;
     }
 
@@ -223,7 +223,7 @@ pub fn prepareLine(allocator: Allocator, content: []const u8) !*PreparedWrapLine
         return prepared;
     }
 
-    var segments = std.ArrayListUnmanaged(Segment){};
+    var segments = @as(std.ArrayListUnmanaged(Segment), .empty);
     errdefer segments.deinit(allocator);
 
     var i: usize = 0;
@@ -261,8 +261,8 @@ pub fn prepareLine(allocator: Allocator, content: []const u8) !*PreparedWrapLine
             continue;
         }
 
-        // 按 grapheme cluster 推进：按码点会把 ZWJ emoji/组合字符拆成
-        // 多个独立 segment，每个都可能成为断点（1e2bee4 的遗漏兄弟）
+        // Advance by grapheme cluster: by codepoint splits ZWJ emoji / combining chars into
+        // multiple separate segments, each could become breakpoint (1e2bee4's missed sibling)
         i = grapheme_cursor.next(i);
         try segments.append(allocator, .{
             .byte_end = @intCast(i),

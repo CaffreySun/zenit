@@ -1,9 +1,9 @@
-/// RenderCommandEncoder - UI DisplayItem -> GPU 调用的统一编码器
+/// RenderCommandEncoder - unified encoder from UI DisplayItem to GPU calls.
 ///
-/// 将 UI 框架生成的 lowered DisplayItem 切片高效编码为 SdfRenderer 和
-/// TextRenderer 的批量调用。
+/// Efficiently encodes the lowered DisplayItem slices produced by the UI framework into
+/// SdfRenderer and TextRenderer batch calls.
 ///
-/// 用法:
+/// usage:
 /// ```
 /// var encoder = RenderCommandEncoder.init(&sdf_renderer, &text_renderer);
 /// encoder.beginFrame(width, height, scale);
@@ -13,7 +13,8 @@
 /// ```
 const std = @import("std");
 
-/// 纹理已被释放（陈旧句柄）时只丢这一张图：向上抛会中止整帧编码，这条命令之后的内容全不画。
+/// Stale texture handle: drop this frame only. Throwing would abort frame encoding, losing all
+/// subsequent content.
 pub fn addImageOrSkip(ir: *ImageRenderer, handle: u64, x: f32, y: f32, w: f32, h: f32, tint: [4]f32, corner_radius: f32, opacity: f32, rotate: f32) !void {
     ir.addImageUV(@intCast(handle), x, y, w, h, .{ 0, 0, 1, 1 }, tint, corner_radius, opacity, rotate) catch |err| switch (err) {
         error.UnknownTexture => logUnknownTextureOnce(handle),
@@ -21,7 +22,7 @@ pub fn addImageOrSkip(ir: *ImageRenderer, handle: u64, x: f32, y: f32, w: f32, h
     };
 }
 
-/// 同一个陈旧纹理句柄每帧都会遇到：只在句柄变化时记一次，别刷屏，也别静默。
+/// Same stale handle every frame: log only on change, avoid spam and silence.
 var last_unknown_texture: u64 = 0;
 fn logUnknownTextureOnce(handle: anytype) void {
     const h: u64 = @intCast(handle);
@@ -30,32 +31,35 @@ fn logUnknownTextureOnce(handle: anytype) void {
     std.log.scoped(.command_encoder).warn("image skipped: unknown texture handle {d}", .{h});
 }
 const gpu = @import("gpu");
-// 纯函数簇（damage bounds / 内容指纹 / 结构折叠）已析出，见该文件头部合同说明。
+// Pure function clusters (damage bounds / content fingerprint / struct folding) extracted; see file
+// head contract.
 const paint_fp = @import("command_encoder/paint_fingerprint.zig");
+const retained_plan = @import("command_encoder/retained_plan.zig");
 const lsort = @import("command_encoder/local_sort.zig");
 const wire_types = @import("command_encoder/wire_types.zig");
 const script_detect = @import("command_encoder/script_detect.zig");
 const clip_geometry = @import("command_encoder/clip_geometry.zig");
-// local-sort 簇状态机（2026-08-05 析出）：encoder 内联的嵌套 struct 改为
-// 借用同目录模块，容量常量随之搬走。
+// local-sort cluster state machine extracted: encoder's nested struct now borrows from
+// same-directory module; capacity constants follow.
 const cluster_mod = @import("command_encoder/local_sort_cluster.zig");
 const LocalSortCluster = cluster_mod.LocalSortCluster;
 const LocalSortRejectReason = cluster_mod.RejectReason;
-// 像素域转换（finitePixelCoordinate / physicalPixelExtent /
-// max_safe_pixel_coordinate，2026-08-05 析出）：与 backdrop_capture.zig
-// 共享同一份 2^24 钳制语义，独立成零依赖小模块，双方都从这里 import。
+// Pixel-domain conversion functions extracted: finitePixelCoordinate / physicalPixelExtent /
+// max_safe_pixel_coordinate share 2^24 clamping semantics with backdrop_capture.zig; both import
+// from
+// shared zero-dependency module.
 const pixel_domain = @import("command_encoder/pixel_domain.zig");
 pub const finitePixelCoordinate = pixel_domain.finitePixelCoordinate;
 pub const physicalPixelExtent = pixel_domain.physicalPixelExtent;
 pub const max_safe_pixel_coordinate = pixel_domain.max_safe_pixel_coordinate;
-// backdrop 采样区域解析（2026-08-05 析出）：computeBackdropCaptureRegion 原本
-// 就是 encoder 上的静态函数（无 self），此处 re-export 保持 backdrop_blur 的
-// 反射调用点（`@TypeOf(encoder.*).computeBackdropCaptureRegion`）零改动。
+// backdrop capture region parsing extracted: computeBackdropCaptureRegion was already a static
+// encoder function (no self); re-export here preserves backdrop_blur's reflective call site
+// (TypeOf(encoder.*).computeBackdropCaptureRegion(...)) with zero changes.
 const backdrop_capture = @import("command_encoder/backdrop_capture.zig");
 pub const BackdropCaptureRegion = backdrop_capture.BackdropCaptureRegion;
-// 跨帧 GPU 资源缓存的簿记（2026-08-05 析出）：字段 + beginFrame/deinit。
-// pipeline 的创建在 backdrop_blur / opacity_layer / blend_composite，
-// uniform 槽分配已在 backdrop_blur，均不随迁。
+// Cross-frame GPU resource cache bookkeeping extracted: fields + beginFrame/deinit.
+// pipeline creation in backdrop_blur / opacity_layer / blend_composite; uniform slot allocation in
+// backdrop_blur; neither migrates.
 const persistent_gpu_cache = @import("command_encoder/persistent_gpu_cache.zig");
 pub const PersistentGpuCache = persistent_gpu_cache.PersistentGpuCache;
 pub const LuminanceSlot = persistent_gpu_cache.LuminanceSlot;
@@ -63,8 +67,8 @@ pub const BlurLevelSlot = persistent_gpu_cache.BlurLevelSlot;
 pub const LUMINANCE_SLOT_COUNT = persistent_gpu_cache.LUMINANCE_SLOT_COUNT;
 pub const BLUR_LEVEL_SLOT_COUNT = persistent_gpu_cache.BLUR_LEVEL_SLOT_COUNT;
 const color_conversion = @import("color_conversion.zig");
-// 析出模块的 test 块必须显式引用才会被收集（本仓库里 `pub const x = @import`
-// 这种再导出**不会**让 test 进 runner，见 render.zig 尾部 test 块的注释）。
+// Extracted module tests must be explicitly imported to be collected (pub const x = @import in this
+// codebase does **not** pull test blocks into runner; see render.zig test block comment).
 test {
     _ = @import("command_encoder/local_sort_cluster.zig");
     _ = @import("command_encoder/backdrop_capture.zig");
@@ -73,8 +77,9 @@ test {
 }
 pub const colorToFloat4 = color_conversion.toFloat4;
 const colorToRenderColor = color_conversion.toRenderColor;
-const srgbByteToLinear = color_conversion.srgbByteToLinear;
-// FontSelector 与 encoder 零耦合，已析出；此处 re-export 保持 render.zig 的公开面不变。
+const byteToShader = color_conversion.byteToShader;
+// FontSelector and encoder have zero coupling, extracted; re-export here keeps render.zig's public
+// surface stable.
 pub const FontSelector = @import("command_encoder/font_selector.zig").FontSelector;
 pub const TextFontProps = @import("command_encoder/font_selector.zig").TextFontProps;
 const icon_ir = @import("icon_ir");
@@ -93,8 +98,8 @@ const path_tess_mod = @import("path_tessellator.zig");
 const PathRenderer = @import("path_renderer.zig").PathRenderer;
 const PathRendererMod = @import("path_renderer.zig");
 
-/// PathRenderer 的顶点与 stroke width 都使用逻辑像素。device scale 只用于
-/// viewport、曲线细分精度与 AA fringe，不能再次作用于线宽。
+/// PathRenderer vertices and stroke width use logical pixels. device scale applies only to
+/// viewport, curve tessellation precision, and AA fringe, not stroke width again.
 pub inline fn pathStrokeWidthForTessellation(logical_width: f32, device_scale: f32) f32 {
     _ = device_scale;
     return logical_width;
@@ -128,8 +133,8 @@ pub const ClipPolygon = struct {
     point_count: u8 = 0,
     contour_count: u8 = 0,
     fill_rule: PathFillRule = .evenodd,
-    contour_end_points: [max_clip_polygon_contours]u8 = [_]u8{0} ** max_clip_polygon_contours,
-    points: [max_clip_polygon_points][2]f32 = [_][2]f32{.{ 0, 0 }} ** max_clip_polygon_points,
+    contour_end_points: [max_clip_polygon_contours]u8 = @as([max_clip_polygon_contours]u8, @splat(0)),
+    points: [max_clip_polygon_points][2]f32 = @as([max_clip_polygon_points][2]f32, @splat(.{ 0, 0 })),
 
     pub fn empty() ClipPolygon {
         return .{};
@@ -153,8 +158,8 @@ const RoundedClipState = struct {
     polygon: ClipPolygon = ClipPolygon.empty(),
 };
 
-/// SVG/CSS 混合模式，镜像 src/ui/core/types.zig 的 BlendMode
-/// render 模块不依赖 ui 模块，需在此独立定义（枚举值必须同步）
+/// SVG/CSS blend modes mirror src/ui/core/types.zig BlendMode; render module has no ui dependency,
+/// must define independently (enum values must stay in sync).
 pub const BlendMode = enum(u8) {
     normal = 0,
     multiply = 1,
@@ -178,8 +183,8 @@ pub const GradientDirection = enum {
     conic,
 };
 
-/// Monospace ASCII advance cache 槽位（详见 FontSelector.ascii_advance_cache 注释）。
-/// Scissor 矩形 (物理像素)
+/// Monospace ASCII advance cache slot (see FontSelector.ascii_advance_cache comment).
+/// Scissor rectangle (physical pixels)
 pub const ScissorRect = struct {
     x: u32,
     y: u32,
@@ -187,11 +192,12 @@ pub const ScissorRect = struct {
     height: u32,
 };
 
-/// GPU retained 命中时挂起的合成信息。内容 pass 被完全跳过，end 处用这些字段
-/// 把缓存好的纹理合成回父目标，等价于普通路径 endOpacityLayer 的第 7 步。
+/// GPU retained composite info suspended on hit. content pass fully skipped; end uses these fields
+/// to composite cached texture back to parent target, equivalent to normal path endOpacityLayer
+/// step 7.
 const RetainedPending = struct {
     texture: TextureLease,
-    /// 该 layer 在父 surface 内的 outer-local 坐标（与 OffscreenLayer.x/y 同语义）。
+    /// Layer's outer-local coordinate within parent surface (same semantics as OffscreenLayer.x/y).
     x: f32,
     y: f32,
     w: f32,
@@ -209,99 +215,102 @@ const RetainedPending = struct {
     used_tex_h: u32,
     alloc_tex_w: u32,
     alloc_tex_h: u32,
+    /// See OffscreenLayer.quad.
+    quad: [4]f32 = .{ 0, 0, 0, 0 },
 };
 
-/// 离屏 Opacity 图层状态
-/// damage-rect：某顶层 opacity layer 的 per-item 捕获区间（damage_scratch 内）。
-pub const DamageRange = struct {
-    start: u32 = 0,
-    len: u32 = 0,
-    /// false = 层内含 control token（嵌套层/clip）或 path 类命令，嵌套 pass
-    /// 会重置 scissor、path renderer 自管 scissor，部分重绘不安全，整层重画。
-    safe: bool = false,
-    /// item 数超 damage_scratch 容量，diff 不完整，放弃部分重绘。
-    overflow: bool = false,
-    /// 该 range 是否真的被捕获过（序号超 64 的层为 false）
-    captured: bool = false,
-};
+/// Offscreen opacity layer state
+/// damage-rect: per-item capture bounds for some top-level opacity layer (within damage_scratch).
+pub const DamageRange = retained_plan.DamageRange;
 
-// pub：单测已析出到 command_encoder_test.zig，需要构造该类型。
+// pub: single tests extracted to command_encoder_test.zig, need to construct this type.
 pub const OffscreenLayer = struct {
     /// Pool-owned offscreen texture lease.
     texture: TextureLease,
-    /// 离屏 render pass（存在栈上，encoder 通过指针引用）
+    /// Offscreen render pass (lives on stack, encoder borrows via pointer)
     render_pass: gpu.Backend.RenderPass,
-    /// end 离屏后要恢复到的目标纹理（嵌套时为父离屏纹理，否则为主 RT）
+    /// Render target to restore to after offscreen ends (nested: parent offscreen texture, else
+    /// main RT)
     restore_target: gpu.Backend.TextureBinding,
-    /// 保存的 clip stack 深度
+    /// Saved clip stack depth
     saved_clip_depth: usize,
-    /// 保存的 clip 溢出计数（离屏 pass 内从 0 开始计，返回时恢复）。
+    /// Saved clip overflow count (resets to 0 within offscreen pass, restored on return).
     saved_clip_overflow_depth: u32 = 0,
-    /// 保存的逻辑 clip 栈内容。离屏 pass 会把 clip_depth 归零后复用同一块栈空间，
-    /// 不备份会在返回主 pass 时把父级 clip/scissor 状态污染掉。
+    /// Saved logical clip stack contents. Offscreen pass zeros clip_depth and reuses the same stack
+    /// space; without backup, returning to main pass corrupts parent clip/scissor state.
     saved_logical_clip_stack: [64]RoundedClipState = undefined,
-    saved_effective_rect_clip_stack: [64][4]f32 = [_][4]f32{.{ 0, 0, 0, 0 }} ** 64,
-    /// 保存的 viewport
+    saved_effective_rect_clip_stack: [64][4]f32 = @as([64][4]f32, @splat(.{ 0, 0, 0, 0 })),
+    /// Saved viewport
     saved_viewport_width: f32,
     saved_viewport_height: f32,
-    /// 图层在恢复目标中的屏幕位置（逻辑像素）
+    /// Layer position on screen in restore target (logical pixels)
     x: f32,
     y: f32,
     w: f32,
     h: f32,
-    /// 合成 opacity
+    /// Composite opacity
     opacity: f32,
-    /// 进层前的光栅倍率（endOpacityLayer 恢复用）。层内 encoder.scale = 该层的
-    /// 有效光栅倍率（父倍率 × 合成变换的放大系数），见 opacity_layer.layerMagnification。
+    /// Raster scale before entering layer (endOpacityLayer restores). layer's effective scale =
+    /// parent scale * composite transform magnification (see opacity_layer.layerMagnification).
     saved_scale: f32 = 1,
-    /// 以图层中心为 origin 的顺时针旋转（弧度）
+    /// This layer's own raster scale (texels per logical unit; 0 = unknown, composite the whole
+    /// used region). See opacity_layer.contentUv.
+    raster_scale: f32 = 0,
+    /// Composite quad inside the layer bounds {x, y inset, w, h} (layer-local logical units;
+    /// w = 0: the whole layer). A rounded layer keeps its own rect for the mask while its
+    /// texture is aligned to the target's pixel grid (opacity_layer.alignTranslationSurface
+    /// widened the bounds); the composite samples the matching texel sub-rect.
+    quad: [4]f32 = .{ 0, 0, 0, 0 },
+    /// Clockwise rotation in radians, origin at layer center
     rotate: f32 = 0,
-    /// 是否以完整 2D affine 变换回贴离屏图层
+    /// Whether to composite offscreen layer back with full 2D affine transform
     use_draw_transform: bool = false,
     draw_transform: [6]f32 = .{ 1, 0, 0, 1, 0, 0 },
-    /// 合成回恢复目标的矩形；默认与 source 相同
+    /// Composite destination rect; defaults to source
     draw_x: f32 = 0,
     draw_y: f32 = 0,
     draw_w: f32 = 0,
     draw_h: f32 = 0,
-    /// 在 image_renderer 中注册的纹理 ID
+    /// Texture ID registered in image_renderer
     texture_id: u32,
-    /// 圆角裁剪半径（0 = 普通 opacity layer）
+    /// Rounded clip radius (0 = ordinary opacity layer)
     corner_radius: f32 = 0,
-    /// SVG/CSS 混合模式（normal = 标准 SrcOver）
+    /// SVG/CSS blend mode (normal = standard SrcOver)
     blend_mode: BlendMode = .normal,
-    /// GPU retained：本层画进的是某个 layer 的专属纹理时，记下它的 stable_id。
-    /// endOpacityLayer 据此决定是"标记内容已就绪"（retained）还是"还回池"
-    /// （普通临时纹理），两者绝不能搞混：把 retained 纹理还回池会让别人覆写
-    /// 它，把临时纹理标记 primed 则毫无意义。
+    /// Lens warp at composite (see types.ContentWarp); all zero = none
+    warp: [4]f32 = .{ 0, 0, 0, 0 },
+    /// GPU retained: when this layer draws into a dedicated layer texture, record its stable_id.
+    /// endOpacityLayer uses it to decide: mark content ready (retained) vs. return to pool
+    /// (ordinary temp texture); never mix them up. Returning retained texture to pool lets others
+    /// overwrite it; marking temp texture primed achieves nothing.
     retained_id: u32 = opacity_layer.INVALID_SURFACE_ID,
-    /// retained：本层 begin 在预扫描里的序号（damage-rect 基线写回用）。
+    /// retained: sequence number of this layer's begin in prescan (damage-rect baseline writeback).
     retained_seq: usize = std.math.maxInt(usize),
-    /// 内容实际占用的物理像素（纹理按 64px 桶向上分配，见 bucketDimension，
-    /// scale 动画期逐帧 ±1px 的尺寸抖动才能命中池复用）。合成时按
-    /// used/alloc 裁 UV；重开 render pass 时 viewport/scissor 必须限到
-    /// used 区域（NDC 默认铺满整个 alloc 纹理会把内容拉伸）。
+    /// Physical pixels actually used by content. Texture allocated in 64px buckets (see
+    /// bucketDimension); scale animation's ±1px frame jitter is needed for pool reuse hit.
+    /// composite uses used/alloc to clip UVs; re-opening render pass must limit viewport/scissor to
+    /// used region (NDC defaults to full alloc texture, stretching content).
     used_tex_w: u32 = 0,
     used_tex_h: u32 = 0,
-    /// 纹理分配的物理像素（桶尺寸）
+    /// Physical pixels of texture allocation (bucket size)
     alloc_tex_w: u32 = 0,
     alloc_tex_h: u32 = 0,
-    /// damage-rect 部分重绘：本层内容 pass 的脏区 scissor（texture-local 物理
-    /// 像素）。嵌套 pass end 恢复本层时必须重新取交（scissor 是 per-pass 状态，
-    /// re-begin 会重置），见 applyOffscreenTargetViewport。null = 整层重画。
+    /// damage-rect partial repaint: this layer's content pass dirty scissor (texture-local physical
+    /// pixels). Nested pass end must re-intersect when restoring this layer (scissor is per-pass
+    /// state, re-begin resets); see applyOffscreenTargetViewport. null = full layer repaint.
     damage_scissor: ?opacity_layer.PartialRepaint = null,
 };
 
-/// RenderCommandEncoder，将 lowered DisplayItem 切片编码为 GPU 调用。
-/// 跨帧持久的 PersistentGpuCache 曾住在这里，已析出到
-/// command_encoder/persistent_gpu_cache.zig（见该文件头部「不搬什么」）。
-/// 一条命令是不是 arc。
+/// RenderCommandEncoder: encodes lowered DisplayItem slices to GPU calls.
+/// The cross-frame PersistentGpuCache lives in command_encoder/persistent_gpu_cache.zig (see that
+/// file's head, 'what not to move').
+/// Is a command an arc?
 ///
-/// arc 复用 `.path` kind，靠 `arc_outer_radius > 0` 区分，且**只**靠它：
-/// 描边宽度、颜色 alpha 是「画不画得出来」的问题，不是「是不是 arc」的问题。
-/// 把可见性条件混进类型判据，就会出现「它不算 arc，于是按 fill_path 处理」
-/// 这种既非 arc 也非 path 的空隙，而 arc 命令从不带 path_geometry_ptr，
-/// 掉进 fill_path 分支的结果是被 `orelse return` 静默吞掉。
+/// An arc reuses the .path kind and is distinguished by `arc_outer_radius > 0`, **only** by it:
+/// stroke width and color alpha decide "can it be drawn", not "is it an arc".
+/// Mixing visibility into the type check creates a gap ("not an arc, so treat as fill_path") that
+/// is neither arc nor path; arc commands never carry path_geometry_ptr, so falling into the
+/// fill_path branch ends in a silent orelse return.
 pub fn isArcCommand(it: anytype) bool {
     return it.kind == .path and it.arc_outer_radius > 0;
 }
@@ -311,12 +320,15 @@ pub const RenderCommandEncoder = struct {
     const max_kawase_uniform_updates: u32 = backdrop_blur.max_kawase_uniform_updates;
     const max_glass_uniform_updates: u32 = backdrop_blur.max_glass_uniform_updates;
 
-    // local-sort 簇状态机已析出到 command_encoder/local_sort_cluster.zig
-    //（refs+len 与四个方法只互相引用，encoder 只在 encodeCommands /
-    // flushLocalSortCluster 两个触点使用）。reject reason 随迁 re-export，
-    // switch 分支名不变。
+    // local-sort cluster state machine extracted to command_encoder/local_sort_cluster.zig
+    // (refs+len and four methods reference only each other; encoder uses only at encodeCommands /
+    // flushLocalSortCluster). reject reason migrates; switch branch names unchanged.
     const LocalSortRejectReason = cluster_mod.RejectReason;
 
+    /// Borrowed timing context; detached encoders can omit optional profiling.
+    io: ?std.Io = null,
+    visual_quality: @import("visual_quality.zig").Quality = .full,
+    retained_enabled: bool = true,
     sdf_renderer: *SdfRenderer,
     text_renderer: *TextRenderer,
     image_renderer: ?*ImageRenderer = null,
@@ -328,122 +340,125 @@ pub const RenderCommandEncoder = struct {
     // overflow_hidden transitions.
     clip_stack: [64]ScissorRect = undefined,
     logical_clip_stack: [64]RoundedClipState = undefined,
-    /// syncRendererClipMask 的 memo：clip 未变时跳过对全部 renderer 的
-    /// 状态拷贝（每次同步是 4-5 个 renderer × ~300B 值拷贝，push/pop clip
-    /// 和 begin/end layer 都会触发）。encoder 每帧重建，默认未同步。
+    /// syncRendererClipMask memo: skip state copy across all renderers when clip hasn't changed
+    /// (each sync is 4-5 renderers * ~300B value copy; push/pop clip and begin/end layer trigger).
+    /// encoder rebuilt each frame, unsynced by default.
     last_synced_clip_mask: ?RoundedClipState = null,
     clip_mask_synced: bool = false,
-    /// begin_rounded_clip 的实现路径栈：end_rounded_clip 必须知道对应的
-    /// begin 走了 shader clip 还是离屏 layer。shader 路径省掉 2 个 render
-    /// pass + 全 RT load/store（tile GPU 上 rounded-clip 免离屏的核心收益）。
+    /// begin_rounded_clip implementation path stack: end_rounded_clip must know whether begin took
+    /// shader clip or offscreen layer path. Shader path saves 2 render passes + full RT load/store
+    /// (core benefit of rounded-clip shader on tile GPU).
     rounded_clip_mode_stack: [32]RoundedClipMode = undefined,
     rounded_clip_mode_depth: u32 = 0,
     rounded_clip_overflow_depth: u32 = 0,
-    /// 逃生阀：ZENIT_ROUNDED_CLIP_LAYER=1 强制全部走旧的离屏路径（进程级缓存）。
+    /// Escape valve: ZENIT_ROUNDED_CLIP_LAYER=1 forces all old offscreen path (process-level
+    /// cache).
     force_rounded_clip_layer: ?bool = null,
-    effective_rect_clip_stack: [64][4]f32 = [_][4]f32{.{ 0, 0, 0, 0 }} ** 64,
+    effective_rect_clip_stack: [64][4]f32 = @as([64][4]f32, @splat(.{ 0, 0, 0, 0 })),
     clip_depth: usize = 0,
-    /// 栈满后被忽略的 push_clip 个数。配对的 pop_clip 必须先抵消这些，
-    /// 否则会弹掉父级真实 clip（push 静默忽略 / pop 无条件弹 = 错配）。
+    /// Count of ignored push_clip after stack full. Paired pop_clip must offset these first, or
+    /// parent clip pops incorrectly (push silent / pop unconditional = mismatch).
     clip_overflow_depth: u32 = 0,
     render_pass: ?*gpu.Backend.RenderPass = null,
     viewport_width: f32 = 0,
     viewport_height: f32 = 0,
     scale: f32 = 1,
     frame_index: u64 = 0,
-    /// v0.9-§D stage 1 audit (2026-05-13): 每帧 beginRenderPass 调用数。
-    /// 主 pass + offscreen opacity_layer + backdrop_blur + clearTexture 等共享计数。
-    /// `beginFrame` 重置；caller (encoder.beginFrame caller) 通过 `pass_count`
-    /// 读上一帧值做 perf 监控。后续 stage 目标：通过合并 single-pass + stencil/blend
-    /// 替代 offscreen 减少 pass count，复杂场景 (多个 opacity layer 嵌套) 收益最大。
+    /// v0.9-S1D audit (2026-05-13): beginRenderPass call count per frame.
+    /// main pass + offscreen opacity_layer + backdrop_blur + clearTexture etc. share counter.
+    /// reset in beginFrame; caller (encoder.beginFrame caller) reads last frame via pass_count for
+    /// perf monitoring. Later stages target: merge single-pass + stencil/blend replacing offscreen,
+    /// complex scenarios (nested opacity layers) yield most.
     pass_count: u32 = 0,
-    /// 诊断（ZENIT_DEBUG_PASSCOUNT）：按调用点归类的 pass 计数，用来回答
-    /// "这一帧的 N 个 pass 分别是什么"。索引见 PassSite。
-    pass_sites: [8]u32 = .{0} ** 8,
-    /// 每个普通 opacity begin 的实际开层结果。必须逐层记录，单纯用 noop
-    /// 深度计数无法表示「noop 外层里有真实内层」这类合法嵌套。
-    /// 当 opacity ≈ 1.0 且 blend_mode = normal 且无 transform/rotate 时，
-    /// 跳过 beginOpacityLayer 的离屏 pass + image 回贴，等价于不开 layer。
+    /// Diagnostics (ZENIT_DEBUG_PASSCOUNT): pass count categorized by callsite, answer "what are
+    /// this frame's N passes". See PassSite for index.
+    pass_sites: [8]u32 = @splat(0),
+    /// Actual layer-open result for each ordinary opacity begin. Must log per-layer; noop depth
+    /// count alone can't represent "noop outer with real inner" legal nesting.
+    /// Skip beginOpacityLayer offscreen pass + image composite when opacity ~= 1.0 && blend_mode =
+    /// normal && no transform/rotate; equivalent to not opening layer.
     opacity_mode_stack: [64]OpacityLayerMode = undefined,
     opacity_mode_depth: usize = 0,
     opacity_mode_overflow_depth: u32 = 0,
-    /// GPU retained：命中缓存时，begin..end 之间的**内容命令全部跳过**（纹理里
-    /// 已经有画好的像素），只在 end 处做一次合成 draw。此计数器跟踪被跳过的
-    /// 嵌套深度，>0 期间 dispatchCommand 直接 return。
-    ///
-    /// 用深度计数而非布尔：被跳过的子树内部可能还有自己的 begin/end opacity
-    /// layer，必须配对计数才能找回正确的 end。
+    /// GPU retained: on cache hit, **all content commands between begin..end skipped** (pixels
+    /// already in texture); only do one composite draw at end.
+    /// Track nesting depth skipped, not just bool: skipped subtree may contain its own begin/end
+    /// opacity layer pairs; depth counting finds correct end.
     retained_skip_depth: u32 = 0,
-    /// retained 命中时挂起的合成信息，内容 pass 被跳过，但仍要在 end 处把
-    /// 缓存纹理合成回父目标。
+    /// retained hit suspends composite info, content pass skipped, but still composite cached
+    /// texture to parent at end.
     retained_pending: [8]RetainedPending = undefined,
     retained_pending_depth: usize = 0,
-    /// 本帧 retained 命中/未命中次数（诊断用；命中一次 = 省掉一整个离屏
-    /// clear+内容 pass 的重光栅化）。
+    /// This frame's retained hit/miss counts (diagnostic; one hit = skip one whole offscreen
+    /// clear+content pass re-rasterization).
     retained_hits: u32 = 0,
     retained_misses: u32 = 0,
-    /// miss 中走了 damage-rect 部分重绘的次数（诊断）
+    /// Miss count where damage-rect partial repaint was used (diagnostic)
     retained_partial_repaints: u32 = 0,
-    /// 每个 begin_opacity_layer 的内容指纹（按出现顺序）。见
-    /// `computeRetainedContentHashes`，这是 retained 的真正缓存键。
-    retained_hashes: [64]u64 = [_]u64{0} ** 64,
+    /// Content fingerprint for each begin_opacity_layer (in order). See
+    /// computeRetainedContentHashes; this is retained's real cache key.
+    retained_hashes: [64]u64 = @as([64]u64, @splat(0)),
     retained_hash_count: usize = 0,
-    /// 本帧已合成过玻璃背板的 owner node id 集合。同一 blur effect 实例的
-    /// begin token 可能在一帧内多次出现（display_list 多 pass 组装会把同
-    /// 子树的零星 item 排到存储尾部 -> effect 链重开）；背板重合成会把
-    /// 先画的内容捕获+模糊+盖掉（下游应用侧栏"玻璃把内容糊掉"实拍）。
-    /// 语义合同：一个 owner 每帧至多一张背板，重复 begin 跳过。
+    /// Set of owner node ids that composited glass backdrop this frame.
+    /// begin token for same blur effect instance may appear multiple times per frame (display_list
+    /// multi-pass assembly puts stray items of same subtree at storage tail -> effect chain
+    /// re-opens); recompositing backdrop captures+blurs+covers prior content (downstream app
+    /// sidebar "glass obscures content" real capture).
+    /// Semantic contract: one owner gets at most one backdrop per frame; repeated begin skips.
     blur_applied_owners: [64]u32 = undefined,
     blur_applied_count: usize = 0,
-    /// dispatch 时走到第几个 begin_opacity_layer（与预扫描的序号对齐）。
+    /// dispatch is at which begin_opacity_layer (aligns with prescan sequence number).
     retained_begin_seq: usize = 0,
-    /// damage-rect：本帧每个**顶层** opacity layer 的 per-item {单条指纹, 外扩
-    /// bounds}，与 retained_hashes 同序号对齐。miss 时与 pool 里存的上一帧基线
-    /// diff 出脏区，只重画脏区。
+    /// damage-rect: per-item {single fingerprint, expanded bounds} for each **top-level** opacity
+    /// layer this frame, same index order as retained_hashes. On miss, diff with pool's last-frame
+    /// baseline to find dirty region; only repaint dirty area.
     damage_scratch: [1024]offscreen_texture.DamageItem = undefined,
     damage_scratch_count: usize = 0,
-    /// layer_tree damage 通路合流（2026-07-30 晚）：
-    /// 读方向，encodeDisplay 每帧从 LayerTree 快照 {stable_id, local-space
-    /// damage bounds}（addDamage 生产端申报），computePartialDamage 并入 diff
-    /// 出的脏区（安全方向：只放大，不缩小）。
-    /// 写方向，retained 层的实际决策（hit/整层/部分重绘）经
-    /// writebackLayerOutcomes 写回 LayerTree.needs_repaint/damage_rect，
-    /// 两条通路从此共享一份状态（观测/测试单一事实源）。
+    /// layer_tree damage path convergence (2026-07-30): read direction, encodeDisplay snapshots
+    /// {stable_id, local-space damage bounds} from LayerTree each frame (addDamage producer side),
+    /// computePartialDamage merges diff dirty regions (safe direction: expand only, shrink never).
+    /// Write direction, retained layer actual decisions (hit/full/partial repaint) via
+    /// writebackLayerOutcomes write back to LayerTree.needs_repaint/damage_rect; both paths now
+    /// share one state source (single observation/test truth).
     layer_damage_ids: [32]u32 = undefined,
     layer_damage_rects: [32][4]f32 = undefined, // local space {min_x,min_y,max_x,max_y}
     layer_damage_count: usize = 0,
     layer_outcome_ids: [64]u32 = undefined,
-    layer_outcome_kinds: [64]u8 = undefined, // 0=hit 1=整层重画 2=部分重绘
+    layer_outcome_kinds: [64]u8 = undefined, // 0=hit 1=full repaint 2=partial repaint
     layer_outcome_rects: [64][4]f32 = undefined, // local space {min_x,min_y,max_x,max_y}
     layer_outcome_count: usize = 0,
-    damage_ranges: [64]DamageRange = [_]DamageRange{.{}} ** 64,
-    // Phase C2/C3: 离屏 opacity 图层
-    /// GPU command encoder（用于在同一 command buffer 中创建多个 render pass）
+    damage_ranges: [64]DamageRange = @as([64]DamageRange, @splat(.{})),
+    // Phase C2/C3: offscreen opacity layers
+    /// GPU command encoder (create multiple render passes within one command buffer)
     gpu_command_encoder: ?*gpu.Backend.CommandEncoder = null,
-    /// 主 render target 纹理（用于 end 离屏后重新 beginRenderPass 回到主目标）
+    /// Main render target texture (restore point after ending offscreen)
     main_render_target: ?gpu.Backend.TextureBinding = null,
-    /// 离屏层栈（支持嵌套）
+    frame_damage_scissor: ?[4]u32 = null,
+    /// Offscreen layer stack (supports nesting)
     offscreen_stack: [8]OffscreenLayer = undefined,
     offscreen_depth: usize = 0,
-    /// 离屏纹理池，指向 **owner（AppRenderer）持有的持久池**。encoder 本身是
-    /// 逐帧局部值；池若内嵌在 encoder 里会随 deinit 整池释放，跨帧复用（池存在
-    /// 的唯一目的）从未发生，每个含离屏效果的帧都在 create/release 纹理。
-    /// owner 负责 pool.deinit()（须在 GPU drain 之后）。
+    /// Offscreen texture pool, points to **owner (AppRenderer) persistent pool**. encoder is
+    /// per-frame local value; embedding pool would release entire pool on deinit, cross-frame reuse
+    /// (pool's only purpose) never happens; each frame with offscreen effects create/release
+    /// textures. owner calls pool.deinit() (must be after GPU drain).
     offscreen_pool: *OffscreenTexturePool,
 
-    /// **跨帧持久**的 GPU 资源缓存（借用，不拥有），与 offscreen_pool 同理。
+    /// **Cross-frame persistent** GPU resource cache (borrowed, not owned), same rationale as
+    /// offscreen_pool.
     ///
-    /// 历史问题（审查报告 P1）：path renderer / tessellator / blur & glass
-    /// pipeline / buffer / sampler 全部内嵌在**逐帧新建**的 encoder 里，
-    /// deinit 即帧末销毁；下一帧遇到 path 或 blur 就要重新 runtime 编译 MSL、
-    /// 创建多个 PSO、重建 buffer/sampler。任何连续的 SVG/path/GlassBox 动画
-    /// 都会因此每帧付一次编译开销，产生主线程与驱动抖动。
+    /// The path renderer / tessellator / blur & glass pipelines / buffers / samplers must not live
+    /// in
+    /// the **per-frame** encoder: its deinit would delete them at frame end, and the next frame
+    /// using
+    /// path/blur would redo MSL compile, PSO creation and buffer/sampler rebuilds, causing
+    /// per-frame
+    /// overhead and jitter in any continuous SVG/path/GlassBox animation.
     ///
-    /// 现在把它们提升到 AppRenderer 持有的 PersistentGpuCache，encoder 只借用。
-    /// 字段访问路径保持不变（下面的 accessor），故调用点无需改动。
+    /// They live in AppRenderer's PersistentGpuCache; the encoder only borrows. Accessor paths are
+    /// unchanged (below).
     persistent: *PersistentGpuCache,
 
-    /// 初始化编码器
+    /// Initialize encoder
     pub fn init(
         sdf_renderer: *SdfRenderer,
         text_renderer: *TextRenderer,
@@ -476,14 +491,14 @@ pub const RenderCommandEncoder = struct {
         };
     }
 
-    /// 释放 encoder 懒加载创建的临时 GPU/路径资源。
+    /// Free encoder's lazily-allocated temporary GPU/path resources.
     ///
-    /// RenderCommandEncoder 常作为逐帧局部值使用；若某帧触发了 path/blur/glass
-    /// 路径而不显式清理，这些资源会在 encoder 离开作用域后泄漏。
+    /// RenderCommandEncoder often used as per-frame local value; if some frame hits path/blur/glass
+    /// paths without explicit cleanup, these resources leak when encoder leaves scope.
     pub fn deinit(self: *RenderCommandEncoder) void {
-        // encoder 是逐帧局部值（AppRenderer.getEncoder 每帧新建），deinit 即帧末，
-        // 此处 pass_count 是全帧终值。
-        if (std.posix.getenv("ZENIT_DEBUG_PASSCOUNT") != null) {
+        // encoder is per-frame local value (AppRenderer.getEncoder creates fresh each frame),
+        // deinit is frame end; pass_count here is full-frame final value.
+        if (@import("zenit_environment").has("ZENIT_DEBUG_PASSCOUNT")) {
             std.debug.print("[passcount] passes={d} retained_hit={d} retained_miss={d} | op_restore={d} op_begin={d} op_composite={d} clear_tex={d} blur={d}/{d}/{d}\n", .{
                 self.pass_count,    self.retained_hits, self.retained_misses,
                 self.pass_sites[0], self.pass_sites[1], self.pass_sites[2],
@@ -497,16 +512,17 @@ pub const RenderCommandEncoder = struct {
             }
         }
 
-        // 帧中途出错（encodeDisplay/flush 的 try 提前返回）时 offscreen 栈里
-        // 还有未 end 的层：它们借用的 external 纹理槽位必须在这里归还。
-        // external 槽位只有 EXTERNAL_SLOT_COUNT 个且句柄不跨帧，漏还即永久丢一个槽。
+        // Frame mid-error (encodeDisplay/flush try early return) leaves unflushed layers in
+        // offscreen stack: external texture slots they borrowed must return here.
+        // external slots only EXTERNAL_SLOT_COUNT exist, handles don't cross frames; leak =
+        // permanently lose one slot.
         self.releaseAbandonedOffscreenBindings();
 
-        // ⚠️ path/blur/glass 的 pipeline、buffer、sampler、tessellator **不再**
-        // 在这里释放，它们已提升到 AppRenderer 持有的 PersistentGpuCache，
-        // 跨帧复用（此前每帧 create+destroy 一轮，连续 path/blur 动画每帧都要
-        // 重新 runtime 编译 MSL，见审查报告 P1）。
-        // encoder 只借用，帧末什么都不用做；缓存由 AppRenderer.deinit 统一释放。
+        // WARNING: path/blur/glass pipeline, buffer, sampler, tessellator **no longer** freed here;
+        // promoted to AppRenderer's PersistentGpuCache, cross-frame reused (prev: create+destroy
+        // per frame; continuous path/blur animation re-ran MSL compile every frame, see review
+        // report P1).
+        // encoder borrows, nothing to do at frame end; AppRenderer.deinit releases cache uniformly.
     }
 
     fn releaseAbandonedOffscreenBindings(self: *RenderCommandEncoder) void {
@@ -520,42 +536,44 @@ pub const RenderCommandEncoder = struct {
         self.offscreen_depth = 0;
     }
 
-    /// 设置字体选择器。
+    /// Set font selector.
     ///
-    /// ⚠️ **不要在这里给 selector 装 drawn-width 回调**。RenderCommandEncoder 是
-    /// **逐帧按值新建**的栈上临时量（AppRenderer.getEncoder 每帧 return 一个），
-    /// 把 `self` 存进生命周期跨帧的 FontSelector 里，帧一结束就是悬垂指针,
-    /// 下一次布局测量即踩，表现为 e2e 里"RPC 超时"而非崩溃堆栈，极难归因。
-    /// 该回调必须绑到生命周期稳定的 TextRenderer 上，由宿主在建窗时装、
-    /// 拆窗时摘（由宿主的字体加载代码负责）。
+    /// WARNING: **don't attach drawn-width callback here**. RenderCommandEncoder is
+    /// **per-frame-by-value new stack temporary** (AppRenderer.getEncoder returns one each frame);
+    /// storing `self` into FontSelector's cross-frame lifespan = dangling pointer at frame end, hit
+    /// on next layout measurement as e2e "RPC timeout" not crash stack, extremely hard to
+    /// attribute.
+    /// Callback must bind to stable-lifetime TextRenderer, installed by host at window creation,
+    /// removed at window destruction (host's font loading code responsible).
     pub fn setFonts(self: *RenderCommandEncoder, fonts: *FontSelector) void {
         self.fonts = fonts;
     }
 
-    /// 初始化 renderer 内部 FontSelector 的 lazy derived font cache
-    /// 必须在 setFonts 之后调用（setFonts 为借用指针，不发生拷贝）
+    /// Initialize renderer's internal FontSelector lazy derived font cache must be called after
+    /// setFonts (setFonts is borrowed pointer, no copy)
     pub fn initFontDerivedCache(self: *RenderCommandEncoder, allocator: std.mem.Allocator) void {
         if (self.fonts) |fs| {
             fs.initDerivedCache(allocator);
         }
     }
 
-    /// 释放 renderer 内部 FontSelector 的 lazy derived font cache
+    /// Free renderer's internal FontSelector lazy derived font cache
     pub fn deinitFontDerivedCache(self: *RenderCommandEncoder) void {
         if (self.fonts) |fs| {
             fs.deinitDerivedCache();
         }
     }
 
-    /// 开始新帧
-    /// width/height: 逻辑像素; scale: DPI 缩放因子 (Retina=2.0)
+    /// Begin new frame
+    /// width/height: logical pixels; scale: DPI scale factor (Retina=2.0)
     pub fn beginFrame(self: *RenderCommandEncoder, width: f32, height: f32, scale: f32) void {
         self.frame_index += 1;
-        // reset 全局 draw call 计数器
+        paint_fp.nextFrameSalt();
+        // reset global draw call counter
         gpu.Backend.RenderPass.frame_draw_call_count = 0;
         // reset per-frame pass count audit counter
         self.pass_count = 0;
-        self.pass_sites = .{0} ** 8;
+        self.pass_sites = @splat(0);
         self.opacity_mode_depth = 0;
         self.opacity_mode_overflow_depth = 0;
         self.retained_skip_depth = 0;
@@ -573,7 +591,7 @@ pub const RenderCommandEncoder = struct {
         self.clip_overflow_depth = 0;
         self.offscreen_depth = 0;
         self.offscreen_pool.resetFrame();
-        // 回收长期没被认领的 retained 纹理（layer 消失后不该一直钉着显存）。
+        // Reclaim retained textures unclaimed long-term (layer gone, shouldn't pin VRAM).
         self.offscreen_pool.sweepRetained(self.frame_index);
         self.offscreen_pool.sweepIdle(self.frame_index);
         backdrop_blur.resetDynamicUniformOffsets(self);
@@ -585,19 +603,26 @@ pub const RenderCommandEncoder = struct {
         self.syncRendererClipMask();
     }
 
-    /// 编码 cx 的 lowered DisplayItem 切片到 sdf/image/text renderer，flush() 后
-    /// 一次性提交 GPU。调用方不直接持有 IR 切片，encoder 自己调
-    /// cx.lowerForEncoderPaintTable() (B-7 主路径切换)。
+    /// Encode cx's lowered DisplayItem slice to sdf/image/text renderer, flush() sends to GPU once.
+    /// Caller doesn't hold IR slice directly; encoder calls cx.lowerForEncoderPaintTable() itself
+    /// (B-7 main path switch).
     pub fn encodeDisplay(self: *RenderCommandEncoder, cx: anytype) !void {
+        return self.encodeDisplayFrom(cx, 0);
+    }
+
+    /// A previously encoded/copied prefix must end with an empty clip stack
+    /// and contain no offscreen layers. All layer bookkeeping belongs here.
+    pub fn encodeDisplayFrom(self: *RenderCommandEncoder, cx: anytype, first: usize) !void {
         self.layer_outcome_count = 0;
         self.captureLayerTreeDamage(&cx.layer_tree);
-        try self.encodeCommands(cx.lowerForEncoderPaintTable());
+        try self.encodeCommands(cx.lowerForEncoderPaintTable()[first..]);
         self.writebackLayerOutcomes(&cx.layer_tree);
     }
 
-    /// layer_tree -> encoder：快照生产端（addDamage）申报的 per-layer 脏区。
-    /// consume-clear：取走即清，生产环境不保证每帧调 LayerTree.beginFrame，
-    /// 不清会让一次申报永久生效（并回脏区的反馈环 = partial 永远 100%）。
+    /// layer_tree -> encoder: snapshot per-layer damage regions produced by addDamage.
+    /// consume-clear: take and clear, production doesn't guarantee LayerTree.beginFrame each frame;
+    /// uncleaned one-time declaration becomes permanent (partial feedback loop = damage forever
+    /// 100%).
     fn captureLayerTreeDamage(self: *RenderCommandEncoder, lt: anytype) void {
         self.layer_damage_count = 0;
         for (lt.layers.items) |*l| {
@@ -614,7 +639,7 @@ pub const RenderCommandEncoder = struct {
         }
     }
 
-    /// encoder -> layer_tree：写回 retained 层本帧实际重绘决策。
+    /// encoder -> layer_tree: write back retained layer's actual repaint decision this frame.
     fn writebackLayerOutcomes(self: *RenderCommandEncoder, lt: anytype) void {
         var i: usize = 0;
         while (i < self.layer_outcome_count) : (i += 1) {
@@ -626,7 +651,7 @@ pub const RenderCommandEncoder = struct {
         }
     }
 
-    /// opacity_layer 在 retained begin 决策点调用（hit/opened_for_repaint）。
+    /// opacity_layer calls during retained begin decision point (hit/opened_for_repaint).
     pub fn recordLayerOutcome(self: *RenderCommandEncoder, stable_id: u32, kind: u8, rect: [4]f32) void {
         if (self.layer_outcome_count >= self.layer_outcome_ids.len) return;
         self.layer_outcome_ids[self.layer_outcome_count] = stable_id;
@@ -635,18 +660,18 @@ pub const RenderCommandEncoder = struct {
         self.layer_outcome_count += 1;
     }
 
-    /// Prewarm text atlas，在 GPU wait 前预生成 glyph，避免渲染时 stall。
+    /// Prewarm text atlas, pre-generate glyphs before GPU wait, avoid render stall.
     pub fn prewarmDisplay(self: *RenderCommandEncoder, cx: anytype) !void {
         try self.prewarmTextCommands(cx.lowerForEncoderPaintTable());
     }
 
-    /// prewarm 的输入指纹：只覆盖「决定需要哪些字形」的字段。
+    /// prewarm input fingerprint: covers only fields determining which glyphs are needed.
     ///
-    /// 位置 / 颜色 / clip 一律**不进**签名，滚动时它们每帧都变，但字形集合
-    /// 完全不变，把它们算进去等于让签名永不命中，优化直接失效。
-    /// 反过来，凡是能改变字形集合的都必须进：文本字节、字号、字重、
-    /// font_flags（italic/mono/symbol 选不同字体）、monospace cell 宽
-    /// （fixed_advance 影响 ligature 切分）、raster policy（影响 subpixel 分箱键）。
+    /// Position / color / clip never in signature; they change every frame scrolling, but glyph set
+    /// stays identical, including them breaks signature hits, optimization fails.
+    /// Conversely, anything changing glyph set must go in: text bytes, font size, weight,
+    /// font_flags (italic/mono/symbol choose fonts), monospace cell width (fixed_advance affects
+    /// ligature split), raster policy (affects subpixel bin key).
     fn prewarmSignature(commands: anytype) u64 {
         var h = std.hash.Wyhash.init(0x9E3779B97F4A7C15);
         for (commands) |it| {
@@ -663,8 +688,8 @@ pub const RenderCommandEncoder = struct {
     }
 
     fn prewarmTextCommands(self: *RenderCommandEncoder, commands: anytype) !void {
-        // 帧间跳过：文本负载与上帧完全一致且 atlas 没驱逐过页 -> 字形必然全在，
-        // 整趟 prewarm 无产出。详见 TextRenderer.prewarm_signature。
+        // Frame skip: text payload identical to last frame && atlas never evicted pages -> glyphs
+        // must all exist, whole prewarm has no output. See TextRenderer.prewarm_signature.
         const signature = prewarmSignature(commands);
         const gc_gen = self.text_renderer.atlas.gc_generation;
         if (self.text_renderer.prewarm_signature_valid and
@@ -674,15 +699,15 @@ pub const RenderCommandEncoder = struct {
             return;
         }
 
-        // 只为把缺失字形提前塞进 atlas，关掉实例产出，避免"文本编码两遍"
-        // （审查报告 P1）。base_* 仍保留做兜底断言：理论上 glyph_only 下
-        // 实例数不该变，若变了说明有路径绕过了这个开关。
+        // Only pre-stuff missing glyphs into atlas, turn off instance output, avoid "text encoded
+        // twice" (review report P1). base_* kept as assertion: theory says glyph_only shouldn't
+        // change instance count; if it does, some path bypassed this flag.
         const base_nearest = self.text_renderer.instances_nearest.items.len;
         const base_linear = self.text_renderer.instances_linear.items.len;
         self.text_renderer.glyph_only = true;
         defer self.text_renderer.glyph_only = false;
-        var offscreen_x: [8]f32 = [_]f32{0} ** 8;
-        var offscreen_y: [8]f32 = [_]f32{0} ** 8;
+        var offscreen_x: [8]f32 = @as([8]f32, @splat(0));
+        var offscreen_y: [8]f32 = @as([8]f32, @splat(0));
         var offscreen_depth: usize = 0;
 
         for (commands) |it| {
@@ -699,6 +724,8 @@ pub const RenderCommandEncoder = struct {
                     const use_mono = (it.text_font_flags & 2) != 0;
                     const use_sym = (it.text_font_flags & 4) != 0;
                     const raster = wire_types.textRasterControls(it.text_raster_policy);
+                    self.text_renderer.smooth_fonts = (it.text_font_flags & 8) == 0;
+                    defer self.text_renderer.smooth_fonts = true;
                     if (it.text_spans) |s| {
                         try self.encodeTextWithSpans(
                             it.geom.x + ox,
@@ -751,27 +778,28 @@ pub const RenderCommandEncoder = struct {
             }
         }
 
-        // glyph_only 下不该有新实例产生；万一某条路径绕过了开关，这里仍然兜底
-        // 截断，保持与旧行为一致（宁可多一次 shrink，也不要把 prewarm 的实例
-        // 泄漏进正式 pass 导致文字画两遍）。
+        // glyph_only should produce no new instances; if some path bypasses flag, truncate here
+        // anyway, stay consistent with old behavior (multi-shrink OK, better than leaking prewarm
+        // instances into actual pass causing double-draw).
         self.text_renderer.instances_nearest.shrinkRetainingCapacity(base_nearest);
         self.text_renderer.instances_linear.shrinkRetainingCapacity(base_linear);
 
-        // 只有真正跑完整趟 prewarm 才记签名，此刻 atlas 对这份文本必然完备。
-        // 注意读的是**跑完之后**的 gc_generation：本帧插入过程中若触发
-        // forceEvictOldestPage，代号会变，那就不能拿旧值当基线。
+        // Only record signature after completing full prewarm pass, at that point atlas must be
+        // complete for this text.
+        // Note reading **after-pass** gc_generation: if forceEvictOldestPage triggers during
+        // insertion, generation changes, can't use old value as baseline.
         self.text_renderer.prewarm_signature = signature;
         self.text_renderer.prewarm_gc_generation = self.text_renderer.atlas.gc_generation;
         self.text_renderer.prewarm_signature_valid = true;
     }
 
-    /// 统一编码循环：
-    /// 1. 跳过空结构块（支持嵌套）
-    /// 2. 在结构边界之间构建局部可排序 cluster
-    /// 3. 其余命令走常规 dispatch
+    /// Unified encoding loop:
+    /// 1. Skip empty struct blocks (supports nesting)
+    /// 2. Build locally-sortable clusters between struct boundaries
+    /// 3. Remaining commands take normal dispatch
     pub fn encodeCommands(self: *RenderCommandEncoder, commands: anytype) !void {
         self.blur_applied_count = 0;
-        if (std.posix.getenv("ZENIT_DEBUG_CMDSTREAM") != null) {
+        if (@import("zenit_environment").has("ZENIT_DEBUG_CMDSTREAM")) {
             std.debug.print("[cmdstream] ── frame {d} commands={d} ──\n", .{ self.frame_index, commands.len });
             for (commands, 0..) |it, ci| {
                 if (it.kind == .control) {
@@ -792,11 +820,12 @@ pub const RenderCommandEncoder = struct {
             const tok = paint_fp.structuralToken(commands[i]);
             if (paint_fp.isBeginStructuralToken(tok)) {
                 if (paint_fp.tryFindNoOpStructuralBlock(commands, i)) |block| {
-                    // GPU retained（2026-07-30 审查修正）：被整块跳过的空结构块
-                    // 里可能含 begin_opacity_layer，预扫描已经给它们编了号，
-                    // 这里不补推 retained_begin_seq 的话，**后续所有层都会拿到
-                    // 前移一位的错误指纹**，跨帧稳定的错误指纹 = 内容变了却判
-                    // 命中 = 画面停在陈旧内容。
+                    // GPU retained (2026-07-30 review fix): empty struct blocks fully skipped may
+                    // contain begin_opacity_layer, prescan already numbered them; the code below
+                    // must advance retained_begin_seq for each skipped begin_opacity_layer: if it
+                    // did not, all subsequent layers would get a fingerprint shifted by one slot;
+                    // a wrong fingerprint that is stable across frames means changed content is
+                    // judged a cache hit and the screen shows stale content.
                     for (commands[i .. block.end_index + 1]) |sk| {
                         if (sk.kind == .control and sk.control_kind == .begin_opacity_layer) {
                             self.retained_begin_seq += 1;
@@ -839,282 +868,28 @@ pub const RenderCommandEncoder = struct {
         try self.flushLocalSortCluster(commands, &cluster);
     }
 
-    /// GPU retained 的**内容指纹**预扫描。
+    /// GPU retained **content fingerprint** prescan.
     ///
-    /// 为什么不能直接用 display item 上带来的 `surface_content_version`：
-    /// 那是 layer **根节点自己**的 content version（node_dirty 里 markLayoutDirty
-    /// 等处 +1），descendant 内容变化并不会让它变。CPU 侧的缓存路径之所以安全，
-    /// 是因为它另外查了 `subtree_render` 脏位；encoder 拿不到那个信息。
-    /// 曾经直接用它做 key，结果 Modal 打开时命中了上一帧的空纹理，
-    /// 整个对话框画不出来（e2e 逮到）。
+    /// Why not use DisplayItem's `surface_content_version` directly: it is the layer's **own root**
+    /// content version (node_dirty markLayoutDirty etc. +1); descendant content changes do not bump
+    /// it. The CPU-side cache is safe only because it separately checks the `subtree_render` dirty
+    /// bit, which the encoder cannot see. Using it directly makes Modal reuse a cached empty
+    /// texture from the previous frame and the whole dialog fails to draw.
     ///
-    /// 现在改成对 begin..end 之间**实际要编码的命令**取哈希：内容变了指纹必变，
-    /// 内容没变指纹必同，与 descendant 深度无关，这是自洽的判据，不依赖上游
-    /// 脏标记的语义。代价是每帧一次线性扫描（无分配，纯算术）。
+    /// Instead, hash the **actual commands to encode** within begin..end: changed content must
+    /// change
+    /// the fingerprint, unchanged content keeps it; independent of descendant depth and of upstream
+    /// dirty-mark semantics. Cost: one linear scan per frame (no allocation, pure arithmetic).
     ///
-    /// 指纹只覆盖会影响**离屏纹理像素**的字段。合成参数（opacity/transform/
-    /// draw_*）故意**不计入**，它们只影响回贴，正是 retained 想省下的
-    /// "内容不变、只改 transform/opacity" 的场景。
+    /// The fingerprint covers fields affecting **offscreen texture pixels only**. Composite params
+    /// (opacity/transform/draw_*) are **intentionally excluded**: they only affect compositing, and
+    /// retained exists to save work when "content is unchanged, only transform/opacity changed".
     pub fn computeRetainedContentHashes(self: *RenderCommandEncoder, commands: anytype) void {
-        self.retained_hash_count = 0;
-        self.damage_scratch_count = 0;
-        self.damage_ranges = [_]DamageRange{.{}} ** 64;
-        // backdrop：子树里有背景模糊（玻璃）。玻璃像素取决于层**身后**的画面，
-        // 身后一变缓存就过期，而层内容指纹看不见身后，这种层（及其所有
-        // 外层，外层纹理里烘着内层玻璃）永不复用缓存纹理。
-        var stack: [64]struct { idx: usize, hasher: std.hash.Wyhash, backdrop: bool = false } = undefined;
-        var depth: usize = 0;
-        var untracked_depth: usize = 0;
-        // 非平坦层捕获状态（2026-07-30 晚扩展）：
-        //   fold_*：嵌套 opacity 子树折叠成单个 item（digest 累计子树全部命令 +
-        //           begin 自身合成参数；bounds = 合成矩形外扩）。运行时安全性：
-        //           子层内容 pass 画进自己的纹理，父 pass 的 damage scissor 在
-        //           end 恢复时由 applyOffscreenTargetViewport 重新取交生效。
-        //   clip_rects：push_clip 的矩形栈，pop_clip 作为 item 时 bounds 取
-        //           配对 push 的矩形（clip 参数变化经 index-diff 会把新旧矩形都
-        //           并入脏区，覆盖裁剪可见性变化）。clip 全走 shader uniform，
-        //           不碰 GPU scissor，运行时无需额外处理。
-        //   nest_offsets：**平移-only** 嵌套 opacity 子树（无 transform/rotate）
-        //           不折叠，逐条递归捕获，bounds 加上嵌套层在父坐标系的偏移。
-        //           这是 overlay（Modal/Popover 内容都包在嵌套 surface 里）能拿到
-        //           细粒度脏区的关键：折叠粒度 = 整个弹层矩形，永远超 60% 阈值。
-        //           带 transform 的子树才回退折叠（合成矩形无法逐条映射）。
-        var fold_depth: usize = 0;
-        var fold_hasher = std.hash.Wyhash.init(0);
-        var fold_bounds: [4]f32 = .{ 0, 0, 0, 0 };
-        var clip_rects: [16][4]f32 = undefined;
-        var clip_count: usize = 0;
-        var nest_offsets: [6][2]f32 = undefined;
-        var nest_rects: [6][4]f32 = undefined;
-        var capture_depth: usize = 0; // 已进入的平移-only 嵌套层数
-
-        for (commands) |it| {
-            // damage-rect 捕获：顶层 layer（depth==1 = 只有 stack[0] 开着）的内容
-            // 命令逐条记 {单条指纹, 外扩 bounds}。层自己的 end token 不算内容。
-            // path（bounds 从点集算）、push/pop_clip（矩形/圆角/椭圆）、嵌套
-            // opacity 子树（折叠）都可捕获；blur/rounded_clip 子树、polygon clip、
-            // 非轴对齐 transform 的嵌套层保持 unsafe -> 整层重画。
-            if (fold_depth > 0) {
-                paint_fp.hashPaintItemInto(&fold_hasher, it);
-                if (it.kind == .control) switch (it.control_kind) {
-                    .begin_opacity_layer => fold_depth += 1,
-                    .end_opacity_layer => {
-                        fold_depth -= 1;
-                        if (fold_depth == 0 and stack[0].idx < self.damage_ranges.len) {
-                            const range = &self.damage_ranges[stack[0].idx];
-                            if (range.captured and range.safe and !range.overflow) {
-                                if (self.damage_scratch_count < self.damage_scratch.len) {
-                                    self.damage_scratch[self.damage_scratch_count] = .{
-                                        .digest = fold_hasher.final(),
-                                        .bounds = fold_bounds,
-                                    };
-                                    self.damage_scratch_count += 1;
-                                    range.len += 1;
-                                } else {
-                                    range.overflow = true;
-                                }
-                            }
-                        }
-                    },
-                    else => {},
-                };
-            } else if (depth >= 1 and depth == capture_depth + 1 and stack[0].idx < self.damage_ranges.len) {
-                const is_own_end = it.kind == .control and it.control_kind == .end_opacity_layer and depth == 1;
-                if (!is_own_end) {
-                    const range = &self.damage_ranges[stack[0].idx];
-                    if (range.captured and range.safe and !range.overflow) capture: {
-                        // 当前累计偏移（平移-only 嵌套链在顶层 surface 坐标系的原点）
-                        var off_x: f32 = 0;
-                        var off_y: f32 = 0;
-                        for (nest_offsets[0..capture_depth]) |o| {
-                            off_x += o[0];
-                            off_y += o[1];
-                        }
-                        var bounds: [4]f32 = undefined;
-                        if (it.kind == .control) {
-                            switch (it.control_kind) {
-                                .push_clip => {
-                                    // polygon clip 的点集只有指针、不进指纹 -> 保守 unsafe
-                                    if (it.clip_shape_kind == 3 or clip_count >= clip_rects.len) {
-                                        range.safe = false;
-                                        break :capture;
-                                    }
-                                    bounds = .{ it.geom.x + off_x - 2, it.geom.y + off_y - 2, it.geom.w + 4, it.geom.h + 4 };
-                                    clip_rects[clip_count] = bounds;
-                                    clip_count += 1;
-                                },
-                                .pop_clip => {
-                                    // 弹出的 clip 不是本层压的（不配对）-> unsafe
-                                    if (clip_count == 0) {
-                                        range.safe = false;
-                                        break :capture;
-                                    }
-                                    clip_count -= 1;
-                                    bounds = clip_rects[clip_count];
-                                },
-                                .begin_opacity_layer => {
-                                    // 坐标合同（由合成公式推导，见 endOpacityLayer 第 6.5/7 步）：
-                                    // 嵌套纹理 (0,0) 对应嵌套-local 点 (geom.x, geom.y)，合成落在
-                                    // parent-raw 的 draw 原点 -> 嵌套-local q 映射到 parent-raw =
-                                    // q + (draw_origin - geom.xy)。plain（无 dt）时 draw==geom ->
-                                    // 偏移 0（in-flow 子层内容坐标本来就与父同系）。
-                                    const translate_only = it.use_draw_transform and it.rotate == 0 and
-                                        it.draw_transform[0] == 1 and it.draw_transform[1] == 0 and
-                                        it.draw_transform[2] == 0 and it.draw_transform[3] == 1;
-                                    const plain = !it.use_draw_transform and it.rotate == 0;
-                                    if ((plain or translate_only) and capture_depth < nest_offsets.len) {
-                                        const pad: f32 = 4;
-                                        var org_x: f32 = 0;
-                                        var org_y: f32 = 0;
-                                        var bx = it.geom.x;
-                                        var by = it.geom.y;
-                                        if (translate_only) {
-                                            org_x = it.draw_transform[4] - it.geom.x;
-                                            org_y = it.draw_transform[5] - it.geom.y;
-                                            bx = it.draw_transform[4];
-                                            by = it.draw_transform[5];
-                                        } else if (!std.math.isNan(it.draw_x) and it.draw_w > 0 and it.draw_h > 0) {
-                                            org_x = it.draw_x - it.geom.x;
-                                            org_y = it.draw_y - it.geom.y;
-                                            bx = it.draw_x;
-                                            by = it.draw_y;
-                                        }
-                                        bounds = .{ bx + off_x - pad, by + off_y - pad, it.geom.w + pad * 2, it.geom.h + pad * 2 };
-                                        nest_offsets[capture_depth] = .{ org_x + off_x, org_y + off_y };
-                                        nest_rects[capture_depth] = bounds;
-                                        capture_depth += 1;
-                                    } else if (paint_fp.nestedCompositeBounds(it)) |b| {
-                                        // 轴对齐 transform：整棵子树折叠成单个 item
-                                        fold_hasher = std.hash.Wyhash.init(0);
-                                        paint_fp.hashPaintItemInto(&fold_hasher, it);
-                                        fold_bounds = .{ b[0] + off_x, b[1] + off_y, b[2], b[3] };
-                                        fold_depth = 1;
-                                        break :capture; // 折叠 item 推迟到子树 end 落盘
-                                    } else {
-                                        // 旋转/非轴对齐 transform：合成范围无法便宜地界定
-                                        range.safe = false;
-                                        break :capture;
-                                    }
-                                },
-                                .end_opacity_layer => {
-                                    // 平移-only 嵌套层收尾：end 作为 item（digest 恒定，
-                                    // 只用于 index 对齐；bounds = 该层合成矩形，保守）
-                                    capture_depth -= 1;
-                                    bounds = nest_rects[capture_depth];
-                                },
-                                else => {
-                                    // blur/rounded_clip 会切 pass / 重置 scissor
-                                    range.safe = false;
-                                    break :capture;
-                                },
-                            }
-                        } else {
-                            bounds = if (it.kind == .path) paint_fp.pathItemBounds(it) else paint_fp.damageItemBounds(it);
-                            bounds[0] += off_x;
-                            bounds[1] += off_y;
-                        }
-                        if (self.damage_scratch_count < self.damage_scratch.len) {
-                            var ih = std.hash.Wyhash.init(0);
-                            paint_fp.hashPaintItemInto(&ih, it);
-                            self.damage_scratch[self.damage_scratch_count] = .{
-                                .digest = ih.final(),
-                                .bounds = bounds,
-                            };
-                            self.damage_scratch_count += 1;
-                            range.len += 1;
-                        } else {
-                            range.overflow = true;
-                        }
-                    }
-                }
-            }
-            // 先把本条命令喂给所有还开着的层（嵌套层共享内层内容）。
-            //
-            // ⚠️ **begin_opacity_layer 也必须喂给外层**（2026-07-30 Sheet 冻结
-            // 回归的根因）：嵌套子层的合成发生在**父层缓存纹理内部**，父层
-            // hit 时子层合成整个被跳过，像素烤在父纹理里。子层的 transform/
-            // opacity 每帧在变（Sheet 滑入、Popover 缩放），父层指纹看不见的话
-            // 就会帧帧 stale hit，整窗画面冻结到动画结束才跳变。
-            // "合成参数不计入指纹"只对**本层自己的** begin token 成立（它的
-            // 合成在缓存内容之外），所以喂外层（stack[0..depth]，不含刚要
-            // 压栈的自己）。
-            var di: usize = 0;
-            while (di < depth) : (di += 1) paint_fp.hashPaintItemInto(&stack[di].hasher, it);
-
-            if (it.kind != .control) continue;
-            switch (it.control_kind) {
-                .begin_blur_layer => {
-                    var bi: usize = 0;
-                    while (bi < depth) : (bi += 1) stack[bi].backdrop = true;
-                },
-                .begin_opacity_layer => {
-                    if (untracked_depth == 0 and depth < stack.len) {
-                        var hasher = std.hash.Wyhash.init(0);
-                        // 几何尺寸进指纹：尺寸变了纹理内容必然要重画。
-                        hasher.update(std.mem.asBytes(&it.geom.w));
-                        hasher.update(std.mem.asBytes(&it.geom.h));
-                        // scale 也必须进指纹（2026-07-30 审查补）：池的尺寸键是
-                        // 64px 桶化后的 alloc 尺寸，跨显示器/分数缩放切换时新旧
-                        // 物理尺寸可能落同一桶，不喂 scale 会命中按旧 scale
-                        // 光栅化的像素（模糊/拉伸 + UV 对不上旧 used 区域）。
-                        hasher.update(std.mem.asBytes(&self.scale));
-                        stack[depth] = .{ .idx = self.retained_hash_count, .hasher = hasher };
-                        // damage-rect：顶层 layer 开始捕获（序号超 64 的层不捕获）。
-                        // 捕获状态按层归零（上一层未配平的 clip/fold 不能串层）。
-                        if (depth == 0) {
-                            clip_count = 0;
-                            fold_depth = 0;
-                            capture_depth = 0;
-                        }
-                        if (depth == 0 and self.retained_hash_count < self.damage_ranges.len) {
-                            self.damage_ranges[self.retained_hash_count] = .{
-                                .start = @intCast(self.damage_scratch_count),
-                                .len = 0,
-                                .safe = true,
-                                .overflow = false,
-                                .captured = true,
-                            };
-                        }
-                        depth += 1;
-                    } else {
-                        // Hash slots beyond the bounded stack stay zero (forced
-                        // cache miss), but their ends must not pop a tracked
-                        // outer frame early.
-                        untracked_depth += 1;
-                    }
-                    // 每个 begin 都要占一个槽（即使栈满也要占，否则 begin 与
-                    // 消费端的序号对不上，序号错位 = 拿错别人的指纹）。
-                    if (self.retained_hash_count < self.retained_hashes.len) {
-                        self.retained_hashes[self.retained_hash_count] = 0;
-                    }
-                    self.retained_hash_count += 1;
-                },
-                .end_opacity_layer => {
-                    if (untracked_depth > 0) {
-                        untracked_depth -= 1;
-                    } else if (depth > 0) {
-                        // 注意：end 自身已经在上面喂给了**包括本层在内**的所有
-                        // 开着的层，所以本层指纹含一个 end 标记，天然区分
-                        // "内容以 end 结束" 与 "内容还没结束"。
-                        depth -= 1;
-                        const fr = &stack[depth];
-                        if (fr.idx < self.retained_hashes.len) {
-                            // 0 是"无效指纹"哨兵，真算出 0 时挪一位避免误判。
-                            // 含玻璃的层恒为 0：强制每帧重画（背景采样必须是当前帧的）。
-                            const h = fr.hasher.final();
-                            // 含玻璃的层恒为 0（无效指纹 -> 永不 retained 命中）：
-                            // 背景采样必须是当前帧的。
-                            self.retained_hashes[fr.idx] = if (fr.backdrop) 0 else if (h == 0) 1 else h;
-                        }
-                    }
-                },
-                else => {},
-            }
-        }
+        retained_plan.scan(self, commands);
     }
 
-    /// 把一条 paint 命令里**影响像素**的字段喂进指纹。
-    /// 宁可多喂（多算一次重画）也不能漏喂（漏喂 = 内容变了却判命中 = 画面陈旧）。
+    /// Feed paint command's **pixel-affecting** fields into fingerprint. Overfeed OK (extra
+    /// repaint); underfeed fatal (content changed but hit = stale screen).
     fn flushLocalSortCluster(self: *RenderCommandEncoder, commands: anytype, cluster: *LocalSortCluster) !void {
         if (cluster.isEmpty()) return;
 
@@ -1127,23 +902,26 @@ pub const RenderCommandEncoder = struct {
         cluster.clear();
     }
 
-    /// 统一命令分发，通过 anytype 接 DisplayItem union（render 模块不直接依赖 ui 模块）
+    /// Unified command dispatch via anytype on the DisplayItem union (render module does not depend
+    /// on ui directly).
     ///
-    /// Z-order barrier: SDF (rect/border/shadow) 和 text 分属不同 GPU pipeline，
-    /// 各自积累 instances 后批量 flush。默认 flush 顺序 SDF->Image->Text 意味着
-    /// 背景总在文字下方，但节点树的 z-order 可能要求"后来的背景遮住先前的文字"
-    /// (如 sticky gutter 覆盖滚动文本、z-index overlay 等)。
-    /// 解决: 当即将分派 SDF 命令时，若 text pipeline 已有 pending instances，
-    /// 说明这个 SDF 图元需要画在已有文字上方，必须先 flush 清空所有 pipeline，
-    /// 再开始新的一批，从而保证正确的 z-order 绘制顺序。
-    /// 获取当前离屏层的坐标偏移（将屏幕坐标转换为离屏局部坐标）
-    /// 在主 pass 中返回 (0, 0)；在离屏层中返回 (-layer.x, -layer.y)
+    /// Z-order barrier: SDF (rect/border/shadow) and text use different GPU pipelines; instances
+    /// accumulate separately and flush in batches. The default flush order SDF->Image->Text puts
+    /// backgrounds under text, but the node tree z-order may want a "later background covers
+    /// earlier
+    /// text" (sticky gutter over scroll text, z-index overlay).
+    /// So before dispatching an SDF command, if the text/image/icon pipelines have pending
+    /// instances, this SDF must paint above them: flush all pipelines first and start a new batch.
+    /// Get the current offscreen layer coordinate offset (screen coord -> offscreen local coord).
+    /// Returns (0, 0) in the main pass; (-layer.x, -layer.y) in an offscreen layer.
     pub inline fn offscreenOffset(self: *const RenderCommandEncoder) [2]f32 {
         if (self.offscreen_depth == 0) return .{ 0, 0 };
-        // 累积所有嵌套层的偏移
-        // 注：每层 offscreen_stack[i].x/y 是**该层在父 surface 内的 outer-local 坐标**（不是 world）。
-        // beginOpacityLayer 入栈前已减去外层累积偏移（见 beginOpacityLayer 内的 outer-local 转换）。
-        // 因此 child paint 的 world coord 减去累积值 = inner-surface-local。
+        // Accumulate all nested layer offsets
+        // Note: offscreen_stack[i].x/y is **that layer's outer-local coord within parent surface**
+        // (not world).
+        // beginOpacityLayer subtracts outer-layer accumulation before pushing (see
+        // beginOpacityLayer's outer-local conversion).
+        // Thus child paint's world coord minus accumulation = inner-surface-local.
         var dx: f32 = 0;
         var dy: f32 = 0;
         for (self.offscreen_stack[0..self.offscreen_depth]) |layer| {
@@ -1161,8 +939,8 @@ pub const RenderCommandEncoder = struct {
         return localized;
     }
 
-    // Clip 几何代数纯函数簇已析出到 command_encoder/clip_geometry.zig
-    // （比较/求交/归一），encoder 这边只留 clip **栈**的推进与回退。
+    // Clip geometry algebra pure function cluster extracted to command_encoder/clip_geometry.zig
+    // (compare/intersect/normalize); encoder keeps **stack** push/pop only.
     const roundedClipEqual = clip_geometry.roundedClipEqual;
     const clipPolygonEqual = clip_geometry.clipPolygonEqual;
 
@@ -1181,17 +959,20 @@ pub const RenderCommandEncoder = struct {
         return self.effective_rect_clip_stack[self.clip_depth - 1];
     }
 
-    /// 重开/恢复 render pass 后统一设置 viewport+scissor：
-    /// 当前目标是离屏纹理时限到该层的 used 区域（纹理按桶分配比内容大，
-    /// NDC 默认铺满 alloc 会拉伸内容）；主目标时 scissor 全 drawable。
+    /// Unified viewport+scissor setup after render pass re-open: when target is offscreen, clip to
+    /// layer's used region (bucket-allocated larger than content, NDC default fills alloc,
+    /// stretching); main target, scissor full drawable.
     pub fn applyOffscreenTargetViewport(self: *RenderCommandEncoder) void {
         const rp = self.render_pass orelse return;
         if (self.offscreen_depth > 0) {
             const layer = self.offscreen_stack[self.offscreen_depth - 1];
             if (layer.used_tex_w == 0 or layer.used_tex_h == 0) return;
-            rp.setViewport(0, 0, @floatFromInt(layer.used_tex_w), @floatFromInt(layer.used_tex_h), 0, 1);
-            // damage-rect：部分重绘层的 scissor 必须在每次 pass 恢复后重新取交
-            //（嵌套 pass 的 re-begin 会把 scissor 重置成整纹理）。
+            // the content's exact extent, as when the layer opened (opacity_layer: w x raster scale)
+            const vw: f32 = if (layer.raster_scale > 0) layer.w * layer.raster_scale else @floatFromInt(layer.used_tex_w);
+            const vh: f32 = if (layer.raster_scale > 0) layer.h * layer.raster_scale else @floatFromInt(layer.used_tex_h);
+            rp.setViewport(0, 0, vw, vh, 0, 1);
+            // damage-rect: partial-repaint layer scissor must re-intersect after each pass restore
+            // (nested pass re-begin resets scissor to full texture).
             if (layer.damage_scissor) |d| {
                 const x1 = @min(d.x + d.w, layer.used_tex_w);
                 const y1 = @min(d.y + d.h, layer.used_tex_h);
@@ -1204,8 +985,9 @@ pub const RenderCommandEncoder = struct {
         } else {
             const vw = physicalPixelExtent(self.viewport_width, self.scale);
             const vh = physicalPixelExtent(self.viewport_height, self.scale);
-            rp.setScissorRect(0, 0, vw, vh);
-            if (self.persistent.path_renderer) |*pr| pr.damage_scissor = null;
+            const rect = self.frame_damage_scissor orelse [4]u32{ 0, 0, vw, vh };
+            rp.setScissorRect(rect[0], rect[1], rect[2], rect[3]);
+            if (self.persistent.path_renderer) |*pr| pr.damage_scissor = self.frame_damage_scissor;
         }
     }
 
@@ -1220,11 +1002,12 @@ pub const RenderCommandEncoder = struct {
 
     pub const intersectClipRects = clip_geometry.intersectClipRects;
 
-    // backdrop 采样区域解析（静态函数，无 self）已析出到
-    // command_encoder/backdrop_capture.zig。backdrop_blur.zig 的调用点是
-    // `@TypeOf(encoder.*).computeBackdropCaptureRegion(...)` 反射式，这里
-    // 保留同名 decl 即零改动；类型一并 re-export。像素域转换原语见文件
-    // 头部（pixel_domain.zig），不再从这里二次转发以免歧义。
+    // backdrop capture region parsing (static, no self) extracted to
+    // command_encoder/backdrop_capture.zig. backdrop_blur.zig call is
+    // TypeOf(encoder.*).computeBackdropCaptureRegion(...) reflective; keeping same decl here = zero
+    // changes; type re-exported.
+    // Pixel-domain primitives at file head (pixel_domain.zig); don't re-forward from here to avoid
+    // ambiguity.
     pub const BackdropCaptureRegion = backdrop_capture.BackdropCaptureRegion;
     pub const computeBackdropCaptureRegion = backdrop_capture.computeBackdropCaptureRegion;
 
@@ -1249,23 +1032,24 @@ pub const RenderCommandEncoder = struct {
         return true;
     }
 
-    /// 落盘全部 pending 批次。
+    /// Flush all pending batches.
     ///
-    /// ⚠️ 单个 renderer 的资源上限**不能**中止整帧编码。
+    /// WARNING: **exhaustion of a single renderer's resources must not abort whole-frame
+    /// encoding**.
     ///
-    /// 这里曾经是一路 `try`：任一 renderer 返回 `UniformSlotsExhausted`
-    /// （每帧 uniform 槽 256 个，一次 rounded-clip 变化吃一个），错误就沿
-    /// `flushAllPending -> dispatchCommand -> encodeCommands` 抛到最外层，
-    /// 调用方 `enc.encodeDisplay(...) catch {}` 又把它吞掉，于是这一批
-    /// 之后的**所有**命令静默不发射，且没有任何报错。
+    /// If every flush used `try`, any renderer returning `UniformSlotsExhausted` (256 per-frame
+    /// slots, one rounded-clip change = one slot) would propagate via `flushAllPending ->
+    /// dispatchCommand -> encodeCommands` to the top, where the caller's
+    /// `enc.encodeDisplay(...) catch {}` swallows it and all later commands are silently dropped.
+    /// E.g. a 52-line git diff on scroll (one clip change per line) exhausted 256 slots mid-frame
+    /// and
+    /// the action bar vanished, while layout rects / display list / command stream all looked
+    /// normal.
     ///
-    /// 实测：git diff 滚动时 52 行 diff 每行一次 clip 变化，256 槽在一帧内
-    /// 耗尽，排在行区后面的动作栏（Discard/Stage）整条从画面消失，而布局
-    /// rect、display list、命令流全部正常，只看节点树永远查不出来。
-    ///
-    /// 现在每个 renderer 各自 catch：一个失败只损失它自己那一批，后续
-    /// renderer 与后续命令照常编码。错误计数仍留在各 renderer 里供诊断。
-    fn flushAllPending(self: *RenderCommandEncoder) !void {
+    /// So each renderer catches separately: one failure only loses its own batch; later renderers
+    /// and
+    /// commands encode normally. Error counts stay in the renderers for diagnostics.
+    pub fn flushAllPending(self: *RenderCommandEncoder) !void {
         const rp = self.render_pass orelse return;
         if (self.sdf_renderer.instances.items.len > 0) {
             self.sdf_renderer.flush(rp) catch |err| self.noteFlushDropped("sdf", err);
@@ -1289,8 +1073,8 @@ pub const RenderCommandEncoder = struct {
         std.log.warn("[encoder] " ++ which ++ " flush dropped a batch: {s} (frame continues)", .{@errorName(err)});
     }
 
-    /// path 命令编码前调用：落盘除 path 外的全部 pending（保证 path 画在其上），
-    /// path 自身留在 path_renderer 里跨命令合批。
+    /// Before encoding path command: flush all except path (ensure path paints on top), path itself
+    /// stays in path_renderer for cross-command batching.
     fn flushNonPathPending(self: *RenderCommandEncoder) !void {
         const rp = self.render_pass orelse return;
         if (self.sdf_renderer.instances.items.len > 0) self.sdf_renderer.flush(rp) catch |err| self.noteFlushDropped("sdf", err);
@@ -1325,7 +1109,7 @@ pub const RenderCommandEncoder = struct {
 
     fn forceRoundedClipLayer(self: *RenderCommandEncoder) bool {
         return self.force_rounded_clip_layer orelse blk: {
-            const forced = std.posix.getenv("ZENIT_ROUNDED_CLIP_LAYER") != null;
+            const forced = @import("zenit_environment").has("ZENIT_ROUNDED_CLIP_LAYER");
             self.force_rounded_clip_layer = forced;
             break :blk forced;
         };
@@ -1338,17 +1122,17 @@ pub const RenderCommandEncoder = struct {
         self.last_synced_clip_mask = active;
         if (active) |clip| {
             const rect = [4]f32{ clip.x, clip.y, clip.w, clip.h };
-            const fill_rule: u32 = @intFromEnum(clip.polygon.fill_rule);
+            const fill_rule: u32 = @backingInt(clip.polygon.fill_rule);
             const point_count: u32 = clip.polygon.point_count;
             const contour_count: u32 = clip.polygon.contour_count;
-            self.sdf_renderer.setClipMask(@intFromEnum(clip.shape_kind), rect, clip.radius, fill_rule, point_count, contour_count, clip.polygon.contour_end_points, clip.polygon.points);
-            self.text_renderer.setClipMask(@intFromEnum(clip.shape_kind), rect, clip.radius, fill_rule, point_count, contour_count, clip.polygon.contour_end_points, clip.polygon.points);
-            if (self.image_renderer) |ir| ir.setClipMask(@intFromEnum(clip.shape_kind), rect, clip.radius, fill_rule, point_count, contour_count, clip.polygon.contour_end_points, clip.polygon.points);
-            if (self.icon_renderer) |ir| ir.setClipMask(@intFromEnum(clip.shape_kind), rect, clip.radius, fill_rule, point_count, contour_count, clip.polygon.contour_end_points, clip.polygon.points);
-            if (self.persistent.path_renderer) |*pr| pr.setClipMask(@intFromEnum(clip.shape_kind), rect, clip.radius);
+            self.sdf_renderer.setClipMask(@backingInt(clip.shape_kind), rect, clip.radius, fill_rule, point_count, contour_count, clip.polygon.contour_end_points, clip.polygon.points);
+            self.text_renderer.setClipMask(@backingInt(clip.shape_kind), rect, clip.radius, fill_rule, point_count, contour_count, clip.polygon.contour_end_points, clip.polygon.points);
+            if (self.image_renderer) |ir| ir.setClipMask(@backingInt(clip.shape_kind), rect, clip.radius, fill_rule, point_count, contour_count, clip.polygon.contour_end_points, clip.polygon.points);
+            if (self.icon_renderer) |ir| ir.setClipMask(@backingInt(clip.shape_kind), rect, clip.radius, fill_rule, point_count, contour_count, clip.polygon.contour_end_points, clip.polygon.points);
+            if (self.persistent.path_renderer) |*pr| pr.setClipMask(@backingInt(clip.shape_kind), rect, clip.radius);
         } else {
-            const empty_points = [_][2]f32{.{ 0, 0 }} ** max_clip_polygon_points;
-            const empty_contours = [_]u8{0} ** max_clip_polygon_contours;
+            const empty_points = @as([max_clip_polygon_points][2]f32, @splat(.{ 0, 0 }));
+            const empty_contours = @as([max_clip_polygon_contours]u8, @splat(0));
             self.sdf_renderer.setClipMask(0, null, 0, 0, 0, 0, empty_contours, empty_points);
             self.text_renderer.setClipMask(0, null, 0, 0, 0, 0, empty_contours, empty_points);
             if (self.image_renderer) |ir| ir.setClipMask(0, null, 0, 0, 0, 0, empty_contours, empty_points);
@@ -1358,23 +1142,23 @@ pub const RenderCommandEncoder = struct {
     }
 
     inline fn coerceClipShapeKind(shape_kind: anytype) ClipShapeKind {
-        return @enumFromInt(@intFromEnum(shape_kind));
+        return @fromBackingInt(@intCast(@backingInt(shape_kind)));
     }
 
     inline fn coercePathFillRule(fill_rule: anytype) PathFillRule {
-        return @enumFromInt(@intFromEnum(fill_rule));
+        return @fromBackingInt(@intCast(@backingInt(fill_rule)));
     }
 
     fn coerceClipPolygon(polygon: anytype) ClipPolygon {
         return clip_geometry.coerceClipPolygon(ClipPolygon, polygon, coercePathFillRule);
     }
 
-    /// dispatchCommand 主路径吃 paint_table.DisplayItem。
+    /// dispatchCommand main path, takes paint_table.DisplayItem.
     ///
-    /// it: paint_table.DisplayItem (anytype), encoder 不引 ui-side type，duck typing
-    /// .kind/.control_kind/.geom/.color/.radii 等字段访问。
+    /// `it` is anytype so the encoder does not reference ui-side types; duck-types the
+    /// .kind/.control_kind/.geom/.color/.radii etc. fields.
     ///
-    /// kind 与 source variant 的映射 (lowerDisplayItem 写入)：
+    /// kind to source variant mapping (written by lowerDisplayItem):
     ///   .rect: fill_rect (stroke_width=0, noise_intensity=0, border_widths=0) /
     ///          stroke_rect (stroke_width>0) / outline_rect (stroke_width>0) /
     ///          border_per_side (border_widths!=0) / noise_rect (noise_intensity>0)
@@ -1388,14 +1172,14 @@ pub const RenderCommandEncoder = struct {
     ///          stroke_path (path_geometry_ptr stroke_width>0)
     ///   .control: 8 control kinds via control_kind enum
     fn dispatchCommand(self: *RenderCommandEncoder, it: anytype) !void {
-        // GPU retained 命中：begin..end 之间的内容已经在缓存纹理里了，全部跳过。
-        // 只需数出配对的 begin/end 找回本层的结束位置。
+        // GPU retained hit: begin..end content already in cached texture, skip all.
+        // Just count paired begin/end to find this layer's end position.
         if (self.retained_skip_depth > 0) {
             if (it.kind == .control) {
                 switch (it.control_kind) {
                     .begin_opacity_layer => {
-                        // 被跳过的内层 begin 也占一个预扫描槽位，序号必须同步推进，
-                        // 否则后续层会读到错位的指纹。
+                        // Skipped inner begin also takes prescan slot, sequence number must advance
+                        // or later layers read wrong fingerprints.
                         self.retained_begin_seq += 1;
                         self.retained_skip_depth += 1;
                     },
@@ -1416,13 +1200,13 @@ pub const RenderCommandEncoder = struct {
         const ox = off[0];
         const oy = off[1];
 
-        // path 合批的顺序 fence：path pending 存在时，任何非 path-pipeline 命令
-        // （含 arc，它走 sdf）编码前必须先把 path 落盘，否则 path 晚 flush 会
-        // 盖到后画的内容之上。path 命令自身在 .path 分支做反向 flushNonPathPending。
-        // ⚠ 「是不是 arc」只能有一份判据。此前这里用 arc_outer_radius <= 0，
-        // 而下面 .path 分支用 (radius>0 and stroke>0 and alpha>0)，两者的
-        // 差值（零宽或全透明的 arc）会掉进 fill_path 分支，而 arc 命令从不设
-        // path_geometry_ptr ⇒ `orelse return` 静默吞掉整条命令。
+        // path batching order fence: when path pending exists, any non-path-pipeline command
+        // (including arc via sdf) must flush path first, else late path flush covers later content.
+        // path command itself does reverse flushNonPathPending in .path branch.
+        // WARNING: "is it arc" must have one criterion only. Previously here arc_outer_radius <= 0,
+        // .path branch used (radius>0 and stroke>0 and alpha>0), difference
+        // (zero-width/fully-transparent arc) falls into fill_path branch, but arc command never
+        // sets path_geometry_ptr => orelse return silently drops.
         const is_arc = isArcCommand(it);
         const is_batched_path = it.kind == .path and !is_arc;
         if (!is_batched_path) try self.flushPathPending();
@@ -1430,9 +1214,9 @@ pub const RenderCommandEncoder = struct {
         switch (it.kind) {
             .none => return,
             .rect => {
-                // 形状上下文：非矩形（椭圆）时，本条命令产出的所有实例
-                // （填充/描边/渐变/噪声/阴影）都用该形状的 SDF。
-                // defer 复位是**必须**的，残留会让后面无关的矩形变椭圆。
+                // Shape context: non-rect (ellipse) means all instances from this command
+                // (fill/stroke/gradient/noise/shadow) use that shape's SDF.
+                // defer reset **mandatory**, residual taints unrelated rects with ellipse.
                 self.sdf_renderer.current_shape =
                     if (it.shape_kind == 1) .ellipse else .rect;
                 defer self.sdf_renderer.current_shape = .rect;
@@ -1441,15 +1225,15 @@ pub const RenderCommandEncoder = struct {
                 if (w <= 0 or h <= 0) return;
                 try self.flushIfTextPending();
                 const radii = it.radii.toArray();
-                // noise_rect: noise_intensity > 0 是判别条件 (即使 fill.a == 0 也要画)
-                if (it.noise_intensity > 0) {
+                // noise_rect: noise_intensity > 0 is condition (even if fill.a == 0, still draw)
+                if (it.noise_intensity > 0 and self.visual_quality != .basic) {
                     try self.sdf_renderer.addNoiseRect(
                         it.geom.x + ox,
                         it.geom.y + oy,
                         w,
                         h,
                         colorToFloat4(it.color),
-                        @enumFromInt(it.noise_mode),
+                        @fromBackingInt(@intCast(it.noise_mode)),
                         it.noise_scale,
                         it.noise_intensity,
                         it.noise_seed,
@@ -1461,16 +1245,11 @@ pub const RenderCommandEncoder = struct {
                 // border_per_side: any width > 0
                 const any_border_width = it.border_widths[0] > 0 or it.border_widths[1] > 0 or
                     it.border_widths[2] > 0 or it.border_widths[3] > 0;
-                // ── 椭圆：填充与描边都走 addEllipse（shape_type=4 的 SDF）──
-                // 必须在 per-side / stroke / fill 三条 rect 路径**之前**拦截：
-                // 那三条都会写 shape_type=rect，椭圆掉进去就退回圆角矩形
-                // （宽高比大时就是"胶囊"）。per-side 宽度在入口折叠成统一宽度,
-                // 椭圆没有"四条边"，且 shader 的 per-side 分支硬编码矩形内轮廓。
-                // ── 椭圆：填充与描边都走 addEllipse（shape_type=4 的 SDF）──
-                // 必须在 per-side / stroke / fill 三条 rect 路径**之前**拦截：
-                // 那三条都会写 shape_type=rect，椭圆掉进去就退回圆角矩形（宽高
-                // 比大时就是"胶囊"）。per-side 宽度在入口折叠成统一宽度,
-                // 椭圆没有"四条边"，且 shader 的 per-side 分支硬编码矩形内轮廓。
+                // Ellipse: fill+stroke both call addEllipse (shape_type=4 SDF) **before** per-side
+                // / stroke / fill rect paths: all three write shape_type=rect, ellipse falls
+                // through to rounded rect (wide aspect ratio = "capsule").
+                // per-side width collapses to uniform at entry; ellipse has no "four edges", shader
+                // per-side branch hardcodes rect inner contour.
                 if (it.shape_kind == 1) {
                     try self.sdf_renderer.addEllipse(
                         it.geom.x + ox,
@@ -1503,7 +1282,7 @@ pub const RenderCommandEncoder = struct {
                     );
                     return;
                 }
-                // stroke_rect / outline_rect (二者都用 addBorderedRect)
+                // stroke_rect / outline_rect (both use addBorderedRect)
                 if (it.stroke_width > 0) {
                     try self.sdf_renderer.addBorderedRect(
                         it.geom.x + ox,
@@ -1517,7 +1296,7 @@ pub const RenderCommandEncoder = struct {
                     );
                     return;
                 }
-                // fill_rect (默认)
+                // fill_rect (default)
                 try self.sdf_renderer.addRoundedRect(
                     it.geom.x + ox,
                     it.geom.y + oy,
@@ -1528,7 +1307,7 @@ pub const RenderCommandEncoder = struct {
                 );
             },
             .text => {
-                const dbg_surf = std.posix.getenv("ZENIT_DEBUG_SURFDUMP") != null and self.offscreen_depth > 0;
+                const dbg_surf = @import("zenit_environment").has("ZENIT_DEBUG_SURFDUMP") and self.offscreen_depth > 0;
                 const dbg_before = if (dbg_surf) self.text_renderer.instances_nearest.items.len + self.text_renderer.instances_linear.items.len else 0;
                 defer if (dbg_surf) {
                     const after = self.text_renderer.instances_nearest.items.len + self.text_renderer.instances_linear.items.len;
@@ -1541,8 +1320,11 @@ pub const RenderCommandEncoder = struct {
                 const use_mono = (it.text_font_flags & 2) != 0;
                 const use_sym = (it.text_font_flags & 4) != 0;
                 const raster = wire_types.textRasterControls(it.text_raster_policy);
-                // 右端淡出遮罩：换算成绝对 x 交给 renderer，逐命令设置并复位
-                // （同 clip_x_* 的模式；fade 只影响 alpha，不影响 glyph atlas）。
+                // TextFontFlag.no_smoothing (TextProps.font_smoothing = false)
+                self.text_renderer.smooth_fonts = (it.text_font_flags & 8) == 0;
+                defer self.text_renderer.smooth_fonts = true;
+                // Right-edge fade mask: convert to absolute x for renderer, set per-command and
+                // reset (same pattern as clip_x_*; fade affects alpha only, not glyph atlas).
                 if (it.text_fade_dx1 > it.text_fade_dx0) {
                     self.text_renderer.fade_x0 = it.geom.x + ox + it.text_fade_dx0;
                     self.text_renderer.fade_x1 = it.geom.x + ox + it.text_fade_dx1;
@@ -1606,6 +1388,7 @@ pub const RenderCommandEncoder = struct {
                             it.icon_corner_clip_radius,
                             it.image_opacity,
                             it.rotate,
+                            it.icon_snap,
                         );
                     }
                 } else {
@@ -1628,6 +1411,15 @@ pub const RenderCommandEncoder = struct {
                 }
             },
             .shadow => {
+                if (self.visual_quality == .basic) {
+                    // Inset/dual shadow commands carry the surface fill too.
+                    // Drop only decoration, never the underlying control body.
+                    if ((it.shadow_secondary_color.a > 0 or it.shadow2_color.a > 0) and it.color.a > 0) {
+                        try self.flushIfTextPending();
+                        try self.sdf_renderer.addRoundedRect(it.geom.x + ox, it.geom.y + oy, it.geom.w, it.geom.h, colorToFloat4(it.color), it.radii.toArray());
+                    }
+                    return;
+                }
                 const w = it.geom.w;
                 const h = it.geom.h;
                 if (w <= 0 or h <= 0) return;
@@ -1655,7 +1447,7 @@ pub const RenderCommandEncoder = struct {
                     );
                     return;
                 }
-                // inset_shadow: shadow_secondary.a > 0 (shadow_color 字段)
+                // inset_shadow: shadow_secondary.a > 0 (shadow_color field)
                 if (it.shadow_secondary_color.a > 0) {
                     try self.sdf_renderer.addInsetShadowRect(
                         it.geom.x + ox,
@@ -1671,7 +1463,7 @@ pub const RenderCommandEncoder = struct {
                     );
                     return;
                 }
-                // 普通 shadow_rect
+                // Normal shadow_rect
                 if (it.color.a == 0) return;
                 try self.sdf_renderer.addShadowRectSpread(
                     it.geom.x + ox,
@@ -1688,9 +1480,9 @@ pub const RenderCommandEncoder = struct {
                 );
             },
             .gradient => {
-                // 渐变也必须服从形状：否则椭圆/正圆的渐变会铺满整个包围盒
-                // （用户实测截图：椭圆外面一个渐变方块）。与 .rect 同一条纪律，
-                // defer 复位防止残留污染后面的矩形。
+                // Gradient must obey shape: else ellipse/circle gradient fills bounding box (user
+                // real capture: gradient quad outside ellipse).
+                // Same discipline as .rect; defer reset prevents residual tainting later rects.
                 self.sdf_renderer.current_shape =
                     if (it.shape_kind == 1) .ellipse else .rect;
                 defer self.sdf_renderer.current_shape = .rect;
@@ -1725,7 +1517,7 @@ pub const RenderCommandEncoder = struct {
                     );
                     return;
                 }
-                // 普通 gradient_rect
+                // Normal gradient_rect
                 if (it.color.a == 0 and it.gradient_to_color.a == 0) return;
                 try self.encodeGradient(
                     it.geom.x + ox,
@@ -1744,9 +1536,9 @@ pub const RenderCommandEncoder = struct {
             },
             .path => {
                 if (is_arc) {
-                    // 零宽 / 全透明的 arc 没有可见像素，直接早退。
-                    // 关键是**不能**让它继续往下掉：arc 命令不带
-                    // path_geometry_ptr，掉进 fill_path 分支只会被静默丢弃。
+                    // Zero-width / fully-transparent arc has no visible pixels, early exit.
+                    // Key: **can't** continue down: arc command carries no path_geometry_ptr,
+                    // fill_path branch silently drops.
                     if (it.stroke_width <= 0 or it.color.a == 0) return;
                     try self.flushIfTextPending();
                     try self.sdf_renderer.addArc(
@@ -1760,9 +1552,9 @@ pub const RenderCommandEncoder = struct {
                     );
                     return;
                 }
-                // fill_path / stroke_path：先落盘其它 pipeline 保证 z-order，
-                // 自身在 path_renderer 里累积，连续多条 path 合并为一次 flush
-                //（反向 fence 在 dispatchCommand 顶部：非 path 命令先 flush path pending）
+                // fill_path / stroke_path: flush other pipelines first for z-order, self
+                // accumulates in path_renderer, consecutive paths merge into one flush (reverse
+                // fence at dispatchCommand top: non-path command flushes path pending).
                 const geo_ptr = it.path_geometry_ptr orelse return;
                 try self.flushNonPathPending();
                 if (it.stroke_width > 0) {
@@ -1777,7 +1569,7 @@ pub const RenderCommandEncoder = struct {
         }
     }
 
-    /// GPU retained 命中的合成收尾（内容 pass 被跳过，只贴一次缓存纹理）。
+    /// GPU retained hit composite finish (content pass skipped, composite cached texture once).
     fn compositeRetainedLayer(self: *RenderCommandEncoder) !void {
         try opacity_layer.compositeRetainedLayer(self);
     }
@@ -1790,13 +1582,13 @@ pub const RenderCommandEncoder = struct {
         switch (it.control_kind) {
             .none => return,
             .push_clip => {
-                if (std.posix.getenv("ZENIT_DEBUG_SURFDUMP") != null and self.offscreen_depth > 0) {
+                if (@import("zenit_environment").has("ZENIT_DEBUG_SURFDUMP") and self.offscreen_depth > 0) {
                     std.debug.print("[surfclip] depth={d} clip=({d:.1},{d:.1},{d:.1},{d:.1}) off=({d:.1},{d:.1})\n", .{
                         self.offscreen_depth, it.geom.x, it.geom.y, it.geom.w, it.geom.h, ox, oy,
                     });
                 }
-                // shape_kind 0/1/2/3 (rect/rounded_rect/ellipse/polygon)。polygon 通过
-                // clip_polygon_ptr 取 source ClipPolygon ptr，其它走 inline 字段。
+                // shape_kind 0/1/2/3 (rect/rounded_rect/ellipse/polygon). polygon gets source
+                // ClipPolygon ptr via clip_polygon_ptr, others use inline fields.
                 const polygon: ClipPolygon = if (it.clip_polygon_ptr) |pp|
                     coerceClipPolygon(pp.*)
                 else
@@ -1807,7 +1599,7 @@ pub const RenderCommandEncoder = struct {
                     it.geom.w,
                     it.geom.h,
                     it.radii.tl,
-                    @enumFromInt(it.clip_shape_kind),
+                    @fromBackingInt(@intCast(it.clip_shape_kind)),
                     polygon,
                 );
             },
@@ -1815,79 +1607,114 @@ pub const RenderCommandEncoder = struct {
                 try self.popClip();
             },
             .begin_opacity_layer => {
+                const aligned = opacity_layer.alignTranslationSurface(it, self.scale, self.offscreenOffset());
+                // A rounded layer composites its own rect (the mask) from the aligned texture.
+                const quad: [4]f32 = if (it.radii.tl >= 0.5 and aligned.geom.w != it.geom.w)
+                    .{ it.geom.x - aligned.geom.x, it.geom.y - aligned.geom.y, it.geom.w, it.geom.h }
+                else
+                    .{ 0, 0, 0, 0 };
                 const content_seq = self.retained_begin_seq;
-                const content_hash: u64 = blk: {
+                var content_hash: u64 = blk: {
                     const seq = self.retained_begin_seq;
                     self.retained_begin_seq += 1;
                     if (seq >= self.retained_hashes.len) break :blk 0;
                     if (seq >= self.retained_hash_count) break :blk 0;
                     break :blk self.retained_hashes[seq];
                 };
-                const draw_x = if (std.math.isNan(it.draw_x)) it.geom.x else it.draw_x;
-                const draw_y = if (std.math.isNan(it.draw_y)) it.geom.y else it.draw_y;
-                const draw_w = if (std.math.isNan(it.draw_w)) it.geom.w else it.draw_w;
-                const draw_h = if (std.math.isNan(it.draw_h)) it.geom.h else it.draw_h;
-                const blend_mode_val: BlendMode = @enumFromInt(it.blend_mode);
+                // A changed pixel phase must invalidate retained pixels even
+                // when the allocation remains in the same size bucket.
+                content_hash = opacity_layer.rasterContentHash(content_hash, aligned.geom, self.scale);
+                const draw_x = if (std.math.isNan(aligned.draw_x)) aligned.geom.x else aligned.draw_x;
+                const draw_y = if (std.math.isNan(aligned.draw_y)) aligned.geom.y else aligned.draw_y;
+                const draw_w = if (std.math.isNan(aligned.draw_w)) aligned.geom.w else aligned.draw_w;
+                const draw_h = if (std.math.isNan(aligned.draw_h)) aligned.geom.h else aligned.draw_h;
+                const blend_mode_val: BlendMode = @fromBackingInt(@intCast(aligned.blend_mode));
                 // Malformed/deep display lists degrade to a direct-rendering noop layer.
                 // Never open an offscreen layer that cannot be paired in our mode stack.
                 if (self.opacity_mode_overflow_depth > 0 or self.opacity_mode_depth >= self.opacity_mode_stack.len) {
                     self.opacity_mode_overflow_depth +|= 1;
                     return;
                 }
-                // 带 corner_radius（rounded-clip 折叠进 opacity layer）时不可走
-                // noop 短路，mask 依赖 composite blit 施加。
-                const trivial = it.opacity >= 0.999 and
+                // With corner_radius (rounded-clip folded into opacity layer) can't take noop
+                // shortcut, mask depends on composite blit.
+                // A surface matrix maps local coordinates back to its envelope. Identity linear
+                // terms plus the envelope origin cancel the localization; opaque normal groups need
+                // no intermediate RT.
+                const identity_surface = gpu.backend_kind == .d3d12 and aligned.use_draw_transform and
+                    aligned.draw_transform[0] == 1 and aligned.draw_transform[1] == 0 and
+                    aligned.draw_transform[2] == 0 and aligned.draw_transform[3] == 1 and
+                    aligned.draw_transform[4] == aligned.geom.x and aligned.draw_transform[5] == aligned.geom.y;
+                // A draw rect other than the source rect moves/scales the
+                // layer's pixels: that needs the offscreen copy even when
+                // opaque (a noop drew nested legacy layers at their source).
+                const same_rect = @abs(draw_x - aligned.geom.x) < 1e-3 and @abs(draw_y - aligned.geom.y) < 1e-3 and
+                    @abs(draw_w - aligned.geom.w) < 1e-3 and @abs(draw_h - aligned.geom.h) < 1e-3;
+                const warp_active = aligned.warp[0] != 0 or aligned.warp[1] != 0;
+                const trivial = aligned.opacity >= 0.999 and
                     blend_mode_val == .normal and
-                    !it.use_draw_transform and
-                    it.rotate == 0 and
-                    it.radii.tl < 0.5;
+                    !warp_active and
+                    (!aligned.use_draw_transform or identity_surface) and
+                    (aligned.use_draw_transform or same_rect) and
+                    aligned.rotate == 0 and
+                    aligned.radii.tl < 0.5;
                 if (trivial) {
                     self.pushOpacityMode(.noop);
-                } else switch (try opacity_layer.tryBeginRetainedOpacityLayer(
+                } else switch (if (warp_active) opacity_layer.RetainedBegin.declined else try opacity_layer.tryBeginRetainedOpacityLayer(
                     self,
-                    it.geom.x,
-                    it.geom.y,
-                    it.geom.w,
-                    it.geom.h,
-                    it.opacity,
-                    it.rotate,
+                    aligned.geom.x,
+                    aligned.geom.y,
+                    aligned.geom.w,
+                    aligned.geom.h,
+                    aligned.opacity,
+                    aligned.rotate,
                     draw_x,
                     draw_y,
                     draw_w,
                     draw_h,
-                    it.use_draw_transform,
-                    it.draw_transform,
+                    aligned.use_draw_transform,
+                    aligned.draw_transform,
                     blend_mode_val,
-                    it.radii.tl,
-                    it.surface_stable_id,
+                    aligned.radii.tl,
+                    aligned.surface_stable_id,
                     content_hash,
                     content_seq,
                 )) {
-                    // 命中：内容 pass 整个跳过，end 处只做一次合成 draw。
-                    .hit => self.retained_skip_depth = 1,
-                    // retained 已经替我们开好层了（画进专属纹理），内容命令照常
-                    // 编码。**绝不能再调一次 beginOpacityLayer**，那会套两层。
-                    .opened_for_repaint => self.pushOpacityMode(.layer),
+                    // Hit: content pass fully skipped, end does one composite draw.
+                    .hit => {
+                        self.retained_skip_depth = 1;
+                        if (self.retained_pending_depth > 0) self.retained_pending[self.retained_pending_depth - 1].quad = quad;
+                    },
+                    // retained already opened layer for us (draws to dedicated texture), encode
+                    // content normally. **Must not call beginOpacityLayer again**, that stacks two
+                    // layers.
+                    .opened_for_repaint => {
+                        self.pushOpacityMode(.layer);
+                        if (self.offscreen_depth > 0) self.offscreen_stack[self.offscreen_depth - 1].quad = quad;
+                    },
                     .declined => {
                         const opened = try opacity_layer.beginOpacityLayer(
                             self,
-                            it.geom.x,
-                            it.geom.y,
-                            it.geom.w,
-                            it.geom.h,
-                            it.opacity,
-                            it.rotate,
+                            aligned.geom.x,
+                            aligned.geom.y,
+                            aligned.geom.w,
+                            aligned.geom.h,
+                            aligned.opacity,
+                            aligned.rotate,
                             draw_x,
                             draw_y,
                             draw_w,
                             draw_h,
-                            it.use_draw_transform,
-                            it.draw_transform,
+                            aligned.use_draw_transform,
+                            aligned.draw_transform,
                             blend_mode_val,
                         );
                         self.pushOpacityMode(if (opened) .layer else .noop);
-                        if (opened and it.radii.tl >= 0.5 and self.offscreen_depth > 0) {
-                            self.offscreen_stack[self.offscreen_depth - 1].corner_radius = it.radii.tl;
+                        if (opened and aligned.radii.tl >= 0.5 and self.offscreen_depth > 0) {
+                            self.offscreen_stack[self.offscreen_depth - 1].corner_radius = aligned.radii.tl;
+                            self.offscreen_stack[self.offscreen_depth - 1].quad = quad;
+                        }
+                        if (opened and warp_active and self.offscreen_depth > 0) {
+                            self.offscreen_stack[self.offscreen_depth - 1].warp = aligned.warp;
                         }
                     },
                 }
@@ -1905,15 +1732,15 @@ pub const RenderCommandEncoder = struct {
                     self.rounded_clip_overflow_depth +|= 1;
                     return;
                 }
-                // Shader clip 转换：轴对齐（无 rotate/draw_transform）且当前没有
-                // 别的 shape clip 占用 mask 槽时，圆角裁剪走各 pipeline 已有的
-                // fragment SDF clip，省掉整个离屏往返（flush + end pass + clear
-                // pass + 内容 + 合成 pass）。否则回退旧的 offscreen layer 路径。
+                // Shader clip path: axis-aligned (no rotate/draw_transform) && no other shape clip
+                // occupying mask slot -> rounded-clip uses pipeline's existing fragment SDF clip,
+                // saves whole offscreen round-trip (flush + end pass + clear pass + content +
+                // composite pass). Else fallback to old offscreen layer path.
                 const can_shader_clip = it.rotate == 0 and
                     !it.use_draw_transform and
                     self.activeRoundedClip() == null and
                     !self.forceRoundedClipLayer();
-                if (std.posix.getenv("ZENIT_DEBUG_PASSCOUNT") != null) {
+                if (@import("zenit_environment").has("ZENIT_DEBUG_PASSCOUNT")) {
                     std.debug.print("[rclip] mode={s}\n", .{if (can_shader_clip) "shader" else "layer"});
                 }
                 if (can_shader_clip) {
@@ -1979,9 +1806,10 @@ pub const RenderCommandEncoder = struct {
                 const draw_y = if (std.math.isNan(it.draw_y)) it.geom.y else it.draw_y;
                 const draw_w = if (std.math.isNan(it.draw_w)) it.geom.w else it.draw_w;
                 const draw_h = if (std.math.isNan(it.draw_h)) it.geom.h else it.draw_h;
-                // 测试 mock item 无此字段，@hasField 守卫（生产 PaintItem 恒有）。
+                // test mock item lacks this field, @hasField guard (production PaintItem always
+                // has).
                 const glass_owner: u32 = if (@hasField(@TypeOf(it), "glass_owner_id")) it.glass_owner_id else std.math.maxInt(u32);
-                // 同 owner 一帧只合成一次背板（见 blur_applied_owners 注释）。
+                // Same owner composites backdrop once per frame (see blur_applied_owners comment).
                 if (glass_owner != std.math.maxInt(u32)) {
                     for (self.blur_applied_owners[0..self.blur_applied_count]) |applied| {
                         if (applied == glass_owner) return;
@@ -1991,15 +1819,92 @@ pub const RenderCommandEncoder = struct {
                         self.blur_applied_count += 1;
                     }
                 }
+                // GlassGroup: container surface has shape table -> one sample, one composite for N
+                // shapes; empty table draws nothing.
+                var group_count: u8 = 0;
+                var group_spacing: f32 = 0;
+                var group_blend: f32 = 1;
+                var group_motion: f32 = 0;
+                var group_continuous = false;
+                var group_shapes: [backdrop_blur.max_group_shapes]backdrop_blur.GroupShape = undefined;
+                var group_aliases: [backdrop_blur.max_group_shapes][2]u32 = undefined;
+                var group_alias_count: u8 = 0;
+                if (comptime @hasField(@TypeOf(g), "group")) {
+                    if (g.group) |grp| {
+                        group_spacing = grp.spacing;
+                        group_blend = grp.blend;
+                        group_motion = grp.motion;
+                        group_continuous = grp.continuous;
+                        const n: usize = @min(grp.count, group_shapes.len);
+                        var union_keys: [backdrop_blur.max_group_shapes]u32 = @splat(0);
+                        shapes: for (grp.shapes[0..n]) |sh| {
+                            // Empty slots (member unregistered / not yet written) and zero-size
+                            // members skip composite
+                            if (sh.node_id == std.math.maxInt(u32) or sh.w <= 0.5 or sh.h <= 0.5) continue;
+                            // glassEffectUnion: same-key members merge into first entry (overall
+                            // bounding box same-shape).
+                            if (sh.union_key != 0) {
+                                for (union_keys[0..group_count], 0..) |k, j| {
+                                    if (k == sh.union_key) {
+                                        backdrop_blur.mergeUnionInto(&group_shapes[j], sh.x, sh.y, sh.w, sh.h, sh.capsule);
+                                        if (group_alias_count < group_aliases.len) {
+                                            group_aliases[group_alias_count] = .{ sh.node_id, @intCast(j) };
+                                            group_alias_count += 1;
+                                        }
+                                        continue :shapes;
+                                    }
+                                }
+                            }
+                            union_keys[group_count] = sh.union_key;
+                            const m = sh.material;
+                            group_shapes[group_count] = .{
+                                .node_id = sh.node_id,
+                                .x = sh.x,
+                                .y = sh.y,
+                                .w = sh.w,
+                                .h = sh.h,
+                                .radius = sh.radius,
+                                .lens = .{ m.lens_bezel_px, m.lens_height_px, m.lens_base_px, m.lens_edge_blur },
+                                .tint = m.glass_tint,
+                                .specular_opacity = m.specular_opacity,
+                                .rim = .{ m.native_rim_offset, m.native_rim_luma, m.native_rim_chroma, m.native_rim_ratio },
+                                .tint_response = .{ m.native_tint_mode, m.native_tint_dark, m.native_tint_chroma_base, m.native_tint_chroma_slope },
+                                .tint_mode = m.tint_mode,
+                                .shadow = .{ sh.shadow_alpha, sh.shadow_blur, sh.shadow_offset_x, sh.shadow_offset_y },
+                                .level = sh.level,
+                                .base_veil = sh.base_veil,
+                                .press_offset = sh.press_offset,
+                            };
+                            group_count += 1;
+                        }
+                        if (group_count == 0) return;
+                    }
+                }
+                if (@import("zenit_environment").has("ZENIT_DEBUG_GLASS")) {
+                    std.debug.print("[glassenc-params] owner={d} tab_lens=({d:.1},{d:.1},{d:.1}) lens_bezel={d:.2} gi={d:.2} surface={d} tint_mode={d} tint=({d:.2},{d:.2},{d:.2},{d:.2}) native_tint_mode={d:.0} sat={d:.3} bri={d:.3} fine=({d:.2},{d:.2}) coarse=({d:.2},{d:.2}) chroma=({d:.2},{d:.2},{d:.0}) blur_level={d:.2} group_count={d} rect=({d:.1},{d:.1},{d:.1},{d:.1})\n", .{ glass_owner, g.tab_lens[0], g.tab_lens[1], g.tab_lens[2], g.lens_bezel_px, g.glass_intensity, coerceGlassSurfaceValue(g.surface), g.tint_mode, g.glass_tint[0], g.glass_tint[1], g.glass_tint[2], g.glass_tint[3], g.native_tint_mode, g.backdrop_saturation, g.backdrop_brightness, g.native_fine_sigma, g.native_fine_weight, g.native_coarse_sigma, g.native_coarse_weight, g.native_chroma_fine, g.native_chroma_coarse, g.native_chroma_enabled, g.blur_level, group_count, it.geom.x, it.geom.y, it.geom.w, it.geom.h });
+                }
                 try backdrop_blur.applyBackdropBlur(self, .{
                     .glass_owner_id = glass_owner,
+                    .group_count = group_count,
+                    .group_spacing = group_spacing,
+                    .group_blend = group_blend,
+                    .group_motion = group_motion,
+                    .group_continuous = group_continuous,
+                    .group_shapes = group_shapes,
+                    .group_aliases = group_aliases,
+                    .group_alias_count = group_alias_count,
                     .x = it.geom.x,
                     .y = it.geom.y,
                     .w = it.geom.w,
                     .h = it.geom.h,
                     .blur_radius = g.backdrop_blur,
-                    .corner_radius = it.radii.tl,
+                    .corner_radius = @max(@max(it.radii.tl, it.radii.tr), @max(it.radii.br, it.radii.bl)),
+                    .corner_radii = it.radii.toArray(),
                     .glass_tint = g.glass_tint,
+                    .tint_mode = g.tint_mode,
+                    .base_veil = g.base_veil,
+                    .veil_curve = g.veil_curve,
+                    .tab_lens = g.tab_lens,
                     .glass_intensity = g.glass_intensity,
                     .specular_opacity = g.specular_opacity,
                     .specular_saturation = g.specular_saturation,
@@ -2020,6 +1925,20 @@ pub const RenderCommandEncoder = struct {
                     .center_zoom_radius = g.center_zoom_radius,
                     .center_zoom_falloff = g.center_zoom_falloff,
                     .backdrop_distance = g.backdrop_distance,
+                    .native_params = .{ g.lens_bezel_px, g.lens_height_px, g.lens_base_px, g.lens_edge_blur },
+                    .native_blur = .{ g.native_fine_sigma, g.native_coarse_sigma, g.native_fine_weight, g.native_coarse_weight },
+                    .native_blur_profile = .{ g.native_fine_slope, g.native_fine_curve, g.native_coarse_slope, g.native_coarse_curve },
+                    .native_rim = .{ g.native_rim_offset, g.native_rim_luma, g.native_rim_chroma, g.native_rim_ratio },
+                    .native_chroma = .{ g.native_chroma_fine, g.native_chroma_coarse, g.native_chroma_enabled, g.native_main_grid_mix },
+                    .native_continuous_geometry = g.native_continuous_geometry,
+                    .press_offset = g.press_offset,
+                    .arrow = g.arrow,
+                    .knob_rim_dark = g.knob_rim_dark,
+                    .knob_rim_light = g.knob_rim_light,
+                    .a11y = g.a11y,
+                    .capture_clamp = g.capture_clamp,
+                    .native_chroma_profile = .{ g.native_chroma_fine_slope, g.native_chroma_fine_curve, g.native_chroma_coarse_slope, g.native_chroma_coarse_curve },
+                    .native_tint_response = .{ g.native_tint_mode, g.native_tint_dark, g.native_tint_chroma_base, g.native_tint_chroma_slope },
                     .blur_gradient_direction = @floatFromInt(g.blur_gradient_direction),
                     .blur_gradient_strength = g.blur_gradient_strength,
                     .blur_gradient_stop_pos = g.blur_gradient_stop_pos,
@@ -2035,23 +1954,24 @@ pub const RenderCommandEncoder = struct {
                 });
             },
             .end_blur_layer => {
-                // backdrop blur 在 begin 时已完成，end 无需操作
+                // backdrop blur completes at begin, end needs no action
             },
         }
     }
 
-    /// paint_table.DisplayItem 主路径的 fill_path 编码。
-    /// it 是 paint_table.DisplayItem (anytype)，geo 是 source PathGeometry ptr (来自 it.path_geometry_ptr)。
-    /// Phase C：path mesh 缓存键，几何逐 tag payload + fill/stroke 判别 +
-    /// scale（fringe/stroke expand 的 AA 宽度依赖 scale）+ stroke 参数。
-    /// offset 不进 key（mesh 平移不变，缓存存 path-local 顶点）。
+    /// paint_table.DisplayItem main path fill_path encoding.
+    /// it is paint_table.DisplayItem (anytype), geo is source PathGeometry ptr (from
+    /// it.path_geometry_ptr).
+    /// Phase C: path mesh cache key: geometry per tag payload + fill/stroke decision + scale
+    /// (fringe/stroke expand AA width depends on scale) + stroke params.
+    /// offset not in key (mesh translation-invariant, cache stores path-local vertices).
     fn pathMeshKey(geo: anytype, scale: f32, is_stroke: bool, stroke_width: f32, line_join: u8) u64 {
         var h = std.hash.Wyhash.init(0x9E3779B97F4A7C15);
         h.update(std.mem.asBytes(&geo.fill_rule));
         var cmd_len: usize = geo.commands.len;
         h.update(std.mem.asBytes(&cmd_len));
         for (geo.commands) |cmd| {
-            const tag: u8 = @intFromEnum(cmd);
+            const tag: u8 = @backingInt(cmd);
             h.update(std.mem.asBytes(&tag));
             switch (cmd) {
                 .move_to, .line_to => |pt| h.update(std.mem.asBytes(&pt)),
@@ -2088,27 +2008,26 @@ pub const RenderCommandEncoder = struct {
         const c = it.color;
         const a = @as(f32, @floatFromInt(c.a)) / 255.0 * it.image_opacity;
         const color = [4]f32{
-            srgbByteToLinear(c.r),
-            srgbByteToLinear(c.g),
-            srgbByteToLinear(c.b),
+            byteToShader(c.r),
+            byteToShader(c.g),
+            byteToShader(c.b),
             a,
         };
 
-        // 矢量填充与描边走**同一条**自适应细分管线（tess.flatten 按
-        // FLATNESS_THRESHOLD/scale，无点数上限），这是唯一正确形态：
-        // 此前这里优先走 ≤32 点 clip 多边形的快速路径（直边弦多边形、
-        // 每段 cubic 最多 12 步），填充边界与描边边界是两套分辨率的几何
-        // 曲线段上弦误差肉眼可见，描边与填充之间露出楔形缺口。
-        // clip 多边形是 clip 的专用结构（display_list 的 32 点上限），
-        // 不该复用为填充渲染器。
-        // 已知取舍：earclip 逐轮廓三角化，多轮廓挖洞（nonzero/evenodd 的
-        // hole 语义）不自洽，该局限对超出 32 点的填充一直存在，矢量填充
-        // 的实际使用域（单轮廓 path）不受影响；多轮廓正确性属于离屏
-        // alpha mask 那一层。
+        // Vector fill+stroke use **same** adaptive tessellation pipeline (tess.flatten by
+        // FLATNESS_THRESHOLD/scale, no point limit), only correct form: previously fast path for
+        // <=32-point clip polygon (straight-edge chord polygon, <=12 steps per cubic), fill and
+        // stroke boundaries two tessellation resolutions, seam error visible, stroke-fill gap.
+        // clip polygon is clip's own struct (display_list 32-point limit), shouldn't reuse for fill
+        // renderer.
+        // Known tradeoff: earclip triangulates per contour, multicontour holes (nonzero/evenodd
+        // hole semantics) don't reconcile, this limit always existed for >32 point fills; actual
+        // fill use (single contour) unaffected; multicontour correctness belongs to offscreen alpha
+        // mask layer.
         if (geo.commands.len == 0) return;
-        // 渐变填充：把 DisplayItem 上的 stop 列表转成 renderer 的 FillGradient。
-        // 逐顶点着色（GPU 侧 PathVertex.color 早就支持，见 path.metal），
-        // 多边形（三角/星形）的渐变填充就靠这条，此前只能退化成纯色。
+        // Gradient fill: convert DisplayItem stop list to renderer's FillGradient.
+        // Per-vertex coloring (GPU PathVertex.color supported in path.metal), gradients for
+        // polygons (triangle/star) rely on this, previously degenerated to solid.
         var grad_stops: [16]PathRendererMod.FillGradient.GradientStopIn = undefined;
         var fill_grad: ?PathRendererMod.FillGradient = null;
         if (it.gradient_direction != 0 and it.mg_stop_count > 0) {
@@ -2117,9 +2036,9 @@ pub const RenderCommandEncoder = struct {
                 const sc = it.mg_stop_colors[i];
                 grad_stops[i] = .{
                     .color = .{
-                        srgbByteToLinear(sc.r),
-                        srgbByteToLinear(sc.g),
-                        srgbByteToLinear(sc.b),
+                        byteToShader(sc.r),
+                        byteToShader(sc.g),
+                        byteToShader(sc.b),
                         @as(f32, @floatFromInt(sc.a)) / 255.0,
                     },
                     .position = it.mg_stop_positions[i],
@@ -2133,9 +2052,9 @@ pub const RenderCommandEncoder = struct {
                 .start_angle = it.gradient_conic_start_angle,
             };
         }
-        // Phase C：mesh 缓存，命中跳过 flatten + earclip/fringe。
-        // ⚠ 渐变**必须绕开缓存**：`appendCachedMesh` 回放时会把统一色重新写进
-        // 每个顶点（它就是为纯色设计的），命中一次渐变就被拍平成纯色。
+        // Phase C: mesh cache, hit skips flatten + earclip/fringe.
+        // WARNING: gradient **must bypass cache**: appendCachedMesh replay rewrites uniform color
+        // into every vertex (designed for solid), one gradient hit flattens to solid.
         path_rend.setFrame(self.frame_index);
         const mesh_key = pathMeshKey(geo.*, self.scale, false, 0, 0);
         if (fill_grad == null) {
@@ -2143,12 +2062,16 @@ pub const RenderCommandEncoder = struct {
         }
         const PathCommand = @TypeOf(geo.commands[0]);
         const contours = try tess.flatten(PathCommand, geo.commands, self.scale);
-        if (try path_rend.addFillPathGradient(contours, color, ox, oy, fill_grad)) |range| {
+        const rule: PathRendererMod.FillRule = switch (coercePathFillRule(geo.fill_rule)) {
+            .evenodd => .evenodd,
+            .nonzero => .nonzero,
+        };
+        if (try path_rend.addFillPathGradient(contours, color, ox, oy, fill_grad, rule)) |range| {
             if (fill_grad == null) path_rend.storeMesh(mesh_key, range[0], range[1], ox, oy);
         }
     }
 
-    /// paint_table.DisplayItem 主路径的 stroke_path 编码。
+    /// paint_table.DisplayItem main path stroke_path encoding.
     fn encodeStrokePathPaint(self: *RenderCommandEncoder, it: anytype, geo: anytype) !void {
         if (self.persistent.path_renderer == null) {
             const device = self.sdf_renderer.device;
@@ -2170,21 +2093,20 @@ pub const RenderCommandEncoder = struct {
         const c = it.color;
         const a = @as(f32, @floatFromInt(c.a)) / 255.0 * it.image_opacity;
         const color = [4]f32{
-            srgbByteToLinear(c.r),
-            srgbByteToLinear(c.g),
-            srgbByteToLinear(c.b),
+            byteToShader(c.r),
+            byteToShader(c.g),
+            byteToShader(c.b),
             a,
         };
 
         const PathLineJoin = @import("path_renderer.zig").LineJoin;
-        const line_join: PathLineJoin = @enumFromInt(it.path_line_join);
-        // Phase C：mesh 缓存，命中跳过 flatten + stroke expand
+        const line_join: PathLineJoin = @fromBackingInt(@intCast(it.path_line_join));
+        // Phase C: mesh cache, hit skips flatten + stroke expand
         path_rend.setFrame(self.frame_index);
-        // `stroke_width` 与 path 顶点一样都已经是逻辑像素。PathRenderer 的
-        // viewport/shader 会把逻辑坐标映射到 Retina 物理像素；这里只需把
-        // device scale 用于曲线细分容差与 1px AA fringe。旧实现再乘一次
-        // `self.scale`，导致 3px stroke 在 2× 屏幕上成为 6 个逻辑像素
-        // （12 个设备像素），而 Box border 仍是正确的 3px。
+        // `stroke_width` and path vertices already logical pixels. PathRenderer viewport/shader
+        // maps logical to Retina physical; here only use device scale for curve tessellation
+        // tolerance and 1px AA fringe. Old code multiplied by `self.scale` again, 3px stroke on 2x
+        // became 6 logical pixels (12 device), but Box border stayed correct 3px.
         const logical_stroke_width = pathStrokeWidthForTessellation(it.stroke_width, self.scale);
         const mesh_key = pathMeshKey(geo.*, self.scale, true, logical_stroke_width, it.path_line_join);
         if (try path_rend.appendCachedMesh(mesh_key, color, ox, oy)) return;
@@ -2208,17 +2130,17 @@ pub const RenderCommandEncoder = struct {
 
     fn coerceGlassSurfaceValue(surface: anytype) f32 {
         return switch (@typeInfo(@TypeOf(surface))) {
-            .@"enum" => @floatFromInt(@intFromEnum(surface)),
+            .@"enum" => @floatFromInt(@backingInt(surface)),
             .int, .comptime_int => @floatFromInt(surface),
             else => 1.0,
         };
     }
 
-    /// z-order 屏障：即将分派 SDF 命令时，若 text/image/icon 任一 pipeline 有
-    /// pending instances，说明这个 SDF 图元需要画在它们上方，默认 flush 顺序
-    /// SDF->Image->Text 会把后来的 SDF 沉到底下（例：画布首个孩子是全幅点阵底图，
-    /// 其后的 SDF 盒子全被底图盖住）。先整体 flush 清空再开新批。
-    /// 代价是 SDF 与图片/图标交错时批次变碎；先正确后快（下游应用）。
+    /// z-order barrier: when dispatching SDF command, if text/image/icon pipeline has pending, this
+    /// SDF needs above them; default flush SDF->Image->Text sinks later SDF below (canvas first
+    /// child is full-frame tile base, all following SDF boxes covered).
+    /// Flush all first, start new batch. Cost: SDF-image/icon interleave fragments batches; correct
+    /// first, fast later (downstream app).
     fn flushIfTextPending(self: *RenderCommandEncoder) !void {
         const text_pending = self.text_renderer.getPendingInstanceCount() > 0;
         const image_pending = if (self.image_renderer) |ir| ir.instances.items.len > 0 else false;
@@ -2254,13 +2176,14 @@ pub const RenderCommandEncoder = struct {
         }
     }
 
-    // 脚本判定 / ASCII 分类纯函数簇已析出到 command_encoder/script_detect.zig。
-    // 这里保留同名 re-export，公共 API（RenderCommandEncoder.preferCjkFallback
-    // 等）与既有调用点、单测全部不变。
+    // Script detection / ASCII classification pure function cluster extracted to
+    // command_encoder/script_detect.zig.
+    // Keep same re-export here, public API (RenderCommandEncoder.preferCjkFallback etc.) and
+    // callsites/tests all unchanged.
     const isAllAscii = script_detect.isAllAscii;
     const fixedMonospaceAdvance = script_detect.fixedMonospaceAdvance;
 
-    /// 编码文本
+    /// Encode text
     fn encodeText(
         self: *RenderCommandEncoder,
         x: f32,
@@ -2278,12 +2201,13 @@ pub const RenderCommandEncoder = struct {
         shader_snap: bool,
     ) !void {
         if (self.fonts) |fonts| {
-            // 字体决策**全部**交给 FontSelector.resolveFonts，与测量端同一个
-            // 函数。这里曾经内联一整条 if 链 + selectCjkFallbackFont，与
-            // measureTextWidth 各选各的，于是同一段文字量出来和画出来不一样宽
-            // （symbols 覆盖 / CJK 内容相关回退 / force_linear 三处分岔）。
-            // 不要把任何字体判断搬回这里。
+            // Font decisions **all** to FontSelector.resolveFonts, same function as measure side.
+            // This used to have inline if chain + selectCjkFallbackFont; measureTextWidth chose
+            // differently, same text measured and drawn different widths (symbols cover / CJK
+            // content-fallback / force_linear three forks).
+            // Don't move font logic back here.
             const resolved = fonts.resolveFonts(content, .{
+                .stack_mode_override = if (self.text_renderer.fallback_stack != null) true else null,
                 .font_size = font_size,
                 .font_weight = font_weight,
                 .font_family = font_family,
@@ -2292,7 +2216,24 @@ pub const RenderCommandEncoder = struct {
                 .use_symbols = use_symbols_font,
                 .force_linear = force_linear,
             });
-            const font = resolved.primary;
+            const font = if (self.text_renderer.font_ranges_provider != null) resolved.shapingFont() else resolved.primary;
+            var ranges: ?*@import("text").FontRanges = null;
+            if (comptime @import("builtin").os.tag == .windows) {
+                if (self.text_renderer.font_ranges_provider) |provider| {
+                    const context = self.text_renderer.font_ranges_context orelse return error.MissingFontRangesContext;
+                    ranges = try provider(context, .{ .text = content, .font_size = font_size, .font_weight = font_weight, .font_family = font_family, .use_italic = use_italic_font, .use_monospace = use_monospace_font, .use_symbols = use_symbols_font }, font, self.text_renderer.allocator);
+                }
+            }
+            self.text_renderer.active_font_ranges = ranges;
+            defer {
+                self.text_renderer.active_font_ranges = null;
+                if (comptime @import("builtin").os.tag == .windows) {
+                    if (ranges) |owned| {
+                        owned.deinit();
+                        self.text_renderer.allocator.destroy(owned);
+                    }
+                }
+            }
             const render_color = colorToRenderColor(color);
             const cjk_fallback = resolved.fallback;
             const fixed_advance = fixedMonospaceAdvance(content, use_monospace_font, monospace_char_width);
@@ -2317,7 +2258,7 @@ pub const RenderCommandEncoder = struct {
         }
     }
 
-    /// 编码带颜色 spans 的文本（整行一次塑形 + 逐 glyph 按 span 着色）
+    /// Encode text with color spans (whole line one shape + per-glyph span color)
     fn encodeTextWithSpans(
         self: *RenderCommandEncoder,
         x: f32,
@@ -2336,10 +2277,11 @@ pub const RenderCommandEncoder = struct {
         spans: anytype,
     ) !void {
         if (self.fonts) |fonts| {
-            // 同 drawText：字体决策收口到 FontSelector.resolveFonts。
-            // 这里原本是第二份一模一样的 if 链，两份拷贝各自演化正是
-            // 「量的和画的不一样」能反复复发的原因。
+            // Like drawText: font decisions route to FontSelector.resolveFonts.
+            // Was second identical if chain, both copies diverged = "measure and draw width
+            // mismatch" kept recurring.
             const resolved = fonts.resolveFonts(content, .{
+                .stack_mode_override = if (self.text_renderer.fallback_stack != null) true else null,
                 .font_size = font_size,
                 .font_weight = font_weight,
                 .font_family = font_family,
@@ -2348,12 +2290,29 @@ pub const RenderCommandEncoder = struct {
                 .use_symbols = use_symbols_font,
                 .force_linear = force_linear,
             });
-            const font = resolved.primary;
+            const font = if (self.text_renderer.font_ranges_provider != null) resolved.shapingFont() else resolved.primary;
+            var ranges: ?*@import("text").FontRanges = null;
+            if (comptime @import("builtin").os.tag == .windows) {
+                if (self.text_renderer.font_ranges_provider) |provider| {
+                    const context = self.text_renderer.font_ranges_context orelse return error.MissingFontRangesContext;
+                    ranges = try provider(context, .{ .text = content, .font_size = font_size, .font_weight = font_weight, .font_family = font_family, .use_italic = use_italic_font, .use_monospace = use_monospace_font, .use_symbols = use_symbols_font }, font, self.text_renderer.allocator);
+                }
+            }
+            self.text_renderer.active_font_ranges = ranges;
+            defer {
+                self.text_renderer.active_font_ranges = null;
+                if (comptime @import("builtin").os.tag == .windows) {
+                    if (ranges) |owned| {
+                        owned.deinit();
+                        self.text_renderer.allocator.destroy(owned);
+                    }
+                }
+            }
             const render_color = colorToRenderColor(color);
             const cjk_fallback = resolved.fallback;
             const fixed_advance = fixedMonospaceAdvance(content, use_monospace_font, monospace_char_width);
 
-            // 构建 render-level color spans
+            // Build render-level color spans
             var render_spans_buf: [128]TextRenderer.ColorSpan = undefined;
             const span_count = @min(spans.len, render_spans_buf.len);
             for (spans[0..span_count], 0..) |s, i| {
@@ -2409,9 +2368,9 @@ pub const RenderCommandEncoder = struct {
         }
     }
 
-    // selectCjkFallbackFont 已删除（2026-08-17）：内容相关回退统一由
-    // FontSelector.resolveContentFallback 决定，渲染与测量共用。
-    // 想加回退规则请改那里，不要在 encoder 里重开一份。
+    // selectCjkFallbackFont deleted (2026-08-17): content-fallback centralized to
+    // FontSelector.resolveContentFallback, shared render/measure.
+    // Change fallback rules there, not another copy in encoder.
 
     pub const preferKoreanFallback = script_detect.preferKoreanFallback;
     pub const preferCjkFallback = script_detect.preferCjkFallback;
@@ -2461,8 +2420,8 @@ pub const RenderCommandEncoder = struct {
                 extend_mode,
             ),
             else => {
-                // 线性渐变：使用 addGradientRect 但需传递 extend_mode
-                // 通过直接写 packed_flags 支持 extend_mode
+                // Linear gradient: use addGradientRect but pass extend_mode
+                // Support extend_mode by writing packed_flags directly
                 try self.sdf_renderer.addGradientRectEx(
                     x,
                     y,
@@ -2480,8 +2439,9 @@ pub const RenderCommandEncoder = struct {
 
     // ========== Clip Stack (Phase 1) ==========
 
-    /// 推入裁剪区域（延迟 flush：只更新 clip stack，实际 GPU scissor 设置推迟到下一个绘制命令）
-    /// pub：单测（command_encoder_test.zig）直接驱动 clip 栈。
+    /// Push clip region (lazy flush: update clip stack only, actual GPU scissor set deferred to
+    /// next draw)
+    /// pub: unit tests (command_encoder_test.zig) drive clip stack directly.
     pub fn pushClip(self: *RenderCommandEncoder, x: f32, y: f32, w: f32, h: f32, radius: f32, shape_kind: ClipShapeKind, polygon: ClipPolygon) !void {
         if (self.clip_overflow_depth > 0 or self.clip_depth >= self.logical_clip_stack.len) {
             if (self.clip_overflow_depth == 0) {
@@ -2510,9 +2470,10 @@ pub const RenderCommandEncoder = struct {
         try self.syncClipStateAfterMutation(prev_rounded);
     }
 
-    /// 弹出裁剪区域（延迟 flush：只更新 clip stack，实际 GPU scissor 恢复推迟到下一个绘制命令）
+    /// Pop clip region (lazy flush: update clip stack only, actual GPU scissor restore deferred to
+    /// next draw)
     pub fn popClip(self: *RenderCommandEncoder) !void {
-        // 先抵消栈满时被忽略的 push，它们没压栈，对应的 pop 也不能弹。
+        // First offset ignores at stack-full; they didn't push, corresponding pops can't pop.
         if (self.clip_overflow_depth > 0) {
             self.clip_overflow_depth -= 1;
             return;
@@ -2545,7 +2506,7 @@ pub const RenderCommandEncoder = struct {
         return self.opacity_mode_stack[self.opacity_mode_depth];
     }
 
-    /// 根据当前 clip stack 同步 text_renderer 的水平裁剪范围
+    /// Sync text renderer's horizontal clip range from current clip stack
     pub fn syncTextClipX(self: *RenderCommandEncoder) void {
         if (self.currentRectClip()) |cur| {
             self.text_renderer.clip_x_min = cur[0];
@@ -2558,7 +2519,7 @@ pub const RenderCommandEncoder = struct {
 
     // ========== Phase C2/C3: Offscreen Opacity Layer ==========
 
-    /// 开始离屏 opacity 图层
+    /// Begin offscreen opacity layer
     pub fn restoreSavedClipState(self: *RenderCommandEncoder, layer: OffscreenLayer) void {
         self.clip_depth = layer.saved_clip_depth;
         self.clip_overflow_depth = layer.saved_clip_overflow_depth;
@@ -2566,27 +2527,27 @@ pub const RenderCommandEncoder = struct {
         self.effective_rect_clip_stack = layer.saved_effective_rect_clip_stack;
     }
 
-    /// 将积累的命令刷新到 GPU RenderPass
+    /// Flush accumulated commands to GPU RenderPass
     pub fn flush(self: *RenderCommandEncoder, render_pass: *gpu.Backend.RenderPass) !void {
-        // 保存 render_pass 引用（用于 clip stack）
+        // Save render_pass reference (for clip stack)
         self.render_pass = render_pass;
 
-        // 先渲染 SDF 图元（背景在下层）
+        // Render SDF elements first (background below)
         try self.sdf_renderer.flush(render_pass);
-        // 渲染图片（中间层）
+        // Render images (middle)
         if (self.image_renderer) |ir| {
             try ir.render(render_pass);
         }
         if (self.icon_renderer) |ir| {
             try ir.render(render_pass);
         }
-        // 渲染矢量路径（路径在图片之上，文字之下）
+        // Render vector paths (above images, below text)
         if (self.persistent.path_renderer) |*pr| {
             try pr.flush(render_pass);
         }
-        // 再渲染文本（文字在上层）
+        // Render text last (top)
         try self.text_renderer.flush(render_pass);
-        // 清除引用
+        // Clear reference
         self.render_pass = null;
     }
 };

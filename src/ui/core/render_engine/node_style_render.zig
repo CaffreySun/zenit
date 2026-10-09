@@ -1,5 +1,6 @@
-/// 节点样式渲染：阴影、背景、边框、大纲、媒体（图像/图标）
-/// 负责将节点的可视样式属性转换为 lowered DisplayItem（lowering_buffer）和显示列表（display_list）项
+/// node style render: shadow, background, border, outline, media (image/icon). responsible for
+/// converting node's visual style properties to lowered DisplayItem (lowering_buffer) and
+/// display_list items
 const std = @import("std");
 const types = @import("../types.zig");
 const node_mod = @import("../node.zig");
@@ -73,7 +74,7 @@ pub fn appendNodeShadowAndBackground(
 ) !void {
     const header = makeDisplayItemHeader(exec_state);
     const local_radii = node.style.effectiveRadii();
-    // 从 World.LayoutTable 读 rect（shadow-sync 保证与 node.rect 一致）。
+    // read rect from World.LayoutTable (shadow-sync guarantees match node.rect).
     const local_rect = cx.rectFromWorld(node);
     const render_x = exec_state.render_x;
     const render_y = exec_state.render_y;
@@ -94,15 +95,15 @@ pub fn appendNodeShadowAndBackground(
     const draw_opacity = if (exec_state.use_opacity_layer) 1.0 else exec_state.node_opacity;
     const effective_bg = computeEffectiveBackdropFill(node, draw_opacity);
 
-    // 外阴影：1 层用 shadow，2 层用 shadow_dual
+    // outer shadow: 1 layer uses shadow, 2 layers uses shadow_dual
     const shadow_slice = node.style.shadowSlice();
     var any_spread = false;
     for (shadow_slice) |sh| {
         if (sh.spread != 0) any_spread = true;
     }
     if (shadow_slice.len >= 3 or any_spread) {
-        // CSS 多重 box-shadow：逐层发射，列表第一项在最上层 -> 从最后一项画起。
-        // 每层都是纯阴影（本体下方挖空），背景填充由下面的常规路径绘制。
+        // CSS multiple box-shadow: emit per layer, list first item topmost -> draw from last item.
+        // each layer pure shadow (hollow under), background fill by display path below.
         var i = shadow_slice.len;
         while (i > 0) {
             i -= 1;
@@ -148,7 +149,7 @@ pub fn appendNodeShadowAndBackground(
         });
     } else if (shadow_slice.len == 1) {
         const s1 = shadow_slice[0];
-        if (std.posix.getenv("ZENIT_DEBUG_SHADOW") != null) {
+        if (@import("zenit_environment").has("ZENIT_DEBUG_SHADOW")) {
             std.debug.print("[shadow] node={d} comp={s} rect=({d:.0},{d:.0},{d:.0},{d:.0}) r={d:.0} blur={d:.0} a={d}\n", .{
                 node.id, node.meta.ownership.meta.component_name orelse "?", local_rect.x, local_rect.y, local_rect.w, local_rect.h, local_radii[0], s1.blur, s1.color.a,
             });
@@ -169,22 +170,22 @@ pub fn appendNodeShadowAndBackground(
         });
     }
 
-    // 有矢量填充路径的节点：背景/渐变由 `fill_path` 画（逐顶点着色），
-    // 这里的矩形分支必须整段跳过，否则会在多边形背后垫一个铺满包围盒的
-    // 渐变方块（用户实测截图：三角外面一圈渐变底）。
-    // 下面 fill_rect 分支早就有同名守卫（`vector.fill.path == null`），
-    // 但 gradient 两支漏了，所以只有渐变态露馅。
+    // nodes with vector fill path: background/gradient drawn by `fill_path` (per-vertex shading),
+    // this rect branch must skip entirely, else draws gradient quad filling bounding box behind
+    // polygon (user screenshot: gradient ring around triangle). below fill_rect branch already
+    // guarded with same name (`vector.fill.path == null`), but gradient branches missed, gradient
+    // mode exposed.
     const has_vector_fill = if (node.layoutOutputPtr()) |lo_vf|
         lo_vf.vector.fill.path != null
     else
         false;
 
     if (has_vector_fill) {
-        // 交给下面的矢量填充分支
+        // hand to vector fill branch below
     } else if (node.style.multi_gradient()) |mg| {
-        // 多色渐变（优先级高于旧两色 gradient）
-        var stop_colors: [16]types.Color = [_]types.Color{types.Color.rgba(0, 0, 0, 0)} ** 16;
-        var stop_positions: [16]f32 = [_]f32{0} ** 16;
+        // multi-color gradient (priority over old two-color gradient)
+        var stop_colors: [16]types.Color = @as([16]types.Color, @splat(types.Color.rgba(0, 0, 0, 0)));
+        var stop_positions: [16]f32 = @as([16]f32, @splat(0));
         const cnt = mg.stop_count;
         for (0..cnt) |i| {
             stop_colors[i] = geometry.modulateColorOpacity(mg.stops[i].color, draw_opacity);
@@ -202,12 +203,12 @@ pub fn appendNodeShadowAndBackground(
                 .stop_colors = stop_colors,
                 .stop_positions = stop_positions,
                 .stop_count = cnt,
-                // 圆心在着色器里是相对 (0.5,0.5) 的 UV 偏移。
+                // center is UV offset relative (0.5, 0.5) in shader.
                 .radial_center_x = mg.radial_center[0] - 0.5,
                 .radial_center_y = mg.radial_center[1] - 0.5,
                 .radial_radius_x = mg.radial_radius[0],
                 .radial_radius_y = mg.radial_radius[1],
-                .shape = @intFromEnum(node.style.shape()),
+                .shape = @backingInt(node.style.shape()),
             },
         });
     } else if (node.style.gradient()) |grad| {
@@ -222,11 +223,11 @@ pub fn appendNodeShadowAndBackground(
                 .to = geometry.modulateColorOpacity(grad.to, draw_opacity),
                 .direction = grad.direction,
                 .radius = local_radii,
-                .shape = @intFromEnum(node.style.shape()),
+                .shape = @backingInt(node.style.shape()),
             },
         });
     } else if (effective_bg) |bg| {
-        // path_geometry 节点用 fill_path 命令渲染，跳过背景矩形
+        // path_geometry node rendered with fill_path command, skip background rect
         if (node.getLayoutOutput().vector.fill.path == null) {
             try cx.display_list.append(.{
                 .fill_rect = .{
@@ -237,13 +238,13 @@ pub fn appendNodeShadowAndBackground(
                     .h = local_rect.h,
                     .color = bg,
                     .radius = local_radii,
-                    .shape = @intFromEnum(node.style.shape()),
+                    .shape = @backingInt(node.style.shape()),
                 },
             });
         }
     }
 
-    // ── 噪声纹理（叠加在背景上）──
+    // ── noise texture (layered on background) ──
     if (node.style.noise()) |np| {
         const fill = geometry.modulateColorOpacity(node.getBackground(), draw_opacity);
         try cx.display_list.append(.{
@@ -254,7 +255,7 @@ pub fn appendNodeShadowAndBackground(
                 .w = local_rect.w,
                 .h = local_rect.h,
                 .fill = fill,
-                .mode = @intFromEnum(np.mode),
+                .mode = @backingInt(np.mode),
                 .scale = np.scale,
                 .intensity = np.intensity,
                 .seed = np.seed,
@@ -263,10 +264,11 @@ pub fn appendNodeShadowAndBackground(
         });
     }
 
-    // ── Inset Shadow 内阴影（叠加在背景上）──
-    // 填充一律透明：底色已由上面的 fill_rect / 渐变画过，着色器画内阴影只看几何
-    // 覆盖率。旧实现在这里再填一次背景，半透明底（玻璃）会被叠深（BulkQuad 路径
-    // 早已按此修正，见 tests.zig 的 inset fill 断言）。多层按 CSS 顺序从最后一层画起。
+    // ── Inset Shadow inner shadow (layered on background) ──
+    // fill always transparent: background color drawn by above fill_rect / gradient, shader draws
+    // inner-shadow only looking at geometric coverage. old impl re-filled background here,
+    // semi-transparent bottom (glass) would darken (BulkQuad path already corrected per this, see
+    // tests.zig inset fill assert). multiple layers drawn from last per CSS order.
     if (node.style.inset_shadow()) |first| {
         const extras = node.style.extraInsetShadows();
         var i: usize = extras.len + 1;
@@ -291,21 +293,21 @@ pub fn appendNodeShadowAndBackground(
         }
     }
 
-    // layoutOutputPtr 给 World slot 稳定地址；display_list
-    // 存 geometry 指针，帧内消费前必须保持有效（slot dense by element_id，
-    // 帧内稳定）。
+    // layoutOutputPtr gives World slot stable address; display_list stores geometry pointer, must
+    // remain valid before frame consumption (slot dense by element_id, stable in-frame).
     if (node.layoutOutputPtr()) |lo| {
-        // 矢量路径填充
+        // vector path fill
         if (lo.vector.fill.path) |*geom| {
-            // 渐变优先于纯色背景：矢量填充的渐变由 path_renderer 逐顶点着色。
-            // 注意判据是 `渐变有效 or 背景不透明`，设了渐变的节点背景常是
-            // 透明的（容器不该垫色），只看 background.a 会把渐变整条跳过。
+            // gradient priority over solid background: vector-fill gradient per-vertex shaded by
+            // path_renderer. note criterion is 'gradient valid or background opaque', nodes with
+            // gradient set often have transparent background (container shouldn't pad color),
+            // checking only background.a skips gradient entirely.
             const mg = node.style.multi_gradient();
             const has_grad = mg != null and mg.?.stop_count >= 2;
             if (has_grad or node.getBackground().a > 0) {
                 const fill_color = geometry.modulateColorOpacity(node.getBackground(), draw_opacity);
-                var g_colors: [16]types.Color = [_]types.Color{types.Color.rgba(0, 0, 0, 0)} ** 16;
-                var g_positions: [16]f32 = [_]f32{0} ** 16;
+                var g_colors: [16]types.Color = @as([16]types.Color, @splat(types.Color.rgba(0, 0, 0, 0)));
+                var g_positions: [16]f32 = @as([16]f32, @splat(0));
                 var g_dir: u8 = 0;
                 var g_cnt: u8 = 0;
                 var g_cx: f32 = 0.5;
@@ -318,9 +320,9 @@ pub fn appendNodeShadowAndBackground(
                         g_colors[i] = geometry.modulateColorOpacity(g.stops[i].color, draw_opacity);
                         g_positions[i] = g.stops[i].position;
                     }
-                    g_dir = @intFromEnum(g.direction);
-                    // MultiGradient 只带 stops + direction；radial/conic 的
-                    // 中心与起始角不在这个结构里，用几何中心的默认值。
+                    g_dir = @backingInt(g.direction);
+                    // MultiGradient carries only stops + direction; radial/conic center and start
+                    // angle not in struct, use geometry center defaults.
                     g_cx = 0.5;
                     g_cy = 0.5;
                     g_ang = 0;
@@ -345,7 +347,7 @@ pub fn appendNodeShadowAndBackground(
             }
         }
 
-        // 矢量路径描边
+        // vector path stroke
         if (lo.vector.stroke.geometry) |*geom| {
             if (lo.vector.stroke.color.a > 0 and lo.vector.stroke.width > 0) {
                 const stroke_color = geometry.modulateColorOpacity(lo.vector.stroke.color, draw_opacity);
@@ -373,7 +375,7 @@ pub fn appendNodeBorder(
 ) !void {
     const header = makeDisplayItemHeader(exec_state);
     const local_radii = node.style.effectiveRadii();
-    // World.LayoutTable 读 rect。
+    // read rect from World.LayoutTable.
     const local_rect = cx.rectFromWorld(node);
     const render_x = exec_state.render_x;
     const render_y = exec_state.render_y;
@@ -421,16 +423,16 @@ pub fn appendNodeBorder(
                 .color = effective_uniform_border,
                 .width = border_widths_raw[types.Border.SIDE_TOP],
                 .radius = local_radii,
-                .shape = @intFromEnum(node.style.shape()),
+                .shape = @backingInt(node.style.shape()),
             },
         });
         return;
     }
 
-    // Per-side border: 使用 border_per_side 命令，shader 内计算内轮廓，无需 clip
+    // per-side border: use border_per_side command, compute inner outline in shader, no clip needed
     if (colors_uniform) {
         const effective_uniform_border = computeEffectiveBackdropBorderColor(node, border_colors[types.Border.SIDE_TOP], draw_opacity);
-        // 颜色一致，宽度不同 -> 单个 draw call
+        // color same, width different -> single draw call
         try cx.display_list.append(.{
             .border_per_side = .{
                 .header = header,
@@ -451,7 +453,7 @@ pub fn appendNodeBorder(
         return;
     }
 
-    // 颜色不同 -> 每边一个 draw call，只设该边宽度非零
+    // color different -> one per side, only set that side width nonzero
     const tw = border_widths[types.Border.SIDE_TOP];
     const rw = border_widths[types.Border.SIDE_RIGHT];
     const bw = border_widths[types.Border.SIDE_BOTTOM];
@@ -530,7 +532,7 @@ pub fn appendNodeOutline(
     const out = node.style.outline() orelse return;
     const header = makeDisplayItemHeader(exec_state);
     const local_radii = node.style.effectiveRadii();
-    // World.LayoutTable 读 rect。
+    // read rect from World.LayoutTable.
     const local_rect = cx.rectFromWorld(node);
     const render_x = exec_state.render_x;
     const render_y = exec_state.render_y;
@@ -574,7 +576,7 @@ pub fn appendNodeMedia(
     exec_state: NodeExecutionState,
 ) !void {
     const header = makeDisplayItemHeader(exec_state);
-    // World.LayoutTable 读 rect。
+    // read rect from World.LayoutTable.
     const local_rect = cx.rectFromWorld(node);
     const render_x = exec_state.render_x;
     const render_y = exec_state.render_y;
@@ -633,6 +635,9 @@ pub fn appendNodeMedia(
                     .tint = ic.tint,
                     .corner_clip_radius = node.style.effectiveRadius(),
                     .opacity = draw_opacity,
+                    // Same rule as text: continuous positions under transform
+                    // animation, pixel-snapped otherwise.
+                    .snap = !exec_state.subtree_force_linear_text,
                 },
             });
         }

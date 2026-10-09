@@ -114,7 +114,8 @@ The Layout / Style detail pages also show a `↗` after attribute values that
 have a reliable source:
 
 - `boxStyled` / `hstackStyled` / `vstackStyled` / `textStyled` point to the
-  definition of the named style function;
+  definition of the named style function (nodes built by `ui.view` do not
+  record the style function yet and point at the view builder);
 - plain `box` / `hstack` / `vstack` / `text` point to the call site of the
   inline style;
 - `setStyle` records the last writer per field and takes precedence over

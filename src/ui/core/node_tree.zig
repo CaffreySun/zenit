@@ -1,16 +1,11 @@
-//! node_tree, v0.12 §N5 god-object split（最后一刀，最高耦合 4/5）：
-//! 从 node.zig 抽出树结构子域（7 方法 + structure callback 单元）。
-//!
-//! 范式同 §N1-§N4：Node-typed free function + @import("node.zig") 循环
-//! import；node.zig 保留 thin delegate（原 pub/private 可见性）。
-//!
-//! 留最后切因耦合最高：appendChild/removeChild 调 dirty(§N1)/
-//! lifecycle.fireCleanupCallbacks(§N4)/interaction.markCustomDrawSubtree
-//! (§N3)，前 4 刀已稳定这些接口，此时切阻力最小。
-//!
-//! structure callback 单元（StructureKind/StructureNotifyFn/
-//! g_structure_notify/setStructureNotifyCallback）整体搬，node.zig
-//! re-export 保持公开 API（外部 core.zig 调 setStructureNotifyCallback）。
+//! node_tree: tree-structure subdomain extracted from node.zig (7 methods +
+//! structure callback unit). Node-typed free functions + @import("node.zig") cyclic
+//! import; node.zig keeps thin delegates (original pub/private visibility).
+//! appendChild/removeChild call dirty / lifecycle.fireCleanupCallbacks /
+//! interaction.markCustomDrawSubtree. The structure callback unit (StructureKind /
+//! StructureNotifyFn / g_structure_notify / setStructureNotifyCallback) lives here;
+//! node.zig re-exports it to keep the public API (core.zig calls
+//! setStructureNotifyCallback).
 
 const std = @import("std");
 const world_mod = @import("world.zig");
@@ -19,30 +14,38 @@ const node_mod = @import("node.zig");
 const Node = node_mod.Node;
 const Allocator = std.mem.Allocator;
 
-// ─────────────────────────────────────────────────────────────────────
-// structure callback 单元（自 node.zig 整体搬入）
-// appendChild/removeChild 同步父子链到 World.elements。
-// ─────────────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
+// Structure callback unit (moved wholesale from node.zig)
+// appendChild/removeChild syncs parent-child links to World.elements.
+// ---------------------------------------------------------------------------
 
 pub const StructureKind = enum(u8) { append, unlink };
 pub const StructureNotifyFn = *const fn (parent_raw: u32, child_raw: u32, kind: StructureKind) void;
 var g_structure_notify: ?StructureNotifyFn = null;
 
-/// 把一次父子链变更同步给节点所属 World 的 elements 表。
+// UI tree operations are serialized, as are the existing structure/dirty hooks.
+// A callback can reorder a list without changing its length or the current slot;
+// an epoch detects those changes without allocating a snapshot or growing Node.
+var g_structure_revision: u64 = 0;
+pub fn structureRevision() u64 {
+    return g_structure_revision;
+}
+
+/// Sync one parent-child chain change to the node's owner World's elements table.
 ///
-/// P0-3 阶段 3：优先直连 `world_ref`；null（cx-less mock）时退回旧全局回调。
-/// 语义与原 core.zig:onNodeStructure 逐行一致，含 append 前的 reparent
-/// unlink（child 已有 parent 时必须先摘链，否则父子链表会串）。
+/// Prefers the direct `world_ref`; null (cx-less mock) falls back to the global
+/// callback. Includes reparent pre-unlink (when child has a parent, it must be
+/// unlinked first or the sibling chain corrupts).
 fn syncWorldStructure(parent: anytype, child: anytype, kind: StructureKind) void {
     if (parent.element_id_raw == 0xFFFFFFFF or child.element_id_raw == 0xFFFFFFFF) return;
-    // 用 parent 的 owner, append 后 child 归属 parent 所在 World。
+    // Use parent's owner; after append child belongs to parent's World.
     if (parent.world_ref) |w| {
         const parent_eid = world_mod.ElementId.fromRaw(parent.element_id_raw);
         const child_eid = world_mod.ElementId.fromRaw(child.element_id_raw);
         if (!w.elements.isValid(parent_eid) or !w.elements.isValid(child_eid)) return;
         switch (kind) {
             .append => {
-                // reparent 场景：child 已有 parent 时先 unlink，否则链表串台。
+                // Reparent scenario: when child has parent, unlink first or chain corrupts.
                 const existing = w.elements.links(child_eid) orelse return;
                 if (!existing.parent.isNull()) w.elements.unlink(child_eid);
                 w.elements.appendChild(parent_eid, child_eid);
@@ -60,11 +63,12 @@ pub fn setStructureNotifyCallback(notify: ?StructureNotifyFn) void {
     g_structure_notify = notify;
 }
 
-// ─────────────────────────────────────────────────────────────────────
-// 树结构方法
-// ─────────────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
+// Tree structure methods
+// ---------------------------------------------------------------------------
 
-/// 沿 parent 链向上查找；self 是 ancestor 后代（含 self）返回 true。
+/// Walk parent chain upward; self is descendent of ancestor (including self)
+/// return true.
 pub fn isDescendantOf(self: *Node, ancestor: *Node) bool {
     var current: ?*Node = self;
     while (current) |n| {
@@ -94,12 +98,14 @@ pub fn appendChild(self: *Node, allocator: Allocator, child: *Node) !void {
     }
     if (child.parent) |old_parent| old_parent.removeChildRetained(child);
     self.children.appendAssumeCapacity(child);
+    g_structure_revision +%= 1;
     child.parent = self;
-    // 子节点有 custom_draw -> 冒泡标记
+    // Child has custom_draw -> bubble mark.
     if (child.frame_state.state_bits.flags.has_custom_draw_subtree) {
         self.markCustomDrawSubtree();
     }
-    // 子树 text / before_render 标志并入父链（同 has_custom_draw_subtree 维护方式）
+    // Child text / before_render flags merge to parent chain (same maintenance as
+    // has_custom_draw_subtree).
     if (child.frame_state.state_bits.flags.has_text_subtree) self.markSubtreeText();
     if (child.frame_state.state_bits.flags.has_before_render_subtree) self.markSubtreeBeforeRenderHook();
     child.frame_state.state_bits.dirty.runtime.dirty = true;
@@ -108,15 +114,78 @@ pub fn appendChild(self: *Node, allocator: Allocator, child: *Node) !void {
     child.frame_state.state_bits.dirty.runtime.subtree_full_rebuild = false;
     self.bubbleChildRuntimeIndexDirty(false);
     self.markLayoutDirty();
-    // P0-3 阶段 3：直连 owner World 同步父子链，不再经过进程级回调。
+    // P0-3 phase 3: sync parent-child chain directly to owner World; no more
+    // process-level callback.
     syncWorldStructure(self, child, .append);
 }
 
-/// 使用现有子节点指针重排 children 顺序。
-/// 不创建/销毁节点，不触发 runtime registry rebuild，只标记 order/layout dirty。
-/// World.elements 的兄弟链表必须同步重排（appendChild/removeChild* 都同步，
-/// 这里曾漏掉）：渲染主路径今天走 Node.children 暂无消费者，但 P3 迁移的
-/// 既定方向是读 World 链表，沉默的表间分叉在那天会变成绘制顺序错乱。
+/// Insert child before anchor; null anchor is equivalent to appendChild. Anchor
+/// must be a direct child of self; otherwise error.InvalidAnchor (no silent append:
+/// control flow uses anchor position; an anchor not in parent means the caller's
+/// region bookkeeping is already broken). A child already under self is moved
+/// (unlink then insert), consistent with appendChild's reparent semantics.
+pub fn insertChildBefore(self: *Node, allocator: Allocator, child: *Node, before: ?*Node) !void {
+    const anchor = before orelse return appendChild(self, allocator, child);
+    if (anchor == child) return;
+    if (anchor.parent != self) return error.InvalidAnchor;
+    try validateChild(self, child);
+    if (child.parent != self) {
+        // No parent links, dirty flags or World links change before allocation.
+        try self.children.ensureUnusedCapacity(allocator, 1);
+    }
+    if (child.parent) |old_parent| old_parent.removeChildRetained(child);
+    // Reposition after unlink: when child was under self and before anchor, index
+    // shifts down.
+    const index = std.mem.indexOfScalar(*Node, self.children.items, anchor) orelse unreachable;
+    self.children.insertAssumeCapacity(index, child);
+    g_structure_revision +%= 1;
+    child.parent = self;
+    if (child.frame_state.state_bits.flags.has_custom_draw_subtree) self.markCustomDrawSubtree();
+    if (child.frame_state.state_bits.flags.has_text_subtree) self.markSubtreeText();
+    if (child.frame_state.state_bits.flags.has_before_render_subtree) self.markSubtreeBeforeRenderHook();
+    child.frame_state.state_bits.dirty.runtime.dirty = true;
+    child.frame_state.state_bits.dirty.runtime.subtree_dirty = true;
+    child.frame_state.state_bits.dirty.runtime.full_rebuild = false;
+    child.frame_state.state_bits.dirty.runtime.subtree_full_rebuild = false;
+    self.bubbleChildRuntimeIndexDirty(false);
+    self.markOrderDirty();
+    self.markLayoutDirty();
+    syncWorldInsertBefore(self, child, anchor, index);
+}
+
+/// World sync for insertChildBefore. O(1) linked-list insert with world_ref;
+/// cx-less old path's global callback only has append/unlink; relink successors one
+/// by one, matches Node.children order (only mock tests hit this).
+fn syncWorldInsertBefore(self: *Node, child: *Node, anchor: *Node, index: usize) void {
+    if (self.element_id_raw == 0xFFFFFFFF or child.element_id_raw == 0xFFFFFFFF) return;
+    if (self.world_ref) |w| fast: {
+        // Anchor not in World table (old-path node) has no insertable list position;
+        // fall through to bulk relink below.
+        if (anchor.element_id_raw == 0xFFFFFFFF) break :fast;
+        const parent_eid = world_mod.ElementId.fromRaw(self.element_id_raw);
+        const child_eid = world_mod.ElementId.fromRaw(child.element_id_raw);
+        const before_eid = world_mod.ElementId.fromRaw(anchor.element_id_raw);
+        if (!w.elements.isValid(parent_eid) or !w.elements.isValid(child_eid)) return;
+        if (!w.elements.isValid(before_eid)) break :fast;
+        // Anchor's parent in World differs from Node tree (tables diverged); table-layer
+        // insertBefore degrades to append, leaving silent order split; switch to bulk
+        // relink using children as source to rewrite order suffix.
+        const before_links = w.elements.links(before_eid) orelse break :fast;
+        if (!before_links.parent.eql(parent_eid)) break :fast;
+        const existing = w.elements.links(child_eid) orelse return;
+        if (!existing.parent.isNull()) w.elements.unlink(child_eid);
+        w.elements.insertBefore(parent_eid, child_eid, before_eid);
+        return;
+    }
+    for (self.children.items[index..]) |sib| syncWorldStructure(self, sib, .unlink);
+    for (self.children.items[index..]) |sib| syncWorldStructure(self, sib, .append);
+}
+
+/// Reorder children using existing node pointers. No create/destroy, no runtime
+/// registry rebuild; only marks order/layout dirty. The World.elements sibling list
+/// must be synced on reorder (appendChild/removeChild* both sync). The render path
+/// reads Node.children today, but the migration target is the World list; a silent
+/// split between the two tables would corrupt render order.
 pub fn replaceChildOrder(self: *Node, allocator: Allocator, ordered_children: []const *Node) !void {
     if (std.mem.eql(*Node, self.children.items, ordered_children)) return;
 
@@ -142,6 +211,7 @@ pub fn replaceChildOrder(self: *Node, allocator: Allocator, ordered_children: []
         child.parent = null;
     }
     self.children.clearRetainingCapacity();
+    g_structure_revision +%= 1;
     for (order) |child| {
         if (child.parent) |old_parent| old_parent.removeChildRetained(child);
         self.children.appendAssumeCapacity(child);
@@ -160,10 +230,10 @@ pub fn replaceChildOrder(self: *Node, allocator: Allocator, ordered_children: []
     self.markLayoutDirty();
 }
 
-/// 从父节点移除子节点，递归触发 onCleanup。
-/// 注意: 不释放 child 内存。调用者需手动 `cx.freeNode(child)` 释放。
-/// on_cleanup 是一次性消费（触发即摘除），detach 后重挂同一节点请走
-/// removeChildRetained，它不触发也不消费 cleanup。
+/// Remove child from parent, recursively fire onCleanup. Note: doesn't free child
+/// memory; caller must manually `cx.freeNode(child)`. on_cleanup is one-shot
+/// (fires and detaches); reattaching same node goes through removeChildRetained
+/// which doesn't fire or consume cleanup.
 pub fn removeChild(self: *Node, child: *Node) void {
     removeChildInternal(self, child, true);
 }
@@ -186,26 +256,25 @@ fn removeChildRetainedInternal(self: *Node, child: *Node, full_runtime_rebuild: 
     if (child.parent != self) return;
     const index = std.mem.indexOfScalar(*Node, self.children.items, child) orelse return;
     _ = self.children.orderedRemove(index);
+    g_structure_revision +%= 1;
     if (full_runtime_rebuild) {
         self.markRuntimeIndexFullRebuild();
     }
     child.parent = null;
     self.markLayoutDirty();
-    // P0-3 阶段 3：同上，直连 owner World。
+    // P0-3 phase 3: same as above, direct owner World.
     syncWorldStructure(self, child, .unlink);
 }
 
-/// 移除所有子节点，递归触发 onCleanup。
-/// 注意: 不释放子节点内存。调用者需对每个子节点手动 `cx.freeNode()` 释放。
+/// Remove all children, recursively fire onCleanup. Note: doesn't free memory;
+/// caller must manually `cx.freeNode()` each child.
 pub fn removeAllChildren(self: *Node) void {
-    for (self.children.items) |child| {
-        node_mod.fireCleanupCallbacks(child);
-        // Keep the World.elements sibling chain in lockstep with Node.children,
-        // exactly like removeChild/removeChildRetained.
-        syncWorldStructure(self, child, .unlink);
-        child.parent = null;
+    // Cleanup callbacks may synchronously detach/reparent children. Never keep
+    // an iterator over the old ArrayList slice across those callbacks: removal
+    // shifts entries and poisons the vacated tail in Debug builds.
+    while (self.children.items.len > 0) {
+        removeChildInternal(self, self.children.items[0], false);
     }
-    self.children.clearRetainingCapacity();
     self.markRuntimeIndexDirty();
     self.markLayoutDirty();
 }

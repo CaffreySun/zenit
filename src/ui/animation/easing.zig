@@ -1,20 +1,18 @@
-/// Easing Functions
+/// Easing Functions - collection of timing curves for animations.
 ///
-/// 缓动函数集合，用于控制动画的时间曲线
-///
-/// 基于标准 CSS easing 和 Robert Penner's easing equations
-/// 支持 31 种预设 + 自定义三次贝塞尔曲线 (CSS cubic-bezier 兼容)
+/// Based on standard CSS easing and Robert Penner's equations. Supports 31 presets plus custom
+/// cubic Bezier (CSS cubic-bezier compatible).
 const std = @import("std");
 const math = std.math;
 
-/// 三次贝塞尔参数 (CSS cubic-bezier(x1, y1, x2, y2) 兼容)
+/// cubic Bezier parameters (CSS cubic-bezier(x1, y1, x2, y2) compatible)
 pub const CubicBezierParams = struct {
     x1: f32,
     y1: f32,
     x2: f32,
     y2: f32,
 
-    // CSS 标准预设
+    // CSS standard presets
     /// CSS ease: cubic-bezier(0.25, 0.1, 0.25, 1.0)
     pub const ease = CubicBezierParams{ .x1 = 0.25, .y1 = 0.1, .x2 = 0.25, .y2 = 1.0 };
     /// CSS ease-in: cubic-bezier(0.42, 0, 1, 1)
@@ -23,76 +21,76 @@ pub const CubicBezierParams = struct {
     pub const ease_out = CubicBezierParams{ .x1 = 0, .y1 = 0, .x2 = 0.58, .y2 = 1 };
     /// CSS ease-in-out: cubic-bezier(0.42, 0, 0.58, 1)
     pub const ease_in_out = CubicBezierParams{ .x1 = 0.42, .y1 = 0, .x2 = 0.58, .y2 = 1 };
-    /// Motion.dev 默认
+    /// Motion.dev default
     pub const motion_default = CubicBezierParams{ .x1 = 0.22, .y1 = 1.0, .x2 = 0.36, .y2 = 1.0 };
 };
 
-/// 缓动函数类型 (tagged union: 31 个预设 + 自定义贝塞尔)
+/// easing function type (tagged union: 31 presets + custom Bezier)
 pub const Easing = union(enum) {
-    // 线性
+    // linear
     linear,
 
-    // 二次
+    // quadratic
     ease_in_quad,
     ease_out_quad,
     ease_in_out_quad,
 
-    // 三次
+    // cubic
     ease_in_cubic,
     ease_out_cubic,
     ease_in_out_cubic,
 
-    // 四次
+    // quartic
     ease_in_quart,
     ease_out_quart,
     ease_in_out_quart,
 
-    // 五次
+    // quintic
     ease_in_quint,
     ease_out_quint,
     ease_in_out_quint,
 
-    // 正弦
+    // sine
     ease_in_sine,
     ease_out_sine,
     ease_in_out_sine,
 
-    // 指数
+    // exponential
     ease_in_expo,
     ease_out_expo,
     ease_in_out_expo,
 
-    // 圆形
+    // circular
     ease_in_circ,
     ease_out_circ,
     ease_in_out_circ,
 
-    // 弹性
+    // elastic
     ease_in_elastic,
     ease_out_elastic,
     ease_in_out_elastic,
 
-    // 回弹
+    // back
     ease_in_back,
     ease_out_back,
     ease_in_out_back,
 
-    // 弹跳
+    // bounce
     ease_in_bounce,
     ease_out_bounce,
     ease_in_out_bounce,
 
-    // 自定义三次贝塞尔
+    // custom cubic Bezier
     cubic_bezier: CubicBezierParams,
 
-    /// 便捷构造: 创建自定义三次贝塞尔缓动
+    /// convenience constructor: create custom cubic Bezier easing
     pub fn cubicBezier(x1: f32, y1: f32, x2: f32, y2: f32) Easing {
         return .{ .cubic_bezier = .{ .x1 = x1, .y1 = y1, .x2 = x2, .y2 = y2 } };
     }
 
-    /// 计算缓动值
-    /// t: 0.0 ~ 1.0 的归一化时间
-    /// 返回: 缓动后的值 (通常也在 0.0 ~ 1.0 范围，但某些缓动会超出)
+    /// compute easing value
+    /// t: normalized time 0.0 to 1.0
+    /// returns: eased value (usually in 0.0 to 1.0 range, but some easings may exceed)
     pub fn apply(self: Easing, raw_t: f32) f32 {
         const t = std.math.clamp(raw_t, 0.0, 1.0);
         return switch (self) {
@@ -154,19 +152,19 @@ pub const Easing = union(enum) {
     }
 };
 
-// ========== 三次贝塞尔求解 ==========
-// 算法来源: WebKit/Chromium 的 UnitBezier 实现
-// 给定 x 坐标 (时间进度)，求解对应的 y 坐标 (缓动值)
-// 使用 Newton-Raphson 迭代 + 二分法回退
+// ========== cubic Bezier solving ==========
+// algorithm from: WebKit/Chromium UnitBezier implementation
+// given x coordinate (time progress), solve for corresponding y coordinate (easing value)
+// uses Newton-Raphson iteration + bisection fallback
 
 fn solveCubicBezier(params: CubicBezierParams, x: f32) f32 {
-    // 边界情况
+    // edge cases
     if (x <= 0) return 0;
     if (x >= 1) return 1;
 
-    // 贝塞尔曲线的多项式系数
+    // Bezier curve polynomial coefficients:
     // B(t) = 3*(1-t)^2*t*P1 + 3*(1-t)*t^2*P2 + t^3
-    // 展开后: B(t) = (3*P1)*t + (-6*P1 + 3*P2)*t^2 + (3*P1 - 3*P2 + 1)*t^3
+    // Expanded: B(t) = (3*P1)*t + (-6*P1 + 3*P2)*t^2 + (3*P1 - 3*P2 + 1)*t^3
     const cx = 3.0 * params.x1;
     const bx = 3.0 * (params.x2 - params.x1) - cx;
     const ax = 1.0 - cx - bx;
@@ -175,10 +173,10 @@ fn solveCubicBezier(params: CubicBezierParams, x: f32) f32 {
     const by = 3.0 * (params.y2 - params.y1) - cy;
     const ay = 1.0 - cy - by;
 
-    // 求解 x(t) = x 的 t 值
-    var t = x; // 初始猜测
+    // solve for t where x(t) = x
+    var t = x; // initial guess
 
-    // Newton-Raphson 迭代 (最多 8 次)
+    // Newton-Raphson iteration (up to 8 times)
     for (0..8) |_| {
         const x_val = ((ax * t + bx) * t + cx) * t - x;
         if (@abs(x_val) < 1e-6) break;
@@ -189,11 +187,11 @@ fn solveCubicBezier(params: CubicBezierParams, x: f32) f32 {
         t -= x_val / dx;
     }
 
-    // 如果 Newton 收敛失败，使用二分法回退
+    // if Newton fails to converge, fall back to bisection
     t = std.math.clamp(t, 0.0, 1.0);
     var x_val = ((ax * t + bx) * t + cx) * t;
     if (@abs(x_val - x) > 1e-4) {
-        // 二分法
+        // bisection
         var lo: f32 = 0.0;
         var hi: f32 = 1.0;
         t = x;
@@ -209,11 +207,11 @@ fn solveCubicBezier(params: CubicBezierParams, x: f32) f32 {
         }
     }
 
-    // 用 t 计算 y(t)
+    // compute y(t) using t
     return ((ay * t + by) * t + cy) * t;
 }
 
-// ========== 预设缓动辅助函数 ==========
+// ========== preset easing helper functions ==========
 
 const c1: f32 = 1.70158;
 const c2: f32 = c1 * 1.525;
@@ -275,7 +273,7 @@ fn bounceOut(t: f32) f32 {
     }
 }
 
-// ========== 测试 ==========
+// ========== tests ==========
 
 test "Easing: linear" {
     const e: Easing = .linear;
@@ -287,14 +285,14 @@ test "Easing: linear" {
 test "Easing: ease_out_quad" {
     const e: Easing = .ease_out_quad;
     const result = e.apply(0.5);
-    try std.testing.expect(result > 0.5); // ease out 应该比线性快
+    try std.testing.expect(result > 0.5); // ease out should be faster than linear
     try std.testing.expectEqual(@as(f32, 1.0), e.apply(1.0));
 }
 
 test "Easing: ease_in_quad" {
     const e: Easing = .ease_in_quad;
     const result = e.apply(0.5);
-    try std.testing.expect(result < 0.5); // ease in 应该比线性慢
+    try std.testing.expect(result < 0.5); // ease in should be slower than linear
 }
 
 test "Easing: ease_in_out_cubic" {
@@ -325,7 +323,7 @@ test "CubicBezier: linear (0, 0, 1, 1)" {
 
 test "CubicBezier: CSS ease (0.25, 0.1, 0.25, 1.0)" {
     const ease = Easing{ .cubic_bezier = CubicBezierParams.ease };
-    // CSS ease 在 t=0.5 时 y > 0.5 (减速曲线)
+    // CSS ease at t=0.5 y > 0.5 (deceleration curve)
     const mid = ease.apply(0.5);
     try std.testing.expect(mid > 0.5);
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), ease.apply(0.0), 0.001);
@@ -334,7 +332,7 @@ test "CubicBezier: CSS ease (0.25, 0.1, 0.25, 1.0)" {
 
 test "CubicBezier: CSS ease-in-out (0.42, 0, 0.58, 1)" {
     const ease_io = Easing{ .cubic_bezier = CubicBezierParams.ease_in_out };
-    // ease-in-out 在 t=0.5 时 y ≈ 0.5 (对称)
+    // ease-in-out at t=0.5 y approx 0.5 (symmetric)
     try std.testing.expectApproxEqAbs(@as(f32, 0.5), ease_io.apply(0.5), 0.05);
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), ease_io.apply(0.0), 0.001);
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), ease_io.apply(1.0), 0.001);
@@ -344,7 +342,7 @@ test "CubicBezier: boundary values" {
     const bezier = Easing.cubicBezier(0.4, 0.0, 0.2, 1.0);
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), bezier.apply(0.0), 0.001);
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), bezier.apply(1.0), 0.001);
-    // 中间值应该单调递增
+    // intermediate values should be monotonically increasing
     const v1 = bezier.apply(0.25);
     const v2 = bezier.apply(0.5);
     const v3 = bezier.apply(0.75);

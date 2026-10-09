@@ -14,7 +14,7 @@
     .name = .myapp,
     .version = "0.1.0",
     .fingerprint = 0x8798022a7f8e220e,
-    .minimum_zig_version = "0.15.2",
+    .minimum_zig_version = "0.17.0",
 
     .dependencies = .{
         // The default `.path` is relative to **this file's directory** and
@@ -23,7 +23,7 @@
         // you MUST change one of:
         //   - `.path` to your local zenit checkout, **relative to this file**.
         //     e.g. if myapp/ sits next to the zenit checkout: `.path = "../zenit"`.
-        //     ⚠ Zig 0.15.2 rejects absolute paths here:
+        //     ⚠ Zig 0.17.0 rejects absolute paths here:
         //       `error: expected path relative to build root; found absolute path`
         //   - or switch to `.url + .hash` (recommended for published apps):
         //     `zig fetch --save=zenit https://github.com/<fork>/zenit/archive/<rev>.tar.gz`

@@ -1,28 +1,29 @@
-/// Sheet，样式层
+/// Sheet, style layer
 ///
-/// 遮罩/面板取色、阴影与内容区样式；overlay 生命周期与滑入动画在 mod.zig。
+/// Overlay / panel coloring, shadow and content area styles; overlay lifecycle and slide-in
+/// animation in mod.zig.
 const core = @import("../../core.zig");
 const theme = core.theme;
 const Color = core.Color;
 const Padding = core.Padding;
 const Shadow = core.Shadow;
 
-/// 遮罩色，props 覆盖优先，默认 overlay token
+/// Overlay color, props override priority, default overlay token
 pub fn sheetBarrierColor(override: ?Color, t: *const theme.ThemeTokens) Color {
-    return override orelse t.color.overlay;
+    return override orelse t.tokens.color.overlay;
 }
 
-/// 面板背景，props 覆盖优先
+/// Panel background, props override priority
 pub fn sheetPanelBackground(override: ?Color, t: *const theme.ThemeTokens) Color {
-    return override orelse t.color.bg_secondary;
+    return override orelse t.tokens.color.bg_secondary;
 }
 
-/// 主投影层，token shadow.lg
+/// Main shadow layer, token shadow.lg
 pub fn sheetKeyShadow(t: *const theme.ThemeTokens) Shadow {
-    return t.shadow.lg;
+    return t.tokens.shadow.lg;
 }
 
-/// 环境光阴影层：sheet 从侧边滑入，横向偏移阴影强调深度感
+/// Ambient light shadow layer: sheet slides in from side, horizontal offset shadow emphasizes depth
 pub const sheet_ambient_shadow: Shadow = .{
     .color = Color.rgba(0, 0, 0, 20),
     .blur = 60,

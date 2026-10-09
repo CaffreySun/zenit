@@ -1,43 +1,40 @@
-//! Line breaking, UAX #14 简化版
+//! Line breaking, simplified UAX #14: line-break-class based decisions (not ASCII punctuation
+//! plus 'allow break after CJK' heuristics).
 //!
-//! 用 UAX #14 line-break-class 体系做断行判定（取代旧的 ASCII 标点 +
-//! "isCJK 之后允许断" hack）。
+//! Scope:
+//! - codepoint -> line-break class (most common 18 classes)
+//! - canBreakBetween(prev, next): minimal pair table
+//! - findBreakOpportunities(text, out): all byte-position break opportunities
 //!
-//! 实现范围：
-//! - codepoint -> line-break class（覆盖最常见 18 类）
-//! - canBreakBetween(prev, next)：极简 pair 表
-//! - findBreakOpportunities(text, out)：返回所有 byte-position 处可断点
+//! Not implemented:
+//! - emoji ZWJ sequence break suppression
+//! - full LB rules (30+ clauses)
+//! - locale-specific breaking (Thai/Lao requires ICU dictionary)
 //!
-//! 不实现（Phase 5 暂不需要）：
-//! - emoji ZWJ sequence break 抑制
-//! - 完整 LB 规则（30+ 条）
-//! - 区域语言定制（Thai/Lao 词典断行需要 ICU）
-//!
-//! 后续可补全。当前最小目标：让 CJK / 拉丁 / 阿拉伯 文本能在合理位置断行
-//! 而不是 ASCII-only 模式。
+//! Goal: CJK/Latin/Arabic text breaks at reasonable positions, not ASCII-only.
 
 const std = @import("std");
 const testing = std.testing;
 
-/// Line break class（UAX #14）
+/// line break class (UAX #14)
 pub const LineBreakClass = enum(u8) {
-    /// Mandatory break (\n, U+2028 等)
+    /// mandatory break (\n, U+2028 etc)
     bk,
     /// Carriage return
     cr,
     /// Line feed
     lf,
-    /// Combining mark (跟前面字符走)
+    /// combining mark (follows preceding character)
     cm,
-    /// Zero width joiner（emoji/script 黏合）
+    /// zero width joiner (emoji/script binding)
     zwj,
     /// Word joiner / non-breaking
     wj,
-    /// Glue / no-break ' '（NBSP）
+    /// glue / no-break ' ' (NBSP)
     gl,
     /// Space
     sp,
-    /// Break after (但 SP 之后也可)
+    /// break after (but can break after SP too)
     ba,
     /// Break before
     bb,
@@ -91,12 +88,12 @@ pub fn classify(cp: u32) LineBreakClass {
     if (cp == 0x2060) return .wj;
 
     // Zero-width
-    if (cp == 0x200B) return .ba; // ZWSP -> 可断
+    if (cp == 0x200B) return .ba; // ZWSP -> can break
 
     // Hyphens
     if (cp == 0x2010 or cp == 0x2011 or cp == 0x2012 or cp == 0x2013 or cp == 0x2014) return .hy;
 
-    // Default：可中断的字母数字（Latin Extended、Cyrillic、Greek 等都视作 AL）
+    // default: breakable alphanumeric (Latin Extended, Cyrillic, Greek treated as AL)
     return .al;
 }
 
@@ -104,7 +101,7 @@ fn classify_ascii(c: u8) LineBreakClass {
     return switch (c) {
         '\n' => .lf,
         '\r' => .cr,
-        '\t' => .ba, // 当前简化为 break-after；真实是 BA
+        '\t' => .ba, // currently simplified to break-after; actual is BA
         ' ' => .sp,
         '0'...'9' => .nu,
         'A'...'Z', 'a'...'z' => .al,
@@ -119,31 +116,31 @@ fn classify_ascii(c: u8) LineBreakClass {
     };
 }
 
-/// 判断是否为 CJK 字符（中日韩统一表意文字范围，可在任意位置断行）。
-/// 单一事实来源：ui/core/text_layout.isCJK 与 text_core/wrap_map 的
-/// precise wrap 断点都走这里，保证编辑态 WrapMap 与渲染端折行一致。
+/// determine if character is CJK (unified CJK ideograph range, can break at any position). Single
+/// source of truth: ui/core/text_layout.isCJK and text_core/wrap_map precise wrap breakpoints both
+/// use this, ensuring editor WrapMap and renderer line breaks stay consistent.
 pub fn isCJK(codepoint: u21) bool {
-    return (codepoint >= 0x4E00 and codepoint <= 0x9FFF) or // CJK 基本
-        (codepoint >= 0x3400 and codepoint <= 0x4DBF) or // CJK 扩展 A
-        (codepoint >= 0x20000 and codepoint <= 0x2A6DF) or // CJK 扩展 B
-        (codepoint >= 0x2A700 and codepoint <= 0x2B73F) or // CJK 扩展 C
-        (codepoint >= 0x2B740 and codepoint <= 0x2B81F) or // CJK 扩展 D
-        (codepoint >= 0xF900 and codepoint <= 0xFAFF) or // CJK 兼容
-        (codepoint >= 0x3000 and codepoint <= 0x303F) or // CJK 符号标点
-        (codepoint >= 0xFF00 and codepoint <= 0xFFEF); // 全角字符
+    return (codepoint >= 0x4E00 and codepoint <= 0x9FFF) or // CJK basic
+        (codepoint >= 0x3400 and codepoint <= 0x4DBF) or // CJK extension A
+        (codepoint >= 0x20000 and codepoint <= 0x2A6DF) or // CJK extension B
+        (codepoint >= 0x2A700 and codepoint <= 0x2B73F) or // CJK extension C
+        (codepoint >= 0x2B740 and codepoint <= 0x2B81F) or // CJK extension D
+        (codepoint >= 0xF900 and codepoint <= 0xFAFF) or // CJK compatibility
+        (codepoint >= 0x3000 and codepoint <= 0x303F) or // CJK symbols and punctuation
+        (codepoint >= 0xFF00 and codepoint <= 0xFFEF); // Fullwidth characters
 }
 
-/// 极简 pair table：判定 prev - next 之间是否允许断行。
-/// 返回 true 表示可在 prev 之后断（即 next 开始处是断点）。
+/// Minimal pair table: can break between prev and next.
+/// Return true means break allowed after prev (i.e. next start is break point).
 ///
-/// 规则（UAX #14 子集，按重要性排序）：
-/// 1. \n / \r / BK 后必断（其实是 mandatory）
-/// 2. SP 之后 + 非 CL/CP/IS 等 -> 可断
-/// 3. WJ / GL / ZWJ / NBSP 周围不断
-/// 4. AL/NU 之间不断（同质连续不断）
-/// 5. ID（CJK）每个字符前后都可断（除非紧跟标点）
-/// 6. HY 之后可断
-/// 7. 默认：拉丁文 AL 与 ID 之间可断
+/// Rules (UAX #14 subset, priority-ordered):
+/// 1. \n / \r / BK mandatory break
+/// 2. SP after + non CL/CP/IS etc -> breakable
+/// 3. WJ / GL / ZWJ / NBSP no break
+/// 4. AL/NU between no break (same-kind continuity)
+/// 5. ID (CJK) breaks before/after (except punctuation adjacent)
+/// 6. HY breakable after
+/// 7. Default: Latin AL and ID breakable between
 pub fn canBreakBetween(prev: LineBreakClass, next: LineBreakClass) bool {
     // No-break around joiners
     if (prev == .wj or next == .wj) return false;
@@ -155,16 +152,16 @@ pub fn canBreakBetween(prev: LineBreakClass, next: LineBreakClass) bool {
     if (prev == .cr and next != .lf) return true;
     if (prev == .cr and next == .lf) return false;
 
-    // SP-NEXT：通常可断（SP 之后任何非 close-punctuation）
+    // SP-NEXT: usually breakable (SP after any non close-punctuation)
     if (prev == .sp) {
         if (next == .cl or next == .cp or next == .ex or next == .is) return false;
         return true;
     }
 
-    // 不在 break-before 之前断（break-before 类是行首类，不应在它前断）
+    // Don't break before break-before (that class is start-of-line, shouldn't precede)
     if (next == .cm) return false;
 
-    // ID（CJK）允许其前后断（除 close 标点紧跟）
+    // ID (CJK) breaks before/after (unless close-punctuation adjacent)
     if (prev == .id) {
         return switch (next) {
             .cl, .cp, .ex, .is, .sy, .hy => false,
@@ -172,34 +169,34 @@ pub fn canBreakBetween(prev: LineBreakClass, next: LineBreakClass) bool {
         };
     }
     if (next == .id) {
-        // ID 前可断除非 prev 是 open 标点
+        // Break before ID unless prev is open-punctuation
         return switch (prev) {
             .op, .qu => false,
             else => true,
         };
     }
 
-    // HY 之后可断
+    // Break after HY
     if (prev == .hy) return true;
 
-    // BA（break-after）之后可断
+    // Break after BA (break-after)
     if (prev == .ba) return true;
 
-    // BB（break-before）之前可断
+    // Break before BB (break-before)
     if (next == .bb) return true;
 
-    // Numeric 间不断
+    // No break between numeric
     if (prev == .nu and next == .nu) return false;
     if (prev == .al and next == .al) return false;
     if (prev == .nu and next == .al) return false;
     if (prev == .al and next == .nu) return false;
 
-    // Default: 不断
+    // Default: don't break
     return false;
 }
 
-/// 在 text 中找出所有 break opportunity（byte position，相对 text 起点）。
-/// 返回所有"可在此 byte 位置之后开始新行"的 position。
+/// Find all break opportunities in text (byte position, relative to text start).
+/// Returns all 'can start new line at this byte position' positions.
 pub fn findBreakOpportunities(
     text: []const u8,
     out: *std.ArrayListUnmanaged(u32),
@@ -237,8 +234,8 @@ test "classify: ASCII space + letter" {
 }
 
 test "classify: CJK is ID" {
-    try testing.expectEqual(LineBreakClass.id, classify(0x4E2D)); // 中
-    try testing.expectEqual(LineBreakClass.id, classify(0x6587)); // 文
+    try testing.expectEqual(LineBreakClass.id, classify(0x4E2D)); // Chinese character U+4E2D
+    try testing.expectEqual(LineBreakClass.id, classify(0x6587)); // Chinese character U+6587
     try testing.expectEqual(LineBreakClass.id, classify(0x3042)); // あ Hiragana
 }
 
@@ -280,32 +277,32 @@ test "canBreakBetween: HY allows break after" {
 }
 
 test "findBreakOpportunities: simple ASCII spaces" {
-    var out: std.ArrayListUnmanaged(u32) = .{};
+    var out: std.ArrayListUnmanaged(u32) = .empty;
     defer out.deinit(testing.allocator);
 
     try findBreakOpportunities("hello world foo", &out, testing.allocator);
-    // 期望在 "hello " 后（byte 6）和 "world " 后（byte 12）有 break
+    // Expect break after 'hello ' (byte 6) and after 'world ' (byte 12)
     try testing.expect(out.items.len >= 2);
     try testing.expectEqual(@as(u32, 6), out.items[0]);
     try testing.expectEqual(@as(u32, 12), out.items[1]);
 }
 
 test "findBreakOpportunities: CJK every char is breakable" {
-    var out: std.ArrayListUnmanaged(u32) = .{};
+    var out: std.ArrayListUnmanaged(u32) = .empty;
     defer out.deinit(testing.allocator);
 
-    // "中文" = 6 bytes (UTF-8 各 3 字节)
+    // 'Chinese text' = 6 bytes (UTF-8 each 3 bytes)
     try findBreakOpportunities("\xE4\xB8\xAD\xE6\x96\x87", &out, testing.allocator);
-    // 中 ↔ 文 之间应有 break
+    // Break between Chinese and Chinese should exist
     try testing.expect(out.items.len >= 1);
     try testing.expectEqual(@as(u32, 3), out.items[0]);
 }
 
 test "findBreakOpportunities: NBSP suppresses break" {
-    var out: std.ArrayListUnmanaged(u32) = .{};
+    var out: std.ArrayListUnmanaged(u32) = .empty;
     defer out.deinit(testing.allocator);
 
-    // "a" + NBSP + "b"，NBSP 是 0xC2 0xA0
+    // 'a' + NBSP + 'b', NBSP is 0xC2 0xA0
     try findBreakOpportunities("a\xC2\xA0b", &out, testing.allocator);
     try testing.expectEqual(@as(usize, 0), out.items.len);
 }

@@ -18,7 +18,7 @@ const WorkResult = core.WorkResult;
 const box = core.box;
 
 fn snapshotLayerDebugEnabled() bool {
-    return std.posix.getenv("ZENIT_SNAPSHOT_DEBUG") != null;
+    return @import("zenit_environment").has("ZENIT_SNAPSHOT_DEBUG");
 }
 
 pub const BackdropConfig = struct {
@@ -74,6 +74,10 @@ pub const SnapshotLayerResult = struct {
     ) void {
         self.state.startOpacityAnimation(from, to, duration_s, dismissOnComplete, @ptrCast(self.state));
     }
+    /// `ui.view` integration (see src/ui/view_parts.zig).
+    pub fn viewParts(self: SnapshotLayerResult) core.ViewParts {
+        return .{ .root = self.node };
+    }
 };
 
 pub fn SnapshotLayer(props: SnapshotLayerProps) SnapshotLayerBuilder {
@@ -111,15 +115,15 @@ pub const SnapshotLayerBuilder = struct {
             .width = .{ .grow = .{} },
             .height = .{ .grow = .{} },
         }, .{});
-        // 所有权交接：registerResource 成功之前，layer / state 由这里的 errdefer 回收；
-        // 成功之后二者（连同 overlay 层、snapshot）归 my_scope 的 cleanup，若仍保留
-        // `errdefer destroy(state)`，后续失败会先释放 state、scope dispose 再跑 cleanup
-        // 释放一次（double free / UAF）。
+        // Ownership handoff: before registerResource succeeds, layer / state freed by errdefer
+        // here; after succeeds, both (plus overlay layer, snapshot) go to my_scope cleanup; keeping
+        // `errdefer destroy(state)` causes subsequent failures to free state first, scope dispose
+        // runs cleanup again (double free / UAF).
         var owned_here = true;
         errdefer if (owned_here) cx.freeNode(layer);
         layer.meta.ownership.meta.component_name = "SnapshotLayer";
         layer.setHitTestVisible(false);
-        // bindFloatingContent 末尾 ensureExtPanic：提前可失败地分配，OOM 走 error 而不是 panic
+        // bindFloatingContent end ensureExtPanic: pre-allocate fallibly, OOM goes error not panic.
         _ = try layer.style.ensureExtFallible(cx.allocator);
 
         const state = try cx.allocator.create(SnapshotLayerState);
@@ -160,7 +164,8 @@ pub const SnapshotLayerBuilder = struct {
         }.cleanup);
         owned_here = false;
         errdefer {
-            // mount 失败时 snapshot 仍归调用方（与 registerResource 之前的失败一致）
+            // On mount failure snapshot still owned by caller (same as failures before
+            // registerResource).
             state.snapshot = null;
             my_scope.dispose();
         }
@@ -231,8 +236,8 @@ const SnapshotLayerState = struct {
             return;
         }
 
-        // controller 插值 0..1 表示 progress；实际 opacity 在 beforeRender 里
-        // 由 (from_opacity, to_opacity) 线性映射：opacity = from + (to - from) * progress
+        // Controller interpolate 0..1 progress; actual opacity in beforeRender linearly mapped from
+        // (from_opacity, to_opacity): opacity = from + (to - from) * progress.
         var controller = AnimationController.initTween(.{
             .from = 0.0,
             .to = 1.0,
@@ -429,7 +434,7 @@ fn snapshotLayerDraw(ctx: DrawContext, context: ?*anyopaque) anyerror!void {
         const backdrop_opacity = backdropOpacity(state.opacity, backdrop.release_alpha);
         if (backdrop_opacity > 0.001) {
             const backdrop_color = applyOpacity(backdrop.color, backdrop_opacity);
-            // Stage B S4: DisplayItem 路径，与 progress/spinner 对齐。
+            // Stage B S4: DisplayItem path, aligned with progress/spinner.
             if (ctx.display_list) |dl| {
                 if (ctx.display_header) |header| {
                     try dl.append(.{
@@ -462,7 +467,7 @@ fn applyOpacity(color: Color, opacity: f32) Color {
 }
 
 test "SnapshotLayer mounts as a pure draw overlay" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(240, 160);
 
@@ -496,12 +501,12 @@ test "SnapshotLayer mounts as a pure draw overlay" {
     _ = cx.render();
     const commands = cx.lowerForEncoderPaintTable();
 
-    // Snapshot 的 anchor/scale/opacity 不是烘进 rect 几何的，而是由包裹它的
-    // begin_opacity_layer 的 **draw_transform** 承载（rect 保持 snapshot 本地
-    // 坐标，encoder 用该 transform 把整层搬到 anchor）。原测试直接找
-    // "几何 == anchor 的 fill_rect"，那是 pre-layer 时代的期望，永远不会命中。
-    // 改为断言真正的不变量：存在一个把本地 bounds 映射到 anchor 的包裹层，
-    // 且层内确实有 snapshot 的 fill_rect。
+    // Snapshot's anchor/scale/opacity not baked into rect geometry, but carried by wrapping
+    // begin_opacity_layer's **draw_transform** (rect keeps snapshot local coord, encoder uses that
+    // transform to relocate entire layer to anchor). Old test directly looked for "fill_rect geom
+    // == anchor", that's pre-layer era expectation, never matches. Revise to assert real invariant:
+    // wrapping layer exists mapping local bounds to anchor, and layer contains snapshot's
+    // fill_rect.
     var layer_at_anchor = false;
     for (commands) |cmd| {
         if (cmd.kind != .control) continue;
@@ -514,7 +519,7 @@ test "SnapshotLayer mounts as a pure draw overlay" {
     }
     try std.testing.expect(layer_at_anchor);
 
-    // 层内 snapshot 内容（本地坐标 40x24）确实被绘制。
+    // Layer's snapshot content (local coord 40x24) actually drawn.
     var found = false;
     for (commands) |cmd| {
         if (cmd.isFillRect() and
@@ -532,7 +537,7 @@ test "SnapshotLayer mounts as a pure draw overlay" {
 }
 
 test "SnapshotLayer opacity animation fades snapshot out" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(240, 160);
 
@@ -592,7 +597,7 @@ test "SnapshotLayer opacity animation fades snapshot out" {
 }
 
 test "SnapshotLayer completion callback may dispose scope" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(240, 160);
 
@@ -639,7 +644,7 @@ test "SnapshotLayer completion callback may dispose scope" {
 }
 
 test "SnapshotLayer dismiss detaches node from root" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(240, 160);
 
@@ -676,7 +681,7 @@ test "SnapshotLayer dismiss detaches node from root" {
 }
 
 test "SnapshotLayer scope dispose releases overlay layer and node" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(240, 160);
 
@@ -715,16 +720,16 @@ test "SnapshotLayer scope dispose releases overlay layer and node" {
 }
 
 test "SnapshotLayer: mount 在任意分配点失败时不泄漏也不 double free（sweep）" {
-    // oom_sweep.sweepMount 不适用：snapshot 必须先 render + capture，而 render 在 OOM
-    // 下按设计 panic。这里只对 mount 本身的分配点逐个注入失败。
+    // oom_sweep.sweepMount not applicable: snapshot must render + capture first, render panics on
+    // OOM by design. Here only inject failures per snapshot's own mount allocation.
     const t = std.testing;
     const Run = struct {
-        /// 返回 mount 自身用掉的分配次数；fail_at = null 表示不注入。
+        /// Return allocation count used by mount itself; fail_at = null means no injection.
         fn once(fail_at: ?usize, induced: *usize) !usize {
-            var gpa = std.heap.GeneralPurposeAllocator(.{ .safety = true }){};
+            var gpa = std.heap.DebugAllocator(.{ .safety = true }){};
             defer if (gpa.deinit() == .leak) @panic("SnapshotLayer mount OOM path leaked");
             var failing = t.FailingAllocator.init(gpa.allocator(), .{});
-            const cx = try Cx.init(failing.allocator());
+            const cx = try Cx.init(failing.allocator(), std.testing.io);
             defer cx.deinit();
             cx.setViewport(240, 160);
             const scope = try Scope.init(failing.allocator(), null, cx.owner);
@@ -742,7 +747,7 @@ test "SnapshotLayer: mount 在任意分配点失败时不泄漏也不 double fre
             const used = failing.alloc_index - before;
             if (result) |_| {} else |_| {
                 induced.* += 1;
-                snapshot.deinit(); // 失败时 snapshot 归调用方
+                snapshot.deinit(); // On failure snapshot owned by caller.
             }
             return used;
         }
@@ -751,6 +756,7 @@ test "SnapshotLayer: mount 在任意分配点失败时不泄漏也不 double fre
     const total = try Run.once(null, &induced);
     try t.expect(total > 0);
     for (0..total) |k| _ = try Run.once(k, &induced);
-    // 个别分配点失败被框架内部降级吞掉（不致 mount 失败），与 oom_sweep 同样按比例卡覆盖
+    // Individual allocation failures downgraded/swallowed inside framework (don't cause mount
+    // failure), same ratio-carded coverage as oom_sweep.
     try t.expect(induced >= total / 2);
 }

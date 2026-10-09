@@ -1,10 +1,11 @@
-/// 节点缓存最终化：将当前帧渲染命令写入 promoted cache 或 legacy overflow cache
+/// node cache finalization: write current-frame render commands to promoted cache or legacy
+/// overflow cache.
 ///
-/// 设计要点 (R3g 后)：cache band 不再切 cx.display_list。改成从每个 child 的
-/// runtime.subtree_display_item_* 范围 + node 自己的 runtime.display_item_* +
-/// content_slices.tail_* 拼接。这样 child 走 subtree-replay / own-replay 短路
-/// (写 lowering_buffer 不写 display_list 末尾) 也能被正确捕获，runtime range 永远
-/// 指向 prebuilt 位置，里面就是 child 的真实 contributing items。
+/// design after R3g: cache band no longer cuts cx.display_list. instead splice each child's
+/// runtime.subtree_display_item_* range + node's own runtime.display_item_* +
+/// content_slices.tail_*. child using subtree-replay / own-replay shortcut (write lowering_buffer
+/// not display_list tail) captured correctly, runtime range always points prebuilt location,
+/// contains child's real contributing items.
 const std = @import("std");
 const node_mod = @import("../node.zig");
 const display_list_mod = @import("../display_list.zig");
@@ -28,7 +29,7 @@ var overlay_debug_cache: ?bool = null;
 
 fn overlayDebugEnabled() bool {
     return overlay_debug_cache orelse blk: {
-        const enabled = std.posix.getenv("ZENIT_DEBUG_OVERLAY") != null;
+        const enabled = @import("zenit_environment").has("ZENIT_DEBUG_OVERLAY");
         overlay_debug_cache = enabled;
         break :blk enabled;
     };
@@ -36,7 +37,7 @@ fn overlayDebugEnabled() bool {
 
 fn shouldDebugOverlayNode(node: *Node) bool {
     if (!overlayDebugEnabled()) return false;
-    if (node.style.composited_group()) return true;
+    if (node.style.composited_group() or node.style.contentWarp() != null) return true;
     const name = node.meta.ownership.meta.component_name orelse return false;
     return std.mem.eql(u8, name, "Select") or
         std.mem.eql(u8, name, "Popover") or
@@ -47,7 +48,7 @@ fn shouldDebugOverlayNode(node: *Node) bool {
         std.mem.eql(u8, name, "DateRangePickerPanel");
 }
 
-/// 从 node 的 runtime.display_item_* 范围切 own (self) items。
+/// slice own (self) items from node's runtime.display_item_* range.
 fn nodeOwnItems(cx: *RenderContext, node_id: u32) []const DisplayItem {
     const runtime = cx.scene_runtime.get(node_id) orelse return &.{};
     const start = @as(usize, runtime.display_item_start);
@@ -59,9 +60,9 @@ fn nodeOwnItems(cx: *RenderContext, node_id: u32) []const DisplayItem {
     return cx.display_list.items.items[start..end];
 }
 
-/// 从 child 的 runtime range 切 child 的 contributing display items。
-/// 优先用 subtree range；若 subtree count=0 但 own count>0，回退到 own range,
-/// 这覆盖 leaf 节点 own 走 prebuild 短路、subtree paint 期间 0 增长的情况。
+/// slice child's contributing display items from child's runtime range. prefer subtree range; if
+/// subtree count=0 but own count>0, fall back to own range, covers leaf node own prebuild shortcut,
+/// zero growth during subtree paint.
 fn childSubtreeItems(cx: *RenderContext, child_id: u32) []const DisplayItem {
     const runtime = cx.scene_runtime.get(child_id) orelse return &.{};
     const total = cx.display_list.items.items.len;
@@ -78,10 +79,10 @@ fn childSubtreeItems(cx: *RenderContext, child_id: u32) []const DisplayItem {
     return cx.display_list.items.items[start..end];
 }
 
-/// 拼接 cache 命令缓冲：
-///   [self_items][regular_children_subtree...][sticky_children_subtree...][overlay_children_subtree...][tail]
-/// 返回 buffer + 各段 count + per-child slices。buffer 用 cx.frame_allocator 分配
-/// (per-frame arena, 拼好交给 cachePromotedRenderCommands 内部 dupe 持有)。
+/// splice cache command buffer:
+/// [self_items][regular_children_subtree...][sticky_children_subtree...][overlay_children_subtree...][tail].
+/// return buffer + segment counts + per-child slices. buffer allocated via cx.frame_allocator
+/// (per-frame arena, spliced then duped in cachePromotedRenderCommands).
 const Assembly = struct {
     commands: []const DisplayItem,
     self_count: u32,
@@ -144,7 +145,7 @@ fn assembleCacheCommands(
     @memcpy(buf[idx .. idx + self_items.len], self_items);
     idx += self_items.len;
 
-    // 节点自身 overflow clip 的 children 包围（与 paint pass 发射的同一对 token）。
+    // node's own overflow clip wrapping children (same token pair as paint pass emits).
     if (clip_band != 0) {
         buf[idx] = render_engine.scrollClipPushToken(exec_state);
         idx += 1;
@@ -187,11 +188,12 @@ fn assembleCacheCommands(
         idx += tail.len;
     }
 
-    // 跨帧自包含化：blob-backed text_run 的 blob_id 指向**每帧重建**的 text_blob_store，
-    // 下帧 replay 时 id 对不上 -> resolveTextRunContent 返回空串 -> settle 帧文字消失。
-    // 写缓存时就地物化：content 指向当前帧 blob 字节（cachePromotedRenderCommands ->
-    // duplicateDisplayItems 会深拷贝 content.len>0 的字节），blob_id 置 INVALID 断开
-    // 跨帧引用。缓存从此不依赖任何帧内序号身份。
+    // cross-frame self-containment: blob-backed text_run blob_id points to **per-frame rebuilt**
+    // text_blob_store, next frame replay id mismatches -> resolveTextRunContent returns empty ->
+    // settle frame text vanishes. materialize on cache write: content points current frame blob
+    // bytes (cachePromotedRenderCommands -> duplicateDisplayItems deep-copies content.len>0 bytes),
+    // blob_id set INVALID cuts cross-frame reference. cache henceforth independent of frame-local
+    // sequence ids.
     for (buf) |*item| {
         switch (item.*) {
             .text_run => |*t| {
@@ -220,8 +222,8 @@ fn assembleCacheCommands(
     };
 }
 
-/// descendant_scoped_promoted 策略：拼接旧 self_commands + 新 descendant_commands
-/// 若无旧缓存或 old_self_commands 为空，退化为直接写 commands_slice
+/// descendant_scoped_promoted strategy: splice old self_commands + new descendant_commands. if no
+/// old cache or old_self_commands empty, degrade to direct write commands_slice
 fn writeDescendantScopedPromotedCache(
     cx: *RenderContext,
     node: *Node,
@@ -237,18 +239,20 @@ fn writeDescendantScopedPromotedCache(
     const descendant_count = asm_.regular_count + asm_.sticky_count + asm_.overlay_count + asm_.tail_count + asm_.clip_open_count + asm_.clip_close_count;
 
     if (node.meta.per_frame.caches.commands.promoted) |old_cache| {
-        // 洗白防护（下游回归 review 指出的洞）：本分支保留**旧帧的 self 命令**
-        // （含按值烘焙旧 glass 参数的 begin_blur token），glass hash 必须跟随
-        // 实际写入的命令（沿用旧 hash），否则 markPromotedCacheRebuilt 盖上
-        // 当前参数的章后，替放守卫比"当前 vs 当前"永远相等，旧 token 畅通
-        // 无阻（GlassBox hover 回落方向视觉冻结的根因）。
+        // whitewash defense (downstream regression caught in review): this branch keeps **old
+        // frame's self commands** (includes begin_blur tokens with old-frame glass params baked),
+        // glass hash must follow actual written commands (reuse old hash), else
+        // markPromotedCacheRebuilt stamps current params, replacement guard comparing 'current vs
+        // current' always equal, old token flows unchecked (GlassBox hover fallback direction
+        // visual freeze root cause).
         const old_glass_hash = old_cache.cached_glass_hash;
         const old_self_commands = old_cache.selfCommands();
         if (old_self_commands.len > 0) {
-            // 拼旧 self + 新 descendant (asm_.commands 是 self ++ descendant 拼好的；切尾)。
+            // splice old self + new descendant (asm_.commands is self ++ descendant spliced; slice
+            // tail).
             const new_descendant_commands = asm_.commands[asm_.self_count..];
-            // frame arena：cachePromotedRenderCommands 内部会 dupe 持久化，
-            // spliced 本身只活到本次调用结束，无需 free。
+            // frame arena: cachePromotedRenderCommands dupes for persistence, spliced itself lives
+            // only until call end, no free needed.
             const spliced_buf = cx.frame_allocator.alloc(DisplayItem, old_self_commands.len + new_descendant_commands.len) catch {
                 node.cachePromotedRenderCommands(
                     cx.allocator,
@@ -312,7 +316,7 @@ fn writeDescendantScopedPromotedCache(
     );
 }
 
-/// 普通 promoted cache 写入（非 descendant_scoped_promoted 策略）
+/// normal promoted cache write (non-descendant_scoped_promoted strategy)
 fn writePromotedCache(
     cx: *RenderContext,
     node: *Node,
@@ -343,21 +347,22 @@ fn writePromotedCache(
     );
 }
 
-/// 写入 promoted cache 后更新 scene_runtime + compositor_plan 状态
+/// after writing promoted cache update scene_runtime + compositor_plan state
 fn markPromotedCacheRebuilt(cx: *RenderContext, node: *Node, exec_state: NodeExecutionState) void {
-    // 记录写入帧的 property-tree 根 id：替放前比对，防 stale 帧内序号索引
-    // 错误/越界的 transform/effect 节点（见 CachedRenderSlice 字段注释）。
+    // record property-tree root id of written frame: compare before replay, prevent stale
+    // frame-local id indexing errors/bounds of transform/effect nodes (see CachedRenderSlice field
+    // comment).
     if (node.meta.per_frame.caches.commands.promoted) |*cache| {
         cache.cached_transform_id = exec_state.retained_ids.transform_id;
         cache.cached_effect_id = exec_state.retained_ids.effect_id;
-        // 下游回归：clip_id 此前漏 stamp/漏比对，纯 clip 数量平移（transform/
-        // effect 不变）可蒙混过关，替放后 item 索引到别的节点的 clip rect。
+        // downstream regression: clip_id previously missed stamp/compare, pure clip count shift
+        // (transform/effect unchanged) could hide, replay misindexes to other node's clip rect.
         cache.cached_clip_id = exec_state.retained_ids.clip_id;
-        // glass 参数按值烘焙在缓存的 begin_blur token 里；参数写入不 bump
-        // content_version、dirty 位会被祖先 subtree replay 提前消费，必须
-        // 独立 stamp（GlassBox interactive hover 真机冻结的根因）。
-        // maxInt 哨兵 = 本次写入是 fresh 记录（splice 路径已带旧命令的旧章，
-        // 覆盖它就是"洗白"，旧 token 配新章，守卫失效）。
+        // glass params baked-by-value in cache's begin_blur token; param write doesn't bump
+        // content_version, dirty consumed early by ancestor subtree replay, needs independent stamp
+        // (GlassBox interactive hover real machine freeze root cause). maxInt sentinel = this write
+        // is fresh record (splice path already has old command's old stamp, overwriting it is
+        // 'whitewash', old token with new stamp, guard fails).
         if (cache.cached_glass_hash == std.math.maxInt(u64)) {
             cache.cached_glass_hash = render_engine.nodeGlassParamsHash(node);
         }
@@ -373,14 +378,14 @@ fn markPromotedCacheRebuilt(cx: *RenderContext, node: *Node, exec_state: NodeExe
 pub fn finalizeNodeCaches(
     cx: *RenderContext,
     node: *Node,
-    legacy_overflow_start_idx: usize,
+    _: usize,
     content_slices: NodeContentSlices,
     exec_state: NodeExecutionState,
     exec_plan: NodeExecutionPlan,
 ) void {
     if (exec_plan.should_write_promoted_cache) {
         const asm_ = assembleCacheCommands(cx, node, content_slices, exec_state) catch {
-            // OOM: 跳过 cache 写入；下帧会重建
+            // OOM: skip cache write; next frame rebuilds
             return;
         };
 
@@ -414,12 +419,19 @@ pub fn finalizeNodeCaches(
     }
 
     if (exec_plan.should_write_legacy_overflow_cache) {
-        const commands_slice = cx.display_list.items.items[legacy_overflow_start_idx..];
+        // Both caches use the same self-before-descendants contract. A raw
+        // paint-pass tail can omit prebuilt own content or include it depending
+        // on the prepass prefix, making replay append a second background.
+        const assembled = assembleCacheCommands(cx, node, content_slices, exec_state) catch return;
         node.cacheRenderCommands(
             cx.allocator,
-            commands_slice,
+            assembled.commands,
             exec_state.world_origin.x,
             exec_state.world_origin.y,
         );
+        if (node.meta.per_frame.caches.commands.own) |*cache| {
+            cache.self_content_command_count = assembled.self_count;
+            cache.descendant_content_command_count = @intCast(assembled.commands.len - assembled.self_count);
+        }
     }
 }

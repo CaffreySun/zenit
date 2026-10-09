@@ -47,20 +47,24 @@ pub const PerfCounters = struct {
     display_list_subtree_replay_count: u32 = 0,
     display_list_subtree_prebuild_count: u32 = 0,
     display_list_self_effect_subtree_replay_count: u32 = 0,
-    /// 单点脏帧放大器修复（下游回归）：paint/prebuild 重录计数。
-    /// own_content_emit_count = appendNodeOwnContent 真实重录节点数（fresh emit）；
-    /// subtree_payload_splice_count = 干净子树跨帧 payload 直接 splice 命中数；
-    /// subtree_payload_cache_write_count = 本帧写入的跨帧 payload 缓存数。
+    /// single-frame dirty amplification fix (downstream regression): paint/prebuild re-record
+    /// count.
+    /// own_content_emit_count = appendNodeOwnContent true re-record node count (fresh emit);
+    /// subtree_payload_splice_count = clean subtree cross-frame payload direct splice hits;
+    /// subtree_payload_cache_write_count = cross-frame payload cache writes this frame.
     own_content_emit_count: u32 = 0,
     subtree_payload_splice_count: u32 = 0,
-    /// 下游回归：splice 时 header 帧内序号 (transform/clip/effect_id) 与本帧
-    /// scene_runtime 不一致而被**改写**的 item 条数（rewriteSplicedItemHeaders）。
-    /// 观测计数：非 0 表示本帧确有 id 平移发生且已被纠正，非错误。
+    /// downstream regression: splice time header frame-local id (transform/clip/effect_id) mismatch
+    /// with this frame
+    /// scene_runtime **rewritten** item count (rewriteSplicedItemHeaders).
+    /// observation count: non-zero means frame had id shift and already corrected, not error.
     subtree_payload_stale_header_count: u32 = 0,
-    /// splice 时 item 所属 node 在**本帧** scene_runtime 里不存在（典型：运行时
-    /// setOpacity(0) 后子树整支跳过遍历）而被**丢弃**的 item 条数。丢弃是语义
-    /// 正确的：没被遍历 = 不可见/已摘除，不该画；带 stale id 放行会索引到
-    /// 别的元素的 transform（下游应用 layers 残影：键画到行左）。
+    /// splice time item's node not in **this frame** scene_runtime (typical:
+    /// runtime setOpacity(0) skips child subtree traversal) **discarded** item count. discard
+    /// semantically correct:
+    /// not traversed = invisible/removed, should not draw; allowing stale id passes through indexes
+    /// to another
+    /// element's transform (downstream app layers ghost: key draws to row left).
     subtree_payload_absent_node_drop_count: u32 = 0,
     subtree_payload_cache_write_count: u32 = 0,
     descendant_scoped_promoted_rebuild_count: u32 = 0,
@@ -83,34 +87,36 @@ pub const PerfCounters = struct {
     tick_nodes: u32 = 0,
     tick_hooks: u32 = 0,
     slow_hook_us: u64 = 0,
-    slow_hook_name: [64]u8 = [_]u8{0} ** 64,
+    slow_hook_name: [64]u8 = @as([64]u8, @splat(0)),
     slow_hook_name_len: u8 = 0,
 
-    /// Stage B-1/B-2: GpuDraw shadow encode 统计（debug build only）。
+    /// Stage B-1/B-2: GpuDraw shadow encode stats (debug build only).
     stage_b_shadow_display_items: u32 = 0,
     stage_b_shadow_drawable_commands: u32 = 0,
     stage_b_shadow_gpu_draws: u32 = 0,
     stage_b_shadow_count_mismatches: u32 = 0,
-    /// B-2: pipeline 序列等价检查，应永远 0；> 0 说明主路径 -> GpuDraw
-    /// 的 pipeline kind 序列不一致（lowering 漏 case 或主路径产了 shadow 没产的）
+    /// B-2: pipeline sequence equivalence check, should always 0; > 0 means main path -> GpuDraw
+    /// pipeline kind sequence inconsistent (lowering missed case or main path produced shadow
+    /// without it)
     stage_b_shadow_pipeline_mismatches: u32 = 0,
-    /// B-5: paint_table.DisplayItem.geom 字段值与 display_list 各 kind 的
-    /// (x,y,w,h) 字段值等价检查，应永远 0；> 0 说明 lowerDisplayItem 的
-    /// 几何字段映射有 bug。给 B-6 真切换 encoder 主路径前的强约束。
+    /// B-5: paint_table.DisplayItem.geom field value vs display_list per-kind (x,y,w,h) field
+    /// equivalence check, should always 0; > 0 means lowerDisplayItem geometry field mapping has
+    /// bug.
+    /// strong invariant before B-6 real encoder main path flip.
     stage_b_shadow_field_value_mismatches: u32 = 0,
-    /// B-2: 累计最大 batch run 长度（debug 观察 batcher 效果）
+    /// B-2: max batch run length accumulated (debug observation of batcher effectiveness)
     stage_b_shadow_max_batch_run: u32 = 0,
 
-    /// B-2 coverage probe: 按 lowered kind 累计 display_list item 数。
-    /// 与 stage_b_shadow_drawable_kind_* 对位，相等说明该 kind 在 shadow
-    /// 路径已 100% 覆盖，可作为下一步主路径 flip 候选。
+    /// B-2 coverage probe: display_list item count accumulated by lowered kind.
+    /// aligned with stage_b_shadow_drawable_kind_*, equal means kind 100% covered in shadow
+    /// path, candidate for next main path flip.
     stage_b_shadow_kind_rect: u32 = 0,
     stage_b_shadow_kind_text: u32 = 0,
     stage_b_shadow_kind_image: u32 = 0,
     stage_b_shadow_kind_path: u32 = 0,
     stage_b_shadow_kind_shadow: u32 = 0,
     stage_b_shadow_kind_gradient: u32 = 0,
-    /// B-2 coverage probe: 按 pipeline id 累计主路径 drawable command 数。
+    /// B-2 coverage probe: main path drawable command count accumulated by pipeline id.
     stage_b_shadow_drawable_kind_rect: u32 = 0,
     stage_b_shadow_drawable_kind_text: u32 = 0,
     stage_b_shadow_drawable_kind_image: u32 = 0,
@@ -129,17 +135,18 @@ pub const PerfCounters = struct {
     phase_prebuild_us: u64 = 0,
     phase_replay_us: u64 = 0,
     encode_us: u64 = 0,
-    /// GPU command buffer finish + submit + present 耗时（宿主填）。
+    /// GPU command buffer finish + submit + present latency (host fills).
     submit_us: u64 = 0,
-    /// 本帧 CPU 段之和（layout + render + encode + … ，不含 wait/acquire）。
-    /// 宿主填，用于喂 CPU-only 的百分位环，见 Cx.pushCpuFrameUs。
+    /// this frame CPU total (layout + render + encode + ..., not wait/acquire).
+    /// host fills, feeds CPU-only percentile loop, see Cx.pushCpuFrameUs.
     cpu_frame_us: u64 = 0,
-    /// 帧首的 deferred work 排空耗时（宿主填）。
+    /// deferred work drain latency at frame start (host fills).
     drain_us: u64 = 0,
-    /// 文本 atlas 预热（RenderCommandEncoder.prewarmDisplay）耗时。
-    /// 宿主填。滚动时可见文本每帧都在变，prewarm 的跳帧签名不命中，
-    /// 这一段会退化成"把所有可见文本再塑形一遍"，是帧里最贵的一段之一,
-    /// 不单独计时的话它会整段藏在 cpu_us 里，看起来像凭空多出来的开销。
+    /// text atlas prewarm (RenderCommandEncoder.prewarmDisplay) latency.
+    /// host fills. text visible every frame during scroll, prewarm skip-frame signature not hit,
+    /// this segment degrades to 'reshape all visible text again', one of frame's most expensive
+    /// pieces;
+    /// without separate timing it hides completely in cpu_us, looks like mysterious overhead.
     prewarm_us: u64 = 0,
     flush_us: u64 = 0,
     wait_us: u64 = 0,
@@ -221,10 +228,12 @@ pub const NodeRegistry = struct {
         for (root.children.items) |child| self.detachSubtree(child);
     }
 
-    /// 节点释放后整条移除（原来只把 last_ptr 置 null，generations 只增不减，
-    /// 长跑的列表型应用每建一个节点就永久多一行）。可以删的前提：生产路径
-    /// 的节点 id 全部来自 Cx.nextId（单调递增、不复用），释放后同 id 不会
-    /// 再出现，也就不需要保留代次去区分"同 id 的下一个节点"。
+    /// remove whole line after node freed (used to only clear last_ptr, generations only grow,
+    /// long-lived list-heavy apps permanently add line per node). deletable precondition:
+    /// production path
+    /// node ids all from Cx.nextId (monotone increasing, no reuse), after freed same id never
+    /// reappears,
+    /// no need to preserve generation to distinguish 'next node of same id'.
     pub fn noteNodeFreed(self: *NodeRegistry, node_id: u32) void {
         _ = self.entries.remove(node_id);
         _ = self.generations.remove(node_id);
@@ -333,8 +342,8 @@ const HitFlags = packed struct(u2) {
 pub const HitProxy = struct {
     handle: NodeHandle,
     node_id: u32,
-    /// 命中优先级的唯一依据：与渲染逐位一致的绘制序（paint_order.zig 三带
-    /// 遍历的 DFS 前序）。z_index 只经由同级排序影响它，没有全局层级。
+    /// only basis for hit priority: paint order bitwise consistent with render (DFS preorder from
+    /// paint_order.zig three-band traversal). z_index only affects sibling order, no global layer.
     paint_order: u64,
     local_rect: ComputedRect,
     true_aabb: ComputedRect,
@@ -372,7 +381,7 @@ const DynamicAabbTree = struct {
     fn init(allocator: Allocator) DynamicAabbTree {
         return .{
             .allocator = allocator,
-            .nodes = .{},
+            .nodes = .empty,
         };
     }
 
@@ -413,7 +422,8 @@ const DynamicAabbTree = struct {
             .height = 0,
             .proxy_id = proxy_id,
         };
-        // 失败时把刚分配的叶子还回 free_list，否则它会变成孤儿槽位滞留到整树销毁。
+        // on failure return freshly-allocated leaf to free_list, else becomes orphan slot lingering
+        // until whole tree destroyed.
         self.insertLeaf(leaf) catch |err| {
             self.freeNode(leaf);
             return err;
@@ -627,10 +637,10 @@ pub const HitRuntime = struct {
         return .{
             .allocator = allocator,
             .proxy_aabb_tree = DynamicAabbTree.init(allocator),
-            .proxies = .{},
-            .proxy_tree_nodes = .{},
-            .shapes = .{},
-            .clip_chain = .{},
+            .proxies = .empty,
+            .proxy_tree_nodes = .empty,
+            .shapes = .empty,
+            .clip_chain = .empty,
         };
     }
 
@@ -665,15 +675,15 @@ pub const HitRuntime = struct {
         try self.buildRecursive(r, registry, Transform2D.identity(), null, false);
     }
 
-    /// Partial rebuild 前刷新全部已烘焙 clip 条目的缓存几何。
+    /// Before a partial rebuild, flush all baked clip entry cached geometry.
     ///
-    /// clip_chain 条目在某次（可能早于本次布局收敛的）rebuild 里烘焙了当时的
-    /// world_aabb/local_rect。若此后祖先 clip 节点因内容变化被 reflow 长大/缩小，
-    /// 而它自身不在本次 partial 子树内（脏标记已被更早的 rebuild 消费），条目会
-    /// 永远停留在旧尺寸，子树内 proxy 刷新到新位置后落在旧 clip 边界外，
-    /// clipChainContains 拒绝命中（实测：Show 重挂载把兄弟按钮推出旧 clip 下缘，
-    /// 点击穿透到外层 ScrollArea）。条目数=场上 overflow_hidden 节点数，全量
-    /// 刷一遍是 O(几个) 的廉价操作。
+    /// A clip_chain entry bakes world_aabb/local_rect at some earlier rebuild. If an ancestor clip
+    /// node later reflows due to a content change outside this partial subtree (its dirty mark was
+    /// consumed by an earlier full rebuild), the entry keeps the old size; a proxy refreshed to its
+    /// new position falls outside it and clipChainContains rejects the hit (e.g. Show remount
+    /// pushes
+    /// a sibling button below the old clip edge, click punches through to the outer ScrollArea).
+    /// Entry count = on-screen overflow_hidden nodes, so a full flush is cheap.
     fn refreshClipEntriesFromLayout(self: *HitRuntime, registry: *const NodeRegistry) void {
         for (self.clip_chain.items) |*entry| {
             const node = registry.resolve(entry.handle, null) orelse continue;
@@ -752,14 +762,15 @@ pub const HitRuntime = struct {
 
     fn resolveCachedQuery(self: *HitRuntime, query: HitQuery, registry: *const NodeRegistry) ?HitResult {
         const cached = switch (query.kind) {
-            // pointer 命中必须实时从空间索引查询最上层节点。
-            // 直接复用 hovered/mouse_down 缓存会把大面积祖先节点“粘住”，
-            // 导致子节点（如 button/input）hover/click 被吞掉。
+            // pointer hit must query from spatial index real-time topmost node.
+            // directly reusing hovered/mouse_down cache 'sticks' large ancestor node,
+            // child nodes (button/input) hover/click swallowed.
             .pointer => null,
-            // scroll 命中也需要实时查询：外层 ScrollArea 往往覆盖整屏，
-            // 若复用缓存会导致滚轮 owner 被“粘住”在祖先层，鼠标移到内层可滚动区域
-            // （如 Textarea/VirtualList）后仍无法接管滚动。
-            // 会话稳定性由 EventDispatcher 的 scroll_session_owner 维护。
+            // scroll hit also needs real-time query: outer ScrollArea often covers full screen,
+            // reusing cache leaves scroll owner 'stuck' at ancestor layer, mouse moves to inner
+            // scrollable area
+            // (e.g. Textarea/VirtualList) scroll still cannot take over.
+            // session stability maintained by EventDispatcher's scroll_session_owner.
             .scroll => @as(?HitResult, null),
             .inspect => null,
         };
@@ -894,7 +905,7 @@ pub const HitRuntime = struct {
 
         const local_transform = retained_scene.buildNodeLocalTransform(node, .{ .include_rotation = true });
         node.frame_state.frame_local.spatial.world.matrix = parent_transform.mul(local_transform);
-        // 全局 hook 读 rect。
+        // global hook reads rect.
         const r = node.rectFromWorldOrFallback();
         const world_rect = node.frame_state.frame_local.spatial.world.matrix.transformRect(ComputedRect.init(0, 0, r.w, r.h));
         node.frame_state.frame_local.spatial.world.inverse = node.frame_state.frame_local.spatial.world.matrix.invert();
@@ -903,13 +914,15 @@ pub const HitRuntime = struct {
         node.frame_state.state_bits.dirty.hit.structure = false;
         node_dirty_gen.bumpLooseInteractionGen();
 
-        // 裁剪归属只由祖先 overflow_hidden 链决定，与 z_index 无关（z>0 不再清空
-        // clip 链、也不再有全局 stacking_z）：命中与像素一致，滚出 ScrollArea 的
-        // z>0 节点不会再抢视口外的点击。z_index 只经 paintOrderedChildren 的同级
-        // 排序影响 paint_order；后代永远排在祖先之后（DFS 前序）。
+        // clip membership determined only by ancestor overflow_hidden chain, unrelated to z_index
+        // (z>0 no longer clears
+        // clip chain, no longer global stacking_z): hit matches pixels, z>0 node scrolled out of
+        // ScrollArea no longer steals click outside viewport. z_index only affects sibling order
+        // via paintOrderedChildren;
+        // descendants always paint after ancestor (DFS preorder).
         var clip_chain_id = parent_clip_chain;
         if (node.style.overflow_hidden and world_rect.w > 0 and world_rect.h > 0) {
-            const clip_shape_id = try self.appendClipShape(node, interaction_semantics.nodeClipShape(node));
+            const clip_shape_id = try self.appendClipShape(node, interaction_semantics.nodeHitClipShape(node));
             const entry_id: u32 = @intCast(self.clip_chain.items.len);
             try self.clip_chain.append(self.allocator, .{
                 .parent_id = clip_chain_id,
@@ -1328,7 +1341,7 @@ fn collectNodeProxySpecs(node: *const Node, out: []HitProxySpec) []const HitProx
     }
 
     if (!interaction_semantics.nodeCreatesHitProxy(node) or out.len == 0) return out[0..0];
-    // 全局 hook 读 rect。
+    // global hook reads rect.
     const r = node.rectFromWorldOrFallback();
     out[0] = .{
         .local_rect = ComputedRect.init(0, 0, r.w, r.h),
@@ -1410,11 +1423,11 @@ fn shapeContainsRecord(shape: ShapeRecord, node: ?*const Node, local_rect: Compu
     }
 }
 
-/// 同级子节点的命中遍历顺序 = 绘制顺序：与 render_engine.sortSubtreeChildrenByZ 同规则
-/// （paint_order.siblingZ 稳定升序，0/负值保持插入序），调用方再按 paint_order.bands
-/// 三带（regular -> sticky -> positive_z）遍历，与渲染的 childPasses 逐位一致。
-/// 没有正 z 的兄弟直接借用原切片，否则返回排序副本。
-/// assignPaintOrderRecursive 与 buildRecursive 必须用同一顺序，paint_order 才与画面一致。
+/// Hit traversal order of sibling children = render order: same rules as
+/// render_engine.sortSubtreeChildrenByZ (paint_order.siblingZ stable ascending, 0/negative
+/// keeps insert order); the caller then traverses by paint_order.bands (regular -> sticky ->
+/// positive_z), consistent with render's childPasses. No positive z: original slice reused,
+/// else a sorted copy. assignPaintOrderRecursive and buildRecursive must use the same order.
 const OrderedChildren = struct {
     items: []const *Node,
     sorted: ?[]*Node,
@@ -1524,11 +1537,11 @@ fn testMultiProxyProvider(node: *const Node, _: ?*anyopaque, out: []HitProxySpec
 }
 
 test "HitRuntime: positive z does not escape clip for hit testing" {
-    // 方案 §9.2 第 11 条（替换旧的 "overlay escapes regular clip and wins by layer"）。
-    // z_index 只影响同级顺序：z>0 的节点照样被祖先 overflow_hidden 链裁剪命中；
-    // 在裁剪区内与兄弟重叠处，z 决定谁在上。overlay 故意先 append，证明赢是靠 z
-    // 排序而不是树序。全量 rebuild 与 partial rebuild（computeParentBuildState
-    // 推导祖先状态，旧实现会在 z>0 祖先处清空 clip 链）必须给出同一结论。
+    // z_index only affects sibling order: a z>0 node is still clipped by its ancestor
+    // overflow_hidden chain; within the clip region z decides who is on top. The overlay is
+    // intentionally appended first, proving the win is by z sort, not tree order. Full and partial
+    // rebuild (computeParentBuildState derives ancestor state) must agree; neither may clear the
+    // clip chain at a z>0 ancestor.
     const allocator = std.testing.allocator;
     var registry = NodeRegistry.init(allocator);
     defer registry.deinit();
@@ -1563,18 +1576,19 @@ test "HitRuntime: positive z does not escape clip for hit testing" {
     try registry.rebuild(root);
     try runtime.rebuild(root, &registry);
 
-    // (120,40)：在 overlay/inner/under 的矩形内，但在 clipper(0..80) 之外 -> 谁都不命中。
+    // (120,40): inside overlay/inner/under rectangle but outside clipper(0..80) -> nobody hit.
     try std.testing.expect(runtime.hitTestQuery(.{ .kind = .pointer, .world_x = 120, .world_y = 40 }, &registry, null) == null);
-    // inspect 查询不要求事件角色：root 可被 inspect，但 clipper 链下的三者一个都不能中。
+    // inspect query does not require event role: root can be inspected, but all three under clipper
+    // chain cannot hit.
     const inspected = runtime.hitTestQuery(.{ .kind = .inspect, .world_x = 120, .world_y = 40 }, &registry, null);
     try std.testing.expect(inspected != null);
     try std.testing.expectEqual(@as(u32, 1), inspected.?.node_id);
-    // (70,40)：clipper 内三者重叠 -> z=10 的 overlay 子树在上，最深的 inner 命中。
+    // (70,40): all three overlap inside clipper -> z=10 overlay subtree on top, deepest inner hit.
     const inside = runtime.hitTestQuery(.{ .kind = .pointer, .world_x = 70, .world_y = 40 }, &registry, null);
     try std.testing.expect(inside != null);
     try std.testing.expectEqual(@as(u32, 5), inside.?.node_id);
 
-    // partial rebuild：inner 的祖先链上有 z>0 的 overlay。
+    // partial rebuild: z>0 overlay in inner's ancestor chain.
     try std.testing.expect(try runtime.rebuildSubtree(inner, &registry));
     try std.testing.expect(runtime.hitTestQuery(.{ .kind = .pointer, .world_x = 120, .world_y = 40 }, &registry, null) == null);
     const inside_again = runtime.hitTestQuery(.{ .kind = .pointer, .world_x = 70, .world_y = 40 }, &registry, null);
@@ -1583,10 +1597,12 @@ test "HitRuntime: positive z does not escape clip for hit testing" {
 }
 
 test "HitRuntime: hit order equals render band order for sticky vs positive-z siblings" {
-    // 方案 §9.2 第 12 条。渲染的同级顺序是 regular -> sticky(z<=0) -> positive_z：
-    // 先 append 的 regular z=5 画在后 append 的 sticky z=0 之上。旧命中侧按
-    // "先非 sticky、再 sticky" 分配 paint_order，把 z=5 排在 sticky 之下，靠全局
-    // stacking_z 才掩盖过去；现在 paint_order 本身必须与渲染逐位对齐。
+    // plan §9.2 item 12. render sibling order is regular -> sticky(z<=0) -> positive_z:
+    // earlier-appended regular z=5 paints above later-appended sticky z=0. old hit side allocated
+    // paint_order
+    // "non-sticky first, then sticky", put z=5 below sticky, masked by global stacking_z; now
+    // paint_order itself
+    // must align bitwise with render.
     const allocator = std.testing.allocator;
     var registry = NodeRegistry.init(allocator);
     defer registry.deinit();
@@ -1617,7 +1633,7 @@ test "HitRuntime: hit order equals render band order for sticky vs positive-z si
     try registry.rebuild(root);
     try runtime.rebuild(root, &registry);
 
-    // 与渲染同序：plain(regular) < sticky(sticky 带) < raised(positive_z 带)。
+    // same order as render: plain(regular) < sticky(sticky band) < raised(positive_z band).
     const plain_order = plain.frame_state.frame_local.spatial.paint.order;
     const sticky_order = sticky.frame_state.frame_local.spatial.paint.order;
     const raised_order = raised.frame_state.frame_local.spatial.paint.order;
@@ -1631,7 +1647,7 @@ test "HitRuntime: hit order equals render band order for sticky vs positive-z si
     try std.testing.expect(pointer != null);
     try std.testing.expectEqual(@as(u32, 62), pointer.?.node_id);
 
-    // 去掉 z 之后 raised 回到 regular 带（在 sticky 与 plain 之下）：最上面是 sticky。
+    // after removing z raised goes back to regular band (below sticky and plain): sticky on top.
     raised.style.ensureExtPanic(allocator).z_index = 0;
     try runtime.rebuild(root, &registry);
     const lowered = runtime.hitTestQuery(.{ .kind = .pointer, .world_x = 60, .world_y = 60 }, &registry, null);
@@ -1708,9 +1724,13 @@ test "HitRuntime: overlay descendants inherit ancestor z-order" {
 }
 
 test "HitRuntime: overlay descendant with its own z_index never sorts below its overlay ancestor" {
-    // 下游编辑器题注浮层实测：Popover 面板 z=142，里面 Input 聚焦后 focus_ring_host 置 z=1，
-    // 旧规则把该子树的 stacking_z 重置成 1 -> 面板（142）压过输入框，鼠标永远命中面板：
-    // 没有 I 形光标、双击选词/拖选全部失效。z_index 只有同级兄弟语义，后代永远画在祖先之上。
+    // downstream editor footnote popup tested: Popover panel z=142, Input inside focused sets
+    // focus_ring_host z=1,
+    // old rule reset subtree's stacking_z to 1 -> panel (142) presses above input, mouse forever
+    // hits panel:
+    // no I-cursor, double-click select-word / drag-select all fail. z_index only has sibling
+    // semantics, descendants
+    // always paint above ancestor.
     const allocator = std.testing.allocator;
     var registry = NodeRegistry.init(allocator);
     defer registry.deinit();
@@ -1733,7 +1753,8 @@ test "HitRuntime: overlay descendant with its own z_index never sorts below its 
     field.behavior.interaction.focusable = true;
     try ring_host.appendChild(allocator, field);
 
-    // setLayoutRect 是父节点局部坐标：field 的世界矩形 = (100,100,120,40)，面板 = (20,20,160,160)
+    // setLayoutRect is parent-local coordinate: field's world rect = (100,100,120,40), panel =
+    // (20,20,160,160)
     root.setLayoutRect(.{ .x = 0, .y = 0, .w = 220, .h = 220 });
     panel.setLayoutRect(.{ .x = 20, .y = 20, .w = 160, .h = 160 });
     ring_host.setLayoutRect(.{ .x = 40, .y = 40, .w = 120, .h = 40 });
@@ -1746,7 +1767,8 @@ test "HitRuntime: overlay descendant with its own z_index never sorts below its 
     try std.testing.expect(pointer != null);
     try std.testing.expectEqual(@as(u32, 44), pointer.?.node_id);
 
-    // 同一子树走 partial rebuild（computeParentBuildState 推导祖先状态）也必须得出同一结论
+    // same subtree partial rebuild (computeParentBuildState derives ancestor state) must reach same
+    // conclusion
     try std.testing.expect(try runtime.rebuildSubtree(ring_host, &registry));
     const again = runtime.hitTestQuery(.{ .kind = .pointer, .world_x = 110, .world_y = 110 }, &registry, null);
     try std.testing.expect(again != null);
@@ -1754,8 +1776,8 @@ test "HitRuntime: overlay descendant with its own z_index never sorts below its 
 }
 
 test "HitRuntime: nested siblings inside an overlay keep sibling z order over tree order" {
-    // render_engine.sortSubtreeChildrenByZ 在每一级都按 z 稳定排序：同一浮层内
-    // 先 append 的 z=5 画在后 append 的 z=3 之上，命中必须与绘制一致。
+    // render_engine.sortSubtreeChildrenByZ stably sorts by z at each level: in same float layer,
+    // earlier-appended z=5 paints above later-appended z=3, hit must match render.
     const allocator = std.testing.allocator;
     var registry = NodeRegistry.init(allocator);
     defer registry.deinit();
@@ -1900,11 +1922,11 @@ test "HitRuntime: svg path importer supports cubic curves" {
     try registry.rebuild(root);
     try runtime.rebuild(root, &registry);
 
-    // 点在 bubble AABB 外 -> miss
+    // point outside bubble AABB -> miss
     try std.testing.expect(runtime.hitTestQuery(.{ .kind = .pointer, .world_x = 10, .world_y = 10 }, &registry, null) == null);
-    // 点在圆心附近（世界坐标 (40,40) -> 局部 (20,20) = 圆心）-> hit
+    // point near bubble center (world coords (40,40) -> local (20,20) = center) -> hit
     try std.testing.expect(runtime.hitTestQuery(.{ .kind = .pointer, .world_x = 40, .world_y = 40 }, &registry, null) != null);
-    // 点在 bubble AABB 内 -> hit（closed path 的 pointOnSegment 行为）
+    // point inside bubble AABB -> hit (closed path pointOnSegment behavior)
     try std.testing.expect(runtime.hitTestQuery(.{ .kind = .pointer, .world_x = 22, .world_y = 22 }, &registry, null) != null);
 }
 
@@ -1962,13 +1984,14 @@ test "HitRuntime: svg document importer merges multiple path tags" {
     try registry.rebuild(root);
     try runtime.rebuild(root, &registry);
 
-    // 第一个矩形区域内（世界 18,18 -> 局部 8,8 -> path1 (4..18) 内）-> hit
+    // inside first rectangle region (world 18,18 -> local 8,8 -> path1 (4..18) inside) -> hit
     try std.testing.expect(runtime.hitTestQuery(.{ .kind = .inspect, .world_x = 18, .world_y = 18 }, &registry, null) != null);
-    // 第二个矩形区域内（世界 40,40 -> 局部 30,30 -> path2 (22..36) 内）-> hit
+    // inside second rectangle region (world 40,40 -> local 30,30 -> path2 (22..36) inside) -> hit
     try std.testing.expect(runtime.hitTestQuery(.{ .kind = .inspect, .world_x = 40, .world_y = 40 }, &registry, null) != null);
-    // 点在 icon AABB 外 -> miss
+    // point outside icon AABB -> miss
     try std.testing.expect(runtime.hitTestQuery(.{ .kind = .inspect, .world_x = 5, .world_y = 5 }, &registry, null) == null);
-    // 两个矩形之间的间隙内（世界 30,20 -> 局部 20,10）-> hit（multi-subpath 的 pointOnSegment 行为）
+    // gap between two rectangles (world 30,20 -> local 20,10) -> hit (multi-subpath pointOnSegment
+    // behavior)
     try std.testing.expect(runtime.hitTestQuery(.{ .kind = .inspect, .world_x = 30, .world_y = 20 }, &registry, null) != null);
 }
 
@@ -2102,15 +2125,16 @@ test "HitRuntime: opaque island blocks pass-through to full-window canvas" {
     var runtime = HitRuntime.init(allocator);
     defer runtime.deinit();
 
-    // 下游应用布局：canvas_host 满窗打底，chrome 岛作为兄弟浮在其上。
+    // downstream app layout: canvas_host fills window bottom, chrome island floats as sibling on
+    // top.
     const root = try Node.create(allocator, 41, .box, .{});
     defer root.destroy(allocator);
 
     const canvas = try Node.create(allocator, 42, .box, .{});
-    canvas.behavior.interaction.focusable = true; // 画布自身可点
+    canvas.behavior.interaction.focusable = true; // canvas itself clickable
     try root.appendChild(allocator, canvas);
 
-    // 纯视觉岛壳：自身没有任何 handler。
+    // pure visual island shell: no handlers.
     const island = try Node.create(allocator, 43, .box, .{});
     try root.appendChild(allocator, island);
 
@@ -2125,26 +2149,26 @@ test "HitRuntime: opaque island blocks pass-through to full-window canvas" {
     try registry.rebuild(root);
     try runtime.rebuild(root, &registry);
 
-    // 修复前：点岛的空白处穿透到 canvas。
+    // before fix: click island blank space punches through to canvas.
     const leaked = runtime.hitTestQuery(.{ .kind = .pointer, .world_x = 150, .world_y = 90 }, &registry, null);
     try std.testing.expect(leaked != null);
     try std.testing.expectEqual(@as(u32, 42), leaked.?.node_id);
 
-    // 浮层根节点只需一个字段：拦截型 hit_behavior 自动隐含 pointer role。
+    // float layer root needs one field: interception hit_behavior implicitly implies pointer role.
     island.style.ensureExtPanic(allocator).hit_behavior = .@"opaque";
     try runtime.rebuild(root, &registry);
 
-    // 岛空白处 ⇒ 命中岛本身，不再是 canvas。
+    // island blank space => hit island itself, no longer canvas.
     const blocked = runtime.hitTestQuery(.{ .kind = .pointer, .world_x = 150, .world_y = 90 }, &registry, null);
     try std.testing.expect(blocked != null);
     try std.testing.expectEqual(@as(u32, 43), blocked.?.node_id);
 
-    // 岛内既有控件行为不变。
+    // existing controls in island behavior unchanged.
     const on_button = runtime.hitTestQuery(.{ .kind = .pointer, .world_x = 20, .world_y = 20 }, &registry, null);
     try std.testing.expect(on_button != null);
     try std.testing.expectEqual(@as(u32, 44), on_button.?.node_id);
 
-    // 画布空白处仍然命中 canvas。
+    // canvas blank space still hits canvas.
     const on_canvas = runtime.hitTestQuery(.{ .kind = .pointer, .world_x = 300, .world_y = 250 }, &registry, null);
     try std.testing.expect(on_canvas != null);
     try std.testing.expectEqual(@as(u32, 42), on_canvas.?.node_id);
@@ -2165,7 +2189,7 @@ test "HitRuntime: explicit opaque hit_behavior implies pointer role" {
     try root.appendChild(allocator, under);
 
     const panel = try Node.create(allocator, 53, .box, .{});
-    // 只设 hit_behavior，不设 hit_roles，应当独立生效。
+    // set hit_behavior only, no hit_roles, should work independently.
     panel.style.ensureExtPanic(allocator).hit_behavior = .@"opaque";
     try root.appendChild(allocator, panel);
 
@@ -2191,8 +2215,8 @@ test "HitRuntime: partial hit_roles override keeps unspecified roles at defaults
     const root = try Node.create(allocator, 71, .box, .{});
     defer root.destroy(allocator);
 
-    // 只覆盖 pointer。inspect 必须保持推导默认值（true），不能被静默归零,
-    // 否则该节点在 devtools 里选不中（HitRolesOverride 存在的理由）。
+    // pointer only. inspect must keep deriving default (true), cannot be silently zeroed,
+    // else node unselectable in devtools (reason HitRolesOverride exists).
     const panel = try Node.create(allocator, 72, .box, .{});
     panel.frame_state.state_bits.flags.inspectable = true;
     panel.style.ensureExtPanic(allocator).hit_roles = .{ .pointer = true };
@@ -2223,9 +2247,9 @@ test "HitRuntime: partial override lets scroll owner keep its derived scroll rol
     const root = try Node.create(allocator, 81, .box, .{});
     defer root.destroy(allocator);
 
-    // overlay_stack:509 的形状：dialog content 根只被加了 pointer role。
-    // 旧的全量覆盖会把 scroll 一并归零，滚轮事件因此不再路由到它；
-    // 逐 role 覆盖后 scroll 按"它本身是不是 scroll owner"推导。
+    // overlay_stack:509 shape: dialog content root only got pointer role added.
+    // old full override would zero scroll too, wheel events no longer route to it;
+    // per-role override after scroll derives from 'is it itself scroll owner'.
     const content = try Node.create(allocator, 82, .scroll, .{});
     content.style.ensureExtPanic(allocator).hit_roles = .{ .pointer = true };
     try root.appendChild(allocator, content);
@@ -2248,7 +2272,8 @@ test "HitRuntime: partial override lets scroll owner keep its derived scroll rol
 test "HitRuntime: every intercepting hit_behavior variant implies pointer role" {
     const allocator = std.testing.allocator;
 
-    // 文档声明三个拦截型变体都隐含 pointer，穿透型两个都不隐含，逐个钉死。
+    // doc declares three interception variants all imply pointer, pass-through both do not, pin
+    // each down.
     for ([_]HitBehavior{ .@"opaque", .self_only, .self_and_children }) |behavior| {
         const node = try Node.create(allocator, 91, .box, .{});
         defer node.destroy(allocator);
@@ -2278,8 +2303,8 @@ test "HitRuntime: explicit hit_roles beats hit_behavior implication" {
     under.behavior.interaction.focusable = true;
     try root.appendChild(allocator, under);
 
-    // 显式写出的 role 压过 hit_behavior 的隐含推导：这里显式 pointer = false，
-    // 即使 behavior 是拦截型，节点仍然穿透。
+    // explicit role overrides hit_behavior's implicit derivation: here explicit pointer = false,
+    // even if behavior interception, node still passes through.
     const panel = try Node.create(allocator, 63, .box, .{});
     const ext = panel.style.ensureExtPanic(allocator);
     ext.hit_behavior = .@"opaque";
@@ -2340,11 +2365,11 @@ test "HitRuntime: hidden hit-test ancestor removes entire subtree from pointer h
 }
 
 test "HitRuntime: partial rebuild 刷新祖先 clip 条目的陈旧尺寸（Show 重挂载类回归）" {
-    // 复现（CORE_REVIEW_2026-08-16 后续，storybook cleanup story 实测）：
-    // clip 祖先在旧布局下烘焙了 clip_chain 条目；内容变化把 clip 长高、按钮被
-    // 推到旧 clip 下缘之外；partial rebuild 根只覆盖内层子树（clip 祖先脏标记
-    // 已被更早的 full rebuild 消费）-> 按钮 proxy 位置刷新但祖先 clip 条目仍是
-    // 旧尺寸 -> 命中被 clipChainContains 拒绝，点击穿透到外层。
+    // Repro (storybook cleanup story): a clip ancestor baked its clip_chain entry at the old
+    // layout; content grew and pushed the button outside the old clip lower edge; the partial
+    // rebuild root covers only the inner subtree (ancestor dirty mark consumed by an earlier full
+    // rebuild) -> button proxy refreshed but ancestor clip entry stale -> hit rejected by
+    // clipChainContains, click punches through to the outer.
     const allocator = std.testing.allocator;
     var registry = NodeRegistry.init(allocator);
     defer registry.deinit();
@@ -2365,7 +2390,7 @@ test "HitRuntime: partial rebuild 刷新祖先 clip 条目的陈旧尺寸（Show
     const button = try Node.create(allocator, 4, .button, .{ .width = .{ .px = 80 }, .height = .{ .px = 30 } });
     try inner.appendChild(allocator, button);
 
-    // 初始布局：clip 高 150，按钮在 clip 内 (10,100)
+    // initial layout: clip height 150, button in clip (10,100)
     root.setLayoutRect(.{ .x = 0, .y = 0, .w = 200, .h = 400 });
     clipbox.setLayoutRect(.{ .x = 0, .y = 0, .w = 200, .h = 150 });
     inner.setLayoutRect(.{ .x = 0, .y = 0, .w = 200, .h = 150 });
@@ -2378,20 +2403,23 @@ test "HitRuntime: partial rebuild 刷新祖先 clip 条目的陈旧尺寸（Show
     try std.testing.expect(hit_before != null);
     try std.testing.expectEqual(@as(u64, 4), hit_before.?.node_id);
 
-    // 内容变化：clip 长高到 300，按钮被推到 (10,200)，旧 clip 边界（150）之外。
-    // 模拟"祖先脏标记已被消费"：只对 inner 子树做 partial rebuild，clipbox 不在根内。
+    // content change: clip grows to height 300, button pushed to (10,200), outside old boundary
+    // (150).
+    // simulate 'ancestor dirty mark consumed': partial rebuild on inner subtree only, clipbox not
+    // in root.
     clipbox.setLayoutRect(.{ .x = 0, .y = 0, .w = 200, .h = 300 });
     inner.setLayoutRect(.{ .x = 0, .y = 0, .w = 200, .h = 300 });
     button.setLayoutRect(.{ .x = 10, .y = 200, .w = 80, .h = 30 });
 
     try std.testing.expect(try runtime.rebuildSubtree(inner, &registry));
 
-    // 修复前：按钮 proxy 在 (10,200) 但祖先 clip 条目缓存 h=150 -> miss（命中 null 或外层）。
+    // before fix: button proxy at (10,200) but ancestor clip entry caches h=150 -> miss (hit null
+    // or outer).
     const hit_after = runtime.hitTestQuery(.{ .kind = .pointer, .world_x = 20, .world_y = 210 }, &registry, null);
     try std.testing.expect(hit_after != null);
     try std.testing.expectEqual(@as(u64, 4), hit_after.?.node_id);
 
-    // 旧位置（clip 内但按钮已不在）不应再命中按钮。
+    // old position (inside clip but button gone) should not hit button.
     const hit_stale = runtime.hitTestQuery(.{ .kind = .pointer, .world_x = 20, .world_y = 110 }, &registry, null);
     try std.testing.expect(hit_stale == null or hit_stale.?.node_id != 4);
 }

@@ -1,7 +1,6 @@
 const ImeReplacement = @import("ime_replacement.zig").ImeReplacement;
-/// TextInputState, Input/Textarea 核心状态
-///
-/// 包含 TextInputState struct 定义及全部方法。
+/// TextInputState, Input/Textarea core state
+/// Defines TextInputState struct and all methods.
 const std = @import("std");
 const core = @import("../../core.zig");
 const theme = core.theme;
@@ -11,6 +10,8 @@ const editable_block = @import("../editable_block/mod.zig");
 const ImeText = @import("ime_text.zig").ImeText;
 const text_utils = @import("text_utils.zig");
 const caret_blink = @import("caret_blink.zig");
+const edit_reconcile = @import("edit_reconcile.zig");
+const HistoryStash = @import("history_stash.zig").HistoryStash;
 const textarea_doc_mod = @import("textarea_document.zig");
 pub const TextareaDocument = textarea_doc_mod.TextareaDocument;
 const core_mod = @import("text_core");
@@ -33,179 +34,230 @@ pub const utf8MeasuredAdvancePrefix = text_utils.utf8MeasuredAdvancePrefix;
 pub const utf8MeasuredAdvance = text_utils.utf8MeasuredAdvance;
 pub const utf8ByteOffsetForMeasuredX = text_utils.utf8ByteOffsetForMeasuredX;
 
-/// Textarea 专用 undo 快照（动态文本，不受 256 字节限制）
+/// Textarea-only undo snapshot (dynamic text, no 256-byte limit)
 pub const TaUndoEntry = struct {
-    /// 文本快照（null = 空 slot）
+    /// Text snapshot (null = empty slot)
     text: ?[]const u8 = null,
-    /// 光标位置 (字节偏移)
+    /// Cursor position (byte offset)
     cursor_pos: usize = 0,
     selection_anchor: ?usize = null,
 
-    fn deinit(self: *TaUndoEntry, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *TaUndoEntry, allocator: std.mem.Allocator) void {
         if (self.text) |t| allocator.free(t);
         self.text = null;
     }
 };
 
-/// 文本输入内部状态
-/// 可合并编辑的种类。不同种类之间不合并（打字后按 Backspace 会开新的 undo 单元）。
+/// Text input internal state
+/// Mergeable edit kinds. Different kinds start new undo unit (Backspace after typing opens new
+/// unit).
 pub const UndoCoalesceKind = enum(u8) { none, insert, delete_backward, delete_forward };
+
+/// User edit transaction: one event (keyboard/text input/IME commit/AX write) from entry to return.
+/// Entry records the pre-edit selection and undo-merge state and logs what the edit did to
+/// history. When value binding (binding.zig) finds at edit exit that the landed value != buffer,
+/// it fixes the buffer in place instead of replacing it wholesale: reject reverts the history
+/// traces and restores the pre-edit selection; rewrite sets the buffer to the landed value, maps
+/// the cursor per edit_reconcile.zig and joins the edit's undo unit. Outside a transaction
+/// (programmatic writes) there is no checkpoint, so binding can only treat it as an external
+/// write.
+pub const UserEditTxn = struct {
+    /// Nesting depth (AX write can occur during event; only outermost records checkpoint)
+    depth: u8 = 0,
+    /// Pre-edit cursor/selection anchor (during composition re-conversion, use the selection saved
+    /// before composition started, same as cancelling composition)
+    cursor: usize = 0,
+    anchor: ?usize = null,
+    /// Pre-edit undo merge state (restored on reject; consecutive typing not interrupted by one
+    /// rejected keystroke)
+    coalesce_kind: UndoCoalesceKind = .none,
+    coalesce_cursor: usize = 0,
+    coalesce_at: ?@import("zenit_time").Instant = null,
+    /// Snapshots pushed to undo stack this transaction (popped on reject)
+    pushes: u8 = 0,
+    /// Undo/redo executed this transaction (reverse on reject to restore stacks)
+    history_op: HistoryOp = .none,
+
+    pub const HistoryOp = enum(u8) { none, undo, redo };
+};
 
 /// Once a state records single-line history it owns heap allocations through
 /// `allocator`; callers constructing a state directly must call `deinit`.
 pub const TextInputState = struct {
     const blink_half_period_ns: i128 = 500 * std.time.ns_per_ms;
 
-    /// undo/redo 栈深。原来是 32，连续打字每键一个快照时历史只有 ~32 次按键；
-    /// 合并落地后一个快照 = 一个输入单元，同样容量能覆盖远更长的历史。
+    /// Undo/redo stack depth. Originally 32 gave ~32 keystrokes; post-coalesce one snapshot = one
+    /// input unit with longer history.
     pub const UNDO_CAPACITY: usize = 64;
 
-    /// 连续输入合并的最大间隔。超过这个静默时间视为新的输入单元
-    /// （对齐 AppKit/NSUndoManager 的 grouping-by-idle 行为）。
+    /// Max idle interval for coalescing consecutive input. Exceeding this time starts new unit
+    /// (aligns with AppKit NSUndoManager grouping-by-idle).
     pub const undo_coalesce_idle_ns: u64 = 800 * std.time.ns_per_ms;
 
-    /// 文本缓冲区 (固定大小, 避免动态分配，见 editable_block.MAX_INPUT_BYTES)
-    buffer: [editable_block.MAX_INPUT_BYTES]u8 = [_]u8{0} ** editable_block.MAX_INPUT_BYTES,
+    /// Text buffer (fixed size, avoids dynamic allocation; see editable_block.MAX_INPUT_BYTES)
+    io: std.Io,
+    buffer: [editable_block.MAX_INPUT_BYTES]u8 = @as([editable_block.MAX_INPUT_BYTES]u8, @splat(0)),
     buffer_len: usize = 0,
     /// Opt-in for fields whose business value must not be silently truncated.
     growable: bool = false,
     input_overflow: ?[]u8 = null,
 
     cursor_pos: usize = 0,
-    /// 同一逻辑 byte 在 bidi/soft-wrap 边界可能有两个视觉位置。
+    /// Same logical byte may have two visual positions at bidi/soft-wrap boundary.
     cursor_affinity: text_coordinates.Affinity = .downstream,
     /// Textarea vertical navigation keeps a visual pixel column, not a UTF-8
     /// byte/codepoint column. Reset by horizontal movement or text mutation.
     preferred_visual_x: ?f32 = null,
 
-    /// 选择锚点 (如果有选择)
+    /// Selection anchor (if selected)
     selection_anchor: ?usize = null,
 
-    /// 撤销/重做栈。槽位只持有当时文本的 owned slice，未使用槽为 null。
-    undo_stack: [UNDO_CAPACITY]UndoSnapshot = [_]UndoSnapshot{.{}} ** UNDO_CAPACITY,
+    /// Undo/redo stack. Slots hold owned text snapshots; unused slots null.
+    undo_stack: [UNDO_CAPACITY]UndoSnapshot = @as([UNDO_CAPACITY]UndoSnapshot, @splat(.{})),
     undo_count: u8 = 0,
-    redo_stack: [UNDO_CAPACITY]UndoSnapshot = [_]UndoSnapshot{.{}} ** UNDO_CAPACITY,
+    redo_stack: [UNDO_CAPACITY]UndoSnapshot = @as([UNDO_CAPACITY]UndoSnapshot, @splat(.{})),
     redo_count: u8 = 0,
 
-    /// ── Undo 合并（coalescing）──
-    /// 原生控件把「连续输入」合并成一个 undo 单元，而不是一次按键一个快照。
-    /// 记录上一次可合并编辑的种类、结束光标位置与时间戳，用于判定是否续接。
+    /// -- Undo coalescing --
+    /// Native controls merge consecutive input into one undo unit, not per-keystroke snapshots.
+    /// Record previous mergeable edit kind, end cursor offset, and timestamp; use to detect
+    /// continuation.
     undo_coalesce_kind: UndoCoalesceKind = .none,
-    /// 上一次可合并编辑结束后的光标字节偏移（光标跳走则断开）
+    /// Cursor byte offset after last mergeable edit (breaks on cursor jump)
     undo_coalesce_cursor: usize = 0,
-    /// 上一次可合并编辑的时间戳（ns 单调时钟；超时则断开）
-    undo_coalesce_at: ?std.time.Instant = null,
+    /// Timestamp of last mergeable edit (ns monotonic clock; breaks on timeout)
+    undo_coalesce_at: ?@import("zenit_time").Instant = null,
+    /// Current user edit transaction (see UserEditTxn; depth == 0 = not in transaction)
+    user_edit: UserEditTxn = .{},
+    /// Redo stack cleared / undo entries evicted during transaction (restored on reject; see
+    /// history_stash.zig)
+    undo_stash: HistoryStash(UndoSnapshot, UNDO_CAPACITY) = .{},
+    ta_undo_stash: HistoryStash(TaUndoEntry, UNDO_CAPACITY) = .{},
 
-    /// 焦点状态
+    /// Focus state
     focused: bool = false,
 
-    /// 水平滚动偏移 (像素, 正值表示文本向左滚动)
+    /// Horizontal scroll offset (pixels; positive = text scrolled left)
     scroll_x: f32 = 0,
+    a11y_scroll_request: ?@import("../../core.zig").A11yProps.TextScrollRequest = null,
 
-    /// 脏标记 (需要重新渲染)
+    /// Dirty flag (needs redraw)
     dirty: bool = false,
 
-    /// 光标闪烁相位（实现见 caret_blink.zig）。相位算术与输入状态无关，
-    /// 已析出成可独立单测的小值类型。
+    /// Cursor blink phase (see caret_blink.zig). Phase arithmetic independent of input state;
+    /// factored into independent unit type.
     blink: caret_blink.CaretBlink = .{},
-    /// 上一帧可见性，用于只在相位翻转时标脏
+    /// Previous frame visibility; dirty only on phase flip
     last_blink_visible: bool = true,
-    /// 鼠标拖拽中
+    /// Mouse drag in progress
     is_dragging: bool = false,
-    /// 多击检测：最近一次 mouse_down 时间戳
-    last_mouse_down_instant: ?std.time.Instant = null,
-    /// 多击检测：最近一次 mouse_down 位置
+    /// Only populated by this input's mouse-move handler, never stale Cx coordinates.
+    drag_pointer: ?struct { x: f32, y: f32, time_ms: f64 } = null,
+    /// Multi-click detection: last mouse_down timestamp
+    last_mouse_down_instant: ?@import("zenit_time").Instant = null,
+    /// Multi-click detection: last mouse_down position
     last_mouse_down_pos: [2]f32 = .{ 0, 0 },
-    /// 多击计数（按下阶段）
+    /// Multi-click count (press phase)
     consecutive_mouse_downs: u8 = 0,
-    /// 多击选词/全选后，按住鼠标期间禁止进入拖拽更新
+    /// After multi-click select-word/select-all, block drag update while mouse held
     suspend_drag_until_mouse_up: bool = false,
-    /// 光标节点引用
+    /// Cursor node reference
     cursor_node: ?*core.Node = null,
-    /// 选区节点引用（仅 multiline 路径使用；single-line 走 text_display_node 上的 spans）
+    /// Selection node reference (multiline only; single-line uses text_display_node spans)
     selection_node: ?*core.Node = null,
-    /// IME 组合下划线节点引用（仅 multiline 路径使用；single-line 走 spans 的 underline）
+    /// IME composition underline node reference (multiline only; single-line uses spans underline)
     preedit_underline_node: ?*core.Node = null,
-    /// 文本显示节点引用（保留模式下用于动态更新 text content）
+    /// Text display node reference (retained mode: dynamic text content update)
     text_display_node: ?*core.Node = null,
-    /// Single-line 的 selection / IME spans 缓冲（owned，与 text_display_node 同生命周期）
-    /// 容量足够：1 selection + 1 preedit underline + 1 ime marked highlight = 3
+    /// Owns the before-render hook that applies scroll and selection visuals.
+    editable_surface_node: ?*core.Node = null,
+    /// Keep input visuals in sync when a host renders through a dirty subtree
+    /// path that does not visit the editable surface's per-frame hook.
+    visual_sync_hook: ?*const fn (*core.Node) void = null,
+    visual_sync_active: bool = false,
+    /// Single-line selection/IME spans buffer (owned, same lifetime as text_display_node).
+    /// Capacity sufficient: 1 selection + 1 preedit underline + 1 ime marked highlight = 3
     text_spans_buf: [4]core.TextSpan = undefined,
     text_spans_len: u8 = 0,
-    /// Placeholder 文本（用于 beforeRender 判断是否显示 placeholder）
+    /// Placeholder text (used in beforeRender to decide placeholder display)
     placeholder_text: ?[]const u8 = null,
-    /// Placeholder 颜色覆盖
+    /// Placeholder color override
     placeholder_color: ?core.Color = null,
-    /// Focus ring 承载节点（外层不裁剪容器）
+    /// Focus ring parent node (unclipped container)
     focus_ring_host: ?*core.Node = null,
-    /// 是否处于 Group attached 组合场景
+    /// Whether in Group attached composite scenario
     grouped_attached: bool = false,
-    /// 输入框容器节点引用（on_focus/on_blur 更新边框样式）
+    /// Input container node reference (on_focus/on_blur update border style)
     input_container_node: ?*core.Node = null,
-    /// hover Signal 引用（blur 时判断是否保留 hover 边框）
+    /// Hover signal reference (blur checks to preserve hover border)
     hover_signal: ?*core.Signal(bool) = null,
-    /// 是否有错误状态（on_focus/on_blur 时跳过边框更新）
+    /// Whether error state (skip border update on focus/blur)
     has_error: bool = false,
-    /// 复合控件嵌入模式：父控件负责 border / hover / focus chrome。
+    /// Dynamic disable: when true, event handlers ignore all input (static disable doesn't install
+    /// handler)
+    disabled: bool = false,
+    /// Composite control embed mode: parent controls border/hover/focus chrome.
     embedded_chrome: bool = false,
-    /// StyleExt 写入使用的 allocator（Group corner radius 透传等）
-    /// Owns single-line undo/redo snapshots. Component mounts replace this
-    /// fallback with their Scope/Cx allocator and register `deinit`.
+    /// Allocator for StyleExt writes (Group corner radius pass-through, etc.)
+    /// Owns single-line undo/redo snapshots. Component mounts replace this fallback with Scope/Cx
+    /// allocator and register deinit.
     allocator: std.mem.Allocator = std.heap.page_allocator,
-    // border 动画已统一到 Transition 系统（enableImplicitAnimation + setBorderColor）
-    /// input_container 全局 x (on_before_render 更新)
+    // Border animation unified into Transition system (enableImplicitAnimation + setBorderColor)
+    /// input_container global x (updated in on_before_render)
     container_x: f32 = 0,
-    /// input_container 全局 y (on_before_render 更新)
+    /// input_container global y (updated in on_before_render)
     container_y: f32 = 0,
-    /// 字符宽度缓存
+    /// Character width cache
     char_width: f32 = 7.8,
-    /// 文本字重（400=regular, 500=medium, 700=bold）
+    /// Text font weight (400=regular, 500=medium, 700=bold)
     font_weight: u16 = 400,
-    /// 文本字号缓存
+    /// Text font size cache
     font_size: f32 = 13.0,
-    /// 水平 padding 缓存
+    /// Horizontal padding cache
     padding_h: f32 = 8.0,
-    /// 垂直 padding 缓存
+    /// Vertical padding cache
     padding_v: f32 = 0.0,
-    /// 行高缓存
+    /// Line height cache
     line_height: f32 = 16.0,
-    /// 内部可用宽度缓存
+    /// Available inner width cache
     input_inner_w: f32 = 200.0,
-    /// Cx 引用 (拖拽时读取 mouse_x)
+    /// Cx reference (drag reads mouse_x)
     cx_ref: ?*core.Cx = null,
 
-    /// password 模式下单个 '*' 的 advance 缓存。每帧 O(1) 命中 ShapingCache 偏贵，
-    /// 而 mask = N 个相同 '*'，advance 是线性的 N × single_star_width，没必要每个
-    /// caller 都重 shape。invalidated 当 font_size/weight/cx 任一变化时。
+    /// Password mode single '*' advance cache. Per-frame ShapingCache hit expensive;
+    /// mask = N identical '*' has linear advance N x single_star_width; no need per-caller shape.
+    /// Invalidated on font_size/weight/cx change.
     cached_star_advance: f32 = 0,
     cached_star_font_size: f32 = -1,
     cached_star_font_weight: u16 = 0,
 
-    /// 输入类型
+    /// Input type
     input_type: InputType = .text,
-    /// 是否多行输入
+    /// User interaction may select/copy, but cannot mutate this document.
+    readonly: bool = false,
+    /// Whether multiline input
     multiline: bool = false,
-    /// 是否接受换行输入
+    /// Whether accepts line breaks
     accept_newline: bool = false,
-    /// 是否软换行（按容器宽度自动折行）
+    /// Whether soft-wrap (auto-wrap by container width)
     soft_wrap: bool = false,
-    /// 无滚动壳的多行编辑器按 WrapMap 的视觉行数自动增长高度。
-    /// Textarea 使用 VirtualList/固定 viewport，因此保持 false。
+    /// Multiline editor without scroll shell auto-grows height by WrapMap visual lines.
+    /// Textarea uses VirtualList/fixed viewport, stays false.
     multiline_auto_height: bool = false,
-    /// 文本显示缓冲区（密码掩码 / IME 组合文本）
+    /// Text display buffer (password mask / IME composition text)
     // Small projections stay inline; overflow storage retains complete text.
     // Retained text nodes own copies and never borrow these scratch buffers.
-    display_buffer: [editable_block.MAX_INPUT_BYTES + 256]u8 = [_]u8{0} ** (editable_block.MAX_INPUT_BYTES + 256),
+    display_buffer: [editable_block.MAX_INPUT_BYTES + 256]u8 = @as([(editable_block.MAX_INPUT_BYTES + 256)]u8, @splat(0)),
     /// Last successfully published display snapshot hash.
     display_text_hash: u64 = 0,
-    display_overflow: std.ArrayListUnmanaged(u8) = .{},
-    wrapped_display_overflow: std.ArrayListUnmanaged(u8) = .{},
-    ime_segment_overflow: std.ArrayListUnmanaged(u8) = .{},
-    /// 多行软换行渲染缓冲区
-    wrapped_display_buffer: [(editable_block.MAX_INPUT_BYTES + 256) * 2]u8 = [_]u8{0} ** ((editable_block.MAX_INPUT_BYTES + 256) * 2),
-    /// IME display segment 融合缓冲区（Textarea WrapMap 渲染路径）
-    ime_segment_buffer: [editable_block.MAX_INPUT_BYTES + 256]u8 = [_]u8{0} ** (editable_block.MAX_INPUT_BYTES + 256),
-    /// IME 预编辑缓冲
+    display_overflow: std.ArrayListUnmanaged(u8) = .empty,
+    wrapped_display_overflow: std.ArrayListUnmanaged(u8) = .empty,
+    ime_segment_overflow: std.ArrayListUnmanaged(u8) = .empty,
+    /// Multiline soft-wrap render buffer
+    wrapped_display_buffer: [(editable_block.MAX_INPUT_BYTES + 256) * 2]u8 = @as([((editable_block.MAX_INPUT_BYTES + 256) * 2)]u8, @splat(0)),
+    /// IME display segment merge buffer (Textarea WrapMap render path)
+    ime_segment_buffer: [editable_block.MAX_INPUT_BYTES + 256]u8 = @as([(editable_block.MAX_INPUT_BYTES + 256)]u8, @splat(0)),
+    /// IME preedit buffer
     ime_preedit: ImeText = .{},
     ime_preedit_len: usize = 0,
     ime_cursor_utf8_offset: usize = 0,
@@ -225,44 +277,49 @@ pub const TextInputState = struct {
     ime_visual_underline_width: f32 = 0,
     ime_visual_total_lines: u32 = 0,
 
-    /// Textarea VirtualList 状态引用（仅 multiline 模式）
+    /// Textarea VirtualList state reference (multiline only)
     vl_state: ?*@import("../virtual_list/mod.zig").VirtualListState = null,
-    /// Textarea 的 overlay 容器节点（承载 selection/cursor/preedit_underline）
+    /// Textarea overlay container node (holds selection/cursor/preedit_underline)
     textarea_overlay_node: ?*core.Node = null,
-    /// 多行选区额外行节点（selection_node 是第一行，这些是第 2~N 行）
-    extra_sel_nodes: [15]?*core.Node = [_]?*core.Node{null} ** 15,
+    /// Multiline selection extra row nodes (selection_node is first row; these are rows 2-N)
+    extra_sel_nodes: [15]?*core.Node = @as([15]?*core.Node, @splat(null)),
     extra_sel_count: u8 = 0,
 
-    /// === Textarea core 模块集成（仅 multiline 模式） ===
-    /// 动态文本文档（替代 buffer[256]）
+    /// === Textarea core module integration (multiline only) ===
+    /// Dynamic text document (replaces buffer[256])
     textarea_doc: ?*TextareaDocument = null,
-    /// 通用光标（替代手工 cursor 逻辑）
+    /// Generic cursor (replaces manual cursor logic)
     textarea_cursor: DocCursor(TextareaDocument) = .{},
-    /// 软换行映射（替代 appendWrappedLines/multilineVisualPosForOffset）
+    /// Soft-wrap map (replaces appendWrappedLines/multilineVisualPosForOffset)
     textarea_wrap: ?*TextareaWrapMap = null,
-    /// Textarea 专用 undo/redo 栈（动态文本，不受 256 字节限制）
-    ta_undo: [UNDO_CAPACITY]TaUndoEntry = [_]TaUndoEntry{.{}} ** UNDO_CAPACITY,
+    /// Textarea-only undo/redo stack (dynamic text, no 256-byte limit)
+    ta_undo: [UNDO_CAPACITY]TaUndoEntry = @as([UNDO_CAPACITY]TaUndoEntry, @splat(.{})),
     ta_undo_count: u8 = 0,
-    ta_redo: [UNDO_CAPACITY]TaUndoEntry = [_]TaUndoEntry{.{}} ** UNDO_CAPACITY,
+    ta_redo: [UNDO_CAPACITY]TaUndoEntry = @as([UNDO_CAPACITY]TaUndoEntry, @splat(.{})),
     ta_redo_count: u8 = 0,
-    /// Textarea 文本上限（字节），0 = 无限制
+    /// Textarea text limit (bytes), 0 = unlimited
     textarea_max_bytes: usize = 0,
 
-    /// Theme tokens 引用 (供 on_before_render 等无 ctx 的回调使用)
+    /// Theme tokens reference (for callbacks without ctx)
     tokens: *const theme.ThemeTokens = &theme.dark,
 
-    /// 宿主可覆写的选区配色（null = 走 tokens.color.selection_bg / 继承文字色）。
-    /// 场景：列表行内重命名把"行变成输入框"时，选区要满饱和 accent 底 + 反白
-    /// 文字（视线先落到名字上），而全局 selection_bg 是浅色淡蓝。仅单行
-    /// spans 路径消费；multiline 的独立 selection_node 不吃 fg（glyph 在
-    /// 高亮之上，改 fg 无意义）。
+    /// Host-override selection color (null = use tokens.color.selection_bg / inherit text color).
+    /// Scene: inline rename sets row as input with saturated accent bg + inverted text (focus on
+    /// name).
+    /// Global selection_bg light blue. Single-line spans only; multiline selection_node doesn't use
+    /// fg.
     selection_bg_override: ?core.Color = null,
     selection_fg_override: ?core.Color = null,
 
-    /// 值变化回调（文本内容真正改变时触发，不含纯光标移动）
-    /// 2026-07-31 并轨：统一 ?core.HandlerRef，用 invokeWithStr 触发
-    /// （payload = 当前全文；⚠ slice 只在回调执行期间有效，需留存请 dupe）。
+    /// Value change callback (fires when text truly changes, not cursor movement).
+    /// 2026-07-31 unified: ?core.HandlerRef with invokeWithStr (payload = full text; WARNING: the
+    /// slice is valid only during the callback, dupe it if you need to keep it).
     on_change: ?core.HandlerRef = null,
+    /// Single-line Enter (non-composition, no line breaks accepted): payload = full text. null
+    /// allows Enter to bubble
+    on_submit: ?core.HandlerRef = null,
+    /// Called after composition cancel: binding applies deferred external writes from composition.
+    on_ime_cancelled: ?core.HandlerRef = null,
 
     // ========== Doc sync ==========
 
@@ -279,7 +336,7 @@ pub const TextInputState = struct {
         self.textarea_cursor.preferred_col = null;
     }
 
-    /// Textarea 专用: 保存 undo 快照
+    /// Textarea-only: save undo snapshot
     fn taPushUndo(self: *TextInputState) bool {
         const doc = self.textarea_doc orelse return false;
         const allocator = doc.allocator;
@@ -290,25 +347,31 @@ pub const TextInputState = struct {
             .cursor_pos = self.cursor_pos,
             .selection_anchor = self.selection_anchor,
         };
+        const in_txn = self.user_edit.depth > 0;
         if (self.ta_undo_count < UNDO_CAPACITY) {
             self.ta_undo[self.ta_undo_count] = entry;
             self.ta_undo_count += 1;
         } else {
-            self.ta_undo[0].deinit(allocator);
+            // Evicted entries during transaction stashed; restored on reject.
+            if (!(in_txn and self.ta_undo_stash.keepEvicted(self.ta_undo[0]))) self.ta_undo[0].deinit(allocator);
             var i: usize = 0;
             while (i < UNDO_CAPACITY - 1) : (i += 1) self.ta_undo[i] = self.ta_undo[i + 1];
             self.ta_undo[UNDO_CAPACITY - 1] = entry;
         }
-        // 清空 redo
-        var j: u8 = 0;
-        while (j < self.ta_redo_count) : (j += 1) self.ta_redo[j].deinit(allocator);
-        self.ta_redo_count = 0;
+        // Clear redo stack (in-place detach during transaction; see history_stash.zig)
+        if (!(in_txn and self.ta_undo_stash.detachRedo(&self.ta_redo_count))) {
+            var j: u8 = 0;
+            while (j < self.ta_redo_count) : (j += 1) self.ta_redo[j].deinit(allocator);
+            self.ta_redo_count = 0;
+        }
         return true;
     }
 
     /// Restore text and indexes before moving either history entry.
     fn taRestoreHistory(self: *TextInputState, redo_direction: bool) bool {
         const doc = self.textarea_doc orelse return false;
+        // Redo slots may be reused: evicted entries during transaction freed first.
+        self.ta_undo_stash.settleRedo(&self.ta_redo, doc.allocator);
         const source = if (redo_direction) &self.ta_redo else &self.ta_undo;
         const source_count = if (redo_direction) &self.ta_redo_count else &self.ta_undo_count;
         const target = if (redo_direction) &self.ta_undo else &self.ta_redo;
@@ -341,8 +404,8 @@ pub const TextInputState = struct {
         return true;
     }
 
-    /// 从 DisplayLineInfo 计算安全的 buffer 字节范围 [start, end)
-    /// byte_end 可能是 maxInt(usize)，需 clamp 到 line_end
+    /// Compute safe buffer byte range [start, end) from DisplayLineInfo.
+    /// byte_end may be maxInt(usize); clamp to line_end
     fn safeSegRange(doc: *const TextareaDocument, info: DisplayLineInfo) struct { start: usize, end: usize } {
         const line_start = doc.getLineStart(info.buffer_line);
         const line_end = doc.getLineEnd(info.buffer_line);
@@ -354,7 +417,7 @@ pub const TextInputState = struct {
         return .{ .start = seg_start, .end = seg_end };
     }
 
-    /// 通知 WrapMap 增量更新 + VirtualList 刷新
+    /// Notify WrapMap incremental update + VirtualList refresh
     fn notifyWrapEdit(self: *TextInputState, start_line: usize, old_line_count: usize, new_line_count: usize) void {
         if (self.textarea_wrap) |wrap| {
             if (self.textarea_doc) |doc| {
@@ -365,13 +428,15 @@ pub const TextInputState = struct {
         }
     }
 
-    /// 释放并清空两种编辑路径的 undo/redo 历史。
-    ///
-    /// 多行快照持有动态文本，不能像单行固定数组一样只把 count 置零。
-    /// EditableText 在切换画布对象时用它阻止 Cmd+Z 恢复上一个对象，同时
-    /// Scope dispose 也通过此函数释放所有尚存快照。
+    /// Free and clear undo/redo history for both edit paths.
+    /// Multiline snapshots hold dynamic text; cannot just zero count like fixed array.
+    /// EditableText uses this to block Cmd+Z recovery on canvas switch; Scope dispose also frees
+    /// remaining snapshots.
     pub fn clearUndoHistory(self: *TextInputState) void {
         self.breakUndoCoalescing();
+        // History fully invalidated: stash also freed, no restorable state in transaction.
+        self.undo_stash.discard(&self.redo_stack, self.allocator);
+        self.user_edit.pushes = 0;
         var i: usize = 0;
         while (i < self.undo_count) : (i += 1) self.undo_stack[i].deinit(self.allocator);
         self.undo_count = 0;
@@ -380,6 +445,7 @@ pub const TextInputState = struct {
         self.redo_count = 0;
 
         if (self.textarea_doc) |doc| {
+            self.ta_undo_stash.discard(&self.ta_redo, doc.allocator);
             i = 0;
             while (i < self.ta_undo_count) : (i += 1) self.ta_undo[i].deinit(doc.allocator);
             self.ta_undo_count = 0;
@@ -422,6 +488,7 @@ pub const TextInputState = struct {
         self.ime_preedit.deinit();
         self.clearImePendingCommit();
         self.clearUndoHistory();
+        self.discardHistoryStash();
         self.display_overflow.deinit(self.allocator);
         self.wrapped_display_overflow.deinit(self.allocator);
         self.ime_segment_overflow.deinit(self.allocator);
@@ -449,17 +516,17 @@ pub const TextInputState = struct {
 
     // ========== Blink ==========
 
-    /// 重置光标闪烁计数 (操作后立即显示光标)
+    /// Reset cursor blink counter (show cursor immediately after action)
     pub fn resetBlink(self: *TextInputState) void {
-        self.blink.reset();
+        self.blink.reset(self.io);
         self.last_blink_visible = true;
     }
 
-    pub fn blinkVisible(self: *TextInputState, now: std.time.Instant) bool {
+    pub fn blinkVisible(self: *TextInputState, now: @import("zenit_time").Instant) bool {
         return self.blink.visible(now);
     }
 
-    pub fn nextBlinkDelayNs(self: *const TextInputState, now: std.time.Instant) u64 {
+    pub fn nextBlinkDelayNs(self: *const TextInputState, now: @import("zenit_time").Instant) u64 {
         return self.blink.nextDelayNs(now);
     }
 
@@ -541,7 +608,7 @@ pub const TextInputState = struct {
         defer display_doc.deinit();
         display_doc.setTextChecked(visible) catch return;
 
-        var display_wrap = TextareaWrapMap.init(allocator);
+        var display_wrap = TextareaWrapMap.init(allocator, self.io);
         defer display_wrap.deinit();
         const canonical_wrap = self.textarea_wrap.?;
         display_wrap.measure_fn = canonical_wrap.measure_fn;
@@ -692,8 +759,8 @@ pub const TextInputState = struct {
         // selection only once the node can own the complete projection.
         _ = try self.syncDisplayTextContentChecked();
         previous.deinit();
-        // 保留非空选区，让后续 ime_commit / fallback text_input 仍能按“覆盖选区”提交。
-        // 折叠选区（anchor == cursor）可安全清空。
+        // Keep non-empty selection for ime_commit / fallback text_input to apply over-selection.
+        // Collapsed selection (anchor == cursor) safe to clear.
         if (self.selection_anchor) |anchor| {
             if (anchor == self.cursor_pos) self.selection_anchor = null;
         }
@@ -701,8 +768,8 @@ pub const TextInputState = struct {
         self.clearImePendingCommit();
         self.dirty = true;
         self.resetBlink();
-        // preedit 变化改了 display text，必须走标脏链，否则零脏帧 fast-path
-        // 跳过 inputBeforeRender/relayout，preedit 字形不上屏而光标已前进
+        // Preedit change modifies display text; must mark dirty, else zero-dirty fast-path skips
+        // inputBeforeRender/relayout.
         self.markVisualDirty();
     }
 
@@ -723,7 +790,27 @@ pub const TextInputState = struct {
         }
     }
 
+    /// Composition abandoned: return to pre-composition baseline and notify binding
+    /// (on_ime_cancelled) to apply deferred external writes.
     pub fn cancelImeComposition(self: *TextInputState) void {
+        self.endImeComposition(true);
+    }
+
+    /// Composition replaced by single write (setText / AX write): end composition but do NOT emit
+    /// on_ime_cancelled.
+    /// Replace write becomes baseline; if emitted, binding applies deferred value, overwriting
+    /// just-written content (AX write lost).
+    /// Deferred writes thereafter handled normally: AX write proposed via on_change, landing
+    /// invalidates defer.
+    pub fn supersedeImeComposition(self: *TextInputState) void {
+        self.endImeComposition(false);
+    }
+
+    fn endImeComposition(self: *TextInputState, notify: bool) void {
+        const was_composing = self.ime_phase == .composing;
+        defer if (was_composing and notify) {
+            if (self.on_ime_cancelled) |h| h.invoke();
+        };
         if (self.ime_replacement) |replacement| {
             self.cursor_pos = @min(replacement.cursor, self.getText().len);
             self.selection_anchor = if (replacement.anchor) |anchor| @min(anchor, self.getText().len) else null;
@@ -735,10 +822,9 @@ pub const TextInputState = struct {
         self.ime_selection_highlight = false;
     }
 
-    /// IME replacementRange 应用：把 [start,end) UTF-8 字节区间设为选区，
-    /// 让随后的插入/删除落在该区间上（insertText 会先删选区）。
-    /// 哨兵或非法区间（起点大于终点 / 终点越界）不动作，退化为现行
-    /// "落在光标处"行为。字符边界钳制由 insertText/deleteRange 内部完成。
+    /// IME replacementRange: set [start,end) UTF-8 bytes as selection for subsequent insert/delete.
+    /// Sentinel or invalid range (start > end / out-of-bounds) no-op, degrade to cursor behavior.
+    /// Char-boundary clamping done inside insertText/deleteRange.
     pub fn applyImeReplacementRange(self: *TextInputState, replace_start_utf8: u32, replace_end_utf8: u32) bool {
         if (replace_start_utf8 == events.ime_no_replacement or
             replace_end_utf8 == events.ime_no_replacement) return false;
@@ -746,8 +832,8 @@ pub const TextInputState = struct {
         const doc_len: usize = if (self.textarea_doc) |doc| doc.totalLength() else self.buffer_len;
         const start: usize = replace_start_utf8;
         const end: usize = replace_end_utf8;
-        // 桥接层区间可能基于过期文本（异步一帧），越界时拒绝而不是钳，
-        // 宁可退化为现行为也不误删。
+        // Bridge range may be stale (async frame); reject out-of-bounds rather than clamp.
+        // Prefer degraded behavior over incorrect deletion.
         if (end > doc_len) return false;
         const text = self.getText();
         const lo = text_coordinates.clampByteOffset(text, .{ .value = start }, .backward).value;
@@ -758,8 +844,8 @@ pub const TextInputState = struct {
         return true;
     }
 
-    /// 带 replacementRange 的 IME commit：非哨兵时本次提交替换该文档区间
-    /// （日文再変換、以词改词等会修订已提交文本的 IME）。
+    /// IME commit with replacementRange: non-sentinel replaces document range (Japanese
+    /// retransformation, word-replace IME).
     pub fn handleImeCommitReplaceEvent(self: *TextInputState, text: []const u8, replace_start_utf8: u32, replace_end_utf8: u32) void {
         self.handleImeCommitReplaceEventChecked(text, replace_start_utf8, replace_end_utf8) catch return;
     }
@@ -881,12 +967,11 @@ pub const TextInputState = struct {
         return base_units + preedit_units;
     }
 
-    /// password 模式下用 mask 字符串替代真实 buffer 内容做测量。
-    /// CJK IME 输入到 password 后，buffer 持 UTF-8 多字节字符 (双宽显示)，
-    /// 但屏幕上画的是 ASCII '*' (单宽)。光标定位必须按 displayed mask 算，
-    /// 否则 cursor 视觉位置与 mask 字符不一致 -> 偏移 bug。
-    /// 由于 mask 是 N 个完全相同的 '*'，shape 一次拿单宽乘 N 就够，避免长输入
-    /// 时 O(N) shape 调用反复磨 ShapingCache。
+    /// Password mode mask replaces real buffer for measurement.
+    /// CJK IME into password: buffer holds UTF-8 multibyte (double-width display) but screen draws
+    /// single-width ASCII '*'.
+    /// Cursor position must calculate from displayed mask; mismatch causes offset bug.
+    /// Mask = N identical '*'; shape once, multiply by N, avoid O(N) calls to ShapingCache.
     fn singleStarAdvance(self: *TextInputState) f32 {
         if (self.cached_star_font_size == self.font_size and
             self.cached_star_font_weight == self.font_weight and
@@ -1188,7 +1273,7 @@ pub const TextInputState = struct {
         const lh = @max(self.line_height, 1.0);
         const target_row: usize = @intFromFloat(@floor(local_y / lh));
 
-        // WrapMap 路径: 通过 displayLineInfo 快速定位到 buffer 行
+        // WrapMap path: fast locate to buffer line via displayLineInfo
         if (self.textarea_wrap) |wrap| {
             if (self.textarea_doc) |doc| {
                 const dl: u32 = @intCast(@min(target_row, if (wrap.total_display_lines > 0) wrap.total_display_lines - 1 else 0));
@@ -1215,7 +1300,7 @@ pub const TextInputState = struct {
             }
         }
 
-        // Fallback: 旧的 O(N²) 路径
+        // Fallback: old O(N^2) path
         const text = self.getText();
         var best_off: usize = 0;
         var best_row_dist: usize = std.math.maxInt(usize);
@@ -1312,9 +1397,9 @@ pub const TextInputState = struct {
         return editable_block.composePreeditIntoBuffer(text, @min(self.cursor_pos, text.len), self.preeditText(), out);
     }
 
-    // ========== 词边界+选区 ==========
+    // ========== Word boundary + selection ==========
 
-    /// 从 pos 向左查找词边界（CJK 感知：每个 CJK 字符视为独立词）
+    /// Find word boundary leftward from pos (CJK-aware: each CJK char is separate word)
     pub fn findWordBoundaryLeft(self: *const TextInputState, pos: usize) usize {
         if (pos == 0) return 0;
         if (self.textarea_doc) |doc| {
@@ -1323,28 +1408,28 @@ pub const TextInputState = struct {
         const text = self.getText();
         var p = pos;
 
-        // 先看左边第一个字符的类别
+        // Check char category left of pos
         const first = text_utils.utf8DecodePrev(text, p);
         const first_class = text_utils.classifyCodepoint(first.cp);
 
         if (first_class == .cjk) {
-            // CJK 字符：只跳一个
+            // CJK: skip one only
             return first.start;
         }
 
         if (first_class == .separator) {
-            // 跳过连续的 separator
+            // Skip consecutive separators
             p = first.start;
             while (p > 0) {
                 const prev = text_utils.utf8DecodePrev(text, p);
                 if (text_utils.classifyCodepoint(prev.cp) != .separator) break;
                 p = prev.start;
             }
-            // 如果到了开头或遇到 CJK，直接返回
+            // If at start or encounter CJK, return
             if (p == 0) return 0;
             const next_prev = text_utils.utf8DecodePrev(text, p);
             if (text_utils.classifyCodepoint(next_prev.cp) == .cjk) return next_prev.start;
-            // 继续跳 word 字符
+            // Continue skipping word chars
             while (p > 0) {
                 const prev = text_utils.utf8DecodePrev(text, p);
                 if (text_utils.classifyCodepoint(prev.cp) != .word) break;
@@ -1353,7 +1438,7 @@ pub const TextInputState = struct {
             return p;
         }
 
-        // word 类别：跳过连续 word 字符
+        // Word category: skip consecutive word chars
         p = first.start;
         while (p > 0) {
             const prev = text_utils.utf8DecodePrev(text, p);
@@ -1363,7 +1448,7 @@ pub const TextInputState = struct {
         return p;
     }
 
-    /// 从 pos 向右查找词边界（CJK 感知：每个 CJK 字符视为独立词）
+    /// Find word boundary rightward from pos (CJK-aware: each CJK char is separate word)
     pub fn findWordBoundaryRight(self: *const TextInputState, pos: usize) usize {
         if (self.textarea_doc) |doc| {
             return DocCursor(TextareaDocument).nextWordBoundary(doc, pos);
@@ -1372,18 +1457,18 @@ pub const TextInputState = struct {
         if (pos >= text.len) return text.len;
         var p = pos;
 
-        // 先看右边第一个字符的类别
+        // Check char category right of pos
         var cp: u21 = 0;
         const step = text_utils.utf8DecodeNext(text, p, &cp);
         const first_class = text_utils.classifyCodepoint(cp);
 
         if (first_class == .cjk) {
-            // CJK 字符：只跳一个
+            // CJK: skip one only
             return p + step;
         }
 
         if (first_class == .word) {
-            // 跳过连续 word 字符
+            // Skip consecutive word chars
             p += step;
             while (p < text.len) {
                 var next_cp: u21 = 0;
@@ -1392,7 +1477,7 @@ pub const TextInputState = struct {
                 p += next_step;
             }
         } else {
-            // separator：跳过连续 separator
+            // Separator: skip consecutive separators
             p += step;
             while (p < text.len) {
                 var next_cp: u21 = 0;
@@ -1402,7 +1487,7 @@ pub const TextInputState = struct {
             }
         }
 
-        // 跳过后续的 separator（使得光标停在下一个词开头）
+        // Skip following separators (cursor stops at next word start)
         while (p < text.len) {
             var next_cp: u21 = 0;
             const next_step = text_utils.utf8DecodeNext(text, p, &next_cp);
@@ -1413,7 +1498,7 @@ pub const TextInputState = struct {
         return p;
     }
 
-    /// 获取选中文本
+    /// Get selected text
     pub fn getSelectedText(self: *const TextInputState) ?[]const u8 {
         const anchor = self.selection_anchor orelse return null;
         const start = @min(anchor, self.cursor_pos);
@@ -1426,7 +1511,7 @@ pub const TextInputState = struct {
         return self.singleLineBuffer()[start..end];
     }
 
-    /// 选中 pos 所在的词（CJK 感知：每个 CJK 字符独立选中）
+    /// Select word at pos (CJK-aware: each CJK char selected independently)
     pub fn selectWordAt(self: *TextInputState, pos: usize) void {
         if (self.textarea_doc) |doc| {
             const bounds = DocCursor(TextareaDocument).wordBoundsAt(doc, pos);
@@ -1439,17 +1524,17 @@ pub const TextInputState = struct {
         if (text.len == 0) return;
         const p = @min(pos, if (text.len > 0) text.len - 1 else 0);
 
-        // 解码当前位置的 codepoint
+        // Decode codepoint at current position
         var cp: u21 = 0;
         const step = text_utils.utf8DecodeNext(text, p, &cp);
         const cls = text_utils.classifyCodepoint(cp);
 
         if (cls == .cjk) {
-            // CJK 字符：只选中这一个字符
+            // CJK: select this char only
             self.selection_anchor = p;
             self.cursor_pos = p + step;
         } else if (cls == .separator) {
-            // 选中连续的 separator
+            // Select consecutive separators
             var start = p;
             while (start > 0) {
                 const prev = text_utils.utf8DecodePrev(text, start);
@@ -1466,7 +1551,7 @@ pub const TextInputState = struct {
             self.selection_anchor = start;
             self.cursor_pos = end;
         } else {
-            // word 字符：选中连续的 word 字符
+            // Word: select consecutive word chars
             var start = p;
             while (start > 0) {
                 const prev = text_utils.utf8DecodePrev(text, start);
@@ -1488,11 +1573,10 @@ pub const TextInputState = struct {
 
     // ========== Undo/Redo ==========
 
-    /// 保存撤销快照。
-    ///
-    /// 无条件压栈，并**断开** undo 合并链，所有走裸 pushUndo 的编辑
-    /// （setText / 词删除 / 行删除 / 粘贴等）都是自成一体的一步。
-    /// 连续输入请走 `pushUndoCoalescing`。
+    /// Save undo snapshot.
+    /// Unconditionally push and break merge chain; all naked pushUndo edits
+    /// (setText / word delete / line delete / paste) are standalone.
+    /// Consecutive input uses pushUndoCoalescing.
     pub fn pushUndo(self: *TextInputState) bool {
         if (!self.pushUndoRaw()) return false;
         self.undo_coalesce_kind = .none;
@@ -1550,26 +1634,41 @@ pub const TextInputState = struct {
 
     fn pushUndoRaw(self: *TextInputState) bool {
         if (self.textarea_doc != null) {
-            return self.taPushUndo();
+            if (!self.taPushUndo()) return false;
+            self.noteUserEditPush();
+            return true;
         }
         // Allocate before touching either history stack. An OOM therefore
         // leaves counts, existing snapshots and the current text unchanged.
         const snapshot = self.makeSingleLineSnapshot() orelse return false;
+        const in_txn = self.user_edit.depth > 0;
+        // Stash oldest evicted entry during transaction (free no-op after slot cleared).
+        if (in_txn and self.undo_count == UNDO_CAPACITY and self.undo_stash.keepEvicted(self.undo_stack[0])) {
+            self.undo_stack[0] = .{};
+        }
         self.pushSingleLineSnapshot(&self.undo_stack, &self.undo_count, snapshot);
-        self.clearSingleLineStack(&self.redo_stack, &self.redo_count);
+        if (!(in_txn and self.undo_stash.detachRedo(&self.redo_count))) {
+            self.clearSingleLineStack(&self.redo_stack, &self.redo_count);
+        }
+        self.noteUserEditPush();
         return true;
     }
 
-    /// 断开 undo 合并链。任何「非连续输入」的动作（光标移动、点击、
-    /// 失焦、粘贴、选区变化、显式 pushUndo 的编辑）都应调用它，
-    /// 这样下一次输入必然开一个新的 undo 单元。
+    fn noteUserEditPush(self: *TextInputState) void {
+        if (self.user_edit.depth > 0) self.user_edit.pushes +|= 1;
+    }
+
+    /// Break undo merge chain. Any non-consecutive action (cursor move, click, blur, paste,
+    /// selection change, explicit pushUndo) should call this
+    /// so next input starts new undo unit.
     pub fn breakUndoCoalescing(self: *TextInputState) void {
         self.undo_coalesce_kind = .none;
         self.undo_coalesce_at = null;
     }
 
-    /// 判断某个字符是否是"硬边界"，即使紧挨着输入也要断开 undo 单元。
-    /// 空白/换行是原生控件公认的分词点：撤销时按"词"回退而不是整段回退。
+    /// Check if char is hard boundary, breaking undo even if adjacent to input.
+    /// Whitespace/line-break are standard word boundaries: undo rewinds by word, not entire
+    /// segment.
     fn isUndoBoundaryText(text: []const u8) bool {
         for (text) |c| {
             if (c == ' ' or c == '\t' or c == '\n' or c == '\r') return true;
@@ -1577,20 +1676,19 @@ pub const TextInputState = struct {
         return false;
     }
 
-    /// 可合并版本的 pushUndo。
-    ///
-    /// 断开规则（任一命中就压新快照，否则复用上一个快照 = 合并）：
-    ///   1. 编辑种类变化（插入 ↔ 退格 ↔ 前向删除）
-    ///   2. 光标不连续：本次编辑起点 ≠ 上次编辑终点（点击/方向键跳转过）
-    ///   3. 距上次编辑超过 `undo_coalesce_idle_ns`（默认 800ms）静默
-    ///   4. 存在选区（替换选中内容是独立的一步）
-    ///   5. 内容含空白/换行等边界字符
+    /// Merge-capable version of pushUndo.
+    /// Break (push a new snapshot) if any condition holds, else reuse = merge:
+    ///   1. Edit kind changes (insert <-> backspace <-> delete forward)
+    ///   2. Cursor discontinuous: edit start != last edit end (jumped via click/arrow)
+    ///   3. Idle longer than undo_coalesce_idle_ns (default 800ms)
+    ///   4. Selection exists (replacing a selection is separate)
+    ///   5. Content contains boundary chars (whitespace/newline)
     fn pushUndoCoalescing(
         self: *TextInputState,
         kind: UndoCoalesceKind,
         text: []const u8,
     ) bool {
-        const now: ?std.time.Instant = std.time.Instant.now() catch null;
+        const now: ?@import("zenit_time").Instant = @import("zenit_time").Instant.now(self.io) catch null;
 
         var breaks = self.selection_anchor != null or isUndoBoundaryText(text);
         if (!breaks) breaks = self.undo_coalesce_kind != kind;
@@ -1605,34 +1703,39 @@ pub const TextInputState = struct {
 
         if (breaks and !self.pushUndoRaw()) return false;
 
-        // 无论是否压栈，链都要续上：合并的编辑更新终点/时间戳，
-        // 边界字符本身不作为下一段的可合并起点（kind=none 强制下次再断一次）。
+        // Chain continues regardless of push: merged edits update end/timestamp.
+        // Boundary char not merge start-point for next segment (kind=none forces break again).
         self.undo_coalesce_kind = if (isUndoBoundaryText(text)) .none else kind;
         self.undo_coalesce_at = now;
         return true;
     }
 
-    /// 在编辑完成后记录新的合并锚点（光标终点）。
+    /// Record new merge anchor after edit (cursor end position).
     fn noteUndoCoalesceEnd(self: *TextInputState) void {
         self.undo_coalesce_cursor = self.cursor_pos;
     }
 
-    /// 撤销
+    /// Undo
     pub fn undo(self: *TextInputState) void {
         if (self.ime_replacement != null) {
             self.cancelImeComposition();
             return;
         }
         if (self.textarea_doc != null) {
-            if (self.taRestoreHistory(false)) self.breakUndoCoalescing();
+            if (self.taRestoreHistory(false)) {
+                self.breakUndoCoalescing();
+                self.noteUserEditHistoryOp(.undo);
+            }
             return;
         }
         if (self.undo_count == 0) return;
-        // 单行: 原有逻辑
-        // Allocate the current state first. If it fails, undo is a no-op and
-        // the target snapshot remains owned by the undo stack.
+        // Single-line: original logic.
+        // Allocate current state first. If it fails, undo is no-op and target snapshot remains
+        // owned by stack.
         const current = self.makeSingleLineSnapshot() orelse return;
         self.breakUndoCoalescing();
+        // Redo slots may be reused: evicted entries during transaction freed first.
+        self.undo_stash.settleRedo(&self.redo_stack, self.allocator);
         self.pushSingleLineSnapshot(&self.redo_stack, &self.redo_count, current);
         self.undo_count -= 1;
         var snapshot = self.undo_stack[self.undo_count];
@@ -1640,20 +1743,28 @@ pub const TextInputState = struct {
         self.restoreSingleLineSnapshot(&snapshot);
         self.dirty = true;
         self.resetBlink();
+        self.noteUserEditHistoryOp(.undo);
     }
 
-    /// 重做
+    fn noteUserEditHistoryOp(self: *TextInputState, op: UserEditTxn.HistoryOp) void {
+        if (self.user_edit.depth > 0) self.user_edit.history_op = op;
+    }
+
+    /// Redo
     pub fn redo(self: *TextInputState) void {
         if (self.ime_replacement != null) {
             self.cancelImeComposition();
             return;
         }
         if (self.textarea_doc != null) {
-            if (self.taRestoreHistory(true)) self.breakUndoCoalescing();
+            if (self.taRestoreHistory(true)) {
+                self.breakUndoCoalescing();
+                self.noteUserEditHistoryOp(.redo);
+            }
             return;
         }
         if (self.redo_count == 0) return;
-        // 单行: 原有逻辑
+        // Single-line: original logic
         const current = self.makeSingleLineSnapshot() orelse return;
         self.breakUndoCoalescing();
         self.pushSingleLineSnapshot(&self.undo_stack, &self.undo_count, current);
@@ -1663,11 +1774,12 @@ pub const TextInputState = struct {
         self.restoreSingleLineSnapshot(&snapshot);
         self.dirty = true;
         self.resetBlink();
+        self.noteUserEditHistoryOp(.redo);
     }
 
     // ========== Hit-test+Scroll ==========
 
-    /// 全局 x 坐标 -> 字符位置 (hit test)
+    /// Global x -> char position (hit test)
     pub fn hitTestCursorPos(self: *TextInputState, global_x: f32) usize {
         if (self.multiline) {
             return self.hitTestCursorPosMultiline(
@@ -1678,8 +1790,8 @@ pub const TextInputState = struct {
         const local_x = global_x - self.container_x + self.scroll_x - self.padding_h;
         const target_x = if (local_x <= 0) 0 else local_x;
         if (self.input_type == .password) {
-            // password 屏幕显示是 mask '*'，buffer 持真实 UTF-8 字符。click x
-            // 必须按 mask 测量找到第 N 个 codepoint，再翻译回 buffer byte offset。
+            // Password screen displays mask '*' but buffer holds real UTF-8.
+            // Click x must measure by mask to find char N, translate back to buffer byte offset.
             const buffer_text = self.getText();
             var mask_buf: [editable_block.MAX_INPUT_BYTES]u8 = undefined;
             const grapheme_count = text_utils.utf8GraphemeLen(buffer_text);
@@ -1713,7 +1825,7 @@ pub const TextInputState = struct {
         const dist_sq = dx * dx + dy * dy;
         var is_multi_click = false;
 
-        const now_instant = std.time.Instant.now() catch null;
+        const now_instant = @import("zenit_time").Instant.now(self.io) catch null;
         if (now_instant) |now| {
             if (self.last_mouse_down_instant) |last| {
                 const time_delta_ns = text_utils.safeElapsedNs(now, last);
@@ -1755,9 +1867,13 @@ pub const TextInputState = struct {
 
     fn syncDisplayTextContentChecked(self: *TextInputState) !bool {
         const text_node = self.text_display_node orelse return false;
-        var props = text_node.getText() orelse return false;
+        // Check if node owns same display content (no re-snapshot): read owned raw value.
+        var props = text_node.getTextRaw() orelse return false;
         const display = try self.buildDisplayTextChecked(self.placeholder_text);
-        if (props.owned and std.mem.eql(u8, props.content, display)) return false;
+        // Empty display needs no owned snapshot (an empty dupe allocates nothing), and setText's
+        // write-back rule cannot carry ownership for an empty slice: without this check every
+        // render-hook write-back would re-snapshot and mark sizing dirty again, forever.
+        if ((props.owned or display.len == 0) and std.mem.eql(u8, props.content, display)) return false;
         const allocator = if (text_node.world_ref) |world| world.allocator else self.allocator;
         const snapshot = try allocator.dupe(u8, display);
         props.content = snapshot;
@@ -1768,30 +1884,64 @@ pub const TextInputState = struct {
         return true;
     }
 
-    /// 把 buffer/ime/cursor 变化通知到渲染管线。
-    /// cx.render() 零脏帧 fast-path 会跳过 before_render hook，导致 inputBeforeRender
-    /// 不跑 -> text.content 不更新（symptom: "输入 n 个字符要再点一下才更新 *"）。
-    /// 任何修改了 buffer / cursor / scroll_x / ime 的 caller 都要在结束时调一次。
+    /// Notify render pipeline of buffer/ime/cursor changes.
+    /// cx.render() zero-dirty fast-path skips before_render hook -> inputBeforeRender doesn't run
+    /// -> text.content doesn't update.
+    /// Any caller modifying buffer/cursor/scroll_x/ime must call this at end.
     pub fn markVisualDirty(self: *TextInputState) void {
         self.syncMultilineAutoHeight();
         _ = self.syncDisplayTextContent();
-        // sizing（而非 layout）：display text 内容会变（打字/IME preedit 插拔），
-        // 软换行文本的 intrinsic 度量有缓存，markLayoutDirty 不会让它失效,
-        // wrap 行盒按旧内容画，表现为 preedit/新字不上屏、光标却按新内容前进。
+        // Sizing (not layout): display text changes (typing/IME preedit attach/detach).
+        // Soft-wrap text intrinsic measure cached; markLayoutDirty doesn't invalidate.
+        // Wrap box draws old content, preedit/new chars off-screen but cursor advances by new
+        // content.
         if (self.text_display_node) |n| n.markSizingDirty();
+        if (self.editable_surface_node) |n| {
+            n.markRenderDirty();
+            if (!self.visual_sync_active) {
+                if (self.visual_sync_hook) |hook| {
+                    self.visual_sync_active = true;
+                    defer self.visual_sync_active = false;
+                    hook(n);
+                }
+            }
+        }
         if (self.cursor_node) |n| n.markRenderDirty();
         if (self.selection_node) |n| n.markRenderDirty();
         if (self.preedit_underline_node) |n| n.markRenderDirty();
     }
 
-    /// 更新水平滚动偏移，确保光标始终在可见区域内。
-    /// 同时把 visual node 标脏，updateScrollX 几乎只在 buffer/cursor/ime/focus
-    /// 变化后调用，cx.render() 零脏帧 fast-path 会跳过 inputBeforeRender，
-    /// 不在这统一标脏的话视觉 mask 不会更新（"输入 n 个字符要点一下才更新 *"）。
+    /// Return true while a held pointer outside the single-line viewport can
+    /// advance. Use elapsed frame time, capped after stalls, and stop at bounds.
+    pub fn advanceEdgeDrag(self: *TextInputState, time_ms: f64) bool {
+        const pointer = if (self.drag_pointer) |*p| p else return false;
+        const elapsed = std.math.clamp(time_ms - pointer.time_ms, 0, 100);
+        pointer.time_ms = time_ms;
+        if (!self.focused or !self.is_dragging or self.suspend_drag_until_mouse_up or self.multiline) return false;
+        const left = self.container_x + self.padding_h;
+        const right = left + self.input_inner_w;
+        const distance = if (pointer.x < left) pointer.x - left else if (pointer.x > right) pointer.x - right else return false;
+        const max_scroll = @max(@as(f32, 0), self.displayedTextAdvance() - self.input_inner_w);
+        if ((distance < 0 and self.scroll_x <= 0) or (distance > 0 and self.scroll_x >= max_scroll)) return false;
+        if (elapsed == 0) return true; // Repeated render hooks in one frame must not move the caret.
+        const speed = 200 + @min(@abs(distance), 200) * 4;
+        const step = speed * @as(f32, @floatCast(elapsed / 1000));
+        self.scroll_x = std.math.clamp(self.scroll_x + (if (distance < 0) -step else step), 0, max_scroll);
+        self.cursor_pos = self.hitTestCursorPosAt(if (distance < 0) left else right, pointer.y);
+        self.updateScrollX();
+        self.resetBlink();
+        return true;
+    }
+
+    /// Update horizontal scroll to keep cursor visible.
+    /// Mark visual node dirty; updateScrollX almost always called after buffer/cursor/ime/focus
+    /// change.
+    /// cx.render() zero-dirty fast-path skips inputBeforeRender -> visual mask won't update without
+    /// unified dirty here.
     pub fn updateScrollX(self: *TextInputState) void {
-        self.markVisualDirty();
         if (self.multiline) {
             self.scroll_x = 0;
+            self.markVisualDirty();
             return;
         }
         if (self.buffer_len > 0 or self.ime_preedit_len > 0) {
@@ -1808,7 +1958,8 @@ pub const TextInputState = struct {
                 const max_scroll = @max(@as(f32, 0), text_w - self.input_inner_w);
                 self.scroll_x = std.math.clamp(self.scroll_x, @as(f32, 0), max_scroll);
 
-                // 边界吸附：避免浮点误差导致“已经到边界但状态不为边界”。
+                // Boundary snap: avoid floating-point errors causing 'at boundary but state !=
+                // boundary'.
                 const snap_eps: f32 = 0.75;
                 if (self.scroll_x <= snap_eps) {
                     self.scroll_x = 0;
@@ -1819,11 +1970,12 @@ pub const TextInputState = struct {
         } else {
             self.scroll_x = 0;
         }
+        self.markVisualDirty();
     }
 
-    // ========== 文本操作 ==========
+    // ========== Text operations ==========
 
-    /// 获取当前文本
+    /// Get current text
     pub fn getText(self: *const TextInputState) []const u8 {
         if (self.textarea_doc) |doc| return doc.getText();
         return self.singleLineBuffer()[0..self.buffer_len];
@@ -1833,6 +1985,7 @@ pub const TextInputState = struct {
     /// coordinate model as the editor and are snapped backward to grapheme
     /// boundaries before any state is changed.
     pub fn setAccessibilitySelection(self: *TextInputState, start_utf8: u32, end_utf8: u32) bool {
+        self.a11y_scroll_request = null;
         const text = self.getText();
         const start = text_coordinates.clampByteOffset(
             text,
@@ -1852,20 +2005,18 @@ pub const TextInputState = struct {
         return true;
     }
 
-    /// 以编程方式整体替换文本内容。
-    ///
-    /// 此前单行 Input **没有**任何 setText, props.value 只在 mount 时读
-    /// 一次（mod.zig 把它 memcpy 进 buffer），此后应用无法再改字段内容。
-    /// 于是"表单先渲染、数据后到"和"提交后清空表单"这两个基本场景都做不到。
-    ///
-    /// 语义：
-    /// - 内容**拷贝**进内部 buffer，调用方不需要保持 `text` 存活。
-    /// - 默认按容量截到完整 grapheme；growable 单行输入保留全文。
-    /// - 光标移到末尾、清除选区、清空 IME 预编辑状态。
-    /// - 记录一次 undo 快照，所以 setText 可被 Cmd+Z 撤销。
-    /// - 多行（Textarea）路径委托给 TextareaDocument.setText。
-    ///
-    /// 返回实际写入的字节数（<  text.len 表示发生了截断）。
+    /// Programmatically replace text content.
+    /// props.value is read once at mount (mod.zig memcpy to buffer), so this is the only way for
+    /// the
+    /// app to change the field later ('render-then-data-arrives', 'clear-after-submit').
+    /// Semantics:
+    /// - Content is copied into the internal buffer; caller need not keep text alive.
+    /// - Default clamps to capacity at a grapheme boundary; growable single-line keeps full text.
+    /// - Cursor to end, clear selection, end composition (treated as replaced, no
+    ///   on_ime_cancelled).
+    /// - Records an undo snapshot (setText can be undone with Cmd+Z).
+    /// - Multiline (Textarea) delegates to TextareaDocument.setText.
+    /// Returns bytes actually written (< text.len means truncated).
     pub fn setText(self: *TextInputState, text: []const u8) usize {
         return self.setTextChecked(text) catch self.getText().len;
     }
@@ -1888,7 +2039,7 @@ pub const TextInputState = struct {
             self.textarea_cursor.preferred_col = null;
             if (self.textarea_wrap) |wrap| wrap.rebuildAll(doc);
             self.ime_replacement = null;
-            self.cancelImeComposition();
+            self.supersedeImeComposition();
             self.dirty = true;
             self.resetBlink();
             return total;
@@ -1906,18 +2057,172 @@ pub const TextInputState = struct {
         self.cursor_pos = n;
         self.selection_anchor = null;
         self.ime_replacement = null;
-        self.cancelImeComposition();
+        self.supersedeImeComposition();
         self.dirty = true;
         self.resetBlink();
         return n;
     }
 
-    /// 清空文本（setText("") 的语义糖）。
+    /// External write from binding (binding.zig): replace all, cursor to end, clear undo history,
+    /// no on_change
+    pub fn applyExternalText(self: *TextInputState, v: []const u8) !void {
+        _ = try self.setTextChecked(v);
+        self.clearUndoHistory();
+        self.updateScrollX();
+    }
+
+    /// User edit transaction entry (event handler / AX write), must pair with endUserEdit.
+    /// Only outermost records checkpoint: pre-edit selection and undo merge state.
+    pub fn beginUserEdit(self: *TextInputState) void {
+        if (self.user_edit.depth == 0) {
+            // Cursor moved into replacement range during composition retransformation.
+            // Edit didn't happen = cancel composition, return to selection saved before composition
+            // (same rule as cancelImeComposition)
+            const replacement = self.ime_replacement;
+            self.user_edit = .{
+                .cursor = if (replacement) |r| r.cursor else self.cursor_pos,
+                .anchor = if (replacement) |r| r.anchor else self.selection_anchor,
+                .coalesce_kind = self.undo_coalesce_kind,
+                .coalesce_cursor = self.undo_coalesce_cursor,
+                .coalesce_at = self.undo_coalesce_at,
+            };
+        }
+        self.user_edit.depth += 1;
+    }
+
+    pub fn endUserEdit(self: *TextInputState) void {
+        std.debug.assert(self.user_edit.depth > 0);
+        self.user_edit.depth -= 1;
+        // Transaction end and edit not rejected: stashed redo / evicted entries freed per original
+        // logic.
+        if (self.user_edit.depth == 0) self.discardHistoryStash();
+    }
+
+    /// Edit exit complete (binding calls this at onBufferChanged end): result final (landed /
+    /// rewritten / rejected / aligned to external write).
+    /// Stash freed per original logic, checkpoint rebuilt from current state.
+    /// Granularity is per-exit not per-event: if later edits in same transaction (e.g. parent
+    /// on_change edits same input), only that one reverts.
+    pub fn settleUserEdit(self: *TextInputState) void {
+        if (self.user_edit.depth == 0) return;
+        self.discardHistoryStash();
+        const depth = self.user_edit.depth;
+        self.user_edit = .{
+            .depth = depth,
+            .cursor = self.cursor_pos,
+            .anchor = self.selection_anchor,
+            .coalesce_kind = self.undo_coalesce_kind,
+            .coalesce_cursor = self.undo_coalesce_cursor,
+            .coalesce_at = self.undo_coalesce_at,
+        };
+    }
+
+    fn discardHistoryStash(self: *TextInputState) void {
+        self.undo_stash.discard(&self.redo_stack, self.allocator);
+        if (self.textarea_doc) |doc| self.ta_undo_stash.discard(&self.ta_redo, doc.allocator);
+    }
+
+    /// In-place fix from binding (binding.zig): the proposed text did not land as-is; `landed` is
+    /// the
+    /// current data source value.
+    /// - rejected (data unchanged: parent refused or rewrite == pre-edit): buffer -> landed,
+    ///   selection -> pre-edit, undo/redo restored to pre-edit (pushed snapshot popped, cleared
+    ///   redo
+    ///   and evicted entries restored from stash), merge chain restored: rejection = nothing
+    ///   happened.
+    /// - else (rewrite): buffer -> landed, cursor/selection mapped per edit_reconcile.zig
+    ///   single-delta-range; no new snapshot, the rewrite joins this edit's undo unit, so Cmd+Z
+    ///   goes
+    ///   to the pre-edit text.
+    /// Outside a user transaction (no checkpoint): degrades to an external write. No change on
+    /// failure.
+    pub fn reconcileUserEdit(self: *TextInputState, landed: []const u8, rejected: bool) !void {
+        if (self.user_edit.depth == 0) return self.applyExternalText(landed);
+        const txn = self.user_edit;
+        const cursor_before = self.cursor_pos;
+        var cursor: usize = undefined;
+        var anchor: ?usize = undefined;
+        if (rejected) {
+            switch (txn.history_op) {
+                .undo => self.redo(),
+                .redo => self.undo(),
+                .none => {},
+            }
+            cursor = txn.cursor;
+            anchor = txn.anchor;
+        } else {
+            const rewrite = edit_reconcile.Rewrite.diff(self.getText(), landed);
+            cursor = rewrite.mapOffset(landed, self.cursor_pos);
+            anchor = if (self.selection_anchor) |a| rewrite.mapOffset(landed, a) else null;
+        }
+        try self.replaceTextKeepingHistory(landed);
+
+        const text = self.getText();
+        self.cursor_pos = edit_reconcile.clampOffset(text, cursor);
+        self.selection_anchor = if (anchor) |a| edit_reconcile.clampOffset(text, a) else null;
+        if (self.selection_anchor == self.cursor_pos) self.selection_anchor = null;
+        if (rejected) {
+            if (txn.history_op == .none) self.restoreUserEditHistory();
+            self.undo_coalesce_kind = txn.coalesce_kind;
+            self.undo_coalesce_cursor = txn.coalesce_cursor;
+            self.undo_coalesce_at = txn.coalesce_at;
+        } else if (self.undo_coalesce_kind != .none and self.undo_coalesce_cursor == cursor_before) {
+            // Merge chain end follows cursor: next keystroke continues into same undo unit.
+            self.undo_coalesce_cursor = self.cursor_pos;
+        }
+        self.syncDocFromCursor();
+        self.cursor_affinity = .downstream;
+        self.preferred_visual_x = null;
+        self.dirty = true;
+        self.resetBlink();
+        self.updateScrollX();
+    }
+
+    /// Reject: restore undo/redo to pre-edit: pop pushed snapshot, restore evicted entries and
+    /// cleared redo.
+    fn restoreUserEditHistory(self: *TextInputState) void {
+        if (self.textarea_doc) |doc| {
+            self.ta_undo_stash.restore(&self.ta_undo, &self.ta_undo_count, &self.ta_redo, &self.ta_redo_count, self.user_edit.pushes, doc.allocator);
+        } else {
+            self.undo_stash.restore(&self.undo_stack, &self.undo_count, &self.redo_stack, &self.redo_count, self.user_edit.pushes, self.allocator);
+        }
+        self.user_edit.pushes = 0;
+    }
+
+    /// Rewrite buffer to text, no undo snapshot, caller handles cursor.
+    /// Multiline replaces single delta range only; soft-wrap map incremental update. No change on
+    /// failure.
+    fn replaceTextKeepingHistory(self: *TextInputState, text: []const u8) !void {
+        const old = self.getText();
+        if (std.mem.eql(u8, old, text)) return;
+        if (self.textarea_doc) |doc| {
+            const n = if (self.textarea_max_bytes > 0) text_coordinates.truncateToGraphemeBoundary(text, self.textarea_max_bytes) else text.len;
+            const target = text[0..n];
+            const rewrite = edit_reconcile.Rewrite.diff(old, target);
+            var prepared = try doc.prepareReplace(rewrite.prefix, rewrite.old_end, target[rewrite.prefix..rewrite.new_end]);
+            defer prepared.deinit();
+            const old_lc = doc.lineCount();
+            const first_line = doc.offsetToLineCol(rewrite.prefix).line;
+            prepared.commit();
+            self.notifyWrapEdit(first_line, old_lc - first_line, doc.lineCount() - first_line);
+        } else {
+            const n = if (self.growable) text.len else text_coordinates.truncateToGraphemeBoundary(text, self.singleLineBuffer().len);
+            var incoming = try ImeText.init(self.allocator, text[0..n]);
+            defer incoming.deinit();
+            const growth = try self.prepareInputGrowth(n);
+            self.commitInputGrowth(growth);
+            @memcpy(self.mutableBuffer()[0..n], incoming.text());
+            self.buffer_len = n;
+        }
+        self.dirty = true;
+    }
+
+    /// Clear text (syntactic sugar for setText("")).
     pub fn clearText(self: *TextInputState) void {
         _ = self.setText("");
     }
 
-    /// 插入文本
+    /// Insert text
     pub fn insertText(self: *TextInputState, text: []const u8) void {
         self.insertTextChecked(text) catch return;
     }
@@ -1965,7 +2270,7 @@ pub const TextInputState = struct {
         self.noteUndoCoalesceEnd();
     }
 
-    /// 删除范围 [start, end)
+    /// Delete range [start, end)
     pub fn deleteRange(self: *TextInputState, start_raw: usize, end_raw: usize) void {
         if (start_raw == end_raw) return;
         const raw_start = @min(start_raw, end_raw);
@@ -1986,11 +2291,11 @@ pub const TextInputState = struct {
             self.selection_anchor = null;
             self.dirty = true;
             self.resetBlink();
-            // 同步 DocCursor
+            // Sync DocCursor
             self.textarea_cursor.offset = start;
             self.textarea_cursor.anchor = null;
             self.textarea_cursor.preferred_col = null;
-            // 通知 WrapMap
+            // Notify WrapMap
             const new_lc = doc.lineCount();
             const affected_start = lc_before.line;
             self.notifyWrapEdit(affected_start, old_lc - affected_start, new_lc - affected_start);
@@ -2004,7 +2309,7 @@ pub const TextInputState = struct {
         const actual_end = @min(end, self.buffer_len);
         const delete_len = actual_end - start;
 
-        // 移动后面的内容
+        // Move content after
         if (actual_end < self.buffer_len) {
             std.mem.copyForwards(
                 u8,
@@ -2020,10 +2325,9 @@ pub const TextInputState = struct {
         self.resetBlink();
     }
 
-    /// 从 pos 向前回退一个 grapheme cluster，返回该 cluster 的起始字节偏移
-    ///
-    /// 按 UAX #29 extended grapheme cluster 走而非按 codepoint：否则 ZWJ emoji
-    /// 序列 / 组合记号 / 旗帜 / 肤色修饰符会被退格拆成残缺序列。
+    /// Back one grapheme cluster from pos, return cluster start byte offset.
+    /// Use UAX#29 extended grapheme cluster not codepoint: prevents ZWJ emoji sequences / combining
+    /// marks / flags / skin-tone modifiers from being backspace-split into broken sequences.
     pub fn utf8PrevCharStart(self: *const TextInputState, pos: usize) usize {
         if (pos == 0) return 0;
         if (self.textarea_doc) |doc| {
@@ -2032,7 +2336,7 @@ pub const TextInputState = struct {
         return grapheme.prevBoundary(self.singleLineBuffer()[0..self.buffer_len], pos);
     }
 
-    /// 从 pos 向后跳过一个 grapheme cluster，返回下一个 cluster 的起始字节偏移
+    /// Forward one grapheme cluster from pos, return next cluster start byte offset.
     pub fn utf8NextCharEnd(self: *const TextInputState, pos: usize) usize {
         if (self.textarea_doc) |doc| {
             return DocCursor(TextareaDocument).nextCharBoundary(doc, pos);
@@ -2058,7 +2362,7 @@ pub const TextInputState = struct {
         if (coalesce != null) self.noteUndoCoalesceEnd();
     }
 
-    /// 向后删除一个字符 (Backspace)
+    /// Delete backward one char (Backspace)
     pub fn deleteBackward(self: *TextInputState) void {
         const cursor = @min(self.cursor_pos, self.getText().len);
         const anchor = @min(self.selection_anchor orelse cursor, self.getText().len);
@@ -2066,7 +2370,7 @@ pub const TextInputState = struct {
         self.deleteRangeWithUndo(start, cursor, .delete_backward);
     }
 
-    /// 向前删除一个字符 (Delete)
+    /// Delete forward one char (Delete)
     pub fn deleteForward(self: *TextInputState) void {
         const cursor = @min(self.cursor_pos, self.getText().len);
         const anchor = @min(self.selection_anchor orelse cursor, self.getText().len);
@@ -2074,7 +2378,7 @@ pub const TextInputState = struct {
         self.deleteRangeWithUndo(cursor, end, .delete_forward);
     }
 
-    /// 移动光标 (UTF-8 感知，delta 以字符为单位)
+    /// Move cursor (UTF-8 aware, delta in chars)
     pub fn moveCursor(self: *TextInputState, delta: i32, extend_selection: bool) void {
         self.breakUndoCoalescing();
         if (extend_selection and self.selection_anchor == null) {
@@ -2093,7 +2397,7 @@ pub const TextInputState = struct {
                     return;
                 }
             }
-            // Multiline: 委托 DocCursor
+            // Multiline: delegate to DocCursor
             self.syncDocFromCursor();
             if (delta < 0) {
                 self.textarea_cursor.moveLeft(doc, extend_selection);
@@ -2161,7 +2465,7 @@ pub const TextInputState = struct {
         self.resetBlink();
     }
 
-    /// 移到行首
+    /// Move to line start
     pub fn moveToStart(self: *TextInputState) void {
         self.cursor_pos = 0;
         self.cursor_affinity = .downstream;
@@ -2169,7 +2473,7 @@ pub const TextInputState = struct {
         self.resetBlink();
     }
 
-    /// 移到行尾
+    /// Move to line end
     pub fn moveToEnd(self: *TextInputState) void {
         if (self.textarea_doc) |doc| {
             self.cursor_pos = doc.totalLength();
@@ -2181,7 +2485,7 @@ pub const TextInputState = struct {
         self.resetBlink();
     }
 
-    /// 全选
+    /// Select all
     pub fn selectAll(self: *TextInputState) void {
         self.breakUndoCoalescing();
         self.selection_anchor = 0;
@@ -2193,14 +2497,14 @@ pub const TextInputState = struct {
         self.resetBlink();
     }
 
-    // ========== 键盘 ==========
+    // ========== Keyboard ==========
 
-    /// 处理键盘事件
+    /// Handle keyboard event
     pub fn handleKeyDown(self: *TextInputState, key: KeyCode, modifiers: events.Modifiers) bool {
         switch (key) {
             .left => {
                 if (modifiers.super) {
-                    // Cmd+Left: 移到行首
+                    // Cmd+Left: move to line start
                     if (modifiers.shift and self.selection_anchor == null) {
                         self.selection_anchor = self.cursor_pos;
                     } else if (!modifiers.shift) {
@@ -2218,8 +2522,8 @@ pub const TextInputState = struct {
                     } else 0;
                     self.dirty = true;
                     self.resetBlink();
-                } else if (modifiers.alt) {
-                    // Alt+Left: 按词向左移动
+                } else if (modifiers.alt or (@import("builtin").target.os.tag == .windows and modifiers.ctrl)) {
+                    // Alt+Left: move word-left
                     if (modifiers.shift and self.selection_anchor == null) {
                         self.selection_anchor = self.cursor_pos;
                     } else if (!modifiers.shift) {
@@ -2228,7 +2532,7 @@ pub const TextInputState = struct {
                     self.cursor_pos = self.findWordBoundaryLeft(self.cursor_pos);
                     self.resetBlink();
                 } else if (!modifiers.shift and self.selection_anchor != null) {
-                    // 无修饰键 + 有选区: 光标跳到选区左端，清除选区
+                    // No modifier + selection: cursor to selection left, clear selection
                     const anchor = self.selection_anchor.?;
                     self.cursor_pos = @min(anchor, self.cursor_pos);
                     self.selection_anchor = null;
@@ -2240,7 +2544,7 @@ pub const TextInputState = struct {
             },
             .right => {
                 if (modifiers.super) {
-                    // Cmd+Right: 移到行尾
+                    // Cmd+Right: move to line end
                     if (modifiers.shift and self.selection_anchor == null) {
                         self.selection_anchor = self.cursor_pos;
                     } else if (!modifiers.shift) {
@@ -2258,8 +2562,8 @@ pub const TextInputState = struct {
                     } else self.buffer_len;
                     self.dirty = true;
                     self.resetBlink();
-                } else if (modifiers.alt) {
-                    // Alt+Right: 按词向右移动
+                } else if (modifiers.alt or (@import("builtin").target.os.tag == .windows and modifiers.ctrl)) {
+                    // Alt+Right: move word-right
                     if (modifiers.shift and self.selection_anchor == null) {
                         self.selection_anchor = self.cursor_pos;
                     } else if (!modifiers.shift) {
@@ -2268,7 +2572,7 @@ pub const TextInputState = struct {
                     self.cursor_pos = self.findWordBoundaryRight(self.cursor_pos);
                     self.resetBlink();
                 } else if (!modifiers.shift and self.selection_anchor != null) {
-                    // 无修饰键 + 有选区: 光标跳到选区右端，清除选区
+                    // No modifier + selection: cursor to selection right, clear selection
                     const anchor = self.selection_anchor.?;
                     self.cursor_pos = @max(anchor, self.cursor_pos);
                     self.selection_anchor = null;
@@ -2279,7 +2583,7 @@ pub const TextInputState = struct {
                 return true;
             },
             .delete => {
-                if (modifiers.super or modifiers.alt) {
+                if (modifiers.super or modifiers.alt or (@import("builtin").target.os.tag == .windows and modifiers.ctrl)) {
                     const cursor = @min(self.cursor_pos, self.getText().len);
                     const anchor = @min(self.selection_anchor orelse cursor, self.getText().len);
                     const start = if (anchor != cursor)
@@ -2306,12 +2610,19 @@ pub const TextInputState = struct {
                 return true;
             },
             .z => {
-                if (modifiers.super) {
+                if (events.primaryModifier(modifiers)) {
                     if (modifiers.shift) {
                         self.redo();
                     } else {
                         self.undo();
                     }
+                    return true;
+                }
+                return false;
+            },
+            .y => {
+                if (@import("builtin").target.os.tag == .windows and modifiers.ctrl) {
+                    self.redo();
                     return true;
                 }
                 return false;
@@ -2353,7 +2664,7 @@ pub const TextInputState = struct {
             .up => {
                 if (self.multiline) {
                     if (modifiers.super) {
-                        // Cmd+Up: 移到文档首
+                        // Cmd+Up: move to doc start
                         if (modifiers.shift and self.selection_anchor == null) {
                             self.selection_anchor = self.cursor_pos;
                         } else if (!modifiers.shift) {
@@ -2372,7 +2683,7 @@ pub const TextInputState = struct {
             .down => {
                 if (self.multiline) {
                     if (modifiers.super) {
-                        // Cmd+Down: 移到文档尾
+                        // Cmd+Down: move to doc end
                         if (modifiers.shift and self.selection_anchor == null) {
                             self.selection_anchor = self.cursor_pos;
                         } else if (!modifiers.shift) {
@@ -2392,7 +2703,7 @@ pub const TextInputState = struct {
         }
     }
 
-    /// 垂直移动光标（上/下一行），保持 x 像素位置最近匹配
+    /// Move cursor vertically (up/down line), preserve closest x pixel position
     fn moveVertical(self: *TextInputState, direction: i2, extend_selection: bool) void {
         if (extend_selection and self.selection_anchor == null) {
             self.selection_anchor = self.cursor_pos;
@@ -2400,7 +2711,7 @@ pub const TextInputState = struct {
             self.selection_anchor = null;
         }
 
-        // WrapMap 路径: 按 display line 移动
+        // WrapMap path: move by display line
         if (self.textarea_wrap) |wrap| {
             if (self.textarea_doc) |doc| {
                 const current = self.textareaVisualLineAtOffset(self.cursor_pos);
@@ -2450,24 +2761,24 @@ pub const TextInputState = struct {
             }
         }
 
-        // Fallback: 旧路径
+        // Fallback: old path
         const text = self.buildDisplayText(null);
         const cur_pos = self.multilineVisualPosForOffset(text, self.displayCursorByteOffset());
         const target_row_i: i32 = @as(i32, @intCast(cur_pos.row)) + @as(i32, direction);
         if (target_row_i < 0) {
-            // 已在首行，移到行首
+            // Already at first line, move to line start
             self.cursor_pos = 0;
         } else {
             const target_row: usize = @intCast(target_row_i);
             const target_x = cur_pos.x;
-            // 在 text 中找 target_row 的最近 x 位置
+            // Find nearest x position for target_row in text
             self.cursor_pos = self.byteOffsetForRowAndX(text, target_row, target_x);
         }
         self.dirty = true;
         self.resetBlink();
     }
 
-    /// 给定目标行号和 x 像素位置，返回最近的字节偏移
+    /// Given target row number and x pixel position, return nearest byte offset
     fn byteOffsetForRowAndX(self: *const TextInputState, text: []const u8, target_row: usize, target_x: f32) usize {
         var best_off: usize = 0;
         var best_found = false;
@@ -2484,22 +2795,22 @@ pub const TextInputState = struct {
                     best_found = true;
                 }
             } else if (pos.row > target_row and best_found) {
-                break; // 已过目标行
+                break; // Passed target row
             }
             if (off >= text.len) break;
             off = nextUtf8CharEnd(text, off);
         }
 
         if (!best_found) {
-            // 目标行超出范围，移到末尾
+            // Target row out of range, move to end
             return @min(self.cursor_pos, self.buffer_len);
-            // 如果是 display text（含 IME），取 buffer_len
+            // If display text (includes IME), use buffer_len
         }
-        // 映射回 buffer 偏移（displayCursorByteOffset 可能含 IME preedit）
+        // Map back to buffer offset (displayCursorByteOffset may include IME preedit)
         return @min(best_off, self.buffer_len);
     }
 
-    /// 使用 TextareaDocument（如有）或 fallback 查找当前光标所在行首
+    /// Use TextareaDocument if present or fallback to find line start for current cursor
     fn docFindLineStart(self: *const TextInputState) usize {
         if (self.textarea_doc) |doc| {
             const lc = doc.offsetToLineCol(self.cursor_pos);
@@ -2508,7 +2819,7 @@ pub const TextInputState = struct {
         return self.findLineStart(self.cursor_pos);
     }
 
-    /// 找到 pos 所在 buffer 行的行首（上一个 \n 之后或 buffer 开头）
+    /// Find buffer line start (after previous \n or buffer start)
     pub fn findLineStart(self: *const TextInputState, pos: usize) usize {
         const text = self.getText();
         if (pos == 0) return 0;
@@ -2521,7 +2832,7 @@ pub const TextInputState = struct {
         return 0;
     }
 
-    /// 找到 pos 所在 buffer 行的行尾（下一个 \n 或 buffer 末尾）
+    /// Find buffer line end (next \n or buffer end)
     pub fn findLineEnd(self: *const TextInputState, pos: usize) usize {
         const text = self.getText();
         var i = @min(pos, text.len);
@@ -2533,7 +2844,7 @@ pub const TextInputState = struct {
     }
 };
 
-// ========== 委托函数 ==========
+// ========== Delegate functions ==========
 
 pub fn isImeSelectionSpace(text: []const u8) bool {
     return editable_block.isImeSelectionSpace(text);
@@ -2554,9 +2865,9 @@ pub fn applyEditableBlockConfig(
     editable_block.applyConfig(state, behavior, metrics, explicit_inner_w, ctx, tokens);
 }
 
-// ========== grapheme cluster 边界（UAX #29）回归测试 ==========
-//
-// 这些用例锁住的是"用户感知字符"语义：按 codepoint 走的旧实现会全部失败。
+// ========== Grapheme cluster boundary (UAX#29) regression tests ==========
+// These cases lock user-perceived-character semantics: codepoint-based old implementation fails
+// all.
 
 const testing = std.testing;
 
@@ -2566,7 +2877,9 @@ const gc_flag_jp = "\u{1F1EF}\u{1F1F5}"; // 🇯🇵
 const gc_thumbs_tone = "\u{1F44D}\u{1F3FB}"; // 👍🏻
 
 fn gcMakeState(text: []const u8) TextInputState {
-    var s = TextInputState{};
+    var s = TextInputState{
+        .io = std.testing.io,
+    };
     @memcpy(s.buffer[0..text.len], text);
     s.buffer_len = text.len;
     s.cursor_pos = text.len;
@@ -2589,7 +2902,7 @@ test "grapheme: 组合尖音符不被单独删掉" {
 test "grapheme: 左方向键不会停在基字符与组合记号之间" {
     var s = gcMakeState("xe\u{0301}");
     s.moveCursor(-1, false);
-    try testing.expectEqual(@as(usize, 1), s.cursor_pos); // 不是 2
+    try testing.expectEqual(@as(usize, 1), s.cursor_pos); // not 2
     s.moveCursor(-1, false);
     try testing.expectEqual(@as(usize, 0), s.cursor_pos);
 }
@@ -2632,7 +2945,9 @@ test "grapheme: 右方向键跨 cluster 前进" {
 }
 
 test "coordinate ingress: IME cursor inside ZWJ emoji clamps to grapheme end" {
-    var s = TextInputState{};
+    var s = TextInputState{
+        .io = std.testing.io,
+    };
     s.setImePreedit("👩‍💻x", 2);
     try testing.expectEqual("👩‍💻".len, s.ime_cursor_utf8_offset);
     try testing.expectEqual("👩‍💻".len, s.effectiveImeCursorOffset());
@@ -2646,7 +2961,9 @@ test "coordinate ingress: deletion endpoints expand to whole graphemes" {
 }
 
 test "coordinate ingress: capacity truncation never stores a partial grapheme" {
-    var s = TextInputState{};
+    var s = TextInputState{
+        .io = std.testing.io,
+    };
     const prefix_len = s.buffer.len - 2;
     @memset(s.buffer[0..prefix_len], 'x');
     s.buffer_len = prefix_len;
@@ -2664,9 +2981,9 @@ test "coordinate model: password masks one glyph per source grapheme" {
 }
 
 test "coordinate model: horizontal arrows follow mixed-bidi visual caret order" {
-    var cx = try core.Cx.init(testing.allocator);
+    var cx = try core.Cx.init(testing.allocator, std.testing.io);
     defer cx.deinit();
-    var fonts = try core.FontSystem.init(testing.allocator);
+    var fonts = try core.FontSystem.init(testing.allocator, @import("std").testing.io);
     defer fonts.deinit();
     cx.text.setFontSystem(&fonts);
     defer cx.text.clearFontSystem();
@@ -2692,9 +3009,9 @@ test "coordinate model: horizontal arrows follow mixed-bidi visual caret order" 
 }
 
 test "coordinate model: Textarea WrapMap uses visual bidi stops and pixel preferred x" {
-    var cx = try core.Cx.init(testing.allocator);
+    var cx = try core.Cx.init(testing.allocator, std.testing.io);
     defer cx.deinit();
-    var fonts = try core.FontSystem.init(testing.allocator);
+    var fonts = try core.FontSystem.init(testing.allocator, @import("std").testing.io);
     defer fonts.deinit();
     cx.text.setFontSystem(&fonts);
     defer cx.text.clearFontSystem();
@@ -2705,7 +3022,7 @@ test "coordinate model: Textarea WrapMap uses visual bidi stops and pixel prefer
     var doc = TextareaDocument.init(testing.allocator);
     defer doc.deinit();
     doc.setText(full_text);
-    var wrap = TextareaWrapMap.init(testing.allocator);
+    var wrap = TextareaWrapMap.init(testing.allocator, @import("std").testing.io);
     defer wrap.deinit();
     wrap.setEnabled(true, &doc);
     wrap.setWrapWidth(1000, &doc);
@@ -2714,6 +3031,7 @@ test "coordinate model: Textarea WrapMap uses visual bidi stops and pixel prefer
     const line = try cx.text.visualLine(.{ .text = content, .font_family = "system", .font_size = 16 });
     try testing.expect(line.caret_stops.len > 3);
     var s = TextInputState{
+        .io = std.testing.io,
         .multiline = true,
         .cx_ref = cx,
         .font_size = 16,
@@ -2746,11 +3064,93 @@ test "coordinate model: Textarea WrapMap uses visual bidi stops and pixel prefer
     try testing.expectApproxEqAbs(chosen.x.value, s.preferred_visual_x.?, 0.01);
 }
 
+test "用户编辑事务：压栈脱离重做栈后同一事务内撤销，脱离的条目先释放再复用槽位（不泄漏）" {
+    inline for (.{ false, true }) |multiline| {
+        var doc = TextareaDocument.init(testing.allocator);
+        defer doc.deinit();
+        var s = TextInputState{ .io = std.testing.io, .allocator = testing.allocator, .multiline = multiline, .textarea_doc = if (multiline) &doc else null };
+        defer s.deinit();
+        s.insertText("a");
+        s.insertText(" ");
+        s.undo(); // One redo entry
+        try testing.expectEqual(@as(u8, 1), if (multiline) s.ta_redo_count else s.redo_count);
+        s.beginUserEdit();
+        s.insertText("b"); // Push: redo stack in-place detach
+        try testing.expectEqual(@as(u8, 0), if (multiline) s.ta_redo_count else s.redo_count);
+        s.undo(); // Undo: write redo stack, must free detached entry first
+        s.endUserEdit();
+        try testing.expect(s.undo_stash.isEmpty() and s.ta_undo_stash.isEmpty());
+    }
+}
+
+test "用户编辑事务：事务内历史被整体清空后，拒绝还原不会复活清空前的重做条目" {
+    var s = TextInputState{ .io = std.testing.io, .allocator = testing.allocator };
+    defer s.deinit();
+    s.insertText("a");
+    s.insertText(" ");
+    s.undo();
+    try testing.expectEqual(@as(u8, 1), s.redo_count);
+    s.beginUserEdit();
+    s.insertText("b"); // Push: redo stack in-place detach
+    try s.applyExternalText("x"); // Replace all, clear history
+    try s.reconcileUserEdit("x", true);
+    s.endUserEdit();
+    try testing.expectEqual(@as(u8, 0), s.redo_count);
+    try testing.expectEqual(@as(u8, 0), s.undo_count);
+    try testing.expectEqualStrings("x", s.getText());
+}
+
+test "用户编辑事务：同一事务内先有一次已落地的编辑，后一次被拒只回滚它自己" {
+    inline for (.{ false, true }) |multiline| {
+        var doc = TextareaDocument.init(testing.allocator);
+        defer doc.deinit();
+        var s = TextInputState{ .io = std.testing.io, .allocator = testing.allocator, .multiline = multiline, .textarea_doc = if (multiline) &doc else null };
+        defer s.deinit();
+        s.insertText("x");
+        s.insertText(" ");
+        s.undo();
+        try testing.expectEqual(@as(u8, 1), if (multiline) s.ta_redo_count else s.redo_count);
+        const undo_before = if (multiline) s.ta_undo_count else s.undo_count;
+        s.beginUserEdit();
+        s.insertText("a"); // First edit: landed (clear redo)
+        s.settleUserEdit();
+        s.insertText(" "); // Second edit: rejected
+        try s.reconcileUserEdit("xa", true);
+        s.endUserEdit();
+        try testing.expectEqualStrings("xa", s.getText());
+        try testing.expectEqual(@as(usize, 2), s.cursor_pos);
+        // Landed edit keeps undo unit; cleared redo doesn't revive
+        try testing.expectEqual(undo_before + 1, if (multiline) s.ta_undo_count else s.undo_count);
+        try testing.expectEqual(@as(u8, 0), if (multiline) s.ta_redo_count else s.redo_count);
+    }
+}
+
+test "用户编辑事务：不经值绑定的事务结束时暂存清空，之后被拒还原不复活旧重做条目" {
+    inline for (.{ false, true }) |multiline| {
+        var doc = TextareaDocument.init(testing.allocator);
+        defer doc.deinit();
+        var s = TextInputState{ .io = std.testing.io, .allocator = testing.allocator, .multiline = multiline, .textarea_doc = if (multiline) &doc else null };
+        defer s.deinit();
+        s.insertText("x");
+        s.insertText(" ");
+        s.undo();
+        s.beginUserEdit();
+        s.insertText("a"); // Push in transaction: redo stack in-place detach
+        s.endUserEdit(); // End transaction: detached entries freed per original logic
+        try testing.expect(s.undo_stash.isEmpty() and s.ta_undo_stash.isEmpty());
+        s.beginUserEdit();
+        s.insertText(" ");
+        try s.reconcileUserEdit("xa", true);
+        s.endUserEdit();
+        try testing.expectEqual(@as(u8, 0), if (multiline) s.ta_redo_count else s.redo_count);
+    }
+}
+
 test "single-line undo snapshots are dynamic and release their owned text" {
     try testing.expect(@sizeOf(UndoSnapshot) < editable_block.MAX_INPUT_BYTES / 8);
     try testing.expect(@sizeOf(TextInputState) < 32 * 1024);
 
-    var s = TextInputState{ .allocator = testing.allocator };
+    var s = TextInputState{ .io = std.testing.io, .allocator = testing.allocator };
     defer s.deinit();
     s.insertText("abc");
     s.insertText(" ");
@@ -2764,7 +3164,7 @@ test "single-line undo snapshots are dynamic and release their owned text" {
 }
 
 test "single-line undo full-stack eviction transfers ownership exactly once" {
-    var s = TextInputState{ .allocator = testing.allocator };
+    var s = TextInputState{ .io = std.testing.io, .allocator = testing.allocator };
     defer s.deinit();
 
     var value_buf: [32]u8 = undefined;
@@ -2786,7 +3186,7 @@ test "single-line undo full-stack eviction transfers ownership exactly once" {
 
 test "single-line edit OOM preserves text history and coalescing state" {
     var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 1 });
-    var s = TextInputState{ .allocator = failing.allocator() };
+    var s = TextInputState{ .io = std.testing.io, .allocator = failing.allocator() };
     defer s.deinit();
 
     s.insertText("seed"); // empty snapshot needs no allocation
@@ -2811,7 +3211,7 @@ test "single-line edit OOM preserves text history and coalescing state" {
 
 test "single-line undo OOM is transactional" {
     var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 1 });
-    var s = TextInputState{ .allocator = failing.allocator() };
+    var s = TextInputState{ .io = std.testing.io, .allocator = failing.allocator() };
     defer s.deinit();
 
     s.insertText("seed");
@@ -2829,7 +3229,7 @@ test "single-line undo OOM is transactional" {
 
 test "single-line capacity is 2048 bytes and truncation is grapheme-safe" {
     try testing.expectEqual(@as(usize, 2048), editable_block.MAX_INPUT_BYTES);
-    var s = TextInputState{ .allocator = testing.allocator };
+    var s = TextInputState{ .io = std.testing.io, .allocator = testing.allocator };
     defer s.deinit();
 
     var exact: [editable_block.MAX_INPUT_BYTES]u8 = undefined;
@@ -2850,9 +3250,9 @@ test "single-line capacity is 2048 bytes and truncation is grapheme-safe" {
 test "IME commit keeps full duplicate candidate and preserves composition on failed undo allocation" {
     const t = std.testing;
     var failing = t.FailingAllocator.init(t.allocator, .{});
-    var state: TextInputState = .{ .allocator = failing.allocator() };
+    var state: TextInputState = .{ .io = @import("std").testing.io, .allocator = failing.allocator() };
     defer state.deinit();
-    const long = "中" ** 200;
+    const long = (@as([("中").len * (200)]u8, @bitCast(@as([200][("中").len]u8, @splat(("中").*)))) ++ "");
     state.handleImeCommitEvent(long);
     state.handleImePreeditEvent("", 0);
     try t.expect(state.consumeImePostCommitDuplicate(long));
@@ -2871,7 +3271,7 @@ test "IME commit keeps full duplicate candidate and preserves composition on fai
 test "failed IME commit preserves pending composition and replacement selection" {
     const t = std.testing;
     var failing = t.FailingAllocator.init(t.allocator, .{});
-    var s: TextInputState = .{ .allocator = failing.allocator() };
+    var s: TextInputState = .{ .io = @import("std").testing.io, .allocator = failing.allocator() };
     defer s.deinit();
     _ = s.setText("keep");
     s.selection_anchor = 0;
@@ -2901,7 +3301,7 @@ test "IME insertion preserves single and legacy multiline state at every allocat
             var failing = t.FailingAllocator.init(t.allocator, .{});
             var doc = TextareaDocument.init(failing.allocator());
             defer doc.deinit();
-            var s: TextInputState = .{ .allocator = failing.allocator(), .multiline = multiline, .accept_newline = multiline, .textarea_doc = if (multiline) &doc else null };
+            var s: TextInputState = .{ .io = @import("std").testing.io, .allocator = failing.allocator(), .multiline = multiline, .accept_newline = multiline, .textarea_doc = if (multiline) &doc else null };
             defer s.deinit();
             const base = "keep tail";
             _ = s.setText(base);
@@ -2922,8 +3322,8 @@ test "IME insertion preserves single and legacy multiline state at every allocat
             const ta_redo_count = s.ta_redo_count;
             const old_text = doc.text.items.ptr;
             const old_lines = doc.line_starts.items.ptr;
-            const value = if (multiline) "文\n" ** 300 else "文" ** 200;
-            const expected = if (multiline) "文\n" ** 300 ++ " tail" else "文" ** 200 ++ " tail";
+            const value = if (multiline) (@as([("文\n").len * (300)]u8, @bitCast(@as([300][("文\n").len]u8, @splat(("文\n").*)))) ++ "") else (@as([("文").len * (200)]u8, @bitCast(@as([200][("文").len]u8, @splat(("文").*)))) ++ "");
+            const expected = if (multiline) (@as([("文\n").len * (300)]u8, @bitCast(@as([300][("文\n").len]u8, @splat(("文\n").*)))) ++ "") ++ " tail" else (@as([("文").len * (200)]u8, @bitCast(@as([200][("文").len]u8, @splat(("文").*)))) ++ "") ++ " tail";
             failing.fail_index = failing.alloc_index + failure;
             failing.resize_fail_index = failing.resize_index;
             const result = s.handleImeCommitEventChecked(value);
@@ -2966,7 +3366,7 @@ test "IME insertion preserves single and legacy multiline state at every allocat
 test "insertion snapshots aliased text and failed replacement range restores cursor state" {
     const t = std.testing;
     var failing = t.FailingAllocator.init(t.allocator, .{});
-    var s: TextInputState = .{ .allocator = failing.allocator() };
+    var s: TextInputState = .{ .io = @import("std").testing.io, .allocator = failing.allocator() };
     defer s.deinit();
     _ = s.setText("abcdef");
     s.selection_anchor = 2;
@@ -2976,7 +3376,7 @@ test "insertion snapshots aliased text and failed replacement range restores cur
     const cursor = s.cursor_pos;
     const anchor = s.selection_anchor;
     failing.fail_index = failing.alloc_index;
-    try t.expectError(error.OutOfMemory, s.handleImeCommitReplaceEventChecked("x" ** 600, 0, 3));
+    try t.expectError(error.OutOfMemory, s.handleImeCommitReplaceEventChecked((@as([("x").len * (600)]u8, @bitCast(@as([600][("x").len]u8, @splat(("x").*)))) ++ ""), 0, 3));
     failing.fail_index = std.math.maxInt(usize);
     try t.expectEqual(cursor, s.cursor_pos);
     try t.expectEqual(anchor, s.selection_anchor);
@@ -2995,10 +3395,10 @@ test "legacy input set and history restore survive every allocation failure" {
             var failing = t.FailingAllocator.init(t.allocator, .{});
             var doc = TextareaDocument.init(failing.allocator());
             defer doc.deinit();
-            const original = "keep\n" ** 80;
+            const original = (@as([("keep\n").len * (80)]u8, @bitCast(@as([80][("keep\n").len]u8, @splat(("keep\n").*)))) ++ "");
             try doc.setTextChecked(original);
 
-            var s: TextInputState = .{ .multiline = true, .textarea_doc = &doc, .allocator = failing.allocator() };
+            var s: TextInputState = .{ .io = @import("std").testing.io, .multiline = true, .textarea_doc = &doc, .allocator = failing.allocator() };
             defer s.deinit();
             s.cursor_pos = original.len;
             s.selection_anchor = 0;
@@ -3016,7 +3416,7 @@ test "legacy input set and history restore survive every allocation failure" {
             failing.resize_fail_index = failing.resize_index;
             switch (operation) {
                 0 => {
-                    _ = s.setText("new\n" ** 120);
+                    _ = s.setText((@as([("new\n").len * (120)]u8, @bitCast(@as([120][("new\n").len]u8, @splat(("new\n").*)))) ++ ""));
                 },
                 1 => s.undo(),
                 2 => s.redo(),
@@ -3034,7 +3434,7 @@ test "legacy input set and history restore survive every allocation failure" {
                 try t.expectEqual(old_anchor, s.selection_anchor);
                 switch (operation) {
                     0 => {
-                        _ = try s.setTextChecked("new\n" ** 120);
+                        _ = try s.setTextChecked((@as([("new\n").len * (120)]u8, @bitCast(@as([120][("new\n").len]u8, @splat(("new\n").*)))) ++ ""));
                     },
                     1 => s.undo(),
                     2 => s.redo(),
@@ -3042,7 +3442,7 @@ test "legacy input set and history restore survive every allocation failure" {
                 }
             }
             const expected = switch (operation) {
-                0 => "new\n" ** 120,
+                0 => (@as([("new\n").len * (120)]u8, @bitCast(@as([120][("new\n").len]u8, @splat(("new\n").*)))) ++ ""),
                 1 => original,
                 2 => "x",
                 else => unreachable,
@@ -3062,7 +3462,7 @@ test "reconversion preedit preserves committed text on cancel and restores undo 
     for ([_]bool{ false, true }) |multiline| {
         var doc = TextareaDocument.init(t.allocator);
         defer doc.deinit();
-        var s: TextInputState = .{ .multiline = multiline, .textarea_doc = if (multiline) &doc else null, .allocator = t.allocator };
+        var s: TextInputState = .{ .io = @import("std").testing.io, .multiline = multiline, .textarea_doc = if (multiline) &doc else null, .allocator = t.allocator };
         defer s.deinit();
         _ = s.setText("x漢字y");
         s.cursor_pos = 8;
@@ -3090,7 +3490,7 @@ test "shared input reconversion commit preserves candidate and both histories th
             var failing = t.FailingAllocator.init(t.allocator, .{});
             var doc = TextareaDocument.init(failing.allocator());
             defer doc.deinit();
-            var s: TextInputState = .{ .multiline = multiline, .textarea_doc = if (multiline) &doc else null, .allocator = failing.allocator() };
+            var s: TextInputState = .{ .io = @import("std").testing.io, .multiline = multiline, .textarea_doc = if (multiline) &doc else null, .allocator = failing.allocator() };
             _ = s.setText("x漢字y");
             defer s.deinit();
             s.cursor_pos = 8;
@@ -3101,7 +3501,7 @@ test "shared input reconversion commit preserves candidate and both histories th
             s.handleImePreeditReplaceEvent("候选", 6, 1, 7);
             const old_undo = (if (multiline) s.ta_undo_count else s.undo_count);
             const old_redo = (if (multiline) s.ta_redo_count else s.redo_count);
-            const value = "新" ** 200;
+            const value = (@as([("新").len * (200)]u8, @bitCast(@as([200][("新").len]u8, @splat(("新").*)))) ++ "");
             failing.fail_index = failing.alloc_index + failure;
             failing.resize_fail_index = failing.resize_index;
             const result = s.handleImeCommitReplaceEventChecked(value, std.math.maxInt(u32), std.math.maxInt(u32));
@@ -3136,7 +3536,7 @@ test "shared input reconversion commit preserves candidate and both histories th
 
 test "shared reconversion cancellation repeated ranges empty commit and password display" {
     const t = std.testing;
-    var s: TextInputState = .{ .allocator = t.allocator };
+    var s: TextInputState = .{ .io = @import("std").testing.io, .allocator = t.allocator };
     defer s.deinit();
     _ = s.setText("x漢字y");
     s.cursor_pos = 8;
@@ -3171,9 +3571,9 @@ test "reconversion display geometry allocation failure preserves canonical model
     var doc = TextareaDocument.init(failing.allocator());
     defer doc.deinit();
     doc.setText("x漢字y");
-    var wm = TextareaWrapMap.init(t.allocator);
+    var wm = TextareaWrapMap.init(t.allocator, @import("std").testing.io);
     defer wm.deinit();
-    var s: TextInputState = .{ .multiline = true, .textarea_doc = &doc, .textarea_wrap = &wm, .allocator = t.allocator };
+    var s: TextInputState = .{ .io = @import("std").testing.io, .multiline = true, .textarea_doc = &doc, .textarea_wrap = &wm, .allocator = t.allocator };
     defer s.deinit();
     s.handleImePreeditReplaceEvent("候", 3, 1, 7);
     failing.fail_index = failing.alloc_index;
@@ -3193,12 +3593,12 @@ test "shared preedit preserves long candidate and the full canonical tail" {
     for ([_]bool{ false, true }) |multiline| {
         var doc = TextareaDocument.init(t.allocator);
         defer doc.deinit();
-        var s: TextInputState = .{ .allocator = t.allocator, .multiline = multiline, .textarea_doc = if (multiline) &doc else null };
+        var s: TextInputState = .{ .io = @import("std").testing.io, .allocator = t.allocator, .multiline = multiline, .textarea_doc = if (multiline) &doc else null };
         defer s.deinit();
-        const original = if (multiline) "x" ** 6000 else "xyz";
+        const original = if (multiline) (@as([("x").len * (6000)]u8, @bitCast(@as([6000][("x").len]u8, @splat(("x").*)))) ++ "") else "xyz";
         _ = try s.setTextChecked(original);
         s.cursor_pos = 1;
-        const candidate = "漢" ** 1000 ++ "👩‍💻";
+        const candidate = (@as([("漢").len * (1000)]u8, @bitCast(@as([1000][("漢").len]u8, @splat(("漢").*)))) ++ "") ++ "👩‍💻";
         s.setImePreedit(candidate, candidate.len - 1);
         try t.expectEqual(candidate.len, s.ime_preedit_len);
         try t.expectEqual(candidate.len, s.effectiveImeCursorOffset());
@@ -3218,14 +3618,14 @@ test "shared preedit update is atomic across candidate scratch and node allocati
         var completed = false;
         for (0..24) |failure| {
             var failing = t.FailingAllocator.init(t.allocator, .{});
-            var cx = try core.Cx.init(failing.allocator());
+            var cx = try core.Cx.init(failing.allocator(), std.testing.io);
             defer cx.deinit();
             const row = try core.box(cx, .{}, .{});
             cx.root = row;
             row.setText(.{ .content = "" });
             var doc = TextareaDocument.init(failing.allocator());
             defer doc.deinit();
-            var s: TextInputState = .{ .allocator = failing.allocator(), .multiline = multiline, .textarea_doc = if (multiline) &doc else null, .cx_ref = cx, .text_display_node = row };
+            var s: TextInputState = .{ .io = @import("std").testing.io, .allocator = failing.allocator(), .multiline = multiline, .textarea_doc = if (multiline) &doc else null, .cx_ref = cx, .text_display_node = row };
             defer s.deinit();
             _ = try s.setTextChecked("x漢字y");
             s.insertText("!");
@@ -3237,7 +3637,7 @@ test "shared preedit update is atomic across candidate scratch and node allocati
             const redo_count = if (multiline) s.ta_redo_count else s.redo_count;
             failing.fail_index = failing.alloc_index + failure;
             failing.resize_fail_index = failing.resize_index;
-            const candidate = "漢" ** 1000;
+            const candidate = (@as([("漢").len * (1000)]u8, @bitCast(@as([1000][("漢").len]u8, @splat(("漢").*)))) ++ "");
             const result = s.handleImePreeditReplaceEventChecked(candidate, candidate.len, 0, 8);
             failing.fail_index = std.math.maxInt(usize);
             failing.resize_fail_index = std.math.maxInt(usize);
@@ -3273,9 +3673,9 @@ test "shared preedit update is atomic across candidate scratch and node allocati
 
 test "long fallback preedit wrapping preserves graphemes and complete display coordinates" {
     const t = std.testing;
-    var s: TextInputState = .{ .allocator = t.allocator, .multiline = true, .soft_wrap = true, .input_inner_w = 1, .char_width = 8 };
+    var s: TextInputState = .{ .io = @import("std").testing.io, .allocator = t.allocator, .multiline = true, .soft_wrap = true, .input_inner_w = 1, .char_width = 8 };
     defer s.deinit();
-    const candidate = "👩‍💻" ** 500;
+    const candidate = (@as([("👩‍💻").len * (500)]u8, @bitCast(@as([500][("👩‍💻").len]u8, @splat(("👩‍💻").*)))) ++ "");
     try s.setImePreeditChecked(candidate, candidate.len);
     const wrapped = try s.buildWrappedDisplayTextChecked(null);
     var lines = std.mem.splitScalar(u8, wrapped, '\n');
@@ -3296,40 +3696,40 @@ test "long shared multiline preedit geometry uses the full visible document" {
     const Map = @import("text_core").wrap_map.WrapMap(TextareaDocument);
     var doc = TextareaDocument.init(t.allocator);
     defer doc.deinit();
-    var wm = Map.init(t.allocator);
+    var wm = Map.init(t.allocator, @import("std").testing.io);
     defer wm.deinit();
-    var s: TextInputState = .{ .allocator = t.allocator, .multiline = true, .soft_wrap = true, .textarea_doc = &doc, .textarea_wrap = &wm, .input_inner_w = 120, .char_width = 12, .font_size = 20 };
+    var s: TextInputState = .{ .io = @import("std").testing.io, .allocator = t.allocator, .multiline = true, .soft_wrap = true, .textarea_doc = &doc, .textarea_wrap = &wm, .input_inner_w = 120, .char_width = 12, .font_size = 20 };
     defer s.deinit();
-    _ = try s.setTextChecked("x" ** 6000);
-    try s.setImePreeditChecked("a" ** 1000, 1000);
+    _ = try s.setTextChecked((@as([("x").len * (6000)]u8, @bitCast(@as([6000][("x").len]u8, @splat(("x").*)))) ++ ""));
+    try s.setImePreeditChecked((@as([("a").len * (1000)]u8, @bitCast(@as([1000][("a").len]u8, @splat(("a").*)))) ++ ""), 1000);
     try t.expectEqual(@as(usize, 7000), s.displayCursorByteOffset());
     s.refreshMultilineImeGeometry();
     try t.expect(s.ime_visual_valid);
     try t.expectEqual(@as(u32, 700), s.ime_visual_total_lines);
     try t.expectEqual(@as(u32, 699), s.ime_visual_display_line);
     try t.expectApproxEqAbs(@as(f32, 120), s.ime_visual_cursor_x, 0.01);
-    try t.expectEqualStrings("x" ** 6000, doc.getText());
+    try t.expectEqualStrings((@as([("x").len * (6000)]u8, @bitCast(@as([6000][("x").len]u8, @splat(("x").*)))) ++ ""), doc.getText());
 }
 
 test "growable Input preserves long text through insertion undo redo and aliases" {
     const t = std.testing;
-    var state: TextInputState = .{ .allocator = t.allocator, .growable = true };
+    var state: TextInputState = .{ .io = @import("std").testing.io, .allocator = t.allocator, .growable = true };
     defer state.deinit();
-    const long = "界" ** 1000;
+    const long = (@as([("界").len * (1000)]u8, @bitCast(@as([1000][("界").len]u8, @splat(("界").*)))) ++ "");
     try t.expectEqual(long.len, try state.setTextChecked(long));
     try t.expectEqualStrings(long, state.getText());
     state.cursor_pos = 3;
     state.selection_anchor = 6;
     try state.insertTextChecked("abc");
-    try t.expectEqualStrings("界abc" ++ "界" ** 998, state.getText());
+    try t.expectEqualStrings("界abc" ++ (@as([("界").len * (998)]u8, @bitCast(@as([998][("界").len]u8, @splat(("界").*)))) ++ ""), state.getText());
     state.undo();
     try t.expectEqualStrings(long, state.getText());
     state.redo();
-    try t.expectEqualStrings("界abc" ++ "界" ** 998, state.getText());
+    try t.expectEqualStrings("界abc" ++ (@as([("界").len * (998)]u8, @bitCast(@as([998][("界").len]u8, @splat(("界").*)))) ++ ""), state.getText());
     _ = try state.setTextChecked(state.getText()[3..]);
-    try t.expectEqualStrings("abc" ++ "界" ** 998, state.getText());
+    try t.expectEqualStrings("abc" ++ (@as([("界").len * (998)]u8, @bitCast(@as([998][("界").len]u8, @splat(("界").*)))) ++ ""), state.getText());
     state.undo();
-    try t.expectEqualStrings("界abc" ++ "界" ** 998, state.getText());
+    try t.expectEqualStrings("界abc" ++ (@as([("界").len * (998)]u8, @bitCast(@as([998][("界").len]u8, @splat(("界").*)))) ++ ""), state.getText());
     _ = try state.setTextChecked(long);
     try state.insertTextChecked(state.getText());
     try t.expectEqualStrings(long ++ long, state.getText());
@@ -3345,14 +3745,14 @@ test "growable Input allocation failure preserves storage text and history" {
         var succeeded = false;
         for (0..32) |fail_at| {
             var failing = t.FailingAllocator.init(t.allocator, .{});
-            var state: TextInputState = .{ .allocator = failing.allocator(), .growable = true };
+            var state: TextInputState = .{ .io = @import("std").testing.io, .allocator = failing.allocator(), .growable = true };
             defer state.deinit();
             _ = try state.setTextChecked("old");
             state.clearUndoHistory();
             const old_ptr = state.getText().ptr;
             failing.fail_index = failing.alloc_index + fail_at;
             failing.resize_fail_index = failing.resize_index;
-            const long = "界" ** 1000;
+            const long = (@as([("界").len * (1000)]u8, @bitCast(@as([1000][("界").len]u8, @splat(("界").*)))) ++ "");
             const result: anyerror!void = if (insert) state.insertTextChecked(long) else blk: {
                 _ = state.setTextChecked(long) catch |err| break :blk err;
                 break :blk {};
@@ -3371,4 +3771,35 @@ test "growable Input allocation failure preserves storage text and history" {
         }
         try t.expect(succeeded);
     }
+}
+
+test "Input stationary edge drag preserves anchor and stops at bounds" {
+    const t = std.testing;
+    var state: TextInputState = .{ .io = @import("std").testing.io, .allocator = t.allocator, .focused = true, .is_dragging = true, .input_inner_w = 80 };
+    defer state.deinit();
+    _ = try state.setTextChecked((@as([("你abc").len * (40)]u8, @bitCast(@as([40][("你abc").len]u8, @splat(("你abc").*)))) ++ ""));
+    state.cursor_pos = 0;
+    state.selection_anchor = 0;
+    try t.expect(!state.advanceEdgeDrag(100)); // No move: never use stale global pointer.
+    state.drag_pointer = .{ .x = 120, .y = 0, .time_ms = 0 };
+    try t.expect(state.advanceEdgeDrag(100));
+    try t.expect(state.scroll_x > 0 and state.cursor_pos > 0);
+    try t.expectEqual(@as(?usize, 0), state.selection_anchor);
+    try t.expect(state.getText()[state.cursor_pos] & 0xc0 != 0x80);
+    const saved_scroll = state.scroll_x;
+    const saved_cursor = state.cursor_pos;
+    try t.expect(state.advanceEdgeDrag(100));
+    try t.expectEqual(saved_scroll, state.scroll_x);
+    try t.expectEqual(saved_cursor, state.cursor_pos);
+    state.is_dragging = false;
+    try t.expect(!state.advanceEdgeDrag(200));
+    try t.expectEqual(saved_scroll, state.scroll_x);
+    state.is_dragging = true;
+    state.drag_pointer = .{ .x = 40, .y = 0, .time_ms = 200 };
+    try t.expect(!state.advanceEdgeDrag(300)); // Re-entering the viewport stops repetition.
+    state.drag_pointer = .{ .x = -30, .y = 0, .time_ms = 300 };
+    for (0..20) |i| _ = state.advanceEdgeDrag(@floatFromInt(400 + i * 100));
+    try t.expectEqual(@as(f32, 0), state.scroll_x);
+    try t.expectEqual(@as(usize, 0), state.cursor_pos);
+    try t.expect(!state.advanceEdgeDrag(2500));
 }

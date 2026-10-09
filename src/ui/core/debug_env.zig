@@ -1,4 +1,4 @@
-//! 进程级 env 调试开关（首次读取后缓存）。Cx 与其拆分出的 cx_* 模块共用。
+//! Process-level env debug flags (cached after first read). Cx and its cx_* modules share it.
 
 const std = @import("std");
 
@@ -11,8 +11,8 @@ pub fn devtoolsHitDebugEnabled() bool {
 
 var cursor_change_debug_enabled_cache: ?bool = null;
 var hit_scene_debug_enabled_cache: ?bool = null;
-/// ZENIT_HIT_SCENE_DEBUG=1：逐 mouse_move 打印命中结果（含 proxy AABB）与
-/// 每次 hit-test 场景重建走的分支，诊断「partial 重建缺口」类命中错乱。
+/// ZENIT_HIT_SCENE_DEBUG=1: print hit result (with proxy AABB) and rebuild branch per mouse_move,
+/// diagnose 'partial rebuild gap' hit scrambling.
 pub fn hitSceneDebugEnabled() bool {
     return readBoolEnvCached(&hit_scene_debug_enabled_cache, "ZENIT_HIT_SCENE_DEBUG");
 }
@@ -40,7 +40,8 @@ pub fn cursorChangeDebugEnabled() bool {
 }
 
 var layout_integrity_every_frame_cache: ?bool = null;
-/// ZENIT_LAYOUT_INTEGRITY=1：shadow-sync 完整性校验恢复逐帧（默认每 64 帧采样）
+/// ZENIT_LAYOUT_INTEGRITY=1: shadow-sync completeness check resumes per-frame (default samples
+/// every 64 frames)
 pub fn layoutIntegrityEveryFrameEnabled() bool {
     return readBoolEnvCached(&layout_integrity_every_frame_cache, "ZENIT_LAYOUT_INTEGRITY");
 }

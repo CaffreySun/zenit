@@ -3,10 +3,11 @@ const Allocator = std.mem.Allocator;
 
 pub const WindowId = u64;
 
-/// IME replacementRange 哨兵：本次 preedit/commit 不修订已提交文本（现行为）。
+/// IME replacementRange sentinel: this preedit/commit doesn't revise already-committed text
+/// (current behavior).
 pub const ime_no_replacement: u32 = 0xFFFF_FFFF;
 
-/// 修饰键
+/// Modifier keys
 pub const Modifiers = packed struct {
     shift: bool = false,
     ctrl: bool = false,
@@ -22,14 +23,14 @@ pub const MouseButton = enum(u8) {
     other,
 };
 
-/// 统一系统事件
+/// Unified system events
 ///
-/// 注意:
-/// - EventQueue 会复制并持有 text_input / ime_* 的 text
-/// - 这些切片至少持续到下一次 pump 调用前有效
-/// 触控板滚动手势阶段（NSEvent.phase）。鼠标滚轮与惯性事件为 none。
+/// Note:
+/// - EventQueue copies and holds text for text_input / ime_*
+/// - these slices are valid until the next pump call
+/// Trackpad scroll gesture phase (NSEvent.phase). Mouse wheel and inertial events are none.
 pub const ScrollPhase = enum(u8) { none, may_begin, began, changed, ended, cancelled };
-/// 惯性阶段（NSEvent.momentumPhase）。非惯性事件为 none。
+/// Inertial phase (NSEvent.momentumPhase). Non-inertial events are none.
 pub const MomentumPhase = enum(u8) { none, began, changed, ended };
 
 pub const MouseWheel = struct {
@@ -63,7 +64,11 @@ pub const Event = union(enum) {
     },
     window_focused: struct {
         window_id: WindowId,
+        /// Routing-sense focus (app backgrounded still points to window last requested as key)
         focused: bool,
+        /// Activation in system appearance sense: app foreground and window is key window. Native
+        /// inactive window Liquid Glass tint desaturates (native_tint_backdrop.swift inactive).
+        appears_active: bool = true,
     },
     window_close_requested: struct {
         window_id: WindowId,
@@ -83,6 +88,8 @@ pub const Event = union(enum) {
         y: f32,
         button: MouseButton,
         pressed: bool,
+        /// Cancel the entire active pointer interaction; button/pressed are ignored.
+        cancelled: bool = false,
         modifiers: Modifiers = .{},
     },
     mouse_wheel: MouseWheel,
@@ -90,7 +97,7 @@ pub const Event = union(enum) {
         window_id: WindowId,
         x: f32,
         y: f32,
-        /// 相对增量：new_scale = old_scale * (1 + magnification)
+        /// Relative delta: new_scale = old_scale * (1 + magnification)
         magnification: f32,
         /// 0=began 1=changed 2=ended 3=cancelled
         phase: u8,
@@ -101,13 +108,14 @@ pub const Event = union(enum) {
         y: f32,
         /// 0=entered 1=updated 2=exited 3=dropped 4=source completed/cancelled
         kind: u8,
-        /// dropped 时有效：换行分隔的文件路径 / URL 列表（backend 缓冲，仅本帧有效）
+        /// Valid on drop: newline-delimited file paths / URL list (backend buffered, valid this
+        /// frame only)
         paths: []const u8 = "",
         /// destination payload: 0=none, 1=file/URL list, 2=text, 3=internal UTF-8.
         payload_kind: u8 = 0,
-        /// kind=4 时关联 `beginDrag` 返回值；destination 事件为 0。
+        /// kind=4 associates `beginDrag` return value; destination events are 0.
         source_token: u64 = 0,
-        /// kind=4 时实际操作位：1=copy 2=move 4=link；0=cancelled。
+        /// kind=4 actual operation: 1=copy 2=move 4=link; 0=cancelled.
         operation: u8 = 0,
         /// The native payload exceeded the backend cap and was rejected whole.
         payload_truncated: bool = false,
@@ -130,8 +138,8 @@ pub const Event = union(enum) {
         window_id: WindowId,
         text: []const u8,
         cursor_utf8_offset: u32,
-        /// IME replacementRange 换算成的 UTF-8 字节区间（相对聚焦 input 文档）。
-        /// ime_no_replacement 哨兵 = 无 replacement（现行为）。
+        /// IME replacementRange converted to UTF-8 byte range (relative to focused input document).
+        /// ime_no_replacement sentinel = no replacement (current behavior).
         replace_start_utf8: u32 = ime_no_replacement,
         replace_end_utf8: u32 = ime_no_replacement,
     },
@@ -141,7 +149,7 @@ pub const Event = union(enum) {
         replace_start_utf8: u32 = ime_no_replacement,
         replace_end_utf8: u32 = ime_no_replacement,
     },
-    /// 系统主题切换事件（macOS Dark/Light mode）
+    /// System theme change event (macOS Dark/Light mode)
     system_theme_changed: struct {
         is_dark: bool,
     },
@@ -170,7 +178,7 @@ pub const Event = union(enum) {
     }
 };
 
-/// SDK 事件队列
+/// SDK event queue
 pub const EventQueue = struct {
     allocator: Allocator,
     list: std.ArrayList(Event),
@@ -185,8 +193,8 @@ pub const EventQueue = struct {
     pub fn init(allocator: Allocator) EventQueue {
         return .{
             .allocator = allocator,
-            .list = .{},
-            .owned_payloads = .{},
+            .list = .empty,
+            .owned_payloads = .empty,
         };
     }
 

@@ -1,29 +1,30 @@
-/// Recipe，样式配方系统
+/// Recipe: style variant system
 ///
-/// 灵感来自 Panda CSS (cva/sva) 和 CVA (Class Variance Authority)，
-/// 用 Zig comptime 实现零运行时开销的声明式样式变体。
+/// Inspired by Panda CSS (cva/sva) and CVA (Class Variance Authority);
+/// uses Zig comptime for zero-runtime-cost declarative style variants.
 ///
-/// 三层架构：
-///   1. ConditionalStyle，带交互条件的样式包 (对标 Panda Conditions: _hover/_active/_disabled)
-///   2. recipe()，单节点配方 (对标 CVA cva())
-///   3. slotRecipe()，多部件配方 (对标 Panda sva())
+/// Three-layer architecture:
+///   1. ConditionalStyle: style bundle with interaction conditions (maps to Panda Conditions:
+///      _hover/_active/_disabled)
+///   2. recipe(): single-node recipe (maps to CVA cva())
+///   3. slotRecipe(): multi-slot recipe (maps to Panda sva())
 ///
-/// CSS Transition 解析器：
-///   4. transition(), comptime 解析 CSS 风格的 transition 字符串
+/// CSS Transition parser:
+///   4. transition(): comptime-parse CSS-style transition strings
 ///
-/// 用法示例：
+/// Usage example:
 /// ```zig
-/// // CSS transition 字符串 -> 编译期解析
+/// // CSS transition string -> compile-time parse
 /// node.applyTransition(allocator, comptime transition("background 200ms ease-out, opacity 150ms"));
 ///
-/// // Recipe 定义
+/// // Recipe definition
 /// const ButtonRecipe = recipe(struct {
 ///     pub const Variants = struct { variant: ControlVariant = .primary, size: ControlSize = .md };
 ///     pub fn base(t: *const ThemeTokens) ConditionalStyle { ... }
 ///     pub const variants = .{ .variant = resolveVariant, .size = resolveSize };
 /// });
 ///
-/// // 使用
+/// // Usage
 /// const styles = ButtonRecipe.resolve(.{ .variant = .primary, .size = .md }, cx.tokens);
 /// ```
 const std = @import("std");
@@ -39,45 +40,46 @@ pub const InteractionState = types.InteractionState;
 pub const ThemeTokens = theme.ThemeTokens;
 
 // ============================================================================
-// 1. ConditionalStyle，带交互条件的样式包
+// 1. ConditionalStyle: style bundle with interaction conditions
 // ============================================================================
 
-/// 一个声明式样式包，同时描述 base + 七种条件态。
+/// Declarative style set: base + seven conditional states.
 ///
-/// 对标 Panda CSS 的 Conditions 系统：
+/// Aligns with Panda CSS conditions:
 ///   css({ bg: "red.500", _hover: { bg: "red.700" }, _disabled: { opacity: 0.5 } })
-/// 条件位收录 Panda 内置条件里组件库有真实消费者的子集：
-///   _hover/_active/_focus/_disabled + _checked(->selected)/_expanded/_invalid。
-/// 刻意不收：_dark（主题差异走 token 层整体换 + 样式函数内 t.scheme 判别，
-/// 不做样式级条件，两个 dark 值来源会打架）、group/peer hover（需事件系统
-/// 支持，另案）、伪元素/媒体查询（无 CSS 引擎对应物）。
+/// Supported: _hover/_active/_focus/_disabled + _checked(->selected)/_expanded/_invalid.
+/// Excluded: _dark (theme diff via token swap + t.scheme in style functions, no style-level
+/// condition to avoid conflicts), group/peer hover (needs event system support),
+/// pseudo-elements/media queries (no CSS engine analogue).
 ///
-/// 替代当前 ControlVariant 的 6 个独立方法（background/hoverBackground/activeBackground/...），
-/// 让每个变体值自包含所有交互态样式。
+/// Each variant value self-contains all interaction-state styles.
 pub const ConditionalStyle = struct {
-    /// 基础态（始终应用）
+    /// Base state (always applied)
     base: StyleOverride = .{},
-    /// 持久选中/勾选态（selected 与 checked 合一，见 InteractionState.is_selected）
+    /// Persistent selected/checked state (selected and checked unified, see
+    /// InteractionState.is_selected)
     selected: ?StyleOverride = null,
-    /// 展开态（accordion item / tree 节点 / chevron）
+    /// Expanded state (accordion item / tree node / chevron)
     expanded: ?StyleOverride = null,
-    /// hover 态（鼠标悬停时 merge 到 base 之上）
+    /// Hover state (merged over base on mouse hover)
     hover: ?StyleOverride = null,
-    /// active / pressed 态
+    /// Active / pressed state
     active: ?StyleOverride = null,
-    /// focus 态
+    /// Focus state
     focus: ?StyleOverride = null,
-    /// 校验失败态（链上排交互态之后：error 视觉需压过 hover/focus，
-    /// 对齐 Input 既有语义，error 时抑制 focus/hover 的边框变化）
+    /// Focus-visible state: focus via keyboard etc, not click (layers after focus)
+    focus_visible: ?StyleOverride = null,
+    /// Invalid state (after interaction states in chain: error visual overrides hover/focus,
+    /// aligns with Input semantics, suppresses focus/hover border changes on error)
     invalid: ?StyleOverride = null,
-    /// disabled 态（disabled 时其余条件态全部不叠加）
+    /// Disabled state (when disabled, no other conditional states layer)
     disabled: ?StyleOverride = null,
 
-    /// 运行时解析：根据交互/组件状态 merge 出最终 StyleOverride
-    ///
-    /// 优先级链: base <- selected <- expanded <- hover <- active <- focus <- invalid <- disabled(短路)
-    /// - selected/expanded 是持久底态，交互态叠其上（hover 高亮可叠在选中行上）；
-    /// - invalid 压过交互态；disabled 与其余互斥（不叠加任何条件态）。
+    /// Runtime resolution: final StyleOverride per state. Priority (low to high):
+    ///   base <- selected <- expanded <- hover <- active <- focus <- focus_visible <- invalid <-
+    ///   disabled
+    /// - selected/expanded persistent base states; interaction states layer over;
+    /// - invalid overrides interaction states; disabled short-circuits (no state stacking).
     pub fn resolve(self: ConditionalStyle, state: InteractionState) StyleOverride {
         var result = self.base;
         if (state.is_disabled) {
@@ -99,14 +101,17 @@ pub const ConditionalStyle = struct {
         if (state.is_focused) {
             if (self.focus) |f| result = result.merge(f);
         }
+        if (state.is_focus_visible) {
+            if (self.focus_visible) |f| result = result.merge(f);
+        }
         if (state.is_invalid) {
             if (self.invalid) |iv| result = result.merge(iv);
         }
         return result;
     }
 
-    /// 提取 background 三态颜色（normal / hover / pressed）
-    /// 给 hooks.useAnimatedBackground 使用
+    /// Extract background three-state colors (normal / hover / pressed)
+    /// for hooks.useAnimatedBackground use
     pub fn bgColors(self: ConditionalStyle) struct { normal: Color, hover: Color, pressed: Color } {
         const normal = self.base.background orelse Color.TRANSPARENT;
         const hover_bg = if (self.hover) |h| (h.background orelse normal) else normal;
@@ -114,9 +119,9 @@ pub const ConditionalStyle = struct {
         return .{ .normal = normal, .hover = hover_bg, .pressed = pressed_bg };
     }
 
-    /// 两个 ConditionalStyle 深度 merge（对标 Panda mergeCss 递归合并）
+    /// Deep merge two ConditionalStyle objects (aligns with Panda mergeCss recursive merge)
     ///
-    /// 后者覆盖前者（非 null 字段覆盖）
+    /// Latter overrides former (non-null fields override)
     pub fn merge(self: ConditionalStyle, other: ConditionalStyle) ConditionalStyle {
         return .{
             .base = self.base.merge(other.base),
@@ -125,14 +130,16 @@ pub const ConditionalStyle = struct {
             .hover = mergeOptionalOverride(self.hover, other.hover),
             .active = mergeOptionalOverride(self.active, other.active),
             .focus = mergeOptionalOverride(self.focus, other.focus),
+            .focus_visible = mergeOptionalOverride(self.focus_visible, other.focus_visible),
             .invalid = mergeOptionalOverride(self.invalid, other.invalid),
             .disabled = mergeOptionalOverride(self.disabled, other.disabled),
         };
     }
 
-    /// 用外部 StyleOverride 覆盖 base 态（用于组件的 style prop 覆盖 recipe 输出）
+    /// Override base state with external StyleOverride (for component style prop to override recipe
+    /// output)
     ///
-    /// 典型场景: Button 的 style/hover_style/pressed_style props
+    /// Typical case: Button style/hover_style/pressed_style props
     pub fn override(self: ConditionalStyle, overrides: struct {
         style: StyleOverride = .{},
         selected_style: ?StyleOverride = null,
@@ -171,7 +178,7 @@ pub const ConditionalStyle = struct {
         return result;
     }
 
-    /// 检查是否完全为空
+    /// Check if completely empty
     pub fn isEmpty(self: ConditionalStyle) bool {
         return self.base.isEmpty() and
             self.selected == null and
@@ -179,6 +186,7 @@ pub const ConditionalStyle = struct {
             self.hover == null and
             self.active == null and
             self.focus == null and
+            self.focus_visible == null and
             self.invalid == null and
             self.disabled == null;
     }
@@ -192,24 +200,22 @@ pub const ConditionalStyle = struct {
 };
 
 // ============================================================================
-// 2. recipe()，单节点配方 (对标 CVA cva())
+// 2. recipe(): single-node recipe (maps to CVA cva())
 // ============================================================================
 
-/// comptime Recipe 工厂函数
+/// comptime Recipe factory function
 ///
-/// 核心算法直接从 CVA 源码翻译:
+/// Core algorithm follows CVA:
 ///   resolve(props) = merge(base, ...variants[dim][props[dim]], ...matchedCompounds)
 ///
-/// Config 需要提供:
-///   - Variants: struct 类型，每个字段是一个 variant 维度（enum 或 bool），有默认值
-///   - base(tokens) -> ConditionalStyle: 基础样式（可选）
-///   - variants: tuple of resolver functions: fn(value, tokens) -> ConditionalStyle（可选）
-///   - derived(variants, tokens) -> ConditionalStyle（可选）: 跨维度组合逻辑，
-///     拿到完整 Variants，承载单维度 resolver 表达不了的"连续函数型组合"
-///     （如 padding = f(size, icon 模式)）。约定：derived 只产出几何字段
-///     （padding/radius/height/width/gap 等），**禁碰 background**,
-///     background 三态取色走 bgColors()，derived 写入会污染动画取色。
-///   - compounds: tuple of { matches: fn(Variants) -> bool, style: fn(tokens) -> ConditionalStyle }（可选）
+/// Config:
+///   - Variants: struct type, each field a variant dimension (enum or bool) with default
+///   - base(tokens) -> ConditionalStyle (optional)
+///   - variants: tuple of fn(value, tokens) -> ConditionalStyle (optional)
+///   - derived(variants, tokens) -> ConditionalStyle (optional): cross-dimension logic over
+///     the full Variants (e.g. padding = f(size, icon mode)). Prefer for continuous geometry;
+///     not a field whitelist. bgColors() reads the final merged result, incl. derived.
+///   - compounds: tuple of { matches: fn(Variants) -> bool, style: fn(tokens) -> ConditionalStyle }
 pub fn recipe(comptime Config: type) type {
     comptime {
         if (!@hasDecl(Config, "Variants")) @compileError("Recipe Config 必须有 Variants 类型");
@@ -218,9 +224,9 @@ pub fn recipe(comptime Config: type) type {
     return struct {
         pub const Variants = Config.Variants;
 
-        /// 核心 resolve，对标 CVA 的 resolve(props)
+        /// Core resolve, aligns with CVA resolve(props)
         ///
-        /// 合并优先级: base < variants < derived < compounds（后者覆盖前者）
+        /// Merge priority: base < variants < derived < compounds (latter overrides)
         pub fn resolve(variants: Variants, tokens: *const ThemeTokens) ConditionalStyle {
             // Step 1: base
             var result: ConditionalStyle = if (@hasDecl(Config, "base"))
@@ -228,9 +234,9 @@ pub fn recipe(comptime Config: type) type {
             else
                 .{};
 
-            // Step 2: 遍历每个 variant 维度，merge 其选中值的样式
+            // Step 2: iterate each variant dimension, merge its selected value's style
             if (@hasDecl(Config, "variants")) {
-                inline for (std.meta.fields(@TypeOf(Config.variants))) |field| {
+                inline for (@import("zenit_reflection").fields(@TypeOf(Config.variants))) |field| {
                     const dim_resolver = @field(Config.variants, field.name);
                     const variant_value = @field(variants, field.name);
                     const variant_style = dim_resolver(variant_value, tokens);
@@ -238,12 +244,12 @@ pub fn recipe(comptime Config: type) type {
                 }
             }
 
-            // Step 2.5: derived，跨维度组合（拿完整 Variants）
+            // Step 2.5: derived, cross-dimension combo (full Variants)
             if (@hasDecl(Config, "derived")) {
                 result = result.merge(Config.derived(variants, tokens));
             }
 
-            // Step 3: compound variants, AND 匹配
+            // Step 3: compound variants, AND match
             if (@hasDecl(Config, "compounds")) {
                 inline for (Config.compounds) |compound| {
                     if (compound.matches(variants)) {
@@ -255,7 +261,7 @@ pub fn recipe(comptime Config: type) type {
             return result;
         }
 
-        /// 便捷方法：只取 base 态的 StyleOverride
+        /// Convenience method: extract base-state StyleOverride only
         pub fn resolveBase(variants: Variants, tokens: *const ThemeTokens) StyleOverride {
             return resolve(variants, tokens).base;
         }
@@ -263,27 +269,26 @@ pub fn recipe(comptime Config: type) type {
 }
 
 // ============================================================================
-// 3. slotRecipe()，多部件配方 (对标 Panda sva())
+// 3. slotRecipe(): multi-slot recipe (maps to Panda sva())
 // ============================================================================
 
-/// comptime SlotRecipe 工厂函数
+/// comptime SlotRecipe factory function
 ///
-/// 核心算法从 Panda getSlotRecipes() + sva() 翻译:
-///   1. 为每个 slot 独立运行 recipe resolve
-///   2. 一个 variant 值同时产出所有 slot 的样式
+/// Follows Panda getSlotRecipes() + sva(): run recipe resolve independently per slot, so one
+/// variant value yields styles for all slots.
 ///
-/// Config 需要提供:
-///   - Slots: struct 类型，每个字段是 ConditionalStyle（代表一个组件部件）
-///   - Variants: struct 类型（同 recipe）
-///   - base(tokens) -> Slots（可选）
-///   - variants: tuple of resolver functions: fn(value, tokens) -> Slots（可选）
-///   - compounds: tuple of { matches, style -> Slots }（可选）
+/// Config:
+///   - Slots: struct type, each field a ConditionalStyle (one component part)
+///   - Variants: struct type (same as recipe)
+///   - base(tokens) -> Slots (optional)
+///   - variants: tuple of fn(value, tokens) -> Slots (optional)
+///   - compounds: tuple of { matches, style -> Slots } (optional)
 pub fn slotRecipe(comptime Config: type) type {
     comptime {
         if (!@hasDecl(Config, "Slots")) @compileError("SlotRecipe Config 必须有 Slots 类型");
         if (!@hasDecl(Config, "Variants")) @compileError("SlotRecipe Config 必须有 Variants 类型");
-        // 验证 Slots 的每个字段都是 ConditionalStyle
-        for (std.meta.fields(Config.Slots)) |field| {
+        // Validate each Slots field is ConditionalStyle
+        for (@import("zenit_reflection").fields(Config.Slots)) |field| {
             if (field.type != ConditionalStyle) {
                 @compileError("Slots." ++ field.name ++ " 必须是 ConditionalStyle 类型");
             }
@@ -294,7 +299,7 @@ pub fn slotRecipe(comptime Config: type) type {
         pub const Slots = Config.Slots;
         pub const Variants = Config.Variants;
 
-        /// 核心 resolve，返回每个 slot 的 ConditionalStyle
+        /// Core resolve, returns ConditionalStyle per slot
         pub fn resolve(variants: Variants, tokens: *const ThemeTokens) Slots {
             // Step 1: base
             var result: Slots = if (@hasDecl(Config, "base"))
@@ -302,24 +307,24 @@ pub fn slotRecipe(comptime Config: type) type {
             else
                 .{};
 
-            // Step 2: 遍历 variant 维度
+            // Step 2: iterate variant dimensions
             if (@hasDecl(Config, "variants")) {
-                inline for (std.meta.fields(@TypeOf(Config.variants))) |field| {
+                inline for (@import("zenit_reflection").fields(@TypeOf(Config.variants))) |field| {
                     const dim_resolver = @field(Config.variants, field.name);
                     const variant_value = @field(variants, field.name);
                     const slot_styles: Slots = dim_resolver(variant_value, tokens);
-                    // merge 每个 slot
-                    inline for (std.meta.fields(Slots)) |sf| {
+                    // merge each slot
+                    inline for (@import("zenit_reflection").fields(Slots)) |sf| {
                         @field(result, sf.name) = @field(result, sf.name)
                             .merge(@field(slot_styles, sf.name));
                     }
                 }
             }
 
-            // Step 2.5: derived，跨维度组合（拿完整 Variants，约定同 recipe）
+            // Step 2.5: derived, cross-dimension combo (full Variants, same convention as recipe)
             if (@hasDecl(Config, "derived")) {
                 const derived_slots: Slots = Config.derived(variants, tokens);
-                inline for (std.meta.fields(Slots)) |sf| {
+                inline for (@import("zenit_reflection").fields(Slots)) |sf| {
                     @field(result, sf.name) = @field(result, sf.name)
                         .merge(@field(derived_slots, sf.name));
                 }
@@ -330,7 +335,7 @@ pub fn slotRecipe(comptime Config: type) type {
                 inline for (Config.compounds) |compound| {
                     if (compound.matches(variants)) {
                         const compound_slots: Slots = compound.style(tokens);
-                        inline for (std.meta.fields(Slots)) |sf| {
+                        inline for (@import("zenit_reflection").fields(Slots)) |sf| {
                             @field(result, sf.name) = @field(result, sf.name)
                                 .merge(@field(compound_slots, sf.name));
                         }
@@ -344,27 +349,27 @@ pub fn slotRecipe(comptime Config: type) type {
 }
 
 // ============================================================================
-// 4. transition(), CSS 风格的 transition 字符串 comptime 解析器
+// 4. transition(): CSS-style transition string comptime parser
 // ============================================================================
 
-/// 解析结果：一组 (属性, 配置) 对
+/// Parse result: array of (property, config) tuples
 pub const TransitionEntry = struct {
     prop: TransitionProp,
     spec: TransitionSpec,
 };
 
-/// 编译期解析 CSS transition 字符串，返回固定大小数组
+/// Compile-time parse a CSS transition string into a fixed-size array.
 ///
-/// 支持的格式 (与 CSS transition 语法对齐):
+/// Supported formats (CSS transition syntax):
 ///   "background 200ms ease-out"
 ///   "background 200ms ease-out, opacity 150ms"
 ///   "background 200ms, opacity 150ms linear"
-///   "all 200ms ease-out"               <- 所有可过渡属性
-///   "background 0.2s ease-in-out"       <- 秒单位
-///   "background 200ms"                  <- 省略 easing -> 默认 ease-out-quad
-///   "background"                        <- 省略 duration -> 默认 150ms
+///   "all 200ms ease-out"               <- all animatable properties
+///   "background 0.2s ease-in-out"       <- second units
+///   "background 200ms"                  <- omit easing -> default ease-out-quad
+///   "background"                        <- omit duration -> default 150ms
 ///
-/// 属性名映射 (CSS -> TransitionProp):
+/// Property name mapping (CSS -> TransitionProp):
 ///   background / background-color / bg    -> .background
 ///   opacity                               -> .opacity
 ///   border-color                          -> .border_color
@@ -375,15 +380,15 @@ pub const TransitionEntry = struct {
 ///   scale-y / scaleY                      -> .scale_y
 ///   rotate / rotation                     -> .rotate
 ///   corner-radius / border-radius         -> .corner_radius
-///   all                                   -> 所有 11 个属性
+///   all                                   -> all 11 properties
 ///
-/// Easing 名映射 (CSS -> Easing):
+/// Easing name mapping (CSS -> Easing):
 ///   linear                                -> .linear
-///   ease / ease-out / ease-in / ease-in-out -> quad 版本
-///   ease-out-cubic / ease-in-cubic / ...   -> 对应 Easing 枚举
+///   ease / ease-out / ease-in / ease-in-out -> quad versions
+///   ease-out-cubic / ease-in-cubic / ...   -> corresponding Easing enum
 ///   spring / bounce                       -> ease_out_back / ease_out_bounce
 ///
-/// 示例:
+/// Example:
 /// ```zig
 /// const spec = comptime transition("background 200ms ease-out, opacity 150ms");
 /// node.applyTransition(allocator, &spec);
@@ -393,7 +398,7 @@ pub fn transition(comptime input: []const u8) [countTransitionEntries(input)]Tra
     return comptime parseTransition(input);
 }
 
-/// 编译期计算结果数组大小
+/// Comptime compute result array size
 fn countTransitionEntries(comptime input: []const u8) usize {
     @setEvalBranchQuota(10000);
     comptime {
@@ -402,7 +407,7 @@ fn countTransitionEntries(comptime input: []const u8) usize {
         for (segments.items[0..segments.len]) |segment| {
             const prop_str = firstToken(segment);
             if (eqlIgnoreCase(prop_str, "all")) {
-                count += 11; // 所有可过渡属性
+                count += 11; // all transitionable properties
             } else {
                 count += 1;
             }
@@ -411,7 +416,7 @@ fn countTransitionEntries(comptime input: []const u8) usize {
     }
 }
 
-/// 编译期解析 transition 字符串
+/// Comptime-parse transition string
 fn parseTransition(comptime input: []const u8) [countTransitionEntries(input)]TransitionEntry {
     @setEvalBranchQuota(10000);
     comptime {
@@ -424,9 +429,15 @@ fn parseTransition(comptime input: []const u8) [countTransitionEntries(input)]Tr
         for (segments.items[0..segments.len]) |segment| {
             const tokens = tokenize(segment);
 
-            // 第一个 token 是属性名
+            // First token is property name
             const prop_str = tokens.items[0];
-            // 后续 token 中找 duration 和 easing
+            // Find duration and easing in following tokens
+            // Words other than duration/easing are typos (previously silently ignored, reverted to
+            // defaults)
+            for (tokens.items[1..tokens.len]) |w| {
+                if (parseDurationValue(w) == null and parseEasingName(w) == null)
+                    @compileError("transition \"" ++ segment ++ "\": `" ++ w ++ "` is neither a duration (200ms, 0.2s, a duration token such as fast) nor an easing");
+            }
             const duration = findDuration(tokens);
             const easing = findEasing(tokens);
             const spec = TransitionSpec{
@@ -435,7 +446,7 @@ fn parseTransition(comptime input: []const u8) [countTransitionEntries(input)]Tr
             };
 
             if (eqlIgnoreCase(prop_str, "all")) {
-                // "all" -> 展开为所有 11 个属性
+                // "all" -> expands to all 11 properties
                 const all_props = [_]TransitionProp{
                     .background,   .opacity,     .border_color,
                     .translate_x,  .translate_y, .scale_x,
@@ -458,10 +469,10 @@ fn parseTransition(comptime input: []const u8) [countTransitionEntries(input)]Tr
     }
 }
 
-// ── 属性名解析 ──────────────────────────────────────────
+// -- Property name parsing ----------------
 
 fn parsePropName(comptime name: []const u8) ?TransitionProp {
-    // background 系列
+    // background family
     if (eqlIgnoreCase(name, "background") or
         eqlIgnoreCase(name, "background-color") or
         eqlIgnoreCase(name, "bg")) return .background;
@@ -514,28 +525,33 @@ fn parsePropName(comptime name: []const u8) ?TransitionProp {
     // width
     if (eqlIgnoreCase(name, "width")) return .width;
 
+    // text color
+    if (eqlIgnoreCase(name, "color") or
+        eqlIgnoreCase(name, "text-color") or
+        eqlIgnoreCase(name, "text_color")) return .text_color;
+
     return null;
 }
 
-// ── Duration 解析 ──────────────────────────────────────────
+// -- Duration parsing ----------------
 
-/// 在 tokens 中查找 duration 值 (数字 + ms/s 后缀)
+/// Find duration value in tokens (number + ms/s suffix)
 fn findDuration(comptime tokens: Tokens) f32 {
     comptime {
-        // 从第二个 token 开始找（第一个是属性名）
+        // Start from second token (first is property name)
         for (tokens.items[1..tokens.len]) |token| {
             if (parseDurationValue(token)) |d| return d;
         }
-        return 150; // 默认 150ms
+        return 150; // default 150ms
     }
 }
 
-/// 尝试解析 "200ms" / "0.2s" / "200" 为毫秒值
+/// Try parsing "200ms" / "0.2s" / "200" as milliseconds
 fn parseDurationValue(comptime token: []const u8) ?f32 {
     comptime {
         if (token.len == 0) return null;
 
-        // 检查后缀
+        // Check suffix
         if (endsWith(token, "ms")) {
             return parseFloat(token[0 .. token.len - 2]);
         } else if (endsWith(token, "s") and !isAlpha(token[0])) {
@@ -545,30 +561,45 @@ fn parseDurationValue(comptime token: []const u8) ?f32 {
             }
             return null;
         } else {
-            // 纯数字 -> 当作 ms
+            // Pure number -> treat as ms
             if (isDigit(token[0])) {
                 return parseFloat(token);
             }
-            return null;
+            // Design system duration token (`fast`/`normal`/`slow`, units seconds): comptime
+            // resolves per design system (duration not theme-dependent)
+            return durationToken(token);
         }
     }
 }
 
-// ── Easing 解析 ──────────────────────────────────────────
+fn durationToken(comptime name: []const u8) ?f32 {
+    if (!@hasField(@TypeOf(theme.light.tokens), "duration")) return null;
+    const D = @TypeOf(theme.light.tokens.duration);
+    if (@hasField(D, name)) return @field(theme.light.tokens.duration, name) * 1000;
+    var snake: [name.len]u8 = name[0..name.len].*;
+    for (&snake) |*ch| {
+        if (ch.* == '-') ch.* = '_';
+    }
+    const s = snake;
+    if (@hasField(D, &s)) return @field(theme.light.tokens.duration, &s) * 1000;
+    return null;
+}
 
-/// 在 tokens 中查找 easing 名
+// -- Easing parsing ----------------
+
+/// Find easing name in tokens
 fn findEasing(comptime tokens: Tokens) Easing {
     comptime {
         for (tokens.items[1..tokens.len]) |token| {
-            if (parseDurationValue(token) != null) continue; // 跳过 duration
+            if (parseDurationValue(token) != null) continue; // skip duration
             if (parseEasingName(token)) |e| return e;
         }
-        return .ease_out_quad; // 默认
+        return .ease_out_quad; // default
     }
 }
 
 fn parseEasingName(comptime name: []const u8) ?Easing {
-    // cubic-bezier(x1,y1,x2,y2)，括号内逗号分隔，无空格
+    // cubic-bezier(x1,y1,x2,y2), comma-separated inside parens, no spaces
     if (name.len > 13 and eqlIgnoreCase(name[0..13], "cubic-bezier(") and name[name.len - 1] == ')') {
         const inner = name[13 .. name.len - 1];
         const params = parseBezierParams(inner);
@@ -580,7 +611,7 @@ fn parseEasingName(comptime name: []const u8) ?Easing {
         } };
     }
 
-    // CSS 标准 easing
+    // CSS standard easing
     if (eqlIgnoreCase(name, "linear")) return .linear;
     if (eqlIgnoreCase(name, "ease") or eqlIgnoreCase(name, "ease-out")) return .ease_out_quad;
     if (eqlIgnoreCase(name, "ease-in")) return .ease_in_quad;
@@ -639,9 +670,9 @@ fn parseEasingName(comptime name: []const u8) ?Easing {
     return null;
 }
 
-// ── CubicBezier 参数解析 ─────────────────────────────────
+// -- CubicBezier parameter parsing --------
 
-/// 解析 "x1,y1,x2,y2" 格式的贝塞尔参数 (comptime)
+/// Parse Bezier params in "x1,y1,x2,y2" format (comptime)
 fn parseBezierParams(comptime inner: []const u8) [4]f32 {
     comptime {
         var result: [4]f32 = undefined;
@@ -665,7 +696,7 @@ fn parseBezierParams(comptime inner: []const u8) [4]f32 {
     }
 }
 
-/// comptime 有符号 float 解析 (支持负号前缀)
+/// comptime signed float parse (supports minus prefix)
 fn parseSignedFloat(comptime s: []const u8) ?f32 {
     comptime {
         if (s.len == 0) return null;
@@ -677,7 +708,7 @@ fn parseSignedFloat(comptime s: []const u8) ?f32 {
     }
 }
 
-// ── Comptime 字符串工具 ──────────────────────────────────
+// -- Comptime string utilities --------
 
 const MAX_SEGMENTS = 16;
 const MAX_TOKENS = 8;
@@ -692,7 +723,7 @@ const Tokens = struct {
     len: usize,
 };
 
-/// 按逗号分割，trim 空白（跳过括号内的逗号，支持 cubic-bezier(...)）
+/// Split by comma, trim whitespace (skip commas inside parens, support cubic-bezier(...))
 fn splitByComma(comptime input: []const u8) Segments {
     comptime {
         var result = Segments{ .items = undefined, .len = 0 };
@@ -722,16 +753,16 @@ fn splitByComma(comptime input: []const u8) Segments {
     }
 }
 
-/// 按空白分割
+/// Split by whitespace
 fn tokenize(comptime input: []const u8) Tokens {
     comptime {
         var result = Tokens{ .items = undefined, .len = 0 };
         var i: usize = 0;
         while (i < input.len) {
-            // 跳过空白
+            // Skip whitespace
             while (i < input.len and isWhitespace(input[i])) : (i += 1) {}
             if (i >= input.len) break;
-            // 找 token 结尾
+            // Find token end
             const start = i;
             while (i < input.len and !isWhitespace(input[i])) : (i += 1) {}
             if (result.len < MAX_TOKENS) {
@@ -743,7 +774,7 @@ fn tokenize(comptime input: []const u8) Tokens {
     }
 }
 
-/// 获取第一个 token
+/// Get first token
 fn firstToken(comptime input: []const u8) []const u8 {
     comptime {
         const tokens = tokenize(input);
@@ -792,7 +823,7 @@ fn toLower(c: u8) u8 {
     return c;
 }
 
-/// comptime float 解析 (支持整数和小数)
+/// comptime float parse (integers and decimals)
 fn parseFloat(comptime s: []const u8) ?f32 {
     comptime {
         if (s.len == 0) return null;
@@ -817,13 +848,13 @@ fn parseFloat(comptime s: []const u8) ?f32 {
         }
 
         if (!has_digit) return null;
-        if (i != s.len) return null; // 还有剩余字符，不是纯数字
+        if (i != s.len) return null; // remaining characters, not pure number
         return integer_part + frac_part;
     }
 }
 
 // ============================================================================
-// 测试
+// Tests
 // ============================================================================
 
 test "transition: 单属性 + duration + easing" {
@@ -867,7 +898,7 @@ test "transition: 省略 duration 使用默认值" {
 test "transition: all 展开为所有属性" {
     const spec = comptime transition("all 200ms ease-out-cubic");
     try std.testing.expectEqual(@as(usize, 11), spec.len);
-    // 验证所有属性都有
+    // Verify all properties present
     try std.testing.expectEqual(TransitionProp.background, spec[0].prop);
     try std.testing.expectEqual(TransitionProp.opacity, spec[1].prop);
     try std.testing.expectEqual(TransitionProp.border_color, spec[2].prop);
@@ -879,7 +910,7 @@ test "transition: all 展开为所有属性" {
     try std.testing.expectEqual(TransitionProp.corner_radius, spec[8].prop);
     try std.testing.expectEqual(TransitionProp.border_width, spec[9].prop);
     try std.testing.expectEqual(TransitionProp.width, spec[10].prop);
-    // 所有 spec 相同
+    // All specs identical
     for (spec) |entry| {
         try std.testing.expectEqual(@as(f32, 200), entry.spec.duration_ms);
         try std.testing.expectEqual(Easing.ease_out_cubic, entry.spec.easing);
@@ -925,19 +956,19 @@ test "ConditionalStyle: resolve 基础" {
         .disabled = .{ .opacity = 0.5 },
     };
 
-    // 正常态
+    // Normal state
     const normal = s.resolve(.{});
     try std.testing.expect(normal.background != null);
     try std.testing.expectEqual(Color.hex(0xFF0000), normal.background.?);
 
-    // hover 态
+    // Hover state
     const hovered = s.resolve(.{ .is_hovered = true });
     try std.testing.expectEqual(Color.hex(0x00FF00), hovered.background.?);
     try std.testing.expectEqual(@as(f32, 1.0), hovered.opacity.?);
 
-    // disabled 态 (不叠加 hover)
+    // Disabled state (no hover stacking)
     const disabled = s.resolve(.{ .is_disabled = true, .is_hovered = true });
-    try std.testing.expectEqual(Color.hex(0xFF0000), disabled.background.?); // base 的 bg，hover 不叠加
+    try std.testing.expectEqual(Color.hex(0xFF0000), disabled.background.?); // base bg, hover doesn't stack
     try std.testing.expectEqual(@as(f32, 0.5), disabled.opacity.?);
 }
 
@@ -948,17 +979,17 @@ test "ConditionalStyle: selected 底态与 hover 叠加, hover 覆盖重叠字�
         .hover = .{ .background = Color.hex(0x333333) },
     };
 
-    // 仅 selected：selected 覆盖 base 背景，带上 border_width
+    // Selected only: selected overrides base bg, includes border_width
     const sel = s.resolve(.{ .is_selected = true });
     try std.testing.expectEqual(Color.hex(0x222222), sel.background.?);
     try std.testing.expectEqual(@as(f32, 2), sel.border_width.?);
 
-    // selected + hover：hover 背景压过 selected，selected 的 border_width 保留
+    // selected + hover: hover bg overrides selected, selected's border_width preserved
     const sel_hover = s.resolve(.{ .is_selected = true, .is_hovered = true });
     try std.testing.expectEqual(Color.hex(0x333333), sel_hover.background.?);
     try std.testing.expectEqual(@as(f32, 2), sel_hover.border_width.?);
 
-    // 未选中不叠加
+    // Unselected doesn't stack
     const plain = s.resolve(.{});
     try std.testing.expectEqual(Color.hex(0x111111), plain.background.?);
     try std.testing.expect(plain.border_width == null);
@@ -996,8 +1027,8 @@ test "ConditionalStyle: disabled 短路忽略 selected/invalid" {
     };
     const r = s.resolve(.{ .is_disabled = true, .is_selected = true, .is_invalid = true });
     try std.testing.expectEqual(@as(f32, 0.5), r.opacity.?);
-    try std.testing.expectEqual(Color.hex(0x111111), r.background.?); // selected 不叠加
-    try std.testing.expect(r.border_color == null); // invalid 不叠加
+    try std.testing.expectEqual(Color.hex(0x111111), r.background.?); // selected doesn't stack
+    try std.testing.expect(r.border_color == null); // invalid doesn't stack
 }
 
 test "ConditionalStyle: merge 与 override 覆盖新条件字段" {
@@ -1033,16 +1064,16 @@ test "ConditionalStyle: merge" {
     };
     const merged = a.merge(b);
 
-    // base 合并了两者
+    // base merges both
     try std.testing.expect(merged.base.background != null);
     try std.testing.expect(merged.base.text_color != null);
 
-    // hover 合并了两者
+    // hover merges both
     try std.testing.expect(merged.hover != null);
-    try std.testing.expect(merged.hover.?.opacity != null); // 来自 a
-    try std.testing.expect(merged.hover.?.background != null); // 来自 b
+    try std.testing.expect(merged.hover.?.opacity != null); // from a
+    try std.testing.expect(merged.hover.?.background != null); // from b
 
-    // disabled 只来自 b
+    // disabled only from b
     try std.testing.expect(merged.disabled != null);
     try std.testing.expectEqual(@as(f32, 0.5), merged.disabled.?.opacity.?);
 }
@@ -1081,15 +1112,15 @@ test "ConditionalStyle: bgColors" {
 }
 
 test "ConditionalStyle: bgColors 继承" {
-    // hover 没指定 bg -> 继承 normal
+    // hover unspecified bg -> inherit normal
     const s = ConditionalStyle{
         .base = .{ .background = Color.hex(0xFF0000) },
         .hover = .{ .opacity = 0.8 },
     };
     const colors = s.bgColors();
     try std.testing.expectEqual(Color.hex(0xFF0000), colors.normal);
-    try std.testing.expectEqual(Color.hex(0xFF0000), colors.hover); // 继承 normal
-    try std.testing.expectEqual(Color.hex(0xFF0000), colors.pressed); // 继承 hover → normal
+    try std.testing.expectEqual(Color.hex(0xFF0000), colors.hover); // inherits normal
+    try std.testing.expectEqual(Color.hex(0xFF0000), colors.pressed); // inherits hover -> normal
 }
 
 test "recipe: 基础 resolve" {
@@ -1158,7 +1189,7 @@ test "recipe: compound variants" {
             }.resolve,
         };
 
-        // compound: danger + sm -> 特殊文本颜色
+        // compound: danger + sm -> special text color
         pub const compounds = .{
             .{
                 .matches = struct {
@@ -1177,17 +1208,17 @@ test "recipe: compound variants" {
 
     const tokens = &theme.dark;
 
-    // 非 compound 组合 -> 无额外样式
+    // non-compound combo -> no extra style
     const primary_md = CompoundRecipe.resolve(.{ .variant = .primary, .size = .md }, tokens);
     try std.testing.expect(primary_md.base.text_color == null);
 
-    // compound 匹配 -> danger + sm 有特殊 text_color
+    // compound matches -> danger + sm has special text_color
     const danger_sm = CompoundRecipe.resolve(.{ .variant = .danger, .size = .sm }, tokens);
     try std.testing.expect(danger_sm.base.text_color != null);
     try std.testing.expectEqual(Color.hex(0xFFFF00), danger_sm.base.text_color.?);
-    try std.testing.expectEqual(Color.hex(0xFF0000), danger_sm.base.background.?); // variant 的 bg 也在
+    try std.testing.expectEqual(Color.hex(0xFF0000), danger_sm.base.background.?); // variant bg also present
 
-    // danger + md -> compound 不匹配
+    // danger + md -> compound doesn't match
     const danger_md = CompoundRecipe.resolve(.{ .variant = .danger, .size = .md }, tokens);
     try std.testing.expect(danger_md.base.text_color == null);
 }
@@ -1201,14 +1232,14 @@ test "recipe: derived 跨维度组合与优先级 base<variants<derived<compound
         };
 
         pub fn base(_: *const ThemeTokens) ConditionalStyle {
-            // base 的 gap 会被 variants 覆盖；opacity 无人覆盖应保留
+            // base gap overridden by variants; opacity unoverridden preserves
             return .{ .base = .{ .gap = 1, .opacity = 0.9 } };
         }
 
         pub const variants = .{
             .size = struct {
                 fn resolve(s: TestSize, _: *const ThemeTokens) ConditionalStyle {
-                    // variants 的 height 会被 derived 覆盖；gap 覆盖 base
+                    // variants height overridden by derived; gap overrides base
                     return switch (s) {
                         .sm => .{ .base = .{ .height = .{ .px = 1 }, .gap = 4 } },
                         .lg => .{ .base = .{ .height = .{ .px = 1 }, .gap = 8 } },
@@ -1217,7 +1248,7 @@ test "recipe: derived 跨维度组合与优先级 base<variants<derived<compound
             }.resolve,
         };
 
-        // derived 拿完整 Variants，做跨维度组合（padding = f(size, icon_only)）
+        // derived takes full Variants, cross-dimension combo (padding = f(size, icon_only))
         pub fn derived(v: Variants, _: *const ThemeTokens) ConditionalStyle {
             const h: f32 = switch (v.size) {
                 .sm => 28,
@@ -1227,7 +1258,7 @@ test "recipe: derived 跨维度组合与优先级 base<variants<derived<compound
                 .base = .{
                     .height = .{ .px = h },
                     .padding = if (v.icon_only) types.Padding.all(h / 4) else types.Padding.symmetric(4, 12),
-                    // derived 的 corner_radius 会被 compound 覆盖（lg+icon_only 时）
+                    // derived corner_radius overridden by compound (on lg+icon_only)
                     .corner_radius = 6,
                 },
             };
@@ -1251,7 +1282,7 @@ test "recipe: derived 跨维度组合与优先级 base<variants<derived<compound
 
     const tokens = &theme.dark;
 
-    // derived 覆盖 variants 的 height；variants 覆盖 base 的 gap；base 的 opacity 保留
+    // derived overrides variants height; variants overrides base gap; base opacity preserved
     const sm = DerivedRecipe.resolve(.{ .size = .sm }, tokens);
     try std.testing.expectEqual(@as(f32, 28), sm.base.height.?.px);
     try std.testing.expectEqual(@as(f32, 4), sm.base.gap.?);
@@ -1259,11 +1290,11 @@ test "recipe: derived 跨维度组合与优先级 base<variants<derived<compound
     try std.testing.expectEqual(@as(f32, 12), sm.base.padding.?.right);
     try std.testing.expectEqual(@as(f32, 6), sm.base.corner_radius.?);
 
-    // 跨维度: icon_only 改变 padding 形状（f(size, icon_only) 单维度 resolver 做不到）
+    // Cross-dimension: icon_only changes padding shape (single-dimension resolver can't do)
     const sm_icon = DerivedRecipe.resolve(.{ .size = .sm, .icon_only = true }, tokens);
     try std.testing.expectEqual(@as(f32, 7), sm_icon.base.padding.?.right);
 
-    // compounds 覆盖 derived 的 corner_radius
+    // compounds override derived corner_radius
     const lg_icon = DerivedRecipe.resolve(.{ .size = .lg, .icon_only = true }, tokens);
     try std.testing.expectEqual(@as(f32, 999), lg_icon.base.corner_radius.?);
     try std.testing.expectEqual(@as(f32, 42), lg_icon.base.height.?.px);
@@ -1275,16 +1306,16 @@ test "ConditionalStyle: override" {
         .hover = .{ .background = Color.hex(0x00FF00) },
     };
 
-    // 外部 override 覆盖 base 的 background，保留 text_color
+    // external override overwrites base background, preserves text_color
     const overridden = base_style.override(.{
         .style = .{ .background = Color.hex(0x0000FF) },
         .hover_style = .{ .opacity = 0.9 },
     });
 
-    try std.testing.expectEqual(Color.hex(0x0000FF), overridden.base.background.?); // 被覆盖
-    try std.testing.expectEqual(Color.hex(0x000000), overridden.base.text_color.?); // 保留
-    try std.testing.expect(overridden.hover.?.background != null); // 原 hover bg 保留
-    try std.testing.expect(overridden.hover.?.opacity != null); // 新增 hover opacity
+    try std.testing.expectEqual(Color.hex(0x0000FF), overridden.base.background.?); // overridden
+    try std.testing.expectEqual(Color.hex(0x000000), overridden.base.text_color.?); // preserved
+    try std.testing.expect(overridden.hover.?.background != null); // original hover bg preserved
+    try std.testing.expect(overridden.hover.?.opacity != null); // new hover opacity added
 }
 
 test "ConditionalStyle: override preserves margin_spec overrides" {
@@ -1352,7 +1383,13 @@ test "slotRecipe: 多 slot resolve" {
     try std.testing.expect(primary.label.base.text_color != null);
 
     const ghost = TestSlots.resolve(.{ .variant = .ghost }, tokens);
-    try std.testing.expectEqual(types.CursorShape.pointer, ghost.root.base.cursor.?); // base 依然有
-    try std.testing.expect(ghost.root.base.background == null); // ghost 没有 bg
+    try std.testing.expectEqual(types.CursorShape.pointer, ghost.root.base.cursor.?); // base still has
+    try std.testing.expect(ghost.root.base.background == null); // ghost has no bg
     try std.testing.expect(ghost.label.base.text_color != null);
+}
+
+test "transition：duration token（按选定设计系统取值，单位换成毫秒）" {
+    const spec = transition("background fast ease-out, opacity slow");
+    try std.testing.expectEqual(@as(f32, theme.light.tokens.duration.fast * 1000), spec[0].spec.duration_ms);
+    try std.testing.expectEqual(@as(f32, theme.light.tokens.duration.slow * 1000), spec[1].spec.duration_ms);
 }

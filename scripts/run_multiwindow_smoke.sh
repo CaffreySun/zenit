@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# run_multiwindow_smoke.sh — 多窗口交付冒烟验证
+# run_multiwindow_smoke.sh -- multi-window delivery smoke test
 #
-# 断言：两个原生窗口在同一进程并存、window_id 不冲突（a11y/系统 API 路由前提）、
-# 双窗口都真实渲染、关闭 A 后 B 继续渲染、最后关闭 B 才干净退出；并验证
-# 两种窗口创建方式、活跃窗切换及 app-wide quit 后的统一资源析构。
-# 用法：bash scripts/run_multiwindow_smoke.sh [frames=120]
+# Asserts: two native windows coexist in one process, window_id does not collide (a11y/system
+# API routing precondition), both render, closing A leaves B running, closing B exits
+# cleanly; covers both window creation methods, active window switch, and app-wide quit
+# resource cleanup.
+# Usage: bash scripts/run_multiwindow_smoke.sh [frames=120]
 set -uo pipefail
 cd "$(dirname "$0")/.."
 

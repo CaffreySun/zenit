@@ -1,62 +1,62 @@
-/// Spring Animation，解析解 (Closed-form Damped Harmonic Oscillator)
+/// Spring Animation: closed-form solution (Damped Harmonic Oscillator).
 ///
-/// 阻尼谐振子方程: m·x'' + d·x' + k·x = 0
-/// 其中 x 是相对于 target 的位移。
+/// Damped oscillator equation: m*x'' + d*x' + k*x = 0
+/// where x is displacement relative to target.
 ///
-/// 解析解按阻尼比 ζ = d / (2·√(k·m)) 分三种情况:
-/// - 欠阻尼 (ζ < 1): x(t) = e^(-ζω₀t) · (A·cos(ωd·t) + B·sin(ωd·t))
-/// - 临界阻尼 (ζ = 1): x(t) = (A + B·t) · e^(-ω₀·t)
-/// - 过阻尼 (ζ > 1): x(t) = C₁·e^(r₁·t) + C₂·e^(r₂·t)
+/// Closed-form solution per damping ratio zeta = d / (2*sqrt(k*m)):
+/// - Underdamped (zeta < 1): x(t) = e^(-zeta*omega_0*t) * (A*cos(omega_d*t) + B*sin(omega_d*t))
+/// - Critically damped (zeta = 1): x(t) = (A + B*t) * e^(-omega_0*t)
+/// - Overdamped (zeta > 1): x(t) = C1*e^(r1*t) + C2*e^(r2*t)
 ///
-/// 优势（相比欧拉积分）:
-/// - 零累积误差：从绝对时间直接算出精确位置
-/// - 帧率无关：跳帧后依然精确
-/// - 可 seek 到任意时刻
-/// - pause/resume 天然支持
+/// Advantages (vs Euler integration):
+/// - Zero cumulative error: exact position from absolute time
+/// - Frame-rate independent: skipped frames still exact
+/// - Seek to any time
+/// - pause/resume native support
 const std = @import("std");
 const math = std.math;
 const AnimationState = @import("mod.zig").AnimationState;
 const render_engine = @import("../core/render_engine/mod.zig");
 
-/// Spring 配置
+/// Spring config
 pub const SpringConfig = struct {
-    /// 弹簧刚度 (推荐 100-500)
+    /// Spring stiffness (recommended 100-500)
     stiffness: f32 = 170.0,
-    /// 阻尼系数 (推荐 10-40)
+    /// Damping coefficient (recommended 10-40)
     damping: f32 = 26.0,
-    /// 质量 (推荐 1-5)
+    /// Mass (recommended 1-5)
     mass: f32 = 1.0,
-    /// 初始速度
+    /// Initial velocity
     initial_velocity: f32 = 0.0,
-    /// 位移静止阈值 (px)
+    /// Displacement rest threshold (px)
     rest_displacement: f32 = 0.01,
-    /// 速度静止阈值 (px/s)
+    /// Velocity rest threshold (px/s)
     rest_velocity: f32 = 0.01,
-    /// 完成回调
+    /// Completion callback
     on_complete: ?*const fn (*anyopaque) void = null,
-    /// 更新回调
+    /// Update callback
     on_update: ?*const fn (f32, *anyopaque) void = null,
-    /// 回调上下文
+    /// Callback context
     context: ?*anyopaque = null,
 };
 
-/// 预设配置
+/// Preset configs
 pub const SpringPreset = struct {
-    /// 默认 (平衡的弹性)
+    /// Default (balanced springiness)
     pub const default = SpringConfig{ .stiffness = 170, .damping = 26 };
-    /// 柔和 (慢而平滑)
+    /// Gentle (slow and smooth)
     pub const gentle = SpringConfig{ .stiffness = 120, .damping = 14 };
-    /// 快速 (快速回弹)
+    /// Quick (fast rebound)
     pub const wobbly = SpringConfig{ .stiffness = 180, .damping = 12 };
-    /// 僵硬 (几乎没有弹性)
+    /// Stiff (nearly springless)
     pub const stiff = SpringConfig{ .stiffness = 210, .damping = 20 };
-    /// 缓慢 (缓慢过渡)
+    /// Slow (slow transition)
     pub const slow = SpringConfig{ .stiffness = 280, .damping = 60 };
-    /// 果冻 (高弹性)
+    /// Jelly (high springiness)
     pub const molasses = SpringConfig{ .stiffness = 280, .damping = 120 };
 };
 
-/// 弹簧动画，解析解
+/// Spring animation, closed-form solution.
 pub const Spring = struct {
     config: SpringConfig,
     from: f32,
@@ -69,26 +69,26 @@ pub const Spring = struct {
     /// Configuration/trajectory changes, distinct from pause/stop commands.
     parameter_revision: u64 = 0,
 
-    // 解析解预计算系数
+    // Precompute closed-form solution coefficients.
     start_time_ms: f64 = 0,
     pause_time_ms: f64 = 0,
-    /// 阻尼比 ζ
+    /// Damping ratio zeta
     zeta: f64 = 0,
-    /// 自然角频率 ω₀
+    /// Natural angular frequency omega_0
     omega0: f64 = 0,
-    /// 初始位移 x₀ = from - to
+    /// Initial displacement x_0 = from - to
     x0: f64 = 0,
-    /// 初始速度 v₀
+    /// Initial velocity v_0
     v0: f64 = 0,
     /// Upward-rounded stable time after the final displacement/velocity threshold
     /// crossing. inf means this trajectory does not settle in finite f32 time.
     settling_time_s: f32 = 0,
-    /// 解析解类型
+    /// Closed-form solution type
     regime: Regime = .underdamped,
 
     const Regime = enum { underdamped, critical, overdamped };
 
-    /// 创建 Spring
+    /// Create Spring
     pub fn init(from: f32, to: f32, config: SpringConfig) Spring {
         var s = Spring{
             .config = config,
@@ -103,7 +103,7 @@ pub const Spring = struct {
         return s;
     }
 
-    /// Builder 风格创建
+    /// Builder-style creation
     pub fn from_value(initial: f32) SpringBuilder {
         return SpringBuilder{
             .from = initial,
@@ -112,7 +112,7 @@ pub const Spring = struct {
         };
     }
 
-    /// 预计算解析解系数
+    /// Precompute closed-form solution coefficients
     pub fn precompute(self: *Spring) void {
         self.control_revision +%= 1;
         self.parameter_revision +%= 1;
@@ -257,7 +257,7 @@ pub const Spring = struct {
         return high;
     }
 
-    /// 从绝对时间 t（秒）计算位移和速度
+    /// Compute displacement and velocity from absolute time t (seconds)
     pub fn solve(self: *const Spring, t_s: f32) struct { x: f32, v: f32 } {
         const result = self.solveWide(safeTime(t_s));
         if (!math.isFinite(result.x) or !math.isFinite(result.v)) return .{ .x = 0, .v = 0 };
@@ -381,7 +381,7 @@ pub const Spring = struct {
         };
     }
 
-    /// 开始播放
+    /// Start playback
     pub fn start(self: *Spring) void {
         self.control_revision +%= 1;
         self.precompute();
@@ -391,7 +391,7 @@ pub const Spring = struct {
         self.start_time_ms = render_engine.current_frame_time_ms;
     }
 
-    /// 暂停
+    /// Pause
     pub fn pause(self: *Spring) void {
         if (self.state == .running) {
             self.control_revision +%= 1;
@@ -400,7 +400,7 @@ pub const Spring = struct {
         }
     }
 
-    /// 恢复
+    /// Resume
     pub fn unpause(self: *Spring) void {
         if (self.state == .paused) {
             self.control_revision +%= 1;
@@ -410,13 +410,13 @@ pub const Spring = struct {
         }
     }
 
-    /// 停止
+    /// Stop
     pub fn stop(self: *Spring) void {
         self.control_revision +%= 1;
         self.state = .idle;
     }
 
-    /// 重置
+    /// Reset
     pub fn reset(self: *Spring) void {
         self.control_revision +%= 1;
         self.precompute();
@@ -425,12 +425,12 @@ pub const Spring = struct {
         self.velocity = self.config.initial_velocity;
     }
 
-    /// 更新目标值 (可以在动画进行中调用)
-    /// 从当前值和当前速度重新启动，保持运动连续性
+    /// Update target value (callable during animation). Restart from current value and velocity,
+    /// preserving motion continuity.
     pub fn setTarget(self: *Spring, target: f32) void {
         if (!math.isFinite(target)) return;
         self.control_revision +%= 1;
-        // 保存当前运动状态作为新动画的初始条件
+        // Save current motion state as initial condition for new animation
         const cur_val = self.current_value;
         const cur_vel = self.velocity;
         self.from = cur_val;
@@ -443,7 +443,7 @@ pub const Spring = struct {
         }
     }
 
-    /// 绝对时间戳驱动的更新 (每帧调用)
+    /// Absolute timestamp-driven update (call each frame)
     /// Standalone callers keep self alive and stable through callbacks.
     pub fn update(self: *Spring, now_ms: f64) void {
         self.updateGuarded(now_ms, AlwaysCurrent{});
@@ -489,7 +489,7 @@ pub const Spring = struct {
         self.current_value = if (numerical_failure) finiteOr(target, 0) else bounded(value);
         self.velocity = if (numerical_failure) 0 else bounded(if (reversed) -result.v else result.v);
 
-        // 调用更新回调
+        // Call update callback
         if (self.config.on_update) |callback| {
             if (self.config.context) |ctx| {
                 if (@hasDecl(@TypeOf(guard), "beforeCallback")) guard.beforeCallback();
@@ -500,7 +500,7 @@ pub const Spring = struct {
         if (!guard.isCurrent()) return;
         if (!guard.isUnchanged() or self.control_revision != revision or self.state != .running) return;
 
-        // 检查是否静止
+        // Check if at rest
         if (numerical_failure or seconds >= self.settling_time_s) {
             self.current_value = finiteOr(target, 0);
             self.velocity = 0;
@@ -515,17 +515,17 @@ pub const Spring = struct {
         }
     }
 
-    /// 获取当前值
+    /// Get current value
     pub fn getValue(self: *const Spring) f32 {
         return self.current_value;
     }
 
-    /// 是否正在运行
+    /// Is it running
     pub fn isRunning(self: *const Spring) bool {
         return self.state == .running;
     }
 
-    /// 是否完成
+    /// Is it complete
     pub fn isCompleted(self: *const Spring) bool {
         return self.state == .completed;
     }
@@ -586,7 +586,7 @@ pub const SpringBuilder = struct {
     }
 };
 
-// ========== 测试 ==========
+// ========== Tests ==========
 
 fn setTestTime(ms: f64) void {
     render_engine.current_frame_time_ms = ms;
@@ -602,7 +602,7 @@ test "Spring: basic animation" {
     spring.start();
     try std.testing.expect(spring.isRunning());
 
-    // 模拟几秒（stiff 预设应该很快收敛）
+    // Simulate few seconds (stiff preset should converge quickly)
     var ms: f64 = 1000.0;
     var i: usize = 0;
     while (i < 300 and spring.isRunning()) : (i += 1) {
@@ -634,7 +634,7 @@ test "Spring: overshoot" {
         }
     }
 
-    // wobbly 预设应该有超调
+    // wobbly preset should have overshoot
     try std.testing.expect(max_value > 100.0);
 }
 
@@ -646,7 +646,7 @@ test "Spring: update target" {
 
     spring.start();
 
-    // 运行到一半
+    // Halfway through
     var ms: f64 = 1000.0;
     var i: usize = 0;
     while (i < 30) : (i += 1) {
@@ -654,11 +654,11 @@ test "Spring: update target" {
         spring.update(ms);
     }
 
-    // 中途改变目标
+    // Change target mid-run
     setTestTime(ms);
     spring.setTarget(100.0);
 
-    // 继续运行
+    // Continue running
     while (i < 300 and spring.isRunning()) : (i += 1) {
         ms += 1000.0 / 60.0;
         spring.update(ms);
@@ -707,7 +707,7 @@ test "Spring: callback" {
 }
 
 test "Spring: analytical solution accuracy" {
-    // 验证解析解在不同帧率下结果一致（这是解析解相比欧拉积分的核心优势）
+    // Verify closed-form gives same result at different framerates (key advantage over Euler)
     setTestTime(0);
     var spring_60fps = Spring.from_value(0.0)
         .to_value(100.0)
@@ -722,7 +722,7 @@ test "Spring: analytical solution accuracy" {
         .build();
     spring_30fps.start();
 
-    // 60fps 跑 60 帧 = 1 秒
+    // 60fps run 60 frames = 1 second
     var ms: f64 = 0;
     var i: usize = 0;
     while (i < 60) : (i += 1) {
@@ -730,7 +730,7 @@ test "Spring: analytical solution accuracy" {
         spring_60fps.update(ms);
     }
 
-    // 30fps 跑 30 帧 = 1 秒
+    // 30fps run 30 frames = 1 second
     ms = 0;
     i = 0;
     while (i < 30) : (i += 1) {
@@ -738,13 +738,14 @@ test "Spring: analytical solution accuracy" {
         spring_30fps.update(ms);
     }
 
-    // 解析解下两者在 t=1s 时结果应该完全一致
+    // Under closed-form both should be identical at t=1s
     try std.testing.expectApproxEqAbs(spring_60fps.getValue(), spring_30fps.getValue(), 0.001);
 }
 
 test "Spring: 非法 stiffness/damping 不产生 NaN（钳制防线）" {
-    // 回归：负 stiffness -> @sqrt(负) -> omega0/zeta 全 NaN，NaN 比较全 false
-    // 骗过 regime 选择与 w0 早退，最终把 NaN 写进节点 style。
+    // Regression: negative stiffness -> sqrt(negative) -> omega0/zeta all NaN, NaN comparisons all
+    // false
+    // bypass regime select and w0 early exit, finally write NaN into node style.
     setTestTime(0);
     var s = Spring.init(0.0, 100.0, .{ .stiffness = -50.0, .damping = -5.0 });
     s.start();
@@ -753,7 +754,7 @@ test "Spring: 非法 stiffness/damping 不产生 NaN（钳制防线）" {
     try std.testing.expect(!std.math.isNan(s.getValue()));
     try std.testing.expect(!std.math.isNan(s.omega0));
     try std.testing.expect(!std.math.isNan(s.zeta));
-    // 负阻尼也不许能量爆炸：值必须有限
+    // Negative damping also can't let energy explode: value must be finite
     setTestTime(5000);
     s.update(5000);
     try std.testing.expect(std.math.isFinite(s.getValue()));

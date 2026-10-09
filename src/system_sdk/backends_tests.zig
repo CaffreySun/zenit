@@ -4,9 +4,9 @@ test {
     _ = macos;
 }
 
-// ── cursor vtable 的可选 set_custom 契约 ────────────────────────────────
-// set_custom 是可选字段：缺失时 customCursorSupported()==false，
-// setCustomCursor 返回 NotSupported（UI 层据此降级到固定形状）。
+// ── cursor vtable optional set_custom contract ────────────────────────────────
+// set_custom is optional field: when missing customCursorSupported()==false,
+// setCustomCursor returns NotSupported (UI layer falls back to fixed shapes).
 
 const std = @import("std");
 const api = @import("api.zig");
@@ -41,12 +41,12 @@ test "SystemSdk: custom cursor degrades when vtable lacks set_custom" {
     defer sdk.deinit();
 
     try std.testing.expect(!sdk.customCursorSupported());
-    const pixels = [_]u8{0} ** 16;
+    const pixels = @as([16]u8, @splat(0));
     try std.testing.expectError(
         error.NotSupported,
         sdk.setCustomCursor(1, .{ .rgba = &pixels, .width = 2, .height = 2, .scale = 2, .hot_x = 0, .hot_y = 0, .key = 7 }),
     );
-    // 固定形状路径不受影响
+    // Fixed shape path unaffected
     try sdk.setCursorShape(1, 4);
     try std.testing.expectEqual(@as(u32, 1), backend.shape_calls);
 }

@@ -1,13 +1,13 @@
-//! LayoutTable, Phase 3 拆 Node 的布局产物存储（SoA, dense, indexed by ElementId）
+//! LayoutTable: storage for Node's layout products (SoA, dense, indexed by ElementId).
 //!
-//! 与 ElementTable 一一对应：每个 element 创建时，layout_table 同步分配槽。
-//! 字段拆分：constraints_in / final_rect / baseline / layout_epoch / intrinsic_cache。
-//! 这样 layout pass 只读 constraints/写 rect，paint pass 只读 rect，各自顺序扫
-//! 单字段数组，cache-friendly。
+//! 1:1 with ElementTable: each element creation syncs a layout_table slot allocation. Fields are
+//! split (constraints_in / final_rect / baseline / layout_epoch / intrinsic_cache) so the layout
+//! pass (reads constraints, writes rect) and paint pass (reads rect) each scan a single field array
+//! sequentially, cache-friendly.
 //!
-//! 历史债避免：
-//! - 不在此表存"渲染缓存"或"命中代理"，那些去 PaintTable / InteractionTable
-//! - 不挂 Allocator 给每个 entry, intrinsic_cache 是 inline struct（4 entry，无堆分配）
+//! Do not:
+//! - Store "render cache" or "hit proxies" here; those go in PaintTable / InteractionTable
+//! - Attach an Allocator per entry; intrinsic_cache is an inline struct (4 entries, no heap alloc)
 
 const std = @import("std");
 const testing = std.testing;
@@ -20,7 +20,7 @@ pub const LayoutOutput = constraint.LayoutOutput;
 pub const Size2D = constraint.Size2D;
 pub const IntrinsicCache = constraint.IntrinsicCache;
 
-/// final_rect, element 在父空间的位置 + 测得的尺寸
+/// final_rect: element position + measured size in parent space
 pub const Rect = struct {
     x: f32 = 0,
     y: f32 = 0,
@@ -30,19 +30,20 @@ pub const Rect = struct {
     pub const ZERO: Rect = .{};
 };
 
-/// LayoutTable 单条记录
+/// Single LayoutTable record
 pub const LayoutData = struct {
-    /// 父->子约束（最近一次 layout 的输入）
+    /// Parent -> child constraint (most recent layout input)
     last_input: LayoutInput = .{ .available_space = .{ .width = .max_content, .height = .max_content } },
-    /// 测得尺寸（perform_layout 写入）
+    /// Measured size (written by perform_layout)
     measured: Size2D = .{},
-    /// final_rect（在父空间）
+    /// final_rect (in parent space)
     final_rect: Rect = .{},
-    /// 第一行 baseline（用于 align-items: baseline）
+    /// First line baseline (for align-items: baseline)
     first_baseline: ?f32 = null,
-    /// 每次重算 layout_epoch++；下游 paint cache 据此判失效
+    /// layout_epoch++ on each recalculation; downstream paint cache uses this to detect
+    /// invalidation
     layout_epoch: u64 = 0,
-    /// intrinsic 测量缓存（4-entry direct-mapped）
+    /// Intrinsic measurement cache (4-entry direct-mapped)
     intrinsic_cache: IntrinsicCache = .{},
 };
 
@@ -59,8 +60,8 @@ pub const LayoutTable = struct {
         self.* = undefined;
     }
 
-    /// 确保对应 ElementId 的 slot 存在（按 index 直接定位）。
-    /// 调用方负责保持与 ElementTable 同步：element create -> layout.ensure(id)
+    /// Ensure slot for the corresponding ElementId exists (direct indexing). Caller must keep in
+    /// sync with ElementTable: element create -> layout.ensure(id)
     pub fn ensureSlot(self: *LayoutTable, id: ElementId) !void {
         if (id.isNull()) return;
         const idx = id.index;
@@ -97,10 +98,10 @@ pub const LayoutTable = struct {
         return self.items.items(.layout_epoch)[id.index];
     }
 
-    /// epoch 与 rect 的单次合并读：epoch==0（已 seed 未 markLaidOut）返回 null。
-    /// 热读路径（rectFromWorldOrFallback，全帧十万次级）此前对 epoch()/rect()
-    /// 各做一次 MultiArrayList 字段切片派生，Debug 下每次派生都是数个不内联
-    /// 调用；这里合并为一次 slice() + 两个字段索引。
+    /// Single combined read of epoch and rect: epoch==0 (seeded, not markLaidOut) returns null. Hot
+    /// read path (rectFromWorldOrFallback, ~100k times per frame) previously did two separate
+    /// MultiArrayList field slice derivations; in Debug each derivation is several non-inlined
+    /// calls. Merged into one slice() + two field indices here.
     pub fn rectIfLaidOut(self: *const LayoutTable, id: ElementId) ?Rect {
         if (id.isNull() or id.index >= self.items.len) return null;
         const s = self.items.slice();
@@ -108,7 +109,7 @@ pub const LayoutTable = struct {
         return s.items(.final_rect)[id.index];
     }
 
-    /// 标记该 id 重新布局；epoch++、清 intrinsic cache（输入约束变了）
+    /// Mark id for relayout; epoch++, clear intrinsic cache (input constraint changed)
     pub fn markLaidOut(self: *LayoutTable, id: ElementId, measured: Size2D, r: Rect) void {
         if (id.isNull() or id.index >= self.items.len) return;
         self.items.items(.measured)[id.index] = measured;

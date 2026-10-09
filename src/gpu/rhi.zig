@@ -90,7 +90,7 @@ pub const NullRhi = struct {
     pub const max_commands = 1024;
 
     capabilities: Capabilities = .{},
-    slots: [max_resources]Slot = [_]Slot{.{}} ** max_resources,
+    slots: [max_resources]Slot = @as([max_resources]Slot, @splat(.{})),
     commands: [max_commands]Command = undefined,
     command_count: usize = 0,
     active_pass: PassKind = .none,

@@ -1,19 +1,23 @@
 # zenit examples
 
-Ten small applications demonstrating different facets of the framework. **Every one is wired in `build.zig` to use only `ui` and `zenit_app` modules** — they double as the build-time fence that enforces the [open-source boundary](../docs/UI_OSS_BOUNDARY.md).
+Twelve applications demonstrating different facets of the framework. **Every one uses the public `ui` and `zenit_app` APIs through `build.zig` (Yix examples also import their generated view module)** — they double as the build-time fence that enforces the [open-source boundary](../docs/UI_OSS_BOUNDARY.md).
 
-| example | what it shows | LOC | binary |
-|---|---|---|---|
-| [`hello_button/`](hello_button/) | Minimal Button + state via `cx.bindState` + `cx.on` | 81 | 5.5 MB |
-| [`counter_reactive/`](counter_reactive/) | `Signal` + `Memo` + `createEffect` (responsive UI without manual updates) | 129 | 5.5 MB |
-| [`virtual_list_perf/`](virtual_list_perf/) | 100k-row `VirtualList` (constant cost regardless of dataset size) | 100 | 5.4 MB |
-| [`text_input/`](text_input/) | `Input` and `Textarea`, including IME (CJK) support — exercises `text_core` integration | 85 | 6.0 MB |
-| [`multi_window/`](multi_window/) | Public `MultiWindowApp`: two native windows, isolated routing, single/last-window teardown | ~190 | varies |
-| [`storybook/`](storybook/) | Complete component showcase and real-window E2E target | — | varies |
-| [`console_probe/`](console_probe/) | `ui.console` diagnostic Console + DevTools console panel verification target | 113 | varies |
-| [`devtools_probe/`](devtools_probe/) | DevTools performance panel real-window acceptance probe | 176 | varies |
-| [`interop_probe/`](interop_probe/) | Rich clipboard / drag-out real-system interop verification target | 107 | varies |
-| [`design_probe/`](design_probe/) | Pixel-accurate rebuild of a pencil design node, for numeric design-diff verification | 103 | varies |
+Most examples write their UI in Yix: `view.yix` holds the components and their styles, `main.zig` only starts the app (and runs smoke assertions for the probes). `main.zig` imports its generated twin, `@import("_view.yix.zig")` (checked in; `zig build gen-yix` regenerates it). Exceptions: `zig_native` deliberately uses no Yix / YSS (components, controlled values, slots and recipes written in plain Zig with `ui.view` — the path for people who prefer Zig only), `counter_reactive` stays hand-written as the pixel reference for `yix_counter`, `interop_probe` wires raw node events below the template layer, and `storybook` has not been ported yet.
+
+| example | what it shows |
+|---|---|
+| [`hello_button/`](hello_button/) | Minimal Button + scoped state, ui.view and ui.on |
+| [`counter_reactive/`](counter_reactive/) | Signal + computed text + cva variants in ui.view |
+| [`zig_native/`](zig_native/) | Reusable components in plain Zig (no Yix / YSS): props, `Model` controlled value, slots, sva recipes, keyed list |
+| [`virtual_list_perf/`](virtual_list_perf/) | 100k-row `VirtualList` (constant cost regardless of dataset size) |
+| [`text_input/`](text_input/) | `Input` and `Textarea`, including IME (CJK) support — exercises `text_core` integration |
+| [`multi_window/`](multi_window/) | Public `MultiWindowApp`: two native windows, isolated routing, single/last-window teardown |
+| [`storybook/`](storybook/) | Complete component showcase and real-window E2E target |
+| [`console_probe/`](console_probe/) | `ui.console` diagnostic Console + DevTools console panel verification target |
+| [`devtools_probe/`](devtools_probe/) | DevTools performance panel real-window acceptance probe |
+| [`interop_probe/`](interop_probe/) | Rich clipboard / drag-out real-system interop verification target |
+| [`design_probe/`](design_probe/) | Pixel-accurate rebuild of a pencil design node, for numeric design-diff verification |
+| [`yix_counter/`](yix_counter/) | Yix version of the reactive counter (styles in `styles.yss`) |
 
 ## Run them
 
@@ -21,6 +25,9 @@ Ten small applications demonstrating different facets of the framework. **Every 
 zig build hello-button         # build .app bundle (ad-hoc signed)
 zig build run-hello-button     # run unbundled
 
+zig build yix-counter
+zig build zig-native
+zig build run-zig-native
 zig build counter-reactive
 zig build run-counter-reactive
 
@@ -83,3 +90,31 @@ bash scripts/run_multiwindow_smoke.sh 120
 3. Run `bash scripts/check_oss_boundary.sh` to confirm the boundary is still intact.
 
 Imports must stay limited to `@import("ui")` and `@import("zenit_app")`. If an example reaches for a language toolchain or a richer document model, it's application code, not framework code — keep it out of this directory.
+
+## Application design system
+
+All examples share [`theme.json`](theme.json), compiled automatically into a
+provider for their own UI/App module graph. Library defaults use a separate
+provider. No generated Zig file needs to be checked in.
+
+```zig
+const TOKENS = ui.theme.refs;
+const label = ui.css(.{ .font_size = TOKENS.font_size.counterValue });
+const title = ui.css(.{ .typography = TOKENS.typography.counterTitle });
+// Where computation is needed, style functions read t.tokens.*.
+// Built-in recipes read the same semantic tokens directly.
+cx.setTheme(&ui.theme.modes.dark);
+```
+
+Base and semantic tokens share this one namespace; duplicate paths are rejected.
+Base scales live in `tokens` (for example `space50 = 2`, `space100 = 4`,
+`space200 = 8`); semantic contains roles and typography aggregation. Component
+size combinations belong in cva/sva recipes, not theme categories.
+`counterValue` (18px) and `counterHeading` (24px) are application names, not
+framework enum cases. `hello_button` demonstrates `ui.cva` with a Signal-backed
+variant; both Counter implementations share the same token-based styles.
+Component states and layout choices stay in Zig/Yix. Built-in recipes require
+the semantic names they reference; there is no bindings table or implicit fallback.
+
+See [build integration](../docs/design-system/TOOLING.md) for consuming this API
+from a separate application.

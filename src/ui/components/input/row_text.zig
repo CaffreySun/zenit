@@ -6,7 +6,9 @@ const core = @import("../../core.zig");
 /// Allocate with the node's Cx allocator so ContentTable can release the copy.
 /// Prepare before publishing; a failed copy leaves the previous row intact.
 pub fn set(node: *core.Node, cx: *core.Cx, content: []const u8, color: core.Color, font_size: f32) !void {
-    const old = node.getText();
+    // Need to check if node already owns equivalent content (reuse, don't reallocate), read raw
+    // value with ownership
+    const old = node.getTextRaw();
     const same_content = if (old) |text| text.owned and std.mem.eql(u8, text.content, content) else false;
     if (same_content and core.Color.eql(old.?.color, color) and old.?.font_size == font_size) return;
     const bytes = if (same_content) old.?.content else try cx.allocator.dupe(u8, content);
@@ -34,7 +36,7 @@ test "VirtualList refresh and recycling release owned row snapshots" {
             set(node, cx, text, core.Color.BLACK, 14) catch unreachable;
         }
     };
-    var cx = try core.Cx.init(t.allocator);
+    var cx = try core.Cx.init(t.allocator, std.testing.io);
     defer cx.deinit();
     const root = try core.box(cx, .{ .width = .{ .px = 320 }, .height = .{ .px = 96 } }, .{});
     cx.root = root;
@@ -54,7 +56,7 @@ test "VirtualList refresh and recycling release owned row snapshots" {
             const index = binding orelse continue;
             var expected: [80]u8 = undefined;
             try t.expectEqualStrings(try std.fmt.bufPrint(&expected, "row-{d}-generation-{d}", .{ index, generation }), row.getText().?.content);
-            try t.expect(row.getText().?.owned);
+            try t.expect(row.getTextRaw().?.owned);
             count += 1;
         }
         try t.expect(count > 0);

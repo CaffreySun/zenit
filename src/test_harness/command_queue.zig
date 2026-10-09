@@ -1,7 +1,7 @@
-/// command_queue，测试命令 SPSC 环形缓冲区
+/// command_queue: SPSC ring buffer for test commands.
 ///
-/// HTTP 线程写入命令 -> 主线程消费执行。
-/// (zenit 最小子集，只支持 IME / click / type / key / query / screenshot / focused)
+/// HTTP thread writes commands -> main thread consumes and executes.
+/// (Minimal zenit subset: supports IME / click / type / key / query / screenshot / focused)
 const std = @import("std");
 
 pub const QUEUE_SIZE = 16;
@@ -9,12 +9,14 @@ pub const RESULT_BUF_SIZE = 256 * 1024; // 256KB JSON result
 
 pub const TestCommand = union(enum) {
     health: void,
-    /// `/click` 同样走 MousePayload，它内部合成 down+up，若不带修饰键，
-    /// "⇧ 点第二个对象"这类用例会静默退化成独占选中（宿主最常用的正是本路由）。
+    /// /click also uses MousePayload, internally synthesizing down+up; without modifiers, cases
+    /// like "shift-click second object" degrade silently to exclusive select (the most common
+    /// operation).
     click: MousePayload,
     click_test_id: TestIdPayload,
-    /// 修饰键随指针事件一起送：⇧ 加选、⌘ 深选、ctrl 框选反转这类交互
-    /// 只有带修饰键的指针事件才测得到。默认全 false ⇒ 老用例不受影响。
+    /// Modifiers travel with pointer events: shift-adds, cmd-deepens, ctrl-inverts selection. These
+    /// interactions are only testable with modifier-carrying pointer events. Default all false =>
+    /// old tests unaffected.
     mouse_down: MousePayload,
     mouse_move: MousePayload,
     mouse_up: MousePayload,
@@ -26,34 +28,53 @@ pub const TestCommand = union(enum) {
     query_selector: TextPayload,
     get_focused: void,
     screen_pos: TestIdPayload,
+    /// Per-frame tracking: begin recording screen rectangles of this test_id node after each frame
+    /// render (for animation assertions; samples unaffected by RPC latency).
+    track_start: TestIdPayload,
+    /// End per-frame tracking, return all samples.
+    track_stop: void,
     screenshot: TestIdPayload,
+    visual_quality: VisualQualityCommand,
     recording_start: RecordingStartPayload,
     recording_status: void,
     recording_stop: void,
-    /// 查询 input/textarea 内部 state (buffer / cursor / preedit / phase)
+    /// Query input/textarea internal state (buffer / cursor / preedit / phase).
     input_state: TestIdPayload,
-    /// 宿主自定义路由（`/app/...`）。harness 不解释语义，
-    /// 原样把 path+body 交给宿主注册的 handler，由它写回 JSON。
-    /// 让下游应用这类宿主能暴露自己的诊断/夹具接口，而不必把应用逻辑塞进 zenit。
+    /// Custom host routes (`/app/...`). Harness does not interpret semantics; passes path+body
+    /// as-is to the host's registered handler, which writes back JSON. Lets downstream apps expose
+    /// diagnostics/fixtures without embedding app logic in zenit.
     app_route: AppRoutePayload,
-    /// 查询上一帧 FrameStats（retained hits/misses/partial_repaints 等）
+    /// Query previous frame's FrameStats (retained hits/misses/partial_repaints, etc).
     frame_stats: void,
-    /// 清空跨帧计时采样环，性能门禁在进入重场景后调用，
-    /// 使 P95 只统计该场景自己的帧（否则会混入上一个 story 的样本）
+    /// Clear cross-frame timing sample ring. Performance gates call this after entering heavy
+    /// scenes, so P95 only counts that scene's frames (otherwise mixes in previous story's
+    /// samples).
     reset_timing: void,
+    frames_start: struct { target: TestIdPayload, escape_on_enter: bool = false, click_target: ?TestIdPayload = null, capture_path: ?TestIdPayload = null, capture_after_ms: f64 = 0 },
+    frames_read: void,
+    frames_capture_read: void,
+    finish_frame_capture: void,
+    animation_clock: f32, // 0 restores realtime; 1..100 ms per active frame.
+    /// Perf probe: continuous full-repaint frames on/off.
+    force_frames: bool,
+    /// Fixed step whose time advances only by clock_advance grants (frozen at 0).
+    animation_clock_locked: f32,
+    /// Grant ms of animation time to a locked clock.
+    clock_advance: f32,
     /// Incremental per-Cx Console snapshot. after_seq=0 starts at the oldest
     /// retained event; limit is clamped by the executor.
     console_query: ConsoleQueryPayload,
     console_clear: void,
-    /// 滚轮事件（带修饰键）
-    /// phase / momentum 按 ui.events.ScrollPhase / MomentumPhase 的序号；默认 0 = none（鼠标滚轮）
+    /// Scroll wheel event (with modifiers). phase / momentum per ui.events.ScrollPhase /
+    /// MomentumPhase ordinal; default 0 = none (mouse wheel).
     scroll: struct { x: f32, y: f32, dx: f32, dy: f32, phase: u8 = 0, momentum: u8 = 0, shift: bool = false, ctrl: bool = false, alt: bool = false, super: bool = false },
-    /// 触控板捏合事件。phase: 0=began 1=changed 2=ended 3=cancelled
+    /// Trackpad pinch event. phase: 0=began 1=changed 2=ended 3=cancelled.
     magnify: struct { x: f32, y: f32, magnification: f32, phase: u8 },
-    /// 拖放事件。kind: 0=entered 1=updated 2=exited 3=dropped；paths 换行分隔
+    /// Drag event. kind: 0=entered 1=updated 2=exited 3=dropped; paths newline-separated.
     drag: DragPayload,
-    /// 调整窗口逻辑尺寸（点）。回归锚点：resize 触发 surface 重配，
-    /// test-mode 下重配必须保留 CPU readback 能力，否则后续 /screenshot 全花。
+    /// Resize window logical size (points). Regression anchor: resize triggers surface
+    /// reconfiguration; in test-mode reconfiguration must preserve CPU readback ability, else
+    /// subsequent /screenshot artifacts.
     resize_window: struct { width: u32, height: u32 },
 };
 
@@ -136,9 +157,9 @@ pub const TextPayload = struct {
     }
 };
 
-/// 指针事件负载。修饰键默认 false，与旧的 `{x, y}` 形态行为一致。
-/// 宿主自定义路由负载。path/body 都是定长内联，避免 RPC 线程与主线程
-/// 之间的所有权纠纷（与 TestIdPayload 同一取舍）。
+/// Pointer event payload. Modifiers default false, matching legacy `{x, y}` behavior. Custom host
+/// route payload. path/body are fixed-size inline, avoiding ownership disputes between RPC and main
+/// threads (same tradeoff as TestIdPayload).
 pub const AppRoutePayload = struct {
     pub const PATH_CAP = 96;
     pub const BODY_CAP = 512;
@@ -172,6 +193,9 @@ pub const MousePayload = struct {
     ctrl: bool = false,
     alt: bool = false,
     super: bool = false,
+    /// `/click` only: consecutive clicks injected back to back inside the app,
+    /// so multi-click detection does not depend on the driver's round trip.
+    count: u8 = 1,
 
     pub fn modifiers(self: *const MousePayload) @import("ui").events.Modifiers {
         return .{ .shift = self.shift, .ctrl = self.ctrl, .alt = self.alt, .super = self.super };
@@ -201,7 +225,8 @@ pub const CommandResult = struct {
     }
 
     pub fn setJson(self: *CommandResult, json: []const u8) void {
-        // 装不下显式报错：截断的 JSON 会被客户端当成功结果吞掉。
+        // Report an explicit error when it doesn't fit: truncated JSON would be swallowed by the client
+        // as a successful result.
         if (json.len > self.buf.len) {
             self.setError("result JSON exceeds RESULT_BUF_SIZE");
             return;
@@ -234,7 +259,8 @@ pub const CommandQueue = struct {
     head: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     tail: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
 
-    done_event: std.Thread.ResetEvent = if (@typeInfo(std.Thread.ResetEvent) == .@"enum") .unset else .{},
+    io: std.Io,
+    done_event: std.Io.Event = .unset,
 
     result: CommandResult = .{},
 
@@ -255,7 +281,7 @@ pub const CommandQueue = struct {
         self.tail.store(tail + 1, .release);
         if (self.wake_fn) |wake| wake();
 
-        self.done_event.wait();
+        self.done_event.waitUncancelable(self.io);
         self.done_event.reset();
 
         return &self.result;
@@ -277,7 +303,7 @@ pub const CommandQueue = struct {
     }
 
     pub fn signalDone(self: *CommandQueue) void {
-        self.done_event.set();
+        self.done_event.set(self.io);
     }
 };
 
@@ -295,7 +321,7 @@ fn consumeOneForTest(queue: *CommandQueue) void {
 
 test "submit publishes command and wakes event pump before waiting" {
     test_wake_count.store(0, .monotonic);
-    var queue = CommandQueue{};
+    var queue = CommandQueue{ .io = std.testing.io };
     queue.setWakeCallback(countTestWake);
 
     const consumer = try std.Thread.spawn(.{}, consumeOneForTest, .{&queue});
@@ -305,3 +331,5 @@ test "submit publishes command and wakes event pump before waiting" {
     try std.testing.expectEqual(@as(u32, 1), test_wake_count.load(.monotonic));
     try std.testing.expectEqualStrings("{\"ok\":true}", result.getData());
 }
+
+pub const VisualQualityCommand = enum { status, auto, full, frosted, basic, fail_blur };

@@ -1,13 +1,15 @@
-/// interop_probe，富剪贴板 + 文件拖出的真机验证探针（脚本驱动，非产品 demo）。
+/// interop_probe: real-hardware verification probe for rich clipboard + file drag-out
+/// (script-driven, not a product demo).
 ///
-/// 与 e2e 注入不同，本探针验证的是**真系统路径**：
-///   - 启动时先读系统剪贴板 HTML（外部脚本预置）-> 验证 get 路径；
-///   - 随后写入 text+HTML 富剪贴板 -> 外部脚本读回验证 set 路径；
-///   - 窗口任意处 mouse_down -> beginDrag(file_url) 起一次真 AppKit 拖拽
-///     会话 -> 由 scripts/verify_interop_probe.sh 用 CGEvent 拖到 Finder，
-///     以目标目录出现文件为判据。
+/// Unlike e2e injection, this verifies real system paths:
+///   - On startup, read system clipboard HTML (preset by an external script) -> verifies the get
+///     path;
+///   - Then write text+HTML rich clipboard -> external script reads it back to verify the set path;
+///   - Mouse down anywhere in the window -> beginDrag(file_url) starts a real AppKit drag session
+///     -> scripts/verify_interop_probe.sh uses CGEvent to drag to Finder; pass = file appears in
+///     target dir.
 ///
-/// 判据全部走 stdout 的 `[PROBE]` 行 + 外部系统状态，脚本 grep。
+/// All criteria go through stdout `[PROBE]` lines + external system state, which the script greps.
 const std = @import("std");
 const ui = @import("ui");
 const App = @import("zenit_app").App;
@@ -19,12 +21,12 @@ fn onProbeEvent(event: ui.events.Event, context: ?*anyopaque) ui.events.EventRes
     _ = context;
     switch (event) {
         .mouse_down => |e| {
-            // 只有窗口**左半边**是拖拽源区：右半边留给普通点击（聚焦/激活），
-            // 否则 verify_menu.sh 的聚焦点击会开出一个空拖拽会话把后续
-            // 键盘事件全部吃掉（实锤：Cmd+P 永远到不了事件循环）。
+            // Only window's left half is drag source; right half for normal clicks
+            // (focus/activate), else verify_menu.sh's focus click spawns an empty drag session
+            // eating all following keyboard events (confirmed: Cmd+P never reaches the event loop).
             if (e.x >= 200) return .ignored;
-            // 必须在 mousedown 里**立刻**起拖（AppKit 要求当前事件是拖拽源事件；
-            // 见 scripts/verify_real_drag.sh 的实测经验）。
+            // Must start drag immediately in mousedown (AppKit requires the current event is the
+            // drag source event; see scripts/verify_real_drag.sh for tested experience).
             if (g_drag_started) return .ignored;
             g_drag_started = true;
             const token = g_app.sdk.beginDrag(g_app.windowId(), .{
@@ -49,34 +51,40 @@ fn onProbeAction(action: ui.actions.Action, context: ?*anyopaque) ui.events.Even
     return .handled;
 }
 
-fn mountUI(cx: *ui.Cx, scope: *ui.Scope) anyerror!*ui.Node {
-    _ = scope;
-    const root = try ui.box(cx, .{
-        .width = .fill(),
-        .height = .fill(),
-        .background = cx.tokens.color.bg_primary,
-    }, .{});
+const v = ui.view;
+
+fn rootStyle(t: *const ui.theme.Values) ui.BoxStyle {
+    return .{ .width = .fill(), .height = .fill(), .background = t.tokens.color.bg_primary };
+}
+
+/// Probe needs raw event flow and native menu routing, node-level capability below DSL: connected
+/// via `v.setup`.
+fn wireProbe(_: void, root: *ui.Node, _: *ui.Scope, cx: *ui.Cx) void {
     root.behavior.events.on_event = onProbeEvent;
-    root.behavior.events.event_context = root; // 非 null 即可，handler 不用它
-    // 原生菜单验收：menu_command -> ActionDispatcher -> 此 handler 打印
+    root.behavior.events.event_context = root; // non-null ok, handler doesn't use it.
+    // Native menu acceptance: menu_command -> ActionDispatcher -> this handler prints.
     root.behavior.interaction.key_context = "probe";
     root.behavior.events.on_action = onProbeAction;
     cx.bindCommandAction(100, .{ .context = "probe", .name = "ping" });
-    return root;
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+fn mountUI(cx: *ui.Cx, scope: *ui.Scope) anyerror!*ui.Node {
+    return v.render(scope, cx, v.setup(v.box(.{ .style = rootStyle }, .{}), {}, wireProbe));
+}
+
+pub fn main(init: std.process.Init) !void {
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
     const app = try App.init(allocator, .{
+        .io = init.io,
         .window = .{ .width = 400, .height = 300, .title = "zenit interop probe" },
     });
     defer app.deinit();
     g_app = app;
 
-    // ---- 剪贴板 get 路径：读外部脚本预置的 HTML ----
+    // ---- Clipboard get path: read HTML preset by external script ----
     if (app.sdk.clipboardGetHtmlAlloc(allocator) catch null) |html| {
         defer allocator.free(html);
         std.debug.print("[PROBE] read-html: {s}\n", .{html});
@@ -84,7 +92,7 @@ pub fn main() !void {
         std.debug.print("[PROBE] read-html: <none>\n", .{});
     }
 
-    // ---- 剪贴板 set 路径：写 text+HTML 双 representation ----
+    // ---- Clipboard set path: write text+HTML dual representation ----
     if (app.sdk.clipboardSetRichText(.{
         .text = "zenit-probe-plain",
         .html = "<b>zenit-probe-html</b>",
@@ -94,9 +102,9 @@ pub fn main() !void {
         std.debug.print("[PROBE] rich-set failed: {}\n", .{e});
     }
 
-    // ---- 原生菜单：真 AppKit 菜单栏点击 / Cmd+P 快捷键验收目标 ----
-    // 注意：AppKit 把主菜单第一个顶级项渲染为应用菜单（强制改名为 app 名），
-    // 所以自定义菜单前必须有一个占位 app 菜单，否则第一个菜单被吃掉。
+    // ---- Native menu: real AppKit menu bar click / Cmd+P hotkey acceptance target ----
+    // Note: AppKit renders the first top-level menu item as the app menu (forces rename to app
+    // name), so a placeholder app menu must precede custom menus or the first menu is swallowed.
     app.setMenuModel(.{ .nodes = &.{
         .{ .id = 1, .kind = .menu, .label = "App" },
         .{ .id = 2, .kind = .menu, .label = "Probe" },

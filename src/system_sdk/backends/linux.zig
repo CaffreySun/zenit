@@ -15,17 +15,17 @@ const CAPS = capabilities_mod.Capabilities{
 
 /// Linux backend (minimal).
 ///
-/// 当前实现提供:
-/// - 事件泵 `pump`
-/// - window resize 事件
-/// - mouse move 事件
-/// - quit 事件
+/// Currently provides:
+/// - event pump `pump`
+/// - window resize event
+/// - mouse move event
+/// - quit event
 /// - requestRedraw
 ///
-/// 未来可扩展:
-/// - X11/Wayland 原生事件
-/// - 剪贴板
-/// - 文件对话框
+/// Future:
+/// - X11/Wayland native events
+/// - clipboard
+/// - file dialogs
 pub const LinuxBackend = struct {
     pub fn initSystemSdk(allocator: Allocator, window: anytype, window_id: WindowId) !SystemSdk {
         const WindowType = @TypeOf(window);

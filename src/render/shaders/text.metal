@@ -1,19 +1,18 @@
 /// Text Shader - Metal Shading Language
 ///
-/// GPU 实例化文本渲染
-/// 每个字形作为一个实例渲染
+/// GPU-instanced text rendering, each glyph renders as one instance
 
 #include <metal_stdlib>
 using namespace metal;
 
 // ============================================================================
-// 数据结构
+// Data structures
 // ============================================================================
 
-/// 全局 Uniforms
+/// global uniforms
 struct Uniforms {
-    float2 viewport_size;  // 视口尺寸（像素）
-    float scale_factor;    // DPI 缩放因子
+    float2 viewport_size; // viewport size (pixels)
+    float scale_factor; // DPI scale factor
     uint clip_shape_kind;
     float4 clip_rect;
     float clip_radius;
@@ -24,20 +23,20 @@ struct Uniforms {
     float2 clip_polygon_points[32];
 };
 
-/// 字形实例数据
+/// glyph instance data
 struct GlyphInstance {
-    float2 position;      // 字形左下角位置（像素）
-    float2 size;          // 字形尺寸（像素）
-    float4 uv_rect;       // UV 矩形 (u_min, v_min, u_max, v_max)
-    float4 color;         // 字形颜色 RGBA
-    float4 rect_clip;     // x, y, w, h（逻辑像素）；0-size = disabled
-    float skew_x;         // 合成斜体 x 偏移（逻辑像素）
-    float page_index;     // Atlas 页号（CPU 分桶用，shader 不读）
-    float is_color;       // >0.5 = 该字形在 BGRA 彩色页（emoji），采样即最终颜色
-    float shader_snap;    // >0.5 = position 吸附到物理像素；动画文本置 0（连续坐标）
+    float2 position; // glyph bottom-left position (pixels)
+    float2 size; // glyph size (pixels)
+    float4 uv_rect; // UV rect (u_min, v_min, u_max, v_max)
+    float4 color; // glyph color RGBA
+    float4 rect_clip; // x, y, w, h (logical pixels); 0-size = disabled
+    float skew_x; // synthetic italic x offset (logical pixels)
+    float page_index; // atlas page index (CPU bucketing only, shader doesn't read)
+    float is_color; // >0.5 = glyph on BGRA color page (emoji), sample is final color
+    float shader_snap; // >0.5 = position snaps to physical pixel; animated text set 0 (continuous coords)
 };
 
-/// 顶点输出
+/// vertex output
 struct VertexOutput {
     float4 position [[position]];
     float2 uv;
@@ -176,7 +175,7 @@ float clip_alpha_text(float2 screen_pos, float4 rect_clip, constant Uniforms& un
 }
 
 // ============================================================================
-// 顶点着色器
+// Vertex shader
 // ============================================================================
 
 vertex VertexOutput text_vertex_main(
@@ -189,40 +188,41 @@ vertex VertexOutput text_vertex_main(
 
     GlyphInstance inst = instances[instance_id];
 
-    // 四边形顶点位置（相对于字形左下角）
-    // 顶点顺序: 0=左下, 1=右下, 2=左上, 3=右上
-    // 三角形: 0-1-2, 1-3-2
+    // quad vertex positions (relative to glyph bottom-left)
+    // vertex order: 0=bottom-left, 1=bottom-right, 2=top-left, 3=top-right
+    // triangles: 0-1-2, 1-3-2
     float2 corners[4] = {
-        float2(0.0, 0.0),  // 左下
-        float2(1.0, 0.0),  // 右下
-        float2(0.0, 1.0),  // 左上
-        float2(1.0, 1.0)   // 右上
+        float2(0.0, 0.0), // bottom-left
+        float2(1.0, 0.0), // bottom-right
+        float2(0.0, 1.0), // top-left
+        float2(1.0, 1.0) // top-right
     };
 
     uint indices[6] = {0, 1, 2, 1, 3, 2};
     uint corner_index = indices[vertex_id];
     float2 corner = corners[corner_index];
 
-    // 计算像素位置（逻辑像素 -> 物理像素）
-    // shader_snap>0.5 时吸附到物理像素（静态/surface 内文本；CPU 已按同规则吸附，
-    // 此处幂等）。动画文本 (direct_animated) 传 0：保持连续浮点坐标，逐 glyph
-    // round 会让相邻字形在不同帧跨越取整阈值，产生字距/基线跳动。
+    // compute pixel position (logical -> physical pixel)
+    // shader_snap>0.5 snaps to physical pixel (static/in-surface text; CPU already snapped per same
+    // rule, idempotent here). animated text (direct_animated) set 0: keep continuous float coords,
+    // per-glyph rounding lets adjacent glyphs cross rounding threshold on different frames,
+    // producing kerning/baseline jitter.
     float s = uniforms.scale_factor;
     float2 scaled_pos = inst.position * s;
     float2 base_pos = (inst.shader_snap > 0.5) ? round(scaled_pos) : scaled_pos;
     float2 pixel_pos = base_pos + corner * inst.size * s;
 
-    // 合成斜体：顶部向右偏移，底部不动
-    // 屏幕坐标系 Y 向下：corner.y=0 是顶部，corner.y=1 是底部
+    // synthetic italic: top offset right, bottom fixed
+    // screen coords Y-down: corner.y=0 is top, corner.y=1 is bottom
     pixel_pos.x += (1.0 - corner.y) * inst.skew_x * s;
 
-    // 转换到 NDC（-1 到 1）
+    // convert to NDC (-1 to 1)
     float2 ndc = (pixel_pos / uniforms.viewport_size) * 2.0 - 1.0;
-    ndc.y = -ndc.y;  // Metal Y 轴向下
+    ndc.y = -ndc.y; // Metal Y-axis down
 
     out.position = float4(ndc, 0.0, 1.0);
 
-    // 计算 UV
+    // compute UV
     out.uv = mix(inst.uv_rect.xy, inst.uv_rect.zw, corner);
     out.screen_pos = pixel_pos;
     out.rect_clip = inst.rect_clip;
@@ -233,7 +233,7 @@ vertex VertexOutput text_vertex_main(
 }
 
 // ============================================================================
-// 片段着色器
+// Fragment shader
 // ============================================================================
 
 fragment float4 text_fragment_main(
@@ -249,30 +249,31 @@ fragment float4 text_fragment_main(
 
     float4 result;
     if (inst.is_color > 0.5) {
-        // 彩色字形（emoji）：BGRA 页里存的已经是 premultiplied 的最终颜色。
-        // **不能**乘 inst.color —— emoji 自带颜色，乘上文字色会把它重新染成
-        // 单色，等于白做。这里只叠 clip alpha 与整体不透明度。
+        // color glyphs (emoji): BGRA page already stores premultiplied final color. **must not**
+        // multiply by inst.color -- emoji has its own color, multiplying by text color would
+        // recolor to monochrome, wasted. here only apply clip alpha and overall opacity.
         const float4 texel = glyph_atlas_color.sample(atlas_sampler, in.uv);
         const float a = clip_a * inst.color.a;
-        result = texel * a;  // texel 已预乘，整体再缩放保持预乘不变式
+        result = texel * a; // texel premultiplied, scale globally preserves premultiplied invariant
         if (result.a < 0.001) {
             discard_fragment();
         }
         return result;
     }
 
-    // 灰度字形：单通道当覆盖率，乘文字颜色（原逻辑，一字未改）
+    // grayscale glyphs: single channel as coverage, multiply by text color (original logic,
+    // unchanged)
     float alpha = glyph_atlas.sample(atlas_sampler, in.uv).r;
 
     result = inst.color;
     result.a *= alpha * clip_a;
 
-    // 丢弃完全透明的像素
+    // discard fully transparent pixels
     if (result.a < 0.001) {
         discard_fragment();
     }
 
-    // 输出预乘 alpha，匹配 premultiplied blend state
+    // output premultiplied alpha, matches premultiplied blend state
     result.rgb *= result.a;
     return result;
 }

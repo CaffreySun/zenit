@@ -112,6 +112,22 @@ Pointer, text, IME, scroll, and drag Harness commands automatically update the
 rendered virtual cursor. Its arrow, pointing-hand, I-beam, pressed, and grabbing
 states therefore appear in the video without capturing the physical cursor.
 
+## Paint invariant
+
+In test mode every rendered frame is checked for one node emitting an identical
+filled or stroked rectangle twice (same geometry, colour, radius, shape and
+stroke width). That is the
+signature of a cache-replay path emitting a node's own content a second time:
+the extra copy usually lands after the children, so an opaque background covers
+them and a translucent one darkens them, for a single frame that screenshot
+comparisons do not catch. `/stats` reports the running total as
+`paint_duplicate_fills` and the most recent offender as `paint_duplicate_node`;
+the storybook suite asserts the total stays 0 after visiting every story, and
+the `paintreplay` story reproduces the conditions (an `overflow_hidden`
+container with a background and children, outside any scroll area, whose
+siblings change). To find the frame and node, rerun with
+`ZENIT_DEBUG_CMDSTREAM=1`.
+
 ## Runtime integration
 
 Applications using `App.runWith` need no application-code changes. A custom

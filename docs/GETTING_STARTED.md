@@ -20,7 +20,9 @@ myapp/
 ├── build.zig          # uses zenit.attach()
 ├── build.zig.zon      # declares zenit dep
 ├── e2e/record-demo.ts # optional Harness recording example
-└── src/main.zig       # counter app
+└── src/
+    ├── main.zig      # counter app
+    └── styles.zig    # token-based css objects
 ```
 
 After copying, adjust the `.path` in `build.zig.zon` to wherever your zenit
@@ -52,7 +54,7 @@ In `build.zig.zon`:
 
 zenit's root `build.zig` is a public build API: once `.zenit` is declared in
 your `build.zig.zon`, `const zenit = @import("zenit");` works at the top of
-your `build.zig` (Zig 0.15.2), and a single `zenit.attach(zenit_dep, exe)`
+your `build.zig` (Zig 0.17.0), and a single `zenit.attach(zenit_dep, exe)`
 call wires everything: the `ui` / `zenit_app` module imports, the five macOS
 native ObjC bridges, and the system frameworks:
 
@@ -105,31 +107,34 @@ virtual cursor, screenshot, and application-surface recording examples.
 
 ## 4. Application code
 
-Two `@import` lines and a `mountUI` callback:
+Two `@import` lines and a `mountUI` callback. The UI is one declarative tree
+built with `ui.view` (the recommended application API; reference in
+[`VIEW_DSL.md`](VIEW_DSL.md)):
 
 ```zig
 const std = @import("std");
 const ui = @import("ui");
 const App = @import("zenit_app").App;
 
+const v = ui.view;
+
+const S = struct {
+    const root = ui.css(.{ .width = .fill, .height = .fill, .align_items = .center, .justify = .center });
+    const title = ui.css(.{ .font_size = .xxxl, .color = .fg_primary });
+};
+
 fn mountUI(cx: *ui.Cx, scope: *ui.Scope) anyerror!*ui.Node {
-    const root = try ui.box(cx, .{
-        .width = .{ .grow = .{} }, .height = .{ .grow = .{} },
-        .align_items = .center, .justify = .center,
-    }, .{});
-
-    try root.appendChild(cx.allocator, try ui.text(cx, "Hello, zenit!", .{
-        .font_size = 24,
+    return v.render(scope, cx, v.col(.{ .style = S.root }, .{
+        v.text(.{ .style = S.title }, "Hello, zenit!"),
     }));
-
-    return root;
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+pub fn main(init: std.process.Init) !void {
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
 
     const app = try App.init(gpa.allocator(), .{
+        .io = init.io,
         .window = .{ .width = 640, .height = 480, .title = "myapp" },
     });
     defer app.deinit();
@@ -147,39 +152,59 @@ pub fn main() !void {
 You only ever write `mountUI`. Anything imperative (cursor, focus, drawing,
 GPU surface configuration, font fallback) is internalized.
 
+Keep named `ui.css` objects in `styles.zig`; tokens resolve against the application theme.
+Use `ui.cva` for finite states and `ui.sva` when several slots share variants. Pass them
+as `.style = S.Card.of(.{ .selected = signal })`. Continuous calculations can use
+`v.styleBy(signal, S.sized)` or theme-aware functions. See [STYLING.md](STYLING.md).
+
+Inline sizes accept numbers, `.fill`, `.fit`, and size tokens; use a typed `ui.Sizing`
+value for other sizing forms. Base and semantic materials share `ui.theme.refs`,
+usually aliased to `TOKENS`; resolved function values live under `t.tokens.*`.
+
 ## 5. State and event handlers
 
-The recommended path uses `cx.bindState` + `cx.on`, with no manual state ids:
+State is a `Signal` created through the scope; handlers write it directly with
+`ui.on`, so there is no handler struct to declare:
 
 ```zig
-const Counter = struct {
-    n: u32 = 0,
-    label: ?*ui.Node = null,
-    buf: [32]u8 = undefined,
-
-    pub fn increment(self: *Counter) void {
-        self.n += 1;
-        const node = self.label orelse return;
-        const content = std.fmt.bufPrint(&self.buf, "Clicked {d} times", .{self.n}) catch return;
-        if (node.getText()) |old| {
-            var t = old;
-            t.content = content;
-            node.setText(t);
-        }
-        node.markRenderDirty();
-    }
-};
+fn inc(n: u32) u32 {
+    return n + 1;
+}
 
 fn mountUI(cx: *ui.Cx, scope: *ui.Scope) anyerror!*ui.Node {
-    const counter = try cx.bindState(Counter, .{});
-    const click = cx.on(Counter, counter, Counter.increment);
-    // ... use `click` as `on_click` on a Button ...
+    const count = try scope.createSignal(u32, 0);
+    const open = try scope.createSignal(bool, false);
+
+    return v.render(scope, cx, v.col(.{}, .{
+        ui.widgets.Button(.{ .label = "+1", .on_click = ui.on.update(count, inc) }),
+        ui.widgets.Button(.{ .label = "Reset", .on_click = ui.on.set(count, 0) }),
+        ui.widgets.Button(.{ .label = "Details", .on_click = ui.on.toggle(open) }),
+        v.text(.{}, v.fmt("Clicked {d} times", .{count})),
+        v.show(open, .{v.text(.{}, "Details go here")}),
+    }));
 }
 ```
 
-`cx.bindState(T, init)` allocates a stable `*T`. The returned pointer survives
-across frames; pass it to `cx.on(T, ptr, T.method)` to get a typed click
-handler.
+| Combinator | Effect | Allocates |
+|---|---|---|
+| `ui.on.set(sig, value)` | set to a compile-time value | no |
+| `ui.on.toggle(sig)` | flip a bool | no |
+| `ui.on.update(sig, f)` | `sig = f(sig)` | no |
+| `ui.on.assign(sig)` | write a value event (`on_change`) into the signal | no |
+| `ui.on.call(state, method)` | call `method(state)` / `method(state, value)` | no |
+| `ui.on.bind(scope, ctx, f)` | capture runtime values (a row id…) | once, freed with the scope |
+
+When several handlers share state, put it in a struct and use `ui.on.call`.
+`cx.bindState(T, init)` allocates a stable `*T` for that:
+
+```zig
+const Editor = struct {
+    text: *ui.Signal([]const u8),
+    fn save(self: *Editor) void { ... }
+};
+const editor = try cx.bindState(Editor, .{ .text = try scope.createText("", .{}) });
+// ... W.Button(.{ .label = "Save", .on_click = ui.on.call(editor, Editor.save) })
+```
 
 **Lifetime caveat**: the framework frees the `T` allocation itself, but it does
 **not** call `T.deinit()`. If your state owns heap resources (ArrayList,
@@ -194,46 +219,31 @@ const canvas = try cx.bindState(Canvas, .{});
 try scope.onCleanup(Canvas, canvas, Canvas.deinit); // ← without this, `items` leaks
 ```
 
-If your app needs to look up state by a stable identifier across mount cycles
-(e.g. routing, hot-reload), use the lower-level `cx.state(T, id, init)` API,
-which is the explicit form `bindState` builds on top of.
-
 ## 6. Reactive state (Signal / Memo / Effect)
 
-For UI that derives from a value, use the reactive primitives instead of
-manual `markRenderDirty`:
+Derived values are memos or inline derivations; the view binds to them:
 
 ```zig
 const count = try scope.createSignal(u32, 0);
 const doubled = try scope.createMemo(u32, .{ .count = count }, struct {
     fn compute(ctx: anytype) u32 { return ctx.count.get() * 2; }
 }.compute);
+const even = ui.map(count, isEven); // inline, allocation-free derivation
 
-// `textFmt` binds the signals directly: the node re-renders itself whenever
-// any signal it reads changes. No manual effect, buffer or dirty-marking.
-try root.appendChild(allocator, try ui.textFmt(
-    cx, scope, "count = {d}", .{count}, .{},
-));
-try root.appendChild(allocator, try ui.textFmt(
-    cx, scope, "doubled = {d}", .{doubled}, .{},
-));
+return v.render(scope, cx, v.col(.{}, .{
+    v.text(.{}, v.fmt("count = {d}", .{count})),
+    v.text(.{}, v.fmt("doubled = {d}", .{doubled})),
+    v.box(.{ .style = S.Badge.of(.{ .even = even }) }, .{"parity"}),
+}));
 ```
 
-Whenever `count.set(...)` runs, the bound text updates automatically. This is
-the pattern in [`examples/counter_reactive/`](../examples/counter_reactive/).
+Whenever `count.set(...)` runs, the bound text and the conditional style update
+automatically. This is the pattern in
+[`examples/counter_reactive/`](../examples/counter_reactive/).
 
-If you do need to drive a node imperatively, use the text accessors rather
-than touching fields: `Node` exposes `getText()` / `setText()` /
-`setTextContent()`, not a public `text` field:
-
-```zig
-try label.setTextContent(allocator, "count = 1");
-```
-
-Both setters schedule repaint automatically. Changes to text or font metrics also
-remeasure the node and its parent layout; color-only changes only repaint. When
-using borrowed content or spans, call `setText()` after mutating their bytes.
-Repeated writes with the same content and properties do not schedule more work.
+Lists use `v.each(items_signal, .id, row)`: rows are keyed, so changing the
+slice only creates and destroys the rows whose key changed, and the list stays
+where it is written in the tree even when siblings toggle.
 
 ## 7. Bundling (.app on macOS)
 
@@ -264,8 +274,7 @@ the fastest way to see why. One line in your `mountUI` turns it on:
 
 ```zig
 fn mountUI(cx: *ui.Cx, scope: *ui.Scope) anyerror!*ui.Node {
-    const root = try ui.box(cx, .{ ... }, .{});
-    // ... build your tree ...
+    const root = try v.render(scope, cx, v.col(.{ .style = S.root }, .{ ... }));
 
     // Optional, dev only: dashed-rect hover highlighting + dimension label.
     _ = try ui.devtools.overlay.attach(cx, scope, root, .{});
@@ -332,10 +341,10 @@ Each of the four examples is wired in `build.zig` with **only** `ui` and
 
 | Symptom | Likely cause / fix |
 |---|---|
-| `zig version too old` | zenit needs `0.15.2`; check `build.zig.zon`. |
+| `zig version too old` | zenit needs `0.17.0`; check `build.zig.zon`. |
 | `framework not found: Cocoa` | Install Xcode Command Line Tools (`xcode-select --install`). |
 | `error: import of file outside module path` running `zig test` on a single file | zenit modules use relative `@import("../X.zig")` paths. Run tests via `zig build test-ui` (or whichever step), not standalone `zig test`. |
-| `@import("zenit")` fails in your `build.zig` | Works on Zig 0.15.2, but only when `.zenit` is declared in your `build.zig.zon` dependencies. Check the dep is named exactly `zenit` and the `.path`/`.url` resolves. See [`templates/minimal-app/build.zig`](../templates/minimal-app/build.zig). |
+| `@import("zenit")` fails in your `build.zig` | Works on Zig 0.17.0, but only when `.zenit` is declared in your `build.zig.zon` dependencies. Check the dep is named exactly `zenit` and the `.path`/`.url` resolves. See [`templates/minimal-app/build.zig`](../templates/minimal-app/build.zig). |
 | `error: expected path relative to build root; found absolute path` | `.path` in `build.zig.zon` must be relative to that file. Convert your absolute path. |
 | `invalid fingerprint: 0x0` | Replace the placeholder with a unique value. Easiest: delete the `.fingerprint` line, run `zig build` once. Zig prints the value to paste back. |
 
@@ -354,7 +363,9 @@ Each of the four examples is wired in `build.zig` with **only** `ui` and
 
 | Symptom | Likely cause / fix |
 |---|---|
-| `error: StateNotFound` from `cx.handler(...)` | You used the explicit-id form without a prior `cx.state(T, id, init)`. Prefer `cx.bindState(T, init)` + `cx.on(T, ptr, T.method)`; no id needed. |
+| `error: StateNotFound` from `cx.handler(...)` | You used the explicit-id form without a prior `cx.state(T, id, init)`. Use `ui.on.*` (or `cx.bindState(T, init)` + `ui.on.call(ptr, T.method)`); no id needed. |
+| `type '@Type(.enum_literal)' not a function` in a style | `.fill()` / `.fixed(n)` inside an inline style literal. Move it into a style function or write `.{ .px = n }`. |
+| Text shows garbage after the parent re-renders a `show` / `each` | The element captured a slice that pointed into a stack buffer. Strings in elements must outlive the region (literals, scope-owned data), or use `v.fmt`. |
 | Effect never re-runs after `signal.set(...)` | Effects only track signals **read inside the compute closure** during their first run. Make sure `signal.get()` is on the read path, not stashed in a captured local. |
 | Memo recomputes every frame | Same: the memo's compute fn must read its inputs via `.get()`. If you accidentally captured a value snapshot, dependency tracking can't see the read. |
 

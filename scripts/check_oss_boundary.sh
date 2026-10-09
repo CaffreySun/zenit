@@ -31,20 +31,22 @@ if ! command -v "$ZIG" >/dev/null 2>&1; then
   exit 1
 fi
 
-# Allowed modules that may appear in src/ui/ imports.
-# Anything else is a boundary violation.
-#   root    — Zig standard "root module" reference (build_options, dbg etc.)
-#   ui_core — only used in src/ui/core/tests.zig as the test root module
-# `text` = CoreText/HarfBuzz 塑形桥（src/text/）。build.zig 明确把它注入
-# ui_module（"物理可见 text module，下游 ui_test / bench / app 全 link
-# target 同步注入"），cx.shapeText 依赖它 —— 属于框架自身的分层，不是
-# 越界。此前漏加进 allow-list，导致这条 gate 一直假红。
-# `svg` / `svg_safety` 同理：都是 build.zig 里 b.addModule 出来的一方模块
-# （src/render/svg.zig、src/svg_safety.zig），都在 build.zig.zon 的公开
-# paths 白名单内随包分发，且 audit 2 早就把它们列为 hello_button 的正常
-# 可达模块。cx.registerTextureSvg 走 svg.rasterize，core/svg_path.zig 的
-# path 解析走 svg_safety 的数值/分段安全原语 —— 属于框架自身分层，不是越界。
-ALLOWED_UI_IMPORTS_REGEX='^@import\("(std|builtin|root|ui_core|system_sdk|icon_ir|zenit_icons|zenit_system_icons|text_core|text|trace|i18n|svg|svg_safety)"\)$'
+# Allowed modules that may appear in src/ui/ imports. Anything else is a boundary violation.
+#   root    -- Zig standard 'root module' reference (build_options, dbg etc.)
+#   ui_core -- only used in src/ui/core/tests.zig as the test root module
+# `text` = CoreText/HarfBuzz shaping bridge (src/text/). build.zig injects it into ui_module and
+# cx.shapeText depends on it: the framework's own layering, not a boundary crossing.
+# `svg` / `svg_safety` likewise: both are b.addModule modules in build.zig (src/render/svg.zig,
+# src/svg_safety.zig) on the public paths whitelist in build.zig.zon. cx.registerTextureSvg goes to
+# svg.rasterize and core/svg_path.zig goes to svg_safety safety primitives: framework's own
+# layering.
+# `zenit_style_values` / `zenit_theme_provider`: ui style value types and the theme injection point.
+# The former is a b.addModule module (src/tokens/style_values.zig); the latter is injected by the
+# public build API `wireThemeProvider` (downstream-chosen theme module). Both are the framework's
+# own layering.
+# Zig 0.17 compatibility helpers are framework-owned: field reflection, caller-I/O
+# clocks, native environment access, and the native calendar-time C header.
+ALLOWED_UI_IMPORTS_REGEX='^@import\("(std|builtin|root|ui_core|system_sdk|icon_ir|zenit_icons|zenit_system_icons|text_core|text|trace|i18n|svg|svg_safety|zenit_style_values|zenit_theme_provider|zenit_reflection|zenit_time|zenit_environment|calendar_time)"\)$'
 
 # Forbidden modules — must NEVER appear in `zig build hello-button --verbose -M*`.
 # Categories of out-of-scope code (see docs/UI_OSS_BOUNDARY.md):
@@ -152,11 +154,11 @@ fi
 bold "  hello_button reachable modules:"
 echo "$modules_present" | sed 's/^/    /'
 
-# test_harness 是**故意**接进 app_module 的：runtime.zig 无条件 import 它，
-# 靠 `pub const enabled = build_options.test_mode`（comptime false）让 Zig
-# 整块消除。所以"模块出现在 -M 图里"不等于"代码进了二进制" —— 对它必须
-# 检查链接产物而不是模块图，否则永远假红。其余 forbidden 模块没有这种
-# comptime 消除约定，仍按模块图判定。
+# test_harness intentionally wired into app_module: runtime.zig unconditionally imports it, relies
+# on `pub const enabled = build_options.test_mode` (comptime false) for Zig to eliminate entire
+# block. So 'module appears in -M graph' != 'code enters binary' -- must check link artifacts not
+# module graph, else always false-red. Other forbidden modules lack this comptime-elision
+# convention, still use module graph.
 COMPTIME_ELIDED_MODULES=" test_harness "
 
 forbidden_hits=$(
@@ -182,9 +184,9 @@ else
   failures=$((failures + 1))
 fi
 
-# ── Audit 2b: comptime-elided 模块必须真的不在二进制里 ──
-# 这条比模块图更强：它验证的是"发布产物里没有测试骨架"这个真实契约。
-# The app bundle name is stable, but the executable's name is build-defined.
+# -- Audit 2b: comptime-elided modules must truly not in binary --
+# Stronger than module graph: validates real contract 'release artifacts have no test harness'. The
+# app bundle name is stable, but the executable's name is build-defined.
 if ! find "$audit_dir/install/Hello Button.app/Contents/MacOS" -maxdepth 1 -type f -perm -u+x -print >"$audit_dir/executables" 2>/dev/null; then
   red "  ✗ hello_button artifact directory missing"
   exit 1

@@ -23,6 +23,14 @@ The line is enforced at **build time**: `zig build hello-button` only allows the
 | `icon_ir` | `src/icon_ir.zig` | SVG asset metadata format |
 | `zenit_icons` | build-selected provider module | Full provider catalog (`ui.icons`); Lucide is the public default |
 | `zenit_system_icons` | `src/ui/system_icons_*.zig` | Provider-neutral semantic icons used by framework components |
+| `zenit_reflection` | `src/reflection.zig` | Zig 0.17 compile-time field descriptors |
+| `zenit_time` | `src/time.zig` | Clock measurements using caller-supplied I/O |
+| `zenit_environment` | `src/environment.zig` | Native process diagnostic flags |
+| `calendar_time` | `native/c_headers/calendar_time.h` | Native calendar-time declarations |
+
+Development tools such as YIX and the vendored ZLS live outside this GUI dependency
+boundary. They have explicit build/test targets; ordinary GUI applications do not
+compile or link the language servers. See `docs/ZIG_0_17_COMPAT.md` for the public profile.
 
 ## What's OUT
 

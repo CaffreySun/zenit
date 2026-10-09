@@ -1,21 +1,21 @@
-/// AppRenderer - 顶层渲染协调器
+/// AppRenderer: top-level render coordinator
 ///
-/// 封装完整的 UI -> 屏幕管线:
-///   1. cx.layout()，计算布局
-///   2. cx.render(), paint pass，填 cx.display_list
-///   3. encoder.encodeDisplay(cx)，编码到 sdf/text/image renderer
-///   4. flush(render_pass)，提交 GPU
-///   5. surface.present()，显示帧
+/// Encapsulates full UI -> screen pipeline:
+///   1. cx.layout() - compute layout
+///   2. cx.render(), paint pass - fill cx.display_list
+///   3. encoder.encodeDisplay(cx) - encode to sdf/text/image renderer
+///   4. flush(render_pass) - submit GPU
+///   5. surface.present() - present frame
 ///
-/// 用法:
+/// Usage:
 /// ```
 /// var app_renderer = try AppRenderer.init(allocator, &device, &queue, &surface, &window);
 /// defer app_renderer.deinit();
 ///
-/// // 设置字体
+/// // Font setup
 /// app_renderer.setFonts(&font_selector);
 ///
-/// // 渲染循环
+/// // Render loop
 /// while (window.pollEvents()) {
 ///     try app_renderer.frame(cx, viewport_w, viewport_h, scale);
 /// }
@@ -24,6 +24,7 @@ const std = @import("std");
 const gpu = @import("gpu");
 const render = @import("render");
 const render_pacing = @import("render_pacing.zig");
+const frame_testing_enabled = @import("builtin").is_test or @import("build_options").test_mode;
 const SdfRenderer = render.SdfRenderer;
 const ImageRenderer = render.ImageRenderer;
 const IconRenderer = render.IconRenderer;
@@ -31,6 +32,12 @@ const TextRenderer = render.TextRenderer;
 const RenderCommandEncoder = render.RenderCommandEncoder;
 const FontSelector = render.FontSelector;
 const TextFontProps = render.TextFontProps;
+
+// Metal-only, opt-in evidence. Null-backend builds prune every call, and
+// disabled tracing does not sample clocks or register completion handlers.
+extern fn metal_glass_clock_trace_enabled() bool;
+extern fn metal_glass_clock_trace_host_time() f64;
+extern fn metal_glass_clock_trace_frame(buffer: *anyopaque, drawable: *anyopaque, frame: u64, sample_host_time: f64, sample_frame_time_ms: f64, sample_frame_dt_ms: f64) void;
 
 /// Stable FontSelector -> TextRenderer bridge.
 ///
@@ -63,136 +70,169 @@ fn measureWidthAsDrawn(ctx: *anyopaque, text: []const u8, font: *render.Font, pr
 /// instance storage. Dropping this below 3 made frame pacing depend too much
 /// on CAMetalLayer drawable availability and pushed jitter into acquireTexture.
 const FRAME_BUFFER_COUNT = render_pacing.frames_in_flight;
-/// 帧性能统计，每帧自动收集，通过 getLastFrameStats() 暴露给 DevTools
+/// Frame performance stats, auto-collected each frame, exposed to DevTools via getLastFrameStats().
 pub const FrameStats = struct {
-    /// 布局计算耗时（微秒）
+    /// Layout compute time (microseconds).
     layout_us: u64 = 0,
-    /// 渲染命令生成耗时（微秒）
+    /// Render command generation time (microseconds).
     render_gen_us: u64 = 0,
-    /// GPU 编码 + 提交耗时（微秒）
+    /// GPU encode + submit time (microseconds).
     gpu_encode_us: u64 = 0,
-    /// 等待上一帧 GPU 完成/下一帧配额的耗时（微秒）
+    /// Time waiting for previous frame GPU completion / next frame quota (microseconds).
     wait_for_frame_us: u64 = 0,
-    /// 获取 drawable / surface texture 的耗时（微秒）
+    /// Time acquiring drawable / surface texture (microseconds).
     acquire_texture_us: u64 = 0,
-    /// 纯 CPU 管线耗时（layout + render + encode + flush，不含 wait/acquire）
+    /// Pure CPU pipeline time (layout + render + encode + flush, excludes wait/acquire).
     cpu_frame_us: u64 = 0,
-    /// **真 GPU 执行时间**（微秒），取自 backend command-buffer timestamp
-    /// interval。区别于 gpu_encode_us（那是 CPU 侧编码+提交
-    /// 的墙钟，混入 wait/acquire）。
-    /// 时序说明：GPU 时间戳只有在 command buffer **完成之后**才有效，
-    /// 而本帧的 buffer 刚提交，故这里报告的是**上一帧**的 GPU 时间,
-    /// 稳态下这正是想要的量级信息；0 表示尚未有已完成的帧。
+    /// **True GPU execution time** (microseconds), from backend command-buffer timestamp interval.
+    /// Differs from gpu_encode_us (CPU-side encode + submit wall-clock, includes wait/acquire).
+    /// GPU timestamps are valid only **after** the command buffer completes; this frame's buffer
+    /// was just submitted, so this reports the **previous frame's** GPU time. 0 = no completed
+    /// frame yet.
     gpu_execute_us: u64 = 0,
-    /// 编码耗时（encodeDisplay，微秒）
+    /// Encode time (encodeDisplay, microseconds).
     encode_us: u64 = 0,
-    /// flush + end render pass 耗时（微秒）
+    /// Flush + end render pass time (microseconds).
     flush_us: u64 = 0,
-    /// path 管线本帧实际发出的 GPU draw 数（合批后）
+    /// Glass (backdrop blur / Liquid Glass) nodes processed and their CPU time.
+    glass_count: u32 = 0,
+    glass_us: u64 = 0,
+    /// Offscreen textures created this frame (steady state: 0).
+    texture_creates: u32 = 0,
+    /// Backend render/blit passes recorded and the native begin/end CPU time
+    /// (D3D12 only; 0 elsewhere).
+    render_passes: u32 = 0,
+    blit_passes: u32 = 0,
+    pass_native_us: u64 = 0,
+    /// Path pipeline GPU draws actually issued this frame (post-batch).
     path_draw_calls: u32 = 0,
-    /// GPU retained 合成：本帧整层缓存命中 / 重画 / damage-rect 部分重画次数
+    /// GPU retained composite: whole-layer cache hit / redraw / damage-rect partial redraw this
+    /// frame.
     retained_hits: u32 = 0,
     retained_misses: u32 = 0,
     retained_partial_repaints: u32 = 0,
-    /// icon 管线本帧 GPU draw 数
+    /// Icon pipeline GPU draws this frame.
     icon_draw_calls: u32 = 0,
-    /// image 管线本帧 GPU draw 数（连续同纹理合批后）
+    /// Image pipeline GPU draws (after batching consecutive same-texture).
     image_draw_calls: u32 = 0,
-    /// image 管线本帧实例数
+    /// Image pipeline instance count this frame.
     image_instances: u32 = 0,
-    /// image 管线本帧纹理绑定切换次数，图片密集画布的真实瓶颈指标
+    /// Image pipeline texture binding switches this frame, real bottleneck metric for dense image
+    /// canvas.
     texture_binds: u32 = 0,
-    /// SDF 管线本帧 GPU draw 数
+    /// SDF pipeline GPU draws this frame.
     sdf_draw_calls: u32 = 0,
-    /// text 管线本帧 GPU draw 数
+    /// Text pipeline GPU draws this frame.
     text_draw_calls: u32 = 0,
-    /// 本帧实际发出的 GPU draw call 总数（sdf + text + path + icon + image 累加）
+    /// Total GPU draw calls issued this frame (sdf + text + path + icon + image sum).
     draw_calls: u32 = 0,
-    /// SDF 实例数
+    /// SDF instance count.
     sdf_instances: u32 = 0,
-    /// 文本字形实例数
+    /// Text glyph instance count.
     text_instances: u32 = 0,
-    /// 渲染命令总数
+    /// Total render commands.
     command_count: u32 = 0,
-    /// 帧总耗时（微秒）
+    /// Total frame time (microseconds).
     total_frame_us: u64 = 0,
 };
 
-/// 跨帧计时采样环（P95 门禁用）。实现与单测在 timing_ring.zig,
-/// 那里不依赖 Metal/ObjC 桥，才能被 `zig build test` 真正覆盖。
+/// Cross-frame timing sample ring (P95 gate use). Implementation and test in timing_ring.zig,
+/// independent of Metal/ObjC bridge so `zig build test` truly covers it.
 pub const TimingRing = @import("timing_ring.zig").TimingRing;
 
-/// 帧清除颜色
+/// Frame clear color. Window clear in **sRGB-encoded values** (0..1, same units as Color
+/// bytes/255).
+/// Render target is non-_sRGB format (docs/SRGB_BLENDING_PLAN.md), clear value written as-is.
+/// Before 2026-10 interpreted as linear; old default 0.08/0.08/0.10 (linear) ≈ encoded
+/// 0.313/0.313/0.349.
 pub const ClearColor = struct {
-    r: f32 = 0.08,
-    g: f32 = 0.08,
-    b: f32 = 0.10,
+    r: f32 = 0.313,
+    g: f32 = 0.313,
+    b: f32 = 0.349,
     a: f32 = 1.0,
 };
 
-/// AppRenderer 配置
+/// AppRenderer config.
 pub const Config = struct {
+    visual_quality: render.visual_quality.Quality = .auto,
     clear_color: ClearColor = .{},
     /// Optional eager glyph upload; draw encoding still resolves missing glyphs.
     prewarm_text: bool = true,
 };
 
 pub const RecordingFrameFn = *const fn (texture: *const gpu.Backend.Texture) bool;
+pub const RecordingFrameContextFn = *const fn (?*anyopaque, *const gpu.Backend.Texture) bool;
 
-/// AppRenderer - 封装完整渲染管线
+/// AppRenderer - encapsulate complete render pipeline.
 pub const AppRenderer = struct {
     allocator: std.mem.Allocator,
 
-    // GPU 基础设施 (借用，不拥有)
+    // GPU infrastructure (borrowed, not owned).
     device: *gpu.Backend.Device,
     queue: *gpu.Backend.Queue,
     surface: *gpu.Backend.Surface,
 
-    // 渲染器 (拥有)
+    // Renderers (owned).
     sdf_renderer: SdfRenderer,
     image_renderer: ImageRenderer,
     icon_renderer: IconRenderer,
     text_renderer: TextRenderer,
 
-    // 字体（借用，不拥有）
+    // Fonts (borrowed, not owned).
     fonts: ?*FontSelector = null,
 
-    // 配置
+    // Config.
     config: Config,
+    io: std.Io,
+    visual_quality: render.visual_quality.Quality = .full,
 
-    // 帧统计
+    // Frame stats.
     frame_count: u64 = 0,
-    /// 累计 retained 计数（跨帧单调递增；/stats 用，per-frame 值会被后续
-    /// settle/idle 帧覆盖，e2e 断言需要累计量）
+    fail_after_encode_for_testing: if (frame_testing_enabled) bool else void = if (frame_testing_enabled) false else {},
+    /// Opt-in desktop audit identity stamp, never enabled for normal rendering.
+    desktop_capture_stamp: bool = false,
+    /// Cumulative retained count (monotonic cross-frame; /stats use, per-frame overwritten by later
+    /// settle/idle frames; e2e assertions need cumulative).
     total_retained_hits: u64 = 0,
     total_retained_misses: u64 = 0,
     total_retained_partial_repaints: u64 = 0,
-    /// backdrop 亮度自适应：上一帧玻璃 backdrop 的平均 luminance（linear 0~1）
+    /// Backdrop luminance adaptation: last frame glass backdrop avg luminance (linear 0~1).
     backdrop_luminance: ?f32 = null,
-    /// 上一帧性能统计
+    /// Last frame performance stats.
     last_frame_stats: FrameStats = .{},
-    /// 跨帧计时采样环（P95 门禁用）。`last_frame_stats` 只是单帧快照，
-    /// 而单帧计时噪声极大，e2e 想要的是"最近 N 帧的 P95"这种抗噪统计量。
+    /// Cross-frame timing sample ring (P95 gate use). `last_frame_stats` single-frame snapshot;
+    /// single-frame timing very noisy. e2e needs "P95 over last N frames" robust aggregate.
     timing_ring: TimingRing = .{},
-    /// 上一**渲染**帧的起始时刻（idle 跳帧不更新），DevTools FPS 的帧间隔
-    /// 采样基准。用 renderer 自己的墙钟而非 cx.frame_dt_seconds：后者被钳到
-    /// 0.1s，区分不出「100ms 卡帧」和「idle 停帧 5s 后恢复」。
-    prev_frame_start: ?std.time.Instant = null,
+    /// Only resolved command-buffer timestamp intervals; no missing-sample zeros.
+    gpu_timing_ring: TimingRing = .{},
+    /// Last **render** frame start time (idle skip doesn't update), DevTools FPS frame-interval
+    /// baseline.
+    /// Use renderer's own wall-clock not cx.frame_dt_seconds: latter 1s capped and idle wake first
+    /// frame
+    /// nominal, not render interval.
+    prev_frame_start: ?@import("zenit_time").Instant = null,
 
-    // GPU 帧同步，防止 CPU 覆盖 GPU 正在读取的 triple buffer
-    // 平台抽象：Metal 用 dispatch_semaphore，未来 Vulkan 用 VkFence
+    // GPU frame sync, prevent CPU overwrite triple buffer GPU is reading. Platform abstraction:
+    // Metal uses dispatch_semaphore, future Vulkan uses VkFence.
     frame_sync: gpu.Backend.FrameSync,
 
-    // 离屏纹理池 + 帧计数，必须活在 AppRenderer（跨帧持久）。encoder 是逐帧
-    // 局部值：池若内嵌其中，每帧 deinit 整池释放，跨帧纹理复用从未发生；
-    // frame_index 每帧从 0 重来，池的 REUSE_LAG_FRAMES in-flight 保护同样失效。
+    // Offscreen texture pool + frame counter must live in AppRenderer (persistent cross-frame).
+    // encoder per-frame local: pool embedded there would deinit whole pool each frame, cross-frame
+    // texture reuse never happens; frame_index resets 0 each frame, pool's REUSE_LAG_FRAMES
+    // in-flight
+    // protection fails.
     offscreen_pool: render.OffscreenTexturePool = .{},
-    /// 跨帧持久的 path/blur/glass GPU 资源（PSO、buffer、sampler、tessellator）。
-    /// 与 offscreen_pool 同理必须活在 AppRenderer，内嵌进逐帧 encoder 会每帧
-    /// 重新 runtime 编译 MSL，连续 path/blur 动画每帧抖动（审查报告 P1）。
+    /// Persistent path/blur/glass GPU resources (PSO, buffer, sampler, tessellator). Same reason as
+    /// offscreen_pool must be in AppRenderer: embedded in per-frame encoder re-compiles MSL runtime
+    /// each
+    /// frame, continuous path/blur animation jitters (audit P1).
     persistent_gpu: render.PersistentGpuCache = .{},
     frame_counter: u64 = 0,
-    /// icon 管线 draw 计数是模块级累计值；存上帧总量以取每帧增量
+    /// Public encoders can submit outside our FrameSync. Once one escapes,
+    /// keep the pool's conservative frame quarantine for this renderer.
+    has_external_encoder: bool = false,
+    /// Icon pipeline draw count module-level cumulative; store last frame total for per-frame
+    /// delta.
     prev_icon_draw_calls_total: u64 = 0,
     prev_image_draw_calls_total: u64 = 0,
     prev_sdf_draw_calls_total: u64 = 0,
@@ -200,40 +240,67 @@ pub const AppRenderer = struct {
     prev_image_instances_total: u64 = 0,
     prev_texture_binds_total: u64 = 0,
 
-    /// 上一帧已提交的 command buffer（仅用于**下一帧**读取其 GPU 时间戳,
-    /// GPUStartTime/GPUEndTime 必须在 buffer 完成后才有效）。
-    /// 包装器持有额外引用，随下一帧读完即释放；上层不观察 native handle。
+    /// Last frame submitted command buffer (used only **next frame** to read its GPU timestamps;
+    /// GPUStartTime/GPUEndTime valid only after buffer complete). Wrapper holds extra ref, released
+    /// after
+    /// next frame reads; upper layer doesn't observe native handle.
     prev_frame_cmd_buffer: ?gpu.Backend.CommandBuffer = null,
+    /// Submitted frames whose GPU timestamps are not resolved yet, oldest
+    /// first. With frames in flight the previous frame is usually still on the
+    /// GPU right after this one is submitted; harvesting only it (as before)
+    /// read a timestamp only while the GPU was idle (a handful at startup).
+    gpu_timing_pending: [4]?gpu.Backend.CommandBuffer = @splat(null),
+    /// In-flight batch per-glass luminance readback: command buffer that wrote staging (extra
+    /// retain).
+    /// Until the batch read is done, the encode side stops writing staging
+    /// (persistent_gpu.luminance_locked); poll waits only for this frame to complete. Waiting on
+    /// "last frame" is wrong: with CVDisplayLink continuous output the last frame is always still
+    /// on the GPU at new-frame start, so readout would stall for the entire animation.
+    lum_batch_cmd_buffer: ?gpu.Backend.CommandBuffer = null,
 
-    // ── e2e:上一次**真实呈现**帧的保留拷贝 ──────────────────────────
-    // /screenshot 曾经"驱动一帧新渲染再 readback"，新帧会把 pending 的
-    // 布局/标脏顺带跑完,截到的画面比屏幕上的新。呈现层 bug(Layers 残影)
-    // 期间:屏幕满是残影、截图完全干净,e2e 全绿,误判持续了三天。
-    // 修法:每帧 present 前把 drawable blit 到保留纹理;截图直接读它,
-    // 不再驱动帧。仅 harness 模式开启(blit 每帧 ~0.1ms GPU,不进 CPU 帧预算)。
+    // -- e2e: retained copy of last **truly presented** frame --
+    // /screenshot used to "drive new render then readback"; the new frame carries pending
+    // layout/dirty, so the screenshot is newer than what is on screen and can hide on-screen
+    // artifacts (e.g. layer ghosts). Instead, blit the drawable to a retained texture before each
+    // present; screenshot reads it and does not drive a frame. Harness mode only (blit ~0.1ms
+    // GPU/frame, not in CPU budget).
     retain_present_copy: bool = false,
+    retained_enabled: bool = true,
+    frame_damage: render.FrameDamage = .{},
+    frame_partial_count: u64 = 0,
+    frame_reuse_count: u64 = 0,
+    background_damage: render.FrameDamage = .{},
+    background_tex: ?gpu.Backend.Texture = null,
+    background_valid: bool = false,
+    background_reuse_count: u64 = 0,
+    background_partial_count: u64 = 0,
     retained_tex: ?gpu.Backend.Texture = null,
     retained_w: u32 = 0,
     retained_h: u32 = 0,
     retained_valid: bool = false,
 
-    // E2E 截图请求，由 test harness 的 screenshot callback 设置（test-mode）。
-    // 实际像素读取在 frame() 内 present 前做（drawable 仍有效 + GPU 已完成）。
-    // 单帧只服务一次请求；读完即清空。容量 512 与 RPC payload 路径上限一致。
+    // E2E screenshot request, set by test harness screenshot callback (test-mode). Actual pixel
+    // read
+    // happens inside frame() before present (drawable valid + GPU done). One request per frame;
+    // cleared
+    // after read. Capacity 512 matches RPC payload limit.
     pending_screenshot_path: ?[512]u8 = null,
     pending_screenshot_len: usize = 0,
     last_screenshot_ok: bool = false,
 
-    // Harness video recording. The callback receives a completed drawable and
-    // immediately GPU-blits it into the platform encoder's pixel-buffer pool.
+    // Window-content recording. Context callbacks receive a submitted drawable
+    // and order their copy on the renderer queue; legacy callbacks wait below.
     recording_active: bool = false,
     recording_frame_fn: ?RecordingFrameFn = null,
+    recording_context_fn: ?RecordingFrameContextFn = null,
+    recording_context: ?*anyopaque = null,
 
-    /// 初始化 AppRenderer
+    /// Initialize AppRenderer.
     ///
-    /// 创建 sdf/image/text renderer，封装渲染管线。
+    /// Create sdf/image/text renderer, encapsulate pipeline.
     pub fn init(
         allocator: std.mem.Allocator,
+        io: std.Io,
         device: *gpu.Backend.Device,
         queue: *gpu.Backend.Queue,
         surface: *gpu.Backend.Surface,
@@ -251,8 +318,27 @@ pub const AppRenderer = struct {
         var text_renderer = try TextRenderer.init(allocator, device);
         errdefer text_renderer.deinit();
 
+        var requested = config.visual_quality;
+        if (comptime gpu.backend_kind == .d3d12) {
+            if (@import("zenit_environment").getOwned(allocator, "ZENIT_VISUAL_QUALITY") catch null) |value| {
+                defer allocator.free(value);
+                requested = try render.visual_quality.parse(value);
+            }
+        }
+        if (comptime gpu.backend_kind == .d3d12) {
+            const args: std.process.Args = .{ .vector = std.os.windows.peb().ProcessParameters.CommandLine.slice() };
+            var argv = try args.iterateAllocator(allocator);
+            defer argv.deinit();
+            const prefix = "--zenit-visual-quality=";
+            while (argv.next()) |arg| {
+                if (std.mem.startsWith(u8, arg, prefix)) requested = try render.visual_quality.parse(arg[prefix.len..]);
+            }
+        }
+        const quality = render.visual_quality.resolve(requested, if (comptime gpu.backend_kind == .d3d12) device.isSoftware() else false);
+        if (comptime gpu.backend_kind == .d3d12) std.log.info("[visual-quality] requested={s} effective={s}", .{ @tagName(requested), @tagName(quality) });
         return AppRenderer{
             .allocator = allocator,
+            .io = io,
             .device = device,
             .queue = queue,
             .surface = surface,
@@ -261,26 +347,45 @@ pub const AppRenderer = struct {
             .icon_renderer = icon_renderer,
             .text_renderer = text_renderer,
             .config = config,
-            .frame_sync = gpu.Backend.FrameSync.init(FRAME_BUFFER_COUNT),
+            .visual_quality = quality,
+            // WARP cannot benefit from a deep queue of expensive stale UI
+            // frames. Keep triple-buffered storage but admit one GPU frame.
+            .frame_sync = if (comptime gpu.backend_kind == .d3d12)
+                gpu.Backend.FrameSync.initWithLimit(FRAME_BUFFER_COUNT, if (device.isSoftware()) 1 else FRAME_BUFFER_COUNT)
+            else if (comptime gpu.backend_kind == .null_backend)
+                gpu.Backend.FrameSync.init(FRAME_BUFFER_COUNT, io)
+            else
+                gpu.Backend.FrameSync.init(FRAME_BUFFER_COUNT),
         };
     }
 
-    /// 获取已正确绑定的 RenderCommandEncoder（自动携带字体 + 持久离屏纹理池）
+    /// Get correctly-bound RenderCommandEncoder (auto-carries fonts + persistent offscreen pool).
     pub fn getEncoder(self: *AppRenderer) RenderCommandEncoder {
+        self.has_external_encoder = true;
+        return self.createEncoder();
+    }
+
+    fn createEncoder(self: *AppRenderer) RenderCommandEncoder {
         var enc = RenderCommandEncoder.initWithImageAndIcon(&self.sdf_renderer, &self.text_renderer, &self.image_renderer, &self.icon_renderer, &self.offscreen_pool, &self.persistent_gpu);
-        // 复位帧内游标（uniform 环形写偏移等），但保留 pipeline/buffer 本身。
+        // Reset frame-internal cursors (uniform ring write offset etc), keep pipeline/buffers.
         self.persistent_gpu.beginFrame();
-        // 帧计数由 AppRenderer 承载（encoder 逐帧新建，自增会每帧归零）。
+        // Frame counter carried by AppRenderer (encoder per-frame new, self-increment zeroes each
+        // frame).
         self.frame_counter += 1;
+        enc.io = self.io;
         enc.frame_index = self.frame_counter;
+        enc.retained_enabled = self.retained_enabled;
+        enc.visual_quality = self.visual_quality;
         if (self.fonts) |f| enc.setFonts(f);
         return enc;
     }
 
-    /// 设置字体选择器，并把测量绑定到生命周期稳定的 TextRenderer。
-    /// 任何经 AppRenderer 绘制的字体都因此默认满足 measure == draw；宿主不再
-    /// 需要另装一份容易漏掉或误绑到逐帧 encoder 的 callback。
+    /// Set font selector, bind measurement to TextRenderer with stable lifetime. Any font drawn via
+    /// AppRenderer thus defaults measure == draw; host no longer needs separate callback easily
+    /// missed or
+    /// mis-bound to per-frame encoder.
     pub fn setFonts(self: *AppRenderer, fonts: *FontSelector) void {
+        if (self.fonts != fonts) self.frame_damage.invalidate();
         if (self.fonts) |previous| {
             if (previous.drawn_width_ctx == @as(*anyopaque, @ptrCast(&self.text_renderer))) {
                 previous.setDrawnWidthSource(null, null);
@@ -288,6 +393,20 @@ pub const AppRenderer = struct {
         }
         self.fonts = fonts;
         fonts.setDrawnWidthSource(&measureWidthAsDrawn, @ptrCast(&self.text_renderer));
+    }
+
+    /// Changing decoration never releases in-flight GPU resources.
+    pub fn setVisualQuality(self: *AppRenderer, requested: render.visual_quality.Quality) void {
+        // Blur pipeline failure auto-downgrades to basic (D3D12 only; WARP etc); Metal keeps
+        // semantics: glass just non-blurred.
+        const quality = if ((comptime gpu.backend_kind == .d3d12) and self.persistent_gpu.blur_pipeline_failed) .basic else render.visual_quality.resolve(requested, if (comptime gpu.backend_kind == .d3d12) self.device.isSoftware() else false);
+        if (self.visual_quality == quality) return;
+        self.visual_quality = quality;
+        self.frame_damage.invalidate();
+        self.background_damage.invalidate();
+        self.background_valid = false;
+        self.retained_valid = false;
+        self.offscreen_pool.invalidateRetainedContents();
     }
 
     pub fn setRecordingFrameCallback(self: *AppRenderer, callback: RecordingFrameFn) void {
@@ -298,11 +417,17 @@ pub const AppRenderer = struct {
         self.recording_active = active;
     }
 
-    /// E2E：请求在下一帧 present 前把当前 drawable 像素截图到 PNG。
-    /// 真实读取发生在 frame() 内（见 captureSurfaceToPng）。返回 true 表示已登记请求。
-    /// 注意：drawable 必须 framebufferOnly=false（test-mode 下 surface 用
-    /// .color_target_and_read 配置），否则 getBytes 读不到像素。
-    /// 纹理内存用量快照（图片画布做 LRU 预算驱逐用）。
+    pub fn setRecordingContextCallback(self: *AppRenderer, context: ?*anyopaque, callback: RecordingFrameContextFn) void {
+        self.recording_context = context;
+        self.recording_context_fn = callback;
+    }
+
+    /// E2E: request next frame capture drawable pixels to PNG before present. Actual read inside
+    /// frame() (see captureSurfaceToPng). Returns true if request registered. Caveat: drawable must
+    /// be
+    /// framebufferOnly=false (test-mode surface uses .color_target_and_read), else getBytes reads
+    /// nothing.
+    /// Texture memory usage snapshot (image canvas LRU budget eviction).
     pub fn textureMemoryStats(self: *const AppRenderer) render.TextureMemoryStats {
         return self.image_renderer.getTextureMemoryStats();
     }
@@ -317,8 +442,9 @@ pub const AppRenderer = struct {
         return true;
     }
 
-    /// 从 surface 纹理读 BGRA8 -> 转 RGBA8 -> 写 PNG。present 前调用。
-    /// cmd_buffer 必须已 waitUntilCompleted，保证渲染结果已落到纹理。
+    /// Read BGRA8 from surface -> convert RGBA8 -> write PNG. Called before present. cmd_buffer
+    /// must
+    /// have waitUntilCompleted, ensuring render landed in texture.
     fn captureSurfaceToPng(self: *AppRenderer, texture: *const gpu.Backend.Texture, width: u32, height: u32) bool {
         if (width == 0 or height == 0) return false;
         const px = @as(usize, width) * @as(usize, height);
@@ -331,12 +457,12 @@ pub const AppRenderer = struct {
 
         texture.readBgra8(width, height, bgra, bytes_per_row) catch return false;
 
-        // BGRA -> RGBA 字节交换
+        // BGRA -> RGBA byte swap.
         var i: usize = 0;
         while (i < px * 4) : (i += 4) {
-            rgba[i] = bgra[i + 2]; // R ← B 位置
+            rgba[i] = bgra[i + 2]; // R <- B position.
             rgba[i + 1] = bgra[i + 1]; // G
-            rgba[i + 2] = bgra[i]; // B ← R 位置
+            rgba[i + 2] = bgra[i]; // B <- R position.
             rgba[i + 3] = bgra[i + 3]; // A
         }
 
@@ -348,8 +474,8 @@ pub const AppRenderer = struct {
         return gpu.Backend.writePngRgba(&path_z, rgba, width, height, bytes_per_row);
     }
 
-    /// 读任意 BGRA8 纹理 -> RGBA8 -> 写 PNG(与 captureSurfaceToPng 同管线,
-    /// 但 path 显式传入,不依赖 pending_screenshot_* 状态)。
+    /// Read any BGRA8 texture -> RGBA8 -> write PNG (same pipeline as captureSurfaceToPng, but path
+    /// explicit, not dependent on pending_screenshot_* state).
     fn textureToPng(self: *AppRenderer, texture: *const gpu.Backend.Texture, width: u32, height: u32, path: []const u8) bool {
         if (width == 0 or height == 0 or path.len == 0 or path.len >= 512) return false;
         const px = @as(usize, width) * @as(usize, height);
@@ -372,18 +498,35 @@ pub const AppRenderer = struct {
         return gpu.Backend.writePngRgba(&path_z, rgba, width, height, bytes_per_row);
     }
 
-    /// e2e 截图的**首选路径**:读上一次真实呈现帧的保留拷贝。
-    /// 返回 false = 还没有保留帧(启动初期/未开启),调用方走旧路径兜底。
+    /// E2E screenshot **preferred path**: read retained copy of last true-presented frame. Return
+    /// false =
+    /// no retained frame yet (startup/disabled), caller falls back to old path.
     pub fn captureRetainedToPng(self: *AppRenderer, path: []const u8) bool {
         if (!self.retained_valid) return false;
         const tex = &(self.retained_tex orelse return false);
-        // blit 编在上一帧的 command stream 里,读之前必须确认 GPU 已完成,
-        // 否则读到半写的内容(稳态下早已完成,这里只是边缘竞态保险)。
+        // Blit encoded in last frame command stream; must confirm GPU done before read, else reads
+        // half-written
+        // (steady-state already done, here just edge-case insurance).
         if (self.prev_frame_cmd_buffer) |*prev| prev.waitUntilCompleted();
         return self.textureToPng(tex, self.retained_w, self.retained_h, path);
     }
 
-    /// 保证保留纹理与当前 surface 尺寸一致(resize 时重建)。
+    /// Ensure retained texture matches current surface size (rebuild on resize).
+    fn ensureBackgroundTexture(self: *AppRenderer, width: u32, height: u32) !void {
+        if (self.background_tex) |*tex| {
+            if (tex.size.width == width and tex.size.height == height) return;
+            tex.destroy();
+            self.background_tex = null;
+        }
+        self.background_valid = false;
+        self.background_tex = try self.device.createTexture(self.allocator, .{
+            .label = "static-frame-prefix",
+            .size = .{ .width = width, .height = height, .depth = 1 },
+            .format = gpu.color_format,
+            .usage = .{ .copy_src = true, .copy_dst = true },
+        });
+    }
+
     fn ensureRetainedTexture(self: *AppRenderer, width: u32, height: u32) bool {
         if (self.retained_tex != null and self.retained_w == width and self.retained_h == height) return true;
         if (self.retained_tex) |*t| t.destroy();
@@ -392,11 +535,12 @@ pub const AppRenderer = struct {
         const tex = self.device.createTexture(self.allocator, .{
             .label = "e2e-retained-present",
             .size = .{ .width = width, .height = height, .depth = 1 },
-            .format = .bgra8_unorm,
+            .format = gpu.color_format,
             .usage = .{ .copy_src = true, .copy_dst = true },
-            // ⚠ 必须 host_upload(CPU 可读的 shared storage)。默认 device_local
-            // 在 Apple Silicon 上是 GPU 私有压缩布局,getBytes 直接 SIGSEGV
-            // (实测崩在 AGX processCompressedRegion2D)。
+            // WARN: must be host_upload (CPU-readable shared storage). Default device_local is
+            // GPU-private
+            // compressed layout on Apple Silicon, getBytes directly SIGSEGV (crashes at AGX
+            // processCompressedRegion2D).
             .memory = .host_upload,
         }) catch return false;
         self.retained_tex = tex;
@@ -405,82 +549,259 @@ pub const AppRenderer = struct {
         return true;
     }
 
-    /// 初始化 AppRenderer 内部 FontSelector 的 lazy derived font cache
-    /// FontSelector 为借用引用，调用方负责生命周期
+    /// Initialize AppRenderer internal FontSelector lazy derived font cache. FontSelector borrowed
+    /// ref,
+    /// caller owns lifetime.
     pub fn initFontDerivedCache(self: *AppRenderer, allocator: std.mem.Allocator) void {
         if (self.fonts) |fs| {
             fs.initDerivedCache(allocator);
         }
     }
 
-    /// 释放 AppRenderer 内部 FontSelector 的 lazy derived font cache
-    /// FontSelector 为借用引用，调用方应仅在全局销毁点调用一次
+    /// Deinitialize AppRenderer internal FontSelector lazy derived font cache. FontSelector
+    /// borrowed ref,
+    /// caller should call once only at global teardown.
     pub fn deinitFontDerivedCache(self: *AppRenderer) void {
         if (self.fonts) |fs| {
             fs.deinitDerivedCache();
         }
     }
 
-    /// 渲染一帧，使用 UI Cx 上下文
+    fn frameResourceKey(self: *const AppRenderer) u64 {
+        var h = std.hash.Wyhash.init(0);
+        h.update(std.mem.asBytes(&self.config.clear_color));
+        const Font = @typeInfo(@TypeOf(@as(render.FontSelector, undefined).small)).pointer.child;
+        if (self.fonts) |fonts| {
+            inline for (@import("zenit_reflection").fields(FontSelector)) |field| {
+                if (field.type == *Font or field.type == ?*Font) {
+                    h.update(std.mem.asBytes(&@field(fonts, field.name)));
+                } else if (@typeInfo(field.type) == .array) {
+                    if (@typeInfo(field.type).array.child == ?*Font)
+                        h.update(std.mem.asBytes(&@field(fonts, field.name)));
+                }
+            }
+        }
+        if (self.text_renderer.fallback_stack) |stack| {
+            for (stack.families[0..stack.family_count]) |family| {
+                h.update(std.mem.asBytes(&family.priority));
+                h.update(std.mem.sliceAsBytes(family.fonts[0..family.count]));
+            }
+        }
+        h.update(std.mem.asBytes(&self.text_renderer.font_ranges_context));
+        h.update(std.mem.asBytes(&self.text_renderer.font_ranges_provider));
+        return h.final();
+    }
+
+    /// Render one frame using UI Cx context.
     ///
-    /// 完整流程:
+    /// Full pipeline:
     ///   1. cx.layout()
-    ///   2. cx.render(), paint pass 填 cx.display_list
+    ///   2. cx.render(), paint pass fills cx.display_list
     ///   3. encode -> rect/text renderer
-    ///   4. 创建 GPU encoder + render pass
-    ///   5. flush + present
+    ///   4. create GPU encoder + render pass
+    ///   5. flush + present.
     pub fn frame(self: *AppRenderer, cx: anytype, viewport_width: f32, viewport_height: f32, scale: f32) !void {
-        const frame_start = std.time.Instant.now() catch null;
-        var wait_start: ?std.time.Instant = null;
-        var wait_end: ?std.time.Instant = null;
+        return self.frameWithPresentation(cx, viewport_width, viewport_height, scale, null);
+    }
 
-        // 0. 推进帧时钟（必须在 layout/render 之前，before_render hooks / overlay
-        // enter-exit / spinner 等动画都读 frame_time_ms）。advanceFrameClock 内部对
-        // idle 帧（整树 clean + 无浮层动画 + 无 needs_redraw）跳过推进，保持零脏帧
-        // 快速路径成立；任一活跃信号（含 spinner 的 markRenderDirty 让树非 clean）会
-        // 让时钟前进，驱动连续动画。没有这一步，frame_time_ms 永远冻结 -> spinner/
-        // overlay 动画全静止。
+    pub fn frameWithPresentation(self: *AppRenderer, cx: anytype, viewport_width: f32, viewport_height: f32, scale: f32, presentation_sample: anytype) !void {
+        if (comptime @hasField(@TypeOf(cx.*), "frame_presentation_sample")) cx.frame_presentation_sample = presentation_sample;
+        defer {
+            if (comptime @hasField(@TypeOf(cx.*), "frame_presentation_sample")) cx.frame_presentation_sample = null;
+        }
+        _ = self.pollBackdropLuminance(cx);
+        // Permanent optional-pipeline failure downgrades this renderer once. Essential GPU errors
+        // still
+        // propagate; basic is not device recovery. Only D3D12 upgrades blur pipeline failure to
+        // overall basic
+        // quality (includes disabling animations).
+        if ((comptime gpu.backend_kind == .d3d12) and self.visual_quality != .basic and self.persistent_gpu.blur_pipeline_failed) {
+            self.visual_quality = .basic;
+            self.frame_damage.invalidate();
+            self.background_damage.invalidate();
+            self.background_valid = false;
+            self.retained_valid = false;
+            self.offscreen_pool.invalidateRetainedContents();
+            cx.needs_redraw = true;
+            if (cx.root) |root| root.markRenderDirty();
+            std.log.warn("[visual-quality] basic: backdrop pipeline unavailable", .{});
+        }
+        if (@hasField(@TypeOf(cx.*), "renderer_reduced_motion")) {
+            cx.renderer_reduced_motion = self.visual_quality == .basic;
+        }
+        // Basic quality draws glass as an opaque material and never reads the
+        // backdrop luminance back; new glass must not wait for a reading.
+        if (@hasField(@TypeOf(cx.*), "backdrop_luminance_readback")) {
+            cx.backdrop_luminance_readback = self.visual_quality != .basic;
+        }
+        const frame_start = @import("zenit_time").Instant.now(cx.io) catch null;
+        errdefer {
+            self.frame_damage.invalidate();
+            self.background_damage.invalidate();
+            self.background_valid = false;
+            self.retained_valid = false;
+            // Layer encoding can mark textures primed before this frame is
+            // submitted. Abandoning its command buffer also abandons those
+            // pixels and damage baselines; the retry must repaint every layer.
+            self.offscreen_pool.invalidateRetainedContents();
+        }
+        const frame_error_start = if (comptime gpu.backend_kind == .d3d12) gpu.Backend.CommandBuffer.error_count.load(.monotonic) else 0;
+        var wait_start: ?@import("zenit_time").Instant = null;
+        var wait_end: ?@import("zenit_time").Instant = null;
+
+        // D3D12 (especially WARP) can wait hundreds of milliseconds for a
+        // frame slot. Sample animation time after that wait, so submitted UI
+        // state does not describe the instant before the GPU stall.
+        const early_frame_wait = gpu.backend_kind == .d3d12;
+        var acquired_slot = false;
+        errdefer if (acquired_slot) self.frame_sync.signal();
+        if (early_frame_wait) {
+            wait_start = @import("zenit_time").Instant.now(cx.io) catch null;
+            try self.frame_sync.waitForNextFrame();
+            wait_end = @import("zenit_time").Instant.now(cx.io) catch null;
+            acquired_slot = true;
+            if (comptime gpu.backend_kind == .d3d12) {
+                // No submitted frame remains after the checked fence wait.
+                // This is common with WARP's single-frame admission limit.
+                // Release only the pool's time quarantine, never its owners or
+                // content fingerprints; the next encoder resets frame leases.
+                if (!self.has_external_encoder and self.frame_sync.pending == 0)
+                    self.offscreen_pool.notifyGpuIdle();
+            }
+        }
+
+        // 0. Advance frame clock (must be before layout/render; before_render hooks, overlay
+        // enter-exit, spinner etc. read frame_time_ms). advanceFrameClock skips the advance for
+        // idle
+        // frames (whole tree clean + no overlay animation + no needs_redraw), keeping the
+        // zero-dirty
+        // fast path; any live signal (e.g. spinner markRenderDirty) advances the clock and drives
+        // continuous animation. Without this, frame_time_ms stays frozen and animations are static.
         cx.advanceFrameClock();
+        const clock_trace_enabled = if (comptime gpu.backend_kind == .metal) metal_glass_clock_trace_enabled() else false;
+        const clock_sample_host_time = if (clock_trace_enabled) metal_glass_clock_trace_host_time() else 0;
+        const clock_sample_frame_time_ms = cx.frame_time_ms;
+        const clock_sample_frame_dt_ms: f64 = cx.frame_dt_ms;
 
-        // 1. 布局
-        const layout_start = std.time.Instant.now() catch null;
+        // 1. Layout.
+        const layout_start = @import("zenit_time").Instant.now(cx.io) catch null;
         cx.layout();
-        const layout_end = std.time.Instant.now() catch null;
+        const layout_end = @import("zenit_time").Instant.now(cx.io) catch null;
 
-        // 2. 生成渲染命令
-        // cx.render() 跑 paint pass 填 cx.display_list；encoder 通过 enc.encodeDisplay(cx)
-        // 自己调 cx.lowerForEncoder() 拿 lowered DisplayItem 切片。调用方不持有 IR。
-        const render_start = std.time.Instant.now() catch null;
+        // 2. Generate render commands. cx.render() runs paint pass fills cx.display_list; encoder
+        //    via
+        // enc.encodeDisplay(cx) calls cx.lowerForEncoder() itself for lowered DisplayItem slice.
+        // Caller doesn't
+        // hold IR.
+        const render_start = @import("zenit_time").Instant.now(cx.io) catch null;
         _ = cx.render();
-        const render_end = std.time.Instant.now() catch null;
+        const render_end = @import("zenit_time").Instant.now(cx.io) catch null;
+        self.scanPaintTable(cx);
 
-        var enc = self.getEncoder();
+        // Admission must precede ring rotation, atlas collection and GPU writes.
+        // CPU layout/paint can still overlap the preceding GPU frame.
+        if (!early_frame_wait) {
+            wait_start = @import("zenit_time").Instant.now(cx.io) catch null;
+            try self.frame_sync.waitForNextFrame();
+            wait_end = @import("zenit_time").Instant.now(cx.io) catch null;
+            acquired_slot = true;
+        }
+        const checkpoint = .{
+            .frame = self.frame_counter,
+            .sdf = self.sdf_renderer.current_buffer,
+            .text = self.text_renderer.current_buffer,
+            .image = self.image_renderer.current_buffer,
+            .icon = self.icon_renderer.current_buffer,
+            .text_frame = self.text_renderer.current_frame,
+            .atlas_frame = self.text_renderer.atlas.current_frame,
+            .icon_frame = self.icon_renderer.frame_index,
+        };
+        const PathCheckpoint = struct { slot: usize, shrink_frame: u64, current_frame: u64 };
+        const path_checkpoint: ?PathCheckpoint = if (self.persistent_gpu.path_renderer) |*pr|
+            .{ .slot = pr.buffer_slot, .shrink_frame = pr.shrink_frame, .current_frame = pr.current_frame }
+        else
+            null;
+        var submitted = false;
+        errdefer if (!submitted) {
+            // An aborted attempt consumed no GPU frame. Keep the next retry on
+            // its available slot, and do not age retired resources on failures.
+            self.frame_counter = checkpoint.frame;
+            self.sdf_renderer.current_buffer = checkpoint.sdf;
+            self.text_renderer.current_buffer = checkpoint.text;
+            self.image_renderer.current_buffer = checkpoint.image;
+            self.icon_renderer.current_buffer = checkpoint.icon;
+            self.text_renderer.current_frame = checkpoint.text_frame;
+            self.text_renderer.atlas.current_frame = checkpoint.atlas_frame;
+            self.icon_renderer.frame_index = checkpoint.icon_frame;
+            if (path_checkpoint) |previous| {
+                if (self.persistent_gpu.path_renderer) |*pr| {
+                    pr.restoreFrameBufferSlot(previous.slot);
+                    pr.shrink_frame = previous.shrink_frame;
+                    pr.current_frame = previous.current_frame;
+                }
+            }
+        };
+        var enc = self.createEncoder();
         defer enc.deinit();
         enc.beginFrame(viewport_width, viewport_height, scale);
         if (self.config.prewarm_text) try enc.prewarmDisplay(cx);
 
-        // Delay the in-flight buffer wait until right before we touch the
-        // triple-buffered GPU instance storage. This lets layout/render overlap
-        // with the previous frame's GPU completion instead of idling at frame start.
-        wait_start = std.time.Instant.now() catch null;
-        self.frame_sync.waitForNextFrame();
-        wait_end = std.time.Instant.now() catch null;
-        // 错误路径归还 slot，防止连续失败后 semaphore 耗尽导致永久阻塞
-        errdefer self.frame_sync.signal();
-
-        // 3. 准备 GPU 提交
-        const acquire_start = std.time.Instant.now() catch null;
+        // 3. Prepare GPU submit.
+        const acquire_start = @import("zenit_time").Instant.now(cx.io) catch null;
         var surface_texture = try self.surface.acquireTexture(self.allocator);
-        const acquire_end = std.time.Instant.now() catch null;
+        const acquire_end = @import("zenit_time").Instant.now(cx.io) catch null;
         defer surface_texture.deinit();
 
+        // A provider may change its output while retaining the same context
+        // address. It has no revision contract, so custom providers repaint.
+        // The preserved texture uses BGRA; other surface formats also repaint.
+        const frame_cache_enabled = if (comptime gpu.backend_kind == .d3d12)
+            self.device.isSoftware() and self.retained_enabled and !self.has_external_encoder and self.config.clear_color.a == 1 and self.text_renderer.font_ranges_provider == null and
+                (surface_texture.texture.format == .bgra8_unorm or surface_texture.texture.format == .bgra8_unorm_srgb)
+        else
+            false;
+        var damage: ?[4]u32 = null;
+        if (frame_cache_enabled) {
+            damage = try self.frame_damage.prepare(self.allocator, cx.lowerForEncoderPaintTable(), surface_texture.texture.size.width, surface_texture.texture.size.height, scale, self.frameResourceKey());
+            if (!self.retained_valid or self.retained_w != surface_texture.texture.size.width or self.retained_h != surface_texture.texture.size.height) damage = null;
+        } else self.frame_damage.invalidate();
+
+        var prefix_len: usize = 0;
+        var reuse_background = false;
+        var background_update: ?[4]u32 = null;
+        if (frame_cache_enabled and !self.frame_damage.pending_valid) {
+            const commands = cx.lowerForEncoderPaintTable();
+            const candidate = render.FrameDamage.flatPrefixEnd(commands);
+            if (candidate > 0) {
+                const change = try self.background_damage.prepare(self.allocator, commands[0..candidate], surface_texture.texture.size.width, surface_texture.texture.size.height, scale, self.frameResourceKey());
+                if (self.background_damage.pending_valid) {
+                    try self.ensureBackgroundTexture(surface_texture.texture.size.width, surface_texture.texture.size.height);
+                    prefix_len = candidate;
+                    reuse_background = self.background_valid and if (change) |rect| rect[2] == 0 or rect[3] == 0 else false;
+                    if (self.background_valid and !reuse_background) background_update = change;
+                }
+            }
+        } else if (!frame_cache_enabled) {
+            self.background_damage.invalidate();
+            self.background_valid = false;
+        }
+
         var gpu_encoder = try gpu.Backend.CommandEncoder.init(self.queue);
-        // 错误路径兜底：下面的 encodeDisplay / flush 都可能抛错提前返回，此时
-        // finish() 从未被调用（state != .finished），command buffer 无人 release。
-        // CommandEncoder.deinit 正是为这种"未 finish"的情况准备的，成功路径上
-        // finish() 会把 state 置为 .finished，deinit 变成 no-op，所有权移交
-        // cmd_buffer，不会重复释放。
+        // Error path fallback: encodeDisplay/flush below may error early-return, then finish()
+        // never called
+        // (state != .finished), command buffer unreleased. CommandEncoder.deinit prepared for this
+        // "unfinished"
+        // case; success path finish() sets state to .finished, deinit becomes no-op, ownership to
+        // cmd_buffer,
+        // no double-free.
         errdefer gpu_encoder.deinit();
+
+        if (damage != null or reuse_background or background_update != null) {
+            var blit = try gpu_encoder.beginBlitPass();
+            defer blit.end();
+            const source = if (reuse_background or background_update != null) self.background_tex.?.binding() else self.retained_tex.?.binding();
+            try blit.copyTextureRegion(source, 0, 0, source.width, source.height, surface_texture.texture.binding(), 0, 0);
+        }
 
         var texture_view = surface_texture.texture.binding().createView();
         defer texture_view.destroy();
@@ -490,37 +811,87 @@ pub const AppRenderer = struct {
             .color_attachments = &[_]gpu.RenderPassColorAttachment{
                 .{
                     .view = texture_view,
-                    .load_op = .clear,
+                    .load_op = if (damage != null or reuse_background or background_update != null) .load else .clear,
                     .store_op = .store,
                     .clear_value = .{ .r = cc.r, .g = cc.g, .b = cc.b, .a = cc.a },
                 },
             },
         });
 
-        // 4. 编码（encoder 持有 render_pass 引用，clip stack 可用）
-        const encode_start = std.time.Instant.now() catch null;
-        // **关键（2026-06-07 CA-surface revamp 发现的根因）**：必须把 gpu_command_encoder +
-        // main_render_target 绑给 encoder，否则 opacity_layer.beginOpacityLayer /
-        // backdrop_blur 在 `gpu_command_encoder == null` 处直接 early-return -> 所有 offscreen
-        // surface（modal/sheet opacity group fade、GlassBox backdrop blur）静默不工作，content
-        // 退化成内联渲染、错位。缺了这两行绑定时 surface 路径"从未真正跑过",
-        // 这正是 overlay fade 一直坏的真根因。
+        // 4. Encode (encoder holds render_pass ref, clip stack available).
+        const encode_start = @import("zenit_time").Instant.now(cx.io) catch null;
+        // **Critical**: must bind gpu_command_encoder + main_render_target to encoder, else
+        // opacity_layer.beginOpacityLayer / backdrop_blur early-return at
+        // `gpu_command_encoder == null` -> all offscreen surfaces (modal/sheet opacity fade,
+        // GlassBox backdrop blur) are silently broken: content degrades inline and misaligned.
         enc.gpu_command_encoder = &gpu_encoder;
         enc.main_render_target = surface_texture.texture.binding();
         enc.render_pass = &render_pass;
-        try enc.encodeDisplay(cx);
-        const encode_end = std.time.Instant.now() catch null;
+        if (prefix_len > 0) {
+            if (!reuse_background) {
+                if (background_update) |rect| {
+                    if (comptime gpu.backend_kind == .d3d12) {
+                        if (!render_pass.clearOpaque(.{ cc.r, cc.g, cc.b, cc.a }, rect)) return error.FrameDamageClearFailed;
+                    }
+                    enc.frame_damage_scissor = rect;
+                    enc.applyOffscreenTargetViewport();
+                }
+                try enc.encodeCommands(cx.lowerForEncoderPaintTable()[0..prefix_len]);
+                try enc.flush(&render_pass);
+                render_pass.end();
+                enc.frame_damage_scissor = null;
+                {
+                    var blit = try gpu_encoder.beginBlitPass();
+                    defer blit.end();
+                    const source = surface_texture.texture.binding();
+                    try blit.copyTextureRegion(source, 0, 0, source.width, source.height, self.background_tex.?.binding(), 0, 0);
+                }
+                render_pass = try gpu_encoder.beginRenderPass(.{ .color_attachments = &.{.{ .view = texture_view, .load_op = .load, .store_op = .store }} });
+                enc.render_pass = &render_pass;
+                enc.applyOffscreenTargetViewport();
+            }
+            try enc.encodeDisplayFrom(cx, prefix_len);
+        } else if (damage) |rect| {
+            if (comptime gpu.backend_kind == .d3d12) {
+                if (rect[2] > 0 and rect[3] > 0 and !render_pass.clearOpaque(.{ cc.r, cc.g, cc.b, cc.a }, rect)) return error.FrameDamageClearFailed;
+            }
+            enc.frame_damage_scissor = rect;
+            enc.applyOffscreenTargetViewport();
+            if (rect[2] > 0 and rect[3] > 0) try enc.encodeDisplay(cx);
+        } else try enc.encodeDisplay(cx);
+        const encode_end = @import("zenit_time").Instant.now(cx.io) catch null;
         const pending_sdf_instances = self.sdf_renderer.instances.items.len;
         const pending_text_instances = self.text_renderer.getPendingInstanceCount();
 
-        // 5. 刷新到 GPU
-        // 离屏合成（opacity surface / backdrop blur）会 end 原 render_pass 并新建一个
-        // restored_pass，写回 enc.render_pass。故必须 flush/end **encoder 当前持有的 pass**
-        // （可能已被替换），而不是本地 `render_pass`，否则会对已 end 的本地 pass 再 end 一次，
-        // 触发 Metal `endEncoding has already been called` 断言崩溃。
-        const flush_start = std.time.Instant.now() catch null;
+        // 5. Flush to GPU. Offscreen composite (opacity surface/backdrop blur) ends original
+        //    render_pass,
+        // creates restored_pass, writes back enc.render_pass. Must flush/end **encoder's current
+        // pass**
+        // (may be replaced), not local `render_pass`, else double-end already-ended pass, trigger
+        // Metal
+        // `endEncoding already called` assertion crash.
+        const flush_start = @import("zenit_time").Instant.now(cx.io) catch null;
         if (enc.render_pass) |rp| {
             try enc.flush(rp);
+            if (comptime gpu.backend_kind == .d3d12) {
+                if (self.desktop_capture_stamp) {
+                    const serial = self.frame_count + 1;
+                    if (serial > 0xffffff) return error.DesktopCaptureSerialOverflow;
+                    const w = surface_texture.texture.size.width;
+                    const h = surface_texture.texture.size.height;
+                    if (w < 8 or h < 4) return error.DesktopCaptureTooSmall;
+                    rp.setScissorRect(0, 0, w, h);
+                    var color: [4]f32 = .{ 0, 0, 0, 1 };
+                    const codes = [2][3]u8{ .{ @truncate(serial), @truncate(serial >> 8), @truncate(serial >> 16) }, .{ 53, 199, 107 } };
+                    for (codes, 0..) |rgb, i| {
+                        for (rgb, 0..) |v, c| {
+                            const n = @as(f32, @floatFromInt(v)) / 255;
+                            color[c] = if (n <= 0.04045) n / 12.92 else std.math.pow(f32, (n + 0.055) / 1.055, 2.4);
+                        }
+                        if (!rp.clearOpaque(color, .{ @as(u32, @intCast(i)) * 4 + 1, 1, 3, 3 })) return error.DesktopCaptureStampFailed;
+                    }
+                }
+            }
             rp.end();
         } else {
             // The original local value may already have been ended by an
@@ -528,25 +899,32 @@ pub const AppRenderer = struct {
             // Objective-C address for a blit encoder in the meantime.
             return error.MissingActiveRenderPass;
         }
-        const flush_end = std.time.Instant.now() catch null;
+        const flush_end = @import("zenit_time").Instant.now(cx.io) catch null;
 
-        // e2e:把即将 present 的内容 blit 进保留纹理(见 retain_present_copy)。
-        // 必须在 finish 之前编进同一 command stream。
-        if (self.retain_present_copy) {
+        // e2e: blit soon-presented content into retained texture (see retain_present_copy). Must
+        // encode
+        // into same command stream before finish.
+        var frame_copy_ok = false;
+        if (self.retain_present_copy or (frame_cache_enabled and self.frame_damage.pending_valid)) {
             const src = surface_texture.texture.binding();
             if (self.ensureRetainedTexture(src.width, src.height)) {
                 if (gpu_encoder.beginBlitPass()) |*bp_const| {
                     var bp = bp_const.*;
-                    // ⚠ 拷贝失败**不能**继续标 valid：captureRetainedToPng 是
-                    // e2e 截图的首选路径，标了 valid 它就直接返回这张纹理，
-                    // 内容却是上一帧（或全新纹理的未定义内容）。e2e 的像素
-                    // 断言全建立在"截图 == 刚呈现的那帧"上，静默读旧帧会让
-                    // 断言假绿，比截图失败更糟。
-                    // 失败时清掉 valid，captureRetainedToPng 返回 false，
-                    // 调用方回退到"重新渲染一帧"的旧路径。
+                    // WARN: copy failure **cannot** mark valid: captureRetainedToPng is the
+                    // preferred e2e
+                    // screenshot path and returns this texture once valid; content would be the
+                    // last frame (or
+                    // an undefined new texture). E2E pixel assertions assume "screenshot ==
+                    // just-presented
+                    // frame", so silently reading an old frame gives false-green, worse than a
+                    // screenshot
+                    // failure. On failure clear valid; captureRetainedToPng returns false and the
+                    // caller falls
+                    // back to the "render new frame" path.
                     if (bp.copyTextureRegion(src, 0, 0, src.width, src.height, self.retained_tex.?.binding(), 0, 0)) {
                         bp.end();
                         self.retained_valid = true;
+                        frame_copy_ok = true;
                     } else |err| {
                         bp.end();
                         self.retained_valid = false;
@@ -556,10 +934,14 @@ pub const AppRenderer = struct {
             }
         }
 
-        // 排障（ZENIT_DEBUG_GLASS_RT="x,y" 设备像素）：帧末 RT 指定区 64×64
-        // blit 进 debug slot 2，renderer 下一帧回读 RGB 均值，与 capture/
-        // composite 两级恒定值对照，三明治定位分叉阶段。
-        if (std.posix.getenv("ZENIT_DEBUG_GLASS_RT")) |spec| blk: {
+        if (!frame_copy_ok) self.retained_valid = false;
+
+        // Diagnostics (ZENIT_DEBUG_GLASS_RT="x,y" device pixels): blit RT 64x64 region
+        // to debug slot 2 at frame end; renderer reads RGB average next frame to compare
+        // with capture/composite baselines for phase localization (sandwich method).
+        const glass_rt_spec = @import("zenit_environment").getOwned(self.allocator, "ZENIT_DEBUG_GLASS_RT") catch null;
+        defer if (glass_rt_spec) |spec| self.allocator.free(spec);
+        if (glass_rt_spec) |spec| blk: {
             var it = std.mem.splitScalar(u8, spec, ',');
             const rx = std.fmt.parseInt(u32, it.next() orelse break :blk, 10) catch break :blk;
             const ry = std.fmt.parseInt(u32, it.next() orelse break :blk, 10) catch break :blk;
@@ -568,7 +950,7 @@ pub const AppRenderer = struct {
                 slot.staging = self.device.createTexture(self.allocator, .{
                     .label = "Zenit.GlassDebugRtStaging",
                     .size = .{ .width = 64, .height = 64 },
-                    .format = .bgra8_unorm_srgb,
+                    .format = gpu.color_format,
                     .usage = .{ .copy_dst = true },
                     .memory = .host_upload,
                 }) catch null;
@@ -592,54 +974,34 @@ pub const AppRenderer = struct {
                 }
             } else |_| {}
         }
+        if (comptime frame_testing_enabled) {
+            if (self.fail_after_encode_for_testing) {
+                self.fail_after_encode_for_testing = false;
+                return error.InjectedFrameFailure;
+            }
+        }
         var cmd_buffer = try gpu_encoder.finish();
         defer cmd_buffer.deinit();
 
-        // 注册 GPU 完成回调，释放 buffer slot
+        // Register GPU completion callback to release buffer slot.
         self.frame_sync.signalOnCompletion(&cmd_buffer);
+        acquired_slot = false;
 
-        // 读取**上一帧**的真 GPU 执行时间（GPUStartTime/GPUEndTime 只有在
-        // command buffer 完成后才有效；本帧的刚提交，读不到）。
-        // 稳态下上一帧早已完成，因此这是零等待的。
-        var gpu_execute_us: u64 = 0;
+        // Read true GPU execution time from prior frame (GPUStartTime/GPUEndTime valid
+        // only after command buffer completion; current frame just submitted, can't read yet).
+        // In steady state prior frame already finished, so this is wait-free.
+        const gpu_execute_us: u64 = self.harvestGpuTimings();
+        self.queueGpuTiming(cmd_buffer.retained());
         if (self.prev_frame_cmd_buffer) |*prev| {
-            gpu_execute_us = prev.gpuElapsedMicros() orelse 0;
-            // backdrop 亮度自适应：逐槽读 staging 求各区域平均 luminance。
-            // 本帧 encode 刚排的 blit 还没执行，用 prev_* 拍存的维度。
-            //
-            // 机会式读回：只有上一帧**已经**完成才读 staging。
-            //
-            // 这里以前是无条件 waitUntilCompleted。注释假设"稳态下上一帧早已
-            // 完成，所以是零等待", GPU 跟得上时确实如此，但一旦一帧的 GPU
-            // 工作超过一帧预算（两万对象的画布实测 260–360ms），它就变成硬性
-            // CPU↔GPU 串行点：主线程每帧都钉在这里等 GPU，UI 完全无法交互，
-            // 而且流水线再也无法重叠，情况只会继续恶化。
-            // backdrop 亮度是纯装饰性的自适应量，晚一帧甚至跳几帧都无所谓，
-            // 绝不值得为它牺牲整条流水线；未完成时沿用上一次的值即可。
+            // Debug staging consumed only after prior submission completes; production luminance
+            // polled before frame encoding. Opportunistic read: only if prior frame already
+            // completed. Never waitUntilCompleted: backdrop brightness is cosmetic and tolerates
+            // late/skipped samples, while blocking would stall the GPU pipeline every frame when
+            // GPU
+            // work exceeds budget.
             const prev_ready = prev.isCompleted();
-            var lum_sum: f64 = 0;
-            var lum_n: usize = 0;
-            for (&self.persistent_gpu.luminance_slots) |*slot| {
-                if (slot.prev_pending and prev_ready) {
-                    if (slot.staging) |*staging| {
-                        slot.value = readAverageLuminance(staging, slot.prev_w, slot.prev_h) orelse slot.value;
-                        if (std.posix.getenv("ZENIT_DEBUG_GLASS") != null) {
-                            std.debug.print("[lumslot] node={d} v={d:.3}\n", .{ slot.key, slot.value orelse -1 });
-                        }
-                    }
-                }
-                slot.prev_pending = slot.cur_pending;
-                slot.prev_w = slot.cur_w;
-                slot.prev_h = slot.cur_h;
-                slot.cur_pending = false;
-                if (slot.value) |v| {
-                    lum_sum += v;
-                    lum_n += 1;
-                }
-            }
-            if (lum_n > 0) self.backdrop_luminance = @floatCast(lum_sum / @as(f64, @floatFromInt(lum_n)));
-            // 排障（ZENIT_DEBUG_GLASS）：glass 中间产物 RGB 均值回读
-            if (std.posix.getenv("ZENIT_DEBUG_GLASS") != null) {
+            // Diagnostics (ZENIT_DEBUG_GLASS): read glass intermediate RGB average.
+            if (@import("zenit_environment").has("ZENIT_DEBUG_GLASS")) {
                 for (&self.persistent_gpu.debug_glass_slots, 0..) |*slot, si| {
                     if (slot.prev_pending and prev_ready) {
                         if (slot.staging) |*staging| {
@@ -664,30 +1026,52 @@ pub const AppRenderer = struct {
             prev.deinit();
             self.prev_frame_cmd_buffer = null;
         }
-        // backdrop 亮度自适应：把实测值递给组件层（GlassBox before_render 平滑）。
-        // 全局均值作 fallback；逐区域列表供组件按自身 rect 就近匹配。
-        cx.backdrop_luminance = self.backdrop_luminance;
-        cx.backdrop_luminance_region_count = 0;
-        for (&self.persistent_gpu.luminance_slots) |*slot| {
-            if (slot.value) |v| {
-                if (slot.key != std.math.maxInt(u32) and cx.backdrop_luminance_region_count < cx.backdrop_luminance_regions.len) {
-                    cx.backdrop_luminance_regions[cx.backdrop_luminance_region_count] = .{
-                        .node_id = slot.key,
-                        .lum = v,
-                    };
-                    cx.backdrop_luminance_region_count += 1;
-                }
-            }
+        // Retain buffer for next frame read (extra retain paired with release above;
+        // cmd_buffer lifetime still managed by this frame's defer deinit).
+        self.prev_frame_cmd_buffer = cmd_buffer.retained();
+        // Frame wrote brightness staging & no in-flight batch: this frame starts new batch,
+        // lock staging before read completes.
+        if (self.lum_batch_cmd_buffer == null) {
+            for (self.persistent_gpu.luminance_slots) |slot| if (slot.cur_pending) {
+                self.lum_batch_cmd_buffer = cmd_buffer.retained();
+                self.persistent_gpu.luminance_locked = true;
+                break;
+            };
         }
 
-        // 留住本帧 buffer 供下一帧读取（额外 retain 一次，与上面的 release 配对；
-        // cmd_buffer 自己的所有权仍由本帧的 defer deinit 负责）。
-        self.prev_frame_cmd_buffer = cmd_buffer.retained();
-
+        if (comptime gpu.backend_kind == .metal) {
+            if (clock_trace_enabled) metal_glass_clock_trace_frame(
+                @ptrCast(cmd_buffer.raw),
+                @ptrCast(surface_texture.drawable),
+                self.frame_count + 1,
+                clock_sample_host_time,
+                clock_sample_frame_time_ms,
+                clock_sample_frame_dt_ms,
+            );
+        }
         surface_texture.preparePresent(&cmd_buffer);
-        cmd_buffer.submit();
+        if (comptime gpu.backend_kind == .d3d12) {
+            try cmd_buffer.submitChecked();
+            if (prefix_len > 0 and gpu.Backend.CommandBuffer.error_count.load(.monotonic) == frame_error_start) {
+                self.background_damage.commit();
+                self.background_valid = true;
+                if (reuse_background) self.background_reuse_count += 1;
+                if (background_update != null) self.background_partial_count += 1;
+            } else if (prefix_len > 0) {
+                self.background_damage.invalidate();
+                self.background_valid = false;
+            }
+            if (frame_copy_ok and frame_cache_enabled and gpu.Backend.CommandBuffer.error_count.load(.monotonic) == frame_error_start) {
+                self.frame_damage.commit();
+                if (damage) |rect| {
+                    if (rect[2] == 0 or rect[3] == 0) self.frame_reuse_count += 1 else self.frame_partial_count += 1;
+                }
+            } else self.frame_damage.invalidate();
+        } else cmd_buffer.submit();
+        submitted = true;
 
-        // E2E 截图：present 前读 drawable 像素。需等 GPU 完成渲染再 getBytes。
+        // E2E screenshot: read drawable pixels before present. Must wait for GPU render
+        // to complete before getBytes.
         if (self.pending_screenshot_path != null) {
             cmd_buffer.waitUntilCompleted();
             self.last_screenshot_ok = self.captureSurfaceToPng(
@@ -700,7 +1084,11 @@ pub const AppRenderer = struct {
         }
 
         if (self.recording_active) {
-            if (self.recording_frame_fn) |record_frame| {
+            if (self.recording_context_fn) |record_frame| {
+                // The Windows callback submits its readback to this same queue;
+                // it polls completion on a later frame and never waits here.
+                if (!record_frame(self.recording_context, &surface_texture.texture)) self.recording_active = false;
+            } else if (self.recording_frame_fn) |record_frame| {
                 // The encoder uses a separate Metal queue. Waiting establishes
                 // an explicit cross-queue ownership boundary for this drawable.
                 cmd_buffer.waitUntilCompleted();
@@ -710,12 +1098,11 @@ pub const AppRenderer = struct {
 
         surface_texture.presentAfterSubmit(&cmd_buffer);
 
-        // 收集帧性能统计
-        const frame_end = std.time.Instant.now() catch null;
-        // FrameStats 此前声明了 wait/acquire/cpu 三个字段却**从不赋值**
-        // （审查报告 §4），三个 timerDelta 结果被 `_ =` 直接丢弃，
-        // 于是 gpu_encode_us 混进了 wait + acquire + CPU encode + 提交，
-        // 读数无法归因。这里补齐拆分。
+        // Collect frame performance statistics.
+        const frame_end = @import("zenit_time").Instant.now(cx.io) catch null;
+        // FrameStats declared wait/acquire/cpu fields but never assigned (review report §4);
+        // three timerDelta results discarded via `_ =`, so gpu_encode_us mixed wait + acquire
+        // + CPU encode + submit. Split here for accurate attribution.
         const encode_us = timerDelta(encode_start, encode_end);
         const flush_us = timerDelta(flush_start, flush_end);
         const wait_us = timerDelta(wait_start, wait_end);
@@ -745,17 +1132,22 @@ pub const AppRenderer = struct {
         self.last_frame_stats = .{
             .layout_us = layout_us,
             .render_gen_us = render_gen_us,
-            // 注意：这仍是"CPU 侧编码+提交"墙钟，**不是 GPU 执行时间**,
-            // 真正的 GPU 时间需要 command buffer timestamp / counter sample，
-            // 尚未接入（审查报告 §4 待办）。
+            // Note: still CPU-side encode+submit wall-clock, not GPU execution time.
+            // True GPU time needs command buffer timestamp/counter (pending, review §4).
             .gpu_encode_us = timerDelta(render_end, frame_end),
             .wait_for_frame_us = wait_us,
             .acquire_texture_us = acquire_us,
-            // 纯 CPU 管线：总耗时扣掉阻塞等待与 drawable 获取。
+            // Pure CPU pipeline: total minus blocking waits and drawable acquisition.
             .cpu_frame_us = total_us -| wait_us -| acquire_us,
             .gpu_execute_us = gpu_execute_us,
             .encode_us = encode_us,
             .flush_us = flush_us,
+            .glass_count = render.backdrop_blur.perf.glass_count,
+            .glass_us = render.backdrop_blur.perf.glass_ns / std.time.ns_per_us,
+            .texture_creates = render.offscreen_texture.perf_texture_creates,
+            .render_passes = if (comptime @hasDecl(gpu.Backend.CommandEncoder, "perf_counters")) gpu.Backend.CommandEncoder.perf_counters.render_passes else 0,
+            .blit_passes = if (comptime @hasDecl(gpu.Backend.CommandEncoder, "perf_counters")) gpu.Backend.CommandEncoder.perf_counters.blit_passes else 0,
+            .pass_native_us = if (comptime @hasDecl(gpu.Backend.CommandEncoder, "perf_counters")) gpu.Backend.CommandEncoder.perf_counters.native_ns / std.time.ns_per_us else 0,
             .path_draw_calls = path_draws,
             .retained_hits = enc.retained_hits,
             .retained_misses = enc.retained_misses,
@@ -772,21 +1164,22 @@ pub const AppRenderer = struct {
             .command_count = @intCast(cx.lowerForEncoderPaintTable().len),
             .total_frame_us = total_us,
         };
+        render.backdrop_blur.perf = .{};
+        render.offscreen_texture.perf_texture_creates = 0;
+        if (comptime @hasDecl(gpu.Backend.CommandEncoder, "perf_counters")) gpu.Backend.CommandEncoder.perf_counters = .{};
 
-        // 只有走到这里的帧才是"真渲染过"的帧，idle 跳帧不会到达此处，
-        // 因此环里不会混入近零样本（否则 P95 会被稀释成假绿）。
+        // Only frames reaching here rendered; idle skip doesn't, so near-zero samples
+        // won't dilute P95.
         self.timing_ring.push(.{
             .gpu_execute_us = self.last_frame_stats.gpu_execute_us,
             .cpu_frame_us = self.last_frame_stats.cpu_frame_us,
             .total_frame_us = self.last_frame_stats.total_frame_us,
         });
 
-        // DevTools（Cx 侧）帧性能回填。devtools panel 的 Performance 页读的是
-        // target Cx 上的 frame_*_history / perf.layout_us / perf.render_us,
-        // 这条链在从下游编辑器抽出时断了（下游原本由自己的窗口渲染代码喂），
-        // 缺了它面板 FPS 恒 0、Timing 恒 0。写点必须在 cx.render() 之后：
-        // perf.resetFrame() 发生在 render() 开头，这里写的值可存活到下一帧，
-        // 供 DevTools 窗口跨 Cx 读取。
+        // DevTools (Cx side) frame perf backfill. Performance panel reads frame_*_history /
+        // perf.layout_us / perf.render_us from target Cx; chain broke when extracted from
+        // downstream editor. Write after cx.render(): perf.resetFrame() clears at render start, so
+        // values here survive to next frame for DevTools to read across Cx.
         cx.frame_perf.pushFrameTotalUs(total_us);
         cx.frame_perf.acquire.push(acquire_us);
         cx.perf.layout_us = layout_us;
@@ -802,37 +1195,284 @@ pub const AppRenderer = struct {
             self.prev_frame_start = fs;
         }
 
+        if (comptime @hasField(@TypeOf(cx.*), "glass_encoded_owners")) {
+            const n = @min(enc.blur_applied_count, cx.glass_encoded_owners.len);
+            // A glass drawn for the first time gets one more frame: its first-frame family probe
+            // only runs once it sees the glass encoded (it does not hold frames before that).
+            const newly_drawn = for (enc.blur_applied_owners[0..n]) |id| {
+                if (std.mem.indexOfScalar(u32, cx.glass_encoded_owners[0..cx.glass_encoded_count], id) == null) break true;
+            } else false;
+            @memcpy(cx.glass_encoded_owners[0..n], enc.blur_applied_owners[0..n]);
+            cx.glass_encoded_count = n;
+            if (newly_drawn) cx.needs_redraw = true;
+        }
         self.total_retained_hits += enc.retained_hits;
         self.total_retained_misses += enc.retained_misses;
         self.total_retained_partial_repaints += enc.retained_partial_repaints;
         self.frame_count += 1;
     }
 
-    /// 获取上一帧的性能统计
-    /// backdrop 亮度自适应：读 shared staging（BGRA8 sRGB 字节）求平均
-    /// linear luminance。失败返回 null（保持旧值）。
-    fn readAverageLuminance(staging: *const gpu.Backend.Texture, w: u32, h: u32) ?f32 {
-        if (w == 0 or h == 0 or w > 64 or h > 64) return null;
-        var buf: [64 * 64 * 4]u8 = undefined;
-        const bpr = w * 4;
-        staging.readBgra8(w, h, &buf, bpr) catch return null;
-        if (std.posix.getenv("ZENIT_DEBUG_GLASS") != null) {
-            std.debug.print("[lum] read {d}x{d} px0=({d},{d},{d},{d}) pxmid=({d},{d},{d},{d})\n", .{ w, h, buf[0], buf[1], buf[2], buf[3], buf[(w * h / 2) * 4], buf[(w * h / 2) * 4 + 1], buf[(w * h / 2) * 4 + 2], buf[(w * h / 2) * 4 + 3] });
+    /// Release completed command references before DXGI recreates back buffers.
+    /// Waiting alone leaves the retained statistics/readback command alive.
+    pub fn prepareSurfaceResize(self: *AppRenderer, cx: anytype) void {
+        self.frame_sync.drain(FRAME_BUFFER_COUNT);
+        _ = self.refreshLuminance(cx);
+        // After drain, brightness batch consumed; explicit release if still retained:
+        // D3D12 retained commands hold resource references until deinit, blocking ResizeBuffers.
+        if (self.lum_batch_cmd_buffer) |*batch| {
+            batch.deinit();
+            self.lum_batch_cmd_buffer = null;
+            self.persistent_gpu.luminance_locked = false;
         }
-        var sum: f64 = 0;
-        var i: usize = 0;
-        const n = @as(usize, w) * @as(usize, h);
-        while (i < n) : (i += 1) {
-            const b = srgbByteToLinear(buf[i * 4 + 0]);
-            const g = srgbByteToLinear(buf[i * 4 + 1]);
-            const r = srgbByteToLinear(buf[i * 4 + 2]);
-            sum += 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        if (self.prev_frame_cmd_buffer) |*previous| {
+            previous.deinit();
+            self.prev_frame_cmd_buffer = null;
         }
-        return @floatCast(sum / @as(f64, @floatFromInt(n)));
+        self.dropGpuTimings();
     }
 
-    /// 排障：staging 的原始 sRGB 字节均值（BGRA -> 返回 [r,g,b]，0..255），
-    /// 与截图 PNG 均值同一量纲，直接对比。
+    /// Windows host idle-poll/pre-resize drain: luminance read unified via
+    /// pollBackdropLuminance; returns whether measurement changed.
+    pub fn refreshLuminance(self: *AppRenderer, cx: anytype) bool {
+        return self.pollBackdropLuminance(cx);
+    }
+
+    /// Get last frame perf stats. Backdrop brightness adaptation: read shared staging (BGRA8 sRGB
+    /// bytes) compute average linear luminance. Returns null on failure (retain old value). Consume
+    /// completed staging copies even while window is idle. Reading before encoding another frame
+    /// also avoids racing the next staging write. Changed measurement requests one frame; unchanged
+    /// values permit idle.
+    pub fn pollBackdropLuminance(self: *AppRenderer, cx: anytype) bool {
+        comptime {
+            const Slot = @TypeOf(self.persistent_gpu.luminance_slots[0]);
+            const per_slot = 1 + @typeInfo(@FieldType(Slot, "shape_keys")).array.len;
+            if (@typeInfo(@TypeOf(cx.backdrop_luminance_regions)).array.len < self.persistent_gpu.luminance_slots.len * per_slot)
+                @compileError("Cx.backdrop_luminance_regions 装不下全部亮度槽的读数");
+        }
+        var changed = false;
+        // Readings arrive with the batch; the published region set is
+        // recomputed on every poll because it also changes without a batch:
+        // a hidden glass writes no staging but must leave the list.
+        if (self.lum_batch_cmd_buffer) |*batch| if (batch.isCompleted()) {
+            batch.deinit();
+            self.lum_batch_cmd_buffer = null;
+            self.persistent_gpu.luminance_locked = false;
+            for (&self.persistent_gpu.luminance_slots) |*slot| {
+                if (!slot.cur_pending) continue;
+                if (slot.staging) |*staging| {
+                    var buf: [64 * 64 * 4]u8 = undefined;
+                    if (readLuminanceBytes(staging, slot.cur_w, slot.cur_h, &buf)) {
+                        const wf: f32 = @floatFromInt(slot.cur_w);
+                        const hf: f32 = @floatFromInt(slot.cur_h);
+                        // The staging holds the whole padded capture: measure
+                        // only the glass's own rect (content_uv), as each
+                        // GlassGroup shape does below.
+                        const cu = slot.content_uv;
+                        const cx0: u32 = @intFromFloat(@floor(std.math.clamp(cu[0] * wf, 0, wf - 1)));
+                        const cy0: u32 = @intFromFloat(@floor(std.math.clamp(cu[1] * hf, 0, hf - 1)));
+                        const cx1: u32 = @max(cx0 + 1, @as(u32, @intFromFloat(@ceil(std.math.clamp((cu[0] + cu[2]) * wf, 0, wf)))));
+                        const cy1: u32 = @max(cy0 + 1, @as(u32, @intFromFloat(@ceil(std.math.clamp((cu[1] + cu[3]) * hf, 0, hf)))));
+                        const value = averageLuminanceIn(&buf, slot.cur_w, cx0, cy0, cx1, cy1);
+                        if (slot.value == null or @abs(value.linear - slot.value.?) > 0.004) changed = true;
+                        slot.value = value.linear;
+                        slot.value_srgb = value.srgb;
+                        // GlassGroup: each member shape averages its sub-rect within one staging
+                        // texture.
+                        slot.shape_value_count = slot.shape_count;
+                        for (0..slot.shape_count) |i| {
+                            const uv = slot.shape_uv[i];
+                            const x0: u32 = @intFromFloat(@floor(std.math.clamp(uv[0] * wf, 0, wf - 1)));
+                            const y0: u32 = @intFromFloat(@floor(std.math.clamp(uv[1] * hf, 0, hf - 1)));
+                            const x1: u32 = @max(x0 + 1, @as(u32, @intFromFloat(@ceil(std.math.clamp(uv[2] * wf, 0, wf)))));
+                            const y1: u32 = @max(y0 + 1, @as(u32, @intFromFloat(@ceil(std.math.clamp(uv[3] * hf, 0, hf)))));
+                            const sv = averageLuminanceIn(&buf, slot.cur_w, x0, y0, x1, y1);
+                            if (@abs(sv.linear - slot.shape_value[i]) > 0.004) changed = true;
+                            slot.shape_value[i] = sv.linear;
+                            slot.shape_value_srgb[i] = sv.srgb;
+                        }
+                    }
+                }
+                slot.cur_pending = false;
+            }
+        };
+        var sum: f64 = 0;
+        var count: usize = 0;
+        for (self.persistent_gpu.luminance_slots) |slot| {
+            if (!self.luminanceSlotLive(slot)) continue;
+            if (slot.value) |value| {
+                sum += value;
+                count += 1;
+            }
+        }
+        if (count > 0) self.backdrop_luminance = @floatCast(sum / @as(f64, @floatFromInt(count)));
+        cx.backdrop_luminance = self.backdrop_luminance;
+        // A changed region set (a slot reused by another owner, with a reading
+        // within the 0.004 band of the old one) must also wake the consumers.
+        const previous_count = cx.backdrop_luminance_region_count;
+        var previous_ids: [cx.backdrop_luminance_regions.len]u32 = undefined;
+        for (0..previous_count) |i| previous_ids[i] = cx.backdrop_luminance_regions[i].node_id;
+        cx.backdrop_luminance_region_count = 0;
+        for (self.persistent_gpu.luminance_slots) |slot| {
+            if (!self.luminanceSlotLive(slot)) continue;
+            if (slot.value) |value| {
+                if (slot.key != std.math.maxInt(u32) and cx.backdrop_luminance_region_count < cx.backdrop_luminance_regions.len) {
+                    cx.backdrop_luminance_regions[cx.backdrop_luminance_region_count] = .{ .node_id = slot.key, .lum = value, .lum_srgb = slot.value_srgb orelse value };
+                    cx.backdrop_luminance_region_count += 1;
+                }
+                for (0..slot.shape_value_count) |i| {
+                    if (cx.backdrop_luminance_region_count >= cx.backdrop_luminance_regions.len) break;
+                    if (slot.shape_keys[i] == std.math.maxInt(u32)) continue;
+                    cx.backdrop_luminance_regions[cx.backdrop_luminance_region_count] = .{ .node_id = slot.shape_keys[i], .lum = slot.shape_value[i], .lum_srgb = slot.shape_value_srgb[i] };
+                    cx.backdrop_luminance_region_count += 1;
+                }
+            }
+        }
+        if (cx.backdrop_luminance_region_count != previous_count) changed = true;
+        for (0..@min(cx.backdrop_luminance_region_count, previous_count)) |i| {
+            if (cx.backdrop_luminance_regions[i].node_id != previous_ids[i]) changed = true;
+        }
+        if (changed) cx.needs_redraw = true;
+        return changed;
+    }
+
+    /// Slots with an owner publish a region; `scanPaintTable` retires the
+    /// owners absent from the frame's paint table, so a hidden glass leaves
+    /// the published set on the next poll.
+    fn luminanceSlotLive(self: *const AppRenderer, slot: anytype) bool {
+        _ = self;
+        return slot.key != std.math.maxInt(u32);
+    }
+
+    /// One pass over this frame's lowered paint table for the two signals
+    /// only the full table carries. "Encoded this frame" is not one: the
+    /// encoder reuses a flat prefix and replays cached layers, so an
+    /// unchanged visible glass is never re-encoded.
+    /// - Glass owners present in the table keep their luminance slot; the
+    ///   others retire (a hidden or unmounted glass must leave the published
+    ///   region set, as the legacy painter did). Readings arrive on the next
+    ///   poll, which sees the smaller set and wakes the consumers.
+    /// - Film grain is reseeded per encoded frame (paint fingerprint carries
+    ///   the frame salt, so damage and retained layers repaint it), but the
+    ///   grain itself has no hook to ask for frames: a visible grain asks
+    ///   here. Basic quality draws no noise and stays idle.
+    fn scanPaintTable(self: *AppRenderer, cx: anytype) void {
+        const none = std.math.maxInt(u32);
+        var seen = @as([self.persistent_gpu.luminance_slots.len]bool, @splat(false));
+        var any_owner = false;
+        for (self.persistent_gpu.luminance_slots) |slot| any_owner = any_owner or slot.key != none;
+        var grain = false;
+        for (cx.lowerForEncoderPaintTable()) |it| {
+            if (any_owner and it.kind == .control and it.control_kind == .begin_blur_layer and it.glass_owner_id != none) {
+                for (self.persistent_gpu.luminance_slots, 0..) |slot, i| {
+                    if (slot.key == it.glass_owner_id) seen[i] = true;
+                }
+            }
+            if (it.noise_mode == 2 and it.noise_intensity > 0) grain = true;
+        }
+        var retired = false;
+        for (&self.persistent_gpu.luminance_slots, seen) |*slot, live| {
+            if (slot.key == none or live) continue;
+            slot.key = none;
+            slot.value = null;
+            slot.value_srgb = null;
+            slot.shape_count = 0;
+            slot.shape_value_count = 0;
+            // An in-flight readback of the retired owner is dropped: reading
+            // it into a dead slot would only raise a spurious `changed`.
+            slot.cur_pending = false;
+            slot.prev_pending = false;
+            retired = true;
+        }
+        if (retired or (grain and self.visual_quality != .basic)) cx.needs_redraw = true;
+    }
+
+    /// Records the GPU time of every pending frame that has completed, in
+    /// submission order (stops at the first one still running). Returns the
+    /// newest recorded interval, 0 when none completed since the last call.
+    fn harvestGpuTimings(self: *AppRenderer) u64 {
+        var latest: u64 = 0;
+        while (self.gpu_timing_pending[0]) |*oldest| {
+            if (!oldest.isCompleted()) break;
+            if (oldest.gpuElapsedMicros()) |elapsed| {
+                latest = elapsed;
+                self.gpu_timing_ring.push(.{ .gpu_execute_us = elapsed });
+            }
+            oldest.deinit();
+            std.mem.copyForwards(?gpu.Backend.CommandBuffer, self.gpu_timing_pending[0 .. self.gpu_timing_pending.len - 1], self.gpu_timing_pending[1..]);
+            self.gpu_timing_pending[self.gpu_timing_pending.len - 1] = null;
+        }
+        return latest;
+    }
+
+    /// Appends a retained submitted frame; when full the oldest is released
+    /// unread (its sample is lost, never waited for).
+    fn queueGpuTiming(self: *AppRenderer, cmd: gpu.Backend.CommandBuffer) void {
+        const slots = &self.gpu_timing_pending;
+        if (slots[slots.len - 1] != null) {
+            slots[0].?.deinit();
+            std.mem.copyForwards(?gpu.Backend.CommandBuffer, slots[0 .. slots.len - 1], slots[1..]);
+            slots[slots.len - 1] = null;
+        }
+        for (slots) |*slot| if (slot.* == null) {
+            slot.* = cmd;
+            return;
+        };
+    }
+
+    /// Releases pending timing references (they hold back buffers that block
+    /// ResizeBuffers, and must go before teardown).
+    fn dropGpuTimings(self: *AppRenderer) void {
+        for (&self.gpu_timing_pending) |*slot| if (slot.*) |*cmd| {
+            cmd.deinit();
+            slot.* = null;
+        };
+    }
+
+    pub fn hasPendingBackdropLuminance(self: *const AppRenderer) bool {
+        for (self.persistent_gpu.luminance_slots) |slot| {
+            if (slot.cur_pending) return true;
+        }
+        return false;
+    }
+
+    const AverageLuminance = struct { linear: f32, srgb: f32 };
+    fn readLuminanceBytes(staging: *const gpu.Backend.Texture, w: u32, h: u32, buf: *[64 * 64 * 4]u8) bool {
+        if (w == 0 or h == 0 or w > 64 or h > 64) return false;
+        const bpr = w * 4;
+        staging.readBgra8(w, h, buf, bpr) catch return false;
+        if (@import("zenit_environment").has("ZENIT_DEBUG_GLASS")) {
+            std.debug.print("[lum] read {d}x{d} px0=({d},{d},{d},{d}) pxmid=({d},{d},{d},{d})\n", .{ w, h, buf[0], buf[1], buf[2], buf[3], buf[(w * h / 2) * 4], buf[(w * h / 2) * 4 + 1], buf[(w * h / 2) * 4 + 2], buf[(w * h / 2) * 4 + 3] });
+        }
+        return true;
+    }
+
+    /// Sub-rect [x0,x1)x[y0,y1) average luminance: linear light + sRGB domain.
+    fn averageLuminanceIn(buf: *const [64 * 64 * 4]u8, w: u32, x0: u32, y0: u32, x1: u32, y1: u32) AverageLuminance {
+        var sum: f64 = 0;
+        var sum_srgb: f64 = 0;
+        var n: usize = 0;
+        var y = y0;
+        while (y < y1) : (y += 1) {
+            var x = x0;
+            while (x < x1) : (x += 1) {
+                const i = (@as(usize, y) * @as(usize, w) + @as(usize, x)) * 4;
+                const b = srgbByteToLinear(buf[i + 0]);
+                const g = srgbByteToLinear(buf[i + 1]);
+                const r = srgbByteToLinear(buf[i + 2]);
+                sum += 0.2126 * r + 0.7152 * g + 0.0722 * b;
+                // Encoded-domain mean: the native family switch thresholds were
+                // measured as sRGB means (black/white coverage cases diverge
+                // strongly between linear and encoded means).
+                sum_srgb += (0.2126 * @as(f64, @floatFromInt(buf[i + 2])) + 0.7152 * @as(f64, @floatFromInt(buf[i + 1])) + 0.0722 * @as(f64, @floatFromInt(buf[i + 0]))) / 255.0;
+                n += 1;
+            }
+        }
+        const nf = @as(f64, @floatFromInt(@max(n, 1)));
+        return .{ .linear = @floatCast(sum / nf), .srgb = @floatCast(sum_srgb / nf) };
+    }
+
+    /// Diagnostics: staging raw sRGB byte average (BGRA -> return [r,g,b], 0..255),
+    /// same dimension as screenshot PNG average for direct comparison.
     fn readAverageRgb(staging: *const gpu.Backend.Texture, w: u32, h: u32) ?[3]f64 {
         if (w == 0 or h == 0 or w > 64 or h > 64) return null;
         var buf: [64 * 64 * 4]u8 = undefined;
@@ -862,32 +1502,38 @@ pub const AppRenderer = struct {
         return self.last_frame_stats;
     }
 
-    /// 渲染一帧，手动控制模式
-    ///
-    /// 不使用 Cx，允许手动积累渲染命令后提交。
-    /// 返回 encoder 供外部使用。
+    /// Render one frame, manual control mode. No Cx use; accumulate render commands
+    /// manually then submit. Returns encoder for external use.
     pub fn beginFrame(self: *AppRenderer, viewport_width: f32, viewport_height: f32, scale: f32) RenderCommandEncoder {
         var enc = self.getEncoder();
         enc.beginFrame(viewport_width, viewport_height, scale);
         return enc;
     }
 
-    /// 销毁
+    /// Destroy.
     pub fn deinit(self: *AppRenderer) void {
-        // 等待所有 in-flight 帧完成，防止销毁时 GPU 仍在读取 buffer
+        self.frame_damage.deinit(self.allocator);
+        self.background_damage.deinit(self.allocator);
+        // Wait for all in-flight frames to complete, prevent GPU reading buffer during deinit.
         self.frame_sync.drain(FRAME_BUFFER_COUNT);
-        // 释放为读 GPU 时间戳而额外 retain 的上一帧 command buffer
-        // （不放这里会漏掉最后一帧那一个）。
+        if (self.background_tex) |*tex| tex.destroy();
+        // Release last frame's command buffer (retained for GPU timestamp reads;
+        // omitting here leaks the final frame).
         if (self.prev_frame_cmd_buffer) |*prev| {
             prev.deinit();
             self.prev_frame_cmd_buffer = null;
         }
-        // 池纹理与持久 PSO 可能被最后几帧的 command buffer 引用，必须在 drain 之后释放
+        self.dropGpuTimings();
+        if (self.lum_batch_cmd_buffer) |*batch| {
+            batch.deinit();
+            self.lum_batch_cmd_buffer = null;
+        }
+        // Pooled textures and persistent PSOs may be referenced by final frames'
+        // command buffers; release after drain.
         self.offscreen_pool.deinit();
         self.persistent_gpu.deinit();
-        // test-harness 模式（retain_present_copy）下的窗口尺寸 present 副本：
-        // 此前只在 ensureRetainedTexture 换尺寸时销毁，关窗即泄漏一整张
-        // 窗口大小的 BGRA 纹理（2880×1800 ≈ 20 MB）。
+        // Test-harness mode present copy (retain_present_copy) of window size: previously
+        // destroyed only on resize, leaked full BGRA texture on close (~20MB at 2880x1800).
         if (self.retained_tex) |*tex| tex.destroy();
         self.retained_tex = null;
         if (self.fonts) |fonts| {
@@ -899,13 +1545,14 @@ pub const AppRenderer = struct {
         self.icon_renderer.deinit();
         self.image_renderer.deinit();
         self.sdf_renderer.deinit();
-        // drain 已平衡 slot，此时 release 安全（多窗口反复开关不再累积泄漏）
+        // Drain balanced slots; safe to release now (multi-window repeated open/close
+        // no longer accumulates leaks).
         self.frame_sync.deinit();
     }
 };
 
-/// 计算两个时间点之间的微秒差值
-fn timerDelta(start: ?std.time.Instant, end: ?std.time.Instant) u64 {
+/// Calculate microsecond delta between two time points.
+fn timerDelta(start: ?@import("zenit_time").Instant, end: ?@import("zenit_time").Instant) u64 {
     if (start) |s| {
         if (end) |e| {
             return e.since(s) / 1000; // ns → us

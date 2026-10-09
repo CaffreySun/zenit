@@ -1,6 +1,6 @@
-/// ScrollArea 滚动条
+/// ScrollArea scrollbar.
 ///
-/// scrollbarBeforeRender + scrollbar event handlers + metrics 计算 + 拖拽
+/// scrollbarBeforeRender + scrollbar event handlers + metrics calculation + dragging.
 const std = @import("std");
 const core = @import("../../core.zig");
 const Node = core.Node;
@@ -41,7 +41,7 @@ fn syncScrollbarFrame(node: *Node, x: f32, y: f32, w: f32, h: f32) bool {
     return rect_changed;
 }
 
-/// 每帧渲染前: bonus 衰减 + 更新滚动条
+/// Before each frame render: bonus decay + update scrollbar.
 pub fn scrollbarBeforeRender(container: *Node) void {
     if (container.behavior.events.on_event != scrollEventHandler) return;
     const ctx: *ScrollEventCtx = @ptrCast(@alignCast(container.behavior.events.event_context orelse return));
@@ -49,10 +49,11 @@ pub fn scrollbarBeforeRender(container: *Node) void {
     const content = ctx.content orelse return;
     const scrollbar = ctx.scrollbar orelse return;
 
-    // 全局 hook 读 rect。
+    // Global hook reads rect.
     const cont_r = container.rectFromWorldOrFallback();
     const content_r = content.rectFromWorldOrFallback();
-    // 更新 viewport/content 尺寸（仅当 rect 有效时更新，避免首帧 rect=0 覆盖 mount 初始值）
+    // Update viewport/content size (only when rect valid, avoid first-frame rect=0 overwriting
+    // mount init).
     if (cont_r.h > 0) {
         state.viewport_height = cont_r.h - container.style.padding.vertical();
     }
@@ -66,7 +67,7 @@ pub fn scrollbarBeforeRender(container: *Node) void {
         if (content_r.w > 0) state.content_width = content_r.w;
     }
 
-    // 窗口 resize 后，maxScroll 可能变小甚至归零 -> re-clamp 防止卡住
+    // After window resize, maxScroll may shrink or zero -> re-clamp prevent stuck.
     const max_y = state.maxScrollY();
     if (state.scroll_y > max_y) {
         state.scroll_y = max_y;
@@ -82,10 +83,11 @@ pub fn scrollbarBeforeRender(container: *Node) void {
 
     const now_ms = render_engine.current_frame_time_ms;
 
-    // 收集重绘需求，最后统一调用一次 markRenderDirty，避免多次向上冒泡标记
+    // Collect redraw requests, unified single markRenderDirty call at end, avoid multiple upward
+    // bubble marks.
     var needs_redraw = false;
 
-    // 回弹动画（绝对时间戳 + duration 缓动驱动）
+    // Spring-back animation (absolute timestamp + duration easing drive).
     if (state.bonus_y != 0 or state.bounce_active_y) {
         const old_ty = content.style.translate_y;
         state.tickBonus(now_ms);
@@ -102,7 +104,8 @@ pub fn scrollbarBeforeRender(container: *Node) void {
         needs_redraw = true;
     }
 
-    // 回弹动画期间启用文本稳定渲染（避免子像素变体在果冻动画中闪动）
+    // During spring-back animation enable text stable rendering (prevent subpixel variants flashing
+    // in jello animation).
     const stabilize_text = state.bonus_y != 0 or state.bounce_active_y or
         state.bonus_x != 0 or state.bounce_active_x;
     if (content.frame_state.state_bits.flags.text_stabilize_subtree != stabilize_text) {
@@ -110,7 +113,7 @@ pub fn scrollbarBeforeRender(container: *Node) void {
         needs_redraw = true;
     }
 
-    // 拖拽中保持滚动条可见
+    // Keep scrollbar visible during drag.
     if (state.scrollbar_dragging) {
         state.scrollbar_fade.onActivity();
         needs_redraw = true;
@@ -120,7 +123,7 @@ pub fn scrollbarBeforeRender(container: *Node) void {
         needs_redraw = true;
     }
 
-    // 滚动条淡出
+    // Scrollbar fade out.
     const old_v_visible = state.needsScrollbar() and state.scrollbar_fade.opacity > 0;
     const old_h_visible = state.needsHScrollbar() and state.scrollbar_fade_h.opacity > 0;
     const scrollbar_fade_changed = state.tickScrollbar();
@@ -135,7 +138,7 @@ pub fn scrollbarBeforeRender(container: *Node) void {
     }
     const scrollbar_h = ctx.scrollbar_h orelse return;
 
-    // ---- 垂直滚动条更新 ----
+    // ---- Vertical scrollbar update ----
     if (!v_visible) {
         const cur = scrollbar.rectFromWorldOrFallback();
         const rect_changed = cur.w != 0 or cur.h != 0;
@@ -153,8 +156,8 @@ pub fn scrollbarBeforeRender(container: *Node) void {
 
         scrollbar.style.width = .{ .px = bar_width };
         scrollbar.style.height = .{ .px = bar_h };
-        // 滚动条吸附在容器边缘，尽量减少对内容区的遮挡。
-        // 同时写 rect（当前帧立即生效）和 margin（layout 重跑时保持正确）。
+        // Scrollbar sticky to container edge, minimize content obstruction. Write both rect
+        // (immediate this frame) and margin (maintain on layout rerun).
         const bar_x_local = cont_r.w - bar_width - ScrollbarVisual.edge_inset;
         const bar_y_local = container.style.padding.top + bar_y;
         const rect_changed = syncScrollbarFrame(scrollbar, bar_x_local, bar_y_local, bar_width, bar_h);
@@ -173,7 +176,7 @@ pub fn scrollbarBeforeRender(container: *Node) void {
         scrollbar.setBackgroundRaw(Color.rgba(thumb.r, thumb.g, thumb.b, alpha));
     }
 
-    // ---- 水平滚动条更新 ----
+    // ---- Horizontal scrollbar update ----
     if (!h_visible) {
         const cur = scrollbar_h.rectFromWorldOrFallback();
         const rect_changed = cur.w != 0 or cur.h != 0;
@@ -192,7 +195,7 @@ pub fn scrollbarBeforeRender(container: *Node) void {
 
         scrollbar_h.style.width = .{ .px = bar_w };
         scrollbar_h.style.height = .{ .px = bar_height };
-        // 水平条吸附在底边，减少遮挡。
+        // Horizontal sticky to bottom edge, reduce obstruction.
         const bar_x_local = container.style.padding.left + bar_x;
         const bar_y_local = cont_r.h - bar_height - ScrollbarVisual.edge_inset;
         const rect_changed = syncScrollbarFrame(scrollbar_h, bar_x_local, bar_y_local, bar_w, bar_height);
@@ -212,7 +215,8 @@ pub fn scrollbarBeforeRender(container: *Node) void {
     }
 }
 
-/// 滚动条节点的事件处理器，hitTest 直接命中 scrollbar thumb，坐标天然正确
+/// Event handler on scrollbar node, hitTest direct hit scrollbar thumb, coordinates naturally
+/// correct.
 pub fn scrollbarEventHandler(event: Event, context: ?*anyopaque) EventResult {
     const ctx: *const ScrollEventCtx = @ptrCast(@alignCast(context.?));
     const state = ctx.state;
@@ -221,7 +225,7 @@ pub fn scrollbarEventHandler(event: Event, context: ?*anyopaque) EventResult {
 
     switch (event) {
         .mouse_down => |down| {
-            // 直接开始拖拽，不区分 thumb/track
+            // Begin drag immediately, don't distinguish thumb/track.
             state.scrollbar_dragging = true;
             state.scrollbar_last_mouse_y = down.y;
             state.scrollbar_hovered = true;
@@ -234,7 +238,7 @@ pub fn scrollbarEventHandler(event: Event, context: ?*anyopaque) EventResult {
         .mouse_up => {
             if (state.scrollbar_dragging) {
                 state.scrollbar_dragging = false;
-                state.onScrollActivity(); // 触发重绘，更新 scrollbar.rect
+                state.onScrollActivity(); // Trigger redraw, update scrollbar.rect.
                 return .stop;
             }
             return .ignored;
@@ -254,7 +258,7 @@ pub fn scrollbarEventHandler(event: Event, context: ?*anyopaque) EventResult {
     }
 }
 
-/// 水平滚动条节点的事件处理器
+/// Event handler on horizontal scrollbar node.
 pub fn scrollbarHEventHandler(event: Event, context: ?*anyopaque) EventResult {
     const ctx: *const ScrollEventCtx = @ptrCast(@alignCast(context.?));
     const state = ctx.state;
@@ -295,7 +299,7 @@ pub fn scrollbarHEventHandler(event: Event, context: ?*anyopaque) EventResult {
     }
 }
 
-// ========== Metrics 计算 ==========
+// ========== Metrics calculation ==========
 
 fn overscrollThumbShrinkFactor(raw_overscroll: f32, viewport: f32) f32 {
     if (raw_overscroll <= 0 or viewport <= 0) return 0;
@@ -359,9 +363,9 @@ pub fn computeHorizontalScrollbarMetrics(state: *const ScrollState, v_clearance:
     return .{ .pos = pinned_x, .length = clamped_w };
 }
 
-// ========== 拖拽 ==========
+// ========== Drag ==========
 
-/// 鼠标像素增量 -> scroll_y 增量（track 像素 : content 像素 的比例换算）
+/// Mouse pixel delta -> scroll_y delta (track pixels : content pixels ratio conversion).
 fn applyScrollbarDrag(state: *ScrollState, content: *Node, mouse_dy: f32) void {
     const bar_h = state.scrollbarHeight();
     const track_h = state.viewport_height - bar_h - 4;
@@ -374,7 +378,7 @@ fn applyScrollbarDrag(state: *ScrollState, content: *Node, mouse_dy: f32) void {
     content.markCompositeAnimFrameDirty();
 }
 
-/// 鼠标像素增量 -> scroll_x 增量（track 像素 : content 像素 的比例换算）
+/// Mouse pixel delta -> scroll_x delta (track pixels : content pixels ratio conversion).
 fn applyHScrollbarDrag(state: *ScrollState, content: *Node, mouse_dx: f32) void {
     const bar_w = state.hScrollbarWidth();
     const track_w = state.viewport_width - bar_w - 4;

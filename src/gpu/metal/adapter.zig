@@ -1,6 +1,6 @@
-/// Metal Adapter 实现
+/// Metal Adapter implementation
 ///
-/// 代表一个 Metal 设备，用于查询能力和创建 Device
+/// Represents a Metal device, used to query capabilities and create Device
 const std = @import("std");
 const gpu = @import("../gpu.zig");
 const mtl = @import("metal_bindings.zig");
@@ -13,7 +13,7 @@ pub const Adapter = struct {
     pub fn requestDevice(self: *Adapter, allocator: std.mem.Allocator, desc: gpu.DeviceDescriptor) !struct { device: Device, queue: Queue } {
         _ = allocator;
 
-        // 创建命令队列
+        // Create command queue
         const command_queue = mtl.metal_device_new_command_queue(self.device) orelse {
             return error.FailedToCreateCommandQueue;
         };

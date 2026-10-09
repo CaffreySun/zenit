@@ -1,198 +1,351 @@
-/// Menu Component
+/// Menu component: command set expanding from a trigger element (dropdown / context menu),
+/// Popover-based.
 ///
-/// 上下文菜单 / 下拉菜单，基于 Popover 实现
-///
-/// 特性:
-/// - 菜单项 + 分隔符
-/// - 键盘导航 (ArrowUp/Down/Enter/Escape)
-/// - 快捷键提示
-/// - danger 样式
-/// - disabled 项
+/// Features:
+/// - Menu items + separators, optional icon/shortcut hint/danger style/disabled state
+/// - Two (compatible) receive modes: per-item `on_click` callback, or whole `on_select` with item
+///   id
+/// - items from signal / derived: a new array rebuilds items
+/// - Keyboard navigation (ArrowUp/Down/Enter/Escape)
+/// - Optional max height (overflow scrolls in panel)
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const core = @import("../../core.zig");
+const view = @import("../../view.zig");
 const Cx = core.Cx;
 const Node = core.Node;
 const box = core.box;
 const Color = core.Color;
 const theme = core.theme;
-const Padding = core.Padding;
-const Signal = core.Signal;
-const Scope = @import("../../reactive.zig").Scope;
+const reactive = @import("../../reactive.zig");
+const Signal = reactive.Signal;
+const Scope = reactive.Scope;
+const Source = reactive.Source;
+const Model = reactive.Model;
+const Handler = core.Handler;
 const events = @import("../../events.zig");
 const Event = events.Event;
 const EventResult = events.EventResult;
 const KeyCode = events.KeyCode;
 const Modifiers = events.Modifiers;
 const popover_mod = @import("../popover/mod.zig");
+const svg_assets = @import("../../svg_assets.zig");
+const bind_mod = @import("../../bind.zig");
 
-// 样式层（recipe + 具名样式函数）在 styles.zig；这里重导出保持公共 API 不变
-const menu_navigation = @import("../menu_navigation.zig");
-const styles = @import("styles.zig");
-pub const MenuItemRecipe = styles.MenuItemRecipe;
-const menuListStyle = styles.menuListStyle;
-const menuSeparatorStyle = styles.menuSeparatorStyle;
-const menuShortcutStyle = styles.menuShortcutStyle;
+// Styling layer (recipe + named style functions) in styles.yss; re-exported here to keep public API
+// stable
+const styles = @import("_styles.yss.zig");
+const views = @import("_menu.yix.zig");
+/// Menu item appearance recipe (root / label / icon slots; danger / lit / disabled switches)
+pub const MenuItemRecipe = styles.MenuRow;
 
-/// 菜单项类型
+/// Menu item type
 pub const MenuItemKind = enum {
     item,
     separator,
 };
 
-/// 菜单项
+/// Menu item
 pub const MenuItem = struct {
+    /// Item identifier (received by `on_select`)
     id: []const u8 = "",
-    label_text: []const u8 = "",
+    /// Display text
+    label: []const u8 = "",
+    /// Type: normal item or separator
     kind: MenuItemKind = .item,
     disabled: bool = false,
+    /// Shortcut hint text
     shortcut: ?[]const u8 = null,
+    /// Dangerous operation style (red)
     danger: bool = false,
+    /// Left icon (optional)
+    icon_asset: ?svg_assets.Asset = null,
+    /// Command callback for this item; menu requests close via toggle pipeline, then calls
+    /// on_select, then it
+    on_click: ?Handler(void) = null,
 };
 
-/// Menu 属性
+/// Menu properties
 pub const MenuProps = struct {
-    items: []const MenuItem = &.{},
-    on_select: ?core.HandlerRef = null,
+    /// Menu items. Static array copied at mount with strings (caller can pass function-local
+    /// array);
+    /// signal / derived borrow current value: new array rebuilds, old array and strings must stay
+    /// valid until replaced. Handler context still follows Scope lifecycle. Items beyond MAX_ITEMS
+    /// not rendered.
+    items: Source([]const MenuItem) = .{ .value = &.{} },
+    /// Toggle: `bool` uncontrolled; `*Signal(bool)` controlled (interaction writes directly);
+    /// `ui.split` intercepts
+    open: Model(bool) = .{ .local = false },
+    on_open_change: ?Handler(bool) = null,
+    /// Select an item (item id, valid only in this call, copy to keep). After select menu requests
+    /// close via toggle pipeline
+    on_select: ?Handler([]const u8) = null,
+    /// Panel width
     width: f32 = 220,
+    /// Popup position
     position: popover_mod.PopoverPosition = .bottom_start,
+    /// Optional menu max height. When set, reuses Popover's native fit_or_scroll / ScrollArea.
+    max_height: ?f32 = null,
 };
 
-/// Menu mount 返回结果
+/// Menu mount result
 pub const MenuResult = struct {
+    /// Outer wrapper node
     wrapper: *Node,
+    /// trigger slot (caller inserts trigger element here)
     trigger: *Node,
-    state: *MenuState,
+    /// Toggle signal (`ui.split` -> null)
+    open: ?*Signal(bool),
+    /// `ui.view` integration (see src/ui/view_parts.zig).
+    pub fn viewParts(self: MenuResult) core.ViewParts {
+        return .{ .root = self.wrapper, .trigger = self.trigger };
+    }
 };
 
-/// Menu 内部状态
+/// Menu internal state (owned by Popover scope, lifetime with menu)
 pub const MenuState = struct {
+    cx: *Cx,
+    /// Current highlight index (keyboard navigation and select use it)
     highlighted_index: usize = 0,
-    is_open: *Signal(bool),
-    items: []const MenuItem,
-    item_nodes: [MAX_ITEMS]?*Node = [_]?*Node{null} ** MAX_ITEMS,
+    /// Visual highlight on screen (row view lights up by it); no highlight until keyboard move or
+    /// pointer enter after create/rebuild
+    highlighted: *Signal(usize),
+    /// Currently rendered menu items (click / keyboard activate by it, matches screen)
+    items: []const MenuItem = &.{},
+    /// Deep copy of static items (null if from signal source, borrows current value)
+    owned_items: ?[]MenuItem = null,
+    /// Menu item UI nodes (for highlight style switching)
+    item_nodes: [MAX_ITEMS]?*Node = @as([MAX_ITEMS]?*Node, @splat(null)),
+    /// Actual rendered item count
     item_count: usize = 0,
-    on_select: ?core.HandlerRef,
-    /// 虚拟高亮背景色，mount 时从 MenuItemRecipe 的 hover 态 resolve 得到
-    highlight_bg: Color,
-    /// Container which owns keyboard focus while item highlight is virtual.
+    on_select: ?Handler([]const u8),
+    /// Request close: goes through Popover toggle pipeline
+    close: Handler(void),
+    /// Container holding keyboard focus (aria-activedescendant attached to it)
     menu_node: ?*Node = null,
 
-    const MAX_ITEMS = 32;
+    pub const MAX_ITEMS = 64;
+    /// highlight's "no highlight" value
+    const no_highlight = std.math.maxInt(usize);
 
+    fn deinit(self: *MenuState, allocator: Allocator) void {
+        if (self.owned_items) |owned| freeItems(allocator, owned);
+        self.owned_items = null;
+        self.items = &.{};
+    }
+
+    /// Select current highlighted item: request close first, then notify on_select, then execute
+    /// item's callback.
+    /// All callbacks may destroy menu or swap items: extract needed values first, don't touch self
+    /// after.
+    /// id is borrowed (static items owned by state, signal items by caller), close request may
+    /// invalidate it,
+    /// so copy; all runs in one batch, effect-driven unmount/rebuild deferred after callbacks.
     pub fn selectHighlighted(self: *MenuState) void {
         if (self.highlighted_index >= self.items.len) return;
         const item = self.items[self.highlighted_index];
         if (item.kind == .separator or item.disabled) return;
-        self.is_open.set(false);
-        if (self.on_select) |handler| handler.invoke();
+        const on_select = self.on_select;
+        const close = self.close;
+        const cx = self.cx;
+
+        var id_buf: [256]u8 = undefined;
+        var heap_id: ?[]u8 = null;
+        defer if (heap_id) |h| cx.allocator.free(h);
+        const id: []const u8 = if (item.id.len <= id_buf.len) blk: {
+            @memcpy(id_buf[0..item.id.len], item.id);
+            break :blk id_buf[0..item.id.len];
+        } else blk: {
+            heap_id = cx.allocator.dupe(u8, item.id) catch {
+                std.log.err("[Menu] out of memory copying item id; selection dropped", .{});
+                return;
+            };
+            break :blk heap_id.?;
+        };
+
+        cx.owner.beginBatch();
+        defer cx.owner.endBatch();
+        close.invoke();
+        if (on_select) |h| h.call(id);
+        if (item.on_click) |h| h.invoke();
     }
 
+    /// Switch highlight to index
     pub fn highlightIndex(self: *MenuState, index: usize) void {
-        if (index >= self.items.len) return;
+        if (index >= self.item_count) return;
         if (self.items[index].kind == .separator) return;
 
-        // 取消旧高亮
-        if (self.highlighted_index < self.item_count) {
-            if (self.item_nodes[self.highlighted_index]) |node| {
-                node.setBackgroundRaw(Color.TRANSPARENT);
-                node.markRenderDirty();
-            }
-        }
-
         self.highlighted_index = index;
+        // Row view lights up by highlighted (data-driven, no direct node background change)
+        self.highlighted.set(index);
 
-        // 新高亮
-        if (index < self.item_count) {
-            if (self.item_nodes[index]) |node| {
-                node.setBackgroundRaw(self.highlight_bg);
-                node.markRenderDirty();
-                if (self.menu_node) |menu_node| {
-                    if (menu_node.behavior.interaction.a11y) |*a| {
-                        a.active_descendant_element_id = node.element_id_raw;
-                    }
-                    menu_node.markRenderDirty();
+        if (self.item_nodes[index]) |node| {
+            // Keyboard highlight is "virtual focus", real focus always on menu container, only
+            // aria-activedescendant tells AT current item.
+            if (self.menu_node) |menu_node| {
+                if (menu_node.behavior.interaction.a11y) |*a| {
+                    a.active_descendant_element_id = node.element_id_raw;
                 }
+                menu_node.markRenderDirty();
             }
         }
     }
 
-    fn nextEnabledIndex(self: *MenuState, from: usize, forward: bool) ?usize {
-        return menu_navigation.nextEnabledIndex(self.items, from, forward);
+    /// Rebuild key: content + string address + callback (strings borrowed, address change stales
+    /// a11y label on old nodes)
+    fn itemsKey(items: []const MenuItem) u64 {
+        var h = std.hash.Wyhash.init(0);
+        h.update(std.mem.asBytes(&items.len));
+        for (items) |it| {
+            hashStr(&h, it.id);
+            hashStr(&h, it.label);
+            if (it.shortcut) |sc| hashStr(&h, sc) else h.update("\x00");
+            h.update(&.{ @backingInt(it.kind), @intFromBool(it.disabled), @intFromBool(it.danger) });
+            const icon: usize = if (it.icon_asset) |a| @intFromPtr(a.svg_data.ptr) else 0;
+            h.update(std.mem.asBytes(&icon));
+            if (it.on_click) |c| {
+                h.update(std.mem.asBytes(&@intFromPtr(c.callback)));
+                h.update(std.mem.asBytes(&@intFromPtr(c.context)));
+            } else h.update("\x00");
+        }
+        return h.final();
+    }
+
+    fn hashStr(h: *std.hash.Wyhash, s: []const u8) void {
+        h.update(std.mem.asBytes(&s.len));
+        h.update(std.mem.asBytes(&@intFromPtr(s.ptr)));
+        h.update(s);
+    }
+
+    /// Build menu items. Click context registered on `items_scope`, freed on rebuild;
+    /// node table built locally, published only if all succeed (fail case rebuildOn clears subtree,
+    /// state stays valid)
+    fn buildItems(self: *MenuState, items_scope: *Scope, item_list: *Node, all_items: []const MenuItem) !void {
+        const cx = self.cx;
+
+        // Old nodes already freed by rebuildOn: clear references to them first
+        self.items = &.{};
+        self.item_nodes = @as([MAX_ITEMS]?*Node, @splat(null));
+        self.item_count = 0;
+        self.highlighted_index = 0;
+        self.highlighted.set(no_highlight);
+        if (self.menu_node) |menu_node| {
+            if (menu_node.behavior.interaction.a11y) |*a| a.active_descendant_element_id = 0xFFFFFFFF;
+        }
+
+        // Only render first MAX_ITEMS; keyboard nav / select limited same range, else can activate
+        // invisible items
+        const items = all_items[0..@min(all_items.len, MAX_ITEMS)];
+        var nodes = @as([MAX_ITEMS]?*Node, @splat(null));
+
+        try view.mount(items_scope, cx, item_list, view.items(RowCtx{ .state = self, .nodes = &nodes }, items, rowElement));
+
+        self.item_nodes = nodes;
+        self.item_count = items.len;
+        self.items = items;
+    }
+
+    const RowCtx = struct { state: *MenuState, nodes: *[MAX_ITEMS]?*Node };
+    const RowArgs = struct { ctx: RowCtx, item: MenuItem, index: usize };
+
+    fn rowElement(ctx: RowCtx, item: MenuItem, i: usize) view.ComponentOf(buildRow) {
+        return view.component(buildRow, RowArgs{ .ctx = ctx, .item = item, .index = i });
+    }
+
+    /// One item (separator or menu item, view in menu.yix); node recorded in caller's local node
+    /// table
+    fn buildRow(args: RowArgs, scope: *Scope, cx: *Cx) !*Node {
+        const item = args.item;
+        const state = args.ctx.state;
+        const node = if (item.kind == .separator)
+            try view.render(scope, cx, views.MenuSeparator(.{}))
+        else
+            try view.render(scope, cx, views.MenuEntry(.{
+                .label = item.label,
+                .index = args.index,
+                .highlighted = state.highlighted,
+                .danger = item.danger,
+                .disabled = item.disabled,
+                .shortcut = item.shortcut,
+                .icon_asset = item.icon_asset,
+                .on_pick = Handler(usize).from(MenuState, state, MenuState.pickIndex),
+                .on_enter = Handler(usize).from(MenuState, state, MenuState.highlightIndex),
+            }));
+        args.ctx.nodes[args.index] = node;
+        return node;
+    }
+
+    /// Click item: highlight it and select
+    fn pickIndex(self: *MenuState, index: usize) void {
+        self.highlighted_index = index;
+        self.selectHighlighted();
     }
 };
 
-/// 创建 Menu
-pub fn Menu(props: MenuProps) MenuBuilder {
-    return MenuBuilder{ .props = props };
+/// Create Menu: `W.Menu(.{ .items = &items, .on_select = cx.on(S, s, S.run) })`
+pub fn Menu(props: anytype) MenuBuilder {
+    return .{ .props = reactive.props.coerce(MenuProps, props) };
 }
 
 pub const MenuBuilder = struct {
     props: MenuProps,
 
-    pub fn items(self: MenuBuilder, its: []const MenuItem) MenuBuilder {
-        var new = self;
-        new.props.items = its;
-        return new;
-    }
-
-    pub fn width(self: MenuBuilder, w: f32) MenuBuilder {
-        var new = self;
-        new.props.width = w;
-        return new;
-    }
-
-    pub fn onSelect(self: MenuBuilder, handler_ref: core.HandlerRef) MenuBuilder {
-        var new = self;
-        new.props.on_select = handler_ref;
-        return new;
-    }
-
-    pub fn position(self: MenuBuilder, pos: popover_mod.PopoverPosition) MenuBuilder {
-        var new = self;
-        new.props.position = pos;
-        return new;
-    }
-
-    /// 保留模式: mount
+    /// Retained mode: mount
     pub fn mount(self: MenuBuilder, scope: *Scope, cx: *Cx) !MenuResult {
-        const my_scope = try scope.childScope();
-        const allocator = cx.allocator;
-        const t = cx.tokens;
+        cx.owner.enterMount();
+        defer cx.owner.exitMount();
         const p = self.props;
 
-        // Popover
         var pop_result = try popover_mod.Popover(.{
             .position = p.position,
             .trigger = .click,
             .width = p.width,
-        }).mount(my_scope, cx);
-        // sweep：wrapper 守到 return；失败先 dispose my_scope 再 freeNode；子树建好即 adopt
+            .max_width = if (p.max_height != null) p.width else null,
+            .max_height = p.max_height,
+            .size_policy = @as(popover_mod.SizePolicy, if (p.max_height != null) .fit_or_scroll else .hard_clip),
+            .constrain_width_to_viewport = true,
+            .open = p.open,
+            .on_open_change = p.on_open_change,
+        }).mount(scope, cx);
+        // All menu resources and effects owned by Popover scope (on wrapper): menu content in
+        // portal,
+        // freed with it on unmount; effects on other scopes wake from external signals, write freed
+        // nodes
+        // sweep: wrapper holds until return (with Popover scope dispose); adopt subtree after build
         errdefer cx.freeNode(pop_result.wrapper);
-        errdefer my_scope.dispose();
+        const menu_scope = pop_result.scope;
 
         pop_result.wrapper.meta.ownership.meta.component_name = "Menu";
 
         // ---- State ----
-        const state = try allocator.create(MenuState);
+        // Do failables first: no fail points between create and adoptResource
+        const highlighted = try menu_scope.createSignal(usize, MenuState.no_highlight);
+        const state = try menu_scope.allocator.create(MenuState);
         state.* = .{
-            .is_open = pop_result.is_open,
-            // 只渲染前 MAX_ITEMS 项；键盘导航 / 选择也必须限在同一范围，
-            // 否则能高亮并激活看不见的项。
-            .items = p.items[0..@min(p.items.len, MenuState.MAX_ITEMS)],
+            .cx = cx,
             .on_select = p.on_select,
-            .highlight_bg = MenuItemRecipe.resolve(.{}, t)
-                .resolve(.{ .is_hovered = true }).background orelse Color.TRANSPARENT,
+            .close = pop_result.close,
+            .highlighted = highlighted,
         };
-        try my_scope.adoptResource(@ptrCast(state), struct {
+        // adoptResource fails, self-destroy (with owned_items)
+        try menu_scope.adoptResource(@ptrCast(state), struct {
             fn cleanup(ptr: *anyopaque, alloc: Allocator) void {
-                const s: *MenuState = @ptrCast(@alignCast(ptr));
-                alloc.destroy(s);
+                const st: *MenuState = @ptrCast(@alignCast(ptr));
+                st.deinit(alloc);
+                alloc.destroy(st);
             }
         }.cleanup);
+        pop_result.wrapper.addDebugState(@ptrCast(state));
+
+        var items = p.items;
+        if (p.items == .value) {
+            state.owned_items = try cloneItems(menu_scope.allocator, p.items.value[0..@min(p.items.value.len, MenuState.MAX_ITEMS)]);
+            items = .{ .value = state.owned_items.? };
+        }
 
         // ---- Menu Items ----
-        const item_list = try core.adoptChild(cx, allocator, pop_result.content, try box(cx, menuListStyle(t), .{}));
+        var item_list: *Node = undefined;
+        try view.mount(menu_scope, cx, pop_result.content, view.capture(&item_list, view.box(.{ .style = styles.list }, {})));
         // The focusable popover content owns the menu role and active
         // descendant. Keeping those on the same node makes VoiceOver's
         // focusedUIElement query resolve the highlighted item; the visual
@@ -201,135 +354,100 @@ pub const MenuBuilder = struct {
         state.menu_node = pop_result.content;
         pop_result.content.setFocusable(true);
 
-        const max_items = @min(p.items.len, MenuState.MAX_ITEMS);
-        for (p.items[0..max_items], 0..) |item, i| {
-            if (item.kind == .separator) {
-                // 分隔线
-                const sep = try core.adoptChild(cx, allocator, item_list, try box(cx, menuSeparatorStyle(t), .{}));
-                sep.behavior.interaction.a11y = .{ .role = .separator };
-                state.item_nodes[i] = sep;
-                state.item_count = i + 1;
-                continue;
-            }
+        try bind_mod.rebuildOn(cx, menu_scope, items, item_list, state, MenuState.itemsKey, MenuState.buildItems);
 
-            // recipe resolve：几何 + 背景 + 文字样式一次拿全
-            // danger 是变体维度；disabled 走条件位（短路语义保证压过 danger）
-            var item_style = MenuItemRecipe.resolve(
-                .{ .danger = item.danger },
-                t,
-            ).resolve(.{ .is_disabled = item.disabled });
-            const fg = item_style.text_color orelse t.color.fg_primary;
-            const label_fs = item_style.font_size orelse 13;
-            // 文本样式经 setText 走 TextProps，不留在 box ext 上
-            item_style.text_color = null;
-            item_style.font_size = null;
-
-            const item_node = try core.adoptChild(cx, allocator, item_list, try box(cx, item_style, .{}));
-
-            // disabled 必须如实报：AT 用户否则会反复尝试激活一个永远没反应的项。
-            item_node.behavior.interaction.a11y = .{
-                .role = .menuitem,
-                .label = item.label_text,
-                .disabled = item.disabled,
-                // 快捷键走 description，AT 在项名之后补读"⌘X"而不污染项名。
-                .description = item.shortcut,
-            };
-
-            // Label
-            const label_node = try core.adoptChild(cx, allocator, item_node, try box(cx, .{
-                .width = .{ .grow = .{} },
-                .height = .{ .fit = .{} },
-            }, .{}));
-            label_node.setText(.{
-                .content = item.label_text,
-                .color = fg,
-                .font_size = label_fs,
-            });
-
-            // Shortcut
-            if (item.shortcut) |sc| {
-                const sc_node = try core.adoptChild(cx, allocator, item_node, try core.text(cx, sc, .{}));
-                if (sc_node.getText()) |old| {
-                    const sc_style = menuShortcutStyle(t);
-                    var txt = old;
-                    txt.color = sc_style.color;
-                    txt.font_size = sc_style.font_size;
-                    sc_node.setText(txt);
-                }
-            }
-
-            if (!item.disabled) {
-                item_node.style.cursor = .pointer;
-                const click_ctx = try allocator.create(MenuItemClickContext);
-                click_ctx.* = .{ .state = state, .index = i };
-                try my_scope.adoptResource(@ptrCast(click_ctx), struct {
-                    fn cleanup(ptr: *anyopaque, alloc: Allocator) void {
-                        const c: *MenuItemClickContext = @ptrCast(@alignCast(ptr));
-                        alloc.destroy(c);
-                    }
-                }.cleanup);
-                item_node.behavior.events.on_event = menuItemEventHandler;
-                item_node.behavior.events.event_context = @ptrCast(click_ctx);
-            }
-
-            state.item_nodes[i] = item_node;
-            state.item_count = i + 1;
-        }
-
-        // 键盘导航
+        // Keyboard navigation
         pop_result.content.behavior.events.on_key_down = menuKeyHandler;
         pop_result.content.behavior.events.key_context = @ptrCast(state);
+
+        // On open, give focus to menu content (keyboard nav attached to it)
+        try menu_scope.createEffect(.{
+            .open = pop_result.open_read,
+            .content = pop_result.content,
+            .cx = cx,
+        }, struct {
+            fn update(c: anytype) void {
+                if (c.open.get()) c.cx.setFocus(c.content);
+            }
+        }.update);
 
         return .{
             .wrapper = pop_result.wrapper,
             .trigger = pop_result.trigger,
-            .state = state,
+            .open = pop_result.open,
         };
     }
 };
 
-// ========== 内部辅助 ==========
+fn cloneItems(allocator: Allocator, source: []const MenuItem) ![]MenuItem {
+    const cloned = try allocator.alloc(MenuItem, source.len);
+    errdefer allocator.free(cloned);
+    var initialized: usize = 0;
+    errdefer for (cloned[0..initialized]) |item| {
+        allocator.free(item.id);
+        allocator.free(item.label);
+        if (item.shortcut) |shortcut| allocator.free(shortcut);
+    };
 
-const MenuItemClickContext = struct {
-    state: *MenuState,
-    index: usize,
-};
-
-fn menuItemEventHandler(event: Event, context: ?*anyopaque) EventResult {
-    switch (event) {
-        .click => {
-            if (context) |ctx| {
-                const mc: *MenuItemClickContext = @ptrCast(@alignCast(ctx));
-                mc.state.highlighted_index = mc.index;
-                mc.state.selectHighlighted();
-                return .stop;
-            }
-        },
-        .mouse_enter => {
-            if (context) |ctx| {
-                const mc: *MenuItemClickContext = @ptrCast(@alignCast(ctx));
-                mc.state.highlightIndex(mc.index);
-                return .handled;
-            }
-        },
-        else => {},
+    for (source, 0..) |item, index| {
+        const id = try allocator.dupe(u8, item.id);
+        errdefer allocator.free(id);
+        const label = try allocator.dupe(u8, item.label);
+        errdefer allocator.free(label);
+        const shortcut = if (item.shortcut) |value| try allocator.dupe(u8, value) else null;
+        cloned[index] = item;
+        cloned[index].id = id;
+        cloned[index].label = label;
+        cloned[index].shortcut = shortcut;
+        initialized += 1;
     }
-    return .ignored;
+    return cloned;
 }
 
+fn freeItems(allocator: Allocator, items: []MenuItem) void {
+    for (items) |item| {
+        allocator.free(item.id);
+        allocator.free(item.label);
+        if (item.shortcut) |shortcut| allocator.free(shortcut);
+    }
+    allocator.free(items);
+}
+
+// ========== Internal helpers ==========
+
+/// From `from` in direction, find next selectable item index, skip separator and disabled, wrap at
+/// boundary.
+/// Returns null if no items selectable.
+fn nextEnabledIndex(items: []const MenuItem, from: usize, forward: bool) ?usize {
+    const len = items.len;
+    if (len == 0) return null;
+    var idx = from;
+    var count: usize = 0;
+    while (count < len) : (count += 1) {
+        if (forward) {
+            idx = if (idx + 1 >= len) 0 else idx + 1;
+        } else {
+            idx = if (idx == 0) len - 1 else idx - 1;
+        }
+        if (items[idx].kind == .item and !items[idx].disabled) return idx;
+    }
+    return null;
+}
+
+/// Keyboard navigation handler
 fn menuKeyHandler(key: KeyCode, _: Modifiers, context: ?*anyopaque) EventResult {
     if (context == null) return .ignored;
     const state: *MenuState = @ptrCast(@alignCast(context.?));
 
     switch (key) {
         .down => {
-            if (state.nextEnabledIndex(state.highlighted_index, true)) |idx| {
+            if (nextEnabledIndex(state.items, state.highlighted_index, true)) |idx| {
                 state.highlightIndex(idx);
             }
             return .stop;
         },
         .up => {
-            if (state.nextEnabledIndex(state.highlighted_index, false)) |idx| {
+            if (nextEnabledIndex(state.items, state.highlighted_index, false)) |idx| {
                 state.highlightIndex(idx);
             }
             return .stop;
@@ -339,129 +457,394 @@ fn menuKeyHandler(key: KeyCode, _: Modifiers, context: ?*anyopaque) EventResult 
             return .stop;
         },
         .escape => {
-            state.is_open.set(false);
+            state.close.invoke();
             return .stop;
         },
         else => return .ignored,
     }
 }
 
-// ========== 测试 ==========
+// ========== Tests ==========
+
+fn stateOf(r: MenuResult) *MenuState {
+    return @ptrCast(@alignCast(r.wrapper.meta.ownership.debug_slots.state_ptrs[0].?));
+}
 
 const test_items = [_]MenuItem{
-    .{ .id = "cut", .label_text = "Cut", .shortcut = "\xe2\x8c\x98X" }, // ⌘X
-    .{ .id = "copy", .label_text = "Copy", .shortcut = "\xe2\x8c\x98C" }, // ⌘C
+    .{ .id = "cut", .label = "Cut", .shortcut = "\xe2\x8c\x98X", .icon_asset = svg_assets.common.star }, // ⌘X
+    .{ .id = "copy", .label = "Copy", .shortcut = "\xe2\x8c\x98C" }, // ⌘C
     .{ .kind = .separator },
-    .{ .id = "paste", .label_text = "Paste", .shortcut = "\xe2\x8c\x98V" }, // ⌘V
-    .{ .id = "delete", .label_text = "Delete", .danger = true },
+    .{ .id = "paste", .label = "Paste", .shortcut = "\xe2\x8c\x98V" }, // ⌘V
+    .{ .id = "delete", .label = "Delete", .danger = true },
+    .{ .id = "disabled_item", .label = "Unavailable", .disabled = true },
 };
 
-test "MenuItemRecipe: disabled 条件压过 danger 变体（等价旧 compounds 梯子）" {
+/// Test helper: on_select id valid only in callback, copy to keep for assertion
+const Picked = struct {
+    buf: [32]u8 = undefined,
+    len: usize = 0,
+    fn set(self: *Picked, id: []const u8) void {
+        @memcpy(self.buf[0..id.len], id);
+        self.len = id.len;
+    }
+    fn get(self: *const Picked) []const u8 {
+        return self.buf[0..self.len];
+    }
+};
+
+const TestEnv = struct {
+    ctx: *Cx,
+    root: *Node,
+    scope: *Scope,
+
+    fn init() !TestEnv {
+        const ctx = try Cx.init(std.testing.allocator, std.testing.io);
+        errdefer ctx.deinit();
+        const root = try box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 1200 } }, .{});
+        ctx.root = root;
+        const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
+        return .{ .ctx = ctx, .root = root, .scope = scope };
+    }
+
+    fn deinit(self: TestEnv) void {
+        self.scope.dispose();
+        self.ctx.deinit();
+    }
+
+    fn mount(self: TestEnv, props: anytype) !MenuResult {
+        const r = try Menu(props).mount(self.scope, self.ctx);
+        try self.root.appendChild(std.testing.allocator, r.wrapper);
+        return r;
+    }
+};
+
+test "MenuItemRecipe: disabled 压过 danger 与虚拟高亮；图标着色跟随文字" {
     const t = &theme.dark;
-    const normal = MenuItemRecipe.resolve(.{}, t).resolve(.{});
-    try std.testing.expectEqual(t.color.fg_primary, normal.text_color.?);
-    const danger = MenuItemRecipe.resolve(.{ .danger = true }, t).resolve(.{});
-    try std.testing.expectEqual(t.color.danger, danger.text_color.?);
-    const dis_danger = MenuItemRecipe.resolve(.{ .danger = true }, t)
-        .resolve(.{ .is_disabled = true });
-    try std.testing.expectEqual(t.color.fg_disabled, dis_danger.text_color.?);
+    const normal = MenuItemRecipe.resolve(.{ .danger = false, .lit = false, .disabled = false }, t);
+    try std.testing.expectEqual(t.tokens.color.fg_primary, normal.label.base.text_color.?);
+    try std.testing.expectEqual(t.tokens.color.fg_primary, normal.icon.base.icon_color.?);
+    const danger = MenuItemRecipe.resolve(.{ .danger = true, .lit = false, .disabled = false }, t);
+    try std.testing.expectEqual(t.tokens.color.danger, danger.label.base.text_color.?);
+    try std.testing.expectEqual(t.tokens.color.danger, danger.icon.base.icon_color.?);
+    const lit = MenuItemRecipe.resolve(.{ .danger = false, .lit = true, .disabled = false }, t);
+    try std.testing.expectEqual(t.tokens.color.list_hover_bg, lit.root.base.background.?);
+    const dis = MenuItemRecipe.resolve(.{ .danger = true, .lit = true, .disabled = true }, t);
+    try std.testing.expectEqual(t.tokens.color.fg_disabled, dis.label.base.text_color.?);
+    try std.testing.expect(dis.root.base.background == null or !std.meta.eql(dis.root.base.background.?, t.tokens.color.list_hover_bg));
 }
 
 test "Menu: basic structure" {
-    var ctx = try Cx.init(std.testing.allocator);
-    defer ctx.deinit();
-
-    const root = try box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 400 } }, .{});
-    ctx.root = root;
-
-    const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
-    defer scope.dispose();
-
-    const result = try Menu(.{
-        .items = &test_items,
-    }).mount(scope, ctx);
-
-    try root.appendChild(std.testing.allocator, result.wrapper);
-    try std.testing.expectEqual(@as(usize, 5), result.state.item_count);
+    const env = try TestEnv.init();
+    defer env.deinit();
+    const result = try env.mount(.{ .items = &test_items });
+    try std.testing.expectEqual(@as(usize, 6), stateOf(result).item_count);
+    // Icon item: icon + text two children in left group
+    const left = stateOf(result).item_nodes[0].?.children.items[0];
+    try std.testing.expectEqual(@as(usize, 2), left.children.items.len);
 }
 
-test "Menu: keyboard navigation skips separator" {
-    var ctx = try Cx.init(std.testing.allocator);
-    defer ctx.deinit();
+test "Menu: static items are copied with their strings — the caller's array may go away" {
+    const env = try TestEnv.init();
+    defer env.deinit();
 
-    const root = try box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 400 } }, .{});
-    ctx.root = root;
+    var picked = Picked{};
+    var local_items = [_]MenuItem{
+        .{ .id = "local", .label = "Local item", .shortcut = "Cmd-L" },
+    };
+    const result = try env.mount(.{ .items = &local_items, .on_select = env.ctx.on(Picked, &picked, Picked.set) });
 
-    const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
-    defer scope.dispose();
-
-    const result = try Menu(.{
-        .items = &test_items,
-    }).mount(scope, ctx);
-
-    try root.appendChild(std.testing.allocator, result.wrapper);
-
-    // 从 index 0 向下，跳过 separator (index 2)
-    _ = menuKeyHandler(.down, .{}, @ptrCast(result.state));
-    try std.testing.expectEqual(@as(usize, 1), result.state.highlighted_index);
-
-    _ = menuKeyHandler(.down, .{}, @ptrCast(result.state));
-    // 应跳过 separator (index 2)，到 index 3
-    try std.testing.expectEqual(@as(usize, 3), result.state.highlighted_index);
+    const items = stateOf(result).items;
+    try std.testing.expect(items.ptr != local_items[0..].ptr);
+    try std.testing.expect(items[0].id.ptr != local_items[0].id.ptr);
+    try std.testing.expect(items[0].label.ptr != local_items[0].label.ptr);
+    try std.testing.expect(items[0].shortcut.?.ptr != local_items[0].shortcut.?.ptr);
+    local_items[0] = .{ .id = "changed", .label = "Changed" };
+    stateOf(result).selectHighlighted();
+    try std.testing.expectEqualStrings("local", picked.get());
+    try std.testing.expectEqualStrings("Local item", items[0].label);
+    try std.testing.expectEqualStrings("Cmd-L", items[0].shortcut.?);
 }
 
-test "Menu: 超过 MAX_ITEMS 时键盘不能导航到未渲染的项" {
-    var ctx = try Cx.init(std.testing.allocator);
-    defer ctx.deinit();
-    const root = try box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 400 } }, .{});
-    ctx.root = root;
-    const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
-    defer scope.dispose();
+test "Menu: state and keyboard navigation are capped to rendered items" {
+    const env = try TestEnv.init();
+    defer env.deinit();
 
-    const many = [_]MenuItem{.{ .id = "x", .label_text = "X" }} ** 40;
-    const result = try Menu(.{ .items = &many }).mount(scope, ctx);
-    try root.appendChild(std.testing.allocator, result.wrapper);
-    var i: usize = 0;
-    while (i < 60) : (i += 1) {
-        _ = menuKeyHandler(.down, .{}, @ptrCast(result.state));
-        try std.testing.expect(result.state.highlighted_index < MenuState.MAX_ITEMS);
-    }
-    _ = menuKeyHandler(.up, .{}, @ptrCast(result.state));
-    try std.testing.expect(result.state.highlighted_index < MenuState.MAX_ITEMS);
+    var many_items: [MenuState.MAX_ITEMS + 1]MenuItem = undefined;
+    for (&many_items) |*item| item.* = .{ .id = "item", .label = "Item" };
+    const result = try env.mount(.{ .items = &many_items });
+    try std.testing.expectEqual(MenuState.MAX_ITEMS, stateOf(result).items.len);
+    try std.testing.expectEqual(MenuState.MAX_ITEMS, stateOf(result).item_count);
+
+    stateOf(result).highlighted_index = MenuState.MAX_ITEMS - 1;
+    _ = menuKeyHandler(.down, .{}, @ptrCast(stateOf(result)));
+    try std.testing.expectEqual(@as(usize, 0), stateOf(result).highlighted_index);
+    _ = menuKeyHandler(.up, .{}, @ptrCast(stateOf(result)));
+    try std.testing.expectEqual(MenuState.MAX_ITEMS - 1, stateOf(result).highlighted_index);
 }
 
-test "Menu: select item closes menu" {
-    var ctx = try Cx.init(std.testing.allocator);
-    defer ctx.deinit();
+test "Menu: keyboard navigation skips separator and disabled" {
+    const env = try TestEnv.init();
+    defer env.deinit();
+    const result = try env.mount(.{ .items = &test_items });
+    const st = stateOf(result);
 
-    const root = try box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 400 } }, .{});
-    ctx.root = root;
-
-    const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
-    defer scope.dispose();
-
-    const result = try Menu(.{
-        .items = &test_items,
-    }).mount(scope, ctx);
-
-    try root.appendChild(std.testing.allocator, result.wrapper);
-
-    result.state.is_open.set(true);
-    result.state.selectHighlighted();
-    try std.testing.expect(!result.state.is_open.peek());
+    _ = menuKeyHandler(.down, .{}, @ptrCast(st));
+    try std.testing.expectEqual(@as(usize, 1), st.highlighted_index);
+    // Skip separator (index 2)
+    _ = menuKeyHandler(.down, .{}, @ptrCast(st));
+    try std.testing.expectEqual(@as(usize, 3), st.highlighted_index);
+    _ = menuKeyHandler(.down, .{}, @ptrCast(st));
+    try std.testing.expectEqual(@as(usize, 4), st.highlighted_index);
+    // Skip disabled (index 5), wrap to index 0
+    _ = menuKeyHandler(.down, .{}, @ptrCast(st));
+    try std.testing.expectEqual(@as(usize, 0), st.highlighted_index);
 }
 
-// styles.zig 的测试收集，这行是必需的，见 docs/STYLING.md
+test "Menu: select closes the menu, then reports the id, then runs the item command" {
+    const env = try TestEnv.init();
+    defer env.deinit();
+
+    const Probe = struct {
+        open: ?*Signal(bool) = null,
+        log: [4]u8 = undefined,
+        len: usize = 0,
+        fn select(self: *@This(), id: []const u8) void {
+            // Close request comes first: toggle now settled to false
+            if (self.open.?.peek()) self.log[self.len] = 'X' else self.log[self.len] = id[0];
+            self.len += 1;
+        }
+        fn run(self: *@This()) void {
+            self.log[self.len] = '!';
+            self.len += 1;
+        }
+    };
+    var probe = Probe{};
+    const items = [_]MenuItem{.{ .id = "go", .label = "Go", .on_click = env.ctx.on(Probe, &probe, Probe.run) }};
+    const result = try env.mount(.{ .items = &items, .on_select = env.ctx.on(Probe, &probe, Probe.select) });
+    probe.open = result.open;
+    result.open.?.set(true);
+    stateOf(result).selectHighlighted();
+    try std.testing.expect(!result.open.?.peek());
+    try std.testing.expectEqualStrings("g!", probe.log[0..probe.len]);
+}
+
+test "Menu: escape closes menu" {
+    const env = try TestEnv.init();
+    defer env.deinit();
+    const result = try env.mount(.{ .items = &test_items });
+    result.open.?.set(true);
+    _ = menuKeyHandler(.escape, .{}, @ptrCast(stateOf(result)));
+    try std.testing.expect(!result.open.?.peek());
+}
+
+test "Menu: a split parent can refuse to close; on_select and the command still run" {
+    const env = try TestEnv.init();
+    defer env.deinit();
+
+    const Parent = struct {
+        open: *Signal(bool),
+        pinned: bool = true,
+        picked: Picked = .{},
+        runs: u32 = 0,
+        fn write(self: *@This(), v: bool) void {
+            if (!v and self.pinned) return; // Reject close when pinned
+            self.open.set(v);
+        }
+        fn select(self: *@This(), id: []const u8) void {
+            self.picked.set(id);
+        }
+        fn run(self: *@This()) void {
+            self.runs += 1;
+        }
+    };
+    var parent = Parent{ .open = try env.scope.createSignal(bool, true) };
+    const items = [_]MenuItem{
+        .{ .id = "cut", .label = "Cut" },
+        .{ .id = "copy", .label = "Copy", .on_click = env.ctx.on(Parent, &parent, Parent.run) },
+    };
+    const result = try env.mount(.{
+        .items = &items,
+        .open = reactive.split(parent.open, env.ctx.on(Parent, &parent, Parent.write)),
+        .on_select = env.ctx.on(Parent, &parent, Parent.select),
+    });
+    try std.testing.expect(result.open == null);
+
+    _ = menuKeyHandler(.down, .{}, @ptrCast(stateOf(result))); // -> copy
+    _ = menuKeyHandler(.@"return", .{}, @ptrCast(stateOf(result)));
+    try std.testing.expectEqualStrings("copy", parent.picked.get());
+    try std.testing.expectEqual(@as(u32, 1), parent.runs);
+    try std.testing.expect(parent.open.peek()); // Parent rejected close
+    _ = menuKeyHandler(.escape, .{}, @ptrCast(stateOf(result)));
+    try std.testing.expect(parent.open.peek());
+
+    parent.pinned = false;
+    _ = menuKeyHandler(.escape, .{}, @ptrCast(stateOf(result)));
+    try std.testing.expect(!parent.open.peek());
+}
+
+test "Menu: a parent that unmounts the menu while closing still gets the right id" {
+    const env = try TestEnv.init();
+    defer env.deinit();
+
+    const Parent = struct {
+        env: TestEnv,
+        open: *Signal(bool),
+        wrapper: ?*Node = null,
+        picked: [16]u8 = undefined,
+        picked_len: usize = 0,
+        runs: u32 = 0,
+        fn write(self: *@This(), v: bool) void {
+            self.open.set(v);
+            // Close syncs unmount: menu's items copy (with id strings) freed
+            if (!v) if (self.wrapper) |w| {
+                self.env.ctx.detachChild(self.env.root, w);
+                self.env.ctx.freeNode(w);
+                self.wrapper = null;
+            };
+        }
+        fn select(self: *@This(), id: []const u8) void {
+            @memcpy(self.picked[0..id.len], id);
+            self.picked_len = id.len;
+        }
+        fn run(self: *@This()) void {
+            self.runs += 1;
+        }
+    };
+    var parent = Parent{ .env = env, .open = try env.scope.createSignal(bool, true) };
+    var items = [_]MenuItem{.{ .id = "copy", .label = "Copy", .on_click = env.ctx.on(Parent, &parent, Parent.run) }};
+    const result = try env.mount(.{
+        .items = &items,
+        .open = reactive.split(parent.open, env.ctx.on(Parent, &parent, Parent.write)),
+        .on_select = env.ctx.on(Parent, &parent, Parent.select),
+    });
+    parent.wrapper = result.wrapper;
+    stateOf(result).selectHighlighted();
+    try std.testing.expect(parent.wrapper == null);
+    try std.testing.expectEqualStrings("copy", parent.picked[0..parent.picked_len]);
+    try std.testing.expectEqual(@as(u32, 1), parent.runs);
+}
+
+test "Menu: items from a signal rebuild when a new array is set" {
+    const env = try TestEnv.init();
+    defer env.deinit();
+
+    var picked = Picked{};
+    const first = [_]MenuItem{
+        .{ .id = "a", .label = "A" },
+        .{ .kind = .separator },
+        .{ .id = "b", .label = "B" },
+        .{ .id = "c", .label = "C" },
+    };
+    const second = [_]MenuItem{.{ .id = "z", .label = "Z" }};
+    const items = try env.scope.createSignal([]const MenuItem, &first);
+    const result = try env.mount(.{ .items = items, .on_select = env.ctx.on(Picked, &picked, Picked.set) });
+    const st = stateOf(result);
+    try std.testing.expectEqual(@as(usize, 4), st.item_count);
+    // Caller-scope signal lent to Popover scope: latter parented below former, borrow valid
+    try std.testing.expectEqual(@as(u32, 0), env.ctx.owner.debug.borrow_warnings);
+
+    // Highlight past end, swap to shorter array: highlight back to start, no overflow, no stale
+    // active_descendant on old nodes
+    st.highlightIndex(3);
+    items.set(&second);
+    try std.testing.expectEqual(@as(usize, 1), st.item_count);
+    try std.testing.expectEqual(@as(usize, 1), st.items.len);
+    try std.testing.expectEqual(@as(usize, 0), st.highlighted_index);
+    try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), st.menu_node.?.behavior.interaction.a11y.?.active_descendant_element_id);
+    try std.testing.expect(st.item_nodes[1] == null);
+    st.selectHighlighted();
+    try std.testing.expectEqualStrings("z", picked.get());
+    // Menu panel now holds only the new item
+    try std.testing.expectEqual(@as(usize, 1), st.item_nodes[0].?.parent.?.children.items.len);
+}
+
+test "Menu: rebuild key ignores array identity but sees borrowed string addresses and handlers" {
+    var copy = test_items;
+    try std.testing.expectEqual(MenuState.itemsKey(&test_items), MenuState.itemsKey(&copy));
+    // Different string address of same content: old nodes' a11y label borrows old address, must
+    // rebuild
+    var label_buf = "Cut".*;
+    copy[0].label = &label_buf;
+    try std.testing.expect(MenuState.itemsKey(&test_items) != MenuState.itemsKey(&copy));
+    // Context changed (same function, different object) requires rebuild, else click calls old
+    // object
+    const noop = struct {
+        fn f(_: *anyopaque) void {}
+    }.f;
+    var n1: u32 = 0;
+    var n2: u32 = 0;
+    copy = test_items;
+    copy[1].on_click = core.HandlerRef{ .callback = noop, .context = @ptrCast(&n1) };
+    var other = copy;
+    other[1].on_click = core.HandlerRef{ .callback = noop, .context = @ptrCast(&n2) };
+    try std.testing.expect(MenuState.itemsKey(&other) != MenuState.itemsKey(&copy));
+    try std.testing.expect(MenuState.itemsKey(&test_items) != MenuState.itemsKey(&copy));
+}
+
+test "Menu: with an external open signal, unmount leaves no live effect behind" {
+    const env = try TestEnv.init();
+    defer env.deinit();
+    const open = try env.scope.createSignal(bool, false);
+    const items = try env.scope.createSignal([]const MenuItem, &test_items);
+    const before = env.ctx.owner.graph.countByKind().get(.effect);
+    const result = try env.mount(.{ .items = items, .open = open });
+    env.ctx.detachChild(env.root, result.wrapper);
+    env.ctx.freeNode(result.wrapper);
+    // Focus effect reads external open, rebuild effect reads external items: both must destroy with
+    // Popover scope,
+    // else write below touches freed menu content
+    try std.testing.expectEqual(before, env.ctx.owner.graph.countByKind().get(.effect));
+    open.set(true);
+    items.set(test_items[0..1]);
+}
+
+test "Menu: 卸载 wrapper 即回收菜单资源（不必等调用方 scope 释放）" {
+    const env = try TestEnv.init();
+    defer env.deinit();
+    const before = env.scope.resources.items.len;
+    const result = try env.mount(.{ .items = &test_items });
+    env.ctx.detachChild(env.root, result.wrapper);
+    env.ctx.freeNode(result.wrapper);
+    // Menu leaves no resources on caller scope
+    try std.testing.expectEqual(before, env.scope.resources.items.len);
+    try std.testing.expectEqual(@as(usize, 0), env.scope.children.items.len);
+}
+
+test "nextEnabledIndex 跳过 separator 与 disabled，到边界回绕" {
+    const items = [_]MenuItem{ .{}, .{ .kind = .separator }, .{ .disabled = true }, .{} };
+    try std.testing.expectEqual(@as(?usize, 3), nextEnabledIndex(&items, 0, true));
+    try std.testing.expectEqual(@as(?usize, 0), nextEnabledIndex(&items, 3, true));
+    try std.testing.expectEqual(@as(?usize, 0), nextEnabledIndex(&items, 3, false));
+    // With one selectable item, wrap to self
+    const single = [_]MenuItem{ .{ .kind = .separator }, .{}, .{ .disabled = true } };
+    try std.testing.expectEqual(@as(?usize, 1), nextEnabledIndex(&single, 1, true));
+    try std.testing.expectEqual(@as(?usize, 1), nextEnabledIndex(&single, 1, false));
+}
+
+test "nextEnabledIndex 全不可选或空列表时返回 null" {
+    const none = [_]MenuItem{ .{ .kind = .separator }, .{ .disabled = true } };
+    try std.testing.expectEqual(@as(?usize, null), nextEnabledIndex(&none, 0, true));
+    try std.testing.expectEqual(@as(?usize, null), nextEnabledIndex(&none, 0, false));
+    try std.testing.expectEqual(@as(?usize, null), nextEnabledIndex(&.{}, 0, true));
+}
+
+// Test collection from styles.yss, this line required, see docs/STYLING.md
 test {
-    _ = @import("styles.zig");
+    _ = @import("_styles.yss.zig");
 }
 
-// 逐分配点 OOM sweep，见 src/ui/components/oom_sweep.zig
-test "menu: mount 在任意分配点失败时不泄漏（sweep）" {
+// OOM sweep at each allocation point, see src/ui/components/oom_sweep.zig
+test "Menu: mount 在任意分配点失败时不泄漏（sweep）" {
     const sw = @import("../oom_sweep.zig");
     try sw.sweepMount("menu", struct {
         fn m(scope: *sw.Scope, cx: *sw.Cx) anyerror!?*sw.Node {
             return (try Menu(.{ .items = &test_items }).mount(scope, cx)).wrapper;
+        }
+    }.m);
+    try sw.sweepMount("menu_signal_items", struct {
+        fn m(scope: *sw.Scope, cx: *sw.Cx) anyerror!?*sw.Node {
+            const items = try scope.createSignal([]const MenuItem, &test_items);
+            return (try Menu(.{ .items = items, .max_height = 120 }).mount(scope, cx)).wrapper;
         }
     }.m);
 }

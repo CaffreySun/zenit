@@ -1,9 +1,8 @@
-//! Cached display item slices used by overflow-hidden subtrees and
-//! display-list replay. Each `Node` owns at most one `CachedRenderSlice`;
-//! the helpers here deep-copy display items (notably text content / spans)
-//! so the cache can outlive the per-frame arena.
+//! Cached display item slices used by overflow-hidden subtrees and display-list replay. Each `Node`
+//! owns at most one `CachedRenderSlice`; the helpers here deep-copy display items (notably text
+//! content / spans) so the cache can outlive the per-frame arena.
 //!
-//! Cache 内部 IR 是 DisplayItem。索引基准 = cx.display_list.items.items.len。
+//! Cache IR is DisplayItem. Index baseline = cx.display_list.items.items.len.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
@@ -34,39 +33,40 @@ pub const CachedRenderSlice = struct {
     descendant_sticky_command_count: u32 = 0,
     descendant_overlay_command_count: u32 = 0,
     descendant_tail_command_count: u32 = 0,
-    /// 节点自身 overflow clip 的 children 包围 token（node-local push_clip /
-    /// pop_clip，见 render_engine emitScrollClipBegin）。它们不属于任何 child，
-    /// 但整段替放（promoted cache hit）必须带上，否则命中缓存的帧 children
-    /// 零裁剪画出去（Popover 内容溢出面板）。布局：
-    ///   [self][clip_open][regular][sticky][overlay][clip_close][tail]
-    /// 按 band 的访问器（descendant-scoped 逐段替放）跳过这两段，那条路径
-    /// 由 paint pass fresh 发射同一对 token。
+    /// Node's own overflow clip wrapper tokens (node-local push_clip / pop_clip, see render_engine
+    /// emitScrollClipBegin). They don't belong to any child, but full-block replacement (promoted
+    /// cache hit) must include them; otherwise frames with cached children render unclipped
+    /// (Popover content overflows panel). Layout:
+    ///  [self][clip_open][regular][sticky][overlay][clip_close][tail]
+    /// Band accessors (descendant-scoped segment replacement) skip these two segments; that path's
+    /// fresh emit generates the same pair of tokens.
     descendant_clip_open_count: u32 = 0,
     descendant_clip_close_count: u32 = 0,
     regular_child_slices: []const ChildCommandSlice = &.{},
     content_version: u32 = 0,
     composite_version: u32 = 0,
     promoted_layer_id: u32 = std.math.maxInt(u32),
-    /// 写缓存帧的 property-tree 序号（transform/effect chain 根）。缓存内每条
-    /// DisplayItem 的 header id 都是**写入帧**的帧内序号；替放前必须比对根 id
-    /// 未平移（全局遍历结构未变），否则 stale id 会索引到错误/越界的 property
-    /// tree 节点。旧实现靠 plan ordinal layer id 的偶然 mismatch 提供这层保护，
-    /// retained stable_id 化后在此显式恢复。
+    /// Write the property-tree sequence number of the cache-frame (transform/effect chain root).
+    /// Every DisplayItem header id in the cache is a frame-local sequence number of the
+    /// write-frame; before replacement, compare root id with no shift (global traverse structure
+    /// unchanged), or stale id will index wrong/out-of-bounds property tree nodes. Old
+    /// implementation relied on accidental mismatch of plan ordinal layer id for this protection;
+    /// after retained stable_id conversion, restored explicitly here.
     cached_transform_id: u32 = std.math.maxInt(u32),
     cached_effect_id: u32 = std.math.maxInt(u32),
-    /// subtree_payload 缓存（单点脏帧放大器修复）额外 stamp：写入帧的
-    /// clip 链根 id。与 transform/effect 同理，帧内序号平移即 MISS。
+    /// subtree_payload cache (single-dirty-frame amplifier fix) extra stamp: clip chain root id of
+    /// the write-frame. Same logic as transform/effect: frame-local sequence shift = MISS.
     cached_clip_id: u32 = std.math.maxInt(u32),
-    // 下游回归注：根 id 三元组只守卫缓存根自身；子树**内部**的帧内序号平移
-    // （effect/clip 条件分配 + 更早节点动画期分配集合变化）不靠 stamp 拦截，
-    // 而是替放时按 node_id 统一改写为本帧值，见 render_engine
-    // rewriteSplicedItemHeaders。
-    /// promoted 缓存里的 begin_blur token **按值烘焙**了写入帧的 glass 参数，
-    /// 而 ext.glass 的写入不 bump content_version，dirty 位又会被祖先的
-    /// subtree replay 提前 markNodeSubtreeRenderedClean 消费（帧内两个缓存层
-    /// 抢一个 dirty 位），GlassBox interactive hover 的参数插值因此在真机上
-    /// 完全冻结（RPC 截图路径反而看不出来）。stamp 写入帧的 glass 参数哈希，
-    /// 参数变 -> MISS 重录。maxInt = 无 glass。
+    // Regression note: root id triple guards only the cache root itself; frame-local sequence
+    // shifts inside the subtree (effect/clip conditional allocation + earlier node animation period
+    // allocation set changes) are not intercepted by stamp, but rewritten uniformly during
+    // replacement by node_id to this frame's value; see render_engine rewriteSplicedItemHeaders.
+    /// promoted cache begin_blur token has glass parameters of the write-frame baked in by value,
+    /// but ext.glass writes do not bump content_version, and the dirty bit gets consumed early by
+    /// ancestor subtree replay markNodeSubtreeRenderedClean (two cache layers contend for one dirty
+    /// bit); GlassBox interactive hover parameter interpolation thus freezes entirely on real
+    /// hardware (RPC screenshot path shows no issue). Stamp captures the write-frame glass
+    /// parameter hash; parameter change -> MISS and re-record. maxInt = no glass.
     cached_glass_hash: u64 = std.math.maxInt(u64),
     world_bounds: ComputedRect = ComputedRect.init(0, 0, 0, 0),
     world_transform: Transform2D = .{},

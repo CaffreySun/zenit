@@ -1,15 +1,18 @@
-//! Form Composition，同档 Input / Select / Button 混排的业务示意。
+//! Form Composition: same-tier Input / Select / Button mixed layout business sketch.
 //!
-//! 三者共用 `ControlSize`（外框高度 = padding_y × 2 + 行高：XS 20 / SM 24 /
-//! MD 32 / LG 40）。这个 story 不演示单个组件，而是把它们按真实业务场景
-//! 拼在一起，看同一档位下高度、圆角、字号、图标与间距是否协调：
-//!   1. 筛选工具栏：四档各一行，Input + Select × 2 + Button × 2 横排；
-//!   2. 新建订单表单：MD 档两列字段 + 底部操作区。
+//! All three share `ControlSize` (outer box height = padding_y*2 + line height:
+//! XS 20 / SM 24 / MD 32 / LG 40). The story shows real assembled layout, checking height /
+//! corner / font / icon / gap alignment within a size tier:
+//!   1. Filter toolbar: four sizes, each row Input + Select*2 + Button*2 horizontal;
+//!   2. Create order form: MD tier two columns + bottom action area.
 
+const std = @import("std");
 const ui = @import("ui");
+const S = @import("styles.zig");
 
+const v = ui.view;
 const W = ui.widgets;
-const ControlSize = ui.theme.ControlSize;
+const ControlSize = ui.widgets.ControlSize;
 
 const status_options = [_]W.SelectOption{
     .{ .value = "all", .label = "All statuses" },
@@ -37,163 +40,174 @@ const priority_options = [_]W.SelectOption{
     .{ .value = "urgent", .label = "Urgent" },
 };
 
-const SizeSpec = struct { size: ControlSize, key: []const u8, title: []const u8 };
-
-const sizes = [_]SizeSpec{
-    .{ .size = .xs, .key = "xs", .title = "XS" },
-    .{ .size = .sm, .key = "sm", .title = "SM" },
-    .{ .size = .md, .key = "md", .title = "MD" },
-    .{ .size = .lg, .key = "lg", .title = "LG" },
+/// One-size toolbar: size, title, test_id for each control
+/// (`story.formcompose.<key>.<part>`).
+const SizeSpec = struct {
+    size: ControlSize,
+    title: []const u8,
+    row_id: []const u8,
+    input_id: []const u8,
+    status_id: []const u8,
+    owner_id: []const u8,
+    reset_id: []const u8,
+    apply_id: []const u8,
 };
 
-fn heading(cx: *ui.Cx, value: []const u8) !*ui.Node {
-    return ui.text(cx, value, .{ .font_size = 13, .font_weight = 600, .color = cx.tokens.color.fg_primary });
+fn sizeSpec(comptime size: ControlSize, comptime key: []const u8, comptime title: []const u8) SizeSpec {
+    const prefix = "story.formcompose." ++ key;
+    return .{
+        .size = size,
+        .title = title,
+        .row_id = prefix ++ ".row",
+        .input_id = prefix ++ ".input",
+        .status_id = prefix ++ ".status",
+        .owner_id = prefix ++ ".owner",
+        .reset_id = prefix ++ ".reset",
+        .apply_id = prefix ++ ".apply",
+    };
 }
 
-fn caption(cx: *ui.Cx, value: []const u8) !*ui.Node {
-    return ui.text(cx, value, .{ .font_size = 12, .color = cx.tokens.color.fg_tertiary });
+const sizes = [_]SizeSpec{
+    sizeSpec(.xs, "xs", "XS"),
+    sizeSpec(.sm, "sm", "SM"),
+    sizeSpec(.md, "md", "MD"),
+    sizeSpec(.lg, "lg", "LG"),
+};
+
+const Styles = struct {
+    fn root(_: *const ui.theme.Values) ui.BoxStyle {
+        return .{ .gap = 16 };
+    }
+    fn heading(t: *const ui.theme.Values) ui.TextStyle {
+        return .{ .font_size = 13, .font_weight = 600, .color = t.tokens.color.fg_primary };
+    }
+    fn caption(t: *const ui.theme.Values) ui.TextStyle {
+        return .{ .font_size = 12, .color = t.tokens.color.fg_tertiary };
+    }
+    fn card(t: *const ui.theme.Values) ui.BoxStyle {
+        return .{
+            .gap = 16,
+            .padding = ui.Padding.all(20),
+            .background = t.tokens.color.bg_primary,
+            .border = .{ .width = 1, .color = t.tokens.color.border, .radius = t.tokens.radius.lg },
+        };
+    }
+    fn cardTitle(t: *const ui.theme.Values) ui.TextStyle {
+        return .{ .font_size = 16, .font_weight = 600, .color = t.tokens.color.fg_primary };
+    }
+    fn field(_: *const ui.theme.Values) ui.BoxStyle {
+        return .{ .width = .{ .px = field_width }, .gap = 6 };
+    }
+    fn fieldLabel(t: *const ui.theme.Values) ui.TextStyle {
+        return .{ .font_size = 12, .font_weight = 600, .color = t.tokens.color.fg_secondary };
+    }
+    fn fieldRow(_: *const ui.theme.Values) ui.BoxStyle {
+        return .{ .gap = 16, .align_items = .start };
+    }
+    fn footer(t: *const ui.theme.Values) ui.BoxStyle {
+        return .{
+            .width = .{ .grow = .{} },
+            .gap = 8,
+            .align_items = .center,
+            .justify = .end,
+            .padding = .{ .top = 16 },
+            .border_top_width = t.tokens.border_width.thin,
+            .border_top_color = t.tokens.color.border,
+        };
+    }
+};
+
+fn filterToolbar(spec: SizeSpec, scope: *ui.Scope, cx: *ui.Cx) !*ui.Node {
+    return v.render(scope, cx, v.col(.{ .style = S.stack(6) }, .{
+        v.text(.{ .style = Styles.caption }, spec.title),
+        v.row(.{ .style = S.line(8), .test_id = spec.row_id }, .{
+            v.attrs(.{ .test_id = spec.input_id }, W.Input(.{
+                .size = spec.size,
+                .placeholder = "Search orders…",
+                .leading_icon_asset = ui.assets.common.search,
+                .width = 180,
+            })),
+            v.attrs(.{ .parts = .{ .trigger = spec.status_id } }, W.Select(.{
+                .size = spec.size,
+                .options = &status_options,
+                .placeholder = "Status",
+                .width = 130,
+            })),
+            v.attrs(.{ .parts = .{ .trigger = spec.owner_id } }, W.Select(.{
+                .size = spec.size,
+                .options = &owner_options,
+                .placeholder = "Owner",
+                .leading_icon = ui.icons.user,
+                .width = 150,
+            })),
+            v.attrs(.{ .test_id = spec.reset_id }, W.Button(.{ .label = "Reset", .variant = .secondary, .size = spec.size })),
+            v.attrs(.{ .test_id = spec.apply_id }, W.Button(.{
+                .label = "Apply filters",
+                .variant = .primary,
+                .size = spec.size,
+                .icon_asset = ui.assets.common.search,
+            })),
+        }),
+    }));
 }
 
-fn tag(node: *ui.Node, comptime id: []const u8) void {
-    node.meta.ownership.meta.test_id = id;
-}
-
-fn filterToolbar(comptime spec: SizeSpec, scope: *ui.Scope, cx: *ui.Cx) !*ui.Node {
-    const a = cx.allocator;
-    const prefix = "story.formcompose." ++ spec.key;
-    const block = try ui.box(cx, .{ .direction = .column, .gap = 6 }, .{});
-    try block.appendChild(a, try caption(cx, spec.title));
-
-    const bar = try ui.box(cx, .{ .direction = .row, .gap = 8, .align_items = .center }, .{});
-    tag(bar, prefix ++ ".row");
-
-    const search = try W.Input(.{
-        .size = spec.size,
-        .placeholder = "Search orders…",
-        .leading_icon_asset = ui.assets.common.search,
-        .width = 180,
-    }).mount(scope, cx);
-    tag(search, prefix ++ ".input");
-    try bar.appendChild(a, search);
-
-    const status = try W.Select(.{
-        .size = spec.size,
-        .options = &status_options,
-        .placeholder = "Status",
-        .width = 130,
-    }, scope, cx);
-    tag(status.trigger, prefix ++ ".status");
-    try bar.appendChild(a, status.wrapper);
-
-    const owner = try W.Select(.{
-        .size = spec.size,
-        .options = &owner_options,
-        .placeholder = "Owner",
-        .leading_icon = ui.icons.user,
-        .width = 150,
-    }, scope, cx);
-    tag(owner.trigger, prefix ++ ".owner");
-    try bar.appendChild(a, owner.wrapper);
-
-    const reset = try W.Button(.{ .label = "Reset", .variant = .secondary, .size = spec.size }).mount(scope, cx);
-    tag(reset, prefix ++ ".reset");
-    try bar.appendChild(a, reset);
-
-    const apply = try W.Button(.{
-        .label = "Apply filters",
-        .variant = .primary,
-        .size = spec.size,
-        .icon_asset = ui.assets.common.search,
-    }).mount(scope, cx);
-    tag(apply, prefix ++ ".apply");
-    try bar.appendChild(a, apply);
-
-    try block.appendChild(a, bar);
-    return block;
+fn toolbar(spec: SizeSpec) v.ComponentOf(filterToolbar) {
+    return v.component(filterToolbar, spec);
 }
 
 const field_width: f32 = 280;
 
-fn field(cx: *ui.Cx, label: []const u8, control: *ui.Node) !*ui.Node {
-    const node = try ui.box(cx, .{ .width = .{ .px = field_width }, .direction = .column, .gap = 6 }, .{});
-    try node.appendChild(cx.allocator, try ui.text(cx, label, .{
-        .font_size = 12,
-        .font_weight = 600,
-        .color = cx.tokens.color.fg_secondary,
-    }));
-    try node.appendChild(cx.allocator, control);
-    return node;
+const field_props = .{ .style = Styles.field };
+const field_label_props = .{ .style = Styles.fieldLabel };
+const field_row_props = .{ .style = Styles.fieldRow };
+
+fn FieldKids(comptime Control: type) type {
+    return @Tuple(&.{ v.Text(@TypeOf(field_label_props), []const u8), Control });
 }
 
-fn fieldRow(cx: *ui.Cx, left: *ui.Node, right: *ui.Node) !*ui.Node {
-    const r = try ui.box(cx, .{ .direction = .row, .gap = 16, .align_items = .start }, .{});
-    try r.appendChild(cx.allocator, left);
-    try r.appendChild(cx.allocator, right);
-    return r;
+/// Field: label + control, fixed width.
+fn field(label: []const u8, control: anytype) v.Box(@TypeOf(field_props), FieldKids(@TypeOf(control)), .column) {
+    return v.col(field_props, FieldKids(@TypeOf(control)){ v.text(field_label_props, label), control });
 }
 
-fn orderForm(scope: *ui.Scope, cx: *ui.Cx) !*ui.Node {
-    const a = cx.allocator;
-    const t = cx.tokens;
-    const card = try ui.box(cx, .{
-        .direction = .column,
-        .gap = 16,
-        .padding = ui.Padding.all(20),
-        .background = t.color.bg_primary,
-        .border = .{ .width = 1, .color = t.color.border, .radius = t.radius.lg },
-    }, .{});
-    tag(card, "story.formcompose.order");
+fn FieldRowKids(comptime L: type, comptime R: type) type {
+    return @Tuple(&.{ L, R });
+}
 
-    const head = try ui.box(cx, .{ .direction = .column, .gap = 4 }, .{});
-    try head.appendChild(a, try ui.text(cx, "New order", .{ .font_size = 16, .font_weight = 600, .color = t.color.fg_primary }));
-    try head.appendChild(a, try caption(cx, "Orders are billed in the customer's region currency."));
-    try card.appendChild(a, head);
-
-    const customer = try W.Input(.{ .placeholder = "Acme Inc.", .width = field_width }).mount(scope, cx);
-    tag(customer, "story.formcompose.order.customer");
-    const email = try W.Input(.{ .input_type = .email, .placeholder = "billing@acme.com", .width = field_width }).mount(scope, cx);
-    try card.appendChild(a, try fieldRow(cx, try field(cx, "Customer", customer), try field(cx, "Billing email", email)));
-
-    const region = try W.Select(.{ .options = &region_options, .placeholder = "Select region", .width = field_width }, scope, cx);
-    tag(region.trigger, "story.formcompose.order.region");
-    const priority = try W.Select(.{ .options = &priority_options, .initial_selected = &.{1}, .width = field_width }, scope, cx);
-    try card.appendChild(a, try fieldRow(cx, try field(cx, "Region", region.wrapper), try field(cx, "Priority", priority.wrapper)));
-
-    const amount = try W.Input(.{ .placeholder = "0.00", .append_text = "USD", .width = field_width }).mount(scope, cx);
-    const due = try W.Input(.{ .placeholder = "YYYY-MM-DD", .leading_icon_asset = ui.assets.common.calendar, .width = field_width }).mount(scope, cx);
-    try card.appendChild(a, try fieldRow(cx, try field(cx, "Amount", amount), try field(cx, "Due date", due)));
-
-    const footer = try ui.box(cx, .{
-        .width = .{ .grow = .{} },
-        .direction = .row,
-        .gap = 8,
-        .align_items = .center,
-        .justify = .end,
-        .padding = .{ .top = 16 },
-        .border_top_width = t.border_width.thin,
-        .border_top_color = t.color.border,
-    }, .{});
-    try footer.appendChild(a, try W.Button(.{ .label = "Save draft", .variant = .ghost }).mount(scope, cx));
-    try footer.appendChild(a, try W.Button(.{ .label = "Cancel", .variant = .secondary }).mount(scope, cx));
-    const submit = try W.Button(.{ .label = "Create order", .variant = .primary }).mount(scope, cx);
-    tag(submit, "story.formcompose.order.submit");
-    try footer.appendChild(a, submit);
-    try card.appendChild(a, footer);
-    return card;
+/// Two-column fields per row.
+fn fieldRow(left: anytype, right: anytype) v.Box(@TypeOf(field_row_props), FieldRowKids(@TypeOf(left), @TypeOf(right)), .row) {
+    return v.row(field_row_props, FieldRowKids(@TypeOf(left), @TypeOf(right)){ left, right });
 }
 
 pub fn build(scope: *ui.Scope, cx: *ui.Cx) anyerror!*ui.Node {
-    const a = cx.allocator;
-    const root = try ui.box(cx, .{ .direction = .column, .gap = 16 }, .{});
-    tag(root, "story.formcompose.root");
+    return v.render(scope, cx, v.col(.{ .style = Styles.root, .test_id = "story.formcompose.root" }, .{
+        v.text(.{ .style = Styles.heading }, "Filter toolbar · same size"),
+        v.text(.{ .style = Styles.caption }, "Input / Select / Button share ControlSize: XS 20 · SM 24 · MD 32 · LG 40 px"),
+        v.list(&sizes, toolbar),
 
-    try root.appendChild(a, try heading(cx, "Filter toolbar · same size"));
-    try root.appendChild(a, try caption(cx, "Input / Select / Button share ControlSize: XS 20 · SM 24 · MD 32 · LG 40 px"));
-    inline for (sizes) |spec| {
-        try root.appendChild(a, try filterToolbar(spec, scope, cx));
-    }
-
-    try root.appendChild(a, try heading(cx, "Business form · MD"));
-    try root.appendChild(a, try orderForm(scope, cx));
-    return root;
+        v.text(.{ .style = Styles.heading }, "Business form · MD"),
+        v.col(.{ .style = Styles.card, .test_id = "story.formcompose.order" }, .{
+            v.col(.{ .style = S.stack(4) }, .{
+                v.text(.{ .style = Styles.cardTitle }, "New order"),
+                v.text(.{ .style = Styles.caption }, "Orders are billed in the customer's region currency."),
+            }),
+            fieldRow(
+                field("Customer", v.attrs(.{ .test_id = "story.formcompose.order.customer" }, W.Input(.{ .placeholder = "Acme Inc.", .width = field_width }))),
+                field("Billing email", W.Input(.{ .input_type = .email, .placeholder = "billing@acme.com", .width = field_width })),
+            ),
+            fieldRow(
+                field("Region", v.attrs(.{ .parts = .{ .trigger = "story.formcompose.order.region" } }, W.Select(.{ .options = &region_options, .placeholder = "Select region", .width = field_width }))),
+                field("Priority", W.Select(.{ .options = &priority_options, .value = "normal", .width = field_width })),
+            ),
+            fieldRow(
+                field("Amount", W.Input(.{ .placeholder = "0.00", .append_text = "USD", .width = field_width })),
+                field("Due date", W.Input(.{ .placeholder = "YYYY-MM-DD", .leading_icon_asset = ui.assets.common.calendar, .width = field_width })),
+            ),
+            v.row(.{ .style = Styles.footer }, .{
+                W.Button(.{ .label = "Save draft", .variant = .ghost }),
+                W.Button(.{ .label = "Cancel", .variant = .secondary }),
+                v.attrs(.{ .test_id = "story.formcompose.order.submit" }, W.Button(.{ .label = "Create order", .variant = .primary })),
+            }),
+        }),
+    }));
 }

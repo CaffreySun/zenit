@@ -1,17 +1,18 @@
-//! HiDPI：scale 变化时该更新哪些 FontSelector。
+//! HiDPI: which FontSelectors to update when scale changes.
 //!
-//! 宿主经 `App.setFontSelector` 换上自己的 selector 后，真正画字/测量走的是
-//! `renderer.fonts`（宿主那份），而此前 scale 变化只更新内建
-//! `app.font_selector`，换屏后宿主字体停在旧 scale（糊 / bearing 错位）。
-//! 同理 setFontSelector 装上时也必须立刻对齐当前 scale，否则首屏就是错的。
+//! After the host installs a custom selector via `App.setFontSelector`, text rendering and
+//! measurement use `renderer.fonts` (the host's), so a scale change must update it too, not
+//! only the built-in `app.font_selector`; otherwise host fonts stay at the old scale after
+//! a screen switch (blurry / bearing misaligned). setFontSelector must likewise sync the
+//! current scale on install, else the first frame is wrong.
 //!
-//! 泛型于 selector 类型（只要求 `setScaleFactor(f32)`），便于脱离 Metal/
-//! CoreText 单测。
+//! Generic on selector type (only requires `setScaleFactor(f32)`), so it can be unit tested
+//! without Metal/CoreText.
 
 const std = @import("std");
 
-/// 内建 selector 恒更新（self.fonts 基准字体挂在它上面）；生效中的外来
-/// selector 与内建不同则一并更新。
+/// Built-in selector always updates (self.fonts base font attached); active external
+/// selector also updates if different from built-in.
 pub fn syncSelectorScale(builtin: anytype, active: ?@TypeOf(builtin), scale: f32) void {
     builtin.setScaleFactor(scale);
     if (active) |sel| {

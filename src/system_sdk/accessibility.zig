@@ -28,9 +28,10 @@ pub const Role = enum(u8) {
     combobox,
     grid,
     gridcell,
-    // 2026-07-31：补组件 a11y 声明时新增。若不在这里同步扩，Tree/DataTable/
-    // Steps 等的新角色只会到达 a11y tree，走 focus.zig 那条 snapshot 路径时
-    // 会被迫降级成别的角色，平台 AT 拿到的仍是错的。
+    // 2026-07-31: added when supplementing component a11y declarations. If not synced here, new
+    // roles
+    // in Tree / DataTable / Steps etc only reach a11y tree; snapshot path via focus.zig
+    // forced to downgrade to different role, platform AT gets wrong one.
     tree,
     treeitem,
     row,

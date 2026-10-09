@@ -1,17 +1,18 @@
-//! Phase 0, Unclipped(T)
+//! Unclipped(T)
 //!
-//! 对齐 Zed `crates/text/src/text.rs` 的 `Unclipped<T>` wrapper。
-//! 用于表示"可以暂时越界的坐标"，供 Anchor 等结构使用。
+//! Aligns with Zed `crates/text/src/text.rs` `Unclipped<T>` wrapper.
+//! Marks "coords that can temporarily be out-of-bounds", used by Anchor etc.
 //!
-//! 动机：Anchor 的 offset 可能临时指向一个"不存在"的位置（例如：一次编辑
-//! 移除了尾部文本，但某个 Anchor 仍然携带旧的 offset）。Unclipped 是一个显式
-//! 标记，告诉读者"这个值可能越界，需要 resolve 后再使用"。
+//! Motivation: an Anchor's offset may temporarily point to a nonexistent location
+//! (e.g., an edit removes tail text but the Anchor still carries the old offset).
+//! Unclipped is an explicit marker telling the reader the value may be out-of-bounds and
+//! must be resolved before use.
 //!
-//! 纯类型标签，无运行时开销。
+//! Pure type tag, zero runtime cost.
 
 const std = @import("std");
 
-/// `Unclipped(T)` = "携带可能越界的 T"。
+/// `Unclipped(T)` = "carries possibly out-of-bounds T".
 pub fn Unclipped(comptime T: type) type {
     return struct {
         const Self = @This();
@@ -41,6 +42,6 @@ test "Unclipped wraps and unwraps any type" {
 test "Unclipped is distinct from inner type at comptime" {
     const UInt = Unclipped(u32);
     const UStr = Unclipped([]const u8);
-    // 纯类型检查：两种实例化类型不同
+    // Pure type check: two instantiated types differ
     try std.testing.expect(@TypeOf(UInt.wrap(1)) != @TypeOf(UStr.wrap("x")));
 }

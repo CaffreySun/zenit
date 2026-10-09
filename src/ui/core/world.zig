@@ -1,21 +1,17 @@
-//! World, Phase 3 拆 Node 后的统一根容器
+//! World: unified root container for retained cross-frame state, indexed by ElementId.
 //!
-//! 取代当前 Cx 内嵌的多个 owned 字段（lowering_buffer、display_list、scene_runtime、
-//! property_tree、compositor_plan 等都散落在 Cx）。新的 World 把所有跨帧保留的
-//! 数据结构聚拢，并按 ElementId 索引。
+//! Consolidates what Cx owned separately (lowering_buffer, display_list, scene_runtime,
+//! property_tree, compositor_plan): 4 tables + property tree + reactive graph + dirty set.
 //!
-//! 当前 Phase 3 阶段：World 是**新的 source of truth 的容器壳子**，结构就位，
-//! 但 Cx 仍保留旧 Node 路径（4 examples 不挂）。Phase 4 起渐进迁移：
-//!   - paint pass 改写 PaintTable
-//!   - layout pass 改写 LayoutTable
-//!   - 旧 Node 字段成为 World 的 view（getter/setter 委托）
+//! World is the new source of truth, but Cx still keeps old Node paths (4 examples unmounted).
+//! Planned migration:
+//!   - paint pass rewrites PaintTable
+//!   - layout pass rewrites LayoutTable
+//!   - old Node fields become World views (getter/setter delegates)
 //!
-//! 4 个表 + property tree + reactive graph + dirty set，构成完整保留态。
-//!
-//! 历史债避免：
-//! - 不让任何成员持有"父级 World 指针"，传 *World 给操作；避免 retain cycle
-//! - dirty set 在此层做"全局 dirty queue"，子系统只 push 到集合，不递归 push
-//!   （吸取 Chromium cc 历史："single layer hierarchy" 18 布尔状态混乱教训）
+//! Design rules:
+//! - no member holds a 'parent World pointer'; pass *World to operations to avoid retain cycles
+//! - dirty set is the 'global dirty queue'; subsystems only push to it, no recursive push
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -30,10 +26,11 @@ const content_table_mod = @import("content_table.zig");
 const paint_state_table_mod = @import("paint_state_table.zig");
 const layout_output_table_mod = @import("layout_output_table.zig");
 
-// 注意：World 不持有 ReactiveGraph。reactive 是 *状态端* 数据；World 是 *渲染端* 数据。
-// 两者通过 dirty_set 通信：reactive effect 调 world.markDirty(id, flags)，渲染管线
-// 在 begin_frame 后消费 dirty_set。这种解耦避免 world.deinit 时与 reactive
-// 生命周期纠缠，也让 World 更易做单测。
+// Note: World does not own ReactiveGraph. Reactive is state-side data; World is render-side data.
+// They communicate via dirty_set: reactive effects call world.markDirty(id, flags); render pipeline
+// consumes dirty_set after begin_frame. Decoupling avoids entanglement with reactive lifecycle at
+// world.deinit,
+// simplifies unit testing.
 
 pub const ElementId = element_id_mod.ElementId;
 pub const Element = element_table_mod.Element;
@@ -50,12 +47,13 @@ pub const PaintStateTable = paint_state_table_mod.PaintStateTable;
 pub const PaintStateData = paint_state_table_mod.PaintStateData;
 pub const LayoutOutputTable = layout_output_table_mod.LayoutOutputTable;
 
-/// DevTools 样式来源。地址指向：
-/// - styled：具名样式函数入口；
-/// - inline_builder / set_style：调用点附近的返回地址。
+/// DevTools style source. Address points to:
+/// - styled: named style function entry;
+/// - inline_builder / set_style: return address near callsite.
 ///
-/// 这里只存代码地址，不在热路径解析 DWARF；用户点 DevTools 的跳转按钮时才
-/// 由 source_link 做符号化。Release 去掉 debug info 后解析自然降级为无结果。
+/// Stores code address only, no DWARF parsing in hot path; symbolization by source_link
+/// only when user clicks DevTools jump button. After stripping debug info in Release, parsing
+/// gracefully degrades to empty.
 pub const StyleOriginKind = enum(u8) {
     inline_builder,
     styled,
@@ -68,11 +66,12 @@ pub const StyleOrigin = struct {
 };
 
 const NodeStyleOrigins = struct {
-    /// boxStyled/textStyled 或 inline builder 的公共来源。
+    /// Common source for boxStyled/textStyled or inline builder.
     base: ?StyleOrigin = null,
-    /// base 实际声明了哪些 StyleField；bit index = @intFromEnum(StyleField)。
+    /// Which StyleFields base actually declares; bit index = @intFromEnum(StyleField).
     base_fields: u64 = 0,
-    /// setStyle 的逐字段 last-writer 覆盖。绝大多数节点为空，不分配。
+    /// Per-field last-writer override from setStyle. Empty (not allocated) for vast majority of
+    /// nodes.
     field_overrides: std.AutoHashMapUnmanaged(u8, StyleOrigin) = .{},
 
     fn deinit(self: *NodeStyleOrigins, allocator: std.mem.Allocator) void {
@@ -87,16 +86,16 @@ pub const World = struct {
     layout: LayoutTable,
     paint: PaintTable,
     interaction: InteractionTable,
-    /// NodeContent SoA mirror（双写期；stage 3 才成 source of truth）
+    /// NodeContent SoA mirror (double-write phase; becomes source of truth at stage 3)
     content: ContentTable,
-    /// PaintState SoA mirror (background + opacity 等 paint 字段)
+    /// PaintState SoA mirror (background + opacity and other paint fields)
     paint_state: PaintStateTable,
-    /// NodeLayoutOutput SoA mirror (vector + artifacts；双写期)
+    /// NodeLayoutOutput SoA mirror (vector + artifacts; double-write phase)
     layout_output: LayoutOutputTable,
-    /// dirty set：本帧待处理；end_frame 时按阶段消费
+    /// dirty set: pending this frame; consumed by stage at end_frame
     dirty_set: std.AutoHashMapUnmanaged(u32, DirtyFlags),
-    /// DevTools-only 稀疏来源表。Node 本体不为 50+ 个 StyleField 扩容；只有
-    /// styled/被 setStyle 修改过的节点才占一个条目。
+    /// DevTools-only sparse source table. Node body does not allocate for 50+ StyleFields;
+    /// only styled / setStyle-modified nodes occupy an entry.
     style_origins: std.AutoHashMapUnmanaged(u32, NodeStyleOrigins),
 
     pub fn init(allocator: std.mem.Allocator) World {
@@ -129,7 +128,8 @@ pub const World = struct {
         self.* = undefined;
     }
 
-    /// 创建一个 element，并同步在 layout/paint/content/paint_state 表里分配 slot。
+    /// Create an element and synchronously allocate slots in layout/paint/content/paint_state
+    /// tables.
     pub fn createElement(self: *World, e: Element) !ElementId {
         const id = try self.elements.create(e);
         errdefer self.destroyElement(id);
@@ -138,19 +138,22 @@ pub const World = struct {
         try self.content.ensureSlot(id);
         try self.paint_state.ensureSlot(id);
         try self.layout_output.ensureSlot(id);
-        // element slot 可能是从 free_list 复用的旧 slot（generation++）。content
-        // 镜像表按 index 存、不校验 generation，ensureSlot 对已存在的 slot 直接
-        // return 不清，于是复用 slot 会残留上一个 owner 的 text -> 新节点 getText
-        // 读到旧内容（典型：Menu 弹层项 "Cut/Copy/Delete" 漏进新挂载的 DatePicker
-        // trigger -> content 串台/空白）。destroyElement 已在销毁侧 clear，但裸
-        // elements.destroy / Node.destroy 路径绕过它，故在分配侧也清 content 双保险。
-        // 注：不清 layout_output，那是布局 source of truth，清了会让 mount 后首个
-        // 未经 layout 的 query 读到 0 rect。content 由节点紧接着 setText 覆盖，安全。
+        // Element slot may be reused from free_list (generation++). Content mirror table is indexed
+        // without generation checks; ensureSlot returns existing slots without clearing, so a
+        // reused
+        // slot keeps the previous owner's text and the new node's getText reads stale content (e.g.
+        // Menu
+        // items 'Cut/Copy/Delete' leaking into a new DatePicker trigger). destroyElement clears on
+        // the
+        // destroy side, but bare elements.destroy / Node.destroy bypass it, so alloc also clears
+        // content.
+        // Do not clear layout_output: it is the layout source of truth; clearing breaks post-mount
+        // unlayouted queries (read 0 rect). Content is overwritten by setText immediately; safe.
         self.content.clear(id);
         return id;
     }
 
-    /// 销毁 element 并清理所有 dirty 标记（不递归子树，caller 决定）。
+    /// Destroy element and clear all dirty flags (non-recursive; caller decides subtree).
     pub fn destroyElement(self: *World, id: ElementId) void {
         if (!self.elements.isValid(id)) return;
         self.clearStyleOrigins(id.raw());
@@ -159,16 +162,18 @@ pub const World = struct {
         _ = self.dirty_set.remove(id.raw());
         self.content.clear(id);
         self.paint_state.clear(id);
-        self.layout_output.clear(id); // v0.10-§L stage 1: 非 owning 镜像，clear 不 free path
+        self.layout_output.clear(id); // v0.10-§L stage 1: non-owning mirror, clear does not free
         self.layout.clear(id);
-        // paint chunk 必须清内容（释放 display_items + 归零 hash/epoch/property_state），
-        // 否则 slot 复用 + hash 撞车时 beginRecord 吐旧 owner 的显示项（见 release 注释）。
+        // Paint chunk must clear content (free display_items + zero hash/epoch/property_state),
+        // else slot reuse + hash collision causes beginRecord to emit old owner's items (see
+        // release note).
         self.paint.release(id);
-        // layout / paint 槽不立即回收（保持 dense by index；空 slot 占少量内存）。
+        // layout / paint slots not immediately recycled (keep dense by index; empty slots use
+        // minimal memory).
     }
 
-    /// 记录声明式/inline builder 的公共来源及它实际设置的字段。
-    /// DevTools 是诊断能力；OOM 时丢一条来源，不能拖垮目标应用。
+    /// Record common source for declarative/inline builder and which fields it actually set.
+    /// DevTools is diagnostic; dropping one source on OOM won't drag down target app.
     pub fn recordStyleBase(self: *World, element_raw: u32, fields: u64, origin: StyleOrigin) void {
         if (builtin.strip_debug_info) return;
         if (element_raw == 0xFFFFFFFF or origin.address == 0 or fields == 0) return;
@@ -178,7 +183,7 @@ pub const World = struct {
         gop.value_ptr.base_fields = fields;
     }
 
-    /// 记录 setStyle 的逐字段 last-writer。
+    /// Record per-field last-writer from setStyle.
     pub fn recordStyleField(self: *World, element_raw: u32, field_index: u8, origin: StyleOrigin) void {
         if (builtin.strip_debug_info) return;
         if (element_raw == 0xFFFFFFFF or origin.address == 0) return;
@@ -187,8 +192,8 @@ pub const World = struct {
         gop.value_ptr.field_overrides.put(self.allocator, field_index, origin) catch {};
     }
 
-    /// 查逐字段覆盖，未覆盖时仅在 base 确实声明过该字段的情况下回退 base。
-    /// field_index=null 用于 TextStyle.line_height 等尚未进入 StyleField 的属性。
+    /// Check per-field overrides; fall back to base only if base actually declared the field.
+    /// field_index=null for attributes like TextStyle.line_height not yet in StyleField.
     pub fn styleOrigin(self: *const World, element_raw: u32, field_index: ?u8) ?StyleOrigin {
         const origins = self.style_origins.get(element_raw) orelse return null;
         if (field_index) |index| {
@@ -205,7 +210,7 @@ pub const World = struct {
         origins.deinit(self.allocator);
     }
 
-    /// 标记 element 脏。flag 通过 union 合并到现有条目。
+    /// Mark element dirty. Flags merged to existing entry via union.
     pub fn markDirty(self: *World, id: ElementId, flags: DirtyFlags) !void {
         if (id.isNull()) return;
         const gop = try self.dirty_set.getOrPut(self.allocator, id.raw());
@@ -222,9 +227,10 @@ pub const World = struct {
         return self.dirty_set.count();
     }
 
-    /// 帧开始：清 dirty set（消费方已处理）。
-    /// PropertyTree 的 beginFrameRetained 由 Cx.property_tree 主路径调用，World 不再
-    /// 持有副本（v0.5-P3 stage 1 去重，2026-04-30）。
+    /// Frame start: clear dirty set (consumers processed it).
+    /// PropertyTree.beginFrameRetained called by Cx.property_tree main path; World no longer holds
+    /// copy
+    /// (v0.5-P3 stage 1 dedup, 2026-04-30).
     pub fn beginFrame(self: *World) void {
         self.dirty_set.clearRetainingCapacity();
     }
@@ -247,10 +253,10 @@ test "World: createElement allocates slots in all dense tables" {
 
     const id = try w.createElement(.{ .tag = .container, .key = 1 });
     try testing.expect(w.elements.isValid(id));
-    // layout / paint 已分配
+    // layout / paint allocated
     try testing.expect(w.layout.get(id) != null);
     try testing.expect(w.paint.get(id) != null);
-    // interaction 是 sparse，未自动分配
+    // interaction is sparse, not auto-allocated
     try testing.expect(w.interaction.get(id) == null);
 }
 
@@ -313,7 +319,7 @@ test "World: destroyElement 清 paint chunk —— slot 复用 + hash 撞车不�
     defer w.deinit();
 
     const id = try w.createElement(.{ .tag = .container, .key = 0 });
-    // 录制一份显示项（hash=42）
+    // Record one display item (hash=42)
     try testing.expect(try w.paint.beginRecord(id, 42));
     try w.paint.pushItem(id, .{ .kind = .rect, .local_bounds = .{ .min_x = 0, .min_y = 0, .max_x = 10, .max_y = 10 } });
     w.paint.endRecord(id, .NONE);
@@ -321,13 +327,13 @@ test "World: destroyElement 清 paint chunk —— slot 复用 + hash 撞车不�
 
     w.destroyElement(id);
 
-    // 复用同一 slot（LIFO free list），新 owner 的 content_hash 恰好撞上旧值：
-    // beginRecord 必须真的重录（返回 true），不得 cache-hit 吐旧 owner 的显示项
+    // Reuse same slot (LIFO free list), new owner's content_hash happens to collide with old value:
+    // beginRecord must truly re-record (return true), cannot cache-hit and emit old owner's items
     const id2 = try w.createElement(.{ .tag = .container, .key = 1 });
-    try testing.expectEqual(id.index, id2.index); // 前提：slot 真的被复用
+    try testing.expectEqual(id.index, id2.index); // Precondition: slot is truly reused
     try testing.expect(try w.paint.beginRecord(id2, 42));
     try testing.expectEqual(@as(usize, 0), w.paint.get(id2).?.display_items.items.len);
-    // property_state 也必须归零，全表扫描按 idx 消费它
+    // property_state must also zero; full table scan consumes it by idx
     try testing.expectEqual(paint_table_mod.PropertyStateRef.NONE, w.paint.get(id2).?.property_state);
 }
 

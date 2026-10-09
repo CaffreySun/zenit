@@ -13,14 +13,20 @@ import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 
+/** True when the suite drives an app on the Windows worker: through the host
+ * HTTP queue, or run on the worker itself (windows_vm_http.py --suite-on-worker). */
+export function runsOnWindowsWorker(): boolean {
+  return Boolean(process.env.ZENIT_E2E_HTTP_JOB_ID) || process.platform === "win32";
+}
+
 export function getRpcDir(): string {
   return process.env.ZENIT_E2E_FILE_RPC_DIR ?? "/tmp/zenit_e2e_rpc_19816";
 }
 
 /**
- * 诊断超时：读 server 写入的 owner.json（单主锁标记），把"沉默超时"分为
- * 三种可定责的状态。旧版 app 不写 owner.json，此时降级为 "unclaimed" 提示，
- * 不影响协议兼容。
+ * Timeout diagnostics: read owner.json written by server (single-owner lock marker),
+ * distinguish "silent timeout" into three attributable states. Old app skips owner.json,
+ * degrade to "unclaimed" hint, protocol compatible.
  */
 async function ownerDiagnostic(rpcDir: string): Promise<string> {
   let text: string;
@@ -75,6 +81,8 @@ export interface QueryNode {
   rotate?: number;
   translate_x?: number;
   translate_y?: number;
+  scale_x?: number;
+  scale_y?: number;
   children?: QueryNode[];
 }
 
@@ -117,13 +125,45 @@ export interface WindowRecordingState {
   error?: string;
 }
 
-// ── 核心 RPC ──
+// ── Core RPC ──
+
+// The Windows worker answers a refused native-input action with ok:false; both
+// transports surface it as an error.
+function checkNativeInput(method: string, path: string, result: any): any {
+  // Native input and desktop capture refusals arrive as {ok:false,error} over file RPC
+  // (the HTTP queue answers 403 instead); surface both the same way.
+  if ((path === "/windows/native-input" || path === "/windows/native-desktop") && result?.ok === false) {
+    throw new Error(`Windows native input ${method} ${path}: ${result.error ?? "request refused"}`);
+  }
+  return result;
+}
 
 export async function request(
   method: string,
   path: string,
   body?: object,
 ): Promise<any> {
+  const httpJob = process.env.ZENIT_E2E_HTTP_JOB_ID;
+  if (httpJob) {
+    const base = process.env.ZENIT_E2E_HTTP_BASE ?? "http://127.0.0.1:19817";
+    const token = process.env.ZENIT_E2E_HTTP_TOKEN;
+    if (!token) throw new Error("ZENIT_E2E_HTTP_TOKEN is required for Windows HTTP RPC");
+    const response = await fetch(`${base}/rpc/${httpJob}`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ method, path, body }),
+      signal: AbortSignal.timeout(getE2eTimeoutMs(35000)),
+    });
+    const raw = await response.text();
+    let result: any;
+    try {
+      result = JSON.parse(raw);
+    } catch {
+      throw new Error(`Windows HTTP RPC ${method} ${path}: HTTP ${response.status}, ${raw.slice(0, 160)}`);
+    }
+    if (!response.ok) throw new Error(`Windows HTTP RPC ${method} ${path}: ${JSON.stringify(result)}`);
+    return checkNativeInput(method, path, result);
+  }
   // Validate before publishing a request so a malformed environment value
   // cannot leave an orphaned req-*.json behind.
   const timeoutMs = getE2eTimeoutMs();
@@ -161,7 +201,7 @@ export async function request(
       if (value === null || typeof value !== "object") {
         throw new Error(`response must be a JSON object or array, got ${typeof value}`);
       }
-      return value;
+      return checkNativeInput(method, path, value);
     } catch (err: any) {
       // A present response is a completed protocol message. Never turn a
       // malformed/truncated message into a successful-looking `{raw: ...}`
@@ -201,29 +241,44 @@ export async function query(testId: string): Promise<QueryNode[]> {
 }
 
 export interface FrameStats {
+  renderer_backend?: "d3d12" | "legacy" | null;
+  window_scale?: number | null;
   retained_hits: number;
   retained_misses: number;
   retained_partial_repaints: number;
   path_draw_calls: number;
   frame_count: number;
   backdrop_luminance_milli: number;
+  /** Paint invariant: cumulative duplicate solid-rect count (same node, frame, identical fill emitted twice). Must be 0 */
+  paint_duplicate_fills: number;
+  /** Most recent double-emit node id (debug; 0 = never) */
+  paint_duplicate_node: number;
 
-  // ── 单帧计时（微秒）──
-  // 噪声大（drawable 获取/调度抖动/PSO 编译），**只用于 log，不要断言**。
-  /** 上一帧真 GPU 执行时间（MTLCommandBuffer GPUEndTime-GPUStartTime） */
+  // ── Per-frame timing (microseconds) ──
+  // High noise (drawable acquire / dispatch jitter / PSO compile), **log only, don't assert**.
+  /** Last frame real GPU time (MTLCommandBuffer GPUEndTime-GPUStartTime) */
   gpu_execute_us: number;
   cpu_frame_us: number;
   layout_us: number;
   render_gen_us: number;
   gpu_encode_us: number;
+  wait_for_frame_us?: number | null;
+  acquire_texture_us?: number | null;
+  encode_us?: number | null;
+  flush_us?: number | null;
   total_frame_us: number;
 
-  // ── 跨帧 P95（微秒），性能门禁断言用的抗噪统计量 ──
+  // ── Cross-frame P95 (microseconds), perf gate assertion anti-noise statistic ──
   gpu_p95_us: number;
   cpu_p95_us: number;
   total_p95_us: number;
-  /** P95 的有效样本数；断言前必须确认它足够大，否则是在对空环下判断（恒 0 = 假绿） */
+  /** P95 valid sample count; must confirm before assert, else judging empty loop (0 ever = false positive) */
   timing_samples: number;
+  cpu_timing_samples?: number;
+  gpu_timing_disjoint_samples?: number;
+  gpu_timing_failed_samples?: number;
+  gpu_timing_pending_queries?: number;
+  gpu_timing_query_supported?: boolean | null;
 }
 
 export async function stats(): Promise<FrameStats> {
@@ -231,8 +286,8 @@ export async function stats(): Promise<FrameStats> {
 }
 
 /**
- * 清空跨帧计时采样环。性能门禁切到重场景并等其 settle 后调用，
- * 使随后的 P95 只统计该场景自己的帧（不混入上一个 story 的样本）。
+ * Clear cross-frame timing sample ring. Perf gate switches heavy scene, waits settle, calls this;
+ * subsequent P95 counts only that scene (unmixes prior story samples).
  */
 export async function resetTiming(): Promise<{ ok: boolean }> {
   return request("POST", "/stats/reset", {});
@@ -292,11 +347,13 @@ export async function waitForConsole(
   throw new Error(`console event timeout: ${JSON.stringify(predicate)}; recent=${JSON.stringify(recent.slice(-10))}`);
 }
 
-export async function clickAt(x: number, y: number): Promise<ClickResult> {
-  return request("POST", "/click", { x, y });
+/** count > 1 injects consecutive clicks inside the app in one request, so a
+ *  double-click never depends on the driver's round-trip time. */
+export async function clickAt(x: number, y: number, count = 1): Promise<ClickResult> {
+  return request("POST", "/click", count === 1 ? { x, y } : { x, y, count });
 }
 
-/** 与 ui.events.ScrollPhase 一致。省略 = 鼠标滚轮。 */
+/** Matches ui.events.ScrollPhase. Omit = mouse wheel. */
 export type ScrollPhase = "none" | "may_begin" | "began" | "changed" | "ended" | "cancelled";
 
 export interface ScrollMods {
@@ -304,13 +361,13 @@ export interface ScrollMods {
   ctrl?: boolean;
   alt?: boolean;
   cmd?: boolean;
-  /** 触控板手势阶段；省略时按鼠标滚轮派发（每个事件按命中目标）。 */
+  /** Trackpad gesture phase; omit -> dispatch as mouse wheel (each event to hit target). */
   phase?: ScrollPhase;
-  /** 松手后的惯性阶段 */
+  /** Inertia phase after release */
   momentum?: "began" | "changed" | "ended";
 }
 
-/** 单个滚动事件。默认是鼠标滚轮；触控板手势请用 trackpadScroll 发完整序列。 */
+/** Single scroll event. Default mouse wheel; trackpad gesture use trackpadScroll send full sequence. */
 export async function scrollAt(x: number, y: number, dx: number, dy: number, mods: ScrollMods = {}): Promise<{ ok: boolean }> {
   const body: Record<string, unknown> = { x, y, dx, dy };
   if (mods.shift) body.shift = true;
@@ -323,8 +380,8 @@ export async function scrollAt(x: number, y: number, dx: number, dy: number, mod
 }
 
 /**
- * 一次完整的触控板手势：began、每个增量一个 changed、最后 ended（与真实设备
- * 的事件序列一致）。stepDelayMs 控制事件间隔。
+ * One complete trackpad gesture: began, changed per delta, ended (matches real device
+ * event sequence). stepDelayMs controls event spacing.
  */
 export async function trackpadScroll(
   x: number,
@@ -352,7 +409,10 @@ export async function dragAt(x: number, y: number, kind: number, paths = ""): Pr
   return request("POST", "/drag", { x, y, kind, paths });
 }
 
-/** 调整窗口逻辑尺寸（点）。resize 会触发 surface 重配，readback 能力回归锚点。 */
+/**
+ * Resize the window's logical size (points). Resizing triggers a surface reconfigure, so this is the
+ * regression anchor for the readback capability.
+ */
 export async function resizeWindow(width: number, height: number): Promise<{ ok: boolean }> {
   return request("POST", "/resize", { width, height });
 }
@@ -394,6 +454,20 @@ export async function imeCommit(text: string): Promise<{ ok: boolean }> {
   return request("POST", "/ime_commit", { text });
 }
 
+export interface TrackSample { t: number; x: number; y: number; w: number; h: number; found: boolean }
+
+/** Begin per-frame tracking: app records screen rect of this node each frame (animation assert, unrelated to RPC latency) */
+export async function trackStart(testId: string): Promise<void> {
+  await request("POST", "/track_start", { test_id: testId });
+}
+
+/** end per-frame tracking, get all samples (first sample is position when tracking started). error if samples hit app-side limit, later frames not recorded */
+export async function trackStop(): Promise<TrackSample[]> {
+  const r = (await request("POST", "/track_stop", {})) as { truncated: boolean; samples: TrackSample[] };
+  if (r.truncated) throw new Error(`track_stop: sample limit reached after ${r.samples.length} frames; later frames were not recorded`);
+  return r.samples;
+}
+
 export async function screenPos(testId: string): Promise<ScreenPos> {
   return request("POST", "/screen_pos", { test_id: testId });
 }
@@ -413,6 +487,7 @@ export interface InputState {
   ime_phase: string;
   input_type: string;
   scroll_x: number;
+  scroll_y?: number;
 }
 
 export async function inputState(testId: string): Promise<InputState> {
@@ -443,7 +518,7 @@ export async function stopWindowRecording(): Promise<WindowRecordingState> {
   return request("POST", "/recording/stop");
 }
 
-// ── 宿主自定义路由（test-mode 下由 app 注册 handler）──
+// ── Host-custom routes (test-mode: app registers handler) ──
 
 export interface ScenarioSetupRequest {
   contract: number;
@@ -462,10 +537,10 @@ export interface ScenarioSetupResponse {
 }
 
 /**
- * 请求 app 进入某个测试 view / 初始 state。`/scenario/setup` 是宿主自定义路由：
- * http_server.zig 会把未命中内置路由的路径原样转交宿主注册的 handler。
- * 约定：幂等、每 case 调用、错误用 `{ok:false,error}` 显式返回；大 data 用
- * `state_key` 引用，不塞 body（app route body 上限 512B）。
+ * Request app enter test view / initial state. /scenario/setup is host custom route:
+ * http_server.zig passes unmatched paths to host-registered handler. Contract:
+ * idempotent, called per case, errors return {ok:false,error} explicitly; large data
+ * uses state_key reference, not body (app route body limit 512B).
  */
 export async function scenarioSetup(payload: ScenarioSetupRequest): Promise<ScenarioSetupResponse> {
   return request("POST", "/scenario/setup", payload);
@@ -479,10 +554,10 @@ export function sleep(ms: number): Promise<void> {
 
 export async function waitFor<T>(
   fn: () => Promise<T | null | undefined>,
-  // ⚠ 默认值必须走 getE2eTimeoutMs：否则 CI 把 ZENIT_E2E_TIMEOUT_MS 放宽到
-  // 45s 只对单次 RPC 生效，不传预算的调用点仍死等 5s。负载下「条件在第
-  // 6~40s 满足」正好落进这个缺口，报错还会写成 "waitFor timeout"，
-  // 把排查引向被测功能而不是超时预算。这是 e2e 在负载下 flaky 的结构性原因。
+  // Warning: default must call getE2eTimeoutMs: else CI sets ZENIT_E2E_TIMEOUT_MS to 45s
+  // only applies per-RPC, call sites that pass no explicit budget still wait a fixed 5s. Under load 'condition true at 6-40s'
+  // lands in gap, error written 'waitFor timeout' blames feature not budget. Structural reason
+  // e2e flaky under load.
   timeoutMs = getE2eTimeoutMs(5000),
   pollMs = 50,
 ): Promise<T> {
@@ -513,4 +588,21 @@ export async function waitForServerReady(timeoutMs = getE2eTimeoutMs(10000)): Pr
     await sleep(100);
   }
   throw new Error(`server not ready after ${timeoutMs}ms`);
+}
+
+/** Native UI-thread click and real-time submitted-frame capture; the HTTP hop
+ * returns an already selected frame, never determines its sampling instant. */
+export async function captureFrameAt(testId: string, clickTestId: string, afterMs: number, path: string): Promise<{ok:boolean; path:string; sample_ms:number; requested_ms:number; frame_index:number; x:number; effective_opacity:number}> {
+  return request("POST", "/frames/capture", {test_id:testId, click_test_id:clickTestId, after_ms:afterMs, path});
+}
+
+/** Windows UI geometry sampled after each successful frame submission, without RPC polling.
+ * Optional clickTestId dispatches a hit-tested background click on the same UI turn
+ * after arming observation. Unsupported backends perform neither action nor observation.
+ */
+export async function startFrameObservation(testId: string, action?: "escape_on_enter", clickTestId?: string): Promise<{ supported: boolean }> {
+  return request("POST", "/frames/start", { test_id: testId, action, click_test_id: clickTestId });
+}
+export async function readFrameObservation(): Promise<{ action_frame_index: number | null; overflow: boolean; missing: number; frames: Array<ScreenPos & { ms: number; opacity?: number; effective_opacity?: number }> }> {
+  return request("POST", "/frames/read");
 }

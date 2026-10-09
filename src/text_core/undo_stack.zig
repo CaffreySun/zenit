@@ -1,19 +1,19 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-/// 编辑操作类型
+/// Edit operation type
 pub const OpType = enum {
     insert,
     delete,
 };
 
-/// 编辑操作记录
+/// Edit operation record
 pub const Operation = struct {
     op_type: OpType,
     position: usize,
     length: usize,
-    text: ?[]const u8, // 对于删除操作，存储被删除的文本
-    group_id: u32 = 0, // 非 0 时，相同 group_id 的操作一起 undo/redo
+    text: ?[]const u8, // For delete operations, store deleted text
+    group_id: u32 = 0, // When nonzero, operations with same group_id undo/redo together
 
     pub fn deinit(self: *Operation, allocator: Allocator) void {
         if (self.text) |text| {
@@ -22,8 +22,8 @@ pub const Operation = struct {
     }
 };
 
-/// Undo/Redo 栈
-/// 基于 Piece Table 的不可变性，我们可以轻量级地存储操作历史
+/// Undo/Redo stack
+/// Based on Piece Table immutability, we can store operation history lightweight
 pub const UndoStack = struct {
     allocator: Allocator,
     undo_stack: std.ArrayList(Operation),
@@ -35,8 +35,8 @@ pub const UndoStack = struct {
     pub fn init(allocator: Allocator, max_size: usize) UndoStack {
         return UndoStack{
             .allocator = allocator,
-            .undo_stack = std.ArrayList(Operation){},
-            .redo_stack = std.ArrayList(Operation){},
+            .undo_stack = @as(std.ArrayList(Operation), .empty),
+            .redo_stack = @as(std.ArrayList(Operation), .empty),
             .max_size = max_size,
         };
     }
@@ -52,36 +52,36 @@ pub const UndoStack = struct {
         self.redo_stack.deinit(self.allocator);
     }
 
-    /// 推入新操作（同时清空 redo 栈）。
-    /// 所有权：成功时 op（含其 text）归栈所有；返回错误时所有权仍在调用方
-    /// （但 redo 栈已被清空，redo 失效是保守且无害的）。
+    /// Push new operation (also clear redo stack).
+    /// Ownership: success -> op (with its text) owned by stack; error -> caller still owns
+    /// (but redo stack cleared, redo invalidated - conservative and harmless).
     pub fn push(self: *UndoStack, op: Operation) !void {
-        // 清空 redo 栈
+        // Clear redo stack
         for (self.redo_stack.items) |*redo_op| {
             redo_op.deinit(self.allocator);
         }
         self.redo_stack.clearRetainingCapacity();
 
-        // 推入 undo 栈
+        // Push undo stack
         try self.undo_stack.append(self.allocator, op);
         self.version +%= 1;
 
-        // 限制栈大小
+        // Limit stack size
         if (self.undo_stack.items.len > self.max_size) {
             var removed = self.undo_stack.orderedRemove(0);
             removed.deinit(self.allocator);
         }
     }
 
-    /// 单次撤销。
-    /// 所有权：返回的 Operation 转移给调用方（用完须 op.deinit(allocator)）；
-    /// redo 栈保留自己的独立副本，两者不共享内存（对照 textarea 快照栈的
-    /// 所有权转移写法）。
-    /// 瞬时 OOM 时返回 null 且状态不变：op 仍留在 undo 栈，可重试。
+    /// Single undo.
+    /// Ownership: returned Operation transferred to caller (call op.deinit(allocator)); redo stack
+    /// keeps independent copy, not shared (contrast textarea snapshot stack ownership).
+    /// Transient OOM returns null, state unchanged: op stays in undo stack, can retry.
     pub fn undo(self: *UndoStack) ?Operation {
         if (self.undo_stack.items.len == 0) return null;
 
-        // 先把所有可失败的分配做完，任一失败则不动任何状态（op 不丢、不泄漏）。
+        // Finish all possibly-failing allocations first; any fail -> no state mutation (op not
+        // lost, not leaked).
         self.redo_stack.ensureUnusedCapacity(self.allocator, 1) catch return null;
         const top = self.undo_stack.items[self.undo_stack.items.len - 1];
         var stack_copy = top;
@@ -95,8 +95,9 @@ pub const UndoStack = struct {
         return op;
     }
 
-    /// 单次重做。所有权契约与 undo 相同：返回值归调用方，undo 栈存独立副本；
-    /// 瞬时 OOM 时返回 null 且状态不变。
+    /// Single redo. Ownership contract same as undo: return to caller, undo stack stores
+    /// independent copy;
+    /// transient OOM returns null, state unchanged.
     pub fn redo(self: *UndoStack) ?Operation {
         if (self.redo_stack.items.len == 0) return null;
 
@@ -122,9 +123,10 @@ pub const UndoStack = struct {
     }
 };
 
-/// 一次性失败 allocator：armed（fail_next=true）后使下一次分配失败一次，
-/// 之后恢复正常。std.testing.FailingAllocator 首中后**永久**失败
-/// （alloc_index 只在成功时递增），模拟「瞬时 OOM 后恢复」必须用这种。
+/// One-shot failing allocator: armed (fail_next=true) causes next allocation to fail once,
+/// then normal. std.testing.FailingAllocator on first fail **permanently** fails
+/// (alloc_index increments only on success), to simulate 'transient OOM then recover' use this
+/// kind.
 const OneShotFailingAllocator = struct {
     backing: Allocator,
     fail_next: bool = false,
@@ -183,15 +185,15 @@ test "UndoStack: 瞬时 OOM 下 undo 不丢操作" {
     const text = try alloc.dupe(u8, "hello");
     try stack.push(.{ .op_type = .delete, .position = 0, .length = 5, .text = text });
 
-    // 使 undo 内部的下一次分配失败一次（瞬时 OOM，随后恢复）。
+    // Make undo's next allocation fail once (transient OOM, then recover).
     one_shot.fail_next = true;
     try std.testing.expect(stack.undo() == null);
 
-    // op 必须仍留在 undo 栈：既不丢操作也不泄漏 text。
+    // op must still in undo stack: neither lose operation nor leak text.
     try std.testing.expect(stack.canUndo());
     try std.testing.expect(!stack.canRedo());
 
-    // OOM 恢复后重试必须成功。
+    // Retry after OOM recovery must succeed.
     var op = stack.undo() orelse return error.TestUnexpectedResult;
     defer op.deinit(alloc);
     try std.testing.expectEqualStrings("hello", op.text.?);
@@ -207,8 +209,8 @@ test "UndoStack: undo/redo 返回的 op 所有权归调用方,与栈内副本不
     try stack.push(.{ .op_type = .delete, .position = 0, .length = 3, .text = text });
 
     var undone = stack.undo() orelse return error.TestUnexpectedResult;
-    // 调用方释放自己那份。若返回值与 redo 栈共享同一 text 指针，
-    // 后续 redo/deinit 会二次释放，testing.allocator 抓 double free。
+    // Caller frees their copy. If returned value and redo stack share same text pointer,
+    // later redo/deinit double-free, testing.allocator catches.
     undone.deinit(std.testing.allocator);
 
     try std.testing.expect(stack.canRedo());
@@ -230,8 +232,8 @@ test "UndoStack: 返回的 op 在后续 push 清空 redo 栈后仍有效" {
     var undone = stack.undo() orelse return error.TestUnexpectedResult;
     defer undone.deinit(std.testing.allocator);
 
-    // push 清空 redo 栈。若 undone.text 与 redo 栈条目共享指针，
-    // 此后读 undone.text 就是 use-after-free。
+    // push clears redo stack. If undone.text shared pointer with redo entry,
+    // reading undone.text later is use-after-free.
     const t2 = try std.testing.allocator.dupe(u8, "second");
     try stack.push(.{ .op_type = .insert, .position = 0, .length = 6, .text = t2 });
 

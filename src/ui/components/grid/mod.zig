@@ -1,27 +1,27 @@
-/// Grid，业务组件：基于 ScrollArea + cell pool 的 2D 虚拟化表格
+/// Grid, business component: 2D virtualized table based on ScrollArea + cell pool.
+/// Design reference: Google Sheets canvas / ag-grid / LinkedIn Rooster
+/// - Double Viewport: outer ScrollArea(.both) + inner content translate_x/y
+/// - Cell Culling: compute visible range from scroll position + viewport, keep only pool nodes
+/// - Frozen Panes: independent absolute layer, not affected by translate
 ///
-/// 设计参考：Google Sheets canvas / ag-grid / LinkedIn Rooster
-/// - Double Viewport：外层 ScrollArea(.both) + 内层 content translate_x/y
-/// - Cell Culling：根据 scroll 位置 + viewport 计算 visible range，只保留 pool 节点
-/// - Frozen Panes (Phase 3)：独立 absolute 层，不随 translate
-///
-/// 保留模式 mount() API：
+/// Retained-mode mount() API:
 /// ```
-/// const g = try mountGrid(.{
+/// const g = try Grid(.{
 ///     .row_count = 1000,
 ///     .col_count = 100,
 ///     .col_widths = &col_ws,
 ///     .cell_render_fn = myCellRender,
-/// }, scope, cx);
+/// }).mount(scope, cx);
 /// try parent.appendChild(alloc, g.root);
 ///
 /// ```
 ///
-/// **Phase 2 虚拟化**：pool_size = (viewport_rows + 2·overscan) × (viewport_cols + 2·overscan)。
-/// 滚动时 pool 内 cell 通过 absolute margin 重新定位到新坐标，不重建节点，不申请内存。
+/// Virtualization: pool_size = (viewport_rows + 2 * overscan) x (viewport_cols + 2 * overscan).
+/// On scroll, cells reposition via absolute margin; no node rebuild, no allocation.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const core = @import("../../core.zig");
+const view = @import("../../view.zig");
 const Node = core.Node;
 const NodeHandle = core.NodeHandle;
 const Cx = core.Cx;
@@ -42,9 +42,13 @@ pub const PinOwner = state_mod.PinOwner;
 pub const GridResult = struct {
     root: *Node,
     state: *GridState,
+    /// `ui.view` integration (see src/ui/view_parts.zig).
+    pub fn viewParts(self: GridResult) core.ViewParts {
+        return .{ .root = self.root };
+    }
 };
 
-/// Pool 大小上限（防炸内存）。
+/// Pool size limit (prevent memory explosion).
 const MAX_POOL_SIZE: usize = 2000;
 
 fn appendPoolNodes(cx: *Cx, content: *Node, nodes: []*Node, comp_name: []const u8) !void {
@@ -55,30 +59,80 @@ fn appendPoolNodes(cx: *Cx, content: *Node, nodes: []*Node, comp_name: []const u
             .position = .absolute,
             .overflow_hidden = true,
         }, .{});
-        // append 失败时这一个 cell_node 无人持有（已挂上的那些归 content，
-        // 由树的 teardown 负责）。下游编辑器表格渲染期 sweep 实测：
-        // 这里是全部 101 处泄漏里最大的一个来源。
+        // append fails: this cell_node orphaned (mounted ones owned by
+        // content, tree teardown cleans). Editor table render sweep measured:
+        // largest of 101 total leaks here.
         errdefer cx.freeNode(cell_node);
         cell_node.meta.ownership.meta.component_name = comp_name;
         try content.appendChild(cx.allocator, cell_node);
-        // 挂稳之后再写进 pool 数组（prepare-then-publish）：
-        // 失败时 nodes[i] 留着一个已释放的指针，稍后 detachGridBindings
-        // 之类的遍历会踩到。
+        // Attach before writing to pool array (prepare-then-publish):
+        // failure leaves dangling pointer in nodes[i], later detachGridBindings
+        // traversal steps on it.
         nodes[i] = cell_node;
     }
 }
 
-/// 挂载 Grid：创建虚拟化 Grid 组件，返回 root 节点 + state handle。
-/// v0.5 推荐入口（取代 `Grid(props).mount(scope, cx)` Builder 链）。
-pub fn mountGrid(props: GridProps, scope: *Scope, cx: *Cx) !GridResult {
+/// Create virtualized Grid: `W.Grid(.{ .row_count = n, .col_count = m,
+/// ... }).mount(scope, cx)`, returns root + state handle.
+pub fn Grid(props: anytype) GridBuilder {
+    return .{ .props = @import("../../reactive.zig").props.coerce(GridProps, props) };
+}
+
+pub const GridBuilder = struct {
+    props: GridProps,
+
+    /// `ui.view` integration: the cell function returns a view element, used as a direct ui.view
+    /// child: `W.Grid(.{ .row_count = r, .col_count = c, .col_widths = &ws }).cells(ctx, cell)`.
+    /// Cell function: `fn (Ctx, row: usize, col: usize) E` / `fn (usize, usize) E` (ctx {}),
+    /// or component `fn (Ctx, usize, usize, *Scope, *Cx) !*Node`. Each cell gets a child scope at
+    /// the root: a pool cell swap rebind/refresh (clear-then-render) destroys the scope and its
+    /// contained effects.
+    pub fn cells(self: GridBuilder, ctx: anytype, comptime cell_fn: anytype) GridCells(@TypeOf(ctx), cell_fn) {
+        return .{ .builder = self, .ctx = ctx };
+    }
+
+    pub fn mount(self: GridBuilder, scope: *Scope, cx: *Cx) !GridResult {
+        return mountImpl(self.props, scope, cx);
+    }
+};
+
+/// `GridBuilder.cells` result: integrated via `viewMount` into ui.view
+/// (use `v.ref` to get GridResult).
+pub fn GridCells(comptime Ctx: type, comptime cell_fn: anytype) type {
+    const what = "Grid.cells";
+    _ = view.callbackIsComponent(@TypeOf(cell_fn), if (Ctx == void) 2 else 3, what);
+    return struct {
+        builder: GridBuilder,
+        ctx: Ctx,
+
+        const Self = @This();
+        const State = view.CallbackState(Ctx);
+
+        pub fn viewMount(self: Self, scope: *Scope, cx: *Cx) !GridResult {
+            const st = try State.create(scope, self.ctx);
+            var p = self.builder.props;
+            p.cell_render_fn = render;
+            p.cell_render_ctx = @ptrCast(st);
+            return mountImpl(p, scope, cx);
+        }
+
+        fn render(node: *Node, row: usize, col: usize, cx: *Cx, user: ?*anyopaque) void {
+            const st: *State = @ptrCast(@alignCast(user.?));
+            view.renderInto(st.scope, cx, node, cell_fn, st.ctx, .{ row, col }, what) catch |err| {
+                std.log.warn("Grid.cells: cell ({d},{d}) render failed: {s}", .{ row, col, @errorName(err) });
+            };
+        }
+    };
+}
+
+fn mountImpl(props: GridProps, scope: *Scope, cx: *Cx) !GridResult {
     const my_scope = try scope.childScope();
-    const alloc = cx.allocator;
     const p = props;
     {
         if (p.cell_render_fn == null) return error.MissingCellRenderFn;
         if (p.col_widths.len != p.col_count) return error.ColWidthsLengthMismatch;
 
-        // 外层 root
+        // Outer root
         var root_style = core.BoxStyle{
             .direction = .column,
             .width = .{ .grow = .{} },
@@ -86,27 +140,7 @@ pub fn mountGrid(props: GridProps, scope: *Scope, cx: *Cx) !GridResult {
         };
         if (p.width) |w| root_style.width = .{ .px = w };
         if (p.height) |h| root_style.height = .{ .px = h };
-        const root = try box(cx, root_style, .{});
-        // root 是返回给调用方的整棵 Grid 子树的根，返回成功前无人持有。
-        // 它下面还有 ScrollArea、四组 pool 节点（各上千个 cell）、
-        // registerResource、onCleanup，任何一处失败都会漏掉整棵。
-        // 下游编辑器表格渲染期 sweep 实测：99 处泄漏里的绝大多数都源于这里，
-        // appendPoolNodes 那 1207 条只是可见的表象（那些 cell 已挂在 root 下）。
-        errdefer cx.freeNode(root);
-        root.meta.ownership.meta.component_name = "Grid";
-        // scope 生命周期必须绑到 root 节点（与 ScrollArea 同款）。
-        //
-        // 没有这行的实测后果（2026-08-22 用户线上 crash，反汇编定位到
-        // detachGridBindings）：caller 用 freeNode/clearChildren 清掉 Grid 子树
-        // 时，my_scope 不会被 dispose，留在父 scope 的 children 里；它的
-        // onCleanup(detachGridBindings) 持有 state.content 节点指针，节点已
-        // 随子树释放。之后父 scope dispose（如虚拟列表 recycleSlot）才跑到这
-        // 条 cleanup -> 解引用已释放节点 -> EXC_BAD_ACCESS。
-        // 绑定后 freeNode(root) 会先 dispose my_scope（此刻节点仍有效，
-        // detach 正常执行），父 scope 再 dispose 时按 disposed 标记跳过。
-        try core.bindScopeToNode(my_scope, root);
-
-        // 预算 content 总尺寸
+        // Budget content total size
         var content_w: f32 = 0;
         for (p.col_widths) |w| content_w += w;
         var content_h: f32 = 0;
@@ -120,27 +154,42 @@ pub fn mountGrid(props: GridProps, scope: *Scope, cx: *Cx) !GridResult {
             content_h = @as(f32, @floatFromInt(p.row_count)) * p.cell_height;
         }
 
-        // Grid 默认保留双轴滚动；业务调用方可把 scroll_direction 收窄成单轴。
-        // sa.container 到下面 root.appendChild 之间是游离子树（ScrollArea 自带
-        // 子 scope，绑定只解绑不释放，调用方 scope.dispose() 回收不到它）。
-        var sa_attached = false;
-        const sa = try scroll_area.mountScrollArea(.{
+        // Grid defaults dual-axis scroll; business caller can narrow
+        // scroll_direction to single-axis.
+        var sa: scroll_area.ScrollAreaResult = undefined;
+        const root = try view.render(my_scope, cx, view.box(.{ .style = root_style }, view.capture(&sa, scroll_area.ScrollArea(.{
             .width = p.width,
             .height = p.height,
             .direction = p.scroll_direction,
             .content_width = content_w,
             .content_height = content_h,
-        }, my_scope, cx);
+        }))));
+        // root is returned Grid subtree root, no one owns until success. Below:
+        // ScrollArea, four cell pools (thousands each), registerResource, onCleanup;
+        // any failure orphans whole. Editor table render sweep measured: most of
+        // 99 leaks from here, appendPoolNodes 1207 just visible (cells mounted below).
+        errdefer cx.freeNode(root);
+        root.meta.ownership.meta.component_name = "Grid";
+        // Scope lifetime is bound to the root node (like ScrollArea).
+        //
+        // Without this: when a caller does freeNode/clearChildren on the Grid subtree, my_scope is
+        // not
+        // disposed and stays in the parent scope's children; its onCleanup(detachGridBindings)
+        // holds
+        // the state.content node pointer, which is freed with the subtree. A later parent dispose
+        // (virtual list recycleSlot) runs the cleanup, dereferences the freed node and hits
+        // EXC_BAD_ACCESS. With the binding, freeNode(root) disposes my_scope first (nodes still
+        // valid, detach runs) and the parent dispose skips it via the disposed flag.
+        try core.bindScopeToNode(my_scope, root);
+
         sa.container.meta.ownership.meta.component_name = "Grid.ScrollArea";
-        errdefer if (!sa_attached) cx.freeNode(sa.container);
-        try root.appendChild(alloc, sa.container);
-        sa_attached = true;
 
         sa.content.meta.ownership.meta.component_name = "Grid.Content";
         sa.content.style.width = .{ .px = content_w };
         sa.content.style.height = .{ .px = content_h };
         sa.content.style.flex_shrink = 0;
-        // content 里 cell 用 absolute 定位，content 本身 direction 不再重要
+        // content cells use absolute positioning; content direction no longer
+        // matters
         sa.content.style.direction = .column;
 
         const scroll_event_ctx: *scroll_area.ScrollEventCtx = @ptrCast(@alignCast(sa.container.behavior.events.event_context.?));
@@ -148,42 +197,43 @@ pub fn mountGrid(props: GridProps, scope: *Scope, cx: *Cx) !GridResult {
         scroll_state_ptr.external_content_width = true;
         scroll_state_ptr.external_content_height = true;
 
-        // frozen 验证
+        // frozen validation
         if (p.frozen_rows > p.row_count) return error.FrozenRowsExceedsRowCount;
         if (p.frozen_cols > p.col_count) return error.FrozenColsExceedsColCount;
 
-        // 估算 pool 大小
+        // Estimate pool size
         const viewport_w_est = p.width orelse 400;
         const viewport_h_est = p.height orelse 300;
         const avg_col_w: f32 = if (p.col_count > 0) content_w / @as(f32, @floatFromInt(p.col_count)) else 100;
         const visible_cols_est: usize = @max(1, @as(usize, @intFromFloat(@ceil(viewport_w_est / @max(avg_col_w, 1)))));
         const visible_rows_est: usize = if (p.row_window_height_hint) |hint| blk: {
-            // 外部行窗口宿主：pool 按窗口高 / 平均行高估算，而不是 Grid 自身高度
-            //（那是全内容高，会把 pool 撑成全部行）。窗口变化超估时运行期再扩容。
+            // External row window host: pool by window height / avg row height, not
+            // Grid's own height (that's full content, bloats pool to all rows).
+            // Window change over-estimates then runtime expand.
             const avg_row_h: f32 = if (p.row_count > 0)
                 content_h / @as(f32, @floatFromInt(p.row_count))
             else
                 p.cell_height;
             break :blk @max(1, @as(usize, @intFromFloat(@ceil(hint / @max(avg_row_h, 1)))));
         } else @max(1, @as(usize, @intFromFloat(@ceil(viewport_h_est / @max(p.cell_height, 1)))));
-        // 池不可能有用地大于实际行列数：多出来的 cell 永远没有数据可绑定，
-        // 却仍以零尺寸节点常驻树上，被 tick / paint-sync / interaction-sync
-        // 三条全树遍历各扫一遍。
-        //
-        // 实测（下游编辑器，25 个 2×2 markdown 表格的文档）：每个 Grid 按视口估算
-        // 建了 50 个 cell，全文档 **900 个** Grid.Cell 池节点，把 synced_nodes
-        // 从 ~1200 抬到 4451，phase_sync 1.1ms -> 6.5ms。按行列数收紧后，
-        // 2×2 的表只建 4 个。
+        // The pool can't usefully exceed actual rows/cols: excess cells never bind data, yet stay
+        // as
+        // zero-size nodes in the tree, swept by tick/paint-sync/interaction-sync. E.g. an editor
+        // doc
+        // with 25 2x2 markdown tables, each Grid sized 50 cells by viewport: 900 Grid.Cell pool
+        // nodes,
+        // synced_nodes ~1200 -> 4451, phase_sync 1.1ms -> 6.5ms. So tighten by row/col (2x2 only
+        // 4).
         const pool_rows = @min(p.row_count, visible_rows_est + 2 * p.overscan_rows);
         const pool_cols = @min(p.col_count, visible_cols_est + 2 * p.overscan_cols);
-        // 4 类 pool 独立分配（按 paint order 依次 append）
+        // Four pool types allocated separately (append per paint order)
         const scrollable_pool_size = @min(MAX_POOL_SIZE, pool_rows * pool_cols);
         const frozen_col_pool_size = @min(MAX_POOL_SIZE, p.frozen_cols * pool_rows);
         const frozen_row_pool_size = @min(MAX_POOL_SIZE, p.frozen_rows * pool_cols);
         const corner_pool_size = @min(MAX_POOL_SIZE, p.frozen_rows * p.frozen_cols);
 
-        // registered：注册成功后，下面这批 errdefer 全部让位给 scope 的 destroy
-        //（同一批 slice 只能有一个回收责任方）。声明必须在第一次使用之前。
+        // registered: after success, following errdefer all defer to scope's
+        // destroy (single batch slice = one cleanup). Declare before first use.
         var registered = false;
         const state = try my_scope.allocator.create(GridState);
         errdefer if (!registered) my_scope.allocator.destroy(state);
@@ -198,7 +248,7 @@ pub fn mountGrid(props: GridProps, scope: *Scope, cx: *Cx) !GridResult {
         const row_offsets = try my_scope.allocator.alloc(f32, p.row_count + 1);
         errdefer if (!registered) my_scope.allocator.free(row_offsets);
 
-        // row_heights: caller 传了就 copy，否则 empty slice 走 uniform 路径
+        // row_heights: caller provided copied, else empty slice uses uniform path
         const owned_row_heights: []f32 = if (p.row_heights) |src| blk: {
             if (src.len != p.row_count) return error.RowHeightsLengthMismatch;
             const buf = try my_scope.allocator.alloc(f32, p.row_count);
@@ -277,14 +327,12 @@ pub fn mountGrid(props: GridProps, scope: *Scope, cx: *Cx) !GridResult {
         state.rebuildColOffsets();
         state.rebuildRowOffsets();
 
-        // ⚠️ 注册成功之后，上面那一长串 `errdefer free(...)` 必须**全部解除**：
-        // 它们与这里登记的 destroy 是同一批 slice 的两个回收责任方。
-        // 注册之后还有 5 处可失败调用（appendPoolNodes ×4 + onCleanup），
-        // 任何一处失败都会让 errdefer 先释放一遍、稍后 scope dispose 再释放一遍
-        // 实测 Segmentation fault in Grid destroy 的 a.free(col_offsets)
-        //（下游编辑器的表格**渲染期** OOM sweep 首次照到，
-        //  mount 期 sweep 走不到这条路）。
-        // 用 registered 标志把两段责任切开。
+        // WARNING: after `registered`, the long errdefer above must **all unwind**: the same batch
+        // slice would have two cleanup responsibilities. 5 more fail points follow (appendPoolNodes
+        // x4
+        // + onCleanup); on any failure, errdefer and scope dispose would both free, causing a
+        // segfault in Grid destroy at a.free(col_offsets). The `registered` flag splits
+        // responsibility.
         try my_scope.registerResource(@ptrCast(state), struct {
             fn destroy(ptr: *anyopaque, a: Allocator) void {
                 const s: *GridState = @ptrCast(@alignCast(ptr));
@@ -305,19 +353,19 @@ pub fn mountGrid(props: GridProps, scope: *Scope, cx: *Cx) !GridResult {
         }.destroy);
         registered = true;
 
-        // 依 paint order append：scrollable -> frozen_col -> frozen_row -> corner
-        // 后 append 的在 children 数组里靠后，先 paint 后者覆盖前者
+        // Append per paint order: scrollable -> frozen_col -> frozen_row ->
+        // corner. Later append -> children array later -> painted last covers first.
         try appendPoolNodes(cx, sa.content, pool_nodes, "Grid.Cell");
         try appendPoolNodes(cx, sa.content, fc_nodes, "Grid.Cell.FrozenCol");
         try appendPoolNodes(cx, sa.content, fr_nodes, "Grid.Cell.FrozenRow");
         try appendPoolNodes(cx, sa.content, cn_nodes, "Grid.Cell.Corner");
 
-        // 挂 on_before_render -> 每帧算 visible range，diff pool
+        // Wire on_before_render -> each frame calc visible range, diff pool
         sa.content.meta.per_frame.hooks.slots.anim_state = @ptrCast(state);
         sa.content.meta.per_frame.hooks.before_render.main = contentBeforeRender;
         try my_scope.onCleanup(GridState, state, detachGridBindings);
 
-        // 初次立刻刷一遍（以免首帧空白）
+        // First frame immediate refresh (avoid blank first frame)
         updateVisibleCells(state);
 
         return .{ .root = root, .state = state };
@@ -336,8 +384,9 @@ fn contentBeforeRender(content_node: *Node) void {
 }
 
 fn detachGridBindings(state: *GridState) void {
-    // anim_state slot 可能已被框架其他清理路径置空（hook scope 之类），但 hook
-    // 函数指针未必同时清。两个字段独立比对独立清。
+    // anim_state slot might be cleared by framework other paths (hook
+    // scope), but hook function pointer not necessarily synced. Two fields
+    // check/clear independently.
     const content = state.content;
     const raw_state: *anyopaque = @ptrCast(state);
     if (content.meta.per_frame.hooks.before_render.main == contentBeforeRender) {
@@ -348,25 +397,23 @@ fn detachGridBindings(state: *GridState) void {
     }
 }
 
-/// 每帧（或 update API 后）调用：
-/// 1. 算 visible range（主滚动区，不含 frozen）
-/// 2. 与 prev_range diff
-/// 3. 回收滚出视口 / 非 frozen 的 pool cell
-/// 4. 为新进入的 cell 从 pool 取节点 bind
-/// 5. 冻结 cells 永远 active，且每帧更新其 translate 以"粘住"在视口边缘
+/// Each frame (or after update API): (1) calc visible range (main scroll,
+/// no frozen) (2) diff with prev_range (3) reclaim pool cells scrolled out /
+/// non-frozen (4) new cells entering: take nodes from pool bind (5) frozen
+/// cells forever active, each frame update translate to "stick" at viewport.
 fn updateVisibleCells(state: *GridState) void {
     const range = state.computeVisibleRange();
     const pinned_changed = !std.meta.eql(state.pinned_rows, state.prev_pinned_rows);
     const range_changed = !state.initialized or !range.eql(state.prev_range) or pinned_changed;
 
-    // 有变化才需要 markLayoutDirty。
-    // Phase 7 的 translate 更新会自己 markInteractionDirty + markRenderDirty，不用重复。
+    // Only mark layout dirty on changes.
+    // Phase 7 translate updates auto-mark interaction and render dirty; no need to repeat.
     var anything_changed = range_changed;
 
-    // --- Scrollable body pool (最底层) ---
+    // --- Scrollable body pool (lowest level) ---
     if (range_changed) {
-        // 需求量超过池容量时先扩容，静默跳过绑定 = 视口内 cell 整帧空白且
-        // 永不自愈（同 md VL 的 pool 钳制教训）。
+        // Demand exceeds capacity: expand first, silent skip bind = viewport cell
+        // blank frame, never self-heal (md VL pool cap lesson).
         var pinned_rows_extra: usize = 0;
         for (state.pinned_rows) |p| {
             if (p) |pr| {
@@ -385,7 +432,7 @@ fn updateVisibleCells(state: *GridState) void {
         for (state.pool_bindings, 0..) |binding, i| {
             if (binding) |b| {
                 const evict = if (state.rowIsPinned(b.row))
-                    // pinned 行的列窗口仍然生效（横滚裁剪）
+                    // pinned row's column window still applies (horizontal scroll clip)
                     (b.col < range.col_start or b.col >= range.col_end)
                 else
                     (b.row < range.row_start or b.row >= range.row_end or
@@ -403,7 +450,7 @@ fn updateVisibleCells(state: *GridState) void {
                 tryBindInPool(state, .scrollable, ri, ci);
             }
         }
-        // pinned 行在窗口外时单独补绑（窗口内时上面的循环已覆盖）
+        // pinned row outside window: separate bind (in-window loop above covers)
         for (state.pinned_rows) |p| {
             const pr = p orelse continue;
             if (pr >= state.frozen_rows and (pr < range.row_start or pr >= range.row_end)) {
@@ -468,8 +515,8 @@ fn updateVisibleCells(state: *GridState) void {
         }
     }
 
-    // --- Corner pool (frozen rows × frozen cols，永远绑定) ---
-    // 初次 mount 时需要一次性绑定，之后不变
+    // --- Corner pool (frozen rows x frozen cols, always bind) ---
+    // one-time bind at mount, unchanged after
     if (!state.initialized and state.frozen_rows > 0 and state.frozen_cols > 0) {
         var fri: usize = 0;
         while (fri < state.frozen_rows) : (fri += 1) {
@@ -480,8 +527,8 @@ fn updateVisibleCells(state: *GridState) void {
         }
     }
 
-    // Phase: 每帧 **只当 content translate 变化时** 更新 frozen cells 的 translate。
-    // idle 状态 translate 不变 -> 无 op -> 零 markDirty 开销。
+    // Phase: each frame **only when content translate changes** update
+    // frozen cells translate. idle -> no change -> zero markDirty cost.
     const content_tx = state.content.style.translate_x;
     const content_ty = state.content.style.translate_y;
     const translate_changed =
@@ -501,23 +548,25 @@ fn updateVisibleCells(state: *GridState) void {
     if (anything_changed) state.content.markLayoutDirty();
 }
 
-/// 立即重跑一次可见 cell diff（等价于 content before_render hook 的那次调用）。
-/// 用于宿主刚改完 external_row_window / pinned_row 又马上要读 cell 节点的场景
-/// （命中测试按需绑定、进入编辑态）。
+/// Re-run visible cell diff immediately (equiv to content
+/// before_render hook). Used when host just changed
+/// external_row_window/pinned_row then immediately needs cell nodes
+/// (hit-test eager bind, enter edit).
 pub fn refreshVisibleCellsNow(state: *GridState) void {
     updateVisibleCells(state);
 }
 
-/// 扩容 scrollable pool 到至少 needed 个 slot（上限 MAX_POOL_SIZE）。
-/// 新节点 append 到 content 尾部；bindings 初始为 null，由后续绑定循环填。
-/// 仅支持无 frozen pool 的 Grid：children 顺序即 paint order，尾部追加会把
-/// 新 scrollable cell 画到 frozen cell 之上。有 frozen 时保持旧行为（不扩容）。
+/// Expand scrollable pool to at least needed slots (cap MAX_POOL_SIZE).
+/// New nodes append to content tail; bindings initially null, filled by loop.
+/// Only no-frozen-pool Grid: children order = paint order, tail append
+/// puts new scrollable above frozen. With frozen: keep old (no expand).
 fn growScrollablePool(state: *GridState, needed: usize) !void {
     if (state.frozen_col_pool_size > 0 or state.frozen_row_pool_size > 0 or
         state.corner_pool_size > 0)
     {
-        // 有 frozen pool 时无法安全扩容（paint order 会错），但这意味着安全网
-        // 失效，超估的 frozen grid 会静默空白，必须留下诊断痕迹。
+        // With frozen pool can't safely expand (paint order breaks), but safe
+        // net fails, over-estimated frozen grid silently blank, must leave
+        // diagnostic trace.
         std.log.warn("[Grid] pool grow refused (frozen pools present): need={d} have={d}", .{ needed, state.pool_size });
         return;
     }
@@ -534,7 +583,7 @@ fn growScrollablePool(state: *GridState, needed: usize) !void {
     @memcpy(new_nodes[0..state.pool_size], state.pool_nodes[0..state.pool_size]);
     @memcpy(new_bindings[0..state.pool_size], state.pool_bindings[0..state.pool_size]);
 
-    // 新增节点：与 mount 时的 appendPoolNodes 同构
+    // New nodes: homomorphic to mount's appendPoolNodes
     for (state.pool_size..target) |i| {
         const cell = try box(state.cx, .{
             .width = .{ .px = 0 },
@@ -582,11 +631,11 @@ pub const PoolKind = enum { scrollable, frozen_col, frozen_row, corner };
 fn tryBindInPool(state: *GridState, kind: PoolKind, row: usize, col: usize) void {
     const bindings = poolBindings(state, kind);
     const nodes = poolNodes(state, kind);
-    // 已存在绑定则 skip
+    // Existing binding: skip
     for (bindings) |b| {
         if (b) |bb| if (bb.row == row and bb.col == col) return;
     }
-    // 找空 slot
+    // Find empty slot
     var slot: ?usize = null;
     for (bindings, 0..) |b, i| {
         if (b == null) {
@@ -595,11 +644,13 @@ fn tryBindInPool(state: *GridState, kind: PoolKind, row: usize, col: usize) void
         }
     }
     const idx = slot orelse {
-        // 池满静默跳过 = 该 cell 整帧空白。计数暴露给诊断（视口空 cell 的第一嫌疑）。
+        // Pool full silent skip = cell blank frame. Expose count for diagnosis
+        // (viewport blank cell's top suspect).
         state.pool_exhausted_count +%= 1;
         return;
     };
-    // 防御：nodes 和 bindings 长度应相同（mount 时同 size alloc），保险起见防越界
+    // Defense: nodes and bindings same length (mount alloc same size),
+    // defensive bounds check.
     if (idx >= nodes.len) return;
     poolBindingsMut(state, kind)[idx] = .{ .row = row, .col = col };
     configureCell(state, nodes[idx], row, col);
@@ -632,12 +683,12 @@ fn poolNodes(state: *const GridState, kind: PoolKind) []const *Node {
     };
 }
 
-/// 将 cell 节点配置为 (row, col) 的可视 cell。
-/// 不设 z_index, render order 由 node 在 content.children 里的位置决定（memory:
-/// `feedback_listening_and_diff_paths.md` 说过 z_index > 0 会跳出祖先 clip）。
+/// Configure cell node as visible (row, col). Don't set z_index; render
+/// order by node position in content.children (memory:
+/// feedback_listening_and_diff_paths.md z_index > 0 exits ancestor clip).
 fn configureCell(state: *GridState, node: *Node, row: usize, col: usize) void {
-    // 越界防御：几何变化（行列数缩小）与 pin/窗口失效之间存在一帧窗口期，
-    // 不能依赖 cell_render_fn（应用回调）自己做边界检查。
+    // Bounds defense: geometry change (rows/cols shrink) and pin/window
+    // invalidation one-frame window, can't rely on cell_render_fn boundary.
     if (row >= state.row_count or col >= state.col_count) return;
     const x = state.col_offsets[col];
     const y = state.rowTop(row);
@@ -650,7 +701,7 @@ fn configureCell(state: *GridState, node: *Node, row: usize, col: usize) void {
     node.style.margin = .{ .left = x, .top = y, .right = 0, .bottom = 0 };
     node.style.overflow_hidden = true;
 
-    // 清旧内容
+    // Clear old content
     clearNodeChildren(node, state.cx);
     node.setText(null);
 
@@ -694,15 +745,14 @@ fn applyGeometryToActivePools(state: *GridState) void {
     state.content.markLayoutDirty();
 }
 
-// =========================================================================
-// Post-mount geometry API
-// 框架自己的布局数据（col_widths/row_heights/offsets/pool bindings）必须由
-// 框架 mutator 维护，此前这些实现散落在应用层（下游编辑器 ui_compat）直接翻
-// GridState 内部字段，computeVisibleRange / 外部行窗口 / pin 无法信任自己的
-// 不变量。所有 mutator 末尾统一走 clampAfterGeometryChange 使 pin/窗口失效。
-// =========================================================================
+// Post-mount geometry API.
+// Framework layout data (col_widths/row_heights/offsets/pool bindings) must be maintained by
+// framework mutators; app code must not touch GridState internals directly, or
+// computeVisibleRange / external row window / pin can't trust the invariants.
+// All mutators call clampAfterGeometryChange at the end to invalidate pin/window.
 
-/// 行列数 / 列宽整体变化（结构性更新）。行高保留旧值，缺省补 cell_height。
+/// rows/cols / column widths structural change. Row heights keep old,
+/// default cell_height.
 pub fn updateGeometry(state: *GridState, rows: usize, cols: usize, widths: []const f32) !void {
     if (widths.len != cols) return error.ColWidthsLengthMismatch;
     const allocator = state.allocator;
@@ -738,7 +788,7 @@ pub fn updateGeometry(state: *GridState, rows: usize, cols: usize, widths: []con
     state.cx.needs_redraw = true;
 }
 
-/// 仅列宽变化（行列数不变）。
+/// Column widths only (rows/cols unchanged).
 pub fn updateColWidths(state: *GridState, widths: []const f32) void {
     if (widths.len != state.col_count) return;
     @memcpy(state.col_widths, widths);
@@ -749,7 +799,7 @@ pub fn updateColWidths(state: *GridState, widths: []const f32) void {
     state.cx.needs_redraw = true;
 }
 
-/// 仅行高变化（行数不变）。
+/// Row heights only (row count unchanged).
 pub fn updateRowHeights(state: *GridState, heights: []const f32) !void {
     if (heights.len != state.row_count) return error.RowHeightsLengthMismatch;
     if (state.row_heights.len != state.row_count) {
@@ -765,9 +815,11 @@ pub fn updateRowHeights(state: *GridState, heights: []const f32) !void {
     state.cx.needs_redraw = true;
 }
 
-/// 重渲染单个 pooled cell：replace-render（先清后渲染），绝不 append-render。
+/// Re-render single pooled cell: replace-render (clear-then-render),
+/// never append-render.
 fn rerenderBoundCell(state: *GridState, node: *Node, cell: CellBinding) void {
-    // tail loop：Cx.freeNode 可能在 before-render tick 中原地改 children.items
+    // tail loop: Cx.freeNode might in-place modify children.items during
+    // before-render tick
     while (node.children.items.len > 0) {
         const child = node.children.items[node.children.items.len - 1];
         state.cx.detachChild(node, child);
@@ -779,7 +831,8 @@ fn rerenderBoundCell(state: *GridState, node: *Node, cell: CellBinding) void {
     node.markLayoutDirty();
 }
 
-/// 重渲染所有当前 bound 的 cell（数据变化后内容级刷新，不改绑定）。
+/// Re-render all currently bound cells (data change content refresh,
+/// no rebind).
 pub fn refreshBoundCells(state: *GridState) void {
     const refresh = struct {
         fn pool(grid: *GridState, bindings: []const ?CellBinding, nodes: []const *Node) void {
@@ -797,7 +850,7 @@ pub fn refreshBoundCells(state: *GridState) void {
     state.cx.needs_redraw = true;
 }
 
-/// 重渲染指定 (row, col) 的 cell（若当前 bound）。
+/// Re-render (row, col) cell (if currently bound).
 pub fn updateCellContent(state: *GridState, row: usize, col: usize) void {
     const refresh = struct {
         fn pool(grid: *GridState, bindings: []const ?CellBinding, nodes: []const *Node, r: usize, c: usize) void {
@@ -818,9 +871,7 @@ pub fn updateCellContent(state: *GridState, row: usize, col: usize) void {
     state.cx.needs_redraw = true;
 }
 
-// =========================================================================
-// 内部工具
-// =========================================================================
+// Internal utilities
 
 fn clearNodeChildren(node: *Node, cx: *Cx) void {
     while (node.children.items.len > 0) {
@@ -833,7 +884,7 @@ fn clearNodeChildren(node: *Node, cx: *Cx) void {
 }
 
 test "Grid: scope dispose detaches content before-render hook" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
@@ -843,7 +894,7 @@ test "Grid: scope dispose detaches content before-render hook" {
     var scope_disposed = false;
     defer if (!scope_disposed) scope.dispose();
 
-    const mounted = try mountGrid(.{
+    const mounted = try Grid(.{
         .row_count = 4,
         .col_count = 3,
         .col_widths = &.{ 80, 90, 100 },
@@ -852,7 +903,7 @@ test "Grid: scope dispose detaches content before-render hook" {
         .cell_render_fn = struct {
             fn render(_: *Node, _: usize, _: usize, _: *Cx, _: ?*anyopaque) void {}
         }.render,
-    }, scope, ctx);
+    }).mount(scope, ctx);
     try root.appendChild(std.testing.allocator, mounted.root);
 
     const content = mounted.state.content;
@@ -908,15 +959,15 @@ pub fn getCellNode(state: *const GridState, row: usize, col: usize) ?*Node {
 }
 
 test "Grid: frozen 区宽/高于视口时可见区间不下溢" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     const root = try box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
     ctx.root = root;
     const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
     defer scope.dispose();
 
-    const widths = [_]f32{120} ** 8;
-    const mounted = try mountGrid(.{
+    const widths = @as([8]f32, @splat(120));
+    const mounted = try Grid(.{
         .row_count = 10,
         .col_count = 8,
         .col_widths = &widths,
@@ -928,7 +979,7 @@ test "Grid: frozen 区宽/高于视口时可见区间不下溢" {
         .cell_render_fn = struct {
             fn render(_: *Node, _: usize, _: usize, _: *Cx, _: ?*anyopaque) void {}
         }.render,
-    }, scope, ctx);
+    }).mount(scope, ctx);
     try root.appendChild(std.testing.allocator, mounted.root);
 
     const state = mounted.state;
@@ -937,9 +988,9 @@ test "Grid: frozen 区宽/高于视口时可见区间不下溢" {
     const range = state.computeVisibleRange();
     try std.testing.expect(range.col_end >= range.col_start);
     try std.testing.expect(range.row_end >= range.row_start);
-    updateVisibleCells(state); // 旧实现在 `col_end - col_start` 处下溢 panic
+    updateVisibleCells(state); // Old implementation panic'd at `col_end - col_start` underflow
 
-    // 行列数缩到 frozen 以下：frozen 被夹住，区间仍合法
+    // Rows/cols shrink below frozen: frozen pinched, range still valid
     try updateGeometry(state, 3, 2, &.{ 120, 120 });
     try std.testing.expect(state.frozen_rows <= 3 and state.frozen_cols <= 2);
     const r2 = state.computeVisibleRange();
@@ -950,9 +1001,9 @@ test "Grid: frozen 区宽/高于视口时可见区间不下溢" {
 test "Grid: mount 在任意分配点失败时不泄漏（sweep）" {
     try @import("../oom_sweep.zig").sweepMount("grid", struct {
         fn m(scope: *Scope, cx: *Cx) anyerror!?*Node {
-            const r = try mountGrid(.{ .row_count = 4, .col_count = 3, .col_widths = &.{ 80, 90, 100 }, .width = 240, .height = 120, .cell_render_fn = struct {
+            const r = try Grid(.{ .row_count = 4, .col_count = 3, .col_widths = &.{ 80, 90, 100 }, .width = 240, .height = 120, .cell_render_fn = struct {
                 fn render(_: *Node, _: usize, _: usize, _: *Cx, _: ?*anyopaque) void {}
-            }.render }, scope, cx);
+            }.render }).mount(scope, cx);
             return r.root;
         }
     }.m);

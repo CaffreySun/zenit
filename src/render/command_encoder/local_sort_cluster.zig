@@ -1,38 +1,32 @@
-//! command_encoder/local_sort_cluster.zig, local-sort 的**簇状态机**
+//! command_encoder/local_sort_cluster.zig: local-sort **cluster state machine**.
 //!
-//! 从 command_encoder.zig 析出（2026-08-05），与 clip_geometry.zig 同批。
-//! 前一批（local_sort.zig，2026-07-31）搬走的是纯函数：单条命令属于哪个
-//! pipeline、它的 bounds 是什么。这一批搬的是**有状态的另一半**：
-//! 在结构边界之间累积「可换序命令」的定长簇。
+//! Holds the fixed-size cluster of accumulated 'reorderable commands' (the stateful half;
+//! local_sort.zig holds the pure functions: which pipeline a command belongs to, its bounds).
 //!
-//! 内聚性判据（本次析出的全部理由）：
-//!   - 字段只有 `refs` + `len`，四个方法（clear / isEmpty / tryAppend /
-//!     buildDispatchOrder）只碰这两个字段，互相之间零 encoder 依赖；
-//!   - 它此前是 `RenderCommandEncoder` 的**嵌套** struct（还带着
-//!     `local_sort_cluster_capacity` 这个容器大小常量），簇逻辑因而是
-//!     「encoder 结构体里的一个独立小机器」，最典型的 god-module 寄生体；
-//!   - encoder 侧只剩 3 个触点：`var cluster = ...Cluster{}`、
-//!     `cluster.tryAppend(...)`、`self.flushLocalSortCluster(commands, &cluster)`
-//!     （flush 留在 encoder：它要调 dispatchCommand，那是编码主循环的职责）。
+//! Cohesion:
+//!   - fields only `refs` + `len`; four methods (clear / isEmpty / tryAppend /
+//!     buildDispatchOrder) touch only these, zero encoder dependency;
+//!   - encoder side has only 3 touch points: `var cluster = ...Cluster{}`,
+//!     `cluster.tryAppend(...)`, `self.flushLocalSortCluster(commands, &cluster)`
+//!     (flush stays in the encoder: it calls dispatchCommand, the encoding loop's job).
 //!
-//! 析出前它**测不了**：嵌套类型没有独立入口，只能借 encodeCommands 的
-//! 整条通路间接观测；现在容量耗尽、fence 拒绝、overlap 拒绝、
-//! pipeline 稳定排序这些都能直接断言（见本文件尾部单测）。
+//! Independently testable: capacity exhausted, fence rejected, overlap rejected, pipeline
+//! stable sort are asserted directly (see tests at end of this file).
 //!
-//! ⚠ 合同继承自 local_sort.zig：`buildDispatchOrder` 输出的顺序必须是
-//! 「按 pipeline 分桶、桶内保持插入序」。local-sort 重排只在**bounds 不
-//! 重叠**的前提下进行，桶内序不变 ⇒ 与原始顺序视觉等价。改成分桶内
-//! 任意重排都守不住这个不变式。
+//! WARNING contract from local_sort.zig: `buildDispatchOrder` output must be
+//! 'bucket per pipeline, bucket-internal preserve insertion order'. Local-sort reorders only when
+//! **bounds don't overlap**, so unchanged bucket-internal order is visually equivalent to the
+//! original. Arbitrary bucket-internal reorder breaks the invariant.
 //!
-//! 这里不搬什么：判定「哪条命令可入簇」的几何（bounds/pipeline）在
-//! local_sort.zig；把簇里的命令真正发射出去（flush -> dispatchCommand）
-//! 在 encoder。本模块只管「攒」。
+//! Not here: deciding 'which command enters cluster' (bounds/pipeline) stays in local_sort.zig;
+//! emitting cluster commands (flush -> dispatchCommand) stays in the encoder.
+//! This module only 'accumulates'.
 
 const std = @import("std");
 const lsort = @import("local_sort.zig");
 
-/// 簇容量。与 encoder 内联时的历史值一致（128 条 paint 命令）；
-/// 超出即拒绝入簇并触发一次 flush，行为不变。
+/// Cluster capacity. Matches history value when inlined in encoder (128 paint commands);
+/// exceed then reject entry and trigger flush, behavior unchanged.
 pub const capacity: usize = 128;
 
 pub const RejectReason = enum {
@@ -60,10 +54,10 @@ pub const LocalSortCluster = struct {
         return self.len == 0;
     }
 
-    /// 尝试把 `commands[index]` 并入簇。
+    /// Try append `commands[index]` into cluster.
     ///
-    /// 返回 `.unsortable` 的两种情况（fence 命令 / 算不出 bounds）由调用方
-    /// 直接 dispatch；`.overlap` / `.capacity` 由调用方 flush 后重试一次。
+    /// Return `.unsortable` two cases (fence command / can't compute bounds) caller
+    /// directly dispatch; `.overlap` / `.capacity` caller flush then retry once.
     pub fn tryAppend(self: *LocalSortCluster, commands: anytype, index: usize) RejectReason {
         const pipeline = lsort.localSortPipelineKind(commands[index]);
         if (pipeline == .fence) return .unsortable;
@@ -84,8 +78,8 @@ pub const LocalSortCluster = struct {
         return .none;
     }
 
-    /// 按 pipeline 分桶输出 dispatch 顺序（sdf -> image -> icon -> text），
-    /// 桶内保持插入序，见模块头的顺序合同。
+    /// Output dispatch order bucketed per pipeline (sdf -> image -> icon -> text),
+    /// bucket-internal preserve insertion, see module head order contract.
     pub fn buildDispatchOrder(self: *const LocalSortCluster, out: *[capacity]usize) []const usize {
         var out_len: usize = 0;
         const order = [_]lsort.PipelineKind{ .sdf, .image, .icon, .text };
@@ -100,16 +94,16 @@ pub const LocalSortCluster = struct {
     }
 };
 
-// ── 测试 ───────────────────────────────────────────────────────────────
-// 此前这套逻辑是 encoder 的嵌套 struct，只能借 encodeCommands 间接观测；
-// 下面用 duck-typed mock 命令直接驱动（与 command_encoder_test.zig 的
-// MockItem 同款手法，render 模块不 import ui 侧的 paint_table）。
+// ── test ───────────────────────────────────────────────────────────────
+// Previously this logic nested struct in encoder, observe indirectly via encodeCommands;
+// below duck-typed mock commands drive direct (same hand-wave as MockItem in
+// command_encoder_test.zig, render module doesn't import ui paint_table).
 
 const MockItem = struct {
-    // ⚠ 枚举成员必须与 local_sort.zig 的 switch 标签一致（那边按 anytype
-    // 鸭子类型直接 switch it.kind）。但它是本模块私有的测试夹具：
-    // command_encoder_test.zig 各自维护自己的 MockItem，谁也不 import 谁，
-    // 避免「既有模块依赖新模块的测试类型」这种反向耦合。
+    // WARNING enum members must match local_sort.zig switch labels (there anytype duck-type
+    // direct switch it.kind). But it's this module private test fixture:
+    // command_encoder_test.zig each keep own MockItem, no cross-import,
+    // avoid 'existing module depends on new module's test type' reverse coupling.
     kind: enum { none, rect, text, image, shadow, gradient, path, control } = .rect,
     geom: struct { x: f32 = 0, y: f32 = 0, w: f32 = 10, h: f32 = 10 } = .{},
     rotate: f32 = 0,
@@ -146,13 +140,13 @@ test "tryAppend: 同 pipeline 相互重叠也照收（bounds 只跨 pipeline 检
 
 test "tryAppend: 跨 pipeline 且 bounds 重叠 ⇒ .overlap，不改动簇" {
     var cluster = LocalSortCluster{};
-    // rects[0]：rect -> sdf，bounds 在 (0,0)。
+    // rects[0]: rect -> sdf, bounds at (0,0).
     try std.testing.expectEqual(RejectReason.none, cluster.tryAppend(&rects, 0));
     const overlapping_image = [_]MockItem{
         .{ .kind = .image, .geom = .{ .x = 5, .y = 5, .w = 10, .h = 10 } },
     };
     try std.testing.expectEqual(RejectReason.overlap, cluster.tryAppend(&overlapping_image, 0));
-    // 拒绝必须是「无副作用」的：簇里仍只有第一条。
+    // Reject must be 'no side effect': cluster still only first.
     try std.testing.expectEqual(@as(usize, 1), cluster.len);
 }
 
@@ -170,14 +164,38 @@ test "tryAppend: control（fence）恒 .unsortable，即便簇为空" {
     try std.testing.expectEqual(@as(usize, 0), cluster.len);
 }
 
+test "positive shadow spread and dual-shadow tails block image reordering" {
+    var cluster = LocalSortCluster{};
+    const spread = [_]MockItem{
+        .{ .kind = .image, .geom = .{ .x = 25, .y = 0, .w = 5, .h = 10 } },
+        .{ .kind = .shadow, .geom = .{ .w = 10, .h = 10 }, .shadow_blur = 1, .shadow_spread = 30 },
+    };
+    try std.testing.expectEqual(RejectReason.none, cluster.tryAppend(&spread, 0));
+    try std.testing.expectEqual(RejectReason.overlap, cluster.tryAppend(&spread, 1));
+    cluster.clear();
+    const dual = [_]MockItem{
+        .{ .kind = .image, .geom = .{ .x = -30, .y = 0, .w = 5, .h = 10 } },
+        .{ .kind = .shadow, .geom = .{ .w = 10, .h = 10 }, .shadow_blur = 1, .shadow2_color = .{ .a = 1 }, .shadow2_blur = 10, .shadow2_offset_x = 40 },
+    };
+    try std.testing.expectEqual(RejectReason.none, cluster.tryAppend(&dual, 0));
+    try std.testing.expectEqual(RejectReason.overlap, cluster.tryAppend(&dual, 1));
+}
+
+test "wide text stays a fence even when em estimates would miss adjacent images" {
+    var cluster = LocalSortCluster{};
+    const text = [_]MockItem{.{ .kind = .text, .text_content = "WWW", .text_font_size = 64 }};
+    try std.testing.expectEqual(RejectReason.unsortable, cluster.tryAppend(&text, 0));
+    try std.testing.expect(cluster.isEmpty());
+}
+
 test "buildDispatchOrder: 按 pipeline 分桶、桶内保插入序" {
     var cluster = LocalSortCluster{};
-    // 插入序：image, sdf, text, sdf，交错。注意各 bounds 互不重叠
-    //（跨 pipeline 重叠会被 tryAppend 拒绝，混不进同一个簇）。
+    // Insertion order: image, sdf, icon, sdf, interleaved. Note each bounds don't overlap
+    // (cross-pipeline overlap rejected by tryAppend, can't mix same cluster).
     const seq = [_]MockItem{
         .{ .kind = .image, .geom = .{ .x = 0, .y = 0, .w = 5, .h = 5 } },
         .{ .kind = .rect, .geom = .{ .x = 0, .y = 10, .w = 5, .h = 5 } },
-        .{ .kind = .text, .geom = .{ .x = 200, .y = 0, .w = 0, .h = 0 } },
+        .{ .kind = .image, .geom = .{ .x = 200, .y = 0, .w = 5, .h = 5 }, .icon_rep_ptr = &@as(u8, 0) },
         .{ .kind = .rect, .geom = .{ .x = 100, .y = 0, .w = 5, .h = 5 } },
     };
     for (0..seq.len) |i| {
@@ -185,7 +203,7 @@ test "buildDispatchOrder: 按 pipeline 分桶、桶内保插入序" {
     }
     var buf: [capacity]usize = undefined;
     const order = cluster.buildDispatchOrder(&buf);
-    // sdf(1), sdf(3), image(0), text(2)
+    // sdf(1), sdf(3), image(0), icon(2)
     try std.testing.expectEqualSlices(usize, &[_]usize{ 1, 3, 0, 2 }, order);
 }
 
@@ -200,7 +218,7 @@ test "clear 后可复用且 isEmpty 为真" {
 }
 
 test "容量耗尽返回 .capacity 而非静默丢命令" {
-    // 回归锚：refs 是定长数组，若满了继续写会越界写 undefined 内存。
+    // Regression anchor: refs fixed-size array, overflow if full still write undefined memory.
     var cluster = LocalSortCluster{};
     var cmds: [capacity + 1]MockItem = undefined;
     for (&cmds) |*c| c.* = .{ .kind = .rect, .geom = .{ .x = 0, .y = 0, .w = 1, .h = 1 } };

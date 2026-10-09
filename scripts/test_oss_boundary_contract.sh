@@ -6,7 +6,7 @@ fixture=$(mktemp -d -t zenit_boundary_contract.XXXXXX)
 trap 'rm -rf "$fixture"' EXIT
 mkdir -p "$fixture/scripts" "$fixture/src/ui" "$fixture/bin" "$fixture/.zig-cache/o"
 cp "$repo/scripts/check_oss_boundary.sh" "$fixture/scripts/"
-printf '@import("std")\n' >"$fixture/src/ui/root.zig"
+printf '@import("std")\n@import("zenit_reflection")\n@import("zenit_time")\n@import("zenit_environment")\n@import("calendar_time")\n' >"$fixture/src/ui/root.zig"
 printf 'developer cache\n' >"$fixture/.zig-cache/o/sentinel"
 cat >"$fixture/bin/zig" <<'MOCK'
 #!/usr/bin/env bash
@@ -43,7 +43,8 @@ cat >"$fixture/bin/strings" <<'MOCK'
 exit 0
 MOCK
 chmod +x "$fixture/bin/"*
-for scenario in success build-failure no-modules missing-binary nm-failure strings-failure forbidden symbol-leak string-leak; do
+for scenario in success build-failure no-modules missing-binary nm-failure strings-failure forbidden static-forbidden symbol-leak string-leak; do
+  printf '@import("%s")\n' "$([[ "$scenario" == static-forbidden ]] && echo workspace || echo std)" >"$fixture/src/ui/extra.zig"
   status=0
   CASE="$scenario" PATH="$fixture/bin:$PATH" bash "$fixture/scripts/check_oss_boundary.sh" >"$fixture/result" 2>&1 || status=$?
   if [[ "$scenario" == success ]]; then

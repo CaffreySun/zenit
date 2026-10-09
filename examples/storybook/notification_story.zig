@@ -1,8 +1,10 @@
-//! Notification story，设计稿 § 16 应用内全局提醒。
-//! 所有卡片都由 Notifier 真实创建；九种类型、堆叠、八个位置与原地转换各有入口。
+//! Notification story: design spec section 16 in-app global alerts.
+//! All cards created by Notifier; nine types, stacking, eight positions + in-place conversion each
+//! has entry.
 const std = @import("std");
 const ui = @import("ui");
 
+const v = ui.view;
 const W = ui.widgets;
 const Notifier = W.Notifier;
 const Id = W.NotificationId;
@@ -23,11 +25,13 @@ const zh_strings = W.NotificationStrings{
 
 const Story = struct {
     n: *Notifier,
-    /// 双实例演示：第二个 Notifier 固定在下中，只放文案提示（主实例放卡片）。
+    /// Dual instance demo: second Notifier fixed at bottom-center, text hints only (primary
+    /// instance has cards).
     hints_n: *Notifier,
     cx: *ui.Cx,
-    status: *ui.Node,
-    /// 正在模拟的进度卡（id + 起始帧时刻 + 时长）。
+    /// Status line text (owned: event callback stacks compose text copied by signal).
+    status: *ui.Signal([]const u8),
+    /// Simulated progress card (id + start frame time + duration).
     progress_id: ?Id = null,
     progress_start_ms: f64 = 0,
     progress_duration_ms: f64 = 5200,
@@ -50,7 +54,7 @@ const Story = struct {
     }
 
     var close_ids: [16][64]u8 = undefined;
-    var close_lens: [16]usize = .{0} ** 16;
+    var close_lens: [16]usize = @splat(0);
     var close_next: usize = 0;
     var button_ids: [32][64]u8 = undefined;
     var button_next: usize = 0;
@@ -68,10 +72,10 @@ const Story = struct {
     }
 
     fn setStatus(self: *Story, text: []const u8) void {
-        self.status.setTextContent(self.cx.allocator, text) catch {};
+        self.status.set(text);
     }
 
-    // ── 九种类型（16.2）──
+    // -- Nine types (16.2) --
 
     fn success(self: *Story) void {
         const id = self.n.show(.{ .tone = .success, .title = "已保存到 iCloud", .body = "3 个文件已同步 · 2.1 MB" }) catch return;
@@ -147,7 +151,7 @@ const Story = struct {
         self.tag(id, "story.notify.digest");
     }
 
-    // ── 文案提示（16.13）：与卡片同一个堆叠 ──
+    // -- Text hints (16.13): same stack as cards --
 
     fn hintPlain(self: *Story) void {
         const id = self.n.hint(.{ .text = "已复制链接到剪贴板" }) catch return;
@@ -186,10 +190,11 @@ const Story = struct {
         self.tag(id, "story.notify.hint.long");
     }
 
-    /// 进行中 -> 2.4s 后同一 id 原地转成功（再显示 2 秒）。
+    /// In-progress -> 2.4s later same id in-place convert to success (show 2 more seconds).
     fn tickHint(self: *Story) void {
         const id = self.hint_loading_id orelse return;
-        // 已被收起（全部收起 / 横扫关闭）：不再原地转换，否则会用同一 id 新弹一条。
+        // Collapsed (all-collapse / sweep-close): won't convert in-place, else new card with same
+        // id.
         const card = self.n.cardForId(id) orelse {
             self.hint_loading_id = null;
             return;
@@ -207,7 +212,7 @@ const Story = struct {
         _ = self.n.hint(.{ .id = id, .text = "已导出 PDF", .mark = .success }) catch return;
     }
 
-    // ── 堆叠 / 清除 ──
+    // -- Stacking / clear --
 
     fn burst(self: *Story) void {
         self.n.dismissAll();
@@ -228,7 +233,7 @@ const Story = struct {
         self.hints_n.dismissAll();
     }
 
-    // ── 双实例：卡片在右上（主实例），文案提示在下中（第二个实例）──
+    // -- Dual instance: cards top-right (primary), text hints bottom-center (second) --
 
     fn dualCards(self: *Story) void {
         self.setPos(.top_right);
@@ -275,7 +280,7 @@ const Story = struct {
         self.setPos(.left_center);
     }
 
-    // ── 原地转换（16.6）──
+    // -- In-place conversion (16.6) --
 
     fn startProgress(self: *Story, id: Id, duration_ms: f64) void {
         self.progress_id = id;
@@ -289,7 +294,7 @@ const Story = struct {
             self.progress_id = null;
             return;
         }
-        // 悬停暂停所有计时，进度模拟也跟着停（演示用：按剩余推进）。
+        // Hover pauses all timers, progress simulation also pauses (demo: advance by remaining).
         if (self.n.isPaused()) {
             self.progress_start_ms += self.cx.frame_dt_seconds * 1000;
             return;
@@ -304,7 +309,7 @@ const Story = struct {
         self.n.setProgress(id, p, label, count);
         if (p >= 1) {
             self.progress_id = null;
-            // 进度跑满：图标换成 ✓，标题改写，life 重置 3400ms。
+            // Progress full: icon -> checkmark, title rewritten, life reset to 3400ms.
             self.n.update(id, .{ .tone = .success, .title = self.progress_title_done, .body = self.progress_body_done, .duration_ms = 3400 }) catch {};
         }
     }
@@ -315,12 +320,12 @@ const Story = struct {
         self.setStatus(std.fmt.bufPrint(&buf, "event · {s} · {s}", .{ @tagName(e.kind), e.tag }) catch "event");
         if (e.kind != .action) return;
         if (std.mem.eql(u8, e.tag, "undo-replace")) {
-            // 撤销后原地换成结果提示。
+            // After undo convert in-place to result hint.
             _ = n.hint(.{ .id = e.id, .text = "已撤销替换" }) catch return;
             return;
         }
         if (std.mem.eql(u8, e.tag, "retry")) {
-            // 常驻的错误卡当场变成进度卡：born 不变，不重新入场。
+            // Persisted error card becomes progress card in-place: born unchanged, no re-entrance.
             n.update(e.id, .{
                 .kind = .progress,
                 .tone = .info,
@@ -330,7 +335,7 @@ const Story = struct {
             }) catch return;
             self.startProgress(e.id, 5200);
         } else if (std.mem.eql(u8, e.tag, "accept")) {
-            // 按钮区整体移除，高度随之收缩；2600ms 后自动收起。
+            // Button area wholly removed, height shrinks; auto-collapse after 2600ms.
             n.update(e.id, .{ .tone = .success, .title = "已加入文档", .body = "《2026 编辑器路线图》· 可编辑权限", .duration_ms = 2600 }) catch return;
         } else if (std.mem.eql(u8, e.tag, "ignore") or std.mem.eql(u8, e.tag, "log") or std.mem.eql(u8, e.tag, "view")) {
             n.dismiss(e.id);
@@ -345,124 +350,159 @@ fn storyHook(node: *ui.Node) void {
     if (self.progress_id != null or self.hint_loading_id != null) node.markRenderDirty();
 }
 
-fn sectionLabel(cx: *ui.Cx, title: []const u8, description: []const u8) !*ui.Node {
-    const t = cx.tokens;
-    const copy = try ui.box(cx, .{ .direction = .column, .gap = 3 }, .{});
-    try copy.appendChild(cx.allocator, try ui.text(cx, title, .{ .font_size = 13, .font_weight = 700, .color = t.color.fg_primary }));
-    try copy.appendChild(cx.allocator, try ui.text(cx, description, .{ .font_size = 12, .font_weight = 400, .color = t.color.fg_tertiary }));
-    return copy;
+/// Escape hatch: progress simulation / hint in-place conversion advance per-frame,
+/// needs before_render hook on root node.
+fn installHook(state: *Story, root: *ui.Node) void {
+    root.meta.per_frame.hooks.slots.anim_state = @ptrCast(state);
+    root.meta.per_frame.hooks.before_render.main = storyHook;
 }
 
-fn controlRow(cx: *ui.Cx) !*ui.Node {
-    const row = try ui.box(cx, .{ .width = .{ .grow = .{} }, .direction = .row, .align_items = .center, .gap = 8 }, .{});
-    (try row.style.ensureExtFallible(cx.allocator)).flex_wrap = .wrap;
-    return row;
+const NotifyS = struct {
+    fn root(_: *const ui.theme.Values) ui.BoxStyle {
+        return .{ .width = .{ .grow = .{} }, .gap = 12 };
+    }
+    fn group(t: *const ui.theme.Values) ui.BoxStyle {
+        return .{
+            .width = .{ .grow = .{} },
+            .gap = 10,
+            .padding = ui.Padding.all(14),
+            .background = t.tokens.color.bg_secondary,
+            .border = .{ .width = 1, .color = t.tokens.color.border, .radius = t.tokens.radius.lg },
+        };
+    }
+    fn section(_: *const ui.theme.Values) ui.BoxStyle {
+        return .{ .gap = 3 };
+    }
+    fn sectionTitle(t: *const ui.theme.Values) ui.TextStyle {
+        return .{ .font_size = 13, .font_weight = 700, .color = t.tokens.color.fg_primary };
+    }
+    fn sectionDesc(t: *const ui.theme.Values) ui.TextStyle {
+        return .{ .font_size = 12, .font_weight = 400, .color = t.tokens.color.fg_tertiary };
+    }
+    fn controlRow(_: *const ui.theme.Values) ui.BoxStyle {
+        return .{ .width = .{ .grow = .{} }, .align_items = .center, .gap = 8, .flex_wrap = .wrap };
+    }
+    fn status(t: *const ui.theme.Values) ui.TextStyle {
+        return .{ .font_size = 12, .font_weight = 550, .color = t.tokens.color.fg_secondary };
+    }
+    fn backdrop(_: *const ui.theme.Values) ui.BoxStyle {
+        return .{ .width = .{ .grow = .{} }, .gap = 0 };
+    }
+    fn backdropLine(tint: u24) ui.BoxStyle {
+        return .{
+            .width = .{ .grow = .{} },
+            .height = .{ .px = 22 },
+            .gap = 28,
+            .padding = ui.Padding.symmetric(0, 12),
+            .align_items = .center,
+            .background = ui.arb.hex(tint),
+        };
+    }
+    fn backdropText(_: *const ui.theme.Values) ui.TextStyle {
+        return .{ .font_size = 13, .color = ui.arb.hex(0xFFFFFF) };
+    }
+};
+
+const section_props = .{ .style = NotifyS.section };
+const title_props = .{ .style = NotifyS.sectionTitle };
+const desc_props = .{ .style = NotifyS.sectionDesc };
+const SectionLabel = v.Box(@TypeOf(section_props), struct { v.Text(@TypeOf(title_props), []const u8), v.Text(@TypeOf(desc_props), []const u8) }, .column);
+
+fn sectionLabel(title: []const u8, description: []const u8) SectionLabel {
+    return v.col(section_props, .{ v.text(title_props, title), v.text(desc_props, description) });
 }
 
-fn addButton(scope: *ui.Scope, cx: *ui.Cx, row: *ui.Node, state: *Story, label: []const u8, test_id: []const u8, comptime method: *const fn (*Story) void, variant: W.ButtonVariant) !void {
-    const button = try W.Button(.{ .label = label, .variant = variant, .size = .sm, .on_click = cx.on(Story, state, method) }).mount(scope, cx);
-    button.meta.ownership.meta.test_id = test_id;
-    try row.appendChild(cx.allocator, button);
+const group_props = .{ .style = NotifyS.group };
+
+fn group(title: []const u8, description: []const u8, controls: anytype) v.Box(@TypeOf(group_props), struct { SectionLabel, @TypeOf(controls) }, .column) {
+    return v.col(group_props, .{ sectionLabel(title, description), controls });
 }
 
-fn group(cx: *ui.Cx, heading: *ui.Node, controls: *ui.Node) !*ui.Node {
-    const t = cx.tokens;
-    const card = try ui.box(cx, .{
-        .width = .{ .grow = .{} },
-        .direction = .column,
-        .gap = 10,
-        .padding = ui.Padding.all(14),
-        .background = t.color.bg_secondary,
-        .border = .{ .width = 1, .color = t.color.border, .radius = t.radius.lg },
-    }, .{});
-    try card.appendChild(cx.allocator, heading);
-    try card.appendChild(cx.allocator, controls);
-    return card;
+const control_props = .{ .style = NotifyS.controlRow };
+
+const ButtonAttrs = struct { test_id: []const u8 };
+const StoryButton = v.Attrs(ButtonAttrs, @TypeOf(W.Button(.{})));
+
+fn button(state: *Story, label: []const u8, test_id: []const u8, comptime method: fn (*Story) void, variant: W.ButtonVariant) StoryButton {
+    return v.attrs(ButtonAttrs{ .test_id = test_id }, W.Button(.{ .label = label, .variant = variant, .size = .sm, .on_click = ui.on.call(state, method) }));
+}
+
+// Glass needs content background to show: simulate body text behind card
+// (spec shows reminder floating over editor body).
+/// 36 lines body text, background color alternates by row.
+const backdrop_rows = @as([36]void, @splat({}));
+const backdrop_tints = [_]u24{ 0xE4572E, 0x17BEBB, 0xFFC914, 0x2E282A, 0x76B041, 0x8059BB };
+const backdrop_word = v.text(.{ .style = NotifyS.backdropText }, "The foundation of any great editor");
+const BackdropWord = @TypeOf(backdrop_word);
+const BackdropLineProps = struct { style: ui.BoxStyle };
+
+fn backdropLine(_: void, index: usize) v.Box(BackdropLineProps, [6]BackdropWord, .row) {
+    return v.row(BackdropLineProps{ .style = NotifyS.backdropLine(backdrop_tints[index % backdrop_tints.len]) }, @as([6]BackdropWord, @splat(backdrop_word)));
 }
 
 pub fn build(scope: *ui.Scope, cx: *ui.Cx) anyerror!*ui.Node {
-    const t = cx.tokens;
-    const root = try ui.box(cx, .{ .width = .{ .grow = .{} }, .direction = .column, .gap = 12 }, .{});
-
     const n = try Notifier.init(scope, cx, .{
         .position = .bottom_center,
-        // storybook 顶部 56px 工具栏。
+        // Storybook top toolbar 56px.
         .content_insets = .{ .top = 56 },
         .strings = zh_strings,
     });
-    const status = try ui.text(cx, "event · idle", .{ .font_size = 12, .font_weight = 550, .color = t.color.fg_secondary });
-    status.meta.ownership.meta.test_id = "story.notify.status";
-    // 第二个实例：固定下中，只放文案提示；与主实例各自独立堆叠 / 悬停 / 清除。
+    // Second instance: fixed bottom-center, text hints only; each independent
+    // stacking / hover / clear from primary.
     const hints_n = try Notifier.init(scope, cx, .{
         .position = .bottom_center,
         .content_insets = .{ .top = 56 },
         .strings = zh_strings,
     });
-    const state = try cx.bindState(Story, .{ .n = n, .hints_n = hints_n, .cx = cx, .status = status });
+    const status = try scope.createText("event · idle", .{});
+    const state = try scope.createState(Story, .{ .n = n, .hints_n = hints_n, .cx = cx, .status = status });
     n.setListener(.{ .context = @ptrCast(state), .callback = Story.onEvent });
     hints_n.setListener(.{ .context = @ptrCast(state), .callback = Story.onEvent });
-    root.meta.per_frame.hooks.slots.anim_state = @ptrCast(state);
-    root.meta.per_frame.hooks.before_render.main = storyHook;
 
-    const kinds = try controlRow(cx);
-    try addButton(scope, cx, kinds, state, "成功 Success", "story.notify.btn.success", Story.success, .secondary);
-    try addButton(scope, cx, kinds, state, "错误 Error", "story.notify.btn.error", Story.failure, .secondary);
-    try addButton(scope, cx, kinds, state, "警告 Warning", "story.notify.btn.warning", Story.warning, .secondary);
-    try addButton(scope, cx, kinds, state, "进行中 Progress", "story.notify.btn.progress", Story.progress, .secondary);
-    try addButton(scope, cx, kinds, state, "需要操作 Action", "story.notify.btn.action", Story.action, .secondary);
-    try addButton(scope, cx, kinds, state, "人员消息 Person", "story.notify.btn.person", Story.person, .secondary);
-    try addButton(scope, cx, kinds, state, "撤销 Undo", "story.notify.btn.undo", Story.undo, .secondary);
-    try addButton(scope, cx, kinds, state, "静默 Quiet", "story.notify.btn.quiet", Story.quiet, .secondary);
-    try addButton(scope, cx, kinds, state, "汇总 Digest", "story.notify.btn.digest", Story.digest, .secondary);
-    try root.appendChild(cx.allocator, try group(cx, try sectionLabel(cx, "九种类型 Nine kinds", "卡片 392 宽 · 圆角 18 · 液态玻璃；按钮在分隔线下方，中性灰底不上色。"), kinds));
-
-    const hints = try controlRow(cx);
-    try addButton(scope, cx, hints, state, "纯文案", "story.notify.hint.btn.plain", Story.hintPlain, .secondary);
-    try addButton(scope, cx, hints, state, "成功", "story.notify.hint.btn.success", Story.hintSuccess, .secondary);
-    try addButton(scope, cx, hints, state, "失败", "story.notify.hint.btn.error", Story.hintError, .secondary);
-    try addButton(scope, cx, hints, state, "键帽", "story.notify.hint.btn.keycap", Story.hintKeycap, .secondary);
-    try addButton(scope, cx, hints, state, "进行中 → 成功", "story.notify.hint.btn.loading", Story.hintLoading, .secondary);
-    try addButton(scope, cx, hints, state, "可撤销", "story.notify.hint.btn.undo", Story.hintUndo, .secondary);
-    try addButton(scope, cx, hints, state, "超长截断", "story.notify.hint.btn.long", Story.hintLong, .secondary);
-    try root.appendChild(cx.allocator, try group(cx, try sectionLabel(cx, "文案提示 Text Toast", "36 高玻璃胶囊 · 与卡片同一个堆叠（折叠、悬停展开、横扫关闭）· 宽度随内容，最大 480。"), hints));
-
-    const dual = try controlRow(cx);
-    try addButton(scope, cx, dual, state, "卡片 → 右上（主实例）", "story.notify.dual.btn.card", Story.dualCards, .secondary);
-    try addButton(scope, cx, dual, state, "提示 → 下中（第二实例）", "story.notify.dual.btn.hint", Story.dualHint, .secondary);
-    try addButton(scope, cx, dual, state, "可撤销提示 → 下中", "story.notify.dual.btn.undo", Story.dualHintUndo, .secondary);
-    try root.appendChild(cx.allocator, try group(cx, try sectionLabel(cx, "双实例 Two notifiers", "卡片要停右上、提示要停下中：建两个 Notifier。各自独立堆叠、悬停暂停与「全部清除」。"), dual));
-
-    const stack = try controlRow(cx);
-    try addButton(scope, cx, stack, state, "连发 4 条", "story.notify.btn.burst", Story.burst, .primary);
-    try addButton(scope, cx, stack, state, "全部收起", "story.notify.btn.clear", Story.clear, .ghost);
-    try stack.appendChild(cx.allocator, status);
-    try root.appendChild(cx.allocator, try group(cx, try sectionLabel(cx, "堆叠 Stack", "折叠露边 9px · 悬停展开并暂停所有计时 · 删除中间一条平滑补位。"), stack));
-
-    const pos = try controlRow(cx);
-    try addButton(scope, cx, pos, state, "上左", "story.notify.pos.tl", Story.posTL, .secondary);
-    try addButton(scope, cx, pos, state, "上中", "story.notify.pos.tc", Story.posTC, .secondary);
-    try addButton(scope, cx, pos, state, "上右", "story.notify.pos.tr", Story.posTR, .secondary);
-    try addButton(scope, cx, pos, state, "右中", "story.notify.pos.rc", Story.posRC, .secondary);
-    try addButton(scope, cx, pos, state, "右下", "story.notify.pos.br", Story.posBR, .secondary);
-    try addButton(scope, cx, pos, state, "下中", "story.notify.pos.bc", Story.posBC, .secondary);
-    try addButton(scope, cx, pos, state, "下左", "story.notify.pos.bl", Story.posBL, .secondary);
-    try addButton(scope, cx, pos, state, "左中", "story.notify.pos.lc", Story.posLC, .secondary);
-    try root.appendChild(cx.allocator, try group(cx, try sectionLabel(cx, "八个停靠位置 Positions", "位置只改锚点、增长方向、入场位移方向；切换不重建卡片。"), pos));
-
-    // 玻璃需要有内容的背景才看得出来：模拟卡片身后的正文（设计稿里提醒浮在编辑器正文上）。
-    const backdrop = try ui.box(cx, .{ .width = .{ .grow = .{} }, .direction = .column, .gap = 0 }, .{});
-    backdrop.meta.ownership.meta.test_id = "story.notify.backdrop";
-    const tints = [_]u24{ 0xE4572E, 0x17BEBB, 0xFFC914, 0x2E282A, 0x76B041, 0x8059BB };
-    var li: usize = 0;
-    while (li < 36) : (li += 1) {
-        const line = try ui.box(cx, .{ .width = .{ .grow = .{} }, .height = .{ .px = 22 }, .direction = .row, .gap = 28, .padding = ui.Padding.symmetric(0, 12), .align_items = .center, .background = ui.arb.hex(tints[li % tints.len]) }, .{});
-        var k: usize = 0;
-        while (k < 6) : (k += 1) try line.appendChild(cx.allocator, try ui.text(cx, "The foundation of any great editor", .{ .font_size = 13, .color = ui.arb.hex(0xFFFFFF) }));
-        try backdrop.appendChild(cx.allocator, line);
-    }
-    try root.appendChild(cx.allocator, backdrop);
-
-    if (!n.portaled) try root.appendChild(cx.allocator, n.container);
-    if (!hints_n.portaled) try root.appendChild(cx.allocator, hints_n.container);
-    return root;
+    return v.render(scope, cx, v.setup(v.col(.{ .style = NotifyS.root }, .{
+        group("九种类型 Nine kinds", "卡片 392 宽 · 圆角 18 · regular 液态玻璃（GlassBox，同 AppKit NSGlassEffectView）；按钮在分隔线下方，中性灰底不上色。", v.row(control_props, .{
+            button(state, "成功 Success", "story.notify.btn.success", Story.success, .secondary),
+            button(state, "错误 Error", "story.notify.btn.error", Story.failure, .secondary),
+            button(state, "警告 Warning", "story.notify.btn.warning", Story.warning, .secondary),
+            button(state, "进行中 Progress", "story.notify.btn.progress", Story.progress, .secondary),
+            button(state, "需要操作 Action", "story.notify.btn.action", Story.action, .secondary),
+            button(state, "人员消息 Person", "story.notify.btn.person", Story.person, .secondary),
+            button(state, "撤销 Undo", "story.notify.btn.undo", Story.undo, .secondary),
+            button(state, "静默 Quiet", "story.notify.btn.quiet", Story.quiet, .secondary),
+            button(state, "汇总 Digest", "story.notify.btn.digest", Story.digest, .secondary),
+        })),
+        group("文案提示 Text Toast", "36 高玻璃胶囊 · 与卡片同一个堆叠（折叠、悬停展开、横扫关闭）· 宽度随内容，最大 480。", v.row(control_props, .{
+            button(state, "纯文案", "story.notify.hint.btn.plain", Story.hintPlain, .secondary),
+            button(state, "成功", "story.notify.hint.btn.success", Story.hintSuccess, .secondary),
+            button(state, "失败", "story.notify.hint.btn.error", Story.hintError, .secondary),
+            button(state, "键帽", "story.notify.hint.btn.keycap", Story.hintKeycap, .secondary),
+            button(state, "进行中 → 成功", "story.notify.hint.btn.loading", Story.hintLoading, .secondary),
+            button(state, "可撤销", "story.notify.hint.btn.undo", Story.hintUndo, .secondary),
+            button(state, "超长截断", "story.notify.hint.btn.long", Story.hintLong, .secondary),
+        })),
+        group("双实例 Two notifiers", "卡片要停右上、提示要停下中：建两个 Notifier。各自独立堆叠、悬停暂停与「全部清除」。", v.row(control_props, .{
+            button(state, "卡片 → 右上（主实例）", "story.notify.dual.btn.card", Story.dualCards, .secondary),
+            button(state, "提示 → 下中（第二实例）", "story.notify.dual.btn.hint", Story.dualHint, .secondary),
+            button(state, "可撤销提示 → 下中", "story.notify.dual.btn.undo", Story.dualHintUndo, .secondary),
+        })),
+        group("堆叠 Stack", "折叠露边 9px · 悬停展开并暂停所有计时 · 删除中间一条平滑补位。", v.row(control_props, .{
+            button(state, "连发 4 条", "story.notify.btn.burst", Story.burst, .primary),
+            button(state, "全部收起", "story.notify.btn.clear", Story.clear, .ghost),
+            v.text(.{ .style = NotifyS.status, .test_id = "story.notify.status" }, status),
+        })),
+        group("八个停靠位置 Positions", "位置只改锚点、增长方向、入场位移方向；切换不重建卡片。", v.row(control_props, .{
+            button(state, "上左", "story.notify.pos.tl", Story.posTL, .secondary),
+            button(state, "上中", "story.notify.pos.tc", Story.posTC, .secondary),
+            button(state, "上右", "story.notify.pos.tr", Story.posTR, .secondary),
+            button(state, "右中", "story.notify.pos.rc", Story.posRC, .secondary),
+            button(state, "右下", "story.notify.pos.br", Story.posBR, .secondary),
+            button(state, "下中", "story.notify.pos.bc", Story.posBC, .secondary),
+            button(state, "下左", "story.notify.pos.bl", Story.posBL, .secondary),
+            button(state, "左中", "story.notify.pos.lc", Story.posLC, .secondary),
+        })),
+        v.col(.{ .style = NotifyS.backdrop, .test_id = "story.notify.backdrop" }, v.list(&backdrop_rows, backdropLine)),
+        // Notifier without portal (no overlay host) container attached to story root.
+        if (!n.portaled) n.container else null,
+        if (!hints_n.portaled) hints_n.container else null,
+    }), state, installHook));
 }

@@ -1,14 +1,16 @@
-/// Path Renderer，矢量路径 GPU 渲染（D5：含边缘 AA）
+/// Path Renderer: vector path GPU rendering (includes edge AA).
 ///
-/// 流程：
-///   1. `addFillPath()` 接收 Contour 列表（来自 PathTessellator）
-///   2. CPU Earcut 生成填充三角形
-///   3. 沿轮廓边生成 AA fringe strip（外侧 alpha_scale=0，内侧=1）
-///   4. `flush()` 时通过 vertex buffer 上传 GPU，draw 绘制
+/// Pipeline:
+///   1. addFillPath() receives Contour list (from PathTessellator)
+///   2. CPU Earcut generates fill triangles
+///   3. AA fringe strip along contour (outer alpha_scale=0, inner=1)
+///   4. flush() uploads via vertex buffer to GPU, draw renders.
 const std = @import("std");
 const gpu = @import("gpu");
 const Contour = @import("path_tessellator.zig").Contour;
 const TPoint = @import("path_tessellator.zig").TPoint;
+const path_fill_rule = @import("path_fill_rule.zig");
+pub const FillRule = path_fill_rule.FillRule;
 
 pub const max_polygon_points: usize = 32;
 pub const max_polygon_contours: usize = 8;
@@ -23,14 +25,14 @@ pub const PathPolygon = struct {
     point_count: u32 = 0,
     contour_count: u32 = 0,
     fill_rule: u32 = 0,
-    contour_end_points: [max_polygon_contours]u32 = [_]u32{0} ** max_polygon_contours,
-    points: [max_polygon_points][2]f32 = [_][2]f32{.{ 0, 0 }} ** max_polygon_points,
+    contour_end_points: [max_polygon_contours]u32 = @as([max_polygon_contours]u32, @splat(0)),
+    points: [max_polygon_points][2]f32 = @as([max_polygon_points][2]f32, @splat(.{ 0, 0 })),
 
     pub fn fromClipPolygon(polygon: anytype) PathPolygon {
         var out = PathPolygon{
             .point_count = polygon.point_count,
             .contour_count = polygon.contour_count,
-            .fill_rule = @intFromEnum(polygon.fill_rule),
+            .fill_rule = @backingInt(polygon.fill_rule),
         };
         const contour_count = @min(@as(usize, polygon.contour_count), max_polygon_contours);
         for (0..contour_count) |i| out.contour_end_points[i] = polygon.contour_end_points[i];
@@ -40,10 +42,10 @@ pub const PathPolygon = struct {
     }
 };
 
-const path_shader_source: []const u8 = @embedFile("shaders/path.metal");
+const path_shader_source: []const u8 = @import("shader_sources.zig").path;
 
 // ============================================================================
-// Uniforms，与 path.metal PathUniforms 对齐
+// Uniforms: align with path.metal PathUniforms
 // ============================================================================
 
 const PathUniforms = extern struct {
@@ -56,83 +58,107 @@ const PathUniforms = extern struct {
     point_count: u32 = 0,
     contour_count: u32 = 0,
     _pad0: u32 = 0,
-    contour_end_points: [max_polygon_contours]u32 = [_]u32{0} ** max_polygon_contours,
-    polygon_points: [max_polygon_points][2]f32 = [_][2]f32{.{ 0, 0 }} ** max_polygon_points,
-    // shape clip mask（与 path.metal PathUniforms 对齐；kind 0=none/1=rounded_rect/2=ellipse）
+    contour_end_points: [max_polygon_contours]u32 = @as([max_polygon_contours]u32, @splat(0)),
+    polygon_points: [max_polygon_points][2]f32 = @as([max_polygon_points][2]f32, @splat(.{ 0, 0 })),
+    // shape clip mask (aligned with path.metal; kind 0=none / 1=rounded_rect / 2=ellipse)
     clip_rect: [4]f32 = .{ 0, 0, 0, 0 },
     clip_radius: f32 = 0,
     clip_shape_kind: u32 = 0,
     _pad1: u32 = 0,
     _pad2: u32 = 0,
+    // draw_mode 2 (gradient): radial/conic gradient evaluated per fragment
+    // over `rect` (the gradient bounds). Same t and stop rules as FillGradient.
+    grad_dir: u32 = 0,
+    grad_stop_count: u32 = 0,
+    grad_center: [2]f32 = .{ 0.5, 0.5 },
+    grad_angle: f32 = 0,
+    _pad3: u32 = 0,
+    _pad4: u32 = 0,
+    _pad5: u32 = 0,
+    grad_colors: [max_gradient_stops][4]f32 = @as([max_gradient_stops][4]f32, @splat(.{ 0, 0, 0, 0 })),
+    grad_positions: [max_gradient_stops]f32 = @as([max_gradient_stops]f32, @splat(0)),
 };
+const max_gradient_stops = 16;
 
 // ============================================================================
-// 顶点格式，与 path.metal PathVertex 对齐
+// Vertex format: align with path.metal PathVertex
 // ============================================================================
 
 const PathVertex = extern struct {
     x: f32,
     y: f32,
-    /// AA 权重：填充三角形 = 1.0；fringe 外侧顶点 = 0.0，内侧 = 1.0
+    /// AA weight: fill triangle = 1.0; fringe outer vertex = 0.0, inner = 1.0.
     alpha_scale: f32,
-    /// linear RGB + alpha（非预乘；shader 端做预乘）。per-vertex 色使相邻
-    /// triangles draw call 可合并为一次 draw。add* 入口统一回填。
+    /// linear RGB + alpha (unpremultiplied; shader premultiplies). per-vertex color
+    /// lets adjacent triangles merge into one draw. All add* entries fill back.
     color: [4]f32 = .{ 0, 0, 0, 0 },
 };
 
 // ============================================================================
-// 单次绘制命令（一个 fill path call）
+// Single draw command (one fill path call)
 // ============================================================================
 
 const DrawCall = struct {
     mode: DrawMode = .triangles,
-    vertex_start: u32, // 在 vertex_buf 中的起始索引
-    vertex_count: u32, // 顶点数量（= index_count，因为三角形列表）
-    color: [4]f32, // RGBA linear + alpha（polygon_fill 经 uniforms 用；triangles 已 per-vertex）
+    vertex_start: u32, // Start index in vertex_buf.
+    vertex_count: u32, // Vertex count (= index_count, triangle list).
+    color: [4]f32, // RGBA linear + alpha (polygon_fill via uniforms; triangles per-vertex).
     rect: [4]f32 = .{ 0, 0, 0, 0 },
     polygon: PathPolygon = .{},
-    /// add 时刻的 rect clip（w/h < 0 = 无裁剪）。合批后 flush 跨 clip 变化，
-    /// scissor 必须按 draw call 分组应用而非取 flush 时刻的单一状态。
+    /// rect_clip at add time (w/h < 0 = no clip). After batching, flush crosses clip
+    /// changes, scissor must group by draw call, not single flush state.
     rect_clip: [4]f32 = .{ 0, 0, -1, -1 },
+    /// .gradient mode: the per-fragment gradient (rect = its bounds).
+    gradient: GradientUniform = .{},
+};
+
+const GradientUniform = struct {
+    dir: u32 = 0,
+    stop_count: u32 = 0,
+    center: [2]f32 = .{ 0.5, 0.5 },
+    angle: f32 = 0,
+    colors: [max_gradient_stops][4]f32 = @as([max_gradient_stops][4]f32, @splat(.{ 0, 0, 0, 0 })),
+    positions: [max_gradient_stops]f32 = @as([max_gradient_stops]f32, @splat(0)),
 };
 
 const DrawMode = enum(u32) {
     triangles = 0,
     polygon_fill = 1,
+    /// Triangles whose colour is a radial/conic gradient evaluated per
+    /// fragment (vertex colour carries only opacity); never coalesced.
+    gradient = 2,
 };
 
-/// 最大顶点数（单帧，动态分配）。
+/// Max vertex count (per frame, dynamic alloc).
 ///
-/// 65K 只能承载约一千条带双端 marker 的矢量连接线；画布在 fit/pan 时会
-/// 合法地一次挂载更多路径，旧上限会把正常文档变成 TooManyPathVertices
-/// 致命错误。缓冲仍按实际用量增长；这里把安全阀提高到最多约 56 MiB 原始
-/// 顶点数据，足以覆盖 42×42 endpoint gallery 的 fit-all 场景。
+/// 65K holds only ~1K vector connector lines with dual markers; a canvas at fit/pan legally
+/// mounts more, and a low limit makes normal documents hit TooManyPathVertices. The buffer grows
+/// by actual use; the valve is ~56MiB raw vertex data, covering a 42x42 endpoint gallery fit-all.
 const MAX_VERTICES_PER_FRAME = 2097152;
 
-// Phase C mesh 缓存参数：总顶点预算 + 闲置逐出 TTL（帧）
+// Phase C mesh cache: total vertex budget + idle eviction TTL (frames).
 const MESH_CACHE_MAX_VERTICES = 262144;
 const MESH_CACHE_TTL_FRAMES = 240;
 
-// ── 顶点 buffer 高水位收缩 ──
+// -- Vertex buffer high water shrinking --
 //
-// ensureVertexBufferCapacity 只扩不缩：大画布 fit-all 一次冲到 ~56MiB 后
-// 峰值即永久驻留。收缩判据 = **连续** SHRINK_FRAMES 帧用量低于
-// capacity/SHRINK_DIVISOR 才释放。单帧判据会抖动，pan/zoom 场景帧间用量
-// 波动大，任何一帧回到高水位都重置计数，振荡负载永远触发不了建销循环；
-// 触发后也只在下一次真的有路径内容时按需重建一次 buffer。
+// ensureVertexBufferCapacity only expands: a large canvas fit-all leaves a ~56MiB peak
+// permanently resident. Shrink when **consecutive** SHRINK_FRAMES frames stay below
+// capacity/SHRINK_DIVISOR. A single-frame test would oscillate (pan/zoom frames vary); any
+// frame back at peak resets the counter. Once shrunk, it rebuilds on demand for real paths.
 const SHRINK_DIVISOR: usize = 4;
-/// ~4s @60fps，与 MESH_CACHE_TTL_FRAMES 同阶。
+/// ~4s @ 60fps, same order as MESH_CACHE_TTL_FRAMES.
 const SHRINK_FRAMES: u32 = 240;
-/// 低于该容量不值得收缩（重建开销 > 内存收益）。
+/// Below this, shrink not worth (rebuild cost > memory savings).
 const SHRINK_MIN_CAPACITY: usize = 256 * 1024;
 
-/// 与 glyph_atlas.MAX_FRAMES_IN_FLIGHT 同一合同（FrameSync 三重缓冲）：
-/// buffer retire 后至少隔这么多帧才真正 destroy，保证在飞的 command buffer
-/// 不会引用已释放的 GPU buffer。
+/// Aligns glyph_atlas.MAX_FRAMES_IN_FLIGHT (triple-buffer FrameSync): buffer
+/// retired then delayed FRAMES frames before true destroy, in-flight command buffers
+/// don't reference freed GPU buffer.
 const BUFFER_MAX_FRAMES_IN_FLIGHT: u64 = 3;
 
-/// 收缩判据状态机。设备无关的纯逻辑，单测确定性验证触发帧边界。
-/// 每帧调用一次 `noteFrame(上一帧字节用量, 当前容量)`；返回 true = 本帧应收缩。
+/// Shrink decision state machine. Device-agnostic pure logic, deterministic unit
+/// tests. Call once per frame `noteFrame(prev_bytes, capacity)`, returns true = shrink.
 pub const ShrinkPolicy = struct {
     low_frames: u32 = 0,
 
@@ -150,14 +176,14 @@ pub const ShrinkPolicy = struct {
     }
 };
 
-/// 已从 vertex_buffer 摘除、但可能仍被在飞 command buffer 引用的 buffer。
-/// 语义同 glyph_atlas.RetiredTexture：epoch 延迟回收。
+/// Extracted from vertex_buffer but possibly referenced by in-flight command.
+/// Semantics match glyph_atlas.RetiredTexture: epoch-delayed cleanup.
 const RetiredBuffer = struct {
     buffer: gpu.Backend.Buffer,
     retired_at_frame: u64,
 };
 
-/// retire 帧号是否已飞过 in-flight 窗口，可安全 destroy。
+/// Is retire frame past in-flight window, safe to destroy.
 fn retiredBufferReady(retired_at_frame: u64, current_frame: u64) bool {
     return current_frame -| retired_at_frame >= BUFFER_MAX_FRAMES_IN_FLIGHT;
 }
@@ -167,43 +193,42 @@ const MeshEntry = struct {
     last_used: u64,
 };
 
-/// 矢量填充的渐变规格（可选）。存在的理由：`fill_path` 的 GPU 侧**早就支持
-/// per-vertex 颜色**（`PathVertex.color`，path.metal 的 fragment 直接插值
-/// `in.fill_color`），只是 CPU 侧一直把统一色回填进每个顶点。多边形（三角/
-/// 星形）的渐变填充就卡在这一步，之前只能退化成纯色。
+/// Vector fill gradient spec (optional). The fill_path GPU path **already supports per-vertex
+/// color** (PathVertex.color, path.metal fragment interpolates fill_color); the CPU side
+/// fills it uniformly unless a gradient is given.
 ///
-/// 做法：三角化之后，按每个顶点在 bbox 内的归一化位置求 t，再按 stop 插值
-/// 写进 `PathVertex.color`。顶点级插值对凸多边形与三角化后的凹多边形都成立
-/// （光栅器在三角形内做线性插值，与渐变本身的线性性一致）。
+/// Method: after triangulate, compute t from each vertex's normalized bbox position and
+/// interpolate by stop into PathVertex.color. Vertex interpolation is exact for convex and
+/// triangulated-concave shapes (rasterizer interpolates linearly inside a triangle).
 ///
-/// 已知偏差：radial/conic 在**顶点**求值，弯曲等值线只在三角形内被线性近似。
-/// 三角/星形顶点少，径向渐变会略显棱角，真要精确需要 fragment 侧求值
-/// （给 path.metal 加 gradient uniform），那是独立一笔。
+/// Known difference: radial/conic is evaluated at **vertices**, so curved isolines are
+/// linearly approximated inside triangles. Shapes with few vertices (triangle/star) look
+/// faceted; exact results need fragment evaluation (gradient uniform in path.metal).
 pub const FillGradient = struct {
-    /// 与 sdf_renderer.GradientDir 同序（1=vertical 2=horizontal 3=diagonal
-    /// 4=radial 5=conic）。0/none 表示不用渐变。
+    /// Matches sdf_renderer.GradientDir (1=vertical 2=horizontal 3=diagonal
+    /// 4=radial 5=conic). 0=none means no gradient.
     dir: u32 = 0,
     stops: []const GradientStopIn = &.{},
-    /// radial/conic 的中心（bbox 归一化，0.5,0.5 = 正中）
+    /// radial/conic center (bbox-normalized, 0.5,0.5 = center).
     center_x: f32 = 0.5,
     center_y: f32 = 0.5,
-    /// conic 起始角（弧度）
+    /// conic start angle (radians).
     start_angle: f32 = 0,
 
     pub const GradientStopIn = struct { color: [4]f32, position: f32 };
 
-    /// 求某个归一化位置 (u,v ∈ [0,1]) 的渐变 t 值。
+    /// Gradient t at normalized position (u,v in [0,1]).
     fn tAt(self: *const FillGradient, u: f32, v: f32) f32 {
         return switch (self.dir) {
             1 => v, // vertical
             2 => u, // horizontal
             3 => (u + v) * 0.5, // diagonal
-            4 => blk: { // radial：到中心的归一化距离（×2 让边缘 ≈ 1）
+            4 => blk: { // radial: normalized distance to center (* 2 edge ~ 1).
                 const dx = u - self.center_x;
                 const dy = v - self.center_y;
                 break :blk std.math.clamp(@sqrt(dx * dx + dy * dy) * 2.0, 0, 1);
             },
-            5 => blk: { // conic：绕中心的角度
+            5 => blk: { // conic: angle around center.
                 const dx = u - self.center_x;
                 const dy = v - self.center_y;
                 var ang = std.math.atan2(dy, dx) - self.start_angle;
@@ -216,7 +241,7 @@ pub const FillGradient = struct {
         };
     }
 
-    /// 按 stop 列表插值出颜色（stops 必须按 position 升序；pad 语义）。
+    /// Interpolate color by stop list (stops ascending by position; pad semantics).
     fn colorAt(self: *const FillGradient, t_in: f32) [4]f32 {
         if (self.stops.len == 0) return .{ 0, 0, 0, 0 };
         if (self.stops.len == 1) return self.stops[0].color;
@@ -244,54 +269,52 @@ pub const PathRenderer = struct {
     allocator: std.mem.Allocator,
     device: *gpu.Backend.Device,
     pipeline: gpu.Backend.RenderPipeline,
-    /// 当前帧槽位的顶点 buffer。
+    /// Current frame slot's vertex buffer.
     ///
-    /// 曾经是**单个** buffer 且每帧把 buffer_write_offset 归零：三帧在飞时第
-    /// N+1 帧的 memcpy 覆写 GPU 尚未消费的第 N 帧顶点（与 icon_renderer 修过的
-    /// 是同一类 bug）。现在按帧槽位轮转：本帧用的 buffer 在 beginFrame 停到
-    /// `parked_buffers[buffer_slot]`，BUFFER_MAX_FRAMES_IN_FLIGHT 帧后才轮回来复用。
+    /// Round-robin by slot: a frame's buffer parks at parked_buffers[buffer_slot] and is reused
+    /// after BUFFER_MAX_FRAMES_IN_FLIGHT frames. A single buffer would let frame N+1's memcpy
+    /// overwrite data frame N's GPU work has not consumed yet.
     vertex_buffer: ?gpu.Backend.Buffer,
     vertex_buffer_capacity: usize,
     buffer_write_offset: usize,
-    parked_buffers: [BUFFER_MAX_FRAMES_IN_FLIGHT]?gpu.Backend.Buffer = [_]?gpu.Backend.Buffer{null} ** BUFFER_MAX_FRAMES_IN_FLIGHT,
-    parked_capacities: [BUFFER_MAX_FRAMES_IN_FLIGHT]usize = [_]usize{0} ** BUFFER_MAX_FRAMES_IN_FLIGHT,
+    parked_buffers: [BUFFER_MAX_FRAMES_IN_FLIGHT]?gpu.Backend.Buffer = @as([BUFFER_MAX_FRAMES_IN_FLIGHT]?gpu.Backend.Buffer, @splat(null)),
+    parked_capacities: [BUFFER_MAX_FRAMES_IN_FLIGHT]usize = @as([BUFFER_MAX_FRAMES_IN_FLIGHT]usize, @splat(0)),
     buffer_slot: usize = 0,
 
-    // CPU 端三角形顶点累积（每帧重置）
+    // CPU vertex accumulation (reset per frame).
     vertices: std.ArrayList(PathVertex),
     draw_calls: std.ArrayList(DrawCall),
-    // earclip 逐 contour 的临时点表，跨 addFillPath 复用
-    earclip_pts: std.ArrayList(TPoint) = .{},
+    // earclip per-contour scratch point table, reused across addFillPath.
+    earclip_pts: std.ArrayList(TPoint) = .empty,
 
-    // ── Phase C：跨帧 mesh 缓存 ──
-    // key = wyhash(path 命令逐 tag payload + fill/stroke 判别 + scale +
-    // stroke 参数)（encoder 侧算）。value = **path-local** 顶点（offset 去除、
-    // 平移不变，earclip/fringe/stroke expand 全是加性平移）。
-    // 命中 = 跳过 flatten + earclip/stroke expand，直接平移回填。
+    // -- Phase C: cross-frame mesh cache --
+    // key = wyhash(path command per-tag payload + fill/stroke flag + scale + stroke params)
+    // (encoder side). value = **path-local** vertices (offset removed, translation-invariant;
+    // earclip/fringe/stroke are all additive). Hit = skip flatten+earclip, translate-fill directly.
     mesh_cache: std.AutoHashMapUnmanaged(u64, MeshEntry) = .{},
     mesh_cache_vertex_total: usize = 0,
     current_frame: u64 = 0,
     frame_mesh_hits: u32 = 0,
     frame_mesh_misses: u32 = 0,
-    /// 最近一次 flush 实际发出的 GPU draw 数（合批后 ≤ draw_calls 数），debug 探针用
+    /// GPU draw count last flush actually emitted (after batch <= draw_calls), debug.
     last_flush_draw_count: u32 = 0,
-    /// damage-rect 部分重绘：当前 pass 的脏区 scissor（物理像素 x,y,w,h）。
-    /// path renderer 自管 per-DrawCall scissor，每次 setScissorRect 都必须
-    /// 与它取交，否则会把脏区外应保留的旧像素画穿。由 encoder 在 pass 切换/
-    /// 恢复时维护（beginOpacityLayerInto / applyOffscreenTargetViewport）。
+    /// damage-rect partial: this pass dirty scissor (pixels x,y,w,h). path renderer
+    /// self-manages per-DrawCall scissor, every setScissorRect must intersect, else
+    /// overwrites old pixels outside damage. Maintained by encoder (beginOpacityLayerInto /
+    /// applyOffscreenTargetViewport).
     damage_scissor: ?[4]u32 = null,
-    /// 帧累计：add* 提交的逻辑 draw call 数 / 合批后实际 draw 数（beginFrame 清零）
+    /// Per-frame accum: logical draw calls submitted / actual after batching (clear beginFrame).
     frame_call_count: u32 = 0,
     frame_draw_count: u32 = 0,
 
-    // ── 顶点 buffer 高水位收缩状态 ──
-    /// beginFrame 递增的本地帧计数。与 Phase C 的 current_frame 不同：那个由
-    /// encoder setFrame 驱动，无路径内容的帧不推进；而收缩判据与延迟释放
-    /// 恰恰要把"空帧"也计成低水位帧，所以必须每帧都走表。
+    // -- Vertex buffer high water shrink state --
+    /// Local frame counter incremented by beginFrame. Unlike Phase C current_frame
+    /// (driven by encoder setFrame, empty frames skip), shrink criteria and delayed
+    /// release must count empty frames as low-water, so walk table every frame.
     shrink_frame: u64 = 0,
     shrink_policy: ShrinkPolicy = .{},
-    /// 延迟释放队列（见 RetiredBuffer / drainRetiredBuffers）。
-    retired_buffers: std.ArrayListUnmanaged(RetiredBuffer) = .{},
+    /// Delayed-free queue (see RetiredBuffer / drainRetiredBuffers).
+    retired_buffers: std.ArrayListUnmanaged(RetiredBuffer) = .empty,
 
     viewport_width: f32,
     viewport_height: f32,
@@ -313,7 +336,7 @@ pub const PathRenderer = struct {
         const pipeline = try gpu.Backend.createRenderPipeline(device, .{
             .vertex_function = &vertex_func,
             .fragment_function = &fragment_func,
-            .color_attachment_formats = &[_]gpu.TextureFormat{.bgra8_unorm_srgb},
+            .color_attachment_formats = &[_]gpu.TextureFormat{gpu.color_format},
             .blend_state = .{
                 .source_rgb = .one,
                 .destination_rgb = .one_minus_src_alpha,
@@ -331,8 +354,8 @@ pub const PathRenderer = struct {
             .vertex_buffer = null,
             .vertex_buffer_capacity = 0,
             .buffer_write_offset = 0,
-            .vertices = .{},
-            .draw_calls = .{},
+            .vertices = .empty,
+            .draw_calls = .empty,
             .viewport_width = 800,
             .viewport_height = 600,
             .scale_factor = 1.0,
@@ -351,8 +374,8 @@ pub const PathRenderer = struct {
         for (&self.parked_buffers) |*maybe| {
             if (maybe.*) |*buffer| buffer.destroy();
         }
-        // deinit 合同与 offscreen_pool 相同：owner 须在 GPU drain 之后调用，
-        // 此时同步 destroy retired buffer 是安全的。
+        // deinit contract matches offscreen_pool: owner calls after GPU drain, then
+        // sync-destroying retired buffer is safe.
         for (self.retired_buffers.items) |*entry| entry.buffer.destroy();
         self.retired_buffers.deinit(self.allocator);
         self.pipeline.deinit();
@@ -368,16 +391,17 @@ pub const PathRenderer = struct {
         self.setViewport(w, h, scale);
         self.shrink_frame += 1;
         self.drainRetiredBuffers();
-        // buffer_write_offset 此刻仍是上一帧的累计字节用量（跨 pass 多次
-        // flush 的总和），正是收缩判据的输入；随后才清零。
-        // 判据用各槽位的最大容量：轮转后槽位容量各异，用当前槽位会被空槽
-        // （容量 0 -> 视为"不需要收缩"）每帧重置计数，永远收缩不了。
+        // buffer_write_offset still holds prev-frame accum (cross-pass flushes total),
+        // exactly shrink input; cleared after. Criteria use max-capacity per-slot: after
+        // rotate, slot capacity varies, current-slot with empty (capacity 0 -> 'no shrink')
+        // resets count every frame, never shrinks.
         if (self.shrink_policy.noteFrame(self.buffer_write_offset, self.peakSlotCapacity())) {
-            // 各槽容量可能各异，统一退役（走延迟释放，在飞帧不受影响）；需要时按实际用量重建。
+            // Slot capacities may vary, retire all (delayed, in-flight unaffected); rebuild
+            // on-demand.
             self.retireVertexBuffer();
             self.retireParkedBuffers();
-            // CPU 侧顶点/draw call 表同为峰值驻留（56MiB 量级同源），一并放掉
-            // 容量。此处两表已被上一帧 flush 清空，free 的只是闲置 capacity。
+            // CPU vertex/draw table also peak-resident (56MiB source), released together.
+            // Tables already cleared by prev flush, free only idle capacity.
             self.vertices.clearAndFree(self.allocator);
             self.draw_calls.clearAndFree(self.allocator);
         }
@@ -392,8 +416,8 @@ pub const PathRenderer = struct {
         self.current_rect_clip = rect orelse .{ 0, 0, -1, -1 };
     }
 
-    /// shape clip mask。path 只支持 rounded_rect(1)/ellipse(2)；polygon(3) 对
-    /// path pipeline 不生效（调用方保证 polygon clip 场景不走 shader clip 转换）。
+    /// shape clip mask. path supports rounded_rect(1) / ellipse(2); polygon(3) inert
+    /// to path pipeline (caller ensures polygon-clip scenariosse avoids shader-clip).
     pub fn setClipMask(self: *PathRenderer, shape_kind: u32, rect: ?[4]f32, radius: f32) void {
         if (rect) |mask_rect| {
             self.clip_rect = mask_rect;
@@ -406,8 +430,77 @@ pub const PathRenderer = struct {
         }
     }
 
-    /// 添加一条填充路径（轮廓 -> Earcut + AA fringe -> 追加三角形顶点）
-    /// 返回产出的顶点区间（Phase C storeMesh 用）；null = 无有效三角形
+    /// Multi-contour fill: plans outer contours and holes under `rule`, joins
+    /// each outer with its holes into one polygon, ear-clips it, and adds the
+    /// AA fringe on the unfilled side of every boundary (outer contours
+    /// oriented positive, holes negative).
+    fn fillContoursWithRule(self: *PathRenderer, contours: []const Contour, rule: FillRule, off_x: f32, off_y: f32) !void {
+        const allocator = self.allocator;
+        if (!std.math.isFinite(off_x) or !std.math.isFinite(off_y)) return;
+        var pool: std.ArrayList(TPoint) = .empty;
+        defer pool.deinit(allocator);
+        const spans = try allocator.alloc([2]usize, contours.len);
+        defer allocator.free(spans);
+        for (contours, spans) |contour, *span| {
+            const start = pool.items.len;
+            span.* = .{ start, start };
+            const n = contour.pointCount();
+            if (n < 3 or n > MAX_EARCLIP_POINTS) continue;
+            var finite = true;
+            for (0..n) |i| {
+                const p = contour.point(i);
+                const point = TPoint{ .x = p.x + off_x, .y = p.y + off_y };
+                finite = finite and std.math.isFinite(point.x) and std.math.isFinite(point.y);
+                try pool.append(allocator, point);
+            }
+            var end = pool.items.len;
+            // A closed path may repeat its start point at the end.
+            while (end - start > 3 and @abs(pool.items[end - 1].x - pool.items[start].x) < 1e-3 and @abs(pool.items[end - 1].y - pool.items[start].y) < 1e-3) end -= 1;
+            span.* = if (finite) .{ start, end } else .{ start, start };
+        }
+        const rings = try allocator.alloc([]const TPoint, contours.len);
+        defer allocator.free(rings);
+        for (rings, spans) |*ring, span| ring.* = pool.items[span[0]..span[1]];
+        const plan = try path_fill_rule.plan(allocator, rings, rule);
+        defer plan.deinit(allocator);
+
+        var oriented: std.ArrayList(TPoint) = .empty;
+        defer oriented.deinit(allocator);
+        var hole_spans: std.ArrayList([2]usize) = .empty;
+        defer hole_spans.deinit(allocator);
+        var holes: std.ArrayList([]const TPoint) = .empty;
+        defer holes.deinit(allocator);
+        for (plan.roles, 0..) |role, outer_index| {
+            if (role != .outer) continue;
+            // Outer positive, its holes negative, all in one buffer.
+            oriented.clearRetainingCapacity();
+            hole_spans.clearRetainingCapacity();
+            try appendOriented(allocator, &oriented, rings[outer_index], true);
+            const outer_len = oriented.items.len;
+            for (plan.roles, plan.owner, 0..) |hole_role, owner, hole_index| {
+                if (hole_role != .hole or owner != outer_index) continue;
+                const start = oriented.items.len;
+                try appendOriented(allocator, &oriented, rings[hole_index], false);
+                try hole_spans.append(allocator, .{ start, oriented.items.len });
+            }
+            holes.clearRetainingCapacity();
+            for (hole_spans.items) |span| try holes.append(allocator, oriented.items[span[0]..span[1]]);
+            self.earclip_pts.clearRetainingCapacity();
+            const joined = try path_fill_rule.bridgeHoles(allocator, &self.earclip_pts, oriented.items[0..outer_len], holes.items);
+            // Only degenerate geometry leaves a hole unbridged (a nested hole's
+            // +x ray always meets its outer ring); it is then filled over.
+            if (joined != holes.items.len) std.log.warn("path fill: {d} of {d} holes could not be bridged and are filled", .{ holes.items.len - joined, holes.items.len });
+            if (self.earclip_pts.items.len > MAX_EARCLIP_POINTS) continue;
+            const fill_start = self.vertices.items.len;
+            try earclipRing(allocator, &self.earclip_pts, &self.vertices);
+            if (self.vertices.items.len == fill_start) continue;
+            try buildAaFringeRing(allocator, &self.vertices, oriented.items[0..outer_len], self.scale_factor);
+            for (holes.items) |hole| try buildAaFringeRing(allocator, &self.vertices, hole, self.scale_factor);
+        }
+    }
+
+    /// Add fill path (contours -> Earcut + AA fringe -> triangles).
+    /// Returns produced vertex range (Phase C storeMesh); null = no valid triangles.
     pub fn addFillPath(
         self: *PathRenderer,
         contours: []const Contour,
@@ -415,10 +508,10 @@ pub const PathRenderer = struct {
         offset_x: f32,
         offset_y: f32,
     ) !?[2]u32 {
-        return self.addFillPathGradient(contours, color_rgba, offset_x, offset_y, null);
+        return self.addFillPathGradient(contours, color_rgba, offset_x, offset_y, null, .nonzero);
     }
 
-    /// 同 `addFillPath`，但可选按渐变逐顶点着色（`grad == null` 即统一色）。
+    /// Like addFillPath, optionally per-vertex gradient color (null = uniform).
     pub fn addFillPathGradient(
         self: *PathRenderer,
         contours: []const Contour,
@@ -426,34 +519,40 @@ pub const PathRenderer = struct {
         offset_x: f32,
         offset_y: f32,
         grad: ?FillGradient,
+        rule: FillRule,
     ) !?[2]u32 {
         const vertex_start: u32 = @intCast(self.vertices.items.len);
 
-        for (contours) |contour| {
+        // Several contours: the fill rule decides which nested regions are
+        // filled (holes of rings, letters, cut-out icons). Triangulating each
+        // contour on its own fills every hole.
+        if (contours.len > 1) try self.fillContoursWithRule(contours, rule, offset_x, offset_y) else for (contours) |contour| {
             const point_count = contour.pointCount();
             if (point_count < 3 or point_count > MAX_EARCLIP_POINTS) continue;
             const contour_vertex_start = self.vertices.items.len;
-            // 填充三角形（alpha_scale = 1.0）
+            // Fill triangles (alpha_scale = 1.0).
             try earclipFill(self.allocator, &self.earclip_pts, &self.vertices, contour, offset_x, offset_y);
-            // 三角化拒绝了非有限/病态输入时，fringe 也必须跳过；否则它会
-            // 重新把 NaN 顶点送进 GPU，且绕过上面的 earclip 工作量上限。
+            // Triangulate rejected non-finite/degenerate, fringe must skip too; else
+            // resubmits NaN vertices to GPU, bypasses earclip budget.
             if (self.vertices.items.len == contour_vertex_start) continue;
-            // AA fringe strip 沿轮廓边（外侧 alpha_scale = 0.0）
+            // AA fringe strip along contour (outer alpha_scale = 0.0).
             try buildAaFringe(self.allocator, &self.vertices, contour, offset_x, offset_y, self.scale_factor);
         }
 
-        const vertex_end: u32 = @intCast(self.vertices.items.len);
-        if (vertex_end == vertex_start) return null; // 无有效三角形
+        if (self.vertices.items.len == vertex_start) return null; // No valid triangles.
         if (self.vertices.items.len > MAX_VERTICES_PER_FRAME) return error.TooManyPathVertices;
 
         if (grad) |g| if (g.dir != 0 and g.stops.len > 0) {
-            // 逐顶点求渐变色：先取本次新增顶点的 bbox（几何已含 offset），
-            // 再按归一化位置求 t -> 颜色。GPU 侧线性插值，fragment 不用改。
+            // Per-vertex gradient: compute added vertices bbox (geometry has offset), then
+            // normalize position to t -> color. GPU interpolates, fragment unchanged.
             var min_x: f32 = std.math.floatMax(f32);
             var min_y: f32 = std.math.floatMax(f32);
             var max_x: f32 = -std.math.floatMax(f32);
             var max_y: f32 = -std.math.floatMax(f32);
+            // Gradient bounds are the geometry's: skip the AA fringe's outer
+            // vertices (alpha_scale 0), which lie one device pixel outside it.
             for (self.vertices.items[vertex_start..]) |v| {
+                if (v.alpha_scale == 0) continue;
                 min_x = @min(min_x, v.x);
                 min_y = @min(min_y, v.y);
                 max_x = @max(max_x, v.x);
@@ -461,12 +560,43 @@ pub const PathRenderer = struct {
             }
             const span_x = @max(max_x - min_x, 1e-6);
             const span_y = @max(max_y - min_y, 1e-6);
+            // Colour is piecewise linear in t; per-vertex colours interpolate
+            // linearly across a triangle, so a triangle spanning a stop shows
+            // the wrong colour (red-to-blue straight past a green middle stop).
+            // Linear gradients are affine in position: cut every triangle at
+            // each stop's iso-line and the interpolation becomes exact.
+            // Radial and conic t is not affine in position: no triangulation makes
+            // per-vertex colour exact. Evaluate them per fragment instead.
+            if ((g.dir == 4 or g.dir == 5) and g.stops.len <= max_gradient_stops) {
+                const vertex_end: u32 = @intCast(self.vertices.items.len);
+                for (self.vertices.items[vertex_start..]) |*v| v.color = .{ 1, 1, 1, color_rgba[3] };
+                var gu = GradientUniform{ .dir = g.dir, .stop_count = @intCast(g.stops.len), .center = .{ g.center_x, g.center_y }, .angle = g.start_angle };
+                for (g.stops, 0..) |stop, k| {
+                    gu.colors[k] = stop.color;
+                    gu.positions[k] = stop.position;
+                }
+                try self.draw_calls.append(self.allocator, DrawCall{
+                    .mode = .gradient,
+                    .vertex_start = vertex_start,
+                    .vertex_count = vertex_end - vertex_start,
+                    .color = color_rgba,
+                    .rect = .{ min_x, min_y, span_x, span_y },
+                    .rect_clip = self.current_rect_clip,
+                    .gradient = gu,
+                });
+                return .{ vertex_start, vertex_end };
+            }
+            if (g.dir >= 1 and g.dir <= 3 and g.stops.len >= 2) {
+                try splitAtGradientStops(self.allocator, &self.vertices, vertex_start, g, .{ min_x, min_y, span_x, span_y });
+                if (self.vertices.items.len > MAX_VERTICES_PER_FRAME) return error.TooManyPathVertices;
+            }
+            const vertex_end: u32 = @intCast(self.vertices.items.len);
             for (self.vertices.items[vertex_start..]) |*v| {
                 const uu = (v.x - min_x) / span_x;
                 const vv = (v.y - min_y) / span_y;
                 var c = g.colorAt(g.tAt(uu, vv));
-                // alpha 再乘调用方的整体不透明度；AA fringe 的 alpha_scale
-                // 由 shader 另乘，这里不碰。
+                // alpha multiplied by caller's overall opacity; AA fringe alpha_scale shader-
+                // multiplied separately, untouched here.
                 c[3] *= color_rgba[3];
                 v.color = c;
             }
@@ -480,6 +610,7 @@ pub const PathRenderer = struct {
             return .{ vertex_start, vertex_end };
         };
 
+        const vertex_end: u32 = @intCast(self.vertices.items.len);
         for (self.vertices.items[vertex_start..]) |*v| v.color = color_rgba;
         try self.draw_calls.append(self.allocator, DrawCall{
             .mode = .triangles,
@@ -525,7 +656,7 @@ pub const PathRenderer = struct {
         });
     }
 
-    /// 添加一条描边路径（轮廓 -> 沿边展开矩形 quad + AA fringe -> 追加三角形顶点）
+    /// Add stroke path (contours -> expand rect quads + AA fringe -> triangles).
     pub fn addStrokePath(
         self: *PathRenderer,
         contours: []const Contour,
@@ -558,7 +689,7 @@ pub const PathRenderer = struct {
         return .{ vertex_start, vertex_end };
     }
 
-    /// Phase C：帧推进 + 周期性逐出闲置 mesh。encoder 每帧编码前调。
+    /// Phase C: advance frame + periodically evict idle mesh. Called by encoder pre-encode.
     pub fn setFrame(self: *PathRenderer, frame: u64) void {
         if (frame == self.current_frame) return;
         self.current_frame = frame;
@@ -582,8 +713,8 @@ pub const PathRenderer = struct {
         }
     }
 
-    /// Phase C：缓存命中路径，平移回填 + 补色 + 记 draw call。
-    /// 返回 false = 未命中（caller 走 flatten + add*Path，然后 storeMesh）。
+    /// Phase C: cache hit, translate-fill + recolor + note draw. false = miss
+    /// (caller flatten + add*Path then storeMesh).
     pub fn appendCachedMesh(self: *PathRenderer, key: u64, color_rgba: [4]f32, offset_x: f32, offset_y: f32) !bool {
         const e = self.mesh_cache.getPtr(key) orelse {
             self.frame_mesh_misses += 1;
@@ -612,8 +743,8 @@ pub const PathRenderer = struct {
         return true;
     }
 
-    /// Phase C：把刚 add*Path 产出的顶点区间（本帧 vertices 里）以 path-local
-    /// 形式存入缓存。任何失败静默放弃（缓存是纯优化）。
+    /// Phase C: store just-added vertices (frame vertices) as path-local in cache.
+    /// Any failure silent (cache pure optimization).
     pub fn storeMesh(self: *PathRenderer, key: u64, vertex_start: u32, vertex_end: u32, offset_x: f32, offset_y: f32) void {
         if (vertex_end <= vertex_start) return;
         if (self.mesh_cache.contains(key)) return;
@@ -630,7 +761,7 @@ pub const PathRenderer = struct {
         self.mesh_cache_vertex_total += n;
     }
 
-    /// 提交本帧所有路径绘制命令
+    /// Submit all frame path draw commands.
     pub fn flush(self: *PathRenderer, render_pass: *gpu.Backend.RenderPass) !void {
         defer {
             self.vertices.clearRetainingCapacity();
@@ -661,8 +792,8 @@ pub const PathRenderer = struct {
             self.buffer_write_offset = byte_offset + vertex_bytes.len;
         }
 
-        // 按 rect_clip 分组应用 scissor；相邻同 clip 的 triangles call
-        // （顶点区间连续，颜色已 per-vertex）合并为一次 draw。
+        // Group by rect_clip apply scissor; adjacent same-clip triangles (vertex
+        // continuous, per-vertex colors) merge into one draw.
         var draws_issued: u32 = 0;
         var applied_scissor: ?[4]f32 = null;
         var triangles_uniforms_bound = false;
@@ -677,11 +808,11 @@ pub const PathRenderer = struct {
 
             if (dc.mode == .triangles) {
                 if (!triangles_uniforms_bound) {
-                    // triangles 组共享一份 uniforms（颜色走 per-vertex）
+                    // triangles group shares one uniforms (color per-vertex).
                     const uniforms = PathUniforms{
                         .viewport_size = .{ self.viewport_width, self.viewport_height },
                         .scale_factor = self.scale_factor,
-                        .draw_mode = @intFromEnum(DrawMode.triangles),
+                        .draw_mode = @backingInt(DrawMode.triangles),
                         .clip_rect = self.clip_rect,
                         .clip_radius = self.clip_radius,
                         .clip_shape_kind = self.clip_shape_kind,
@@ -704,7 +835,7 @@ pub const PathRenderer = struct {
                 const uniforms = PathUniforms{
                     .viewport_size = .{ self.viewport_width, self.viewport_height },
                     .scale_factor = self.scale_factor,
-                    .draw_mode = @intFromEnum(dc.mode),
+                    .draw_mode = @backingInt(dc.mode),
                     .color = dc.color,
                     .rect = dc.rect,
                     .fill_rule = dc.polygon.fill_rule,
@@ -715,6 +846,12 @@ pub const PathRenderer = struct {
                     .clip_rect = self.clip_rect,
                     .clip_radius = self.clip_radius,
                     .clip_shape_kind = self.clip_shape_kind,
+                    .grad_dir = dc.gradient.dir,
+                    .grad_stop_count = dc.gradient.stop_count,
+                    .grad_center = dc.gradient.center,
+                    .grad_angle = dc.gradient.angle,
+                    .grad_colors = dc.gradient.colors,
+                    .grad_positions = dc.gradient.positions,
                 };
                 render_pass.setVertexBytes(1, std.mem.asBytes(&uniforms));
                 render_pass.setFragmentBytes(1, std.mem.asBytes(&uniforms));
@@ -724,18 +861,18 @@ pub const PathRenderer = struct {
                 i += 1;
             }
         }
-        // 还原 pass 的 scissor：path 是唯一用硬件 scissor 做矩形裁剪的管线，其余
-        // 管线（sdf/text/icon/image）在 shader 里按 rect_clip 裁、默认 pass scissor
-        // 是整个 drawable（或 damage 区）。不还原的话，本次 flush 最后一组 draw 的
-        // scissor 会留给之后所有批次，编辑器里一张矢量图之后，视口外的状态栏、
-        // 卡片以下的正文整段消失（2026-09-04 下游编辑器 chart block 实测）。
+        // Restore pass scissor: path is the only pipeline using hardware scissor for rect clip;
+        // others (sdf/text/icon/image) shader-clip by rect_clip (default pass scissor =
+        // drawable or damage). If not restored, the last draw's scissor leaks into all later
+        // batches,
+        // making UI outside the vector diagram's viewport (status bar, cards below text) vanish.
         if (applied_scissor != null) self.applyScissor(render_pass, .{ 0, 0, -1, -1 });
         self.last_flush_draw_count = draws_issued;
         self.frame_call_count += @intCast(self.draw_calls.items.len);
         self.frame_draw_count += draws_issued;
     }
 
-    /// rect_clip: 逻辑像素 x,y,w,h；w/h < 0 = 无裁剪（全 viewport）
+    /// rect_clip: logical pixels x,y,w,h; w/h < 0 = no clipping (full viewport)
     fn applyScissor(self: *PathRenderer, render_pass: *gpu.Backend.RenderPass, rect_clip: [4]f32) void {
         var sx: u32 = 0;
         var sy: u32 = 0;
@@ -751,7 +888,8 @@ pub const PathRenderer = struct {
             sw = nonNegativeFloatToU32(@max(0, clip_x1 - clip_x0) * self.scale_factor);
             sh = nonNegativeFloatToU32(@max(0, clip_y1 - clip_y0) * self.scale_factor);
         }
-        // 部分重绘 pass：与脏区 scissor 取交，脏区外像素绝不能被触碰
+        // Partial redraw pass: intersect with dirty-area scissor; pixels outside dirty area must
+        // not be touched
         if (self.damage_scissor) |d| {
             const x1 = @min(sx +| sw, d[0] +| d[2]);
             const y1 = @min(sy +| sh, d[1] +| d[3]);
@@ -785,16 +923,19 @@ pub const PathRenderer = struct {
             .size = new_capacity,
             .usage = .{ .vertex = true, .map_write = true },
         });
-        // 旧 buffer 可能被本帧早前 pass（setVertexBuffer 已录进当前 command
-        // buffer）或仍在飞的前几帧引用，走 retire 延迟 destroy，而不是像
-        // 旧实现那样同步释放（与 glyph_atlas evictPage 修过的是同一类 bug）。
+        // Old buffer may be referenced by earlier passes in this frame (already recorded in
+        // setVertexBuffer
+        // to current command buffer) or in-flight from preceding frames. Use retire queue for
+        // delayed
+        // destroy, not synchronous free like old code (same bug class as glyph_atlas evictPage
+        // fix).
         self.retireVertexBuffer();
         self.vertex_buffer = new_buffer;
         self.vertex_buffer_capacity = new_capacity;
     }
 
-    /// 摘除当前 vertex buffer，进入延迟释放队列。容量归零后，下一次
-    /// flush 需要时由 ensureVertexBufferCapacity 按实际用量重建。
+    /// Remove current vertex buffer and enqueue for delayed release. Capacity resets to zero.
+    /// ensureVertexBufferCapacity rebuilds on next flush if needed, sized to actual usage.
     fn retireVertexBuffer(self: *PathRenderer) void {
         const buffer = self.vertex_buffer orelse return;
         self.vertex_buffer = null;
@@ -803,20 +944,29 @@ pub const PathRenderer = struct {
             .buffer = buffer,
             .retired_at_frame = self.shrink_frame,
         }) catch {
-            // OOM 兜底：同步 destroy。Metal command buffer 默认 retain 引用
-            // 资源，实际不会悬垂；这里只是放弃我们自己的保守时序。
+            // OOM fallback: synchronous destroy. Metal command buffer retains resource refs by
+            // default,
+            // so no actual dangling pointer; we just give up our conservative timing guarantee
+            // here.
             var b = buffer;
             b.destroy();
         };
     }
 
-    /// 把本帧 buffer 停进当前槽位，切到下一个槽位的 buffer（可能为 null，
-    /// 首次 flush 时按需创建）。下一个槽位上次被写是 BUFFER_MAX_FRAMES_IN_FLIGHT
-    /// 帧之前，frame_sync 保证 GPU 已消费完。
+    /// Retire current frame's buffer to this slot, switch to next slot's buffer (may be null,
+    /// created on-demand at first flush). GPU is guaranteed to have consumed the next slot last
+    /// written BUFFER_MAX_FRAMES_IN_FLIGHT frames ago (frame_sync ensures this).
     fn rotateVertexBufferSlot(self: *PathRenderer) void {
+        self.restoreFrameBufferSlot((self.buffer_slot + 1) % BUFFER_MAX_FRAMES_IN_FLIGHT);
+    }
+
+    /// Undo an unsubmitted frame's rotation without losing ownership of either
+    /// slot's allocation. Failed-frame storage remains parked for its retry.
+    pub fn restoreFrameBufferSlot(self: *PathRenderer, slot: usize) void {
+        if (slot == self.buffer_slot) return;
         self.parked_buffers[self.buffer_slot] = self.vertex_buffer;
         self.parked_capacities[self.buffer_slot] = self.vertex_buffer_capacity;
-        self.buffer_slot = (self.buffer_slot + 1) % BUFFER_MAX_FRAMES_IN_FLIGHT;
+        self.buffer_slot = slot;
         self.vertex_buffer = self.parked_buffers[self.buffer_slot];
         self.vertex_buffer_capacity = self.parked_capacities[self.buffer_slot];
         self.parked_buffers[self.buffer_slot] = null;
@@ -829,7 +979,7 @@ pub const PathRenderer = struct {
         return peak;
     }
 
-    /// 当前 + 停放槽位中存活的顶点 buffer 数（测试/诊断用）。
+    /// Count live vertex buffers in current + parked slots (test/diagnostics).
     fn liveSlotBufferCount(self: *const PathRenderer) usize {
         var n: usize = @intFromBool(self.vertex_buffer != null);
         for (self.parked_buffers) |maybe| n += @intFromBool(maybe != null);
@@ -851,7 +1001,8 @@ pub const PathRenderer = struct {
         }
     }
 
-    /// 释放已飞过 in-flight 窗口的 retired buffer。每帧 beginFrame 调用。
+    /// Release retired buffers that have exited the in-flight window. Called at beginFrame each
+    /// frame.
     fn drainRetiredBuffers(self: *PathRenderer) void {
         var i: usize = 0;
         while (i < self.retired_buffers.items.len) {
@@ -866,28 +1017,28 @@ pub const PathRenderer = struct {
 };
 
 // ============================================================================
-// Ear-clipping 三角剖分
+// Ear-clipping triangulation
 //
-// 简单 O(N²) 实现，适用于路径轮廓（通常 < 200 顶点）。
-// - 仅处理无空洞的单多边形
-// - 支持 CW 和 CCW 绕向（自动检测符号面积）
+// Simple O(N^2) implementation for path contours (typically < 200 vertices).
+// - Handles only simple polygons without holes.
+// - Supports CW and CCW winding (auto-detect by signed area).
 //
-// 多个 contour 各自独立三角化。
+// Multiple contours triangulated independently.
 // ============================================================================
 
 const MAX_EARCLIP_POINTS: usize = 4096;
 const MAX_EARCLIP_POINT_TESTS: usize = 8_000_000;
 
-/// 相邻 triangles draw call 是否可合并为一次 draw：同 clip 且顶点区间连续。
-/// prev_count 是 prev 起点起已累计的合并顶点数。
+/// Whether adjacent triangle draw calls can merge: same clip and continuous vertex range.
+/// prev_count = cumulative merged vertex count from prev's starting point.
 fn canCoalesce(prev: DrawCall, prev_count: u32, next: DrawCall) bool {
     return prev.mode == .triangles and next.mode == .triangles and
         std.mem.eql(f32, &prev.rect_clip, &next.rect_clip) and
         next.vertex_start == prev.vertex_start + prev_count;
 }
 
-/// 将 contour 三角化后追加到 vertices（三角形列表，无索引）。
-/// scratch: 调用方持有的临时点表，跨调用复用容量。
+/// Triangulate contour and append to vertices (triangle list, no indices).
+/// scratch: temp point array owned by caller, capacity reused across calls.
 fn earclipFill(
     allocator: std.mem.Allocator,
     scratch: *std.ArrayList(TPoint),
@@ -902,7 +1053,7 @@ fn earclipFill(
     const out_start = out.items.len;
     errdefer out.shrinkRetainingCapacity(out_start);
 
-    // 拷贝顶点到可变列表（ear-clip 过程中会移除已处理顶点）
+    // Copy vertices to mutable list (ear-clip removes processed vertices during iteration).
     scratch.clearRetainingCapacity();
     const pts = scratch;
     try pts.ensureTotalCapacity(allocator, n);
@@ -917,12 +1068,20 @@ fn earclipFill(
         pts.appendAssumeCapacity(.{ .x = x, .y = y });
     }
 
-    // 确保 CCW 绕向（签名面积 > 0）
+    // Ensure CCW winding (signed area > 0).
     ensureCCW(pts.items);
+    try earclipRing(allocator, pts, out);
+}
 
-    // Ear-clipping 主循环
+/// Ear-clips the positive-area polygon in `pts` (consumed) into `out`. The
+/// polygon may be weakly simple: bridged holes repeat their bridge vertices,
+/// which the strict point-in-triangle test lets through.
+fn earclipRing(allocator: std.mem.Allocator, pts: *std.ArrayList(TPoint), out: *std.ArrayList(PathVertex)) !void {
+    const out_start = out.items.len;
+    errdefer out.shrinkRetainingCapacity(out_start);
+    // Ear-clipping main loop.
     var remaining: usize = pts.items.len;
-    // 去除末尾与起点重合的点（close 路径可能产生）
+    // Remove trailing point if it coincides with start (closed paths may produce this).
     while (remaining > 3) {
         const last = pts.items[remaining - 1];
         const first = pts.items[0];
@@ -946,12 +1105,12 @@ fn earclipFill(
             const next = (i + 1) % remaining;
 
             if (isEar(pts.items[0..remaining], prev, i, next)) {
-                // 输出三角形（填充，alpha_scale = 1.0）
+                // Output triangle (fill, alpha_scale = 1.0).
                 try out.append(allocator, .{ .x = pts.items[prev].x, .y = pts.items[prev].y, .alpha_scale = 1.0 });
                 try out.append(allocator, .{ .x = pts.items[i].x, .y = pts.items[i].y, .alpha_scale = 1.0 });
                 try out.append(allocator, .{ .x = pts.items[next].x, .y = pts.items[next].y, .alpha_scale = 1.0 });
 
-                // 移除 ear 顶点
+                // Remove ear vertex.
                 _ = pts.orderedRemove(i);
                 remaining -= 1;
                 found_ear = true;
@@ -959,9 +1118,13 @@ fn earclipFill(
             }
         }
         if (!found_ear) {
-            // 浮点误差下可能一个"合法" ear 都测不出来（顶点恰落在候选三角形边上等）。
-            // 与其提前放弃留下未填充楔形，不如强制剪掉最凸的顶点，对简单多边形
-            // 结果仍正确，病态自交输入最多产生轻微过绘。
+            // Under floating-point error, a "valid" ear may fail to detect (e.g., point lands on
+            // edge).
+            // Better to force-clip the most convex vertex than abandon early, leaving unfilled
+            // wedges.
+            // For simple polygons result is still correct; pathological self-intersecting input
+            // worst case
+            // produces light over-draw.
             var best: ?usize = null;
             var best_cross: f32 = 0;
             var k: usize = 0;
@@ -980,7 +1143,7 @@ fn earclipFill(
             const clip_idx = best orelse {
                 completed = false;
                 break :clip_loop;
-            }; // 无凸顶点（全退化），放弃
+            }; // No convex vertex found (fully degenerate), give up.
             const prev = if (clip_idx == 0) remaining - 1 else clip_idx - 1;
             const next = (clip_idx + 1) % remaining;
             try out.append(allocator, .{ .x = pts.items[prev].x, .y = pts.items[prev].y, .alpha_scale = 1.0 });
@@ -996,7 +1159,7 @@ fn earclipFill(
         return;
     }
 
-    // 最后三角形
+    // Last triangle.
     if (remaining >= 3) {
         const cross = triangleCross(pts.items[0], pts.items[1], pts.items[2]);
         if (!std.math.isFinite(cross) or @abs(cross) <= std.math.floatEps(f32)) {
@@ -1009,7 +1172,7 @@ fn earclipFill(
     }
 }
 
-/// 确保顶点列表为 CCW 绕向（若为 CW 则反转）
+/// Ensure vertex list is CCW winding (reverse if CW).
 fn ensureCCW(pts: []TPoint) void {
     var area2: f32 = 0;
     const n = pts.len;
@@ -1019,22 +1182,22 @@ fn ensureCCW(pts: []TPoint) void {
         area2 -= pts[j].x * pts[i].y;
     }
     if (area2 < 0) {
-        // CW -> 反转为 CCW
+        // CW -> reverse to CCW.
         std.mem.reverse(TPoint, pts);
     }
 }
 
-/// 判断顶点 i 是否为 ear（凸角 + 无其他顶点在三角形内）
+/// Test whether vertex i is an ear (convex angle + no other vertex inside triangle).
 fn isEar(pts: []const TPoint, prev: usize, i: usize, next: usize) bool {
     const a = pts[prev];
     const b = pts[i];
     const c = pts[next];
 
-    // 叉积判断是否为凸角（CCW 时叉积 > 0 为凸）
+    // Cross product test: is this a convex angle (cross > 0 = convex for CCW).
     const cross = triangleCross(a, b, c);
     if (!std.math.isFinite(cross) or cross <= 0) return false;
 
-    // 判断没有其他顶点在三角形 abc 内
+    // Check no other vertex lies inside triangle abc.
     for (pts, 0..) |p, j| {
         if (j == prev or j == i or j == next) continue;
         if (pointInTriangle(p, a, b, c)) return false;
@@ -1042,7 +1205,7 @@ fn isEar(pts: []const TPoint, prev: usize, i: usize, next: usize) bool {
     return true;
 }
 
-/// 判断点 p 是否严格在三角形 abc 内部（不含边界）
+/// Test whether point p is strictly inside triangle abc (excluding boundary).
 fn pointInTriangle(p: TPoint, a: TPoint, b: TPoint, c: TPoint) bool {
     const d1 = sign(p, a, b);
     const d2 = sign(p, b, c);
@@ -1050,8 +1213,8 @@ fn pointInTriangle(p: TPoint, a: TPoint, b: TPoint, c: TPoint) bool {
     // Non-finite predicates must block this candidate ear. Treating NaN as
     // "outside" accepts a corrupt triangle and forwards it to the GPU.
     if (!std.math.isFinite(d1) or !std.math.isFinite(d2) or !std.math.isFinite(d3)) return true;
-    // 严格内部：三个符号必须全部同号且非零
-    // 使用 <= 排除共线点（在边上的点不算"在三角形内"）
+    // Strictly inside: all three signs same and non-zero.
+    // Use <= to exclude collinear points (points on edge don't count as "inside").
     const all_pos = (d1 > 0) and (d2 > 0) and (d3 > 0);
     const all_neg = (d1 < 0) and (d2 < 0) and (d3 < 0);
     return all_pos or all_neg;
@@ -1065,10 +1228,10 @@ fn triangleCross(a: TPoint, b: TPoint, c: TPoint) f32 {
     return (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
 }
 
-/// 沿多边形轮廓生成 AA fringe strip。
+/// Generate AA fringe strip along polygon outline.
 ///
-/// 每条轮廓边 [P_i, P_{i+1}] 往外扩 fringe_w 像素（沿外法线方向），
-/// 生成 2 个三角形（quad），外侧顶点 alpha_scale=0，内侧=1。
+/// Each contour edge [P_i, P_{i+1}] expands outward by fringe_w pixels (along outer normal),
+/// producing 2 triangles (quad). Outer vertex alpha_scale=0, inner=1.
 fn buildAaFringe(
     allocator: std.mem.Allocator,
     out: *std.ArrayList(PathVertex),
@@ -1082,7 +1245,16 @@ fn buildAaFringe(
     const edge_count: usize = if (contour.closed and n >= 2) n else n - 1;
     if (edge_count == 0) return;
 
-    const fringe_w = 1.0 / @max(scale_factor, 0.001);
+    // Fringe on the unfilled side: right of each edge for a positive-area
+    // contour, left for a negative one (a clockwise-in-y-up path); otherwise
+    // the fringe lies inside the fill and the outer edge stays aliased.
+    var area2: f32 = 0;
+    for (0..n) |i| {
+        const p = contour.point(i);
+        const q = contour.point((i + 1) % n);
+        area2 += p.x * q.y - q.x * p.y;
+    }
+    const fringe_w = (if (area2 < 0) @as(f32, -1) else 1) / @max(scale_factor, 0.001);
 
     for (0..edge_count) |i| {
         const j = i + 1;
@@ -1099,7 +1271,7 @@ fn buildAaFringe(
         const len = @sqrt(ex * ex + ey * ey);
         if (len < 1e-6) continue;
 
-        // 外法线（CCW 多边形的右侧为外侧）：旋转 +90° -> (ey, -ex)
+        // Outer normal (for CCW polygon, right side = outer): rotate +90deg -> (ey, -ex).
         const nx = ey / len * fringe_w;
         const ny = -ex / len * fringe_w;
 
@@ -1118,10 +1290,105 @@ fn buildAaFringe(
     }
 }
 
-/// 描边展开：单遍 per-edge 发射，每个顶点计算 miter/bevel/round join。
+/// Replaces the triangles in `verts[start..]` by pieces that no stop iso-line
+/// of the (affine) gradient crosses: each triangle is clipped to every band
+/// between consecutive interior stops and the pieces fan-triangulated, with
+/// position and alpha_scale interpolated along the cut edges.
+fn splitAtGradientStops(allocator: std.mem.Allocator, verts: *std.ArrayList(PathVertex), start: usize, g: FillGradient, bounds: [4]f32) !void {
+    const Clip = struct {
+        fn t(grad: FillGradient, b: [4]f32, v: PathVertex) f32 {
+            return grad.tAt((v.x - b[0]) / b[2], (v.y - b[1]) / b[3]);
+        }
+        fn lerp(p: PathVertex, q: PathVertex, k: f32) PathVertex {
+            var out = p;
+            out.x = p.x + (q.x - p.x) * k;
+            out.y = p.y + (q.y - p.y) * k;
+            out.alpha_scale = p.alpha_scale + (q.alpha_scale - p.alpha_scale) * k;
+            return out;
+        }
+        /// Keeps the part of convex `poly` where side * (t - level) >= 0.
+        fn half(grad: FillGradient, b: [4]f32, poly: []const PathVertex, level: f32, side: f32, out: []PathVertex) usize {
+            var n: usize = 0;
+            for (poly, 0..) |p, i| {
+                const q = poly[(i + 1) % poly.len];
+                const dp = side * (t(grad, b, p) - level);
+                const dq = side * (t(grad, b, q) - level);
+                if (dp >= 0) {
+                    out[n] = p;
+                    n += 1;
+                }
+                if ((dp >= 0) != (dq >= 0)) {
+                    out[n] = lerp(p, q, dp / (dp - dq));
+                    n += 1;
+                }
+            }
+            return n;
+        }
+    };
+    // Interior breakpoints of the piecewise-linear colour (stops ascend).
+    var levels: [18]f32 = undefined;
+    var level_count: usize = 0;
+    for (g.stops) |stop| {
+        if (level_count == levels.len) break;
+        if (stop.position > 0 and stop.position < 1 and (level_count == 0 or stop.position > levels[level_count - 1])) {
+            levels[level_count] = stop.position;
+            level_count += 1;
+        }
+    }
+    if (level_count == 0) return;
+    const source = try allocator.dupe(PathVertex, verts.items[start..]);
+    defer allocator.free(source);
+    verts.shrinkRetainingCapacity(start);
+    var i: usize = 0;
+    while (i + 2 < source.len) : (i += 3) {
+        const tri = source[i .. i + 3];
+        for (0..level_count + 1) |band| {
+            // Clipping a triangle by two parallel lines leaves a convex
+            // polygon of at most five vertices.
+            var a: [8]PathVertex = undefined;
+            var b: [8]PathVertex = undefined;
+            var n: usize = 3;
+            @memcpy(a[0..3], tri);
+            if (band > 0) n = Clip.half(g, bounds, a[0..n], levels[band - 1], 1, &b) else @memcpy(b[0..3], tri);
+            if (n < 3) continue;
+            if (band < level_count) n = Clip.half(g, bounds, b[0..n], levels[band], -1, &a) else @memcpy(a[0..n], b[0..n]);
+            if (n < 3) continue;
+            for (1..n - 1) |k| try verts.appendSlice(allocator, &.{ a[0], a[k], a[k + 1] });
+        }
+    }
+}
+
+fn appendOriented(allocator: std.mem.Allocator, out: *std.ArrayList(TPoint), ring: []const TPoint, positive: bool) !void {
+    const start = out.items.len;
+    try out.appendSlice(allocator, ring);
+    if ((path_fill_rule.signedArea2(ring) > 0) != positive) std.mem.reverse(TPoint, out.items[start..]);
+}
+
+/// AA fringe on the right of every edge of a closed ring (already offset):
+/// outside for a positive-area outer contour, inside the hole for a
+/// negative-area hole. Same strip geometry as `buildAaFringe`.
+fn buildAaFringeRing(allocator: std.mem.Allocator, out: *std.ArrayList(PathVertex), ring: []const TPoint, scale_factor: f32) !void {
+    const fringe_w = 1.0 / @max(scale_factor, 0.001);
+    for (ring, 0..) |p, i| {
+        const q = ring[(i + 1) % ring.len];
+        const ex = q.x - p.x;
+        const ey = q.y - p.y;
+        const len = @sqrt(ex * ex + ey * ey);
+        if (len < 1e-6) continue;
+        const nx = ey / len * fringe_w;
+        const ny = -ex / len * fringe_w;
+        const a_inner = PathVertex{ .x = p.x, .y = p.y, .alpha_scale = 1.0 };
+        const b_inner = PathVertex{ .x = q.x, .y = q.y, .alpha_scale = 1.0 };
+        const a_outer = PathVertex{ .x = p.x + nx, .y = p.y + ny, .alpha_scale = 0.0 };
+        const b_outer = PathVertex{ .x = q.x + nx, .y = q.y + ny, .alpha_scale = 0.0 };
+        try out.appendSlice(allocator, &.{ a_inner, b_inner, a_outer, b_inner, b_outer, a_outer });
+    }
+}
+
+/// Stroke expansion: single-pass per-edge emission, each vertex computes miter/bevel/round join.
 ///
-/// 对每条边 [Pi, Pj]，先在 Pi 处计算 join 展开点，再发射该边的 quad + fringe。
-/// Bevel/round 通过在 join 处发射额外的扇形三角形来连接。
+/// For each edge [Pi, Pj], compute join expansion at Pi, emit edge quad + fringe.
+/// Bevel/round connect via extra fan triangles at joins.
 fn buildStrokeExpand(
     allocator: std.mem.Allocator,
     out: *std.ArrayList(PathVertex),
@@ -1140,7 +1407,7 @@ fn buildStrokeExpand(
     const edge_count: usize = if (is_closed) n else n - 1;
     const MITER_LIMIT: f32 = 4.0;
 
-    // ---- Phase 1: 计算每条边的单位法线 ----
+    // ---- Phase 1: compute unit normal for each edge ----
     const edge_norms = try allocator.alloc([2]f32, edge_count);
     defer allocator.free(edge_norms);
 
@@ -1158,9 +1425,9 @@ fn buildStrokeExpand(
         }
     }
 
-    // ---- Phase 2: 对每条边发射三角形 ----
-    // 每条边都使用该边自身的法线来展开两侧，保证同一条边的起点和终点
-    // 完全平行于原始边。join 的衔接通过额外的三角形扇形来处理。
+    // ---- Phase 2: emit triangle per edge ----
+    // Each edge uses its own normal for expansion; both edge endpoints stay parallel to original.
+    // Join connection handled via extra triangle fan.
     for (0..edge_count) |ei| {
         const ej = (ei + 1) % n;
         const pi = contour.point(ei);
@@ -1177,7 +1444,7 @@ fn buildStrokeExpand(
         const nx = nn[0];
         const ny = nn[1];
 
-        // 该边的四个实心顶点
+        // Four solid vertices for this edge.
         const a0x = ax - nx * half_w;
         const a0y = ay - ny * half_w;
         const a1x = ax + nx * half_w;
@@ -1187,7 +1454,7 @@ fn buildStrokeExpand(
         const b1x = bx + nx * half_w;
         const b1y = by + ny * half_w;
 
-        // 实心 quad
+        // Solid quad.
         try out.append(allocator, .{ .x = a0x, .y = a0y, .alpha_scale = 1.0 });
         try out.append(allocator, .{ .x = b0x, .y = b0y, .alpha_scale = 1.0 });
         try out.append(allocator, .{ .x = a1x, .y = a1y, .alpha_scale = 1.0 });
@@ -1195,7 +1462,7 @@ fn buildStrokeExpand(
         try out.append(allocator, .{ .x = b1x, .y = b1y, .alpha_scale = 1.0 });
         try out.append(allocator, .{ .x = a1x, .y = a1y, .alpha_scale = 1.0 });
 
-        // AA fringe，外侧 (+n)
+        // AA fringe, outer side (+n).
         const ao_x = ax + nx * (half_w + fringe_w);
         const ao_y = ay + ny * (half_w + fringe_w);
         const bo_x = bx + nx * (half_w + fringe_w);
@@ -1207,7 +1474,7 @@ fn buildStrokeExpand(
         try out.append(allocator, .{ .x = bo_x, .y = bo_y, .alpha_scale = 0.0 });
         try out.append(allocator, .{ .x = ao_x, .y = ao_y, .alpha_scale = 0.0 });
 
-        // AA fringe，内侧 (-n)
+        // AA fringe, inner side (-n).
         const ai_x = ax - nx * (half_w + fringe_w);
         const ai_y = ay - ny * (half_w + fringe_w);
         const bi_x = bx - nx * (half_w + fringe_w);
@@ -1219,18 +1486,18 @@ fn buildStrokeExpand(
         try out.append(allocator, .{ .x = ai_x, .y = ai_y, .alpha_scale = 0.0 });
         try out.append(allocator, .{ .x = bi_x, .y = bi_y, .alpha_scale = 0.0 });
 
-        // ---- Join at vertex Pj (连接当前边和下一条边) ----
+        // ---- Join at vertex Pj (connect current and next edge) ----
         const next_edge = (ei + 1) % edge_count;
-        if (!is_closed and ej == n - 1) continue; // 开放路径末端无 join
+        if (!is_closed and ej == n - 1) continue; // Open path: no join at end.
 
         const nn2 = edge_norms[next_edge];
         if (nn2[0] == 0 and nn2[1] == 0) continue;
 
-        // 计算 miter
+        // Compute miter.
         const mx = nx + nn2[0];
         const my = ny + nn2[1];
         const mlen_sq = mx * mx + my * my;
-        if (mlen_sq < 1e-6) continue; // ~180 度折弯
+        if (mlen_sq < 1e-6) continue; // ~180 degree bend.
 
         const inv_mlen = 1.0 / @sqrt(mlen_sq);
         const mdx = mx * inv_mlen;
@@ -1243,7 +1510,8 @@ fn buildStrokeExpand(
         const use_miter = line_join == .miter and miter_scale <= half_w * MITER_LIMIT;
 
         if (use_miter) {
-            // Miter join：仅在外侧发射 miter，避免在凹角/自交路径上双侧外扩。
+            // Miter join: emit miter only on outer side, avoid double-expansion into
+            // concave/self-intersecting paths.
             const mr_x = bx + mdx * miter_scale;
             const mr_y = by + mdy * miter_scale;
             const ml_x = bx - mdx * miter_scale;
@@ -1306,7 +1574,7 @@ fn buildStrokeExpand(
                 try out.append(allocator, .{ .x = nfl_x, .y = nfl_y, .alpha_scale = 0.0 });
             }
 
-            // 内侧连接只做补片，避免双侧都外扩成 spike。
+            // Inner connection: patch only, avoid double-expansion spike.
             {
                 const inner_scale = @min(miter_scale, half_w * 2.0);
                 var mi_x: f32 = undefined;
@@ -1332,12 +1600,12 @@ fn buildStrokeExpand(
                 }
             }
         } else {
-            // Bevel / Round join：用扇形连接两条边端点
-            // 确定外侧（发射扇形的一侧）
-            // cross > 0 -> 左转 -> 外侧在右 (+n)
-            // cross < 0 -> 右转 -> 外侧在左 (-n)
+            // Bevel/Round join: connect two edge endpoints with fan.
+            // Determine outer side (fan emission side).
+            // cross > 0 -> left turn -> outer on right (+n)
+            // cross < 0 -> right turn -> outer on left (-n).
 
-            // 外侧：当前边终点 -> 下条边起点
+            // Outer: current edge end -> next edge start.
             var s0_x: f32 = undefined;
             var s0_y: f32 = undefined;
             var s1_x: f32 = undefined;
@@ -1366,23 +1634,23 @@ fn buildStrokeExpand(
                 fs1_y = by - nn2[1] * (half_w + fringe_w);
             }
 
-            // 内侧：用 miter 补两个三角形连接
+            // Inner: use miter to patch two triangles connecting.
             {
                 const inner_scale = @min(miter_scale, half_w * 2.0);
                 var mi_x: f32 = undefined;
                 var mi_y: f32 = undefined;
                 if (outside_right) {
-                    // 内侧在左 (-n)，miter 方向是 -mdx,-mdy
+                    // Inner on left (-n), miter direction is -mdx,-mdy.
                     mi_x = bx - mdx * inner_scale;
                     mi_y = by - mdy * inner_scale;
-                    // 当前边左端 -> miter -> 下条边左端
+                    // Current edge left end -> miter -> next edge left end.
                     try out.append(allocator, .{ .x = bx, .y = by, .alpha_scale = 1.0 });
                     try out.append(allocator, .{ .x = mi_x, .y = mi_y, .alpha_scale = 1.0 });
                     try out.append(allocator, .{ .x = b0x, .y = b0y, .alpha_scale = 1.0 });
                     try out.append(allocator, .{ .x = bx, .y = by, .alpha_scale = 1.0 });
                     try out.append(allocator, .{ .x = bx - nn2[0] * half_w, .y = by - nn2[1] * half_w, .alpha_scale = 1.0 });
                     try out.append(allocator, .{ .x = mi_x, .y = mi_y, .alpha_scale = 1.0 });
-                    // 内侧 fringe
+                    // Inner fringe.
                     const fi_scale = @min((half_w + fringe_w) / cos_half, (half_w + fringe_w) * MITER_LIMIT);
                     const fmi_x = bx - mdx * fi_scale;
                     const fmi_y = by - mdy * fi_scale;
@@ -1403,7 +1671,7 @@ fn buildStrokeExpand(
                     try out.append(allocator, .{ .x = fmi_x, .y = fmi_y, .alpha_scale = 0.0 });
                     try out.append(allocator, .{ .x = nfl, .y = nfly, .alpha_scale = 0.0 });
                 } else {
-                    // 内侧在右 (+n)，miter 方向是 +mdx,+mdy
+                    // Inner on right (+n), miter direction is +mdx,+mdy.
                     mi_x = bx + mdx * inner_scale;
                     mi_y = by + mdy * inner_scale;
                     try out.append(allocator, .{ .x = bx, .y = by, .alpha_scale = 1.0 });
@@ -1412,7 +1680,7 @@ fn buildStrokeExpand(
                     try out.append(allocator, .{ .x = bx, .y = by, .alpha_scale = 1.0 });
                     try out.append(allocator, .{ .x = mi_x, .y = mi_y, .alpha_scale = 1.0 });
                     try out.append(allocator, .{ .x = bx + nn2[0] * half_w, .y = by + nn2[1] * half_w, .alpha_scale = 1.0 });
-                    // 内侧 fringe
+                    // Inner fringe.
                     const fi_scale = @min((half_w + fringe_w) / cos_half, (half_w + fringe_w) * MITER_LIMIT);
                     const fmi_x = bx + mdx * fi_scale;
                     const fmi_y = by + mdy * fi_scale;
@@ -1435,7 +1703,7 @@ fn buildStrokeExpand(
                 }
             }
 
-            // 外侧扇形
+            // Outer fan.
             const segments: usize = if (line_join == .round) blk: {
                 const angle0 = std.math.atan2(s0_y - by, s0_x - bx);
                 var angle1 = std.math.atan2(s1_y - by, s1_x - bx);
@@ -1449,7 +1717,7 @@ fn buildStrokeExpand(
             } else 1;
 
             if (segments == 1) {
-                // Bevel：直接用精确坐标
+                // Bevel: use exact coordinates.
                 try out.append(allocator, .{ .x = bx, .y = by, .alpha_scale = 1.0 });
                 try out.append(allocator, .{ .x = s0_x, .y = s0_y, .alpha_scale = 1.0 });
                 try out.append(allocator, .{ .x = s1_x, .y = s1_y, .alpha_scale = 1.0 });
@@ -1461,7 +1729,7 @@ fn buildStrokeExpand(
                 try out.append(allocator, .{ .x = fs1_x, .y = fs1_y, .alpha_scale = 0.0 });
                 try out.append(allocator, .{ .x = fs0_x, .y = fs0_y, .alpha_scale = 0.0 });
             } else {
-                // Round：圆弧扇形
+                // Round: circular arc fan.
                 const angle0 = std.math.atan2(s0_y - by, s0_x - bx);
                 var angle1 = std.math.atan2(s1_y - by, s1_x - bx);
                 if (outside_right) {
@@ -1531,7 +1799,7 @@ fn roundJoinSegmentCount(sweep: f32) usize {
 }
 
 // ============================================================================
-// 单元测试
+// Unit tests
 // ============================================================================
 
 test "round join and scissor conversions bound non-finite values" {
@@ -1548,13 +1816,13 @@ test "earclipFill star polygon produces correct triangle count" {
         60.0, 85.0, 27.0, 107.0, 40.0,  67.0, 5.0,  43.0, 47.0, 43.0,
     };
     const contour = Contour{ .vertices = &star_verts };
-    var scratch = std.ArrayList(TPoint){};
+    var scratch = @as(std.ArrayList(TPoint), .empty);
     defer scratch.deinit(alloc);
-    var out = std.ArrayList(PathVertex){};
+    var out = @as(std.ArrayList(PathVertex), .empty);
     defer out.deinit(alloc);
     try earclipFill(alloc, &scratch, &out, contour, 0, 0);
     try std.testing.expectEqual(@as(usize, 24), out.items.len);
-    // scratch 复用：第二次调用结果一致
+    // scratch reuse: second call yields same result.
     out.clearRetainingCapacity();
     try earclipFill(alloc, &scratch, &out, contour, 0, 0);
     try std.testing.expectEqual(@as(usize, 24), out.items.len);
@@ -1572,20 +1840,20 @@ test "earclipFill 40-point burst star fills completely" {
         verts[i * 2 + 1] = 32.0 + std.math.sin(angle) * radius;
     }
     const contour = Contour{ .vertices = &verts, .closed = true };
-    var scratch = std.ArrayList(TPoint){};
+    var scratch = @as(std.ArrayList(TPoint), .empty);
     defer scratch.deinit(alloc);
-    var out = std.ArrayList(PathVertex){};
+    var out = @as(std.ArrayList(PathVertex), .empty);
     defer out.deinit(alloc);
     try earclipFill(alloc, &scratch, &out, contour, 0, 0);
-    // n=40 简单多边形完整三角化 = (n-2)*3 = 114 顶点
+    // n=40 simple polygon full triangulation = (n-2)*3 = 114 vertices.
     try std.testing.expectEqual(@as(usize, 114), out.items.len);
 }
 
 test "earclipFill rejects non-finite and oversized contours" {
     const alloc = std.testing.allocator;
-    var scratch = std.ArrayList(TPoint){};
+    var scratch = @as(std.ArrayList(TPoint), .empty);
     defer scratch.deinit(alloc);
-    var out = std.ArrayList(PathVertex){};
+    var out = @as(std.ArrayList(PathVertex), .empty);
     defer out.deinit(alloc);
 
     var invalid = [_]f32{ 0, 0, std.math.nan(f32), 1, 1, 0 };
@@ -1611,13 +1879,13 @@ test "canCoalesce merges only contiguous same-clip triangles calls" {
     const t2 = DrawCall{ .vertex_start = 42, .vertex_count = 6, .color = .{ 0, 0, 1, 1 }, .rect_clip = clip_b };
     const p0 = DrawCall{ .mode = .polygon_fill, .vertex_start = 42, .vertex_count = 6, .color = .{ 0, 0, 1, 1 }, .rect_clip = clip_a };
 
-    // 不同色但同 clip、区间连续 -> 可合并（颜色 per-vertex）
+    // Different colors but same clip, continuous range -> mergeable (per-vertex color).
     try std.testing.expect(canCoalesce(t0, t0.vertex_count, t1));
-    // 合并 t0+t1 后与 t2：clip 不同 -> 不可合并
+    // Merge t0+t1 then compare to t2: different clip -> not mergeable.
     try std.testing.expect(!canCoalesce(t0, t0.vertex_count + t1.vertex_count, t2));
-    // polygon_fill 永不参与合并
+    // polygon_fill never participates in merge.
     try std.testing.expect(!canCoalesce(t0, t0.vertex_count + t1.vertex_count, p0));
-    // 区间不连续 -> 不可合并
+    // Discontinuous range -> not mergeable.
     try std.testing.expect(!canCoalesce(t0, t0.vertex_count, t2));
 }
 
@@ -1633,11 +1901,11 @@ test "buildStrokeExpand open contour does not add implicit closing edge" {
     const open_contour = Contour{ .vertices = &open_verts, .closed = false };
     const closed_contour = Contour{ .vertices = &closed_verts, .closed = true };
 
-    var open_out = std.ArrayList(PathVertex){};
+    var open_out = @as(std.ArrayList(PathVertex), .empty);
     defer open_out.deinit(alloc);
     try buildStrokeExpand(alloc, &open_out, open_contour, 0, 0, 2.0, 1.0, .miter);
 
-    var closed_out = std.ArrayList(PathVertex){};
+    var closed_out = @as(std.ArrayList(PathVertex), .empty);
     defer closed_out.deinit(alloc);
     try buildStrokeExpand(alloc, &closed_out, closed_contour, 0, 0, 2.0, 1.0, .miter);
 
@@ -1653,11 +1921,11 @@ test "buildStrokeExpand miter join stays near bevel bounds for star contour" {
     };
     const contour = Contour{ .vertices = &star_verts, .closed = true };
 
-    var bevel_out = std.ArrayList(PathVertex){};
+    var bevel_out = @as(std.ArrayList(PathVertex), .empty);
     defer bevel_out.deinit(alloc);
     try buildStrokeExpand(alloc, &bevel_out, contour, 0, 0, 3.0, 1.0, .bevel);
 
-    var miter_out = std.ArrayList(PathVertex){};
+    var miter_out = @as(std.ArrayList(PathVertex), .empty);
     defer miter_out.deinit(alloc);
     try buildStrokeExpand(alloc, &miter_out, contour, 0, 0, 3.0, 1.0, .miter);
 
@@ -1707,8 +1975,8 @@ test "Phase C mesh cache: store → 平移回填命中 → TTL 逐出" {
         .vertex_buffer = null,
         .vertex_buffer_capacity = 0,
         .buffer_write_offset = 0,
-        .vertices = .{},
-        .draw_calls = .{},
+        .vertices = .empty,
+        .draw_calls = .empty,
         .viewport_width = 800,
         .viewport_height = 600,
         .scale_factor = 1.0,
@@ -1722,17 +1990,17 @@ test "Phase C mesh cache: store → 平移回填命中 → TTL 逐出" {
         r.draw_calls.deinit(alloc);
     }
 
-    // 未命中
+    // No hit.
     try std.testing.expect(!try r.appendCachedMesh(42, .{ 1, 1, 1, 1 }, 0, 0));
 
-    // 模拟 addFillPath 产出的顶点（世界坐标 = local + offset(10,20)）
+    // Simulate vertices from addFillPath (world = local + offset(10,20)).
     try r.vertices.append(alloc, .{ .x = 10, .y = 20, .alpha_scale = 1 });
     try r.vertices.append(alloc, .{ .x = 15, .y = 26, .alpha_scale = 1 });
     try r.vertices.append(alloc, .{ .x = 12, .y = 30, .alpha_scale = 0 });
     r.storeMesh(42, 0, 3, 10, 20);
     try std.testing.expectEqual(@as(usize, 3), r.mesh_cache_vertex_total);
 
-    // 命中：新 offset (100,200) 平移回填 + 补色 + 记 draw call
+    // Hit: new offset (100,200) translates fill result + adds color + records draw call.
     r.vertices.clearRetainingCapacity();
     r.draw_calls.clearRetainingCapacity();
     try std.testing.expect(try r.appendCachedMesh(42, .{ 0.5, 0, 0, 1 }, 100, 200));
@@ -1745,7 +2013,7 @@ test "Phase C mesh cache: store → 平移回填命中 → TTL 逐出" {
     try std.testing.expectEqual(@as(usize, 1), r.draw_calls.items.len);
     try std.testing.expectEqual(DrawMode.triangles, r.draw_calls.items[0].mode);
 
-    // TTL 逐出：last_used=0，360 帧（120 的倍数触发 sweep）时 0+240 < 360 -> 移除
+    // TTL eviction: last_used=0, at frame 360 (120 multiple triggers sweep) 0+240 < 360 -> remove.
     r.setFrame(360);
     try std.testing.expect(!try r.appendCachedMesh(42, .{ 1, 1, 1, 1 }, 0, 0));
     try std.testing.expectEqual(@as(usize, 0), r.mesh_cache_vertex_total);
@@ -1755,20 +2023,20 @@ test "vertex buffer 收缩判据：连续低水位在精确帧边界触发" {
     var p = ShrinkPolicy{};
     const cap: usize = 8 * 1024 * 1024;
 
-    // 高水位（用量 ≥ cap/4）：永不触发
+    // High watermark (usage >= cap/4): never triggers.
     var i: u32 = 0;
     while (i < SHRINK_FRAMES * 2) : (i += 1) {
         try std.testing.expect(!p.noteFrame(cap / 2, cap));
     }
 
-    // 低水位 SHRINK_FRAMES-1 帧：未达阈值不收缩
+    // Low watermark SHRINK_FRAMES-1 frames: not enough for shrink threshold.
     i = 0;
     while (i < SHRINK_FRAMES - 1) : (i += 1) {
         try std.testing.expect(!p.noteFrame(cap / SHRINK_DIVISOR - 1, cap));
     }
-    // 恰第 SHRINK_FRAMES 帧：收缩
+    // Exactly frame SHRINK_FRAMES: shrink triggered.
     try std.testing.expect(p.noteFrame(cap / SHRINK_DIVISOR - 1, cap));
-    // 触发后计数清零：下一帧不会再次收缩
+    // Count resets after trigger: no re-shrink next frame.
     try std.testing.expect(!p.noteFrame(0, cap));
 }
 
@@ -1778,9 +2046,9 @@ test "vertex buffer 收缩判据：中途一帧回到高水位即重置计数（
 
     var i: u32 = 0;
     while (i < SHRINK_FRAMES - 1) : (i += 1) _ = p.noteFrame(0, cap);
-    // 差一帧到阈值时插入一帧高用量（恰好 cap/4 也算高）-> 重置
+    // One frame before threshold, insert high usage frame (cap/4 counts as high) -> counter resets.
     try std.testing.expect(!p.noteFrame(cap / SHRINK_DIVISOR, cap));
-    // 重新数满整个窗口才触发
+    // Refill entire window before trigger again.
     i = 0;
     while (i < SHRINK_FRAMES - 1) : (i += 1) {
         try std.testing.expect(!p.noteFrame(0, cap));
@@ -1797,7 +2065,7 @@ test "vertex buffer 收缩判据：小容量不收缩" {
 }
 
 test "retired buffer 延迟释放：满 in-flight 窗口才可 destroy" {
-    // retire 于帧 10：帧 10/11/12 仍可能在飞，帧 13 起才安全
+    // Retire at frame 10: frames 10/11/12 may still be in-flight, frame 13+ safe.
     try std.testing.expect(!retiredBufferReady(10, 10));
     try std.testing.expect(!retiredBufferReady(10, 11));
     try std.testing.expect(!retiredBufferReady(10, 12));
@@ -1805,10 +2073,10 @@ test "retired buffer 延迟释放：满 in-flight 窗口才可 destroy" {
 }
 
 test "vertex buffer 高水位收缩：beginFrame 序列驱动 retire → 延迟 destroy" {
-    // 需要真实 createBuffer/destroy 与 stats 计数，只在 Null 后端下可确定性
-    // 运行（Metal 下要真设备，那是 test-metal 的领域）。
-    // 实跑：`zig build test-render -Dgpu-backend=null`。
-    // SKIP-REASON: 只在 -Dgpu-backend=null 下有意义（Metal 后端跑的是真实管线）
+    // Needs real createBuffer/destroy and stats counting, only deterministic with Null backend
+    // (Metal needs real device, that's test-metal's domain).
+    // Run: `zig build test-render -Dgpu-backend=null`.
+    // SKIP-REASON: only meaningful with -Dgpu-backend=null (Metal backend runs real pipeline).
     if (comptime gpu.backend_kind != .null_backend) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
@@ -1820,8 +2088,8 @@ test "vertex buffer 高水位收缩：beginFrame 序列驱动 retire → 延迟 
         .vertex_buffer = null,
         .vertex_buffer_capacity = 0,
         .buffer_write_offset = 0,
-        .vertices = .{},
-        .draw_calls = .{},
+        .vertices = .empty,
+        .draw_calls = .empty,
         .viewport_width = 800,
         .viewport_height = 600,
         .scale_factor = 1.0,
@@ -1837,50 +2105,51 @@ test "vertex buffer 高水位收缩：beginFrame 序列驱动 retire → 延迟 
 
     const destroyed_base = gpu.Backend.stats.buffers_destroyed;
 
-    // 增长到高水位（> SHRINK_MIN_CAPACITY）
+    // Grow to high watermark (> SHRINK_MIN_CAPACITY).
     try r.ensureVertexBufferCapacity(2 * 1024 * 1024);
     try std.testing.expect(r.vertex_buffer_capacity >= 2 * 1024 * 1024);
 
-    // 扩容路径也走延迟释放：再扩一档，旧 buffer 进 retired 队列而非同步 destroy
+    // Grow path also uses delayed release: expand one tier, old buffer enters retired queue (not
+    // sync destroy).
     try r.ensureVertexBufferCapacity(4 * 1024 * 1024);
     try std.testing.expectEqual(@as(usize, 1), r.retired_buffers.items.len);
     try std.testing.expectEqual(destroyed_base, gpu.Backend.stats.buffers_destroyed);
 
-    // 连续低水位 SHRINK_FRAMES-1 帧：不收缩
+    // Sustained low watermark SHRINK_FRAMES-1 frames: no shrink.
     var i: u32 = 0;
     while (i < SHRINK_FRAMES - 1) : (i += 1) {
-        r.buffer_write_offset = 1024; // 模拟上一帧仅用 1KiB « cap/4
+        r.buffer_write_offset = 1024; // Simulate last frame used only 1 KiB << cap/4.
         r.beginFrame(800, 600, 1.0);
-        // 峰值 buffer 仍停在某个槽位里（轮转不丢 buffer）
+        // Peak buffer still parked in some slot (rotation doesn't discard buffers).
         try std.testing.expectEqual(@as(usize, 1), r.liveSlotBufferCount());
     }
-    // 前面扩容 retire 的旧 buffer 此时早已 drain（3 帧后）
+    // Old buffer from earlier grow-retire has drained by now (3 frames later).
     try std.testing.expectEqual(destroyed_base + 1, gpu.Backend.stats.buffers_destroyed);
 
-    // 恰第 SHRINK_FRAMES 帧：收缩发生，buffer 摘除进 retired，容量归零
+    // Exactly frame SHRINK_FRAMES: shrink occurs, buffer removed and enters retired, capacity zero.
     r.buffer_write_offset = 1024;
     r.beginFrame(800, 600, 1.0);
     try std.testing.expectEqual(@as(usize, 0), r.liveSlotBufferCount());
     try std.testing.expectEqual(@as(usize, 0), r.peakSlotCapacity());
     try std.testing.expectEqual(@as(usize, 1), r.retired_buffers.items.len);
-    // 收缩帧当帧不 destroy（可能仍在飞）
+    // Shrink frame itself doesn't destroy (may still be in-flight).
     try std.testing.expectEqual(destroyed_base + 1, gpu.Backend.stats.buffers_destroyed);
 
-    // 再过 2 帧仍不 destroy（in-flight 窗口 = 3）
+    // Still not destroyed 2 frames later (in-flight window = 3).
     r.beginFrame(800, 600, 1.0);
     r.beginFrame(800, 600, 1.0);
     try std.testing.expectEqual(destroyed_base + 1, gpu.Backend.stats.buffers_destroyed);
 
-    // 第 3 帧：drain 真正释放
+    // Frame 3: drain finally releases.
     r.beginFrame(800, 600, 1.0);
     try std.testing.expectEqual(destroyed_base + 2, gpu.Backend.stats.buffers_destroyed);
     try std.testing.expectEqual(@as(usize, 0), r.retired_buffers.items.len);
 }
 
 test "顶点 buffer 按帧槽位轮转：在飞窗口内相邻帧不共用同一块 buffer" {
-    // 回归：单 buffer + 每帧 write offset 归零时，第 N+1 帧 memcpy 覆写 GPU
-    // 尚在消费的第 N 帧顶点。
-    // SKIP-REASON: 需要 Null 后端确定性 createBuffer（Metal 下是 test-metal 的领域）
+    // Regression: single buffer + reset write offset each frame means frame N+1 memcpy overwrites
+    // GPU still-consuming frame N vertices.
+    // SKIP-REASON: needs Null backend determinism (Metal is test-metal's domain).
     if (comptime gpu.backend_kind != .null_backend) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
@@ -1892,8 +2161,8 @@ test "顶点 buffer 按帧槽位轮转：在飞窗口内相邻帧不共用同一
         .vertex_buffer = null,
         .vertex_buffer_capacity = 0,
         .buffer_write_offset = 0,
-        .vertices = .{},
-        .draw_calls = .{},
+        .vertices = .empty,
+        .draw_calls = .empty,
         .viewport_width = 800,
         .viewport_height = 600,
         .scale_factor = 1.0,
@@ -1914,12 +2183,97 @@ test "顶点 buffer 按帧槽位轮转：在飞窗口内相邻帧不共用同一
         slot.* = (try r.vertex_buffer.?.getMappedRange(0, 1)).ptr;
         r.buffer_write_offset = 4096;
     }
-    // 任意 BUFFER_MAX_FRAMES_IN_FLIGHT 个连续帧的 buffer 两两不同
+    // Any BUFFER_MAX_FRAMES_IN_FLIGHT consecutive frames use distinct buffers.
     for (0..seen.len) |i| {
         for (i + 1..@min(seen.len, i + BUFFER_MAX_FRAMES_IN_FLIGHT)) |j| {
             try std.testing.expect(seen[i] != seen[j]);
         }
     }
-    // 轮满一圈后复用（不是每帧新建）
+    // After full cycle reuse (not new per frame).
     try std.testing.expectEqual(seen[0], seen[BUFFER_MAX_FRAMES_IN_FLIGHT]);
+}
+
+test {
+    _ = path_fill_rule;
+}
+
+test "multi-contour fill: bridged hole is triangulated with the hole left uncovered" {
+    const allocator = std.testing.allocator;
+    const outer = [_]TPoint{ .{ .x = 0, .y = 0 }, .{ .x = 10, .y = 0 }, .{ .x = 10, .y = 10 }, .{ .x = 0, .y = 10 } };
+    const hole = [_]TPoint{ .{ .x = 3, .y = 7 }, .{ .x = 7, .y = 7 }, .{ .x = 7, .y = 3 }, .{ .x = 3, .y = 3 } };
+    var ring: std.ArrayList(TPoint) = .empty;
+    defer ring.deinit(allocator);
+    _ = try path_fill_rule.bridgeHoles(allocator, &ring, &outer, &.{&hole});
+    var tris: std.ArrayList(PathVertex) = .empty;
+    defer tris.deinit(allocator);
+    try earclipRing(allocator, &ring, &tris);
+    var area: f32 = 0;
+    var covers_hole = false;
+    var covers_solid = false;
+    var i: usize = 0;
+    while (i + 2 < tris.items.len) : (i += 3) {
+        const a = TPoint{ .x = tris.items[i].x, .y = tris.items[i].y };
+        const b = TPoint{ .x = tris.items[i + 1].x, .y = tris.items[i + 1].y };
+        const c = TPoint{ .x = tris.items[i + 2].x, .y = tris.items[i + 2].y };
+        area += @abs(triangleCross(a, b, c)) / 2;
+        covers_hole = covers_hole or pointInTriangle(.{ .x = 5, .y = 5 }, a, b, c);
+        covers_solid = covers_solid or pointInTriangle(.{ .x = 1.5, .y = 5.2 }, a, b, c);
+    }
+    try std.testing.expectApproxEqAbs(@as(f32, 100 - 16), area, 1e-3);
+    try std.testing.expect(!covers_hole);
+    try std.testing.expect(covers_solid);
+}
+
+test "splitAtGradientStops makes per-vertex colour exact across a middle stop" {
+    const allocator = std.testing.allocator;
+    const stops = [_]FillGradient.GradientStopIn{
+        .{ .color = .{ 1, 0, 0, 1 }, .position = 0 },
+        .{ .color = .{ 0, 1, 0, 1 }, .position = 0.5 },
+        .{ .color = .{ 0, 0, 1, 1 }, .position = 1 },
+    };
+    const g = FillGradient{ .dir = 2, .stops = &stops };
+    var verts: std.ArrayList(PathVertex) = .empty;
+    defer verts.deinit(allocator);
+    const square = [_][2]f32{ .{ 0, 0 }, .{ 80, 0 }, .{ 80, 80 }, .{ 0, 0 }, .{ 80, 80 }, .{ 0, 80 } };
+    for (square) |p| try verts.append(allocator, .{ .x = p[0], .y = p[1], .alpha_scale = 1 });
+    const bounds = [4]f32{ 0, 0, 80, 80 };
+    try splitAtGradientStops(allocator, &verts, 0, g, bounds);
+    for (verts.items) |*v| v.color = g.colorAt(g.tAt(v.x / 80, v.y / 80));
+    // Interpolate at the middle (40, 30) inside whichever piece contains it.
+    const p = TPoint{ .x = 40, .y = 30 };
+    var found = false;
+    var i: usize = 0;
+    while (i + 2 < verts.items.len) : (i += 3) {
+        const a = verts.items[i];
+        const b = verts.items[i + 1];
+        const c = verts.items[i + 2];
+        const den = (b.y - c.y) * (a.x - c.x) + (c.x - b.x) * (a.y - c.y);
+        if (@abs(den) < 1e-6) continue;
+        const wa = ((b.y - c.y) * (p.x - c.x) + (c.x - b.x) * (p.y - c.y)) / den;
+        const wb = ((c.y - a.y) * (p.x - c.x) + (a.x - c.x) * (p.y - c.y)) / den;
+        const wc = 1 - wa - wb;
+        if (wa < -1e-4 or wb < -1e-4 or wc < -1e-4) continue;
+        for (0..3) |ch| try std.testing.expectApproxEqAbs(@as(f32, if (ch == 1) 1 else 0), wa * a.color[ch] + wb * b.color[ch] + wc * c.color[ch], 1e-3);
+        found = true;
+        break;
+    }
+    try std.testing.expect(found);
+}
+
+test "buildAaFringe puts the fringe outside the fill for either contour orientation" {
+    const allocator = std.testing.allocator;
+    var ccw = [_]f32{ 0, 0, 10, 0, 10, 10, 0, 10 };
+    var cw = [_]f32{ 0, 0, 0, 10, 10, 10, 10, 0 };
+    for ([_][]f32{ &ccw, &cw }) |pts| {
+        var out: std.ArrayList(PathVertex) = .empty;
+        defer out.deinit(allocator);
+        try buildAaFringe(allocator, &out, .{ .vertices = pts, .closed = true }, 0, 0, 1);
+        try std.testing.expect(out.items.len > 0);
+        for (out.items) |v| {
+            if (v.alpha_scale != 0) continue;
+            // Strictly outside the square (an inward fringe vertex sits on or
+            // inside its boundary).
+            try std.testing.expect(v.x < 0 or v.x > 10 or v.y < 0 or v.y > 10);
+        }
+    }
 }

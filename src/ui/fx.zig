@@ -1,10 +1,10 @@
-/// fx, zenit 动画 / 物理 / 过渡
+/// fx: zenit animations / physics / transitions
 ///
-/// 把动画、弹性物理、视图过渡（VTAPI-style snapshot transition）、router 这类
-/// "运动 / 过渡领域" 的功能集中到一个子命名空间，与组件库（widgets）和核心
-/// （ui）分开。
+/// Consolidates animations, elastic physics, view transitions (VTAPI-style snapshot transitions),
+/// router and similar motion functionality into one namespace, separate from the component
+/// library (widgets) and core (ui).
 ///
-/// 用法：
+/// Usage:
 /// ```zig
 /// const ui = @import("ui");
 ///
@@ -16,16 +16,24 @@ const animation_mod = @import("animation/mod.zig");
 const physics_mod = @import("physics.zig");
 const snapshot_transition_mod = @import("snapshot_transition.zig");
 const timeline_profiler_mod = @import("timeline_profiler.zig");
+
+// Tests in const-referenced files aren't collected (orphan test scanner caught
+// router / snapshot_transition / timeline_profiler tests never executed)
+test {
+    _ = router_mod;
+    _ = snapshot_transition_mod;
+    _ = timeline_profiler_mod;
+}
 const router_mod = @import("router.zig");
 
-// 子模块直通
+// Submodule pass-through
 pub const animation = animation_mod;
 pub const physics = physics_mod;
 pub const snapshot_transition = snapshot_transition_mod;
 pub const timeline_profiler = timeline_profiler_mod;
 pub const router = router_mod;
 
-// ── 动画原语 ──
+// -- Animation primitives --
 pub const Tween = animation_mod.Tween;
 pub const Spring = animation_mod.Spring;
 pub const AnimatedValue = animation_mod.AnimatedValue;
@@ -37,15 +45,15 @@ pub const Timeline = animation_mod.Timeline;
 pub const Position = animation_mod.Position;
 pub const Easing = animation_mod.Easing;
 
-// ── 物理 ──
+// -- Physics --
 pub const RubberBand = physics_mod.RubberBand;
 pub const FadeIndicator = physics_mod.FadeIndicator;
 
-// ── 视图过渡（snapshot-based view transitions）──
+// -- View transitions (snapshot-based view transitions) --
 pub const Transition = snapshot_transition_mod.Transition;
 pub const SnapshotTransition = snapshot_transition_mod.SnapshotTransition;
 
-// ── 时间线分析 ──
+// -- Timeline analysis --
 pub const TimelineProfiler = timeline_profiler_mod.TimelineProfiler;
 
 // ── Router ──

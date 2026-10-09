@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
-# IME 真机验证 —— 真输入法（拼音/日文）走完整 NSTextInputClient 路径：
-#   CGEvent 键盘事件 → 输入法 preedit(setMarkedText) → 空格选字 →
-#   insertText commit → Input 文档。
+# IME real-device verification: true input methods (Pinyin/Japanese) traverse the full
+# NSTextInputClient path:
+#   CGEvent keyboard -> input method preedit(setMarkedText) -> space selects candidate ->
+#   insertText commit -> Input document.
 #
-# 与 e2e 注入的差别：这里的 marked text / candidate 窗口 / commit 全部来自
-# **真实系统输入法**（含本轮 replacementRange 改动的回归面）。
-# 聚焦与回读走 storybook test harness 的文件 RPC（真实 hit-test + 文档
-# 状态直读），只有打字这一步是全局 CGEvent —— 免去像素猜测。
+# Unlike e2e injection, marked text / candidate window / commit all come from the
+# **real system input method** (covers replacementRange behavior).
+# The storybook test harness focuses/reads back via file RPC (real hit-test + direct
+# doc state read); only typing uses global CGEvent, avoiding pixel guessing.
 #
-# 前置条件：GUI 会话 + 辅助功能权限 + 已启用 简体拼音 或 日文罗马字。
-# 副作用：抢占键盘焦点约 8 秒；结束恢复原输入法。运行期间别碰键盘。
-# 用法：bash scripts/verify_ime.sh
+# Prerequisites: GUI session + accessibility permission + Simplified Pinyin or
+# Japanese Romaji enabled.
+# Side effects: seizes keyboard focus ~8s; input method restored at end. Don't touch
+# the keyboard during the run.
+# Usage: bash scripts/verify_ime.sh
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
@@ -76,9 +79,9 @@ for a in CommandLine.arguments.dropFirst() {
 }
 EOF
 
-# ---- storybook test-harness 文件 RPC ----
+# ---- storybook test-harness file RPC ----
 RPC_SEQ=0
-rpc() { # $1 = path, $2 = body json（内层）, $3 = method（默认 POST；/health 是 GET）
+rpc() { # $1 = path, $2 = body json (inner), $3 = method (default POST; /health is GET)
   RPC_SEQ=$((RPC_SEQ+1))
   local id="ime$RPC_SEQ"
   python3 - "$RPCDIR" "$id" "$1" "$2" "${3:-POST}" <<'PYEOF'
@@ -102,8 +105,9 @@ echo "==> 输入法盘点"
 ORIG_SOURCE=$(swift "$TIS_HELPER" current)
 echo "    当前：${ORIG_SOURCE}（结束后恢复）"
 IME_ID=""; EXPECT=""
-# 优先日文罗马字：该输入法 ID 本身钉死平假名模式，没有拼音那种跨会话持久的
-# 中/英切换态（实测拼音会英文直通且合成 Shift 切不动它）。
+# prefer Japanese Romaji: that input method ID is pinned to Hiragana mode, no cross-session
+# persistent EN/JP toggle like Pinyin (empirical: Pinyin pass-through English and compose Shift
+# can't toggle it).
 if swift "$TIS_HELPER" list | grep -q "com.apple.inputmethod.Kotoeri.RomajiTyping.Japanese"; then
   IME_ID="com.apple.inputmethod.Kotoeri.RomajiTyping.Japanese"; EXPECT="日本語|にほんご" # nihongo + 回车（Kotoeri live conversion 提交汉字，老版本提交假名）
 elif swift "$TIS_HELPER" list | grep -q "com.apple.inputmethod.SCIM.ITABC"; then
@@ -139,14 +143,14 @@ osascript -e 'tell application "System Events" to tell process "storybook" to se
 swift "$TIS_HELPER" select "$IME_ID"
 sleep 0.8
 
-type_and_read() { # 输出 input_state json
+type_and_read() { # output input_state json
   if [ "$IME_ID" = "com.apple.inputmethod.Kotoeri.RomajiTyping.Japanese" ]; then
-    # n i h o n g o = 45 34 4 31 45 5 31；回车 36 原样提交平假名
+    # nihongo = 45 34 4 31 45 5 31; return 36 commits hiragana as-is
     swift "$KEY_HELPER" 45 34 4 31 45 5 31
     sleep 0.8
     swift "$KEY_HELPER" 36
   else
-    # n i h a o = 45 34 4 0 31；空格 49 选首候选提交
+    # nihao = 45 34 4 0 31; space 49 selects first candidate to commit
     swift "$KEY_HELPER" 45 34 4 0 31
     sleep 0.8
     swift "$KEY_HELPER" 49
@@ -157,9 +161,10 @@ type_and_read() { # 输出 input_state json
 
 STATE=$(type_and_read)
 if echo "$STATE" | grep -q '"buffer":"nihao' ; then
-  # 拼音处于英文模式（中/英状态跨会话持久）：单击 Shift 切中文，清空重试一次
+  # Pinyin is in English mode (CN/EN state persists across sessions): press Shift to switch to
+  # Chinese, clear and retry once
   echo "    检测到英文直通（buffer=nihao ），Shift 切中文模式后重试"
-  swift "$KEY_HELPER" cmd+0 51   # Cmd+A + Delete 清空
+  swift "$KEY_HELPER" cmd+0 51 # Cmd+A + Delete to clear
   sleep 0.3
   swift "$KEY_HELPER" shift
   sleep 0.5

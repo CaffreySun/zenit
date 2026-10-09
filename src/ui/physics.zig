@@ -1,28 +1,26 @@
-/// Physics Primitives - 可复用的物理原语
+/// Physics primitives, reusable by any component (extracted from ScrollArea).
 ///
-/// 从 ScrollArea 提取的物理模块，任何组件可以复用。
-///
-/// 模块:
-/// - RubberBand: Apple UIScrollView 级橡皮筋阻尼
-/// - FadeIndicator: 自动淡入淡出指示器 (如滚动条)
+/// Modules:
+/// - RubberBand: Apple UIScrollView-class rubber band damping
+/// - FadeIndicator: auto fade in/out indicator (e.g., scrollbar)
 const std = @import("std");
 
-/// Apple UIScrollView 级橡皮筋阻尼
+/// Apple UIScrollView-level rubber band damping
 ///
-/// 有理函数: f(x) = x*d*c / (d + c*x)
-/// - 小位移近乎线性 (手感灵敏)
-/// - 大位移渐近于 d (平滑衰减)
+/// Rational function: f(x) = x*d*c / (d + c*x)
+/// - Small displacement near-linear (responsive feel)
+/// - Large displacement approaches d (smooth decay)
 ///
-/// 用法:
+/// Usage:
 /// ```zig
 /// const rb = RubberBand{};
 /// const visual = rb.clamp(raw_overscroll, viewport_size);
 /// ```
 pub const RubberBand = struct {
-    /// 阻尼系数 (Apple 标准 = 0.55)
+    /// Damping coefficient (Apple standard = 0.55).
     coefficient: f32 = 0.55,
 
-    /// 将原始输入距离映射为视觉距离 (阻尼后)
+    /// Map raw input distance to visual distance (damped).
     pub fn clamp(self: RubberBand, input: f32, dimension: f32) f32 {
         const c = self.coefficient;
         const d = @max(dimension, 1.0);
@@ -31,56 +29,57 @@ pub const RubberBand = struct {
         return if (input < 0) -clamped else clamped;
     }
 
-    /// clamp 的精确反函数: 从视觉值恢复原始距离
+    /// Precise inverse of clamp: recover raw distance from visual value.
     pub fn unclamp(self: RubberBand, visual: f32, dimension: f32) f32 {
         const c = self.coefficient;
         const d = @max(dimension, 1.0);
         const abs_v = @abs(visual);
         if (abs_v == 0) return 0;
-        // 有理函数渐近线为 d，限制在 d*0.999 以内避免除零
+        // Rational function asymptotes to d; clamp to d*0.999 to avoid division by
+        // zero.
         const max_visual = d * 0.999;
         const safe = @min(abs_v, max_visual);
         const denom = c * d - c * safe;
-        // 分母过小时返回相对于 dimension 的合理大值
+        // Small denominator returns reasonable large value relative to dimension.
         const saturated = d * 100;
         if (denom < 1e-6) return if (visual < 0) -saturated else saturated;
         const raw = safe * d / denom;
         return if (visual < 0) -raw else raw;
     }
 
-    /// iOS 风格增量更新: 反函数恢复 raw -> 加 delta -> 重新映射
+    /// iOS-style incremental update: inverse recovers raw -> add delta -> remap.
     pub fn applyDelta(self: RubberBand, current_bonus: f32, raw_delta: f32, dimension: f32) f32 {
         const raw = self.unclamp(current_bonus, dimension) + raw_delta;
         return self.clamp(raw, dimension);
     }
 };
 
-/// 自动淡入淡出指示器
+/// Auto fade-in/fade-out indicator
 ///
-/// 活跃时显示，空闲一段时间后自动淡出。hover 时保持显示。
+/// Shows when active, auto-fades after idle time. Stays visible on hover.
 ///
-/// 用法:
+/// Usage:
 /// ```zig
 /// var indicator = FadeIndicator{};
-/// indicator.onActivity();   // 滚动时调用
-/// indicator.tick();         // 每帧调用
+/// indicator.onActivity();   // call on scroll
+/// indicator.tick();         // call each frame
 /// const alpha = indicator.opacity;
 /// ```
 pub const FadeIndicator = struct {
-    /// 当前不透明度 [0, 1]
+    /// Current opacity [0, 1].
     opacity: f32 = 0,
-    /// 空闲帧数计数
+    /// Idle frame count.
     idle_frames: u32 = 0,
-    /// 是否被 hover (hover 时不淡出)
+    /// Whether hovered (no fade on hover).
     hovered: bool = false,
-    /// 淡出前的延迟帧数 (默认 90 帧 ≈ 1.5s @60fps)
+    /// Delay frames before fade (default 90 frames ~ 1.5s at 60fps).
     fade_delay: u32 = 90,
-    /// 每帧淡出速度 (默认 1/36 ≈ 0.6s 完全淡出)
+    /// Fade per frame (default 1/36 ~ 0.6s to fully fade).
     fade_speed: f32 = 1.0 / 36.0,
-    /// 激活时的初始不透明度
+    /// Initial opacity when active.
     active_opacity: f32 = 0.7,
 
-    /// 标记活跃 (有滚动/交互时调用)
+    /// Mark active (call on scroll/interaction).
     pub fn onActivity(self: *FadeIndicator) void {
         self.idle_frames = 0;
         if (self.opacity < self.active_opacity) {
@@ -88,9 +87,9 @@ pub const FadeIndicator = struct {
         }
     }
 
-    /// 每帧 tick: 处理淡出逻辑
+    /// Per-frame tick: handle fade logic.
     pub fn tick(self: *FadeIndicator) void {
-        // hover 时保持 100% 不透明
+        // Stay 100% opaque on hover.
         if (self.hovered) {
             self.opacity = 1.0;
             self.idle_frames = 0;
@@ -99,20 +98,20 @@ pub const FadeIndicator = struct {
 
         if (self.opacity <= 0) return;
 
-        self.idle_frames +|= 1; // 饱和加法防溢出
+        self.idle_frames +|= 1; // Saturating add prevents overflow.
         if (self.idle_frames > self.fade_delay) {
             self.opacity -= self.fade_speed;
             if (self.opacity < 0) self.opacity = 0;
         }
     }
 
-    /// 是否可见
+    /// Whether visible.
     pub fn isVisible(self: *const FadeIndicator) bool {
         return self.opacity > 0;
     }
 };
 
-// ========== 测试 ==========
+// ========== Tests ==========
 
 test "RubberBand: clamp/unclamp round-trip" {
     const rb = RubberBand{};
@@ -129,20 +128,20 @@ test "RubberBand: asymptotic behavior" {
     const rb = RubberBand{};
     const dim: f32 = 200;
 
-    // 小输入: 有衰减但接近输入
+    // Small input: damped but close to input.
     const small = rb.clamp(10, dim);
     try std.testing.expect(small > 0);
     try std.testing.expect(small <= 10.0);
 
-    // 大输入: 渐近于 dim
+    // Large input: asymptotes to dim.
     const large = rb.clamp(10000, dim);
     try std.testing.expect(large > 0);
     try std.testing.expect(large <= dim);
 
-    // 单调递增
+    // Monotone increasing.
     try std.testing.expect(large > small);
 
-    // 负输入对称
+    // Negative input symmetric.
     const neg = rb.clamp(-50, dim);
     try std.testing.expect(neg < 0);
 }
@@ -151,7 +150,7 @@ test "RubberBand: applyDelta cumulative" {
     const rb = RubberBand{};
     const dim: f32 = 200;
 
-    // 连续越界: 阻力累积
+    // Continuous overshoot: accumulated damping.
     const first = rb.applyDelta(0, -5, dim);
     try std.testing.expect(first < 0);
 
@@ -166,7 +165,7 @@ test "RubberBand: custom coefficient" {
     const rb_standard = RubberBand{};
     const dim: f32 = 200;
 
-    // 更低系数 = 更强衰减
+    // Lower coefficient = stronger damping.
     const custom = rb.clamp(50, dim);
     const standard = rb_standard.clamp(50, dim);
     try std.testing.expect(custom < standard);
@@ -185,15 +184,15 @@ test "FadeIndicator: fade after delay" {
     var fi = FadeIndicator{};
     fi.onActivity();
 
-    // 延迟期内: 不淡出
+    // Within delay: no fade.
     for (0..90) |_| fi.tick();
     try std.testing.expectEqual(@as(f32, 0.7), fi.opacity);
 
-    // 延迟后: 开始淡出
+    // After delay: start fade.
     fi.tick();
     try std.testing.expect(fi.opacity < 0.7);
 
-    // 跑足够帧: 完全淡出
+    // Run enough frames: fully fade.
     for (0..40) |_| fi.tick();
     try std.testing.expectEqual(@as(f32, 0), fi.opacity);
     try std.testing.expect(!fi.isVisible());
@@ -207,7 +206,7 @@ test "FadeIndicator: hover suppresses fade" {
     fi.tick();
     try std.testing.expectEqual(@as(f32, 1.0), fi.opacity);
 
-    // 即使超过 delay 也不淡出
+    // Never fade even past delay on hover.
     for (0..200) |_| fi.tick();
     try std.testing.expectEqual(@as(f32, 1.0), fi.opacity);
 }
@@ -216,15 +215,15 @@ test "FadeIndicator: activity resets fade" {
     var fi = FadeIndicator{};
     fi.onActivity();
 
-    // 等到开始淡出
+    // Wait until fade starts.
     for (0..95) |_| fi.tick();
     try std.testing.expect(fi.opacity < 0.7);
 
-    // 重新活跃
+    // Become active again.
     fi.onActivity();
     try std.testing.expectEqual(@as(f32, 0.7), fi.opacity);
 
-    // 延迟重新开始计时
+    // Delay timer restarts.
     for (0..90) |_| fi.tick();
     try std.testing.expectEqual(@as(f32, 0.7), fi.opacity);
 }

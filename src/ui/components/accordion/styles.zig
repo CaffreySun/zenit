@@ -1,4 +1,5 @@
-//! Accordion 样式层，AccordionItemRecipe(variant) 与 header/body 几何合同（zenit-styling-revamp）。
+//! Accordion style layer, AccordionItemRecipe(variant) and header/body geometry contract
+//! (zenit-styling-revamp).
 const core = @import("../../core.zig");
 const theme = core.theme;
 const Color = core.Color;
@@ -19,14 +20,14 @@ pub const AccordionItemRecipe = recipe_mod.recipe(struct {
                 return switch (v) {
                     .default => .{
                         .base = .{
-                            .background = t.color.bg_secondary,
-                            .corner_radius = t.radius.xl,
+                            .background = t.tokens.color.bg_secondary,
+                            .corner_radius = t.tokens.radius.xl,
                         },
                     },
                     .outline => .{
                         .base = .{
                             .background = Color.TRANSPARENT,
-                            .border = Border{ .width = 1, .color = t.color.fg_tertiary, .radius = t.radius.xl },
+                            .border = Border{ .width = 1, .color = t.tokens.color.fg_tertiary, .radius = t.tokens.radius.xl },
                         },
                     },
                     .ghost => .{
@@ -40,10 +41,10 @@ pub const AccordionItemRecipe = recipe_mod.recipe(struct {
     };
 });
 
-// ── 具名静态样式（header / title / body / chevron 几何合同） ──
+// ── Named static styles (header / title / body / chevron geometry contract) ──
 //
-// body 左缩进 = chevron 尺寸 + header gap + header 左 padding（对齐标题起点），
-// 三个量是同一几何合同的一部分，集中声明在这里。
+// body left indent = chevron size + header gap + header left padding (aligns title start),
+// three quantities are part of same geometry contract, declared centrally here.
 
 pub const accordion_header_padding = Padding.symmetric(14, 20);
 pub const accordion_header_gap: f32 = 12;
@@ -61,11 +62,10 @@ pub fn accordionHeaderStyle(_: *const theme.ThemeTokens) core.BoxStyle {
     };
 }
 
-pub fn accordionTitleText(is_expanded: bool, t: *const theme.ThemeTokens) core.TextProps {
+pub fn accordionTitleText(is_expanded: bool, t: *const theme.ThemeTokens) core.TextStyle {
     return .{
-        .content = "",
-        .color = t.color.fg_primary,
-        .font_size = t.font_size.lg,
+        .color = t.tokens.color.fg_primary,
+        .font_size = t.tokens.font_size.lg,
         .font_weight = if (is_expanded) 600 else 500,
         .line_height = 1.538,
     };
@@ -81,7 +81,7 @@ pub fn accordionBodyStyle(_: *const theme.ThemeTokens) core.BoxStyle {
     };
 }
 
-/// hover 时 item 容器的 border 颜色（随 variant 背景调和）
+/// item container border color on hover (harmonized with variant background)
 pub fn accordionHoverBorderColor(item_bg: Color, t: *const theme.ThemeTokens) Color {
-    return Color.lerp(t.color.fg_tertiary, item_bg, 0.5);
+    return Color.lerp(t.tokens.color.fg_tertiary, item_bg, 0.5);
 }

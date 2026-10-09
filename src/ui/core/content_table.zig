@@ -1,11 +1,10 @@
-//! ContentTable, v0.9-§a NodeContent SoA, dense by ElementId
-//!
-//! 与 ElementTable 一一对应：每个 element 创建时同步 ensureSlot。
-//! v0.9 stage 1 (本提交): 双写期。Node.visuals.content 仍是 source of truth；
-//! 此表是镜像，给未来读路径切换准备。stage 3 才真删 Node 字段。
-//!
-//! TextProps 的 inline_buf 自指 slice 问题：set 路径必须 fixupAfterMove。
-//! ImageProps / IconProps 没有自指字段，普通值拷贝即可。
+//! ContentTable: NodeContent SoA, dense by ElementId.
+//! One-to-one with ElementTable: ensureSlot is synced at element creation.
+//! Currently dual-write: Node.visuals.content is still the source of truth and this table mirrors
+//! it,
+//! in preparation for switching the read path.
+//! TextProps inline_buf is a self-referential slice: the set path must fixupAfterMove.
+//! ImageProps/IconProps have no self-refs; copy values normally.
 
 const std = @import("std");
 const testing = std.testing;
@@ -17,8 +16,8 @@ pub const TextProps = types.TextProps;
 pub const ImageProps = types.ImageProps;
 pub const IconProps = types.IconProps;
 
-/// 单 element 的 content 镜像（text + media）。
-/// 与 node.zig NodeContent / NodeMedia 字段对齐。
+/// Single-element content mirror (text + media).
+/// Aligns with node.zig NodeContent / NodeMedia fields.
 pub const ContentData = struct {
     text: ?TextProps = null,
     image: ?ImageProps = null,
@@ -28,19 +27,36 @@ pub const ContentData = struct {
 pub const ContentTable = struct {
     allocator: std.mem.Allocator,
     items: std.ArrayListUnmanaged(ContentData),
+    /// Replaced owned content/spans on text change: prior frame text blob and cached commands still
+    /// borrow them (blob content lifetime until next-frame blob reset); don't release immediately;
+    /// releaseRetired frees at next-frame blob reset. Node destroy doesn't go here (node already
+    /// invisible).
+    retired_content: std.ArrayListUnmanaged([]const u8) = .empty,
+    retired_spans: std.ArrayListUnmanaged([]const types.TextSpan) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) ContentTable {
-        return .{ .allocator = allocator, .items = .{} };
+        return .{ .allocator = allocator, .items = .empty };
     }
 
     pub fn deinit(self: *ContentTable) void {
+        self.releaseRetired();
+        self.retired_content.deinit(self.allocator);
+        self.retired_spans.deinit(self.allocator);
         self.items.deinit(self.allocator);
         self.* = undefined;
     }
 
-    /// Grow items 并 re-fixup 所有现有 entry 的 inline_buf 自指 slice。
-    /// ArrayList 扩容时 entries 会 move 到新地址，旧 inline_buf slice 失效，必须
-    /// 全表重 fixup。
+    /// Release swapped-out old text (frame boundary call: prior frame's borrows now all invalid).
+    pub fn releaseRetired(self: *ContentTable) void {
+        for (self.retired_content.items) |c| self.allocator.free(c);
+        self.retired_content.clearRetainingCapacity();
+        for (self.retired_spans.items) |s| self.allocator.free(s);
+        self.retired_spans.clearRetainingCapacity();
+    }
+
+    /// Grow items and re-fixup all entry inline_buf self-refs.
+    /// ArrayList realloc moves entries to new address; old inline_buf slices invalid;
+    /// must re-fixup entire table.
     pub fn ensureSlot(self: *ContentTable, id: ElementId) !void {
         if (id.isNull()) return;
         const idx = id.index;
@@ -54,7 +70,7 @@ pub const ContentTable = struct {
         }
         const new_ptr = @intFromPtr(self.items.items.ptr);
         if (old_ptr != 0 and old_ptr != new_ptr) {
-            // 内存搬过家，所有 text inline_buf slice 失效；逐 entry re-fixup。
+            // Memory moved; all text inline_buf slices invalid; re-fixup each entry.
             for (self.items.items) |*entry| {
                 if (entry.text) |*tt| tt.fixupAfterMove();
             }
@@ -66,31 +82,34 @@ pub const ContentTable = struct {
         return self.items.items[id.index];
     }
 
-    /// 返回 TextProps 值 copy。caller 拿到 copy 后 content 仍指 ContentTable 内部
-    /// inline_buf；这是有意为之，因为 caller 通常立即读 content 不会复制 struct。
-    /// 若 caller `var t = getText().?; ... node.setText(t)`，setText 内部会再 fixup
-    /// 让 stored entry 的 inline_buf 重新自洽。
+    /// Return TextProps value copy. After caller receives copy, content still points
+    /// ContentTable internal inline_buf; intentional (caller usually reads immediately,
+    /// doesn't copy struct). If caller `var t = getText().?; ... node.setText(t)`,
+    /// setText re-fixups stored entry's inline_buf for consistency.
     pub fn getText(self: *const ContentTable, id: ElementId) ?TextProps {
         if (id.isNull() or id.index >= self.items.items.len) return null;
         return self.items.items[id.index].text;
     }
 
-    /// 写入 text；fixupAfterMove 把 inline_buf 自指 slice 重定向到新存储地址。
-    /// 用智能 fixup：仅当 content 字节内容与 inline_buf[0..inline_len] 一致时
-    /// 才视为 inline-storage 路径，重定向到 slot 的 inline_buf；否则保留外部 slice。
+    /// Write text; fixupAfterMove redirects inline_buf self-ref slice to new storage address.
+    /// Smart fixup: only if content bytes match inline_buf[0..inline_len] treat as inline-storage,
+    /// redirect to slot's inline_buf; else keep external slice.
     pub fn setText(self: *ContentTable, id: ElementId, t: ?TextProps) void {
         if (id.isNull() or id.index >= self.items.items.len) return;
         var slot = &self.items.items[id.index];
-        // 换文本时释放旧 owned 内容/spans，否则被换出的 dupe 永久泄漏。
-        // 指针守卫：caller `getText -> 改字段 -> setText` 原样写回同一块内存时不能 free。
+        // Release old owned content/spans on text change; else swapped dupe leaks permanently.
+        // Pointer guard: caller `getText -> modify field -> setText` writing back same memory can't
+        // free.
         if (slot.text) |old| {
             const new_content_ptr: ?[*]const u8 = if (t) |nt| nt.content.ptr else null;
             const new_spans_ptr: ?[*]const types.TextSpan = if (t) |nt| nt.spans.ptr else null;
+            // Retire instead of immediate release (see retired_content); fall back to immediate
+            // release if registration fails.
             if (old.owned and old.content.len > 0 and old.content.ptr != new_content_ptr) {
-                self.allocator.free(old.content);
+                self.retired_content.append(self.allocator, old.content) catch self.allocator.free(old.content);
             }
             if (old.spans_owned and old.spans.len > 0 and old.spans.ptr != new_spans_ptr) {
-                self.allocator.free(old.spans);
+                self.retired_spans.append(self.allocator, old.spans) catch self.allocator.free(old.spans);
             }
         }
         slot.text = t;
@@ -113,7 +132,7 @@ pub const ContentTable = struct {
         self.items.items[id.index].icon = ic;
     }
 
-    /// Cx.destroyElement 调；不缩容 (dense by index)。
+    /// Called by Cx.destroyElement; no shrinking (dense by index).
     pub fn clear(self: *ContentTable, id: ElementId) void {
         if (id.isNull() or id.index >= self.items.items.len) return;
         self.items.items[id.index] = .{};
@@ -196,18 +215,19 @@ test "ContentTable: setText frees replaced owned content" {
     const first = try testing.allocator.dupe(u8, "first owned content!");
     t.setText(id, .{ .content = first, .owned = true });
 
-    // 换成新 owned 内容：旧的 first 应被 setText 自动释放（泄漏由 testing.allocator 检测）
+    // Swap to new owned content: old first should auto-release via setText (leak detected by
+    // testing.allocator).
     const second = try testing.allocator.dupe(u8, "second owned content");
     t.setText(id, .{ .content = second, .owned = true });
     try testing.expectEqualStrings("second owned content", t.getText(id).?.content);
 
-    // 原样写回同一块内存：不能误 free
+    // Write back same memory unchanged: don't mistakenly free.
     var same = t.getText(id).?;
     same.color = .{ .r = 1, .g = 0, .b = 0, .a = 1 };
     t.setText(id, same);
     try testing.expectEqualStrings("second owned content", t.getText(id).?.content);
 
-    // 收尾：模拟节点销毁路径释放最后一份 owned 内容
+    // Cleanup: simulate node destroy path to release final owned content.
     if (t.getText(id)) |last| {
         if (last.owned) testing.allocator.free(last.content);
     }

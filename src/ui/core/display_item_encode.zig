@@ -1,15 +1,15 @@
 //! DisplayItem -> GpuDraw direct encoder
 //!
-//! DisplayItem -> GpuDraw 直译路径。
-//! encodeDisplayItem 把单个 DisplayItem 直接产出 GpuDraw（一对一或一对多）。
+//! encodeDisplayItem translates a single DisplayItem directly to GpuDraw (one-to-one or
+//! one-to-many).
 //!
-//! Batcher：encodeStream 顺序处理 DisplayItem 序列，输出 GpuDraw 序列；
-//! 相邻可合并的 draw（同 pipeline + 同 scissor + 同 blend + 同 layer + 兼容
-//! texture）合并为单个 batch（vbo 范围扩展，instance count++）。
+//! Batcher: encodeStream processes a DisplayItem sequence into a GpuDraw sequence; adjacent
+//! mergeable draws (same pipeline + scissor + blend + layer + compatible texture) merge into one
+//! batch (vbo range extends, instance count++).
 //!
-//! 当前实现：纯 CPU IR 转换，不真分配 GPU buffer（那是 backend 职责）。
-//! 输出 GpuDraw 的 vbo/ibo/uniforms 字段填 placeholder NONE；调用方在
-//! 真 backend encode 时填充真 buffer range。
+//! Pure CPU IR conversion; it does not allocate GPU buffers (backend responsibility). Output
+//! GpuDraw vbo/ibo/uniforms fields are placeholder NONE; the backend encode fills real buffer
+//! ranges.
 
 const std = @import("std");
 const testing = std.testing;
@@ -22,8 +22,8 @@ pub const GpuDraw = gpu_draw_mod.GpuDraw;
 pub const PipelineId = gpu_draw_mod.PipelineId;
 pub const BlendMode = gpu_draw_mod.BlendMode;
 
-/// DisplayItemKind -> PipelineId 映射。每种 kind 对应一个固定 pipeline；
-/// backend 在初始化时注册这些 pipeline 进 table，PipelineId 是 1-based。
+/// DisplayItemKind -> PipelineId mapping. Each kind maps fixed pipeline; backend registers these
+/// pipelines into table at init, PipelineId is 1-based.
 pub fn pipelineForKind(kind: DisplayItemKind) PipelineId {
     return switch (kind) {
         .none => 0,
@@ -33,11 +33,11 @@ pub fn pipelineForKind(kind: DisplayItemKind) PipelineId {
         .path => 4,
         .shadow => 5,
         .gradient => 6,
-        .control => 0, // effect/clip token 不走 GPU pipeline
+        .control => 0, // effect/clip token doesn't go through GPU pipeline
     };
 }
 
-/// 单个 DisplayItem 直译成一个 GpuDraw（不做合并；合并由 encodeStream 负责）
+/// single DisplayItem direct to one GpuDraw (no merge; merge is encodeStream's job)
 pub fn encodeOne(item: DisplayItem, layer_id_raw: u32) GpuDraw {
     return GpuDraw{
         .pipeline = pipelineForKind(item.kind),
@@ -57,8 +57,8 @@ pub fn encodeOne(item: DisplayItem, layer_id_raw: u32) GpuDraw {
     };
 }
 
-/// 批量编码：DisplayItem 序列 -> GpuDraw 序列，相邻可合并的合到 instance_count++。
-/// 返回写入 out 的 GpuDraw 数量。out 长度需 >= items.len。
+/// batch encode: DisplayItem sequence -> GpuDraw sequence, adjacent mergeable stacked into
+/// instance_count++. Returns number of GpuDraw written to out. out length needs >= items.len.
 pub fn encodeStream(
     items: []const DisplayItem,
     layer_id_raw: u32,
@@ -73,7 +73,7 @@ pub fn encodeStream(
     for (items[1..]) |item| {
         const candidate = encodeOne(item, layer_id_raw);
         if (current.canBatchWith(candidate)) {
-            // 合并：instance_count++（真实 vbo 合并由 backend encode 处理）
+            // merge: instance_count++ (real vbo merge handled by backend encode)
             current.instance_count += 1;
         } else {
             out[write] = current;
@@ -86,7 +86,7 @@ pub fn encodeStream(
     return write;
 }
 
-/// 统计：相邻可合并的连续 run 长度（用于 batcher 效果度量）。
+/// stats: adjacent mergeable consecutive run length (for batcher effectiveness measurement).
 pub fn maxBatchableRun(items: []const DisplayItem, layer_id_raw: u32) u32 {
     if (items.len == 0) return 0;
     var max_run: u32 = 1;

@@ -1,7 +1,7 @@
-/// test_harness, E2E 测试骨架
+/// test_harness, E2E test skeleton
 ///
-/// 提供 file-based RPC API 让 e2e 测试自动化 UI 交互。
-/// 通过 `zig build -Dtest-mode=true` 启用，否则编译期消除。
+/// Provides file-based RPC API for e2e test automation of UI interactions. Enable via `zig build
+/// -Dtest-mode=true`, otherwise compile-time erased.
 const std = @import("std");
 const build_options = @import("build_options");
 const ui = @import("ui");
@@ -13,10 +13,16 @@ pub const TestCommand = @import("command_queue.zig").TestCommand;
 const command_executor = @import("command_executor.zig");
 const http_server = @import("http_server.zig");
 
-var g_queue: CommandQueue = .{};
+var g_queue: CommandQueue = undefined;
 var g_thread: ?std.Thread = null;
 
-/// 注册截图回调
+/// Queried by submitted-frame capture on the same application thread that
+/// executes /frames/capture/finish. Process-wide, including secondary windows.
+pub fn frameCaptureFinished() bool {
+    return enabled and command_executor.frameCaptureFinished();
+}
+
+/// Register screenshot callback
 pub fn setScreenshotCallback(f: command_executor.CaptureScreenshotFn) void {
     if (!enabled) return;
     command_executor.setCaptureScreenshotFn(f);
@@ -38,35 +44,36 @@ pub fn setRecordingCallbacks(
 pub const FrameStatsSnapshot = command_executor.FrameStatsSnapshot;
 pub const AppRouteFn = command_executor.AppRouteFn;
 
-/// 注册宿主自定义路由（`/myapp/...` 之类）。handler 在主线程执行，
-/// 可安全读写宿主 UI 状态；返回 null = 该路径不认，harness 回 404。
+/// Register host-custom routes (`/myapp/...` etc). Handler runs on main thread, can safely
+/// read/write host UI state; return null = path not recognized, harness replies 404.
 pub fn setAppRouteHandler(f: AppRouteFn) void {
     if (!enabled) return;
     command_executor.setAppRouteFn(f);
 }
 
-/// 注册 FrameStats 查询回调（/stats 路由）
+/// Register FrameStats query callback (/stats route)
 pub fn setFrameStatsCallback(f: command_executor.GetFrameStatsFn) void {
     if (!enabled) return;
     command_executor.setGetFrameStatsFn(f);
 }
 
-/// 注册计时环清零回调（/stats/reset 路由）
+/// Register timing ring clear callback (/stats/reset route)
 pub fn setResetTimingCallback(f: command_executor.ResetTimingFn) void {
     if (!enabled) return;
     command_executor.setResetTimingFn(f);
 }
 
-/// 注册窗口 resize 回调（/resize 路由）
+/// Register window resize callback (/resize route)
 pub fn setResizeWindowCallback(f: command_executor.ResizeWindowFn) void {
     if (!enabled) return;
     command_executor.setResizeWindowFn(f);
 }
 
-/// 初始化测试线束：设置回调 + 启动 HTTP 服务器线程
-pub fn init(get_ctx_fn: command_executor.GetCtxFn, wake_fn: *const fn () void) void {
+/// Initialize test harness: set callbacks + start HTTP server thread
+pub fn init(io: std.Io, get_ctx_fn: command_executor.GetCtxFn, wake_fn: *const fn () void) void {
     if (!enabled) return;
     command_executor.setGetCtxFn(get_ctx_fn);
+    if (g_thread == null) g_queue = .{ .io = io };
     g_queue.setWakeCallback(wake_fn);
     // App.mount is invoked once per native window. The harness queue and its
     // file-RPC directory are process-global, so MultiWindowApp must keep one
@@ -84,19 +91,54 @@ pub fn init(get_ctx_fn: command_executor.GetCtxFn, wake_fn: *const fn () void) v
     std.debug.print("[test_harness] File RPC server started (port {d})\n", .{build_options.e2e_port});
 }
 
-/// 主线程每帧调用：消费并执行命令队列中的测试命令
+/// Main thread post-render each frame: per-frame tracking (track_start/track_stop) record samples
+/// here
+pub fn afterFrame() void {
+    if (!enabled) return;
+    command_executor.afterFrame();
+}
+
+/// Main thread each frame: consume and execute test commands from queue
 pub fn drainCommands() void {
     if (!enabled) return;
     command_executor.drainCommands(&g_queue);
 }
 
+/// Hosts with display-tick coalescing use this one-shot result to keep input
+/// and capture commands immediate while allowing readonly polling to stay idle.
+pub fn drainCommandsRequestFrame() bool {
+    if (!enabled) return false;
+    return command_executor.drainCommandsRequestFrame(&g_queue);
+}
+
 test {
-    // 显式引用子文件测试（本仓库 orphan 测试前科：光 @import 不进 test 块 = 从不编译）。
+    // Explicitly reference sub-file tests (this repo has orphan-test history: a bare @import
+    // outside a test block = never compiled).
     _ = @import("http_server.zig");
     _ = @import("command_queue.zig");
-    // command_executor.zig 的 2 个测试（console 序列化 / recording 状态序列化）
-    // 曾是孤儿：挂进来会让 test-harness 链接失败（经 ui->text 拉进 CoreText 的
-    // extern 符号）。已在 build.zig 给 harness_tests 补 addCoreTextBridge。
+    // command_executor.zig's 2 tests (console serialize / recording state serialize) were orphans:
+    // including breaks harness link (CoreText extern symbols via ui->text path). Added
+    // addCoreTextBridge to harness_tests in build.zig.
     _ = @import("command_executor.zig");
     _ = @import("tree_serializer.zig");
+}
+
+/// Observe successfully submitted Windows frames; never forces layout or rendering.
+pub fn observeSubmittedFrame(ctx: *ui.Cx) void {
+    if (!enabled) return;
+    command_executor.observeSubmittedFrame(ctx);
+}
+
+/// Serialize the same UI state that produced a submitted frame, without
+/// advancing layout/animation. Used by opt-in native frame archives.
+pub fn submittedTreeJson(ctx: *ui.Cx, buffer: []u8) ![]const u8 {
+    if (!enabled) return error.TestHarnessDisabled;
+    const root = ctx.root orelse return error.NoRoot;
+    return @import("tree_serializer.zig").serializeFrameTree(root, &ctx.overlay_stack, buffer);
+}
+
+pub const VisualQualityCommand = command_executor.VisualQualityCommand;
+pub fn setVisualQualityCallback(f: command_executor.VisualQualityFn) void {
+    if (!enabled) return;
+    command_executor.setVisualQualityFn(f);
 }

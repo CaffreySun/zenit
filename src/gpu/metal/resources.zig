@@ -1,8 +1,9 @@
-/// Metal 资源类型
+/// Metal resource types
 ///
-/// 定义 Buffer, Texture, TextureView, Sampler 等资源的 Metal 实现
+/// Define Buffer, Texture, TextureView, Sampler etc Metal implementation
 const gpu = @import("../gpu.zig");
 const mtl = @import("metal_bindings.zig");
+const test_support = @import("test_support.zig");
 
 // ============================================================================
 // Buffer
@@ -18,7 +19,7 @@ pub const Buffer = struct {
             return error.BufferNotMappable;
         }
 
-        // 边界检查：防止越界访问
+        // Boundary check: prevent out-of-bounds access
         if (size == 0) return error.BufferNotMapped;
         if (offset > self.size or size > self.size - offset) {
             return error.BufferNotMapped;
@@ -30,7 +31,7 @@ pub const Buffer = struct {
     }
 
     pub fn unmap(self: *Buffer) void {
-        // Metal Shared 模式不需要显式 unmap
+        // Metal Shared mode needs no explicit unmap
         _ = self;
     }
 
@@ -71,7 +72,8 @@ pub const Texture = struct {
             return error.InvalidTextureRegion;
         }
         const required = @as(usize, bytes_per_row) * @as(usize, height);
-        if (bytes_per_row == 0 or bytes.len < required) return error.InvalidTextureData;
+        if (bytes_per_row < minimumUploadRowBytes(self.format, width) or bytes.len < required)
+            return error.InvalidTextureData;
         mtl.metal_texture_replace_region_level(
             self.raw,
             x,
@@ -109,15 +111,14 @@ pub const Texture = struct {
         mtl.release(self.raw);
     }
 
-    /// 仅供测试：构造一个只有元数据、没有真实 GPU 资源的 Texture。
+    /// Test-only: build a Texture with metadata only, no real GPU resource.
     ///
-    /// 存在的理由是抽象边界：`src/render` 的簿记类测试（如 offscreen 池的
-    /// retained 语义）需要一个 Texture 值，但**不应该知道后端的字段布局**。
-    /// 从前它直接写 `.raw = undefined` 字面量，于是换后端就编译不过，这是
-    /// C1 抓出的三个抽象泄漏之一。改由后端各自提供构造器后，测试只依赖
-    /// 「能造一个指定尺寸的假纹理」这个中立能力。
+    /// `src/render` bookkeeping tests (e.g., offscreen pool retained semantics) need a Texture
+    /// value but **shouldn't know the backend field layout** (hand-written `.raw = undefined`
+    /// literals break when the backend switches). Each backend provides a constructor, so tests
+    /// depend only on the neutral capability "make a fake texture of this size".
     ///
-    /// 返回值不可用于任何真实 GPU 操作；`destroy` 亦不可调用。
+    /// The returned value is unusable for real GPU ops; `destroy` is also unusable.
     pub fn fakeForTesting(width: u32, height: u32, format: gpu.TextureFormat) Texture {
         return .{
             .raw = undefined,
@@ -138,6 +139,21 @@ pub const Texture = struct {
     }
 };
 
+/// Match Metal's physical texel/block storage (depth24_plus maps to depth32).
+/// Widen before multiplication so an invalid, oversized row cannot wrap.
+fn minimumUploadRowBytes(format: gpu.TextureFormat, width: u32) usize {
+    const w: usize = width;
+    return switch (format) {
+        .r8_unorm, .r8_snorm, .r8_uint, .r8_sint, .stencil8 => w,
+        .r16_uint, .r16_sint, .r16_float, .rg8_unorm, .rg8_snorm, .rg8_uint, .rg8_sint, .depth16_unorm => w * 2,
+        .r32_uint, .r32_sint, .r32_float, .rg16_uint, .rg16_sint, .rg16_float, .rgba8_unorm, .rgba8_unorm_srgb, .rgba8_snorm, .rgba8_uint, .rgba8_sint, .bgra8_unorm, .bgra8_unorm_srgb, .rgb10a2_unorm, .depth24_plus, .depth32_float => w * 4,
+        .rg32_uint, .rg32_sint, .rg32_float, .rgba16_uint, .rgba16_sint, .rgba16_float, .depth24_plus_stencil8, .depth32_float_stencil8 => w * 8,
+        .rgba32_uint, .rgba32_sint, .rgba32_float => w * 16,
+        .bc1_rgba_unorm, .bc1_rgba_unorm_srgb, .bc4_r_unorm, .bc4_r_snorm => ((w + 3) / 4) * 8,
+        .bc2_rgba_unorm, .bc2_rgba_unorm_srgb, .bc3_rgba_unorm, .bc3_rgba_unorm_srgb, .bc5_rg_unorm, .bc5_rg_snorm, .bc6h_rgb_ufloat, .bc6h_rgb_float, .bc7_rgba_unorm, .bc7_rgba_unorm_srgb => ((w + 3) / 4) * 16,
+    };
+}
+
 /// Non-owning texture reference suitable for command binding. It cannot destroy
 /// the underlying resource, so renderer batching cannot accidentally duplicate
 /// ownership while copying bindings.
@@ -154,9 +170,9 @@ pub const TextureBinding = struct {
         return .{ .raw = mtl.retain(self.raw) };
     }
 
-    /// 后端中立的测试构造器。`token` 只需可比较（`eql` 是渲染器唯一依赖的
-    /// 性质），各后端自行决定塞进哪个字段，测试因此不必知道具体后端表示。
-    /// 产出的 binding 不指向真实纹理，只能用于不解引用它的纯 CPU 测试。
+    /// Backend-neutral test constructor. `token` needs only comparable (renderer's only dependency
+    /// `eql`), backends choose which field; tests thus unaware of concrete representation. Produced
+    /// binding doesn't reference real texture, only for CPU-only tests not dereferencing it.
     pub fn testBinding(token: u64, width: u32, height: u32) TextureBinding {
         return .{ .raw = @ptrFromInt(token), .width = width, .height = height };
     }
@@ -180,8 +196,15 @@ pub const TextureView = struct {
 
 pub const Sampler = struct {
     raw: *mtl.MTLSamplerState,
+    testing_live_count: if (test_support.enabled) ?*usize else void = if (test_support.enabled) null else {},
 
     pub fn destroy(self: *Sampler) void {
         mtl.release(self.raw);
+        if (comptime test_support.enabled) {
+            if (self.testing_live_count) |count| {
+                count.* -= 1;
+                self.testing_live_count = null;
+            }
+        }
     }
 };

@@ -1,15 +1,15 @@
-/// OverlayStack，全局浮层管理器
+/// OverlayStack: global floating layer manager
 ///
-/// 三个框架级原语合一:
-/// 1. OverlayStack, z-index 自动分配 + 层栈管理
-/// 2. DismissLayer，统一 Escape / outside-click / focus-out 关闭
-/// 3. ExitTransition，退出动画的延迟销毁（Phase 2 实现）
+/// Three framework-level primitives in one:
+/// 1. OverlayStack, auto z-index allocation + layer stack management
+/// 2. DismissLayer, unified Escape / outside-click / focus-out close
+/// 3. ExitTransition, deferred destroy after exit animation
 ///
-/// 设计参考:
-/// - CSS Top Layer 的 FIFO 语义（后打开的在上面）
-/// - Radix DismissableLayer 的栈式关闭
-/// - GPUI 的 deferred() + anchored() + occlude() 三原语
-/// - React Stack 的 z-index 自动分配（Math.max(value, parent) + 1）
+/// Design references:
+/// - CSS Top Layer FIFO semantics (later opened, higher z)
+/// - Radix DismissableLayer stack-based closing
+/// - GPUI deferred() + anchored() + occlude() three primitives
+/// - React Stack auto z-index allocation (Math.max(value, parent) + 1)
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const core = @import("core.zig");
@@ -23,28 +23,29 @@ const NodeHandle = core.NodeHandle;
 const Scope = @import("reactive.zig").Scope;
 const overlay_transition = @import("overlay_transition.zig");
 const overlay_layer_refs = @import("overlay_layer_refs.zig");
-// Cx 拆分：Transition / TransitionController 析出到 overlay_transition.zig
-//（进度时钟 + 曲线表，可脱离层栈单测）。此处 re-export 维持
-// `overlay_stack_mod.Transition` 等既有引用路径（popover/sheet/modal 都用）。
+// Cx split: Transition / TransitionController extracted to overlay_transition.zig
+// (progress clock + curve table, testable independently). Re-export here maintains
+// existing paths like `overlay_stack_mod.Transition` (popover/sheet/modal all use).
 pub const Transition = overlay_transition.Transition;
 pub const TransitionController = overlay_transition.TransitionController;
-// 这三个原来是本文件私有 fn（无外部调用者），保持私有，不扩大 API 面。
+// These three were private fns in this file (no external callers), keep private,
+// don't expand API surface.
 const transitionAffectsOpacity = overlay_transition.transitionAffectsOpacity;
 const transitionAffectsTransform = overlay_transition.transitionAffectsTransform;
 const layerNeedsCompositedGroup = overlay_transition.layerNeedsCompositedGroup;
-// Cx 拆分：trigger/anchor 的代次化弱引用 + 存活校验析出到
-// overlay_layer_refs.zig（悬垂指针不变量在那里用测试钉住）。
-// 注意：不能 `const trackNode = overlay_layer_refs.trackNode`，同名方法挂在
-// OverlayStack 上（注入 node_registry 后写回 layer 字段），顶层再起同名别名
-// 会在 self.trackNode(...) 解析里产生遮蔽歧义。统一走命名空间访问。
+// Trigger/anchor generational weak refs + liveness checks live in overlay_layer_refs.zig
+// (dangling-pointer invariants pinned with tests there).
+// Note: don't alias `const trackNode = overlay_layer_refs.trackNode`: OverlayStack has a
+// same-name method (node_registry injected, writes back layer field), and a same-name top-level
+// alias makes `self.trackNode(...)` resolution ambiguous. Use namespaced access.
 const render_engine = @import("core/render_engine/mod.zig");
 
 fn overlayDebugEnabled() bool {
-    return std.posix.getenv("ZENIT_POPOVER_DEBUG") != null;
+    return @import("zenit_environment").has("ZENIT_POPOVER_DEBUG");
 }
 
 fn outsideClickDebugEnabled() bool {
-    return std.posix.getenv("ZENIT_DEBUG_OUTSIDE_CLICK") != null;
+    return @import("zenit_environment").has("ZENIT_DEBUG_OUTSIDE_CLICK");
 }
 
 fn nodeTestId(node: ?*Node) []const u8 {
@@ -71,44 +72,43 @@ fn logOutsideClickLayer(prefix: []const u8, layer: *const OverlayLayer, target: 
 }
 const floating = @import("compute_position.zig");
 
-// ========== 公共类型 ==========
+// ========== Public types ==========
 
-/// 层句柄（push 返回，用于后续操作）
+/// Layer handle (returned from push, used for subsequent operations)
 pub const LayerHandle = struct {
     id: u32,
     z_index: i16,
 };
 
-/// 层类型
+/// Layer kind
 pub const LayerKind = enum {
-    /// 全屏遮罩，焦点陷阱，Escape 关闭
+    /// Fullscreen modal, focus trap, Escape close
     modal,
-    /// 无遮罩，外部可交互，outside-click 关闭
+    /// No modal, external interactive, outside-click close
     non_modal,
-    /// 无交互阻断，定时消失
+    /// No interaction blocking, auto-dismiss after timeout
     toast,
 };
 
-/// 语义层级 tier，系统级 z-index manager 的基线表。
+/// Semantic tier, baseline z-index table for the system-level manager.
 ///
-/// 参考 zui Stack 的 STACKING_DEFAULT_ORDER（OVERLAY < POPOVER < DIALOG）与
-/// React Stack 的嵌套继承语义：每层实际 z = max(tier 基线 + 同 tier 内
-/// activation 序号, 嵌套父层 z + 2)。tier 决定"类别间"的恒定关系
-/// （tooltip 永远压过 toast/dialog/popover，无论打开顺序）；activation 序号
-/// 决定"同类别内"后开在上；嵌套继承保证"从弹层里再开的弹层"永远压过宿主层
-/// （modal 里开 popover：popover tier 基线 100 < dialog 1000，但继承后
-/// ≥ dialog z + 2）。
+/// Follows zui Stack STACKING_DEFAULT_ORDER (OVERLAY < POPOVER < DIALOG) and React Stack nested
+/// inheritance: actual z = max(tier baseline + same-tier activation sequence, nested parent z + 2).
+/// Tier fixes the cross-category order (tooltip always caps toast/dialog/popover regardless of open
+/// order); activation sequence orders within a category (later opens higher); nested inheritance
+/// ensures an overlay opened from within another overlay always caps its host layer (popover opened
+/// inside a modal: popover tier baseline 100 < dialog 1000, but after inheritance >= dialog z + 2).
 ///
-/// 基线间隔 ≥ 1000：同 tier 内每层占 2 个 z（barrier+content），32 层封顶
-/// 也到不了下一 tier。devtools overlay 固定 32000，恒在所有 tier 之上。
+/// Tier spacing >= 1000: each tier uses 2 z per layer (barrier+content), 32 layers max within a
+/// tier never reaches the next tier. devtools overlay is fixed at 32000, above all tiers.
 pub const StackTier = enum {
-    /// popover / menu / dropdown / select 等锚定浮层
+    /// popover / menu / dropdown / select etc anchored floaters
     overlay,
-    /// modal / sheet 等带 barrier 的对话层
+    /// modal / sheet etc barrier-based dialog layers
     dialog,
-    /// toast 通知
+    /// toast notification
     toast,
-    /// tooltip，纯提示，永远最上
+    /// tooltip, pure hint, always topmost
     tooltip,
 
     pub fn base(self: StackTier) i16 {
@@ -120,7 +120,7 @@ pub const StackTier = enum {
         };
     }
 
-    /// kind -> 默认 tier（组件不显式传 tier 时的推导）
+    /// kind -> default tier (inferred when component doesn't explicitly pass tier)
     pub fn fromKind(kind: LayerKind) StackTier {
         return switch (kind) {
             .modal => .dialog,
@@ -130,51 +130,51 @@ pub const StackTier = enum {
     }
 };
 
-/// 层状态
+/// Layer state
 pub const LayerState = enum {
     entering,
     visible,
     exiting,
 };
 
-/// 外部点击行为
+/// Outside-click behavior
 pub const OutsideClickBehavior = enum {
-    /// 不关闭
+    /// Don't close
     none,
-    /// 只通知 on_dismiss，让组件自行决定如何退场
+    /// Notify on_dismiss only, let component decide exit
     notify,
-    /// 关闭，事件继续传播
+    /// Close, event continues propagating
     close,
-    /// 关闭并消费事件
+    /// Close and consume event
     close_and_consume,
 };
 
-/// 关闭行为配置
+/// Close behavior config
 pub const DismissConfig = struct {
     outside_click: OutsideClickBehavior = .close,
     escape: bool = true,
     focus_out: bool = false,
 };
 
-/// 遮罩配置
+/// Backdrop config
 pub const BarrierConfig = union(enum) {
     none,
     color: Color,
 };
 
-/// 焦点配置
+/// Focus config
 pub const FocusConfig = struct {
     trap: bool = false,
     auto_focus: bool = true,
     restore: bool = true,
 };
 
-/// Hover 触发配置
+/// Hover trigger config
 pub const HoverConfig = struct {
     leave_delay_ms: f32 = 100,
 };
 
-/// 层配置（传给 push）
+/// Layer config (pass to push)
 pub const LayerConfig = struct {
     kind: LayerKind,
     dismiss: DismissConfig = .{},
@@ -183,27 +183,34 @@ pub const LayerConfig = struct {
     focus: FocusConfig = .{},
     barrier: BarrierConfig = .none,
     on_dismiss: ?*Signal(bool) = null,
+    /// Once set, Esc / outside-click / mutex group / consuming outside-press only call it
+    /// (request close), layer doesn't exit itself: component proposes open=false via write
+    /// pipeline,
+    /// after data source persists, component's open effect calls beginExit. Parent can thus reject
+    /// close (docs/SIGNAL_API_DESIGN.md §4.4.1).
+    on_dismiss_request: ?core.HandlerRef = null,
     trigger_node: ?*Node = null,
     group: ?[]const u8 = null,
     hover: ?HoverConfig = null,
-    /// 入场延迟（ms）：层 push/reactivate 后先按 progress=0（不可见）持有这么久，
-    /// 再开始 enter_transition。用于 hover tooltip 的 display delay，期间移开
-    /// 指针会直接退场（beginExit 从当前 enter progress 起播，0 -> 立即消失）。
-    /// 仅对 enter_transition != .none 的层生效。
+    /// Entrance delay (ms): layer held at progress=0 (invisible) for this long after
+    /// push/reactivate
+    /// before enter_transition starts. Tooltip hover display delay; pointer leave during delay
+    /// goes straight to exit (beginExit from current enter progress, 0 -> immediate vanish).
+    /// Only affects layers where enter_transition != .none.
     enter_delay_ms: f32 = 0,
     a11y: A11yProps = .{},
     barrier_blocks_hover: bool = true,
     content_hit_test_visible: bool = true,
     z_index: ?i16 = null,
-    /// 语义 tier；null = 按 kind 推导（modal->dialog / toast->toast / non_modal->overlay）。
-    /// z_index 显式覆盖时 tier 不参与计算。
+    /// Semantic tier; null = infer from kind (modal->dialog / toast->toast / non_modal->overlay).
+    /// When z_index is set explicitly, tier does not participate in the computation.
     tier: ?StackTier = null,
 };
 
 // ========== TransitionController ==========
-// 已析出到 overlay_transition.zig（头部 re-export 维持旧路径）。
+// Extracted to overlay_transition.zig (header re-export maintains old paths).
 
-/// 层实例
+/// Layer instance
 pub const OverlayLayer = struct {
     handle: LayerHandle,
     config: LayerConfig,
@@ -223,36 +230,46 @@ pub const OverlayLayer = struct {
     anchor: ?AnchorConfig = null,
     anchor_target_handle: ?NodeHandle = null,
     enter_last_content_rect: ?ComputedRect = null,
-    enter_stable_frame_count: u8 = 0,
-    /// 层已关闭但未销毁（scope 仍存活），可通过 resume() 恢复
+    /// Layer closed but not destroyed (scope still alive), resumable via resume()
     suspended: bool = false,
+    /// Which node currently holds layer accessibility semantics; invariant: null or equals
+    /// content_node.
+    /// See applyLayerSemantics.
+    a11y_owner: ?*Node = null,
+    /// Last recovered semantics from holding node (including component-applied rewrites); null
+    /// means still config.a11y initial value.
+    a11y_semantics: ?A11yProps = null,
 };
 
-/// overlay() 工厂函数的返回值
+/// Return value of overlay() factory function
 pub const OverlayResult = struct {
     handle: LayerHandle,
     barrier: ?*Node,
     content: *Node,
-    /// true = barrier 已被自动挂到 portal（cx.ensurePopoverPortalRoot()），caller 不应再
-    /// appendChild。false = 没有 barrier，或 cx.root == null 的纯单元测试场景：caller 仍需
-    /// 把返回的 overlay 节点 append 到自己的树里，这种 inline 挂载受祖先裁剪。
+    /// true = barrier auto-mounted to portal (cx.ensurePopoverPortalRoot()), caller should not
+    /// appendChild.
+    /// false = no barrier or cx.root == null unit-test scenario: caller still needs to append
+    /// returned
+    /// overlay node to own tree; inline-mounted floaters subject to ancestor clipping.
     portaled: bool = false,
 };
 
 // ========== OverlayStack ==========
 
 pub const OverlayStack = struct {
-    /// 32 -> 256（2026-08-22）：suspended 的 Tooltip/Popover 从 mount 起就
-    /// 占槽（下游编辑器实测：app chrome ~15 层 + 一个 md 编辑器 ~16 层 ≈ 32，
-    /// 第二个编辑器一挂 push 即 TooManyLayers，文件隔一个打不开）。层数随
-    /// 挂载的 UI 组件数增长而非交互深度，32 太小；彻底去限（ArrayList 化）
-    /// 与 focus scope 的同类改造一起留给后续。逐槽遍历是 null check，
-    /// 256 槽的每帧代价可忽略。
+    /// Layer capacity 256: suspended Tooltip/Popover occupy a slot from mount, so layer count grows
+    /// with mounted UI components, not interaction depth (an app chrome of ~15 layers plus two
+    /// editors
+    /// of ~16 each exceeds 32 and hits TooManyLayers). Lifting the limit entirely (ArrayList) is
+    /// deferred with the focus_scope refactor. Per-slot traversal is a null check; 256-slot
+    /// per-frame
+    /// cost is negligible.
     const MAX_LAYERS = 256;
 
-    layers: [MAX_LAYERS]?OverlayLayer = [_]?OverlayLayer{null} ** MAX_LAYERS,
-    /// hasActiveAnimations 的代际 memo：任何可能改变层状态的入口 bump
-    /// anim_gen（bumpAnimGen），查询命中同代直接返回。单线程 UI 假设。
+    layers: [MAX_LAYERS]?OverlayLayer = @as([MAX_LAYERS]?OverlayLayer, @splat(null)),
+    /// hasActiveAnimations generational memo: any entry that might change layer state bumps
+    /// anim_gen
+    /// (bumpAnimGen), same-generation query returns directly. Single-threaded UI assumption.
     anim_gen: u64 = 1,
     anim_memo_gen: u64 = 0,
     anim_memo_result: bool = false,
@@ -261,12 +278,11 @@ pub const OverlayStack = struct {
     next_z: i16 = 100,
     next_id: u32 = 1,
     next_activation_order: u64 = 1,
-    /// commitExit 时若 layer 配了 focus.restore，把 previous_focus 排到这里，
-    /// 由 Cx（持有 focus_manager）在帧内 drain。
+    /// commitExit queues previous_focus here if the layer configured focus.restore; Cx (holding
+    /// focus_manager) drains it during the frame.
     ///
-    /// 为什么要绕这一道：OverlayStack 拿不到 cx，而恢复焦点必须走
-    /// focus_manager。此前 previous_focus **写了但全仓无人读**,
-    /// 于是关闭 Modal/Sheet 后焦点直接丢失而不是回到触发它的控件。
+    /// Why: OverlayStack can't access cx, and focus restoration needs focus_manager. Without the
+    /// drain, closing Modal/Sheet loses focus instead of returning to the trigger.
     pending_focus_restore: ?NodeHandle = null,
     node_registry: ?*core.NodeRegistry = null,
 
@@ -278,11 +294,11 @@ pub const OverlayStack = struct {
         self.node_registry = registry;
     }
 
-    /// 注册新层，分配 z-index
+    /// Register new layer, allocate z-index
     pub fn push(self: *OverlayStack, config: LayerConfig) !LayerHandle {
         self.bumpAnimGen();
         if (self.layer_count >= MAX_LAYERS) {
-            if (std.posix.getenv("ZENIT_DEBUG_OVERLAY") != null) {
+            if (@import("zenit_environment").has("ZENIT_DEBUG_OVERLAY")) {
                 std.debug.print("[overlay-dbg] push FAIL count={d}\n", .{self.layer_count});
                 for (&self.layers, 0..) |*slot, i| {
                     if (slot.*) |*layer| {
@@ -296,14 +312,14 @@ pub const OverlayStack = struct {
             return error.TooManyLayers;
         }
 
-        // 互斥组：同 group 的 non_modal 层自动关闭
+        // Mutex group: non_modal layers in same group auto-close
         if (config.group) |group| {
             for (&self.layers) |*slot| {
                 if (slot.*) |*layer| {
                     if (!layer.suspended and layer.state != .exiting and layer.config.kind != .modal) {
                         if (layer.config.group) |eg| {
                             if (std.mem.eql(u8, eg, group)) {
-                                self.beginExit(layer.handle);
+                                self.requestDismiss(layer);
                             }
                         }
                     }
@@ -315,7 +331,7 @@ pub const OverlayStack = struct {
         if (config.z_index) |_| {
             self.next_z = @max(self.next_z, z +| 2);
         } else {
-            self.next_z +|= 2; // barrier + content 各占一个
+            self.next_z +|= 2; // barrier + content each take one
         }
         const handle = LayerHandle{
             .id = self.next_id,
@@ -323,7 +339,7 @@ pub const OverlayStack = struct {
         };
         self.next_id += 1;
 
-        // 找空位
+        // Find empty slot
         const slot = self.findEmptySlot() orelse return error.TooManyLayers;
         const enter_transition = config.enter_transition;
         const initial_state: LayerState = if (enter_transition == .none) .visible else .entering;
@@ -346,40 +362,107 @@ pub const OverlayStack = struct {
         return handle;
     }
 
-    /// 绑定 overlay 层的真实内容节点。
-    /// 适用于两类场景：
-    /// - Popover/Tooltip/Toast 这类直接 push() 的 floating content
-    /// - Modal/Sheet 这类通过 barrier 挂载、但动画实际应作用在 dialog/panel 上的内容节点
+    /// Bind the overlay layer's real content node.
+    /// Applies to two scenarios:
+    /// - Popover/Tooltip/Toast directly pushed() floating content
+    /// - Modal/Sheet via barrier mount, where animation targets the actual dialog/panel content
+    ///   node
+    /// Layer accessibility semantics (initial config.a11y: dialog role, title, modal) belong to the
+    /// layer, recorded by a11y_owner. When swapping the content node, transfer semantics as a
+    /// whole,
+    /// including component-applied modifications (e.g. expanded): the old owner clears, only one
+    /// owner
+    /// at any time. A new node declaring its own semantics takes precedence (layer defers, no
+    /// longer
+    /// owns). Must be called before layer.content_node becomes node.
+    ///
+    /// Ownership is by target object, not value equality: a value-equality check treats
+    /// component-modified copies as 'not the layer's', leaving a phantom modal=true overlay that
+    /// may
+    /// make the real dialog inert. Modal/Sheet replace the overlay's auto-created content with
+    /// their
+    /// own dialog/panel node, acquiring dialog semantics here.
+    ///
+    /// Invariant a11y_owner in {null, content_node}: content_node only changes via overlay()
+    /// and bindContentNode, both call this first. The content node isn't freed before replacement
+    /// (cleanup runs with the layer's scope), so dereferencing the owner here is safe.
+    fn applyLayerSemantics(layer: *OverlayLayer, node: *Node) void {
+        if (layer.config.a11y.role == .none) return;
+        if (layer.a11y_owner) |owner| {
+            if (owner == node) return;
+            std.debug.assert(owner == layer.content_node);
+            if (owner.behavior.interaction.a11y) |current| layer.a11y_semantics = current;
+            owner.behavior.interaction.a11y = null;
+            layer.a11y_owner = null;
+        }
+        // Node declares own semantics: defer, layer retains recovered copy, reuse on later swap to
+        // null.
+        if (node.behavior.interaction.a11y != null) return;
+        node.behavior.interaction.a11y = layer.a11y_semantics orelse layer.config.a11y;
+        layer.a11y_owner = node;
+    }
+
     pub fn bindContentNode(self: *OverlayStack, allocator: Allocator, handle: LayerHandle, content_node: *Node) void {
         if (self.findLayer(handle)) |layer| {
+            applyLayerSemantics(layer, content_node);
             layer.content_node = content_node;
             const ext = content_node.style.ensureExtPanic(allocator);
-            // CA-pure revamp P6.1（settle 帧 children-drop 根因已修，paint-order 不变式
-            // + 缓存自包含化后，non_modal 也统一走 composited_group surface：整组
-            // scale+opacity fade 语义正确（不再逐 primitive 内联调制互透）、文本不逐帧
-            // 重栅格。单一 CA 矩阵合成（surface_draw_transform = owner_world·T(src)）。
+            // CA-pure revamp P6.1 (settle-frame children-drop root cause fixed, paint-order
+            // invariants +
+            // cache self-contained after: non_modal also unified to composited_group surface;
+            // scale+opacity
+            // fade semantics correct (no per-primitive inline modulation), text never re-rasters
+            // per-frame.
+            // Single CA matrix composite (surface_draw_transform = owner_world·T(src)).
             ext.composited_group = true;
-            // content（dialog/panel）必须显式拿 pointer hit role，否则点 dialog 的空白
-            // 区域/纯文本（无 on_click）时 hit-test 穿透到 barrier 甚至背后 ScrollArea，
-            // outside-click 误判"点在 content 外" -> 关闭。给 pointer role 后，点 content
-            // 内任意处都命中 content 子树（isDescendantOf(content)=true）-> 不关闭；内部
-            // 按钮（× / 菜单项）更深，仍优先命中并触发自身 handler。
-            // 逐 role 覆盖：只加 pointer，scroll/inspect 沿用推导默认值
-            // （content 若本身是 scroll owner 仍保留 scroll；devtools 仍能选中它）。
+            // Content (dialog/panel) must explicitly get the pointer hit role, else clicking a
+            // blank area or
+            // plain text (no on_click) pierce-tests to the barrier or background ScrollArea, and
+            // outside-click misdetects 'clicked outside' -> close. With the pointer role, any
+            // content click
+            // hits the content subtree (isDescendantOf(content)=true) -> no close; inner buttons (x
+            // / menu
+            // items) are deeper and still take priority with their own handlers. Per-role override:
+            // pointer
+            // only; scroll/inspect keep derived defaults (content still owns scroll; devtools can
+            // still
+            // select it).
             ext.hit_roles = .{ .pointer = true };
             syncLayerHitTestVisibility(layer);
             self.syncAllLayerVisualOrder();
         }
     }
 
-    /// 兼容 helper：保留给无 barrier 的 floating overlay 调用。
+    /// Compat helper: reserved for barrier-less floating overlay calls.
     pub fn bindFloatingContent(self: *OverlayStack, allocator: Allocator, handle: LayerHandle, content_node: *Node) void {
         self.bindContentNode(allocator, handle, content_node);
     }
 
-    /// 开始退出：启动退场动画（如果有），动画完成后 tick() 中自动 commitExit。
-    /// 注意：on_dismiss Signal 在 commitExit 中触发（退场动画完成后），
-    /// 避免 Effect 在动画播放前就把节点缩成 0×0。
+    /// Whether any layer is exiting (test/diagnostic use).
+    pub fn anyExiting(self: *const OverlayStack) bool {
+        for (self.layers) |maybe| {
+            if (maybe) |layer| {
+                if (layer.state == .exiting) return true;
+            }
+        }
+        return false;
+    }
+
+    /// User-triggered close (Esc / outside-click / mutex group): with on_dismiss_request only
+    /// requests,
+    /// else begins exit directly.
+    fn requestDismiss(self: *OverlayStack, layer: *OverlayLayer) void {
+        if (layer.config.on_dismiss_request) |h| {
+            h.invoke();
+            return;
+        }
+        self.beginExit(layer.handle);
+    }
+
+    /// Start exit: launch exit animation (if any), tick() auto-commits after. Note: on_dismiss
+    /// Signal
+    /// fires in commitExit (after exit animation), prevent Effect from shrinking node to 0x0 before
+    /// animation.
     pub fn beginExit(self: *OverlayStack, handle: LayerHandle) void {
         self.bumpAnimGen();
         if (self.findLayer(handle)) |layer| {
@@ -387,38 +470,40 @@ pub const OverlayStack = struct {
             if (layer.state == .exiting) return;
             if (layer.suspended) return;
 
-            // 无退场动画 -> 立即提交（commitExit 中触发 sig.set(false)）
+            // No exit animation -> commit immediately (trigger sig.set(false) in commitExit)
             if (layer.config.exit_transition == .none) {
                 self.commitExit(handle);
                 return;
             }
 
-            // 有退场动画 -> 进入 exiting 状态，等 tick() 驱动完成
+            // With exit animation -> enter exiting state, wait for tick() to drive completion
             const was_entering = layer.state == .entering;
             layer.state = .exiting;
             layer.exit_ctrl = TransitionController.initWithTime(layer.config.exit_transition, .exiting, render_engine.current_frame_time_ms);
-            // enter 中途（含 enter_delay 持有期，progress 仍为 0）就离开：
-            // exit 从当前 enter progress 起播，不从 1.0 全量闪现。
-            if (was_entering) layer.exit_ctrl.seedFromProgress(layer.enter_ctrl.progress);
+            // Leave mid-enter (including enter_delay hold, progress still 0): exit plays from
+            // current enter
+            // progress, not full flash from 1.0.
+            if (was_entering) layer.exit_ctrl.seedFromProgress(layer.enter_ctrl.visualProgress());
             syncLayerHitTestVisibility(layer);
             logOutsideClickLayer("begin-exit-applied", layer, null);
         }
     }
 
-    /// 退场完成后：隐藏节点 + 挂起层（不从栈移除，可通过 resume 恢复）
+    /// After exit completes: hide node + suspend layer (don't remove from stack, resumable)
     pub fn commitExit(self: *OverlayStack, handle: LayerHandle) void {
         self.bumpAnimGen();
         const idx = self.findLayerIndex(handle) orelse return;
         if (self.layers[idx]) |*layer| {
-            if (layer.suspended) return; // 已经挂起
+            if (layer.suspended) return; // Already suspended
 
-            // Signal 回调可同步 dispose scope、removePermanently 并释放节点。
-            // 先快照指针，所有 layer/node 写操作完成后再把它作为最后一步触发。
+            // Signal callback may sync-dispose scope, removePermanently, free node. Snapshot ptr
+            // first,
+            // trigger as final step after all layer/node writes complete.
             const dismiss_signal = layer.config.on_dismiss;
 
-            // 隐藏节点
+            // Hide node
             if (layer.barrier_node) |barrier| {
-                // 有 barrier 的层（Modal/Sheet）：隐藏 barrier 即可，content 在 barrier 内部
+                // Layers with barrier (Modal/Sheet): hide barrier only, content inside barrier
                 barrier.style.width = .{ .px = 0 };
                 barrier.style.height = .{ .px = 0 };
                 barrier.style.overflow_hidden = true;
@@ -426,21 +511,25 @@ pub const OverlayStack = struct {
                 setManualTransitionFlags(barrier, layer.config.exit_transition, false);
                 barrier.markLayoutDirty();
             } else if (layer.content_node) |content| {
-                // 无 barrier 的 floating overlay（Popover/Tooltip/Menu/Picker）需要保留
-                // 可测量几何，避免 reopen 的第一个可见帧还在经历 0x0 -> full-size 的补布局。
-                // 对这类 absolute overlay，关闭时只隐藏视觉和命中，不再压成 0x0。
+                // Barrier-less floating overlay (Popover/Tooltip/Menu/Picker) must preserve
+                // measurable geometry
+                // to avoid reopen first visible frame needing 0x0->full-size relayout. For absolute
+                // overlays,
+                // hide visual/hit only, don't shrink to 0x0.
                 content.setOpacityRaw(0);
                 content.style.overflow_hidden = false;
                 setManualTransitionFlags(content, layer.config.enter_transition, false);
                 setManualTransitionFlags(content, layer.config.exit_transition, false);
-                // suspend 必须**保住** prewarm 的 descendant render caches（reopen 首帧
-                // 直接复用），故不可用 markCompositePropDirty（含 invalidateRenderCache）；
-                // opacity 走 anim-frame 组合 + overflow_hidden 变更标 render。
+                // suspend must preserve prewarm descendant render caches (reopen first frame
+                // reuses), so can't
+                // use markCompositePropDirty (invalidateRenderCache); opacity uses anim-frame +
+                // overflow_hidden
+                // change marks render.
                 content.markCompositeAnimFrameDirty();
                 content.markRenderDirty();
             }
 
-            // 焦点恢复：把 previous_focus 排给 Cx 处理（见 pending_focus_restore）。
+            // Focus restore: queue previous_focus for Cx (see pending_focus_restore).
             if (layer.config.focus.restore) {
                 if (layer.previous_focus) |prev| {
                     self.pending_focus_restore = prev;
@@ -450,13 +539,13 @@ pub const OverlayStack = struct {
 
             layer.scope_pushed = false;
             layer.suspended = true;
-            layer.state = .visible; // 重置状态，方便 resume 时从正确状态开始
+            layer.state = .visible; // Reset state for correct resume starting point
             syncLayerHitTestVisibility(layer);
             if (dismiss_signal) |sig| sig.set(false);
         }
     }
 
-    /// scope dispose 时真正永久移除层（仅在 cleanup 回调中调用）
+    /// Truly remove layer permanently during scope dispose (only in cleanup callback)
     pub fn removePermanently(self: *OverlayStack, handle: LayerHandle) void {
         self.bumpAnimGen();
         const idx = self.findLayerIndex(handle) orelse return;
@@ -466,7 +555,7 @@ pub const OverlayStack = struct {
         self.syncAllLayerVisualOrder();
     }
 
-    /// 恢复挂起的层（重新打开时由组件 Effect 调用）
+    /// Resume suspended layer (called by component Effect on reopen)
     pub fn reactivate(self: *OverlayStack, handle: LayerHandle) void {
         self.bumpAnimGen();
         if (self.findLayer(handle)) |layer| {
@@ -476,15 +565,17 @@ pub const OverlayStack = struct {
             layer.skip_outside_click_frame = true;
             layer.enter_paused = false;
             layer.enter_last_content_rect = null;
-            layer.enter_stable_frame_count = 0;
 
-            // 重新激活时不要递归清空整棵浮层子树缓存。
-            // 预热隐藏态的目的就是保住完整内容和字形 atlas，让首个可见帧直接复用。
-            // 如果这里把 descendants cache 全清掉，Popover/Select/DatePicker 会重新走
-            // 冷启动渲染路径，首帧又退化成壳体先出、内容下一帧补齐。
-            //
-            // reopen 真正需要的是重新进入 composite / interaction 流程；若组件自身在
-            // 打开前改了尺寸或内容，它们已经会通过 sizing/render dirty 精确失效。
+            // Don't recursively clear the whole floater subtree cache on reactivate. Prewarming in
+            // hidden
+            // state preserves full content + glyph atlas and the first visible frame reuses them.
+            // Clearing
+            // descendants' cache here would make Popover/Select/DatePicker cold-start render a
+            // shell on the
+            // first frame and content on the next. Reopen really only needs re-entering the
+            // composite/interaction flow; size/content changes before open are already invalidated
+            // via
+            // sizing/render dirty.
             if (layer.content_node) |content| {
                 setManualTransitionFlags(content, layer.config.enter_transition, layer.config.enter_transition != .none);
                 content.markCompositeAnimFrameDirty();
@@ -538,16 +629,17 @@ pub const OverlayStack = struct {
             if (next_state == .entering) {
                 layer.skip_outside_click_frame = true;
                 layer.enter_ctrl = TransitionController.initWithTime(layer.config.enter_transition, .entering, render_engine.current_frame_time_ms);
-                // 退场中途拉回：enter 从当前 exit progress 接着播（不重走 enter_delay，
-                // 快速二次 hover 应立即出现）。
-                layer.enter_ctrl.seedFromProgress(layer.exit_ctrl.progress);
+                // Pull back mid-exit: enter continues from current exit progress (skip enter_delay,
+                // quick
+                // re-hover appears immediately).
+                layer.enter_ctrl.seedFromProgress(layer.exit_ctrl.visualProgress());
             }
             syncLayerHitTestVisibility(layer);
             self.syncAllLayerVisualOrder();
         }
     }
 
-    /// 当前最顶层（跳过 .exiting 和 .suspended 状态的）
+    /// Current topmost (skip .exiting and .suspended)
     pub fn topmost(self: *const OverlayStack) ?*const OverlayLayer {
         var best: ?*const OverlayLayer = null;
         for (&self.layers) |*slot| {
@@ -561,7 +653,7 @@ pub const OverlayStack = struct {
         return best;
     }
 
-    /// 某 handle 是否是最顶层
+    /// Whether handle is topmost
     pub fn isTopmost(self: *const OverlayStack, handle: LayerHandle) bool {
         if (self.topmost()) |top| {
             return top.handle.id == handle.id;
@@ -569,10 +661,8 @@ pub const OverlayStack = struct {
         return false;
     }
 
-    /// 统一 Escape 处理
-    /// 从栈顶向下找第一个 escape=true 且非 exiting 的层，关闭它。
-    /// 遇到 modal 层停止搜索（modal 阻断 Escape 向下传播）。
-    /// 返回 true 表示已消费该事件。
+    /// Unified Escape handling: find topmost layer with escape=true and not exiting, close it.
+    /// Stop at modal (modal blocks Escape downward). Return true if consumed.
     pub fn handleEscape(self: *OverlayStack) bool {
         self.bumpAnimGen();
         if (self.layer_count == 0) return false;
@@ -585,21 +675,21 @@ pub const OverlayStack = struct {
             i -= 1;
             if (self.layers[ordered[i]]) |*layer| {
                 if (layer.config.dismiss.escape) {
-                    self.beginExit(layer.handle);
+                    self.requestDismiss(layer);
                     return true;
                 }
-                // modal 阻断 Escape 向下传播
+                // modal blocks Escape downward propagation
                 if (layer.config.kind == .modal) return true;
             }
         }
         return false;
     }
 
-    /// 统一 outside-click 处理
-    /// 从栈顶向下遍历，对每个 non_modal 层检查点击是否在外部。
-    /// 按下那一刻命中的是哪一层（content 或 trigger 包含目标的最上层）。
-    /// 渲染期的 `handleOutsideClick` 用它兜底：按下的节点可能在 click 回调里随
-    /// 所在层退场被失效（引用被清空），不能因此把父层误判成「点在外面」。
+    /// Unified outside-click handling: traverse top-to-bottom, check each non_modal layer if click
+    /// outside. Layer pressed was determined by hit at press time (topmost layer with
+    /// content/trigger
+    /// containing target). renderPhase handleOutsideClick fallback: pressed node may become invalid
+    /// when layer exits in click callback; can't misdetect parent as "outside".
     pub fn findPressOwner(self: *OverlayStack, target: ?*Node) ?LayerHandle {
         const t = target orelse return null;
         if (self.layer_count == 0) return null;
@@ -624,8 +714,8 @@ pub const OverlayStack = struct {
         self.handleOutsideClickOwned(has_new_mouse_down, last_mouse_down_target, null);
     }
 
-    /// `press_owner`：按下时记录的所属层（见 `findPressOwner`）。遍历到它就停,
-    /// 它和它下面的层都不是「外面」。
+    /// `press_owner`: layer recorded at press (see `findPressOwner`). Stop at it; it and below
+    /// are not "outside".
     pub fn handleOutsideClickOwned(self: *OverlayStack, has_new_mouse_down: bool, last_mouse_down_target: ?*Node, press_owner: ?LayerHandle) void {
         self.bumpAnimGen();
         if (!has_new_mouse_down) return;
@@ -635,8 +725,8 @@ pub const OverlayStack = struct {
         var ordered: [MAX_LAYERS]usize = undefined;
         const count = self.collectOrderedLayerIndices(&ordered, true);
 
-        // 按下所属的层已不在活动列表里（它在 click 回调里自己关了）：这一下
-        // 是在它里面处理掉的，不是点在任何层外面。
+        // Press-owning layer no longer in active list (closed itself in click callback): pressed
+        // handled inside, not outside any layer.
         if (press_owner) |owner| {
             var present = false;
             for (ordered[0..count]) |idx| {
@@ -662,7 +752,7 @@ pub const OverlayStack = struct {
                 if (layer.state == .exiting) continue;
                 if (layer.skip_outside_click_frame) continue;
 
-                // 点在 content 内部 -> 不关闭
+                // Click inside content -> don't close
                 if (layer.config.content_hit_test_visible) {
                     if (target) |target_node| {
                         if (layer.content_node) |content| {
@@ -674,7 +764,7 @@ pub const OverlayStack = struct {
                     }
                 }
 
-                // 点在 trigger 内部 -> 让 trigger 自己处理
+                // Click inside trigger -> let trigger handle
                 if (target) |target_node| {
                     if (self.resolveTrigger(layer)) |trig| {
                         if (target_node.isDescendantOf(trig)) {
@@ -684,7 +774,7 @@ pub const OverlayStack = struct {
                     }
                 }
 
-                // 点在 barrier 上 -> dismiss 当前层，barrier 阻断
+                // Click on barrier -> dismiss layer, barrier blocks
                 if (target) |target_node| {
                     if (layer.barrier_node) |barrier| {
                         if (target_node.isDescendantOf(barrier)) {
@@ -694,15 +784,15 @@ pub const OverlayStack = struct {
                                     logOutsideClickLayer("barrier-notify-dismiss", layer, target);
                                     if (layer.config.on_dismiss) |sig| sig.set(false);
                                 },
-                                else => self.beginExit(layer.handle),
+                                else => self.requestDismiss(layer),
                             }
                             logOutsideClickLayer("barrier-return", layer, target);
-                            return; // barrier 阻断
+                            return; // barrier blocks
                         }
                     }
                 }
 
-                // 点在所有已知区域之外 -> dismiss
+                // Click outside all known areas -> dismiss
                 switch (layer.config.dismiss.outside_click) {
                     .none => {},
                     .notify => {
@@ -711,20 +801,20 @@ pub const OverlayStack = struct {
                     },
                     else => {
                         logOutsideClickLayer("outside-begin-exit", layer, target);
-                        self.beginExit(layer.handle);
-                        // non_modal: 继续向下检查（可能关闭多个嵌套 popover）
-                        // modal 不会到这里（barrier 已拦截）
+                        self.requestDismiss(layer);
+                        // non_modal: continue downward (may close multiple nested popover)
+                        // modal won't reach here (barrier already intercepted)
                     },
                 }
             }
         }
     }
 
-    /// mouse-down 分发**之前**调用：若最上层活动 overlay 配置了
-    /// `.close_and_consume` 且这次按下落在它的 content / trigger 之外，就关闭它并
-    /// 返回 true，调用方吞掉这次按下（连同之后的抬起），点中的东西不会同时被触发。
-    /// 按下落在某层 content / trigger 内部、或最上层不是 consume 型时返回 false，
-    /// 照常走分发与渲染期的 `handleOutsideClick`。
+    /// mouse-down pre-dispatch: if topmost active overlay configured `.close_and_consume` and click
+    /// outside content/trigger, close it and return true, caller swallows press (and following
+    /// release),
+    /// hit thing not also triggered. Click inside layer content/trigger or topmost not consume-type
+    /// returns false, normal dispatch and renderPhase handleOutsideClick proceed.
     pub fn consumeOutsidePress(self: *OverlayStack, target: ?*Node) bool {
         self.bumpAnimGen();
         if (self.layer_count == 0) return false;
@@ -747,19 +837,19 @@ pub const OverlayStack = struct {
             }
             if (layer.config.dismiss.outside_click != .close_and_consume) return false;
             logOutsideClickLayer("consume-begin-exit", layer, target);
-            self.beginExit(layer.handle);
+            self.requestDismiss(layer);
             return true;
         }
         return false;
     }
 
-    /// 每帧布局前更新 anchor 定位。仅更新几何，不推进动画时间。
+    /// Update anchor positioning before layout each frame. Geometry only, don't advance animation.
     pub fn updateAnchors(self: *OverlayStack, vp_w: f32, vp_h: f32) void {
         for (&self.layers) |*slot| {
             if (slot.*) |*layer| {
                 if (layer.suspended) continue;
 
-                // Anchor 定位（每帧更新，因为 trigger 可能移动）
+                // Anchor positioning (updated each frame, trigger may move)
                 if (layer.state != .exiting) {
                     updateAnchorPosition(self, layer, vp_w, vp_h);
                 }
@@ -767,7 +857,8 @@ pub const OverlayStack = struct {
         }
     }
 
-    /// 每帧布局后推进过渡动画。返回 true = 有活跃动画需要继续重绘。
+    /// Advance transition animations after layout each frame. Return true = active animations need
+    /// redraw.
     pub fn tickAnimations(self: *OverlayStack, now_ms: f64, dt: f32, allocator: Allocator) bool {
         self.bumpAnimGen();
         var any_animating = false;
@@ -799,7 +890,8 @@ pub const OverlayStack = struct {
                             continue;
                         }
 
-                        // 如果有 anchor 且 content 尺寸还没算好，暂停入场动画（防闪烁）
+                        // If anchored and content size not calculated, pause enter animation
+                        // (prevent flicker)
                         if (layer.anchor != null) {
                             if (layer.content_node) |content| {
                                 const cr = content.rectFromWorldOrFallback();
@@ -839,10 +931,11 @@ pub const OverlayStack = struct {
                         }
                         if (done) {
                             layer.state = .visible;
-                            // 恢复 content 的完全可见状态。
-                            // 不要在这里重置 translate_x / translate_y：
-                            // Popover / anchored overlay 会复用 translate_* 作为最终定位，
-                            // 如果在入场动画完成帧把它们归零，会导致 panel 瞬间跳回 trigger 位置一帧。
+                            // Restore content full visibility. Don't reset translate_x/translate_y
+                            // here: Popover/anchored overlay
+                            // reuse translate_* for final positioning; zeroing at enter-completion
+                            // frame causes panel jump back
+                            // to trigger position one frame.
                             if (layer.content_node) |content| {
                                 content.setOpacityRaw(1.0);
                                 content.markCompositeAnimFrameDirty();
@@ -863,10 +956,10 @@ pub const OverlayStack = struct {
                             barrier.markCompositeAnimFrameDirty();
                         }
                         if (done) {
-                            // 动画完成 -> 真正隐藏并移除
+                            // Animation complete -> truly hide and remove
                             self.commitExit(layer.handle);
-                            // 提交隐藏后还需要再跑一帧布局/树快照，
-                            // 否则像 Sheet 这类 barrier 仍可能保留旧 rect。
+                            // After commitExit still need one layout/tree-snapshot frame, else
+                            // barriers like Sheet may keep old rect.
                             any_animating = true;
                         } else {
                             any_animating = true;
@@ -895,13 +988,15 @@ pub const OverlayStack = struct {
     }
 
     pub fn hasActiveAnimations(self: *const OverlayStack) bool {
-        // 本函数挂在每次唤醒判定链上（每个泵循环 × 每窗口多次），闲时是
-        // 纯轮询：用代际 memo 把重复扫描降为 O(1)。所有可能改变层状态的
-        // 入口（push/exit/reactivate/tick/clear/findLayer…）都 bump
-        // anim_gen，memo 只可能多扫、不会陈旧。
+        // Function on each wakeup check chain (per pump loop x per-window multiple times), idle
+        // pure
+        // polling: generational memo reduces repeat scan to O(1). All entries changing layer state
+        // (push/exit/reactivate/tick/clear/findLayer...) bump anim_gen, memo may over-scan never
+        // stale.
         if (self.anim_memo_gen == self.anim_gen) return self.anim_memo_result;
-        // 按引用遍历：[MAX_LAYERS]?OverlayLayer 的按值 for 会整槽拷贝
-        // （每槽数百字节 × 256）。
+        // Traverse by reference: value-for over [MAX_LAYERS]?OverlayLayer copies entire slot
+        // (hundreds
+        // bytes x 256).
         var result = false;
         for (&self.layers) |*slot| {
             const layer = if (slot.*) |*l| l else continue;
@@ -920,7 +1015,7 @@ pub const OverlayStack = struct {
         return result;
     }
 
-    /// 清空所有层
+    /// Clear all layers
     pub fn clear(self: *OverlayStack) void {
         self.bumpAnimGen();
         for (&self.layers) |*slot| {
@@ -931,7 +1026,7 @@ pub const OverlayStack = struct {
         self.next_activation_order = 1;
     }
 
-    /// 查找 handle 对应的层
+    /// Find layer for handle
     pub fn findLayer(self: *OverlayStack, handle: LayerHandle) ?*OverlayLayer {
         self.bumpAnimGen();
         const idx = self.findLayerIndex(handle) orelse return null;
@@ -939,7 +1034,7 @@ pub const OverlayStack = struct {
         return null;
     }
 
-    /// 根据内容节点或其任意后代，查找所属 overlay 层。
+    /// Find overlay layer for content node or descendants.
     pub fn findLayerForNode(self: *const OverlayStack, node: *Node) ?*const OverlayLayer {
         for (&self.layers) |*slot| {
             const layer = if (slot.*) |*l| l else continue;
@@ -953,10 +1048,60 @@ pub const OverlayStack = struct {
         return null;
     }
 
-    /// 节点是否落在某个**挂起**（已关闭未销毁）层的 content / barrier 子树里。
-    /// 与 findLayerForNode 不同：逐层检查而非取第一个命中，嵌套时节点可能同时
-    /// 属于外层（仍打开）与内层（已挂起），任一挂起祖先层都意味着它不呈现。
-    /// 只比较指针（isDescendantOf 沿节点自身父链走），不解引用层里的节点。
+    /// Semantic actions must respect the same modal boundary as pointer input.
+    /// Portaled children belong through their live trigger chain, not DOM ancestry.
+    pub fn allowsSemanticAction(self: *const OverlayStack, node: *const Node) bool {
+        var modal: ?*const OverlayLayer = null;
+        for (&self.layers) |*slot| {
+            const layer = if (slot.*) |*l| l else continue;
+            const inside = layerContains(layer, node);
+            if (inside and (layer.suspended or layer.state == .exiting)) return false;
+            if (layer.suspended or layer.state == .exiting or layer.config.kind != .modal) continue;
+            if (modal == null or layer.activation_order > modal.?.activation_order) modal = layer;
+        }
+        const boundary = modal orelse return true;
+        if (layerContains(boundary, node)) return true;
+        var ordered: [MAX_LAYERS]usize = undefined;
+        const count = self.collectOrderedLayerIndices(&ordered, true);
+        var allowed: [MAX_LAYERS]bool = @splat(false);
+        for (ordered[0..count], 0..) |index, position| {
+            const layer = &(self.layers[index].?);
+            if (layer.handle.id == boundary.handle.id) {
+                allowed[position] = true;
+                continue;
+            }
+            if (layer.activation_order <= boundary.activation_order) continue;
+            const trigger = self.resolveTrigger(layer) orelse continue;
+            for (ordered[0..position], 0..) |parent_index, parent_position| {
+                if (allowed[parent_position] and layerContains(&(self.layers[parent_index].?), trigger)) {
+                    allowed[position] = true;
+                    break;
+                }
+            }
+            if (allowed[position] and layerContains(layer, node)) return true;
+        }
+        return false;
+    }
+
+    fn isSemanticDescendant(node: *const Node, ancestor: *const Node) bool {
+        var current: ?*const Node = node;
+        while (current) |n| : (current = n.parent) {
+            if (n == ancestor) return true;
+        }
+        return false;
+    }
+
+    fn layerContains(layer: *const OverlayLayer, node: *const Node) bool {
+        if (layer.content_node) |content| if (isSemanticDescendant(node, content)) return true;
+        if (layer.barrier_node) |barrier| if (isSemanticDescendant(node, barrier)) return true;
+        return false;
+    }
+
+    /// Whether node in **suspended** (closed not destroyed) layer content/barrier subtree. Differs
+    /// from
+    /// findLayerForNode: check all layers not first hit; nested, node may belong to outer (open)
+    /// and inner (suspended), any suspended ancestor means not visible. Ptr comparison only
+    /// (isDescendantOf walks node parent chain), no layer node dereference.
     pub fn isNodeInSuspendedLayer(self: *const OverlayStack, node: *Node) bool {
         for (&self.layers) |*slot| {
             const layer = if (slot.*) |*l| l else continue;
@@ -1017,9 +1162,9 @@ pub const OverlayStack = struct {
         return layer.config.tier orelse StackTier.fromKind(layer.config.kind);
     }
 
-    /// trigger/anchor 的代次化弱引用 + 存活校验：实现析出到
-    /// overlay_layer_refs.zig（不变量与单测在那里）。OverlayStack 侧只留
-    /// 把 node_registry 注入的这一层。
+    /// trigger/anchor generational weak refs + liveness check: impl extracted to
+    /// overlay_layer_refs.zig
+    /// (invariants and tests there). OverlayStack side only injects node_registry then records.
     fn trackNode(self: *OverlayStack, node: ?*Node) ?NodeHandle {
         return overlay_layer_refs.trackNode(self.node_registry, node);
     }
@@ -1039,9 +1184,11 @@ pub const OverlayStack = struct {
         layer.anchor_target_handle = target_handle;
     }
 
-    /// 嵌套继承：本层 trigger 落在哪个已排层的 content 子树里 -> 取其中最高的
-    /// 已算出 z。ordered[0..upto] 是 activation 序在前的层（父层必先于子层打开，
-    /// 故单趟即可收敛）。
+    /// Nested inheritance: which active layer's content subtree contains this layer's trigger ->
+    /// take
+    /// highest z. ordered[0..upto] layers with earlier activation sequence (parent opens before
+    /// child,
+    /// single pass converges).
     fn nestedParentZ(self: *const OverlayStack, trigger: *Node, ordered: []const usize, computed: *const [MAX_LAYERS]i16, upto: usize) ?i16 {
         var best: ?i16 = null;
         for (ordered[0..upto]) |idx| {
@@ -1058,21 +1205,23 @@ pub const OverlayStack = struct {
     fn syncAllLayerVisualOrder(self: *OverlayStack) void {
         var ordered: [MAX_LAYERS]usize = undefined;
         const count = self.collectOrderedLayerIndices(&ordered, false);
-        // 每层实际 z = max(tier 基线 + 同 tier 序号*2, 嵌套父层 z + 2)。
-        // 显式 z_index_override 完全绕过 tier/继承（caller 自己负责）。
-        var computed: [MAX_LAYERS]i16 = [_]i16{0} ** MAX_LAYERS;
-        var tier_seq = [_]i16{0} ** @typeInfo(StackTier).@"enum".fields.len;
-        // CSS Top Layer FIFO：dialog 至少压过此前所有活动的 overlay/dialog 层。
-        // 光靠 trigger 嵌套继承不够，Modal 没有 trigger_node（从 popover 里
-        // 打开的 modal 拿不到嵌套父），tier 序号又可能与被继承抬高的 popover
-        // 打平，层序退化成 DOM 挂载序。tooltip/toast tier 不参与（tooltip 恒顶
-        // 语义不能被后开的 modal 压掉）。
+        // Each layer actual z = max(tier baseline + same-tier sequence*2, nested parent z + 2).
+        // Explicit z_index_override bypasses tier/inheritance (caller responsible).
+        var computed: [MAX_LAYERS]i16 = @as([MAX_LAYERS]i16, @splat(0));
+        var tier_seq = @as([@import("zenit_reflection").fields(StackTier).len]i16, @splat(0));
+        // CSS Top Layer FIFO: dialog caps all previously active overlay/dialog layers. Trigger
+        // inheritance
+        // insufficient; Modal has no trigger_node (modal from popover gets no parent), tier
+        // sequence may
+        // match inherited-elevated popover, order degrades to DOM mount. tooltip/toast tiers
+        // excluded
+        // (tooltip always topmost semantically).
         var active_max_below_toast: i16 = 0;
         for (ordered[0..count], 0..) |idx, pos| {
             if (self.layers[idx]) |*layer| {
                 const base_z = layer.z_index_override orelse blk: {
                     const tier = layerTier(layer);
-                    const seq = &tier_seq[@intFromEnum(tier)];
+                    const seq = &tier_seq[@backingInt(tier)];
                     var z = tier.base() +| seq.* * 2;
                     seq.* += 1;
                     if (self.resolveTrigger(layer)) |trigger| {
@@ -1129,7 +1278,6 @@ fn holdEnterUntilGeometryStable(layer: *OverlayLayer, allocator: Allocator) bool
     const rect = content.rectFromWorldOrFallback();
     if (rect.w <= 0.1 or rect.h <= 0.1) {
         layer.enter_last_content_rect = rect;
-        layer.enter_stable_frame_count = 0;
         setManualTransitionFlags(content, layer.config.enter_transition, true);
         layer.enter_ctrl.apply(content, allocator);
         return true;
@@ -1140,7 +1288,6 @@ fn holdEnterUntilGeometryStable(layer: *OverlayLayer, allocator: Allocator) bool
     layer.enter_last_content_rect = rect;
 
     if (layout_unstable or rect_changed) {
-        layer.enter_stable_frame_count = 0;
         // Re-anchor the transition clock so frozen frames don't get paid back
         // as a large jump on the next visible frame.
         layer.enter_ctrl.last_tick_time_ms = render_engine.current_frame_time_ms;
@@ -1154,24 +1301,15 @@ fn holdEnterUntilGeometryStable(layer: *OverlayLayer, allocator: Allocator) bool
         return true;
     }
 
-    if (layer.enter_stable_frame_count < 2) {
-        layer.enter_stable_frame_count += 1;
-        layer.enter_ctrl.last_tick_time_ms = render_engine.current_frame_time_ms;
-        setManualTransitionFlags(content, layer.config.enter_transition, true);
-        layer.enter_ctrl.apply(content, allocator);
-        if (layer.barrier_node) |barrier| {
-            setManualTransitionFlags(barrier, layer.config.enter_transition, true);
-            barrier.setOpacityRaw(layer.enter_ctrl.currentOpacity());
-            barrier.markCompositeAnimFrameDirty();
-        }
-        return true;
-    }
-
+    // This runs after layout. A clean second observation matching the recorded
+    // rect is enough: extra frame-count warmup adds adapter-dependent latency
+    // without stronger geometry evidence. Dirty/changing geometry above still
+    // holds and re-anchors the first visible step.
     return false;
 }
 
-// transitionAffectsOpacity / transitionAffectsTransform / layerNeedsCompositedGroup
-// 已析出到 overlay_transition.zig（头部 re-export）。
+// transitionAffectsOpacity / transitionAffectsTransform / layerNeedsCompositedGroup extracted to
+// overlay_transition.zig (header re-export).
 
 fn setManualTransitionFlags(node: *Node, transition: Transition, active: bool) void {
     const next_opacity = active and transitionAffectsOpacity(transition);
@@ -1187,16 +1325,16 @@ fn setManualTransitionFlags(node: *Node, transition: Transition, active: bool) v
     node.markCompositeDirty();
 }
 
-// ========== 工厂函数 ==========
+// ========== Factory functions ==========
 
-/// 创建一个 overlay 层
+/// Create an overlay layer
 pub fn overlay(scope: *Scope, cx: *core.Cx, config: LayerConfig) !OverlayResult {
     const handle = try cx.overlay_stack.push(config);
     errdefer cx.overlay_stack.removePermanently(handle);
     const allocator = cx.allocator;
     const t = cx.tokens;
 
-    // barrier 节点（modal 类型才有）
+    // barrier node (modal type only)
     var barrier_node: ?*Node = null;
     errdefer if (barrier_node) |barrier| cx.freeNode(barrier);
     if (config.barrier != .none) {
@@ -1214,26 +1352,29 @@ pub fn overlay(scope: *Scope, cx: *core.Cx, config: LayerConfig) !OverlayResult 
         }, .{});
         const b_ext = try barrier_node.?.style.ensureExtFallible(allocator);
         b_ext.z_index = handle.z_index;
-        // barrier 必须显式拿 pointer hit role：空 box 默认 pointer=false（无 handler），
-        // 那样 modal backdrop 点击会**穿透**到下面的 ScrollArea/内容，hit-test 命中错误
-        // 节点 -> outside-click 逻辑判"点在所有已知区域外" -> 误关闭。给 pointer role 后
-        // backdrop 拦截所有点击（modal 语义：阻断与背后内容交互），点空白处 dismiss。
+        // barrier must explicitly get pointer hit role: empty box defaults pointer=false (no
+        // handler),
+        // modal backdrop click pierces to ScrollArea/content, hit-test misses node -> outside-click
+        // logic
+        // says "clicked outside" -> wrong close. With pointer role backdrop blocks all clicks
+        // (modal
+        // semantics: block background interaction), blank click dismisses.
         b_ext.hit_roles = .{ .pointer = true };
-        // P6.2：barrier 不再 avoid_opacity_layer, settle children-drop 与缓存自包含
-        // 修复后，嵌套 surface（barrier surface 内含 dialog surface）由引擎通用规则
-        // 正确处理；fade 期间引擎按 opacity<0.999 自动开 surface，rest 时无 surface 开销。
+        // P6.2: barrier no avoid_opacity_layer; settle children-drop + cache self-contain
+        // fixed, nested surface (barrier surface inside dialog surface) engine general rules
+        // handle correctly; opacity<0.999 engine auto surface, rest no overhead.
     }
 
-    // content 节点
+    // content node.
     const content_node = try box(cx, .{
         .position = .absolute,
         .direction = .column,
-        .background = t.color.bg_secondary,
+        .background = t.tokens.color.bg_secondary,
     }, .{});
     errdefer cx.freeNode(content_node);
     (try content_node.style.ensureExtFallible(allocator)).z_index = handle.z_index +| 1;
 
-    // 焦点管理
+    // focus mgmt.
     if (config.focus.trap) {
         content_node.setFocusScope(.{
             .trap = true,
@@ -1241,17 +1382,13 @@ pub fn overlay(scope: *Scope, cx: *core.Cx, config: LayerConfig) !OverlayResult 
         });
     }
 
-    // a11y
-    if (config.a11y.role != .none) {
-        content_node.behavior.interaction.a11y = config.a11y;
-    }
+    // a11y: semantics owned by layer, register content_node unified apply (applyLayerSemantics).
 
-    // Portal 契约（方案 §6 步骤 1）：有 barrier 的层（Modal/Sheet）与 Popover 一致，
-    // 总是经 cx.ensurePopoverPortalRoot() 取 portal（standalone Cx 下在 root 下补建），
-    // 不再有"portal 为空就交给 caller inline append"的分支。唯一保留的回退是
-    // cx.root == null 的纯单元测试场景：此时 caller 自己 append，**inline 回退受祖先
-    // 裁剪**（z_index 不会让它逃出 overflow_hidden 祖先）。
-    // 在登记 cleanup 之前取 portal 并预留容量，后面的 appendChild 才不可失败。
+    // portal contract (@6 step 1): barrier layers (Modal/Sheet) match Popover, always via
+    // cx.ensurePopoverPortalRoot() portal (standalone Cx builds under root), no 'portal null
+    // = caller inline append' branch. only fallback: cx.root==null pure unit-test: caller
+    // append, inline mount **subject ancestor clip** (z_index can't escape overflow_hidden).
+    // take portal pre-reserve capacity before cleanup register, later appendChild can't fail.
     var barrier_portal: ?*Node = null;
     if (barrier_node != null) {
         barrier_portal = cx.ensurePopoverPortalRoot() catch |err| switch (err) {
@@ -1261,7 +1398,7 @@ pub fn overlay(scope: *Scope, cx: *core.Cx, config: LayerConfig) !OverlayResult 
         if (barrier_portal) |portal| try portal.children.ensureUnusedCapacity(allocator, 1);
     }
 
-    // Scope cleanup: scope dispose 时自动从 stack 移除，并释放孤立节点
+    // scope cleanup: auto remove stack on dispose, free orphan nodes.
     const cleanup_ctx = try scope.allocator.create(CleanupContext);
     errdefer scope.allocator.destroy(cleanup_ctx);
     cleanup_ctx.* = .{ .handle = handle, .cx = cx, .content_node = content_node, .barrier_node = barrier_node };
@@ -1269,15 +1406,16 @@ pub fn overlay(scope: *Scope, cx: *core.Cx, config: LayerConfig) !OverlayResult 
         fn cleanup(ptr: *anyopaque, alloc: Allocator) void {
             const ctx: *CleanupContext = @ptrCast(@alignCast(ptr));
             ctx.cx.overlay_stack.removePermanently(ctx.handle);
-            // portal 化的 barrier 挂在 portal root（非 caller 子树），不会被 Show 卸载
-            // story 子树时连带释放，这里主动从 portal 摘下并释放，避免残留。
+            // portal barrier hangs portal root (not caller), not freed with Show unload story
+            // subtree, manually detach from portal free, avoid remnant.
             if (ctx.barrier_portaled) {
                 if (ctx.barrier_node) |n| {
                     if (n.parent) |p| p.removeChild(n);
                     ctx.cx.freeDetachedNodeAfterScopeDispose(n);
                 }
             }
-            // 释放没有被加入 UI 树的孤立节点（无 parent 说明不在树中，freeNode 不会覆盖到）
+            // free orphan nodes never added to UI tree (no parent = not on-tree, freeNode won't
+            // cover).
             if (ctx.content_node) |n| {
                 if (n.parent == null) ctx.cx.freeDetachedNodeAfterScopeDispose(n);
             }
@@ -1288,8 +1426,9 @@ pub fn overlay(scope: *Scope, cx: *core.Cx, config: LayerConfig) !OverlayResult 
         }
     }.cleanup);
 
-    // 更新 layer 的节点引用
+    // update layer node reference.
     if (cx.overlay_stack.findLayer(handle)) |layer| {
+        OverlayStack.applyLayerSemantics(layer, content_node);
         layer.content_node = content_node;
         layer.barrier_node = barrier_node;
         if (config.focus.restore) {
@@ -1299,9 +1438,9 @@ pub fn overlay(scope: *Scope, cx: *core.Cx, config: LayerConfig) !OverlayResult 
     }
     cx.overlay_stack.syncAllLayerVisualOrder();
 
-    // Portal 化：有 barrier 的层（Modal/Sheet）把 barrier 挂到 portal（覆盖整窗口的
-    // containing block），而非留给 caller 内联 append。这样 barrier 的 absolute
-    // grow/grow 解析到整个窗口，dialog 才能真正全屏遮罩+居中。
+    // portal: barrier layers (Modal/Sheet) hang portal (window-covering containing block),
+    // not caller inline append. barrier absolute grow/grow resolve to full window, dialog
+    // truly full-screen mask + center.
     var portaled = false;
     if (barrier_node) |barrier| {
         if (barrier_portal) |portal| {
@@ -1324,16 +1463,16 @@ const CleanupContext = struct {
     cx: *core.Cx,
     content_node: ?*Node = null,
     barrier_node: ?*Node = null,
-    /// barrier 被挂到了 portal root（非 caller 子树）。scope dispose 时必须主动从
-    /// portal 摘下并释放，否则 portal 里会残留已卸载 story 的 modal 节点。
+    /// barrier hung portal root (not caller). scope dispose must manually detach from
+    /// portal free, else portal remnant unloaded story modal node.
     barrier_portaled: bool = false,
 };
 
-// ========== Anchor 定位 ==========
+// ========== anchor positioning ==========
 
 pub const PopoverPosition = floating.Placement;
 
-/// Anchor 配置（浮动层锚定到触发节点）
+/// anchor config (float pinned to trigger).
 pub const AnchorConfig = struct {
     target: *Node,
     placement: PopoverPosition = .bottom_start,
@@ -1342,7 +1481,7 @@ pub const AnchorConfig = struct {
     shift: bool = true,
 };
 
-/// 对有 anchor 的层执行定位计算（在 tick 中调用）
+/// position calc for anchor layers (call in tick).
 fn updateAnchorPosition(self: *const OverlayStack, layer: *OverlayLayer, vp_w: f32, vp_h: f32) void {
     const anchor = layer.anchor orelse return;
     const content = layer.content_node orelse return;
@@ -1355,7 +1494,7 @@ fn updateAnchorPosition(self: *const OverlayStack, layer: *OverlayLayer, vp_w: f
     const pw = content_rect.w;
     const ph = content_rect.h;
 
-    // 尺寸还没 layout 好，跳过
+    // size not layout yet, skip.
     if (pw == 0 or ph == 0) return;
 
     const trigger_global = target.globalRect();
@@ -1390,13 +1529,14 @@ fn updateAnchorPosition(self: *const OverlayStack, layer: *OverlayLayer, vp_w: f
     if (@abs(content.style.translate_x - new_tx) < 0.01 and @abs(content.style.translate_y - new_ty) < 0.01) return;
     content.style.translate_x = new_tx;
     content.style.translate_y = new_ty;
-    // 权威失效组合：只 markInteractionDirty 会让 prebuilt payload 按旧位置 replay
-    //（与 popover setPopoverTranslate 修过的是同类 bug）。注：当前无组件走
-    // layer.anchor 通用锚定（全走 popover before_render 路径），此处是防未来启用时复雷。
+    // Authoritative invalidation combo: calling only markInteractionDirty would make the prebuilt
+    // payload replay at the old position (same class of bug fixed in popover setPopoverTranslate).
+    // Note: no component currently uses the generic layer.anchor path (all use popover
+    // before_render); this guards against regression if enabled later.
     content.markCompositePropDirty();
 }
 
-// ========== 辅助函数 ==========
+// ========== helpers ==========
 
 fn writeNodeZIndex(node: *Node, z_index: i16) void {
     if (node.style.ext) |ext| {
@@ -1407,7 +1547,7 @@ fn writeNodeZIndex(node: *Node, z_index: i16) void {
     }
 }
 
-// ========== 测试 ==========
+// ========== tests ==========
 
 test "OverlayStack: push and z-index monotonic" {
     var stack = OverlayStack{};
@@ -1533,12 +1673,12 @@ test "OverlayStack: handleEscape closes topmost" {
     const h2 = try stack.push(.{ .kind = .non_modal, .dismiss = .{ .escape = true } });
     try std.testing.expectEqual(@as(u8, 2), stack.layer_count);
 
-    // Escape 只关闭栈顶
+    // escape close top only.
     const consumed = stack.handleEscape();
     try std.testing.expect(consumed);
     try std.testing.expectEqual(@as(u8, 2), stack.layer_count);
 
-    // h2 进入退场动画状态（默认 exit_transition = .scale_fade）
+    // h2 enter exit-anim (default exit_transition = .scale_fade).
     if (stack.findLayer(h2)) |layer| {
         try std.testing.expectEqual(LayerState.exiting, layer.state);
     } else {
@@ -1553,10 +1693,10 @@ test "OverlayStack: handleEscape blocked by modal" {
     _ = try stack.push(.{ .kind = .modal, .dismiss = .{ .escape = false } });
     try std.testing.expectEqual(@as(u8, 2), stack.layer_count);
 
-    // modal 的 escape=false 但 modal 本身阻断传播
+    // modal escape=false but modal self-block propagate.
     const consumed = stack.handleEscape();
-    try std.testing.expect(consumed); // modal 阻断
-    try std.testing.expectEqual(@as(u8, 2), stack.layer_count); // 没有层被关闭
+    try std.testing.expect(consumed); // modal block.
+    try std.testing.expectEqual(@as(u8, 2), stack.layer_count); // no layer closed.
 }
 
 test "OverlayStack: isTopmost" {
@@ -1577,10 +1717,10 @@ test "OverlayStack: mutual exclusion group" {
     try std.testing.expectEqual(@as(u8, 1), stack.layer_count);
     try std.testing.expect(stack.findLayer(h1) != null);
 
-    // 同组的 non_modal 互斥
+    // same-group non_modal mutex.
     const h2 = try stack.push(.{ .kind = .non_modal, .group = "menu" });
     _ = h2;
-    // h1 进入退场动画状态（默认 exit_transition = .scale_fade）
+    // h1 enter exit-anim (default exit_transition = .scale_fade).
     if (stack.findLayer(h1)) |layer| {
         try std.testing.expectEqual(LayerState.exiting, layer.state);
     } else {
@@ -1589,8 +1729,8 @@ test "OverlayStack: mutual exclusion group" {
     try std.testing.expectEqual(@as(u8, 2), stack.layer_count);
 }
 
-// TransitionController 的 5 个单测已随实现移到 overlay_transition.zig
-//（fade enter / fade exit / none is instant / enter delay / seedFromProgress）。
+// TransitionController 5 unit-tests moved to overlay_transition.zig with impl (fade
+// enter/exit / none instant / enter delay / seedFromProgress).
 
 test "OverlayStack: beginExit with exit transition stays in exiting state" {
     var stack = OverlayStack{};
@@ -1599,27 +1739,27 @@ test "OverlayStack: beginExit with exit transition stays in exiting state" {
     const h1 = try stack.push(.{
         .kind = .non_modal,
         .exit_transition = .fade,
-        .enter_transition = .none, // 立即可见
+        .enter_transition = .none, // immediately visible.
     });
     try std.testing.expectEqual(@as(u8, 1), stack.layer_count);
 
-    // beginExit 不会立即移除（有退场动画）
+    // beginExit doesn't immediate-remove (exit-anim).
     stack.beginExit(h1);
-    try std.testing.expectEqual(@as(u8, 1), stack.layer_count); // 仍在栈中
+    try std.testing.expectEqual(@as(u8, 1), stack.layer_count); // still on stack.
     if (stack.findLayer(h1)) |layer| {
         try std.testing.expectEqual(LayerState.exiting, layer.state);
     } else {
         return error.TestUnexpectedResult;
     }
 
-    // tick 推进动画直到完成
+    // tick advance anim until done.
     var ticks: u32 = 0;
     while (stack.findLayer(h1) != null and ticks < 100) : (ticks += 1) {
         test_time += 16.0;
         render_engine.current_frame_time_ms = test_time;
         _ = stack.tick(test_time, 0.016, 1920, 1080, std.testing.allocator); // ~60fps
     }
-    // 动画完成后应被挂起
+    // post-anim suspended.
     if (stack.findLayer(h1)) |layer| {
         try std.testing.expect(layer.suspended);
     } else {
@@ -1657,7 +1797,7 @@ test "OverlayStack: tooltip tier 恒在 dialog 之上（无关打开顺序）" {
     const allocator = std.testing.allocator;
     var stack = OverlayStack{};
 
-    // tooltip 先开、dialog 后开：纯 activation 序会把 dialog 排上面，tier 基线必须赢。
+    // tooltip first, dialog later: pure sequence would rank dialog top, tier baseline must win.
     const tip = try stack.push(.{ .kind = .non_modal, .tier = .tooltip, .enter_transition = .none, .exit_transition = .none });
     const dlg = try stack.push(.{ .kind = .modal, .enter_transition = .none, .exit_transition = .none });
     const tip_n = try Node.create(allocator, 701, .box, .{ .width = .{ .px = 40 }, .height = .{ .px = 20 } });
@@ -1683,7 +1823,7 @@ test "OverlayStack: 嵌套继承 —— dialog content 里的 trigger 开 popove
     try dlg_content.appendChild(allocator, trigger);
     stack.bindFloatingContent(allocator, dlg, dlg_content);
 
-    // popover tier 基线（100）远低于 dialog（1000），继承必须把它抬到 dialog 之上
+    // popover tier (100) << dialog (1000), inherit must lift it above dialog.
     const pop = try stack.push(.{ .kind = .non_modal, .enter_transition = .none, .exit_transition = .none, .trigger_node = trigger });
     const pop_n = try Node.create(allocator, 713, .box, .{ .width = .{ .px = 120 }, .height = .{ .px = 60 } });
     defer pop_n.destroy(allocator);
@@ -1691,7 +1831,7 @@ test "OverlayStack: 嵌套继承 —— dialog content 里的 trigger 开 popove
 
     try std.testing.expect(pop_n.style.z_index() > dlg_content.style.z_index());
 
-    // 树外 trigger 的普通 popover 不受影响，仍在 overlay tier 基线附近
+    // popover no trigger node usual overlay tier baseline nearby.
     const free_pop = try stack.push(.{ .kind = .non_modal, .enter_transition = .none, .exit_transition = .none });
     const free_n = try Node.create(allocator, 714, .box, .{ .width = .{ .px = 100 }, .height = .{ .px = 40 } });
     defer free_n.destroy(allocator);
@@ -1703,8 +1843,8 @@ test "OverlayStack: 后开的 dialog 压过此前活动的 popover（Top Layer F
     const allocator = std.testing.allocator;
     var stack = OverlayStack{};
 
-    // 先开 tooltip 和 popover，再开一个无 trigger_node 的 modal（如从 popover
-    // 内容里打开的 Modal, Modal 组件不传 trigger）。
+    // Open tooltip and popover first, then modal without trigger_node (e.g. Modal from popover
+    // content, Modal component doesn't pass trigger).
     const tip = try stack.push(.{ .kind = .non_modal, .tier = .tooltip, .enter_transition = .none, .exit_transition = .none });
     const pop = try stack.push(.{ .kind = .non_modal, .enter_transition = .none, .exit_transition = .none });
     const dlg = try stack.push(.{ .kind = .modal, .enter_transition = .none, .exit_transition = .none });
@@ -1718,9 +1858,9 @@ test "OverlayStack: 后开的 dialog 压过此前活动的 popover（Top Layer F
     stack.bindFloatingContent(allocator, pop, pop_n);
     stack.bindFloatingContent(allocator, dlg, dlg_n);
 
-    // FIFO：后开的 dialog 必须压过先开的 popover（即便无 trigger 嵌套继承）
+    // FIFO: later-open dialog >= prior popover (even no-trigger nesting).
     try std.testing.expect(dlg_n.style.z_index() > pop_n.style.z_index());
-    // tooltip 恒顶：不被后开的 dialog 压掉
+    // tooltip forever-top: not buried later dialog.
     try std.testing.expect(tip_n.style.z_index() > dlg_n.style.z_index());
 }
 
@@ -1782,9 +1922,9 @@ test "OverlayStack: bound content gains pointer role without losing inspect" {
     defer content.destroy(allocator);
     stack.bindFloatingContent(allocator, handle, content);
 
-    // bindContentNode 只想给 content 加 pointer。历史上它写的是 bool 结构体
-    // `.{ .pointer = true }`，把 inspect 从默认 true 静默改成 false, dialog/panel
-    // 因此在 devtools 里选不中。逐 role 覆盖后 inspect 必须保持 true。
+    // bindContentNode only add pointer. history: struct `.{ .pointer = true }`, silently
+    // inspect true->false, dialog/panel select-miss devtools. per-role override, inspect must
+    // keep true.
     const roles = core.interaction_semantics.nodeHitRoles(content);
     try std.testing.expect(roles.pointer);
     try std.testing.expect(roles.inspect);
@@ -1848,7 +1988,7 @@ test "OverlayStack: entering state transitions to visible" {
         try std.testing.expectEqual(LayerState.entering, layer.state);
     }
 
-    // tick 到完成
+    // tick until done.
     var ticks: u32 = 0;
     while (ticks < 100) : (ticks += 1) {
         test_time += 16.0;
@@ -1898,14 +2038,10 @@ test "OverlayStack: enter transition pending first tick preserves initial frame"
     content.frame_state.state_bits.dirty.core.layout = false;
     content.frame_state.state_bits.dirty.core.subtree_layout = false;
 
-    // Warm-up ticks: rect is now stable but the hold needs three observations
-    // (one to record the rect baseline, two to bump enter_stable_frame_count
-    // to 2) before it releases. progress stays at 0 across all three.
-    for (0..3) |_| {
-        test_time += 16.0;
-        render_engine.current_frame_time_ms = test_time;
-        _ = stack.tick(test_time, 0.016, 1920, 1080, allocator);
-    }
+    // Record the first laid-out rect without exposing changing geometry.
+    test_time += 16.0;
+    render_engine.current_frame_time_ms = test_time;
+    _ = stack.tick(test_time, 0.016, 1920, 1080, allocator);
     if (stack.findLayer(handle)) |layer| {
         try std.testing.expectEqual(LayerState.entering, layer.state);
         try std.testing.expectApproxEqAbs(@as(f32, 0), layer.enter_ctrl.progress, 0.001);
@@ -2061,15 +2197,140 @@ test "OverlayStack: clear" {
     try std.testing.expectEqual(@as(u8, 0), stack.layer_count);
 }
 
-// ── 析出模块的测试收集 ─────────────────────────────────────────────────
-// ⚠ `pub const x = @import(...)` 再导出**不会**让该文件的 test 块被收集
-//（见 build.zig:556-570 对 text 模块同类问题的注释）。必须用裸
-// `_ = @import("...")` 语句把这些文件登记为 test 来源，单测才真的会跑。
+// --- extracted-module test collection ---
+// Warning: `pub const x = @import(...)` re-export **won't** collect that file's test
+// blocks (see build.zig:556-570 text module note). Must register with a bare
+// `_ = @import("...")` as a test source for the tests to run.
 //
-// overlay_transition.zig：TransitionController 时钟/曲线表单测（12 个，
-// 其中 5 个随实现从本文件迁出、7 个为本次新增钉住坑 1~4）。
-// overlay_layer_refs.zig：trigger/anchor 悬垂指针存活校验单测（5 个，全新）。
+// overlay_transition.zig: TransitionController clock/curve table tests.
+// overlay_layer_refs.zig: trigger/anchor dangling-ptr liveness tests.
 test {
     _ = @import("overlay_transition.zig");
     _ = @import("overlay_layer_refs.zig");
+}
+
+test "OverlayStack: 对话框语义归 layer 所有，多次重绑不丢失、不错挂、不清节点固有语义" {
+    const allocator = std.testing.allocator;
+    var stack = OverlayStack{};
+    const dialog_semantics: A11yProps = .{ .role = .dialog, .label = "Settings", .modal = true };
+    const handle = try stack.push(.{ .kind = .modal, .enter_transition = .none, .exit_transition = .none, .a11y = dialog_semantics });
+
+    const a = try Node.create(allocator, 11, .box, .{});
+    defer a.destroy(allocator);
+    const b = try Node.create(allocator, 12, .box, .{});
+    defer b.destroy(allocator);
+    const own = try Node.create(allocator, 13, .box, .{});
+    defer own.destroy(allocator);
+    own.behavior.interaction.a11y = .{ .role = .group, .label = "Own" };
+    const d = try Node.create(allocator, 14, .box, .{});
+    defer d.destroy(allocator);
+
+    stack.bindContentNode(allocator, handle, a);
+    try std.testing.expectEqual(core.A11yRole.dialog, a.behavior.interaction.a11y.?.role);
+
+    // swap to b: a's layer-applied withdrawn, b gets dialog semantics.
+    stack.bindContentNode(allocator, handle, b);
+    try std.testing.expect(a.behavior.interaction.a11y == null);
+    try std.testing.expectEqual(core.A11yRole.dialog, b.behavior.interaction.a11y.?.role);
+
+    // swap to self-declared: theirs, b's withdrawn, own native semantics kept.
+    stack.bindContentNode(allocator, handle, own);
+    try std.testing.expect(b.behavior.interaction.a11y == null);
+    try std.testing.expectEqualStrings("Own", own.behavior.interaction.a11y.?.label.?);
+
+    // swap to blank: dialog semantics remain (old impl here lost entire), own native
+    // untouched.
+    stack.bindContentNode(allocator, handle, d);
+    try std.testing.expectEqual(core.A11yRole.dialog, d.behavior.interaction.a11y.?.role);
+    try std.testing.expectEqualStrings("Own", own.behavior.interaction.a11y.?.label.?);
+
+    // component rewrote layer-applied then swap: rewrite trails semantics, old no phantom
+    // modal (value-judge would leave rewritten copy = 'not layer's' wrongly).
+    d.behavior.interaction.a11y.?.label = "Settings (edited)";
+    stack.bindContentNode(allocator, handle, a);
+    try std.testing.expect(d.behavior.interaction.a11y == null);
+    try std.testing.expectEqualStrings("Settings (edited)", a.behavior.interaction.a11y.?.label.?);
+    try std.testing.expect(a.behavior.interaction.a11y.?.modal);
+
+    // through one yield (own self-declared) then swap blank: rewrite value continues, no
+    // reset to initial.
+    stack.bindContentNode(allocator, handle, own);
+    try std.testing.expect(a.behavior.interaction.a11y == null);
+    stack.bindContentNode(allocator, handle, b);
+    try std.testing.expectEqualStrings("Settings (edited)", b.behavior.interaction.a11y.?.label.?);
+}
+
+test "OverlayStack: semantic actions respect modal and portaled trigger chains" {
+    const a = std.testing.allocator;
+    var stack = OverlayStack{};
+    const background = try Node.create(a, 500, .button, .{});
+    defer background.destroy(a);
+    const modal = try Node.create(a, 501, .box, .{});
+    defer modal.destroy(a);
+    const trigger = try Node.create(a, 502, .button, .{});
+    try modal.appendChild(a, trigger);
+    const popover = try Node.create(a, 503, .box, .{});
+    defer popover.destroy(a);
+    const nested = try Node.create(a, 504, .button, .{});
+    defer nested.destroy(a);
+    try std.testing.expect(stack.allowsSemanticAction(background));
+    const m = try stack.push(.{ .kind = .modal, .enter_transition = .none, .exit_transition = .fade });
+    stack.bindFloatingContent(a, m, modal);
+    try std.testing.expect(!stack.allowsSemanticAction(background));
+    try std.testing.expect(stack.allowsSemanticAction(trigger));
+    const p = try stack.push(.{ .kind = .non_modal, .trigger_node = trigger });
+    stack.bindFloatingContent(a, p, popover);
+    const n = try stack.push(.{ .kind = .non_modal, .trigger_node = popover });
+    stack.bindFloatingContent(a, n, nested);
+    try std.testing.expect(stack.allowsSemanticAction(popover));
+    try std.testing.expect(stack.allowsSemanticAction(nested));
+    // An unrelated newer popup cannot punch through the modal boundary.
+    stack.findLayer(p).?.trigger_node = background;
+    try std.testing.expect(!stack.allowsSemanticAction(popover));
+    try std.testing.expect(!stack.allowsSemanticAction(nested));
+    stack.findLayer(p).?.trigger_node = trigger;
+    const inner = try stack.push(.{ .kind = .modal, .enter_transition = .none });
+    const inner_node = try Node.create(a, 505, .button, .{});
+    defer inner_node.destroy(a);
+    stack.bindFloatingContent(a, inner, inner_node);
+    try std.testing.expect(!stack.allowsSemanticAction(trigger));
+    try std.testing.expect(!stack.allowsSemanticAction(nested));
+    try std.testing.expect(stack.allowsSemanticAction(inner_node));
+    stack.commitExit(inner);
+    try std.testing.expect(!stack.allowsSemanticAction(inner_node));
+    try std.testing.expect(stack.allowsSemanticAction(nested));
+    stack.beginExit(m);
+    try std.testing.expect(!stack.allowsSemanticAction(trigger));
+    try std.testing.expect(stack.allowsSemanticAction(background));
+}
+
+test "OverlayStack: slow clean geometry releases without extra GPU frame holds" {
+    const previous_time = render_engine.current_frame_time_ms;
+    defer render_engine.current_frame_time_ms = previous_time;
+    const allocator = std.testing.allocator;
+    var stack = OverlayStack{};
+    render_engine.current_frame_time_ms = 0;
+    const handle = try stack.push(.{ .kind = .non_modal, .enter_transition = .fade, .exit_transition = .none });
+    const content = try Node.create(allocator, 390, .box, .{ .width = .{ .px = 80 }, .height = .{ .px = 40 } });
+    defer content.destroy(allocator);
+    stack.bindFloatingContent(allocator, handle, content);
+    const layer = stack.findLayer(handle).?;
+    try std.testing.expect(holdEnterUntilGeometryStable(layer, allocator)); // no geometry
+    content.setLayoutRect(.{ .x = 0, .y = 0, .w = 80, .h = 40 });
+    content.frame_state.state_bits.dirty.core.layout = false;
+    content.frame_state.state_bits.dirty.core.subtree_layout = false;
+    try std.testing.expect(holdEnterUntilGeometryStable(layer, allocator)); // baseline
+    render_engine.current_frame_time_ms = 250;
+    try std.testing.expect(!holdEnterUntilGeometryStable(layer, allocator)); // equal, clean
+    content.frame_state.state_bits.dirty.core.layout = true;
+    try std.testing.expect(holdEnterUntilGeometryStable(layer, allocator)); // dirty must reset
+    render_engine.current_frame_time_ms = 500;
+    try std.testing.expect(holdEnterUntilGeometryStable(layer, allocator)); // still dirty
+    content.frame_state.state_bits.dirty.core.layout = false;
+    render_engine.current_frame_time_ms = 516;
+    try std.testing.expect(!holdEnterUntilGeometryStable(layer, allocator)); // clean equal geometry, even at 16 ms
+    content.setLayoutRect(.{ .x = 0, .y = 0, .w = 90, .h = 40 });
+    try std.testing.expect(holdEnterUntilGeometryStable(layer, allocator)); // size changed
+    render_engine.current_frame_time_ms = 550;
+    try std.testing.expect(!holdEnterUntilGeometryStable(layer, allocator));
 }

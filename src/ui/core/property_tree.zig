@@ -1,11 +1,9 @@
-/// Property Trees, Transform / Clip / Effect / Scroll 的保留式数据结构。
+/// Property Trees, retained data structure for Transform / Clip / Effect / Scroll.
+/// Design reference: Chromium RenderingNG's 4 property trees (transform / clip / effect / scroll):
+/// https://developer.chrome.com/docs/chromium/renderingng-data-structures
 ///
-/// 设计参照 Chromium RenderingNG 的 4 棵 property tree：
-///   transform / clip / effect / scroll
-/// （https://developer.chrome.com/docs/chromium/renderingng-data-structures）
-///
-/// Phase 2 目标：4 棵齐全 + 跨帧保留（通过 epoch 跟踪节点改动而非每帧 clear）。
-/// 当前向后兼容 `clear()` API；新代码使用 `beginFrameRetained()` 路径。
+/// Trees are retained across frames (node changes tracked via epoch, not cleared each frame).
+/// The `clear()` API remains for compatibility; new code uses the `beginFrameRetained()` path.
 const std = @import("std");
 const types = @import("types.zig");
 const display_list_mod = @import("display_list.zig");
@@ -14,7 +12,7 @@ const Allocator = std.mem.Allocator;
 const Transform2D = types.Transform2D;
 const ComputedRect = types.ComputedRect;
 
-/// 无效 ID 哨兵值（表示无父节点 / 无关联）
+/// Invalid ID sentinel (indicates no parent / no association).
 pub const INVALID_ID: u32 = std.math.maxInt(u32);
 
 // =========== Transform Tree ===========
@@ -30,24 +28,24 @@ pub const TransformFlags = packed struct(u8) {
 };
 
 pub const TransformNode = struct {
-    /// 父节点在 transforms 数组中的索引（root 节点 parent = 0 自引用）
+    /// Parent index in transforms array (root node parent = 0 self-reference).
     parent: u32,
-    /// 对应 UI Node.id
+    /// Corresponds to UI Node.id.
     node_id: u32,
-    /// 本节点局部变换
+    /// This node's local transform.
     local: Transform2D,
-    /// 累积世界变换 (parent.world × local)
+    /// Accumulated world transform (parent.world × local).
     world: Transform2D,
-    /// world 的逆矩阵（用于 hit-test / 坐标反算）
+    /// Inverse of world transform (for hit-test / coordinate back-projection).
     inverse_world: Transform2D,
-    /// Stage B S5.2: display_list ItemHeader.transform_id 指向此 transform 时
-    /// 用于 lower 的"内容空间"变换。
-    /// - 顶层节点：content == world（与 paint pass 等价）
-    /// - surface (opacity layer / scale layer 等) 内 child：
-    ///   content == inverse_layer_world * world，即在 surface-local 坐标系下
-    ///   叠加 child 自身 transform。这样 lower 出来的 DisplayItem 与 paint
-    ///   pass subtree replay (inverse_replay_base * world) 字节等价。
-    /// - 默认值 == world（无 surface 时不需要区分）
+    /// 'Content space' transform for lowering when display_list ItemHeader.transform_id points to
+    /// this transform.
+    /// - Top-level node: content == world (equivalent to paint pass)
+    /// - Child inside a surface (opacity layer / scale layer etc):
+    ///   content == inverse_layer_world * world, i.e. stacked in the surface-local coord system
+    ///   with the child's own transform. Lowered DisplayItem is byte-equal to
+    ///   paint pass subtree replay (inverse_replay_base * world).
+    /// - Default == world (no distinction needed without a surface).
     content: Transform2D,
     flags: TransformFlags = .{},
 };
@@ -55,36 +53,41 @@ pub const TransformNode = struct {
 // =========== Clip Tree ===========
 
 pub const ClipNode = struct {
-    /// 该 clip 来自 tag==.scroll 的容器(ScrollArea/VirtualList)。
-    /// effect(玻璃/opacity 层)内部只发射这类 clip，全量发射会把
-    /// Input 等小 clip 以错误投影裁没(placeholder 文字消失,实测)。
+    /// This clip from tag==.scroll container (ScrollArea/VirtualList). Inside effect
+    /// (glass/opacity layer) only emit this type clip; full emit wrongly clips small clips
+    /// like Input (placeholder text disappears, measured).
     from_scroll: bool = false,
-    /// 父 clip 节点索引（INVALID_ID = 无父裁剪）
+    /// Parent clip node index (INVALID_ID = no parent clip).
     parent: u32,
-    /// 关联的 transform 节点索引
+    /// Associated transform node index.
     transform_id: u32,
-    /// 对应 UI Node.id
+    /// Corresponds to UI Node.id.
     node_id: u32,
-    /// 本节点局部空间的裁剪矩形
+    /// Clipping rectangle in this node's local space.
     local_rect: ComputedRect,
-    /// 世界空间 AABB
+    /// World-space AABB.
     world_aabb: ComputedRect,
-    /// Render runtime 侧实际消费的 clip 形状。
+    /// Actual clip shape consumed by render runtime.
     shape_kind: display_list_mod.ClipShapeKind = .rect,
     radius: f32 = 0,
     polygon: display_list_mod.ClipPolygon = .{},
-    /// true 表示当前只是用 bounds 做保守退化，不是精确 shape clip。
+    /// true means currently using bounds as conservative degeneration, not precise shape clip.
     bounds_fallback: bool = false,
-    /// CSS overflow 语义：clip 只裁 owner（`node_id`）的**后代**，owner 自己的
-    /// shadow / background / border 不受自身 clip 约束（它们本来就画在 border-box
-    /// 上甚至之外，阴影被自身 overflow clip 裁成矩形，圆角外露出方形灰块）。
-    /// 外部裁剪（external_clip_rects：宿主声明"本节点受此矩形裁剪"）要裁 owner
-    /// 本身，此时为 false。lowering 在 item.node_id == node_id 时跳过本层。
+    /// CSS overflow semantics: a clip only clips the owner's (`node_id`) **descendants**; the
+    /// owner's
+    /// own shadow/background/border are not constrained by its clip (drawn on the border-box or
+    /// beyond;
+    /// clipping a shadow to the rect by own overflow exposes square gray blocks at rounded
+    /// corners).
+    /// External clip (external_clip_rects: host declares 'this node clipped by this rect') clips
+    /// the
+    /// owner itself, false here. Lowering skips this layer when item.node_id == node_id.
     owner_content_exempt: bool = false,
-    /// owner 有画在 children clip 之外的自身内容（阴影 / outline / 可见描边），
-    /// 本 clip 只能以 children 包围的 node-local push_clip 实现（render_engine
-    /// emitScrollClipBegin）。effect owner 的 compositor apply_clip 因此不取本层
-    /// 而取父 clip（apply_clip 在 begin_layer 后立即 push，会裁到 owner 自身）。
+    /// Owner has self-content drawn outside children clip (shadow / outline / visible stroke),
+    /// this clip can only be implemented as a node-local push_clip that wraps just the children
+    /// (render_engine emitScrollClipBegin). Effect owner's compositor apply_clip thus doesn't use
+    /// this layer but parent clip (apply_clip immediately pushes after begin_layer, clips owner
+    /// itself).
     owner_wraps_children: bool = false,
 };
 
@@ -98,49 +101,52 @@ pub const EffectKind = enum(u8) {
 };
 
 pub const EffectNode = struct {
-    /// 父 effect 节点索引（INVALID_ID = 无父效果）
+    /// Parent effect node index (INVALID_ID = no parent effect).
     parent: u32,
-    /// 关联的 transform 节点索引
+    /// Associated transform node index.
     transform_id: u32,
-    /// 对应 UI Node.id
+    /// Corresponds to UI Node.id.
     node_id: u32,
     kind: EffectKind,
     opacity: f32 = 1.0,
-    /// 非 normal 时合成走 W3C blend（仅 opacity/composited_group kind 消费）。
+    /// When non-normal, composition uses W3C blend (only opacity/composited_group kind consumes).
     blend_mode: types.BlendMode = .normal,
-    /// 液态玻璃效果参数（GPU 就绪格式）
+    /// Lens warp of the composited surface (opacity / composited_group kinds).
+    warp: types.ContentWarp = .{},
+    /// Liquid glass effect parameters (GPU-ready format).
     glass: types.ResolvedGlassParams = .{},
     corner_radius: [4]f32 = .{ 0, 0, 0, 0 },
     requires_offscreen: bool = false,
-    /// 效果影响的局部区域
+    /// Local region affected by effect.
     local_bounds: ComputedRect,
 };
 
-// =========== Scroll Tree (Phase 2 新增；对齐 Chromium RenderingNG) ===========
+// =========== Scroll Tree (Phase 2 new; align with Chromium RenderingNG) ===========
 
-/// Scroll 节点，用于复合层位移而非内容重画。
-/// 每个 overflow:scroll/auto 容器对应一个 ScrollNode；动画 / 拖拽时仅更新
-/// `scroll_offset`，下游 layer transform 由此 offset 应用，paint chunk 不变。
+/// Scroll node for composite layer translation, not content repaint. Each
+/// overflow:scroll/auto container has one ScrollNode; during animation/drag, only update
+/// `scroll_offset`, downstream layer transform applies this offset, paint chunk unchanged.
 pub const ScrollNode = struct {
-    /// 父 scroll 节点索引（INVALID_ID = root）
+    /// Parent scroll node index (INVALID_ID = root).
     parent: u32,
-    /// 关联的 transform 节点索引
+    /// Associated transform node index.
     transform_id: u32,
-    /// 对应 UI Node.id
+    /// Corresponds to UI Node.id.
     node_id: u32,
-    /// 当前滚动偏移（正值表示内容向左/上移动，等同视口向右/下）
+    /// Current scroll offset (positive = content moves left/up, equiv viewport moves right/down).
     scroll_offset: types.Point = .{ .x = 0, .y = 0 },
-    /// 内容尺寸（可滚动的总区域）
+    /// Content size (total scrollable area).
     content_size: types.Size = types.Size.ZERO,
-    /// 视口尺寸（可见区域）
+    /// Viewport size (visible area).
     viewport_size: types.Size = types.Size.ZERO,
-    /// 当前帧是否处于滚动动画中（用于 layer 提升决策）
+    /// Whether in scroll animation this frame (for layer promotion decision).
     is_scrolling: bool = false,
 };
 
-// =========== PropertyTree 容器 ===========
+// =========== PropertyTree Container ===========
 
-/// 节点改动 epoch，跨帧保留模式下，调用方可以读这个值决定 layer 是否需要重建。
+/// Node change epoch; in retained-across-frames mode, caller can read this to decide if layer
+/// needs rebuild.
 pub const NodeEpoch = u64;
 
 pub const PropertyTree = struct {
@@ -148,25 +154,26 @@ pub const PropertyTree = struct {
     transforms: std.ArrayList(TransformNode),
     clips: std.ArrayList(ClipNode),
     effects: std.ArrayList(EffectNode),
-    /// Phase 2: scroll 树
+    /// Phase 2: scroll tree.
     scrolls: std.ArrayList(ScrollNode),
 
-    /// 跨帧保留模式状态。`current_epoch` 在每次 beginFrameRetained 时 ++，
-    /// caller 通过比对消费方记录的 epoch 判断是否需要重新读取节点。
+    /// Retained-across-frames mode state. `current_epoch` increments each beginFrameRetained;
+    /// caller compares with consumer's recorded epoch to decide if node re-read needed.
     current_epoch: NodeEpoch = 0,
-    /// 上一次树结构变化（增/删节点）所在的 epoch；layer cache 据此判失效。
+    /// Epoch of last tree structure change (add/delete nodes); layer cache uses this to judge
+    /// invalidation.
     last_structural_change: NodeEpoch = 0,
-    /// 是否启用跨帧保留模式。false（默认）= 旧的"每帧 clear" 路径，向后兼容。
-    /// Phase 4 layer tree 上线后切到 true。
+    /// Whether retained-across-frames mode enabled. false (default) = old 'clear each frame'
+    /// path, backward compatible. Switch to true after Phase 4 layer tree ships.
     retained_mode: bool = false,
 
     pub fn init(allocator: Allocator) PropertyTree {
         return .{
             .allocator = allocator,
-            .transforms = .{},
-            .clips = .{},
-            .effects = .{},
-            .scrolls = .{},
+            .transforms = .empty,
+            .clips = .empty,
+            .effects = .empty,
+            .scrolls = .empty,
         };
     }
 
@@ -177,33 +184,35 @@ pub const PropertyTree = struct {
         self.scrolls.deinit(self.allocator);
     }
 
-    /// 旧路径：每帧清空。等 Phase 4 layer tree 接入后，render_engine 改调
-    /// beginFrameRetained()，此函数仅作过渡兼容存在。
+    /// Old path: clear each frame. After Phase 4 layer tree connects, render_engine calls
+    /// beginFrameRetained(); this function exists for compatibility.
     pub fn clear(self: *PropertyTree) void {
         self.transforms.clearRetainingCapacity();
         self.clips.clearRetainingCapacity();
         self.effects.clearRetainingCapacity();
         self.scrolls.clearRetainingCapacity();
-        // 在非 retained 模式下，每次 clear 视作"全树重建"，等同结构变化
+        // In non-retained mode, each clear counts as 'full tree rebuild', equivalent to structure
+        // change.
         if (!self.retained_mode) {
             self.current_epoch +%= 1;
             self.last_structural_change = self.current_epoch;
         }
     }
 
-    /// 跨帧保留模式：开始一帧。不清空节点，只前进 epoch。
-    /// 调用方负责对真正变更的节点用 mutateXxx 系列 API 推进 last_structural_change。
+    /// Retained-across-frames mode: begin frame. Don't clear nodes, only advance epoch. Caller
+    /// responsible for pushing last_structural_change via mutateXxx series APIs for truly changed
+    /// nodes.
     pub fn beginFrameRetained(self: *PropertyTree) void {
         self.retained_mode = true;
         self.current_epoch +%= 1;
     }
 
-    /// 通知 PropertyTree 发生了拓扑变化（增删节点），让消费方失效缓存。
+    /// Notify PropertyTree of topology change (add/delete nodes), invalidate consumer cache.
     pub fn markStructuralChange(self: *PropertyTree) void {
         self.last_structural_change = self.current_epoch;
     }
 
-    /// 追加 transform 节点，返回其索引
+    /// Append transform node, return its index.
     pub fn appendTransform(self: *PropertyTree, node: TransformNode) !u32 {
         const id: u32 = @intCast(self.transforms.items.len);
         try self.transforms.append(self.allocator, node);
@@ -211,7 +220,7 @@ pub const PropertyTree = struct {
         return id;
     }
 
-    /// 追加 clip 节点，返回其索引
+    /// Append clip node, return its index.
     pub fn appendClip(self: *PropertyTree, node: ClipNode) !u32 {
         const id: u32 = @intCast(self.clips.items.len);
         try self.clips.append(self.allocator, node);
@@ -219,7 +228,7 @@ pub const PropertyTree = struct {
         return id;
     }
 
-    /// 追加 effect 节点，返回其索引
+    /// Append effect node, return its index.
     pub fn appendEffect(self: *PropertyTree, node: EffectNode) !u32 {
         const id: u32 = @intCast(self.effects.items.len);
         try self.effects.append(self.allocator, node);
@@ -227,7 +236,7 @@ pub const PropertyTree = struct {
         return id;
     }
 
-    /// 追加 scroll 节点，返回其索引
+    /// Append scroll node, return its index.
     pub fn appendScroll(self: *PropertyTree, node: ScrollNode) !u32 {
         const id: u32 = @intCast(self.scrolls.items.len);
         try self.scrolls.append(self.allocator, node);
@@ -235,8 +244,8 @@ pub const PropertyTree = struct {
         return id;
     }
 
-    /// 更新 scroll offset（动画/拖拽热路径）。**不**触发结构变化 epoch，
-    /// 只是 in-place 修改；layer 据此应用平移而无需重 paint。
+    /// Update scroll offset (animation/drag hot path). **Don't** trigger structure-change epoch,
+    /// just in-place mutation; layer applies translation without re-paint.
     pub fn updateScrollOffset(self: *PropertyTree, scroll_id: u32, offset: types.Point) void {
         if (scroll_id >= self.scrolls.items.len) return;
         self.scrolls.items[scroll_id].scroll_offset = offset;
@@ -299,30 +308,30 @@ test "PropertyTree: updateScrollOffset does not change structure epoch" {
         .content_size = .{ .width = 1000, .height = 5000 },
         .viewport_size = .{ .width = 1000, .height = 800 },
     });
-    // 创建节点是结构变化
+    // Creating nodes is structural change.
     try testing.expect(pt.last_structural_change >= epoch_before_create);
 
-    // 推进帧
+    // Advance frame.
     pt.beginFrameRetained();
     const epoch_at_anim = pt.current_epoch;
     const struct_at_anim = pt.last_structural_change;
 
-    // 动画期间只改 offset
+    // During animation, only modify offset.
     pt.updateScrollOffset(0, .{ .x = 0, .y = 100 });
     pt.updateScrollOffset(0, .{ .x = 0, .y = 200 });
 
-    // 结构 epoch 没变，layer 缓存可继续命中
+    // Structure epoch unchanged, layer cache continues to hit.
     try testing.expectEqual(struct_at_anim, pt.last_structural_change);
     try testing.expectEqual(epoch_at_anim, pt.current_epoch);
 
-    // 但 offset 真的更新了
+    // But offset truly updated.
     try testing.expectEqual(@as(f32, 200), pt.scrolls.items[0].scroll_offset.y);
 }
 
 test "PropertyTree: clear in legacy mode bumps structural epoch" {
     var pt = PropertyTree.init(testing.allocator);
     defer pt.deinit();
-    // legacy mode（默认）
+    // legacy mode (default).
     const before = pt.last_structural_change;
     pt.clear();
     try testing.expect(pt.last_structural_change != before);

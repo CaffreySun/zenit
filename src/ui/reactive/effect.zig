@@ -5,14 +5,14 @@ const EffectBase = @import("effect_base.zig").EffectBase;
 const SignalOwner = @import("owner.zig").SignalOwner;
 const Scope = @import("scope.zig").Scope;
 
-/// Effect: 自动响应依赖变化
+/// Effect: automatically responds to dependency changes
 ///
-/// 核心机制:
-/// 1. Effect 运行时,会自动追踪所有访问的 Signal
-/// 2. 当任何依赖的 Signal 变化时,Effect 会自动重新运行
-/// 3. 每次运行前会清空旧依赖,重新收集
+/// Core mechanism:
+/// 1. Effect runtime auto-tracks all accessed Signals
+/// 2. When any dependency Signal changes, Effect reruns automatically
+/// 3. Before each run, clears old dependencies and recollects them
 ///
-/// 用法:
+/// Usage:
 /// ```zig
 /// try owner.createEffect(.{ .count = count }, struct {
 ///     fn run(ctx: anytype) void {
@@ -28,7 +28,7 @@ pub fn Effect(comptime Context: type, comptime effectFn: anytype) type {
 
         const Self = @This();
 
-        /// 创建 Effect（Arena 路径，旧代码兼容）
+        /// Create Effect (owner arena path, released with owner; app code use `scope.createEffect`)
         pub fn create(owner: *SignalOwner, context: Context) !*Self {
             const effect = try owner.allocator().create(Self);
             errdefer owner.allocator().destroy(effect);
@@ -38,36 +38,36 @@ pub fn Effect(comptime Context: type, comptime effectFn: anytype) type {
                 .owner = owner,
             };
 
-            // 注册到 owner
+            // Register to owner
             try owner.registerEffect(&effect.base);
-            // graph 注册失败时把半注册态摘掉：注册表里留一个 graph_node_raw
-            // 仍是 0xFFFFFFFF 的 EffectBase，会被后续遍历当成活 effect
+            // graph register fail strip half-register: table left EffectBase with graph_node_raw
+            // still 0xFFFFFFFF treated live effect by later traverse
             errdefer if (owner.effects.items.len > 0 and
                 owner.effects.items[owner.effects.items.len - 1] == &effect.base)
             {
                 _ = owner.effects.pop();
             };
 
-            // 在 graph 注册 effect node + recompute callback。
-            // graph 的 markSignalWritten 路径会通过 NodeId 入 pending queue，
-            // drainPendingEffects 时按拓扑序跑，调到这个 callback。
+            // Register effect node + recompute callback in graph.
+            // graph markSignalWritten path queues via NodeId, drainPendingEffects runs topo-order,
+            // calls this callback.
             const gid = try owner.graph.createNodeRaw(.effect, &graphRecomputeCb, &effect.base);
             effect.base.graph_node_raw = @bitCast(gid);
 
-            // 初始运行一次（建立依赖）
+            // Initial run once (establish dependencies)
             effect.runWithTracking();
 
             return effect;
         }
 
-        /// 在 Scope 中创建 Effect（保留模式路径）
+        /// Create Effect in Scope (retain-mode path)
         pub fn createInScope(scope: *Scope, context: Context) !*Self {
             const owner = scope.owner;
             const allocator = scope.allocator;
             owner.assertThread();
             const effect = try allocator.create(Self);
-            // scope.allocator 是 caller allocator：graph 注册失败必须整体回退，
-            // 否则 effect 结构体净泄漏 + scope.effects 里留半注册态
+            // scope.allocator is caller allocator: graph register fail must rollback all,
+            // else effect struct pure leak + scope.effects left half-register
             var effect_owned_by_scope = false;
             errdefer if (!effect_owned_by_scope) allocator.destroy(effect);
             effect.* = .{
@@ -75,10 +75,10 @@ pub fn Effect(comptime Context: type, comptime effectFn: anytype) type {
                 .context = context,
                 .owner = owner,
             };
-            // Scope 路径：dependencies 列表也用 scope.allocator
+            // Scope path: dependencies list also uses scope.allocator
             effect.base.scope_allocator = allocator;
 
-            // 注册到 scope
+            // Register to scope
             try scope.registerEffect(&effect.base);
             var registered_with_scope = true;
             errdefer if (registered_with_scope and scope.effects.items.len > 0 and
@@ -87,12 +87,12 @@ pub fn Effect(comptime Context: type, comptime effectFn: anytype) type {
                 _ = scope.effects.pop();
             };
 
-            // 同步在 graph 注册（与 Arena 路径一致）
+            // Sync register in graph (match Arena path)
             const gid = try owner.graph.createNodeRaw(.effect, &graphRecomputeCb, &effect.base);
             errdefer owner.graph.destroyNode(gid);
             effect.base.graph_node_raw = @bitCast(gid);
 
-            // 初始运行一次
+            // Initial run once
             owner.beginReactiveCallback();
             effect.runWithTracking();
             const scope_was_disposed = scope.willBeDisposedAfterReactiveCallback();
@@ -111,13 +111,13 @@ pub fn Effect(comptime Context: type, comptime effectFn: anytype) type {
             return effect;
         }
 
-        /// 虚函数表（Arena 路径）
+        /// vtable (Arena path)
         const vtable = EffectBase.VTable{
             .run = runImpl,
             .cleanup = cleanupImpl,
         };
 
-        /// 虚函数表（Scope 路径，支持单独释放）
+        /// vtable (Scope path, supports individual release)
         const scope_vtable = EffectBase.VTable{
             .run = runImpl,
             .cleanup = cleanupImpl,
@@ -129,10 +129,10 @@ pub fn Effect(comptime Context: type, comptime effectFn: anytype) type {
             effectFn(self.context);
         }
 
-        /// graph 调度路径下的 recompute callback。
-        /// 走 runWithTrackingFast, graph.recomputeNode 已经做了
-        /// clearSources + pushTracking + popTracking，跳过重复设置（~30 ns/effect）。
-        /// 返回 false：effect 没有"值"概念（不影响 version 戳）。
+        /// recompute callback in graph dispatch path.
+        /// use runWithTrackingFast, graph.recomputeNode already did
+        /// clearSources + pushTracking + popTracking, skip duplicate setup (~30 ns/effect).
+        /// return false: effect has no 'value' concept (doesn't affect version stamp).
         fn graphRecomputeCb(ctx: *anyopaque) bool {
             const base: *EffectBase = @ptrCast(@alignCast(ctx));
             const self: *Self = @fieldParentPtr("base", base);
@@ -141,31 +141,31 @@ pub fn Effect(comptime Context: type, comptime effectFn: anytype) type {
         }
 
         fn cleanupImpl(base: *EffectBase) void {
-            // Arena allocator 会自动释放所有内存
-            // 依赖关系的清理在 owner.deinit() 中统一处理
+            // Arena allocator auto-releases all memory
+            // dependency cleanup in owner.deinit() unified
             _ = base;
         }
 
         fn destroyImpl(base: *EffectBase, allocator: Allocator) void {
             const self: *Self = @fieldParentPtr("base", base);
-            // dependencies 字段已删；graph 路径处理边
+            // dependencies field deleted; graph path handles edge
             allocator.destroy(self);
         }
 
-        /// 运行 Effect 并重新收集依赖
+        /// Run Effect and recollect dependencies
         fn runWithTracking(self: *Self) void {
             self.base.runWithTracking(self.owner, self.owner.allocator());
         }
     };
 }
 
-// ===== 辅助函数 =====
+// ===== helper functions =====
 
-/// 创建 Effect 的便捷函数
+/// Convenience create Effect
 ///
 /// owner: SignalOwner
-/// context: 传递给 effectFn 的上下文
-/// comptime effectFn: Effect 函数
+/// context: context passed to effectFn
+/// comptime effectFn: Effect function
 pub fn createEffect(
     owner: *SignalOwner,
     context: anytype,
@@ -176,7 +176,7 @@ pub fn createEffect(
     _ = try EffectType.create(owner, context);
 }
 
-// ===== 测试 =====
+// ===== test =====
 
 const Signal = @import("signal.zig").Signal;
 
@@ -193,12 +193,12 @@ test "Effect: basic execution" {
         .counter = &effect_run_count,
     }, struct {
         fn run(ctx: anytype) void {
-            _ = ctx.count.get(); // 建立依赖
+            _ = ctx.count.get(); // establish dependency
             ctx.counter.* += 1;
         }
     }.run);
 
-    // Effect 创建时应该执行一次
+    // Effect created should run once
     try std.testing.expectEqual(@as(i32, 1), effect_run_count);
 }
 
@@ -215,14 +215,14 @@ test "Effect: auto dependency tracking" {
         .counter = &effect_run_count,
     }, struct {
         fn run(ctx: anytype) void {
-            _ = ctx.count.get(); // 自动追踪依赖
+            _ = ctx.count.get(); // auto-track dependencies
             ctx.counter.* += 1;
         }
     }.run);
 
     try std.testing.expectEqual(@as(i32, 1), effect_run_count);
 
-    // 修改 count,Effect 应该自动重新执行
+    // modify count, Effect should auto-rerun
     count.set(1);
     try std.testing.expectEqual(@as(i32, 2), effect_run_count);
 
@@ -273,8 +273,8 @@ test "Effect: no tracking with peek" {
         .counter = &effect_run_count,
     }, struct {
         fn run(ctx: anytype) void {
-            _ = ctx.tracked.get(); // 追踪
-            _ = ctx.untracked.peek(); // 不追踪
+            _ = ctx.tracked.get(); // track
+            _ = ctx.untracked.peek(); // don't track
             ctx.counter.* += 1;
         }
     }.run);
@@ -282,10 +282,10 @@ test "Effect: no tracking with peek" {
     try std.testing.expectEqual(@as(i32, 1), effect_run_count);
 
     tracked.set(1);
-    try std.testing.expectEqual(@as(i32, 2), effect_run_count); // Effect 重新运行
+    try std.testing.expectEqual(@as(i32, 2), effect_run_count); // Effect reruns
 
     untracked.set(1);
-    try std.testing.expectEqual(@as(i32, 2), effect_run_count); // Effect 不运行
+    try std.testing.expectEqual(@as(i32, 2), effect_run_count); // Effect not run
 }
 
 test "Effect: dynamic dependency switching" {
@@ -434,7 +434,7 @@ test "Effect: batch + untrack + nested effects keep tracking" {
         }
     }.run);
 
-    // A: trigger true 时，在 untrack 内执行 batch，批量更新 source
+    // A: trigger true time, in untrack execute batch, batch-update source
     try createEffect(owner, .{
         .owner = owner,
         .trigger = trigger,
@@ -451,7 +451,7 @@ test "Effect: batch + untrack + nested effects keep tracking" {
                     args.owner.batch(struct {
                         fn update(inner: anytype) void {
                             inner.source.set(1);
-                            inner.source.set(2); // batch 去重后 B 只应运行一次
+                            inner.source.set(2); // batch dedup so B only run once
                         }
                     }.update, .{ .source = args.source }) catch unreachable;
                 }
@@ -462,20 +462,20 @@ test "Effect: batch + untrack + nested effects keep tracking" {
         }
     }.run);
 
-    // 初始运行
+    // initial run
     try std.testing.expectEqual(@as(i32, 1), a_runs);
     try std.testing.expectEqual(@as(i32, 1), b_runs);
     try std.testing.expectEqual(@as(i32, 1), c_runs);
     try std.testing.expectEqual(@as(i32, 0), leaf_value);
 
-    // 触发 A：在 untrack + batch 中修改 source，B/C 需正确运行并保持订阅
+    // trigger A: in untrack + batch modify source, B/C must run correctly and keep subscribe
     trigger.set(true);
     try std.testing.expectEqual(@as(i32, 2), a_runs);
     try std.testing.expectEqual(@as(i32, 2), b_runs);
     try std.testing.expectEqual(@as(i32, 2), c_runs);
     try std.testing.expectEqual(@as(i32, 4), leaf_value);
 
-    // 再次直接更新 source，验证 B/C 订阅没有丢失
+    // direct update source again, verify B/C subscribe not lost
     source.set(3);
     try std.testing.expectEqual(@as(i32, 3), b_runs);
     try std.testing.expectEqual(@as(i32, 3), c_runs);

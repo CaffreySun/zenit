@@ -1,21 +1,19 @@
 /// Checkbox, Radio, Switch Components
 ///
-/// 复选框、单选框、开关组件
+/// Signal-driven: hover state is managed via Signal, Effect auto-updates style. Toggle state is
+/// kept in StateStore (involves DOM structure change).
 ///
-/// Signal 驱动: hover 状态通过 Signal 管理，
-/// Effect 自动更新样式。Toggle 状态保留 StateStore
-/// （涉及 DOM 结构变化）。
-///
-/// 特性:
-/// - 状态管理: toggle 通过 StateStore, hover 通过 Signal
-/// - 事件驱动: 通过 on_event 处理 click 事件
-/// - 焦点支持: 可聚焦, 支持 Tab 导航
-/// - 标签支持
-/// - 禁用状态
-/// - on_change 回调
+/// Features:
+/// - State management: toggle by StateStore, hover by Signal
+/// - Event driven: on_event handles click
+/// - Focus support: focusable, Tab navigation
+/// - Label support
+/// - Disabled state
+/// - on_change callback
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const core = @import("../../core.zig");
+const ui_view = @import("../../view.zig");
 const Cx = core.Cx;
 const Node = core.Node;
 const box = core.box;
@@ -29,12 +27,19 @@ const EventResult = events.EventResult;
 const hooks = @import("../../hooks.zig");
 const svg_assets = @import("../../svg_assets.zig");
 const icons = @import("zenit_system_icons");
-const Scope = @import("../../reactive.zig").Scope;
+const reactive = @import("../../reactive.zig");
+const Scope = reactive.Scope;
+const Source = reactive.Source;
+const Model = reactive.Model;
+const Handler = core.Handler;
+const bind_mod = @import("../../bind.zig");
+const ui_split = reactive.split;
+const eq_mod = @import("../../reactive/eq.zig");
 
 const recipe_mod = @import("../../recipe.zig");
 
-// 样式层析出至 styles.zig；下列别名保持调用点与公共 API 不变。
-const styles = @import("styles.zig");
+// Style layer factor to styles.yss; aliases below keep call-site and public API unchanged.
+const styles = @import("_styles.yss.zig");
 pub const CheckboxRecipe = styles.CheckboxRecipe;
 pub const SwitchRecipe = styles.SwitchRecipe;
 pub const CheckboxColors = styles.CheckboxColors;
@@ -51,913 +56,255 @@ const switchTrackStyle = styles.switchTrackStyle;
 const switchThumbStyle = styles.switchThumbStyle;
 const switchLabelStyle = styles.switchLabelStyle;
 
-/// Checkbox 内部状态
-pub const CheckboxState = struct {
-    checked: bool = false,
-    indeterminate: bool = false,
-    disabled: bool = false,
+// Checkbox
+//
+// Signal-first (docs/SIGNAL_API_DESIGN.md): `checked` is Model (local/bound/split);
+// other changeable props are Source. View = f(checked, indeterminate, disabled), derived by one
+// effect. Interaction only calls `Bound.propose`; if the parent refuses, the view stays unchanged.
 
-    /// Theme tokens 引用 (供 on_before_render 使用)
-    tokens: *const theme.ThemeTokens = &theme.dark,
+/// Create Checkbox: `W.Checkbox(.{ .label = "Agree", .checked = agree })`.
+/// props: checked (controlled value Model(bool))/indeterminate (read-only)/label/disabled/
+/// on_change (only report settled value)/check_icon_asset.
+/// View in checkbox.yix, style in styles.yss CheckboxParts.
+pub const Checkbox = @import("_checkbox.yix.zig").Checkbox;
 
-    /// 外部回调 (存储 props 传入的回调)
-    /// 2026-07-31 并轨：统一 ?core.HandlerRef（含 context），用
-    /// invokeWithBool 触发。旧的 fn-ptr + callback_context 双字段已合并。
-    on_change: ?core.HandlerRef = null,
-
-    /// checkbox_box 节点引用（用于 setBackground/setBorderColor 触发 Transition）
-    checkbox_box: ?*Node = null,
-
-    pub fn toggle(self: *CheckboxState) void {
-        if (self.disabled) return;
-        self.checked = !self.checked;
-        self.indeterminate = false;
-
-        // toggle 后立即更新 checkbox_box 的颜色（通过 Transition 系统自动过渡）
-        if (self.checkbox_box) |checkbox_node| {
-            const t = self.tokens;
-            // indeterminate 视为 checked 来计算颜色
-            const effectively_checked = self.checked or self.indeterminate;
-            checkbox_node.setBackground(CheckboxColors.background(t, effectively_checked, self.disabled));
-            checkbox_node.setBorderColor(CheckboxColors.borderColor(t, effectively_checked, self.disabled));
-        }
-
-        if (self.on_change) |h| h.invokeWithBool(self.checked);
-    }
-};
-
-/// Checkbox on_before_render 钩子：更新 checkmark / indeterminate 可见性
-/// 背景色和边框色的过渡动画由框架 Transition 系统自动处理（toggle 时通过 setBackground/setBorderColor 触发）
-fn checkboxBeforeRender(node: *Node) void {
-    const state: *CheckboxState = @ptrCast(@alignCast(node.behavior.events.event_context orelse return));
-
-    if (node.behavior.interaction.a11y) |*a11y| {
-        a11y.checked = state.checked;
-        a11y.indeterminate = state.indeterminate and !state.checked;
-    }
-
-    if (node.children.items.len == 0) return;
-    const checkbox_box = node.children.items[0];
-
-    if (checkbox_box.children.items.len < 2) return;
-    const checkmark = checkbox_box.children.items[0];
-    const indet_overlay = checkbox_box.children.items[1];
-
-    // 更新可见性
-    checkmark.setOpacityRaw(if (state.checked) 1.0 else 0.0);
-    indet_overlay.setOpacityRaw(if (state.indeterminate and !state.checked) 1.0 else 0.0);
+/// Click or spacebar
+fn isToggleEvent(event: Event) bool {
+    return switch (event) {
+        .click => true,
+        .key_down => |e| e.key == .space,
+        else => false,
+    };
 }
 
-/// Checkbox 事件处理器
-fn checkboxEventHandler(event: Event, context: ?*anyopaque) EventResult {
-    const state: *CheckboxState = @ptrCast(@alignCast(context orelse return .ignored));
-    if (state.disabled) return .ignored;
-
-    switch (event) {
-        .click => {
-            state.toggle();
-            return .handled;
-        },
-        .key_down => |e| {
-            // Space 键也可以切换
-            if (e.key == .space) {
-                state.toggle();
-                return .handled;
-            }
-            return .ignored;
-        },
-        else => return .ignored,
-    }
-}
-
-/// Checkbox 属性
-pub const CheckboxProps = struct {
-    /// 选中状态
-    /// 初始勾选态。**只在 mount 时读取一次**，之后改无效（组件持有
-    /// 自己的 CheckboxState）。需要外部驱动请用 mountResult 拿 state 后
-    /// 调 setChecked，或用 ui.Show 重建。
-    initial_checked: bool = false,
-    /// 不确定状态
-    indeterminate: bool = false,
-    /// 标签
-    label_text: ?[]const u8 = null,
-    /// 禁用
-    disabled: bool = false,
-    /// 变化回调。2026-07-31 并轨为 `?core.HandlerRef`。
-    /// 需要拿到新值用 `cx.boolHandlerFrom(State, ptr, method)` 构造；
-    /// 只关心"变了"用 `cx.handlerFrom(...)`。
-    on_change: ?core.HandlerRef = null,
-    /// 状态 ID (用于 StateStore)
-    state_id: ?u64 = null,
-    /// Check icon SVG 资产
-    check_icon_asset: ?svg_assets.Asset = null,
-};
-
-/// 创建 Checkbox
-pub fn Checkbox(props: CheckboxProps) CheckboxBuilder {
-    return CheckboxBuilder{ .props = props };
-}
-
-pub const CheckboxBuilder = struct {
-    props: CheckboxProps,
-
-    pub fn checked(self: CheckboxBuilder, c: bool) CheckboxBuilder {
-        var new = self;
-        new.props.initial_checked = c;
-        return new;
-    }
-
-    pub fn label(self: CheckboxBuilder, text: []const u8) CheckboxBuilder {
-        var new = self;
-        new.props.label_text = text;
-        return new;
-    }
-
-    pub fn disabled(self: CheckboxBuilder, d: bool) CheckboxBuilder {
-        var new = self;
-        new.props.disabled = d;
-        return new;
-    }
-
-    pub fn onChange(self: CheckboxBuilder, handler_ref: core.HandlerRef) CheckboxBuilder {
-        var new = self;
-        new.props.on_change = handler_ref;
-        return new;
-    }
-
-    pub fn checkIconAsset(self: CheckboxBuilder, asset: svg_assets.Asset) CheckboxBuilder {
-        var new = self;
-        new.props.check_icon_asset = asset;
-        return new;
-    }
-
-    /// 保留模式: mount
-    pub fn mount(self: CheckboxBuilder, scope: *Scope, cx: *Cx) !*Node {
-        const my_scope = try scope.childScope();
-        const allocator = cx.allocator;
-        const t = cx.tokens;
-        const p = self.props;
-
-        // Scope 分配内部状态（替代 StateStore）
-        const state = try my_scope.allocator.create(CheckboxState);
-        state.* = .{
-            .checked = p.initial_checked,
-            .indeterminate = p.indeterminate,
-            .disabled = p.disabled,
-            .tokens = t,
-            .on_change = p.on_change,
-        };
-        try my_scope.adoptResource(@ptrCast(state), struct {
-            fn destroy(ptr: *anyopaque, alloc: std.mem.Allocator) void {
-                const s: *CheckboxState = @ptrCast(@alignCast(ptr));
-                alloc.destroy(s);
-            }
-        }.destroy);
-
-        // 外层容器
-        const container = try box(cx, controlRowStyle(), .{});
-        // sweep：container 从建好到 return 之间还有多步可失败构造，守卫一直武装到 return
-        errdefer cx.freeNode(container);
-        container.tag = .button;
-        container.setFocusable(true);
-        container.meta.ownership.meta.component_name = "Checkbox";
-        try core.bindScopeToNode(my_scope, container);
-        container.behavior.interaction.a11y = .{
-            .role = .checkbox,
-            .label = p.label_text,
-            .checked = state.checked,
-            .indeterminate = state.indeterminate and !state.checked,
-            .disabled = p.disabled,
-        };
-        container.style.cursor = if (p.disabled) .not_allowed else .pointer;
-        container.addDebugState(@ptrCast(state));
-
-        // 复选框方框（indeterminate 视为 checked 来决定颜色）
-        const effectively_checked = p.initial_checked or p.indeterminate;
-        // 建好即挂（container 的 errdefer 兜底整棵），子节点各自 adopt
-        const checkbox_box = try core.adoptChild(cx, allocator, container, try box(cx, checkboxBoxStyle(t, effectively_checked, p.disabled), .{}));
-
-        // 配置 Transition: 背景色和边框色自动过渡（替代手动 AnimatedColor）
-        checkbox_box.applyTransition(allocator, &comptime recipe_mod.transition("background 150ms ease-out, border-color 150ms ease-out"));
-        state.checkbox_box = checkbox_box;
-
-        // Check 层：flex child，居中。
-        // 默认用图标库的 `check` 字形（纯对勾，无外框，方框由 checkbox_box 自身绘制），
-        // 调用方可通过 check_icon_asset 覆盖。
-        const checkmark = try core.adoptChild(cx, allocator, checkbox_box, try core.iconTint(cx, p.check_icon_asset orelse icons.check, t.color.button_primary_fg, checkIconStyle()));
-        checkmark.setOpacityRaw(if (state.checked) 1.0 else 0.0);
-
-        // Indeterminate 层：absolute 覆盖 checkbox_box 同尺寸，内部 justify+align 居中
-        const indet_overlay = try core.adoptChild(cx, allocator, checkbox_box, try box(cx, indetOverlayStyle(), .{}));
-        // indeterminate 用图标库的 `minus` 字形（圆头横杠，无外框）
-        _ = try core.adoptChild(cx, allocator, indet_overlay, try core.iconTint(cx, icons.minus, t.color.button_primary_fg, checkIconStyle()));
-        indet_overlay.setOpacityRaw(if (state.indeterminate and !state.checked) 1.0 else 0.0);
-
-        // 标签
-        if (p.label_text) |lbl| {
-            const label_node = try core.adoptChild(cx, allocator, container, try box(cx, .{}, .{}));
-            var label_txt = controlLabelStyle(t, p.disabled);
-            label_txt.content = lbl;
-            label_node.setText(label_txt);
-        }
-
-        // 事件处理器
-        container.behavior.events.event_context = state;
-
-        // on_before_render 必须在 useFocusRing 之前设置，
-        // 因为 useFocusRing 会链式保存旧的 on_before_render
-        container.meta.per_frame.hooks.before_render.main = checkboxBeforeRender;
-
-        if (!p.disabled) {
-            container.behavior.events.on_event = checkboxEventHandler;
-
-            // Scoped hover（始终提供 hover 效果）
-            _ = try hooks.useHover(my_scope, container);
-            try hooks.useFocusRing(my_scope, cx, container, .{});
-        }
-
-        return container;
-    }
-};
-
-// ==================== Radio ====================
-
-/// Radio 属性
-pub const RadioProps = struct {
-    checked: bool = false,
-    label_text: ?[]const u8 = null,
-    value: []const u8 = "",
-    name: []const u8 = "",
-    disabled: bool = false,
-    on_change: ?core.HandlerRef = null,
-    /// 跳过内部交互注册（RadioGroup 统一管理时设 true）
-    _skip_interaction: bool = false,
-};
-
-/// 创建 Radio
-pub fn Radio(props: RadioProps) RadioBuilder {
-    return RadioBuilder{ .props = props };
-}
-
-pub const RadioBuilder = struct {
-    props: RadioProps,
-
-    pub fn checked(self: RadioBuilder, c: bool) RadioBuilder {
-        var new = self;
-        new.props.initial_checked = c;
-        return new;
-    }
-
-    pub fn label(self: RadioBuilder, text: []const u8) RadioBuilder {
-        var new = self;
-        new.props.label_text = text;
-        return new;
-    }
-
-    pub fn value(self: RadioBuilder, v: []const u8) RadioBuilder {
-        var new = self;
-        new.props.value = v;
-        return new;
-    }
-
-    pub fn disabled(self: RadioBuilder, d: bool) RadioBuilder {
-        var new = self;
-        new.props.disabled = d;
-        return new;
-    }
-
-    /// 保留模式: mount
-    pub fn mount(self: RadioBuilder, scope: *Scope, cx: *Cx) !*Node {
-        const my_scope = try scope.childScope();
-        const allocator = cx.allocator;
-        const t = cx.tokens;
-        const p = self.props;
-
-        // 外层容器
-        const container = try box(cx, controlRowStyle(), .{});
-        // sweep：container 守卫一直武装到 return；子节点建好即 adopt
-        errdefer cx.freeNode(container);
-        container.meta.ownership.meta.component_name = "Radio";
-        try core.bindScopeToNode(my_scope, container);
-        container.setOpacityRaw(if (p.disabled) 0.5 else 1.0);
-
-        const circle = try core.adoptChild(cx, allocator, container, try box(cx, radioCircleStyle(t, p.checked), .{}));
-
-        // 配置 Transition: 背景色和边框色自动过渡（选中态切换由 RadioGroup 的 before_render 触发）
-        circle.applyTransition(allocator, &comptime recipe_mod.transition("background 150ms ease-out, border-color 150ms ease-out"));
-
-        // 内部圆点（白色，始终存在，未选中时隐藏）
-        const dot = try core.adoptChild(cx, allocator, circle, try box(cx, radioDotStyle(t), .{}));
-        // 圆点的显隐做透明度过渡（与 circle 同步时长），避免硬切
-        dot.applyTransition(allocator, &comptime recipe_mod.transition("opacity 150ms ease-out"));
-        dot.setOpacityRaw(if (p.checked) 1.0 else 0.0);
-
-        // 标签
-        if (p.label_text) |lbl| {
-            const label_node = try core.adoptChild(cx, allocator, container, try box(cx, .{ .width = .{ .fit = .{} }, .height = .{ .fit = .{} } }, .{}));
-            var label_txt = controlLabelStyle(t, false);
-            label_txt.content = lbl;
-            label_node.setText(label_txt);
-        }
-
-        // 交互（hover + focus ring），RadioGroup 统一管理时跳过
-        if (p.disabled) {
-            container.style.cursor = .not_allowed;
-        } else if (!p._skip_interaction) {
-            container.style.cursor = .pointer;
-            _ = try hooks.useHoverHighlight(my_scope, container, circle, .border_color, t.color.checkbox_border, t.color.accent, .{});
-            try hooks.useFocusRing(my_scope, cx, container, .{});
-        }
-
-        return container;
-    }
-};
-
-// ==================== RadioGroup ====================
-
-pub const RadioGroupProps = struct {
-    options: []const RadioOption,
-    value: ?[]const u8 = null,
-    name: []const u8 = "",
-    horizontal: bool = false,
-    disabled: bool = false,
-    on_change: ?core.HandlerRef = null,
-    state_id: ?u64 = null,
-};
+// ==================== Radio / RadioGroup ====================
 
 pub const RadioOption = struct {
     value: []const u8,
-    label_text: []const u8,
+    label: []const u8,
     disabled: bool = false,
+    /// Option node test_id (e2e / a11y locate; borrowed, outlive component)
+    test_id: ?[]const u8 = null,
 };
 
-/// RadioGroup 内部状态
-pub const RadioGroupState = struct {
-    /// 当前选中值的索引
-    selected_index: ?usize = null,
-    /// 选项数量
-    option_count: usize = 0,
-    /// 选项值列表 (指向外部 options 的指针, 最多 16 个)
-    option_values: [16]?[]const u8 = [_]?[]const u8{null} ** 16,
+/// Standalone Radio: display only (selection logic via RadioGroup). Props: checked / label /
+/// disabled (all may signal).
+pub const Radio = @import("_radio.yix.zig").Radio;
 
-    /// 外部回调
-    /// 2026-07-31 并轨：统一 ?core.HandlerRef，用 invokeWithStr 触发。
-    on_change: ?core.HandlerRef = null,
-
-    pub fn select(self: *RadioGroupState, index: usize) void {
-        if (index >= self.option_count) return;
-        if (self.selected_index != null and self.selected_index.? == index) return;
-
-        self.selected_index = index;
-
-        if (self.on_change) |h| {
-            if (self.option_values[index]) |val| h.invokeWithStr(val);
-        }
-    }
-};
-
-/// RadioGroup 点击上下文
-const RadioClickContext = struct {
-    group_state: *RadioGroupState,
-    option_index: usize,
-};
-
-/// RadioGroup on_before_render 渲染上下文
-const RadioGroupRenderContext = struct {
-    state: *RadioGroupState,
-    tokens: *const theme.ThemeTokens,
-    option_count: usize,
-    last_selected: ?usize = null,
-};
-
-/// RadioGroup on_before_render 钩子：根据 selected_index 更新 radio 样式
-fn radioGroupBeforeRender(node: *Node) void {
-    const render_ctx: *RadioGroupRenderContext = @ptrCast(@alignCast(node.behavior.events.event_context orelse return));
-    const state = render_ctx.state;
-    const t = render_ctx.tokens;
-
-    // 脏检测：选中态没变就不用重设样式（避免重启 transition）。
-    if (state.selected_index == render_ctx.last_selected) return;
-    render_ctx.last_selected = state.selected_index;
-
-    // 遍历 radio 子节点
-    const count = @min(node.children.items.len, render_ctx.option_count);
-    for (node.children.items[0..count], 0..) |radio, i| {
-        const is_checked = if (state.selected_index) |si| si == i else false;
-        if (radio.behavior.interaction.a11y) |*a11y| a11y.checked = is_checked;
-        if (radio.children.items.len == 0) continue;
-
-        const circle = radio.children.items[0];
-
-        // 选中项：冻结其 hover 高亮钩子，把 border 控制权收回来钉死成 accent。
-        // 否则 hover 钩子每帧把 border 插值回 normal(=checkbox_border 浅灰)，盖掉选中底色
-        // 鼠标移开后选中圈就镶一层浅灰。未选中项解冻，border 交还 hover 钩子管理。
-        _ = hooks.setHoverHighlightFrozen(circle, is_checked);
-
-        // 用非 Raw setter，走 mount 时配的 Transition slot 平滑插值（Raw 会瞬切->僵硬）。
-        circle.setBackground(if (is_checked) t.color.accent else t.color.checkbox_bg);
-        circle.setBorderColor(if (is_checked) t.color.accent else t.color.checkbox_border);
-
-        if (circle.children.items.len > 0) {
-            const dot = circle.children.items[0];
-            dot.setOpacity(if (is_checked) 1.0 else 0.0);
-        }
-    }
-    node.markRenderDirty();
-}
-
-/// RadioGroup 点击事件处理器
-fn radioGroupClickHandler(event: Event, context: ?*anyopaque) EventResult {
-    const click_ctx: *RadioClickContext = @ptrCast(@alignCast(context orelse return .ignored));
-
-    switch (event) {
-        .click => {
-            click_ctx.group_state.select(click_ctx.option_index);
-            return .handled;
-        },
-        else => return .ignored,
-    }
-}
-
-/// 创建 RadioGroup
-pub fn RadioGroup(props: RadioGroupProps) RadioGroupBuilder {
-    return RadioGroupBuilder{ .props = props };
-}
-
-pub const RadioGroupBuilder = struct {
-    props: RadioGroupProps,
-
-    /// 保留模式: mount（Scope 管理 RadioGroupState 生命周期）
-    pub fn mount(self: RadioGroupBuilder, scope: *Scope, cx: *Cx) !*Node {
-        const my_scope = try scope.childScope();
-        const allocator = cx.allocator;
-        const t = cx.tokens;
-        const p = self.props;
-
-        // Scope 分配 RadioGroupState
-        const state = try my_scope.allocator.create(RadioGroupState);
-        state.* = blk: {
-            var initial = RadioGroupState{};
-            initial.option_count = @min(p.options.len, 16);
-            for (p.options, 0..) |opt, i| {
-                if (i >= 16) break;
-                initial.option_values[i] = opt.value;
-            }
-            if (p.value) |v| {
-                for (p.options, 0..) |opt, i| {
-                    if (std.mem.eql(u8, opt.value, v)) {
-                        initial.selected_index = i;
-                        break;
-                    }
-                }
-            }
-            break :blk initial;
-        };
-        try my_scope.adoptResource(@ptrCast(state), struct {
-            fn destroy(ptr: *anyopaque, alloc: std.mem.Allocator) void {
-                const s: *RadioGroupState = @ptrCast(@alignCast(ptr));
-                alloc.destroy(s);
-            }
-        }.destroy);
-
-        state.on_change = p.on_change;
-
-        const container = try box(cx, radioGroupContainerStyle(p.horizontal), .{});
-        // sweep：container 守卫一直武装到 return；每个 radio 建好即 adopt
-        errdefer cx.freeNode(container);
-        container.meta.ownership.meta.component_name = "RadioGroup";
-        try core.bindScopeToNode(my_scope, container);
-        container.addDebugState(@ptrCast(state));
-
-        // Scope 分配渲染上下文
-        const render_ctx = try my_scope.allocator.create(RadioGroupRenderContext);
-        render_ctx.* = .{
-            .state = state,
-            .tokens = t,
-            .option_count = p.options.len,
-            .last_selected = state.selected_index,
-        };
-        try my_scope.adoptResource(@ptrCast(render_ctx), struct {
-            fn destroy(ptr: *anyopaque, alloc: std.mem.Allocator) void {
-                const s: *RadioGroupRenderContext = @ptrCast(@alignCast(ptr));
-                alloc.destroy(s);
-            }
-        }.destroy);
-        container.behavior.events.event_context = render_ctx;
-        container.meta.per_frame.hooks.before_render.main = radioGroupBeforeRender;
-
-        for (p.options, 0..) |opt, i| {
-            const is_checked = if (state.selected_index) |si| si == i else false;
-            const is_disabled = p.disabled or opt.disabled;
-
-            const radio = try core.adoptChild(cx, allocator, container, try Radio(.{
-                .checked = is_checked,
-                .label_text = opt.label_text,
-                .value = opt.value,
-                .name = p.name,
-                .disabled = is_disabled,
-                ._skip_interaction = true,
-            }).mount(my_scope, cx));
-
-            if (!is_disabled) {
-                radio.style.cursor = .pointer;
-                // Scope 分配点击上下文
-                const click_ctx = try my_scope.allocator.create(RadioClickContext);
-                click_ctx.* = .{ .group_state = state, .option_index = i };
-                try my_scope.adoptResource(@ptrCast(click_ctx), struct {
-                    fn destroy(ptr: *anyopaque, alloc: std.mem.Allocator) void {
-                        const s: *RadioClickContext = @ptrCast(@alignCast(ptr));
-                        alloc.destroy(s);
-                    }
-                }.destroy);
-
-                radio.behavior.events.on_event = radioGroupClickHandler;
-                radio.behavior.events.event_context = click_ctx;
-                radio.tag = .button;
-                radio.setFocusable(true);
-                radio.behavior.interaction.a11y = .{ .role = .radio, .checked = is_checked };
-
-                // Scope 版 hover 高亮（所有非 disabled 项都注册，选中态由 beforeRender 覆盖）
-                const circle_node = radio.children.items[0];
-                _ = try hooks.useHoverHighlight(my_scope, radio, circle_node, .border_color, t.color.checkbox_border, t.color.accent, .{});
-                try hooks.useFocusRing(my_scope, cx, radio, .{});
-            }
-        }
-
-        return container;
-    }
-};
+/// Radio group: W.RadioGroup(.{ .options = &opts, .value = choice }). Props: options / value
+/// (controlled Model(?[]const u8), borrows option value string) / disabled / horizontal / on_change
+/// (reports settled choice only). View in radio.yix, style in styles.yss RadioParts.
+pub const RadioGroup = @import("_radio.yix.zig").RadioGroup;
 
 // ==================== Switch ====================
 
-/// Switch 内部状态
-pub const SwitchState = struct {
-    /// Toggle 状态 (委托给 hooks.ToggleState)
-    toggle_state: hooks.ToggleState = .{},
-    hovered: bool = false,
+/// Create Switch: W.Switch(.{ .label = "Wi-Fi", .checked = wifi }). Props: checked (controlled
+/// Model(bool)) / label / disabled / on_change (reports settled value only). View in switch.yix,
+/// style in styles.yss SwitchParts.
+pub const Switch = @import("_switch.yix.zig").Switch;
 
-    /// thumb Off/On 的 x 位置
-    x_off: f32 = 2,
-    x_on: f32 = 20,
-    /// 上一帧的 checked 状态（用于检测变化并发起动画）
-    last_checked: bool = false,
+/// Test fixture: Cx + root node + scope.
+const Fixture = struct {
+    cx: *Cx,
+    root: *Node,
+    scope: *Scope,
 
-    /// Theme tokens 引用
-    tokens: *const theme.ThemeTokens = &theme.dark,
+    fn init() !Fixture {
+        const cx = try Cx.init(std.testing.allocator, std.testing.io);
+        errdefer cx.deinit();
+        const root = try box(cx, .{ .width = .{ .px = 200 }, .height = .{ .px = 100 } }, .{});
+        cx.root = root;
+        return .{ .cx = cx, .root = root, .scope = try Scope.init(std.testing.allocator, null, cx.owner) };
+    }
 
-    /// 节点引用
-    track: ?*core.Node = null,
-    thumb: ?*core.Node = null,
+    fn deinit(f: Fixture) void {
+        f.scope.dispose();
+        f.cx.deinit();
+    }
 
-    /// 动画分配器（必须与节点的 allocator 一致）
-    alloc: std.mem.Allocator = std.heap.page_allocator,
+    fn add(f: Fixture, node: *Node) !*Node {
+        try f.root.appendChild(std.testing.allocator, node);
+        return node;
+    }
 
-    pub fn toggle(self: *SwitchState) void {
-        self.toggle_state.toggle();
+    fn effects(f: Fixture) usize {
+        return f.cx.owner.graph.countByKind().get(.effect);
     }
 };
 
-const node_animator = @import("../../animation/node_animator.zig");
-
-/// Switch 渲染前钩子：检测 checked 变化 -> 发起 translate_x 动画 + 颜色联动
-fn updateSwitchThumbPosition(node: *core.Node) void {
-    const state: *SwitchState = @ptrCast(@alignCast(node.behavior.events.event_context orelse return));
-    const thumb = state.thumb orelse return;
-    const track = state.track orelse return;
-
-    // 检测 checked 状态变化，发起 translate_x 动画
-    const checked = state.toggle_state.checked;
-    if (node.behavior.interaction.a11y) |*a11y| a11y.checked = checked;
-    const target = if (checked) state.x_on else state.x_off;
-    if (state.last_checked != checked) {
-        state.last_checked = checked;
-        node_animator.animateNode(thumb, state.alloc, .{
-            .prop = .translate_x,
-            .to = target,
-            .duration = 0.2,
-            .easing = .ease_out_cubic,
-        });
-    }
-
-    // 用 thumb 的当前 translate_x 计算归一化进度（animateNode 自动驱动 translate_x）
-    const travel = state.x_on - state.x_off;
-    const t = if (travel > 0.1) std.math.clamp((thumb.style.translate_x - state.x_off) / travel, 0, 1) else 0;
-
-    // 颜色联动（插值端点集中在 SwitchColors）
-    const track_color = SwitchColors.track(state.tokens, t);
-    const thumb_c = SwitchColors.thumb(state.tokens, t);
-    const label_c = SwitchColors.label(state.tokens, t);
-    node.setOpacityRaw(if (state.toggle_state.disabled) 0.5 else 1.0);
-
-    track.setBackgroundRaw(track_color);
-    thumb.setBackgroundRaw(thumb_c);
-    if (node.children.items.len > 1) {
-        const label_node = node.children.items[1];
-        if (label_node.getText()) |old| {
-            var txt = old;
-            txt.color = label_c;
-            label_node.setText(txt);
-        }
-    }
-
-    // 动画进行中持续刷新（颜色联动需要跟踪 translate_x 变化）
-    if (thumb.frame_state.frame_local.runtime.commands) |anims| {
-        if (anims.count > 0) {
-            node.markRenderDirty();
-        }
-    }
-    thumb.markInteractionDirty();
+/// Dispatch click / spacebar via real event handler (batch processing via Cx entry; here direct
+/// handler call).
+fn sendClick(node: *Node) EventResult {
+    return node.behavior.events.on_event.?(.{ .click = .{ .x = 1, .y = 1, .button = .left, .click_count = 1 } }, node.behavior.events.event_context);
 }
 
-/// Switch 事件处理器: 转发给内嵌的 ToggleState
-fn switchEventHandler(event: Event, context: ?*anyopaque) EventResult {
-    const state: *SwitchState = @ptrCast(@alignCast(context orelse return .ignored));
-    return hooks.toggleEventHandlerFn(event, &state.toggle_state);
+fn sendSpace(node: *Node) EventResult {
+    return node.behavior.events.on_event.?(.{ .key_down = .{ .key = .space, .raw_keycode = 49, .modifiers = .{} } }, node.behavior.events.event_context);
 }
 
-/// Switch 属性
-pub const SwitchProps = struct {
-    /// 初始开关态。**只在 mount 时读取一次**（语义同
-    /// CheckboxProps.initial_checked）。
-    initial_checked: bool = false,
-    label_text: ?[]const u8 = null,
-    disabled: bool = false,
-    on_change: ?core.HandlerRef = null,
-    state_id: ?u64 = null,
-};
-
-/// 创建 Switch
-pub fn Switch(props: SwitchProps) SwitchBuilder {
-    return SwitchBuilder{ .props = props };
+/// Checkbox/Switch is view-declared button semantic node: click run on_click
+fn press(node: *Node) void {
+    const h = node.behavior.events.on_click.?;
+    h.callback(h.context);
 }
 
-pub const SwitchBuilder = struct {
-    props: SwitchProps,
+fn findText(n: *Node, text: []const u8) ?*Node {
+    if (n.getText()) |t| if (std.mem.eql(u8, t.content, text)) return n;
+    for (n.children.items) |c| if (findText(c, text)) |r| return r;
+    return null;
+}
 
-    pub fn checked(self: SwitchBuilder, c: bool) SwitchBuilder {
-        var new = self;
-        new.props.initial_checked = c;
-        return new;
-    }
+fn checkmarkOf(cb: *Node) *Node {
+    return cb.children.items[0].children.items[0];
+}
 
-    pub fn label(self: SwitchBuilder, text: []const u8) SwitchBuilder {
-        var new = self;
-        new.props.label_text = text;
-        return new;
-    }
+fn indetOf(cb: *Node) *Node {
+    return cb.children.items[0].children.items[1];
+}
 
-    pub fn disabled(self: SwitchBuilder, d: bool) SwitchBuilder {
-        var new = self;
-        new.props.disabled = d;
-        return new;
-    }
-
-    pub fn onChange(self: SwitchBuilder, handler_ref: core.HandlerRef) SwitchBuilder {
-        var new = self;
-        new.props.on_change = handler_ref;
-        return new;
-    }
-
-    /// 保留模式: mount
-    pub fn mount(self: SwitchBuilder, scope: *Scope, cx: *Cx) !*Node {
-        const my_scope = try scope.childScope();
-        const allocator = cx.allocator;
-        const t = cx.tokens;
-        const p = self.props;
-
-        // Scope 分配内部状态
-        const state = try my_scope.allocator.create(SwitchState);
-        state.* = .{
-            .toggle_state = .{
-                .checked = p.initial_checked,
-                .disabled = p.disabled,
-                .on_change = p.on_change,
-            },
-            .alloc = allocator,
-        };
-        try my_scope.adoptResource(@ptrCast(state), struct {
-            fn destroy(ptr: *anyopaque, alloc: std.mem.Allocator) void {
-                const s: *SwitchState = @ptrCast(@alignCast(ptr));
-                alloc.destroy(s);
-            }
-        }.destroy);
-
-        state.tokens = t;
-
-        // 外层容器
-        const container = try box(cx, controlRowStyle(), .{});
-        // sweep：container 守卫一直武装到 return；track / thumb / label 建好即 adopt
-        errdefer cx.freeNode(container);
-        container.tag = .button;
-        container.setFocusable(true);
-        container.meta.ownership.meta.component_name = "Switch";
-        try core.bindScopeToNode(my_scope, container);
-        container.behavior.interaction.a11y = .{ .role = .switch_role, .label = p.label_text, .checked = state.toggle_state.checked, .disabled = p.disabled };
-        container.addDebugState(@ptrCast(state));
-
-        // 轨道 + thumb：样式来自具名样式函数；init_translate 与 SwitchState.x_off/x_on 对应
-        const is_on = state.toggle_state.checked;
-        const track = try core.adoptChild(cx, allocator, container, try box(cx, switchTrackStyle(t, is_on), .{}));
-
-        const init_translate: f32 = if (is_on) state.x_on else state.x_off;
-        const thumb = try core.adoptChild(cx, allocator, track, try box(cx, switchThumbStyle(t, is_on, init_translate), .{}));
-
-        state.track = track;
-        state.thumb = thumb;
-        state.last_checked = p.initial_checked;
-
-        if (p.disabled) {
-            container.style.cursor = .not_allowed;
-            track.setBackgroundRaw(SwitchColors.disabledTrack(t, is_on));
-            thumb.setBackgroundRaw(SwitchColors.disabledThumb(t, is_on));
-        } else {
-            container.style.cursor = .pointer;
-        }
-
-        // 标签
-        if (p.label_text) |lbl| {
-            const label_node = try core.adoptChild(cx, allocator, container, try box(cx, .{ .width = .{ .fit = .{} }, .height = .{ .fit = .{} } }, .{}));
-            var label_txt = switchLabelStyle(t, is_on, p.disabled);
-            label_txt.content = lbl;
-            label_node.setText(label_txt);
-        }
-
-        // 事件处理器
-        container.behavior.events.event_context = state;
-        if (!p.disabled) {
-            container.behavior.events.on_event = switchEventHandler;
-        }
-
-        // on_before_render 必须在 useFocusRing 之前设置，
-        // 因为 useFocusRing 会链式保存旧的 on_before_render
-        container.meta.per_frame.hooks.before_render.main = updateSwitchThumbPosition;
-
-        if (!p.disabled) {
-            const is_hovered = try hooks.useHover(my_scope, container);
-            try my_scope.createEffect(.{
-                .state = state,
-                .is_hovered = is_hovered,
-                .node = container,
-            }, struct {
-                fn update(c: anytype) void {
-                    c.state.hovered = c.is_hovered.get();
-                    c.node.markRenderDirty();
-                }
-            }.update);
-
-            try hooks.useFocusRing(my_scope, cx, container, .{});
-        }
-
-        return container;
+const BoolSink = struct {
+    last: ?bool = null,
+    calls: u32 = 0,
+    fn changed(self: *BoolSink, v: bool) void {
+        self.last = v;
+        self.calls += 1;
     }
 };
 
-// ========== 测试 ==========
-
-test "Checkbox: basic" {
-    var ctx = try Cx.init(std.testing.allocator);
-    defer ctx.deinit();
-
-    const root = try box(ctx, .{ .width = .{ .px = 200 }, .height = .{ .px = 100 } }, .{});
-    ctx.root = root;
-
-    const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
-
-    defer scope.dispose();
-
-    const cb = try Checkbox(.{})
-        .label("Remember me")
-        .checked(false)
-        .mount(scope, ctx);
-
-    try root.appendChild(std.testing.allocator, cb);
-
-    // 应该有 2 个子节点: checkbox box + label
-    try std.testing.expectEqual(@as(usize, 2), cb.children.items.len);
+test "Checkbox: structure — label node only when a label is given" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    const with_label = try f.add(try Checkbox(.{ .label = "Remember me" }).mount(f.scope, f.cx));
+    try std.testing.expectEqual(@as(usize, 2), with_label.children.items.len);
+    try std.testing.expectEqualStrings("Remember me", with_label.behavior.interaction.a11y.?.label.?);
+    const bare = try f.add(try Checkbox(.{}).mount(f.scope, f.cx));
+    try std.testing.expectEqual(@as(usize, 1), bare.children.items.len);
+    try std.testing.expectEqual(@as(usize, 2), bare.children.items[0].children.items.len); // checkmark + indet
 }
 
-test "Checkbox: checked state" {
-    var ctx = try Cx.init(std.testing.allocator);
-    defer ctx.deinit();
-
-    const root = try box(ctx, .{ .width = .{ .px = 200 }, .height = .{ .px = 100 } }, .{});
-    ctx.root = root;
-
-    const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
-
-    defer scope.dispose();
-
-    const cb = try Checkbox(.{})
-        .label("Checked")
-        .checked(true)
-        .mount(scope, ctx);
-
-    try root.appendChild(std.testing.allocator, cb);
-
-    // 选中状态下，checkbox box 有 2 个子节点: checkmark + indet_overlay
-    const checkbox_box = cb.children.items[0];
-    try std.testing.expectEqual(@as(usize, 2), checkbox_box.children.items.len);
-}
-
-test "Checkbox: accessibility state tracks mixed and runtime toggle" {
-    var ctx = try Cx.init(std.testing.allocator);
-    defer ctx.deinit();
-    const root = try box(ctx, .{ .width = .{ .px = 200 }, .height = .{ .px = 100 } }, .{});
-    ctx.root = root;
-    const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
-    defer scope.dispose();
-
-    const cb = try Checkbox(.{ .indeterminate = true }).label("Mixed").mount(scope, ctx);
-    try root.appendChild(std.testing.allocator, cb);
-    try std.testing.expect(cb.behavior.interaction.a11y.?.indeterminate);
+test "Checkbox: local model — click toggles view, a11y and reports the landed value" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    var sink = BoolSink{};
+    const cb = try f.add(try Checkbox(.{ .checked = true, .on_change = f.cx.on(BoolSink, &sink, BoolSink.changed) }).mount(f.scope, f.cx));
+    try std.testing.expectEqual(@as(f32, 1), checkmarkOf(cb).getOpacity());
+    press(cb);
+    try std.testing.expectEqual(@as(f32, 0), checkmarkOf(cb).getOpacity());
     try std.testing.expect(!cb.behavior.interaction.a11y.?.checked.?);
+    try std.testing.expectEqual(@as(?bool, false), sink.last);
+    // Keyboard: Space via Cx synthesize click on focus node
+    f.cx.setViewport(200, 100);
+    f.cx.layout();
+    f.cx.focus_manager.setFocus(cb);
+    f.cx.handleKeyDown(.space, .{});
+    try std.testing.expectEqual(@as(?bool, true), sink.last);
+    try std.testing.expectEqual(@as(u32, 2), sink.calls);
+}
 
-    const state: *CheckboxState = @ptrCast(@alignCast(cb.behavior.events.event_context.?));
-    state.toggle();
-    checkboxBeforeRender(cb);
-    try std.testing.expect(!cb.behavior.interaction.a11y.?.indeterminate);
+test "Checkbox: bound model — external set drives the view, clicks write the signal" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    const agree = try f.scope.createSignal(bool, false);
+    const cb = try f.add(try Checkbox(.{ .label = "Agree", .checked = agree }).mount(f.scope, f.cx));
+    try std.testing.expectEqual(@as(f32, 0), checkmarkOf(cb).getOpacity());
+    agree.set(true); // external drive
+    try std.testing.expectEqual(@as(f32, 1), checkmarkOf(cb).getOpacity());
     try std.testing.expect(cb.behavior.interaction.a11y.?.checked.?);
+    press(cb); // interaction write-back
+    try std.testing.expect(!agree.peek());
+    try std.testing.expectEqual(@as(f32, 0), checkmarkOf(cb).getOpacity());
 }
 
-test "Checkbox: state toggle via CheckboxState" {
-    var state = CheckboxState{ .checked = false };
-
-    try std.testing.expect(!state.checked);
-
-    state.toggle();
-    try std.testing.expect(state.checked);
-
-    state.toggle();
-    try std.testing.expect(!state.checked);
-}
-
-test "Checkbox: toggle fires on_change callback" {
-    const CallbackCtx = struct {
-        last_value: bool = false,
-        call_count: u32 = 0,
+test "Checkbox: split model — a rejected proposal leaves value and view unchanged" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    const agree = try f.scope.createSignal(bool, false);
+    const Gate = struct {
+        agree: *Signal(bool),
+        allow: bool = false,
+        fn propose(self: *@This(), v: bool) void {
+            if (self.allow) self.agree.set(v);
+        }
     };
-
-    var cb_ctx = CallbackCtx{};
-
-    var state = CheckboxState{
-        .checked = false,
-        // 并轨后：boolHandlerFrom 把 context 与回调捆在一起，
-        // 且**必须真的收到 new_val**，这正是并轨最容易丢的东西。
-        .on_change = core.Cx.boolHandlerFrom(CallbackCtx, &cb_ctx, struct {
-            fn handler(c: *CallbackCtx, new_val: bool) void {
-                c.last_value = new_val;
-                c.call_count += 1;
-            }
-        }.handler),
-    };
-
-    state.toggle();
-    try std.testing.expect(state.checked);
-    try std.testing.expect(cb_ctx.last_value);
-    try std.testing.expectEqual(@as(u32, 1), cb_ctx.call_count);
-
-    state.toggle();
-    try std.testing.expect(!state.checked);
-    try std.testing.expect(!cb_ctx.last_value);
-    try std.testing.expectEqual(@as(u32, 2), cb_ctx.call_count);
+    var gate = Gate{ .agree = agree };
+    var sink = BoolSink{};
+    const cb = try f.add(try Checkbox(.{
+        .checked = ui_split(agree, f.cx.on(Gate, &gate, Gate.propose)),
+        .on_change = f.cx.on(BoolSink, &sink, BoolSink.changed),
+    }).mount(f.scope, f.cx));
+    press(cb);
+    try std.testing.expect(!agree.peek());
+    try std.testing.expectEqual(@as(f32, 0), checkmarkOf(cb).getOpacity());
+    try std.testing.expectEqual(@as(u32, 0), sink.calls);
+    gate.allow = true;
+    press(cb);
+    try std.testing.expect(agree.peek());
+    try std.testing.expectEqual(@as(f32, 1), checkmarkOf(cb).getOpacity());
+    try std.testing.expectEqual(@as(?bool, true), sink.last);
 }
 
-test "Checkbox: disabled state prevents toggle" {
-    var state = CheckboxState{ .checked = false, .disabled = true };
-
-    state.toggle();
-    try std.testing.expect(!state.checked); // 不应该改变
+test "Checkbox: indeterminate and disabled follow their sources" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    const mixed = try f.scope.createSignal(bool, true);
+    const busy = try f.scope.createSignal(bool, true);
+    const cb = try f.add(try Checkbox(.{ .indeterminate = mixed, .disabled = busy }).mount(f.scope, f.cx));
+    try std.testing.expectEqual(@as(f32, 1), indetOf(cb).getOpacity());
+    try std.testing.expect(cb.behavior.interaction.a11y.?.indeterminate);
+    try std.testing.expect(!cb.behavior.interaction.focusable);
+    press(cb); // disabled: don't change value
+    try std.testing.expect(!cb.behavior.interaction.a11y.?.checked.?);
+    busy.set(false);
+    try std.testing.expect(cb.behavior.interaction.focusable);
+    press(cb); // checked -> true
+    try std.testing.expect(cb.behavior.interaction.a11y.?.checked.?);
+    try std.testing.expectEqual(@as(f32, 0), indetOf(cb).getOpacity()); // checked no show mixed
+    mixed.set(false);
+    try std.testing.expect(!cb.behavior.interaction.a11y.?.indeterminate);
 }
 
-test "Checkbox: event handler responds to click" {
-    var state = CheckboxState{ .checked = false };
-
-    const result = checkboxEventHandler(.{ .click = .{
-        .x = 10,
-        .y = 10,
-        .button = .left,
-        .click_count = 1,
-    } }, @ptrCast(&state));
-
-    try std.testing.expectEqual(EventResult.handled, result);
-    try std.testing.expect(state.checked);
+test "Checkbox: dynamic label from an owned text signal" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    const name = try f.scope.createText("Notify me", .{});
+    const cb = try f.add(try Checkbox(.{ .label = name }).mount(f.scope, f.cx));
+    try std.testing.expect(findText(cb, "Notify me") != null);
+    name.set("Notify me about every reply in this thread");
+    try std.testing.expect(findText(cb, "Notify me about every reply in this thread") != null);
+    try std.testing.expectEqualStrings("Notify me about every reply in this thread", cb.behavior.interaction.a11y.?.label.?);
 }
 
-test "Checkbox: event handler responds to space key" {
-    var state = CheckboxState{ .checked = false };
+test "Checkbox: static props add no effects (zero-cost static)" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    const e0 = f.effects();
+    _ = try f.add(try Checkbox(.{}).mount(f.scope, f.cx));
+    const bare = f.effects() - e0;
+    const e1 = f.effects();
+    _ = try f.add(try Checkbox(.{ .label = "x", .disabled = false, .indeterminate = false, .checked = true }).mount(f.scope, f.cx));
+    try std.testing.expectEqual(bare, f.effects() - e1);
+}
 
-    const result = checkboxEventHandler(.{ .key_down = .{
-        .key = .space,
-        .raw_keycode = 49,
-        .modifiers = .{},
-    } }, @ptrCast(&state));
-
-    try std.testing.expectEqual(EventResult.handled, result);
-    try std.testing.expect(state.checked);
+test "Checkbox: 方框颜色过渡（底色 / 边框色都插值）" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    const on = try f.scope.createSignal(bool, false);
+    const cb = try f.add(try Checkbox(.{ .checked = on }).mount(f.scope, f.cx));
+    const box_node = cb.children.items[0];
+    try std.testing.expectEqual(f.cx.tokens.tokens.color.checkbox_border, box_node.style.border.color);
+    on.set(true);
+    const slots = box_node.frame_state.frame_local.runtime.transitions.?;
+    try std.testing.expect(slots.find(.background).?.active);
+    const border = slots.find(.border_color).?;
+    try std.testing.expect(border.active);
+    // start color is pre-change, not post-reset baseline
+    try std.testing.expectEqual(f.cx.tokens.tokens.color.checkbox_border, border.from_color);
+    try std.testing.expectEqual(f.cx.tokens.tokens.color.accent, border.to_color);
+    try std.testing.expectEqualStrings("Checkbox", cb.meta.ownership.meta.component_name.?);
 }
 
 test "Radio: basic" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 200 }, .height = .{ .px = 100 } }, .{});
@@ -967,24 +314,21 @@ test "Radio: basic" {
 
     defer scope.dispose();
 
-    const radio = try Radio(.{})
-        .label("Option 1")
-        .value("opt1")
-        .mount(scope, ctx);
+    const radio = try Radio(.{ .label = "Option 1" }).mount(scope, ctx);
 
     try root.appendChild(std.testing.allocator, radio);
     try std.testing.expectEqual(@as(usize, 2), radio.children.items.len);
 }
 
 test "Radio: checked render emits inner dot" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     ctx.setViewport(120, 40);
 
     const root = try box(ctx, .{
         .width = .{ .px = 120 },
         .height = .{ .px = 40 },
-        .background = ctx.tokens.color.bg_primary,
+        .background = ctx.tokens.tokens.color.bg_primary,
     }, .{});
     ctx.root = root;
 
@@ -993,7 +337,7 @@ test "Radio: checked render emits inner dot" {
 
     const radio = try Radio(.{
         .checked = true,
-        .label_text = "On",
+        .label = "On",
     }).mount(scope, ctx);
     try root.appendChild(std.testing.allocator, radio);
 
@@ -1004,7 +348,7 @@ test "Radio: checked render emits inner dot" {
     var saw_dot = false;
     for (commands) |cmd| if (cmd.isFillRect()) {
         const r = cmd;
-        if (Color.eql(r.color.toColor(), ctx.tokens.color.button_primary_fg) and r.geom.w >= 7 and r.geom.h >= 7 and r.geom.w <= 10 and r.geom.h <= 10) {
+        if (Color.eql(r.color.toColor(), ctx.tokens.tokens.color.button_primary_fg) and r.geom.w >= 7 and r.geom.h >= 7 and r.geom.w <= 10 and r.geom.h <= 10) {
             saw_dot = true;
         }
     };
@@ -1013,7 +357,7 @@ test "Radio: checked render emits inner dot" {
 }
 
 test "Radio: disabled checked keeps selected color and uses container opacity" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{
@@ -1028,17 +372,17 @@ test "Radio: disabled checked keeps selected color and uses container opacity" {
     const radio = try Radio(.{
         .checked = true,
         .disabled = true,
-        .label_text = "Disabled",
+        .label = "Disabled",
     }).mount(scope, ctx);
     try root.appendChild(std.testing.allocator, radio);
 
     try std.testing.expectApproxEqAbs(@as(f32, 0.5), radio.getOpacity(), 0.001);
-    try std.testing.expectEqual(ctx.tokens.color.accent, radio.children.items[0].getBackground());
-    try std.testing.expectEqual(ctx.tokens.color.accent, radio.children.items[0].style.border.color);
+    try std.testing.expectEqual(ctx.tokens.tokens.color.accent, radio.children.items[0].getBackground());
+    try std.testing.expectEqual(ctx.tokens.tokens.color.accent, radio.children.items[0].style.border.color);
 }
 
 test "RadioGroup: multiple options" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 200 }, .height = .{ .px = 200 } }, .{});
@@ -1049,179 +393,313 @@ test "RadioGroup: multiple options" {
     defer scope.dispose();
 
     const options = [_]RadioOption{
-        .{ .value = "a", .label_text = "Option A" },
-        .{ .value = "b", .label_text = "Option B" },
-        .{ .value = "c", .label_text = "Option C" },
+        .{ .value = "a", .label = "Option A" },
+        .{ .value = "b", .label = "Option B" },
+        .{ .value = "c", .label = "Option C" },
     };
 
     const group = try RadioGroup(.{
         .options = &options,
         .value = "b",
-        .name = "test-group",
     }).mount(scope, ctx);
 
     try root.appendChild(std.testing.allocator, group);
-    try std.testing.expectEqual(@as(usize, 3), group.children.items.len);
+    try std.testing.expectEqual(@as(usize, 3), optionCount(group));
+    // radio group always require one selected (UIA SelectionPattern.IsSelectionRequired)
+    try std.testing.expectEqual(core.A11yRole.radiogroup, group.behavior.interaction.a11y.?.role);
+    try std.testing.expect(group.behavior.interaction.a11y.?.required);
 }
 
-test "Switch: basic" {
-    var ctx = try Cx.init(std.testing.allocator);
-    defer ctx.deinit();
+const StrSink = struct {
+    last: [16]u8 = undefined,
+    len: usize = 0,
+    calls: u32 = 0,
+    fn changed(self: *StrSink, v: []const u8) void {
+        @memcpy(self.last[0..v.len], v);
+        self.len = v.len;
+        self.calls += 1;
+    }
+    fn value(self: *const StrSink) []const u8 {
+        return self.last[0..self.len];
+    }
+};
 
-    const root = try box(ctx, .{ .width = .{ .px = 200 }, .height = .{ .px = 100 } }, .{});
-    ctx.root = root;
-
-    const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
-
-    defer scope.dispose();
-
-    const sw = try Switch(.{})
-        .label("Enable feature")
-        .checked(true)
-        .mount(scope, ctx);
-
-    try root.appendChild(std.testing.allocator, sw);
-    try std.testing.expectEqual(@as(usize, 2), sw.children.items.len);
+fn radioDotOpacity(group: *Node, i: usize) f32 {
+    return option(group, i).children.items[0].children.items[0].getOpacity();
 }
 
-test "Switch: checked render emits track and thumb" {
-    var ctx = try Cx.init(std.testing.allocator);
+/// RadioGroup i-th option (options from signal, keyed list area has anchor nodes before/after)
+fn option(group: *Node, i: usize) *Node {
+    var k: usize = 0;
+    for (group.children.items) |c| {
+        if (c.tag == .anchor) continue;
+        if (k == i) return c;
+        k += 1;
+    }
+    unreachable;
+}
+
+fn optionCount(group: *Node) usize {
+    var k: usize = 0;
+    for (group.children.items) |c| k += @intFromBool(c.tag != .anchor);
+    return k;
+}
+
+test "RadioGroup: bound value — external set and clicks, disabled option ignored" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    const opts = [_]RadioOption{ .{ .value = "light", .label = "Light" }, .{ .value = "dark", .label = "Dark" }, .{ .value = "auto", .label = "Auto", .disabled = true } };
+    const theme_sig = try f.scope.createSignal(?[]const u8, "light");
+    var sink = StrSink{};
+    const group = try f.add(try RadioGroup(.{ .options = &opts, .value = theme_sig, .on_change = f.cx.on(StrSink, &sink, StrSink.changed) }).mount(f.scope, f.cx));
+    try std.testing.expect(option(group, 0).behavior.interaction.a11y.?.checked.?);
+    theme_sig.set("dark"); // external drive
+    try std.testing.expect(option(group, 1).behavior.interaction.a11y.?.checked.?);
+    try std.testing.expect(!option(group, 0).behavior.interaction.a11y.?.checked.?);
+    try std.testing.expectEqual(@as(u32, 0), sink.calls); // program write don't trigger on_change
+    press(option(group, 0)); // interaction write-back
+    try std.testing.expectEqualStrings("light", theme_sig.peek().?);
+    try std.testing.expectEqualStrings("light", sink.value());
+    press(option(group, 2)); // disabled item
+    try std.testing.expectEqualStrings("light", theme_sig.peek().?);
+    try std.testing.expectEqual(@as(u32, 1), sink.calls);
+    press(option(group, 0)); // same value: no trigger
+    try std.testing.expectEqual(@as(u32, 1), sink.calls);
+}
+
+test "RadioGroup: options from a signal rebuild the items" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    const two = [_]RadioOption{ .{ .value = "a", .label = "A" }, .{ .value = "b", .label = "B" } };
+    const three = [_]RadioOption{ .{ .value = "a", .label = "A" }, .{ .value = "b", .label = "B" }, .{ .value = "c", .label = "C" } };
+    const options = try f.scope.createSignal([]const RadioOption, &two);
+    const group = try f.add(try RadioGroup(.{ .options = options, .value = "b" }).mount(f.scope, f.cx));
+    try std.testing.expectEqual(@as(usize, 2), optionCount(group));
+    options.set(&three);
+    try std.testing.expectEqual(@as(usize, 3), optionCount(group));
+    try std.testing.expect(option(group, 1).behavior.interaction.a11y.?.checked.?); // selected keep
+    press(option(group, 2)); // new option interactive
+    try std.testing.expect(option(group, 2).behavior.interaction.a11y.?.checked.?);
+    try std.testing.expect(!option(group, 1).behavior.interaction.a11y.?.checked.?);
+}
+
+test "Radio: standalone radio follows its sources" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    const on = try f.scope.createSignal(bool, false);
+    const r = try f.add(try Radio(.{ .label = "Solo", .checked = on }).mount(f.scope, f.cx));
+    try std.testing.expect(!r.behavior.interaction.a11y.?.checked.?);
+    on.set(true);
+    try std.testing.expect(r.behavior.interaction.a11y.?.checked.?);
+}
+
+test "Switch: structure and checked render emits track and thumb" {
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     ctx.setViewport(140, 40);
-
-    const root = try box(ctx, .{
-        .width = .{ .px = 140 },
-        .height = .{ .px = 40 },
-        .background = ctx.tokens.color.bg_primary,
-    }, .{});
+    const root = try box(ctx, .{ .width = .{ .px = 140 }, .height = .{ .px = 40 }, .background = ctx.tokens.tokens.color.bg_primary }, .{});
     ctx.root = root;
-
     const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
     defer scope.dispose();
 
-    const sw = try Switch(.{
-        .initial_checked = true,
-        .label_text = "Enabled",
-    }).mount(scope, ctx);
+    const sw = try Switch(.{ .checked = true, .label = "Enabled" }).mount(scope, ctx);
     try root.appendChild(std.testing.allocator, sw);
+    try std.testing.expectEqual(@as(usize, 2), sw.children.items.len);
 
     ctx.layout();
     _ = ctx.render();
     const commands = ctx.lowerForEncoderPaintTable();
-
     var saw_track = false;
     var saw_thumb = false;
     for (commands) |cmd| if (cmd.isFillRect()) {
         const r = cmd;
-        if (Color.eql(r.color.toColor(), ctx.tokens.color.accent) and r.geom.w >= 38 and r.geom.h >= 20) saw_track = true;
+        if (Color.eql(r.color.toColor(), ctx.tokens.tokens.color.accent) and r.geom.w >= 38 and r.geom.h >= 20) saw_track = true;
         if (Color.eql(r.color.toColor(), Color.hex(0xFFFFFF)) and r.geom.w >= 16 and r.geom.h >= 16 and r.geom.w <= 20 and r.geom.h <= 20) saw_thumb = true;
     };
-
     try std.testing.expect(saw_track);
     try std.testing.expect(saw_thumb);
 }
 
-test "Switch: state toggle via SwitchState" {
-    var state = SwitchState{};
-
-    try std.testing.expect(!state.toggle_state.checked);
-
-    state.toggle();
-    try std.testing.expect(state.toggle_state.checked);
-
-    state.toggle();
-    try std.testing.expect(!state.toggle_state.checked);
+/// Switch is view-declared button semantic node: click run on_click, Space/Enter via Cx
+/// synthesize click on focus node
+fn clickSwitch(sw: *Node) void {
+    const h = sw.behavior.events.on_click.?;
+    h.callback(h.context);
 }
 
-test "Switch: toggle fires on_change callback" {
-    const CallbackCtx = struct {
-        last_value: bool = false,
-        call_count: u32 = 0,
+test "Switch: local model toggles and reports; disabled source blocks input" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    var sink = BoolSink{};
+    const off = try f.scope.createSignal(bool, false);
+    const sw = try f.add(try Switch(.{ .disabled = off, .on_change = f.cx.on(BoolSink, &sink, BoolSink.changed) }).mount(f.scope, f.cx));
+    clickSwitch(sw);
+    try std.testing.expectEqual(@as(?bool, true), sink.last);
+    try std.testing.expect(sw.behavior.interaction.a11y.?.checked.?);
+    // Keyboard: Space via Cx synthesize click on focus node
+    f.cx.setViewport(200, 100);
+    f.cx.layout();
+    f.cx.focus_manager.setFocus(sw);
+    f.cx.handleKeyDown(.space, .{});
+    try std.testing.expectEqual(@as(?bool, false), sink.last);
+    off.set(true);
+    clickSwitch(sw);
+    try std.testing.expectEqual(@as(u32, 2), sink.calls);
+    // disabled exit Tab order, a11y sync
+    try std.testing.expect(!sw.behavior.interaction.focusable);
+    try std.testing.expect(sw.behavior.interaction.a11y.?.disabled);
+}
+
+test "Switch: bound model — external set moves the thumb with a transition" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    const wifi = try f.scope.createSignal(bool, false);
+    const sw = try f.add(try Switch(.{ .label = "Wi-Fi", .checked = wifi }).mount(f.scope, f.cx));
+    const thumb = sw.children.items[0].children.items[0];
+    try std.testing.expectEqual(@as(f32, 2), thumb.style.translate_x);
+    wifi.set(true);
+    try std.testing.expect(sw.behavior.interaction.a11y.?.checked.?);
+    // offset advance by transition declare in style (translate-x 200ms), target 20
+    const slot = thumb.frame_state.frame_local.runtime.transitions.?.find(.translate_x).?;
+    try std.testing.expect(slot.active);
+    // label color sync transition (text color via text_color transition interp), end is primary
+    // text
+    const label = sw.children.items[1];
+    const color_slot = label.frame_state.frame_local.runtime.transitions.?.find(.text_color).?;
+    try std.testing.expect(color_slot.active);
+    try std.testing.expectEqual(f.cx.tokens.tokens.color.fg_primary, color_slot.to_color);
+    clickSwitch(sw);
+    try std.testing.expect(!wifi.peek());
+}
+
+test "Switch: split model — rejected toggle keeps the signal" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    const on = try f.scope.createSignal(bool, true);
+    const Deny = struct {
+        fn propose(_: *@This(), _: bool) void {}
     };
-
-    var cb_ctx = CallbackCtx{};
-
-    var state = SwitchState{
-        .toggle_state = .{
-            .checked = false,
-            .on_change = core.Cx.boolHandlerFrom(CallbackCtx, &cb_ctx, struct {
-                fn handler(c: *CallbackCtx, new_val: bool) void {
-                    c.last_value = new_val;
-                    c.call_count += 1;
-                }
-            }.handler),
-        },
-    };
-
-    state.toggle();
-    try std.testing.expect(state.toggle_state.checked);
-    try std.testing.expect(cb_ctx.last_value);
-    try std.testing.expectEqual(@as(u32, 1), cb_ctx.call_count);
+    var deny = Deny{};
+    const sw = try f.add(try Switch(.{ .checked = ui_split(on, f.cx.on(Deny, &deny, Deny.propose)) }).mount(f.scope, f.cx));
+    clickSwitch(sw);
+    try std.testing.expect(on.peek());
+    try std.testing.expect(sw.behavior.interaction.a11y.?.checked.?);
 }
 
-test "Switch: disabled state prevents toggle" {
-    var state = SwitchState{ .toggle_state = .{ .checked = false, .disabled = true } };
-
-    state.toggle();
-    try std.testing.expect(!state.toggle_state.checked);
+test "Switch: 静态 props 不建 memo；焦点环已挂上" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    const before = f.cx.owner.graph.countByKind().get(.memo);
+    const sw = try f.add(try Switch(.{ .label = "Static", .checked = true }).mount(f.scope, f.cx));
+    try std.testing.expectEqual(before, f.cx.owner.graph.countByKind().get(.memo));
+    try std.testing.expect(sw.meta.per_frame.hooks.slots.focus_ring_anim != null);
+    try std.testing.expectEqualStrings("Switch", sw.meta.ownership.meta.component_name.?);
 }
 
-test "Switch: event handler responds to click" {
-    var state = SwitchState{};
-
-    const result = switchEventHandler(.{ .click = .{
-        .x = 10,
-        .y = 10,
-        .button = .left,
-        .click_count = 1,
-    } }, @ptrCast(&state));
-
-    try std.testing.expectEqual(EventResult.handled, result);
-    try std.testing.expect(state.toggle_state.checked);
-}
-
-test "Switch: event handler responds to space key" {
-    var state = SwitchState{ .toggle_state = .{ .checked = true } };
-
-    const result = switchEventHandler(.{ .key_down = .{
-        .key = .space,
-        .raw_keycode = 49,
-        .modifiers = .{},
-    } }, @ptrCast(&state));
-
-    try std.testing.expectEqual(EventResult.handled, result);
-    try std.testing.expect(!state.toggle_state.checked); // toggled off
-}
-
-// styles.zig 的测试收集，这行是必需的，见 docs/STYLING.md
 test {
-    _ = @import("styles.zig");
+    _ = @import("_styles.yss.zig");
 }
 
-// 逐分配点 OOM sweep，见 src/ui/components/oom_sweep.zig
+// per-alloc OOM sweep, see src/ui/components/oom_sweep.zig
 test "checkbox(indeterminate): mount 在任意分配点失败时不泄漏（sweep）" {
     try @import("../oom_sweep.zig").sweepMount("checkbox(indeterminate)", struct {
         fn m(scope: *Scope, cx: *Cx) anyerror!?*Node {
-            return try Checkbox(.{ .label_text = "check", .indeterminate = true }).mount(scope, cx);
+            return try Checkbox(.{ .label = "check", .indeterminate = true }).mount(scope, cx);
         }
     }.m);
 }
 
-// 逐分配点 OOM sweep，见 src/ui/components/oom_sweep.zig
+// per-alloc OOM sweep, see src/ui/components/oom_sweep.zig
 test "radio_group: mount 在任意分配点失败时不泄漏（sweep）" {
     try @import("../oom_sweep.zig").sweepMount("radio_group", struct {
         fn m(scope: *Scope, cx: *Cx) anyerror!?*Node {
-            const opts = [_]RadioOption{ .{ .value = "a", .label_text = "A" }, .{ .value = "b", .label_text = "B", .disabled = true } };
+            const opts = [_]RadioOption{ .{ .value = "a", .label = "A" }, .{ .value = "b", .label = "B", .disabled = true } };
             return try RadioGroup(.{ .options = &opts, .value = "a" }).mount(scope, cx);
         }
     }.m);
 }
 
-// 逐分配点 OOM sweep，见 src/ui/components/oom_sweep.zig
+// per-alloc OOM sweep, see src/ui/components/oom_sweep.zig
 test "switch: mount 在任意分配点失败时不泄漏（sweep）" {
     try @import("../oom_sweep.zig").sweepMount("switch", struct {
         fn m(scope: *Scope, cx: *Cx) anyerror!?*Node {
-            return try Switch(.{ .label_text = "toggle", .initial_checked = true }).mount(scope, cx);
+            return try Switch(.{ .label = "toggle", .checked = true }).mount(scope, cx);
         }
     }.m);
+}
+
+test "radio_group(options signal): mount 在任意分配点失败时不泄漏（sweep）" {
+    try @import("../oom_sweep.zig").sweepMount("radio_group(signal)", struct {
+        const opts = [_]RadioOption{ .{ .value = "a", .label = "A" }, .{ .value = "b", .label = "B" } };
+        fn m(scope: *Scope, cx: *Cx) anyerror!?*Node {
+            const o = try scope.createSignal([]const RadioOption, &opts);
+            const v = try scope.createSignal(?[]const u8, "a");
+            return try RadioGroup(.{ .options = o, .value = v }).mount(scope, cx);
+        }
+    }.m);
+}
+
+test "RadioGroup: static options are copied, so a caller's stack array may go away" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    var sink = StrSink{};
+    const group = blk: {
+        var opts = [_]RadioOption{ .{ .value = "a", .label = "A" }, .{ .value = "b", .label = "B" } };
+        const g = try RadioGroup(.{ .options = &opts, .on_change = f.cx.on(StrSink, &sink, StrSink.changed) }).mount(f.scope, f.cx);
+        opts[1] = .{ .value = "clobbered", .label = "X" }; // caller later clobber/free own array
+        break :blk g;
+    };
+    _ = try f.add(group);
+    press(option(group, 1));
+    try std.testing.expectEqualStrings("b", sink.value());
+}
+
+test "RadioGroup: mount builds the selected state directly (no transition at mount)" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    const opts = [_]RadioOption{ .{ .value = "x", .label = "X" }, .{ .value = "y", .label = "Y" } };
+    const group = try f.add(try RadioGroup(.{ .options = &opts, .value = "y" }).mount(f.scope, f.cx));
+    for (group.children.items) |radio| {
+        const circle = radio.children.items[0];
+        const dot = circle.children.items[0];
+        for ([_]*Node{ circle, dot }) |n| {
+            if (n.frame_state.frame_local.runtime.transitions) |slots| try std.testing.expect(!slots.any_active);
+        }
+    }
+    try std.testing.expectEqual(@as(f32, 1), radioDotOpacity(group, 1));
+}
+
+test "RadioGroup: an equal-content options array does not rebuild the items" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    // string literal deduplicate (same addr), need 'same content, diff addr' must use separate
+    // buffer
+    const Arrays = struct {
+        var va1 = "a".*;
+        var la1 = "A".*;
+        var vb1 = "b".*;
+        var lb1 = "B".*;
+        var va2 = "a".*;
+        var la2 = "A".*;
+        var vb2 = "b".*;
+        var lb2 = "B".*;
+        var a: [2]RadioOption = undefined;
+        var b: [2]RadioOption = undefined;
+    };
+    Arrays.a = .{ .{ .value = &Arrays.va1, .label = &Arrays.la1 }, .{ .value = &Arrays.vb1, .label = &Arrays.lb1 } };
+    Arrays.b = .{ .{ .value = &Arrays.va2, .label = &Arrays.la2 }, .{ .value = &Arrays.vb2, .label = &Arrays.lb2 } };
+    // memo switch between two same-content diff-addr arrays: memo compare key byte-wise, propagate
+    // down
+    const which = try f.scope.createSignal(bool, false);
+    const options = try f.scope.createMemo([]const RadioOption, .{ .which = which }, struct {
+        fn pick(c: anytype) []const RadioOption {
+            return if (c.which.get()) Arrays.b[0..] else Arrays.a[0..];
+        }
+    }.pick);
+    const group = try f.add(try RadioGroup(.{ .options = options }).mount(f.scope, f.cx));
+    const first = group.children.items[0];
+    which.set(true);
+    // confirm view truly re-ran (memo byte compare, diff addr means propagate), just no rebuild
+    try std.testing.expect(options.peek().ptr == &Arrays.b);
+    try std.testing.expect(group.children.items[0] == first);
 }

@@ -1,10 +1,10 @@
-/// runtime, zenit 应用运行时（App helper）
+/// runtime, zenit app runtime (app helper)
 ///
-/// 把 main() 里的 ~110 行启动 + 主循环 boilerplate 一行解决：
+/// Replaces ~110 lines of startup + main loop boilerplate with one line:
 ///
 /// ```
 /// pub fn main() !void {
-///     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+///     var gpa = std.heap.DebugAllocator(.{}){};
 ///     defer _ = gpa.deinit();
 ///
 ///     var app = try App.init(gpa.allocator(), .{
@@ -18,23 +18,24 @@
 /// }
 /// ```
 ///
-/// 覆盖：
-///   - 平台初始化（NSApplication delegate / 主菜单）
-///   - 窗口创建
+/// covers:
+///   - platform init (NSApplication delegate / main menu)
+///   - window creation
 ///   - GPU instance / device / queue / surface
-///   - AppRenderer + FontManager + 默认字体加载
+///   - AppRenderer + FontManager + default font load
 ///   - SystemSdk
-///   - UI Cx 初始化 + 视口设置 + measure_fn 接线
-///   - 主循环（事件 pump + 类型转换 + dispatch + resize 检测 + frame）
+///   - UI Cx init + viewport setup + measure_fn wiring
+///   - main loop (event pump + type conversion + dispatch + resize detect + frame)
 ///
-/// 不覆盖（应用层关注点，用户自己写）：
-///   - mountUI() 构建 UI 树（这是应用的业务）
-///   - devtools、热重载、IME 高级路径、devtools deferred dispatch
-///   - 复杂字体配置（Inter/Lora/JetBrains 等多家族 + 多字重）
+/// does not cover (application layer, user writes):
+///   - mountUI() building the UI tree
+///   - devtools, hot reload, advanced IME paths, devtools deferred dispatch
+///   - complex font config (Inter/Lora/JetBrains multi-family + multi-weight)
 ///
-/// 多窗口应用使用本文件下方的 MultiWindowApp；它为每个原生窗口保留独立
-/// App/GPU/UI 状态，并统一处理事件路由、关闭与退出。需要完全自定义事件循环时，
-/// App 的字段仍是 pub，processEvents / maybeReconfigureSurface / frame 可单独调。
+/// Multi-window apps use MultiWindowApp below; it keeps independent App/GPU/UI state per native
+/// window plus unified event routing, close and exit handling. For a fully custom event loop,
+/// App fields are still pub; processEvents / maybeReconfigureSurface / frame can be called
+/// independently.
 extern fn zenit_text_input_preedit_applied(window_id: u32, start_utf16: u64, end_utf16: u64, start_utf8: u32, end_utf8: u32) callconv(.c) c_int;
 const std = @import("std");
 const builtin = @import("builtin");
@@ -46,30 +47,34 @@ const system_sdk = @import("system_sdk");
 const gpu = @import("gpu");
 const render = @import("render");
 
-// macOS NSAccessibility push-side C ABI (window_bridge.m 提供)。
-// 仅 App 这层链接，runtime.App.init 调 ui.a11y.macos_bridge.setPushHooks
-// 注册到 macos_bridge.zig，让 tests 不依赖 ObjC link。
-extern fn zenit_a11y_push_children_changed(window_id: u32, element_raw: u32) callconv(.c) c_int;
-extern fn zenit_a11y_push_property_changed(window_id: u32, element_raw: u32, flags: u16) callconv(.c) c_int;
-extern fn zenit_a11y_push_focus_changed(window_id: u32, element_raw: u32) callconv(.c) c_int;
+// macOS NSAccessibility push-side C ABI (window_bridge.m provides). Only App links it;
+// runtime.App.init calls ui.a11y.macos_bridge.setPushHooks registered to macos_bridge.zig
+// so tests don't require ObjC link.
+extern fn zenit_a11y_push_children_changed(window_id: u32, element_raw: u64) callconv(.c) c_int;
+extern fn zenit_a11y_push_property_changed(window_id: u32, element_raw: u64, flags: u16) callconv(.c) c_int;
+extern fn zenit_a11y_push_focus_changed(window_id: u32, element_raw: u64) callconv(.c) c_int;
 extern fn zenit_a11y_push_announce(window_id: u32, text_ptr: [*]const u8, text_len: c_int, priority: u8) callconv(.c) c_int;
-extern fn zenit_a11y_push_active_descendant(window_id: u32, container_raw: u32, active_raw: u32) callconv(.c) c_int;
+extern fn zenit_a11y_push_active_descendant(window_id: u32, container_raw: u64, active_raw: u64) callconv(.c) c_int;
 extern fn zenit_a11y_push_window_cleared(window_id: u32) callconv(.c) c_int;
+extern fn zenit_a11y_push_element_destroyed(window_id: u32, element_raw: u64) callconv(.c) c_int;
+extern fn zenit_a11y_push_flush_end(window_id: u32) callconv(.c) c_int;
+extern fn zenit_a11y_display_options() callconv(.c) u32;
+extern fn zenit_a11y_observe_display_options() callconv(.c) void;
 
 const renderer_mod = @import("renderer.zig");
 const window_lifecycle = @import("window_lifecycle.zig");
 const text_hook_owners = @import("text_hook_owners.zig");
 const selector_scale = @import("selector_scale.zig");
+const render_pacing = @import("render_pacing.zig");
 
-/// 每轮主循环一个 autorelease pool。
+/// One autorelease pool per main loop iteration.
 ///
-/// 主循环（pump + layout + encode + CoreText shaping + present）跑在 AppKit
-/// run loop **之外**，没有任何外层 pool：ObjC 侧 autorelease 的临时对象
-/// （NSAttributeDictionary / NSNumber / MTLBuffer / CAMetalLayer 引用……）
-/// 永远不会被释放。实测 OBJC_DEBUG_MISSING_POOLS=YES 下 text_input 启动 8s
-/// 报 735 条 "just leaking"，storybook 8s 报 ~98k 条（绝大多数是
-/// AGXG16XFamilyBuffer）。libobjc 的 push/pop 就是 @autoreleasepool 的实现，
-/// 嵌套开销可忽略。
+/// The main loop (pump + layout + encode + CoreText shaping + present) runs outside the AppKit
+/// run loop with no outer pool, so ObjC-side autoreleased temporaries (NSAttributeDictionary /
+/// NSNumber / MTLBuffer / CAMetalLayer refs...) would never be released. With
+/// OBJC_DEBUG_MISSING_POOLS=YES, an 8s text_input run reports 735 "just leaking", an 8s
+/// storybook run ~98k (mostly AGXG16XFamilyBuffer).
+/// libobjc push/pop is the @autoreleasepool implementation; nesting overhead is negligible.
 const AutoreleasePool = struct {
     token: ?*anyopaque,
 
@@ -91,23 +96,20 @@ const ClearColor = renderer_mod.ClearColor;
 
 const test_harness = @import("test_harness");
 
-var isolate_os_pointer_cache: ?bool = null;
-/// ZENIT_E2E_ISOLATE_POINTER=1：test-mode 下忽略系统鼠标输入，只认 harness 注入。
+const pointer_isolation = @import("pointer_isolation.zig");
+/// ZENIT_E2E_ISOLATE_POINTER=1: in test-mode, ignore system mouse; accept only harness injection.
 fn isolateOsPointer() bool {
-    if (isolate_os_pointer_cache) |v| return v;
-    const v = if (std.posix.getenv("ZENIT_E2E_ISOLATE_POINTER")) |raw| raw.len > 0 and !std.mem.eql(u8, raw, "0") else false;
-    isolate_os_pointer_cache = v;
-    return v;
+    return pointer_isolation.enabled(false);
 }
 
-// E2E test harness 全局 cx 引用 (单窗口应用，多窗口需要扩展)
+// E2E test harness global cx reference (single-window app; multi-window needs extension).
 var g_test_cx: ?*ui.Cx = null;
 fn getTestCx() ?*ui.Cx {
     return g_test_cx;
 }
 
-// E2E test harness 截图，全局 App 引用（单窗口）。callback 只登记请求，
-// 真实读像素在 renderer.frame() 内 present 前做。
+// E2E test harness screenshot, global App reference (single-window). Callback only registers
+// request; actual pixel read happens in renderer.frame() before present.
 var g_screenshot_app: ?*App = null;
 fn getFrameStats() test_harness.FrameStatsSnapshot {
     const app = g_screenshot_app orelse return .{};
@@ -120,16 +122,28 @@ fn getFrameStats() test_harness.FrameStatsSnapshot {
         .path_draw_calls = app.renderer.last_frame_stats.path_draw_calls,
         .frame_count = app.renderer.frame_count,
         .backdrop_luminance = app.renderer.backdrop_luminance orelse -1,
+        .paint_duplicate_fills = app.cx.paint_duplicate_fills,
+        .paint_duplicate_node = app.cx.paint_duplicate_node,
 
-        // 单帧计时（噪声大，仅供 log）
+        // Single-frame timing (noisy, log only).
         .gpu_execute_us = app.renderer.last_frame_stats.gpu_execute_us,
         .cpu_frame_us = app.renderer.last_frame_stats.cpu_frame_us,
         .layout_us = app.renderer.last_frame_stats.layout_us,
         .render_gen_us = app.renderer.last_frame_stats.render_gen_us,
         .gpu_encode_us = app.renderer.last_frame_stats.gpu_encode_us,
+        .wait_for_frame_us = app.renderer.last_frame_stats.wait_for_frame_us,
+        .acquire_texture_us = app.renderer.last_frame_stats.acquire_texture_us,
+        .encode_us = app.renderer.last_frame_stats.encode_us,
+        .flush_us = app.renderer.last_frame_stats.flush_us,
+        .glass_count = app.renderer.last_frame_stats.glass_count,
+        .glass_us = app.renderer.last_frame_stats.glass_us,
+        .texture_creates = app.renderer.last_frame_stats.texture_creates,
+        .render_passes = app.renderer.last_frame_stats.render_passes,
+        .blit_passes = app.renderer.last_frame_stats.blit_passes,
+        .pass_native_us = app.renderer.last_frame_stats.pass_native_us,
         .total_frame_us = app.renderer.last_frame_stats.total_frame_us,
 
-        // 跨帧 P95（门禁断言用）
+        // Cross-frame P95 (for gate assertions).
         .gpu_p95_us = app.renderer.timing_ring.gpuPercentile(95),
         .cpu_p95_us = app.renderer.timing_ring.cpuPercentile(95),
         .total_p95_us = app.renderer.timing_ring.totalPercentile(95),
@@ -137,11 +151,12 @@ fn getFrameStats() test_harness.FrameStatsSnapshot {
     };
 }
 
-/// 清空跨帧计时环，e2e 性能门禁切到重场景、等其 settle 后调用，
-/// 使随后的 P95 只反映该场景本身（不混入上一个 story 的样本）。
+/// Clear cross-frame timing ring. E2E perf gates switch to heavy scene, wait settle, then call
+/// so subsequent P95 reflects only that scene (no prior story samples).
 fn resetTiming() void {
     const app = g_screenshot_app orelse return;
     app.renderer.timing_ring.reset();
+    app.renderer.gpu_timing_ring.reset();
 }
 
 fn wakeTestHarness() void {
@@ -153,20 +168,41 @@ fn wakeTestHarness() void {
 fn resizeWindowForHarness(width: u32, height: u32) bool {
     const app = g_screenshot_app orelse return false;
     app.win.setSize(width, height);
-    // 尺寸变化经主循环的 maybeReconfigureSurface 在后续帧重配 surface；
-    // 这里只负责触发。回归锚点：重配后的 usage 必须保留 test-mode 的
-    // CPU readback（surfaceConfigFor 单一出口），否则 resize 后 /screenshot 全花。
+    // Size changes reconfigure surface via maybeReconfigureSurface in later frame; here just
+    // trigger.
+    // Anchor: after reconfig, usage must retain test-mode CPU readback (surfaceConfigFor single
+    // outlet),
+    // else resize -> /screenshot all corrupt.
     app.cx.needs_redraw = true;
     return true;
 }
 
+/// e2e `/visual-quality`: the same tiers and sticky blur-failure injection as
+/// the Windows runtime, so degraded glass is testable on macOS too.
+fn visualQualityForHarness(command: test_harness.VisualQualityCommand) ?[]const u8 {
+    const app = g_screenshot_app orelse return null;
+    switch (command) {
+        .status => {},
+        .auto => app.setVisualQuality(.auto),
+        .full => app.setVisualQuality(.full),
+        .frosted => app.setVisualQuality(.frosted),
+        .basic => app.setVisualQuality(.basic),
+        .fail_blur => {
+            app.renderer.persistent_gpu.blur_pipeline_failed = true;
+            app.cx.needs_redraw = true;
+            if (app.cx.root) |root| root.markRenderDirty();
+        },
+    }
+    return @tagName(app.renderer.visual_quality);
+}
+
 fn captureScreenshot(path: []const u8) bool {
     const app = g_screenshot_app orelse return false;
-    // 首选:读上一次**真实呈现**帧的保留拷贝(不驱动新帧)。
-    // 驱动新帧会把 pending 布局/标脏顺带跑完,截到的比屏幕上新,
-    // 呈现层 bug 期间"屏幕满残影、截图干净",e2e 全绿误判了三天。
+    // Preferred: read retained copy of last truly-presented frame (don't drive new frame). Driving
+    // new frame runs pending layout/dirty, screenshot newer than screen. During render layer bug:
+    // screen full ghosting, screenshot clean, e2e false-green for three days.
     if (app.renderer.captureRetainedToPng(path)) return true;
-    // 兜底(启动初期还没有保留帧):旧路径,驱动一帧再 readback。
+    // Fallback (early startup, no retained frame yet): old path, drive one frame then readback.
     if (!app.renderer.requestCapture(path)) return false;
     app.frame() catch return false;
     return app.renderer.last_screenshot_ok;
@@ -230,78 +266,51 @@ const FontManager = render.FontManager;
 const FontSelector = render.FontSelector;
 const Font = render.Font;
 
-pub const TitlebarStyle = enum {
-    /// 系统默认：透明标题栏 + 内容延伸到顶（FullSizeContentView），
-    /// 红绿灯在系统默认位置。
-    default,
-    /// 自定义内嵌标题栏（Figma/Linear 式）：红绿灯垂直居中于
-    /// titlebar_height，顶部该高度区域可拖动窗口。App 自绘标题栏内容。
-    custom_inset,
-};
+pub const TitlebarStyle = @import("window_config.zig").TitlebarStyle;
+pub const WindowConfig = @import("window_config.zig").WindowConfig;
 
-pub const WindowConfig = struct {
-    width: u16 = 800,
-    height: u16 = 600,
-    title: [:0]const u8 = "zenit",
-    titlebar: TitlebarStyle = .default,
-    /// custom_inset 时的自绘标题栏高度（逻辑像素，如 52）
-    titlebar_height: f32 = 52,
-    /// custom_inset 时标题栏右侧排除拖拽的宽度（给自绘 action buttons 让出点击区）
-    titlebar_drag_right_inset: f32 = 0,
-};
-
-pub const FontConfig = struct {
-    /// 默认字体大小（用于 ui.text 默认 14pt）。`small` slot。
-    small_size: u32 = 14,
-    /// 中等字体（用于 H3 等）。`medium` slot。
-    medium_size: u32 = 18,
-    /// 大字体（用于 H2 等）。`large` slot。
-    large_size: u32 = 24,
-    /// 字体家族 fallback 链。第一个找到的即用。默认链兼容 macOS / Linux 桌面。
-    fallback_families: []const []const u8 = &.{
-        "Helvetica Neue",
-        "Arial",
-        "Helvetica",
-        "Inter",
-        "Menlo",
-    },
-};
+pub const FontConfig = @import("font_config.zig").FontConfig;
 
 pub const FramePacing = enum { poll, display_link };
 
 pub const Config = struct {
+    /// Application-owned I/O implementation, valid until all windows are destroyed.
+    io: std.Io,
+    visual_quality: ?@import("render").visual_quality.Quality = null,
     window: WindowConfig = .{},
     font: FontConfig = .{},
     /// Per-window diagnostic console sinks and bounded capture capacity.
     console: ui.console.Config = ui.console.defaultConfig(),
-    /// 背景色（每帧 clear）。默认白色。
+    /// Background color (cleared each frame). Default white.
     clear_color: ClearColor = .{ .r = 1.0, .g = 1.0, .b = 1.0, .a = 1.0 },
-    /// `sdk.pump` 超时毫秒。16 = 约 60Hz idle 唤醒。仅 `.poll` 帧节奏下生效。
+    /// sdk.pump timeout milliseconds. 16 ~= 60Hz idle wake. Only effective with .poll frame pacing.
     pump_timeout_ms: u32 = 16,
-    /// 帧节奏来源：
-    /// - `.display_link`（默认）：CVDisplayLink 每 vsync 唤醒主线程，pump 长超时
-    ///   纯阻塞等事件；idle 时 link 停掉 -> CPU 完全静默。ProMotion 下自动 120Hz。
-    /// - `.poll`：旧行为，pump(pump_timeout_ms) 定时轮询。回滚开关。
-    /// 环境变量 `ZENIT_FRAME_PACING=poll|display_link` 可覆盖（App.init 读取）。
+    /// Frame pacing source:
+    /// - .display_link (default): CVDisplayLink wakes per vsync, pump uses a long timeout (pure
+    ///   event
+    ///   block); idle stops the link -> CPU silent. ProMotion auto 120Hz.
+    /// - .poll: legacy, periodic pump(pump_timeout_ms). Rollback switch.
+    /// Env ZENIT_FRAME_PACING=poll|display_link overrides (App.init reads).
     frame_pacing: FramePacing = .display_link,
-    /// display-link 模式下 pump 阻塞的兜底超时毫秒（防 deadline 任务在纯事件
-    /// 阻塞下饿死）；实际超时取 min(此值, 距最近 wake deadline 的剩余时间)。
+    /// display-link mode pump fallback timeout ms (prevent deadline tasks starving on pure event
+    /// block);
+    /// actual timeout = min(this, remaining until next wake deadline).
     idle_wait_ms: u32 = 500,
-    /// idle 时跳过整帧 GPU 提交（树 clean + 无动画 + 无 deferred work）。
-    /// 逃生阀：怀疑"该重绘却没绘"时置 false 回旧行为对照。
+    /// Idle skip entire GPU submit (tree clean + no animations + no deferred work).
+    /// Escape: suspect missing redraw, set false for regression test.
     idle_skip_frames: bool = true,
 };
 
-/// App，一站式应用运行时
+/// App, one-stop app runtime.
 ///
-/// 字段都是 pub 以便高级用户绕过 run() 自己写主循环：
+/// Fields are pub so power users can bypass run() and write a custom main loop:
 ///   var app = try App.init(...);
 ///   defer app.deinit();
 ///   while (custom condition) {
 ///     _ = try app.sdk.pump(16);
-///     app.processEvents();              // 把 sdk 事件 dispatch 到 cx
-///     try app.maybeReconfigureSurface(); // resize 检测
-///     try app.frame();                   // 渲染一帧
+///     app.processEvents();              // dispatch sdk events to cx
+///     try app.maybeReconfigureSurface(); // resize detect
+///     try app.frame();                   // render one frame
 ///   }
 pub const App = struct {
     allocator: Allocator,
@@ -314,29 +323,34 @@ pub const App = struct {
     surface: gpu.Backend.Surface,
     renderer: *AppRenderer,
     font_manager: FontManager,
-    /// 宿主装上来的字体族注册表(可选)。App 只借指针,负责在 scale 变化时
-    /// 通知它，见 setFontRegistry。
+    /// Font family registry from host (optional). App borrows pointer, notify on scale change;
+    /// see setFontRegistry.
     font_registry: ?*render.FontRegistry = null,
     fonts: [3]*Font, // small / medium / large
-    /// 基础字体实际解析到的字体族（按字重加载时沿用）。
+    /// Actual font family resolved from base font (reused when loading by weight).
     resolved_font_family: ?[]const u8 = null,
     font_selector: FontSelector,
     sdk: system_sdk.api.SystemSdk,
     cx: *ui.Cx,
 
-    // 主循环状态
+    // Main loop state.
     current_drawable_w: u32,
     current_drawable_h: u32,
     viewport_w: f32,
     viewport_h: f32,
     scale: f32,
     should_quit: bool = false,
-    /// display-link 帧节奏状态（frame_pacing == .display_link 时用）
+    /// display-link pacing state (when frame_pacing == .display_link).
     display_link_running: bool = false,
-    /// 连续 idle（want=false）计数，达到阈值才 stop link（防 clean/dirty 边界抖动）
+    display_tick_gate: render_pacing.DisplayTickGate = .{},
+    resize_frame_pending: bool = false,
+    /// Consecutive idle (want=false) count; stop link when threshold hit (dampen clean/dirty
+    /// jitter).
     idle_streak: u8 = 0,
-    /// live-resize 同步渲染重入护栏（setFrameSize 回调可能嵌套触发）
+    /// live-resize sync render guard (setFrameSize callback may nest).
     in_live_resize_render: bool = false,
+    /// ZENIT_DEBUG_JANK: time of last consecutive render frame (multi-window loop, see jankProbe).
+    debug_jank_prev: ?@import("zenit_time").Instant = null,
 
     fn titlebarHitTestCb(ctx: ?*anyopaque, x: f32, y: f32) callconv(.c) c_int {
         const app: *App = @ptrCast(@alignCast(ctx orelse return 0));
@@ -344,52 +358,67 @@ pub const App = struct {
     }
 
     pub fn init(allocator: Allocator, config: Config) !*App {
-        // 窗口 / Metal device / 字体装配同样在任何 run loop pool 之外。
+        // Window / Metal device / font assembly similarly outside any run loop pool.
         const pool = AutoreleasePool.push();
         defer pool.pop();
-        // App 自己堆分配，否则 cx.measure_fn 全局桩拿不到稳定指针。
+        // App heap-allocated; else cx.measure_fn stub can't get stable pointer.
         var app = try allocator.create(App);
         errdefer allocator.destroy(app);
 
         app.allocator = allocator;
         app.config = config;
+        // Win32 has no display-link callback yet; use the timed message pump.
+        if (builtin.os.tag == .windows) app.config.frame_pacing = .poll;
         app.should_quit = false;
         app.display_link_running = false;
+        app.display_tick_gate = .{};
+        app.resize_frame_pending = false;
         app.idle_streak = 0;
         app.in_live_resize_render = false;
+        app.debug_jank_prev = null;
 
-        // 回滚开关：ZENIT_FRAME_PACING=poll 强制回旧轮询节奏，一行环境变量回滚
-        if (std.posix.getenv("ZENIT_FRAME_PACING")) |val| {
+        // Rollback: ZENIT_FRAME_PACING=poll forces legacy polling pacing, one-line env rollback.
+        const pacing_env = @import("zenit_environment").getOwned(allocator, "ZENIT_FRAME_PACING") catch null;
+        defer if (pacing_env) |value| allocator.free(value);
+        if (pacing_env) |val| {
             if (std.mem.eql(u8, val, "poll")) {
                 app.config.frame_pacing = .poll;
-            } else if (std.mem.eql(u8, val, "display_link")) {
+            } else if (builtin.os.tag == .macos and std.mem.eql(u8, val, "display_link")) {
                 app.config.frame_pacing = .display_link;
             } else {
                 std.log.scoped(.zenit_runtime).warn("ZENIT_FRAME_PACING={s} 无效（poll|display_link），忽略", .{val});
             }
         }
 
-        // 把 macOS NSAccessibility push-side hooks (window_bridge.m
-        // 实装的 zenit_a11y_push_*) 注册到 ui.a11y.macos_bridge, cx.render() 末尾
-        // flushToBridge 通过这些 fn ptr 把 dirty event 推到 NSAccessibilityPostNotification。
-        ui.a11y.macos_bridge.setPushHooks(.{
-            .property_changed = zenit_a11y_push_property_changed,
-            .focus_changed = zenit_a11y_push_focus_changed,
-            .children_changed = zenit_a11y_push_children_changed,
-            .announce = zenit_a11y_push_announce,
-            .active_descendant_changed = zenit_a11y_push_active_descendant,
-            .window_cleared = zenit_a11y_push_window_cleared,
-        });
+        // Register macOS NSAccessibility push-side hooks (window_bridge.m zenit_a11y_push_*) to
+        // ui.a11y.macos_bridge; cx.render() end flushToBridge pushes dirty events via these fn ptrs
+        // to NSAccessibilityPostNotification.
+        if (builtin.os.tag == .macos) {
+            ui.a11y.macos_bridge.setPushHooks(.{
+                .property_changed = zenit_a11y_push_property_changed,
+                .focus_changed = zenit_a11y_push_focus_changed,
+                .children_changed = zenit_a11y_push_children_changed,
+                .announce = zenit_a11y_push_announce,
+                .active_descendant_changed = zenit_a11y_push_active_descendant,
+                .window_cleared = zenit_a11y_push_window_cleared,
+                .element_destroyed = zenit_a11y_push_element_destroyed,
+                .flush_end = zenit_a11y_push_flush_end,
+            });
+            ui.a11y.macos_bridge.setTextInputAppliedHook(zenit_text_input_preedit_applied);
+        }
 
-        ui.a11y.macos_bridge.setTextInputAppliedHook(zenit_text_input_preedit_applied);
+        // System accessibility preference: inject reader fn, read once, listen for changes.
+        ui.a11y.preferences.system_reader = zenit_a11y_display_options;
+        _ = ui.a11y.preferences.refresh();
+        zenit_a11y_observe_display_options();
 
-        // 平台 init
+        // Platform init.
         Window.initAppWithDelegate();
         app.win = try Window.init(config.window.width, config.window.height, config.window.title);
         errdefer app.win.deinit();
 
         if (config.window.titlebar == .custom_inset) {
-            // 红绿灯垂直居中于自绘标题栏；x 取系统默认起点 7
+            // Traffic light centered vertically on custom title bar; x default system origin 7.
             app.win.setTrafficLightsInset(7, config.window.titlebar_height / 2.0);
             app.win.setTitlebarDragHeight(config.window.titlebar_height);
             if (config.window.titlebar_drag_right_inset > 0) {
@@ -412,8 +441,8 @@ pub const App = struct {
         errdefer app.device.deinit();
         errdefer app.queue.deinit();
 
-        // Surface。句柄按 `*anyopaque` 交给后端解释，App 运行时不认识
-        // CAMetalLayer，也不该认识（见 Surface.init 的注释）。
+        // Surface. Handles passed to backend as *anyopaque, App runtime doesn't know CAMetalLayer
+        // and shouldn't (see Surface.init comment).
         app.surface = gpu.Backend.Surface.init(app.win.getNativeSurfaceHandle());
         errdefer app.surface.deinit();
         const drawable = app.win.getDrawableSize();
@@ -424,13 +453,14 @@ pub const App = struct {
         // AppRenderer
         app.renderer = try allocator.create(AppRenderer);
         errdefer allocator.destroy(app.renderer);
-        app.renderer.* = try AppRenderer.init(allocator, &app.device, &app.queue, &app.surface, .{
+        app.renderer.* = try AppRenderer.init(allocator, config.io, &app.device, &app.queue, &app.surface, .{
             .clear_color = config.clear_color,
+            .visual_quality = config.visual_quality orelse .auto,
         });
         errdefer app.renderer.deinit();
 
         // Font
-        app.font_manager = try FontManager.init(allocator);
+        app.font_manager = try FontManager.init(allocator, config.io);
         errdefer app.font_manager.deinit();
         app.scale = app.win.getScaleFactor();
 
@@ -445,9 +475,9 @@ pub const App = struct {
             if (resolved_family == null) resolved_family = r.family;
             loaded_count += 1;
         }
-        // "system" family 收敛到渲染实际用的 family（GlyphRun 管线的
-        // shapeText/visualLine 与 FontSelector 渲染必须同基字体，否则拉丁
-        // kerning 与 🈶 类符号 emoji 的 fallback 解析会出现度量≠渲染）。
+        // "system" family converges to rendering family (GlyphRun pipeline shapeText/visualLine and
+        // FontSelector render must use same base font, else Latin kerning and emoji 🈶 fallback
+        // parsing diverge: measurement != rendering).
         app.font_manager.setDefaultFamily(resolved_family);
 
         app.font_selector = .{
@@ -455,17 +485,20 @@ pub const App = struct {
             .medium = app.fonts[1],
             .large = app.fonts[2],
         };
-        // 按字重加载：同一字体族，目标字重（600 / 700 …）。否则所有粗体静默退回常规体。
+        // Load by weight: same family, target weight (600/700...). Else all bold silently reverts
+        // regular.
         app.resolved_font_family = resolved_family;
         app.font_selector.weight_loader = .{ .context = @ptrCast(app), .load = loadWeightedFont };
+        if (comptime builtin.os.tag == .macos) app.font_selector.system_ui_loader = .{ .context = @ptrCast(app), .load = loadSystemUiFont };
         app.renderer.setFonts(&app.font_selector);
         app.renderer.initFontDerivedCache(allocator);
 
-        // 本窗口的真实系统 id（macOS = NSWindow.windowNumber）。以前这里硬编码 1，
-        // 两个 App 并存时 a11y / 系统 API 会全部路由到同一个 id 上互相覆盖。
-        // 0 说明底层没拿到窗口；此时用进程内单调递增的合成 id 兜底，不能都
-        // 退回同一个常数（两个 App 都拿 0 时会以同键注册、静默回到互相覆盖），
-        // 合成 id 从高位段起，避免与真实 windowNumber 撞号。
+        // Real system window id for this window (macOS = NSWindow.windowNumber). Must not be a
+        // constant: two Apps would route a11y/system API to the same id and clobber each other.
+        // 0 means the layer has no window yet; fall back to a monotonic per-process synthetic id,
+        // not
+        // a shared constant (two Apps at 0 would register the same key, silently clobbering again).
+        // Synthetic ids start high to avoid collision with real windowNumbers.
         const window_id: system_sdk.events.WindowId = blk: {
             const raw = app.win.getWindowId();
             if (raw != 0) break :blk raw;
@@ -482,9 +515,13 @@ pub const App = struct {
         errdefer app.sdk.deinit();
 
         // UI Cx
-        app.cx = try ui.Cx.init(allocator);
+        app.cx = try ui.Cx.init(allocator, config.io);
         app.cx.console().configure(app.config.console);
         errdefer app.cx.deinit();
+        // Render reads background luminance per glass (except basic fidelity): declare before any
+        // UI
+        // mount (startup-mounted glass must also run first-frame detection).
+        app.cx.backdrop_luminance_readback = app.renderer.visual_quality != .basic;
         app.cx.setWindowId(window_id);
         app.cx.setSystemSdk(&app.sdk);
         const win_size = app.win.getSize();
@@ -492,25 +529,26 @@ pub const App = struct {
         app.viewport_h = @floatFromInt(win_size[1]);
         app.cx.setWindowMetrics(app.viewport_w, app.viewport_h, app.scale);
 
-        // 命中驱动拖拽区（下游应用）：custom_inset 标题栏内 mouseDown
-        // 先做真实 hit-test，点在任意交互控件上就正常下发事件，其余空白才拖窗口。
-        // 矩形模型（drag_right_inset）仍生效，作为回调之前的粗筛。
-        if (config.window.titlebar == .custom_inset) {
+        // Drag-region hit (downstream app): custom_inset title bar mouseDown true hit-test first;
+        // if on interactive control, dispatch normal event, else empty space drags window.
+        // Rect model (drag_right_inset) still applies as coarse pre-filter.
+        if ((builtin.os.tag == .macos or builtin.os.tag == .windows) and config.window.titlebar == .custom_inset) {
             app.win.setTitlebarHitCallback(titlebarHitTestCb, app);
         }
 
-        // 接 measure_fn。优先用**带 context** 的版本：它把本 App 自己的
-        // FontSelector 作为 context 传下去，多个 App 并存时各测各的字体。
-        // 无 context 的全局指针保留为兜底（旧 API 兼容），但不再是主路径,
-        // 它曾是多窗口的两处非 World 全局依赖之一。
+        // Connect to measure_fn. Prefer version with context: it passes this App's own FontSelector
+        // as context, each concurrent App measures its own fonts. Fallback pointer-global
+        // no-context
+        // remains for compat but no longer primary path; it was one of two non-World globals in
+        // multi-window.
         app.cx.text.measure_ctx_fn = measureTextWithCtx;
         app.cx.text.measure_ctx = @ptrCast(&app.font_selector);
         app.cx.text.measure_fn = measureText;
 
-        // GlyphRun pipeline 接管旧 measure 路径起步，把 FontManager
-        // 注入 cx，让 cx.shapeText 能找 Font + 调 TextShaper。
-        // setSystemSdk 风格：单向注入，cx 持有 ?*FontSystem 弱引用，App.deinit
-        // 时 cx.deinit 在 font_manager.deinit 之前（生命周期由 App 兜底）。
+        // GlyphRun pipeline takes over old measure path, injecting FontManager to cx so
+        // cx.shapeText
+        // finds Font + calls TextShaper. setSystemSdk style: one-way inject, cx holds ?*FontSystem
+        // weak ref; cx.deinit before font_manager.deinit on App.deinit (lifespan backstop).
         app.cx.text.setFontSystem(&app.font_manager);
 
         // The runtime owns the complete text pipeline, so its default setup
@@ -520,77 +558,81 @@ pub const App = struct {
         // stack or deinit hands them back to the next live App.
         installProcessTextHooks(try g_text_hook_owners.push(app, &app.font_selector));
 
-        // live resize 同步渲染：AppKit 的 resize tracking loop 会把 pump 整段阻塞，
-        // 主循环在拖拽期间完全不转，MetalView.setFrameSize 里的回调是唯一渲染机会。
-        // 不注册它，CoreAnimation 就只能拉伸旧帧（"画布像图片一样变形"）。
+        // live resize sync render: AppKit resize tracking loop blocks pump entirely; main loop
+        // stops
+        // during drag, MetalView.setFrameSize callback is only render chance. Missing it,
+        // CoreAnimation
+        // stretches old frame ("canvas warps like image").
         app.win.setRenderCallback(liveResizeRender, @ptrCast(app));
 
         return app;
     }
 
-    /// 用 App 自己装配的 FontSelector 顶替 runtime 内建的那套（`app.font_selector`）。
+    /// Replace the runtime's built-in FontSelector (app.font_selector) with the App's own.
     ///
-    /// == 为什么必须有这个 API，而不能只调 renderer.setFonts ==
-    /// 「谁来回答一段文本有多宽」在 runtime 里有**四个**出口，init() 时全部
-    /// 绑到内建字体上：
-    ///   1. `renderer.fonts`，真正画字形的那套
-    ///   2. `cx.measure_ctx`, measure_ctx_fn 的 context
-    ///   3. `g_font_selector_for_measure`，无 context 的 measure_fn 兜底
-    ///   4. GlyphRun 管线（shapeViaPipeline）自己解析的字体，光标定位、
-    ///      选区端点、命中测试走的就是它
+    /// == Why this API exists rather than just renderer.setFonts ==
+    /// "How wide is text?" has four outlets in the runtime, all bound to built-in fonts at init():
+    ///   1. renderer.fonts: draws glyphs
+    ///   2. cx.measure_ctx, measure_ctx_fn context
+    ///   3. g_font_selector_for_measure: measure_fn fallback (no context)
+    ///   4. GlyphRun pipeline (shapeViaPipeline) self-resolved fonts, used for cursor position,
+    ///      selection endpoints, hit test
     ///
-    /// 前三个走 FontSelector，第四个**完全不经过 FontSelector**。所以
-    /// 「只换 selector」和「只换 renderer」一样不够：必须四个一起换。
+    /// The first three use FontSelector; the fourth bypasses it completely. Swapping only the
+    /// selector or only the renderer is insufficient: all four must be swapped together.
     ///
-    /// 第 4 个不能用 `font_manager.setDefaultFamily("Inter")` 糊过去：那只是
-    /// 把 "system" 换个名字再去查**系统已安装**字体，而 Inter/Lora 是 App 用
-    /// loadFont(path) 从仓库文件装的，系统库里没有，查不到就静默回退到别的
-    /// 族，偏差反而从 1.442px 放大到 3.783px（实测）。只有把 FontSelector
-    /// 本身交给管线当解析器，才能保证「量的和画的是同一个 *Font 对象」。
+    /// The fourth cannot use font_manager.setDefaultFamily("Inter"): that only renames "system" and
+    /// queries system-installed fonts. Inter/Lora loaded by the App from repo files are not in the
+    /// system library, the query fails and the silent fallback widens text (1.442px -> 3.783px).
+    /// Only passing FontSelector itself as the pipeline parser guarantees measurement and rendering
+    /// read the same *Font.
     ///
-    /// == 漏掉第 4 个会怎样（本函数存在的直接原因）==
-    /// measureTextWidthWithSpans **不是** 参数的纯函数：measureProportional
-    /// 先试 g_shape_measure_fn（GlyphRun 管线，走出口 4），NaN 才回落到
-    /// measure_ctx_fn / measure_fn（走出口 1~3）。于是同一行文本、同一组
-    /// 参数，在「钩子装着」与「钩子没装」两种环境下得到不同答案：
-    ///   fs=14 fw=450 "ssdf x😊"（Inter 排版、default_family 还是 HelveticaNeue）
-    ///     钩子装着（GlyphRun/HelveticaNeue）= 57.906   <- computeCursorPos 走这条
-    ///     钩子没装（FontSelector/Inter）    = 59.348   <- 布局与绘制走这条
-    ///   差 1.442px，光标与选区端点因此**短**在字形右缘里侧，越往行尾差越大。
-    /// 逐字符看，拉丁段每个字母都差（s 7.465->7.266、d 8.614->8.554、
-    /// f 5.247->4.410…），emoji 段两边都是 19.000，这个 bug 与 emoji 无关，
-    /// 纯英文行同样错，只是行尾 emoji 让缺口最显眼。
+    /// == If the fourth is missing ==
+    /// measureTextWidthWithSpans is not pure: measureProportional tries g_shape_measure_fn first
+    /// (GlyphRun pipeline, outlet 4); NaN falls back to measure_ctx_fn/measure_fn (outlets 1-3).
+    /// Same text and params give different widths depending on whether the hook is wired:
+    ///   fs=14 fw=450 "ssdf x<emoji>" (Inter layout, default_family still HelveticaNeue)
+    ///     hook wired (GlyphRun/HelveticaNeue) = 57.906   <- computeCursorPos uses
+    ///     hook unwired (FontSelector/Inter)  = 59.348   <- layout and draw use
+    ///   Diff 1.442px; cursor/selection endpoints fall short of the glyph right edge, growing
+    ///   toward
+    ///   the line end. Per-char widths differ for Latin letters too (s 7.465->7.266, d
+    ///   8.614->8.554,
+    ///   f 5.247->4.410...), so it is not emoji-specific; a trailing emoji just exposes it.
     ///
-    /// `selector` 由调用方持有，生命周期必须覆盖整个 App；这里只借指针。
+    /// The selector is caller-held and its lifespan must cover the entire App; only a pointer is
+    /// borrowed here.
     pub fn setFontSelector(self: *App, selector: *FontSelector) void {
         self.renderer.setFonts(selector);
         self.renderer.initFontDerivedCache(self.allocator);
-        // 立刻对齐当前 backing scale：scale_changed 只在**变化**时触发，
-        // 已经在 2x 屏上装载的宿主 selector 否则会一直按 1x 光栅化。
+        // Immediately align current backing scale: scale_changed only triggers on change; selector
+        // already on 2x screen rasterizes 1x if never fires.
         selector.setScaleFactor(self.scale);
         self.cx.text.measure_ctx_fn = measureTextWithCtx;
         self.cx.text.measure_ctx = @ptrCast(selector);
-        // 出口 3 + 4：无 context 兜底与 GlyphRun 管线字体解析器（进程全局，
-        // 经归属栈登记，见 text_hook_owners.zig）。
-        // self 已在 init 登记：更新已有 owner 不扩容，不会失败。
+        // Outlet 3 + 4: no-context fallback and GlyphRun pipeline font parser (process-global,
+        // registered per ownership stack, see text_hook_owners.zig). self already registered at
+        // init:
+        // update existing owner no-realloc, won't fail.
         installProcessTextHooks(g_text_hook_owners.push(self, selector) catch
             @panic("text hook owner update must not allocate"));
     }
 
-    /// 装上字体族解析器(render.FontRegistry)。
+    /// Wire the font family parser (render.FontRegistry).
     ///
-    /// 装到**当前生效的** FontSelector 上，内建的那个,或宿主经
-    /// `setFontSelector` 换上来的那个。因为 resolveFonts 是测量与渲染
-    /// 共用的唯一入口,装在这一处就同时覆盖四个出口。
+    /// Applies to the currently active FontSelector (built-in, or one installed via
+    /// setFontSelector). Since resolveFonts is the single measurement/render entry point, wiring
+    /// here covers all four outlets.
     ///
-    /// `registry` 由调用方持有,生命周期必须覆盖整个 App;这里只借指针。
+    /// The registry is caller-held, its lifespan must cover the entire App; only a pointer is
+    /// borrowed.
     pub fn setFontRegistry(self: *App, registry: *render.FontRegistry) void {
         const sel = self.renderer.fonts orelse &self.font_selector;
         sel.family_resolve_fn = &resolveFamilyFont;
         sel.family_resolve_ctx = @ptrCast(registry);
         self.font_registry = registry;
-        // 立刻对齐当前 scale，装载时可能已经在 2x 屏上了,
-        // 等下一次 scale **变化**才同步的话首屏就是糊的。
+        // Immediately align current scale; if already on 2x screen at load, waiting until next
+        // scale change to sync means first screen is blurry.
         registry.setScaleFactor(self.scale);
     }
 
@@ -599,7 +641,7 @@ pub const App = struct {
         // A closing window can still be inside live resize, IME composition, or
         // a drag session, so teardown order is part of the public contract.
         self.win.setRenderCallback(null, null);
-        self.win.setTitlebarHitCallback(null, null);
+        if (builtin.os.tag == .macos or builtin.os.tag == .windows) self.win.setTitlebarHitCallback(null, null);
         if (self.display_link_running) {
             self.win.stopDisplayLink();
             self.display_link_running = false;
@@ -621,20 +663,22 @@ pub const App = struct {
         installProcessTextHooks(g_text_hook_owners.remove(self));
         self.cx.deinit();
         self.sdk.deinit();
-        // ⚠️ 先把**外来** selector 摘掉,再动 font-derived cache。
+        // WARNING: remove the external selector first, then touch font-derived caches.
         //
-        // `setFontSelector` 之后 `renderer.fonts` 指向的是**宿主自己的**
-        // FontSelector,而它的生命周期不归 App 管。宿主惯常写法是
+        // After setFontSelector, renderer.fonts points to the host's own FontSelector, whose
+        // lifespan the
+        // App does not manage. Typical host pattern:
         //   var app = try App.init(...);   defer app.deinit();
         //   const font_set = try loadFonts(...);  defer font_set.deinit();
-        // defer 是 LIFO,于是 font_set 先释放、App.deinit 后执行,
-        // `deinitFontDerivedCache()` 就会去遍历一份**已释放**的 selector:
-        // EXC_BAD_ACCESS,栈顶正是 `runtime.App.deinit`(实测下游编辑器
-        // 每次关窗必崩)。
+        // defer is LIFO, so font_set frees first and App.deinit runs later:
+        // deinitFontDerivedCache() then iterates a freed selector (EXC_BAD_ACCESS in
+        // runtime.App.deinit).
         //
-        // 让 App 在拆自己之前先回到内建 selector:外来那份由宿主自己负责,
-        // 我们既不释放它、也不再读它。这样宿主两种 defer 顺序都安全,
-        // 生命周期契约不该由调用方的声明次序来保证。
+        // So the App falls back to the built-in selector before tearing down. The external selector
+        // is
+        // the caller's responsibility; we neither free it nor read it again. Both defer orders are
+        // safe;
+        // the lifespan contract must not depend on declaration order.
         if (self.renderer.fonts != &self.font_selector) {
             self.renderer.setFonts(&self.font_selector);
         }
@@ -649,23 +693,24 @@ pub const App = struct {
         self.instance.deinit();
         self.win.deinit();
         const allocator = self.allocator;
-        // g_font_selector_for_measure 已在上面随归属栈回落到下一个存活 App
-        // （或 null）。外来 selector 可能被多个窗口共享，只能断言内建那份。
+        // g_font_selector_for_measure already fell back via ownership stack to next live App
+        // (or null). External selector may be shared by multiple windows; only assert built-in.
         std.debug.assert(g_font_selector_for_measure != &self.font_selector);
         allocator.destroy(self);
     }
 
-    /// Mount 函数签名，`runWith` / `mount` 接受这种回调。
-    /// scope 由 App 创建并持有；返回的 root node 直接装上去。
+    /// Mount fn signature; runWith / mount accept this callback. Scope created and held
+    /// by App; returned root node mounts directly.
     pub const MountFn = *const fn (cx: *ui.Cx, scope: *ui.Scope) anyerror!*ui.Node;
 
-    /// 创建 root_scope、调用 mount_fn 构建 UI 树、把 root 装上 cx。
-    /// 这把每个 mountUI() 都写过的 4 行 boilerplate 一次性吃掉。
-    /// test-mode：把 file-RPC harness 的目标重新绑到本 App。
-    /// `mount()` 的注册是"后到者赢"，多窗口宿主（DevTools 等辅助窗口也走
-    /// App.mount）会把 g_test_cx / g_screenshot_app 顶成辅助窗口，此后所有
-    /// RPC 按键/截图都打到错误的窗口上。宿主创建完辅助窗口后调用本方法把
-    /// 主窗抢回来。非 test-mode 下是 no-op。
+    /// Create root_scope, call mount_fn to build the UI tree, attach root to cx.
+    /// Replaces the 4-line boilerplate every mountUI() would write.
+    /// test-mode: rebinds the file-RPC harness target to this App. mount() registration is
+    /// "last one wins"; in a multi-window host (DevTools auxiliary windows also use App.mount)
+    /// g_test_cx / g_screenshot_app would point to the auxiliary window and all RPC
+    /// keys/screenshots
+    /// go to the wrong window. After creating an auxiliary window, the host calls this to take the
+    /// main window back. No-op outside test-mode.
     pub fn rebindTestHarness(self: *App) void {
         if (!test_harness.enabled) return;
         g_test_cx = self.cx;
@@ -673,22 +718,24 @@ pub const App = struct {
     }
 
     pub fn mount(self: *App, mount_fn: MountFn) !void {
-        // Build-first / commit-last 事务：任何一步失败都必须让 App 回到"未 mount"
-        // 状态，且不留下任何指向已释放内存的字段，用户惯用 `defer app.deinit()`，
-        // deinit 第一件事就是 cx.deinit()，会重新走一遍 root_scope / root。
+        // Build-first / commit-last transaction: any step failure must return the App to the
+        // "unmounted"
+        // state with no dangling pointers to freed memory. User idiom: defer app.deinit(), and
+        // cx.deinit() runs first, re-traversing root_scope / root.
         //
-        // 注意不能简单地把赋值挪到最后：mount_fn 里的 `cx.provide()` 会调
-        // ensureRootScope()，若此时 cx.root_scope 仍是 null，它会**另建**一个
-        // scope 并装上去，于是 provide 的 context 落在孤儿 scope 上（用户
-        // consume 不到），我们这个 root_scope 也再无人引用。
-        // 所以：构建期间必须可见，失败时才回滚。
+        // The assignment cannot simply move to the end: mount_fn's cx.provide() calls
+        // ensureRootScope(); if cx.root_scope is still null it creates and attaches another scope,
+        // so
+        // provide's context lands on an orphaned scope (consumers cannot see it) and our root_scope
+        // has
+        // no refs left. So it must be visible during build and rolled back on failure.
         const allocator = self.cx.allocator;
-        // Window-root portal 必须在 mount_fn **之前**就存在。Popover /
-        // Tooltip 在 mount_fn 里建树；如果到 mount_fn 返回后才填
-        // cx.popover_portal_root，它们只能退化成挂在 anchor wrapper 旁边，
-        // 实际上根本没走 portal。portal 是窗口级 containing block：其下
-        // absolute floating content 等价于 CSS position:fixed，定位只用 viewport
-        // 坐标，不再依赖 trigger 的祖先布局。
+        // The window-root portal must exist before mount_fn runs. Popover / Tooltip build their
+        // tree
+        // inside mount_fn; if cx.popover_portal_root were filled after mount_fn returns, they would
+        // degrade to anchored siblings and never use the portal. The portal is the window-level
+        // containing block: absolute floating content below behaves like CSS position:fixed,
+        // positioned only in viewport coords, independent of the trigger's ancestors.
         const app_root = try ui.box(self.cx, .{
             .width = .{ .grow = .{} },
             .height = .{ .grow = .{} },
@@ -705,13 +752,18 @@ pub const App = struct {
         errdefer if (portal_orphan) portal.destroy(allocator);
         portal.meta.ownership.meta.component_name = "WindowOverlayPortal";
         (try portal.style.ensureExtFallible(allocator)).z_index = ui.Cx.window_portal_z_index;
-        // 注意：不能用 setHitTestVisible(false), hit-test 构建在不可见节点处直接
-        // 剪掉**整棵子树**（hit_runtime.buildRecursive: !participates -> return），会让
-        // portal 里的 Modal/Sheet 全部不可点（× 关不掉、遮罩点不消）。空 box 默认就没有
-        // pointer hit role（defaultRoles: 无 handler/非 focusable/非 button -> pointer=false），
-        // portal 自身本就不拦截命中，其子树（barrier/dialog）正常参与 hit-test。
-        // Scope 晚于两个节点创建，errdefer 时会先 dispose scope，
-        // 让 portaled content 的 resource cleanup 还能安全访问 portal，然后再销毁树。
+        // WARNING: do not use setHitTestVisible(false); hit-test recurses and cuts the entire
+        // subtree
+        // at invisible nodes (hit_runtime.buildRecursive: !participates -> return), making every
+        // Modal/Sheet in the portal unclickable (x cannot close, mask does not dismiss).
+        // An empty box has no pointer hit role by default (defaultRoles: no handler/not
+        // focusable/not
+        // button -> pointer=false), so the portal itself does not intercept hits while children
+        // (barrier/dialog) participate normally. Scope is created after both nodes; errdefer
+        // disposes
+        // the scope first so portaled content cleanup can safely access the portal, then destroys
+        // the
+        // tree.
         const root_scope = try ui.Scope.init(allocator, null, self.cx.owner);
         var root_scope_owned = true;
         errdefer if (root_scope_owned) {
@@ -723,16 +775,19 @@ pub const App = struct {
 
         self.cx.root_scope = root_scope;
         self.cx.root = app_root;
-        // portal 暂时是一棵 detached tree，但指针在 mount 期间已稳定；
-        // floating nodes 可以直接挂进去。建树完成后再把整棵 portal 作为
-        // app_root 的最后一个 child 提交，保证它画在用户树之上。
+        // Portal temporarily detached tree, but pointer stable during mount; floating nodes
+        // attach directly. After tree complete, commit entire portal as last child of app_root,
+        // ensuring it draws above user tree.
         self.cx.popover_portal_root = portal;
 
+        // Components may start transitions/animations during mount: first bind this window's
+        // clock (multi-window: clock is global).
+        self.cx.bindEventClock();
         const user_root = try mount_fn(self.cx, root_scope);
 
-        // 以下两个 append 是本事务最后的可失败步骤。失败时必须
-        // 先 dispose scope（它会从 detached portal 摘 floating content），
-        // 再销毁孤立 user_root / app_root，不能依赖默认 errdefer 逆序。
+        // Next two appends are last failing steps in transaction. On failure, dispose scope
+        // first (removes floating content from detached portal), then destroy orphaned user_root
+        // / app_root; don't rely on default errdefer reverse.
         app_root.appendChild(allocator, user_root) catch |err| {
             root_scope.dispose();
             root_scope_owned = false;
@@ -750,20 +805,24 @@ pub const App = struct {
             self.cx.root = null;
             return err;
         };
-        portal_orphan = false; // 所有权已转移给 app_root
+        portal_orphan = false; // Ownership transferred to app_root.
 
-        // ── COMMIT ──────────────────────────────────────────────────────
-        // 至此所有可失败步骤已完成。下面全是不可失败的字段赋值，一次性提交；
-        // app_root 的所有权交给 cx（cx.deinit 负责销毁整棵树）。
+        // -- COMMIT --
+        // All failing steps done. Below: all non-failing field assignments committed at once;
+        // app_root ownership goes to cx (cx.deinit destroys entire tree).
         root_scope_owned = false;
         app_root_orphan = false;
         self.cx.is_mounted = true;
 
-        // E2E test harness: 注册 cx 引用 + 截图 callback + 启 file RPC server (test-mode=true 时)
+        // E2E test harness: register cx reference + screenshot callback + start file RPC
+        // server (when test-mode=true).
         if (test_harness.enabled) {
             g_test_cx = self.cx;
             g_screenshot_app = self;
-            // 开启"呈现帧保留拷贝",让 /screenshot 读真实呈现而非新渲染帧
+            // Per-frame render invariant check (repeat emission count via /stats for e2e gate).
+            self.cx.paint_invariant_check = true;
+            // Enable presented frame retained copy so /screenshot reads actual presentation, not
+            // new render.
             self.renderer.retain_present_copy = true;
             self.renderer.setRecordingFrameCallback(appendWindowRecordingFrame);
             test_harness.setScreenshotCallback(captureScreenshot);
@@ -771,11 +830,12 @@ pub const App = struct {
             test_harness.setFrameStatsCallback(getFrameStats);
             test_harness.setResetTimingCallback(resetTiming);
             test_harness.setResizeWindowCallback(resizeWindowForHarness);
-            test_harness.init(getTestCx, wakeTestHarness);
+            test_harness.setVisualQualityCallback(visualQualityForHarness);
+            test_harness.init(self.config.io, getTestCx, wakeTestHarness);
         }
     }
 
-    /// 一站式：mount + run 主循环。推荐入口。
+    /// one-stop: mount + run main loop. recommended entry.
     /// ```
     /// try app.runWith(mountUI); // mountUI: fn(*ui.Cx, *ui.Scope) !*ui.Node
     /// ```
@@ -803,31 +863,34 @@ pub const App = struct {
         self.win.activate();
     }
 
-    /// 跑主循环到窗口关闭。先调 `mount` / `runWith` 装好 UI 再调这个，
-    /// 或者用更老的"手动写 mountUI 然后 app.run()"流程。
-    /// 进阶应用：手动 pump + processEvents + frame，自己控制 cadence。
+    /// Run main loop until window closes. Call mount / runWith to set up UI first, or use
+    /// older "manually write mountUI then app.run()" flow. Advanced: manual pump +
+    /// processEvents + frame, control cadence yourself.
     pub fn run(self: *App) !void {
-        // 首帧必渲染（needs_redraw 默认 true 也兜底，双保险）。
+        // First frame always renders (needs_redraw defaults true as backup, belt-and-suspenders).
         var force_frame = true;
         const display_link_mode = self.config.frame_pacing == .display_link;
-        // ZENIT_DEBUG_FRAMEPACE=1：帧节奏统计，每 120 个连续渲染帧打一行
-        // mean/min/max/stddev dt（ms）。验证 vsync 对齐（60Hz 下应紧贴 16.67ms、
-        // 无 16/33ms 交替的 beat pattern）。idle 间隙（>100ms）不计入。
-        const pace_debug = std.posix.getenv("ZENIT_DEBUG_FRAMEPACE") != null;
-        // ZENIT_DEBUG_JANK=1：逐帧探针，连续渲染帧间隔 > 20ms 时打一行
-        // （100ms 以上视为 idle 间隙不计）。定位动画卡顿用。
-        const jank_debug = std.posix.getenv("ZENIT_DEBUG_JANK") != null;
-        var jank_prev: ?std.time.Instant = null;
-        var pace_prev: ?std.time.Instant = null;
+        // ZENIT_DEBUG_FRAMEPACE=1: frame pacing stats, one line per 120 consecutive render
+        // frames with mean/min/max/stddev dt (ms). Verify vsync lock (60Hz should tight 16.67ms,
+        // no 16/33ms beat pattern). Idle gaps (>100ms) excluded.
+        const pace_debug = @import("zenit_environment").has("ZENIT_DEBUG_FRAMEPACE");
+        // ZENIT_DEBUG_JANK=1: per-frame probe, logs line when consecutive render dt > 20ms
+        // (skip >100ms as idle gap). Pinpoint animation stutter.
+        const jank_debug = @import("zenit_environment").has("ZENIT_DEBUG_JANK");
+        var jank_prev: ?@import("zenit_time").Instant = null;
+        var pace_prev: ?@import("zenit_time").Instant = null;
         var pace_dts: [120]f64 = undefined;
         var pace_n: usize = 0;
         while (!self.win.shouldClose() and !self.should_quit) {
             const pool = AutoreleasePool.push();
             defer pool.pop();
-            // .poll：定时轮询（旧行为逐字保留）。
-            // .display_link：pump 长超时纯阻塞，link 运行时每 vsync 由空事件唤醒；
-            // link 停掉（idle）时靠输入事件唤醒，超时钳到最近的 wake deadline
-            // （光标闪烁 scheduleRedrawAfterNs / deferred 任务），兜底 idle_wait_ms。
+            // .poll: timed polling.
+            // .display_link: pump uses a long timeout (pure block); the link wakes at each vsync
+            // via an empty
+            //   event; a stopped (idle) link is woken by input events, with timeout clamped to the
+            //   nearest
+            //   wake deadline (cursor blink scheduleRedrawAfterNs / deferred tasks), fallback
+            //   idle_wait_ms.
             const pump_timeout: u32 = if (display_link_mode)
                 self.computeIdleTimeoutMs()
             else
@@ -836,31 +899,33 @@ pub const App = struct {
                 std.log.scoped(.zenit_runtime).err("sdk.pump failed: {s}", .{@errorName(err)});
                 return err;
             };
-            // 任何输入事件后至少渲染一帧：hover/cursor 等路径不保证翻 needs_redraw。
+            // Render at least one frame after any input event: hover/cursor paths don't guarantee
+            // needs_redraw flip.
             if (self.sdk.events().len > 0 or pump_result.requested_redraw) force_frame = true;
             self.processEvents();
-            // E2E test harness: 消费命令队列 (test-mode=true 时)
+            // E2E test harness: consume command queue (when test-mode=true).
             if (test_harness.enabled) {
-                test_harness.drainCommands();
+                if (test_harness.drainCommandsRequestFrame()) force_frame = true;
             }
             if (self.should_quit) break;
             try self.maybeReconfigureSurface();
 
-            // idle 停帧门控：树全 clean、无动画、无 deferred work 时跳过整个
-            // GPU acquire/encode/present（改动前 idle 稳定 ~60fps 空转提交）。
-            // needs_redraw 由 advanceFrameClock 在帧内边沿消费（时钟读完后清），
-            // 这里不要提前清，会把本次唤醒的帧时钟冻住，时间驱动的 overlay
-            // 入场动画会永远停在 0。
-            const want = !self.config.idle_skip_frames or force_frame or self.cx.wantsFrame() or self.renderer.recording_active;
-            // display link start/stop 与 idle 门控同一决策点：want 沿变启停。
-            // want && !running 时本帧仍立即渲染（不等下个 vsync，输入延迟不变差）。
-            if (display_link_mode) self.syncDisplayLink(want);
-            if (want) {
+            // Idle frame gate: skip the entire GPU acquire/encode/present when the tree is clean,
+            // no
+            // animations are running and no deferred work is pending.
+            // needs_redraw is consumed by advanceFrameClock at the frame edge (cleared after the
+            // clock
+            // read); do not clear it early here, or this wakeup's clock freezes and time-driven
+            // overlay
+            // entry animations stick at 0.
+            _ = self.renderer.pollBackdropLuminance(self.cx);
+            if (self.shouldRenderAutomaticFrame(force_frame)) {
                 force_frame = false;
-                const jank_t0 = if (jank_debug) std.time.Instant.now() catch null else null;
+                const jank_t0 = if (jank_debug) @import("zenit_time").Instant.now(self.config.io) catch null else null;
                 try self.frame();
+                if (test_harness.enabled) test_harness.afterFrame();
                 if (jank_debug) {
-                    if (std.time.Instant.now() catch null) |now| {
+                    if (@import("zenit_time").Instant.now(self.config.io) catch null) |now| {
                         const cpu_ms = if (jank_t0) |t0| @as(f64, @floatFromInt(now.since(t0))) / 1e6 else 0;
                         if (jank_prev) |prev| {
                             const dt_ms = @as(f64, @floatFromInt(now.since(prev))) / 1e6;
@@ -872,7 +937,7 @@ pub const App = struct {
                     }
                 }
                 if (pace_debug) {
-                    if (std.time.Instant.now() catch null) |now| {
+                    if (@import("zenit_time").Instant.now(self.config.io) catch null) |now| {
                         if (pace_prev) |prev| {
                             const dt_ms = @as(f64, @floatFromInt(now.since(prev))) / 1e6;
                             if (dt_ms < 100.0) {
@@ -904,29 +969,35 @@ pub const App = struct {
                 }
             }
         }
-        // 退出主循环时停掉 link（destroy_window 也会兜底 stop+release）
+        // Stop link on exit main loop (destroy_window also backstops stop+release).
         if (self.display_link_running) {
             self.win.stopDisplayLink();
             self.display_link_running = false;
         }
     }
 
-    /// display-link 模式的 pump 超时：min(idle_wait_ms, 距最近 wake deadline)。
-    /// test harness 下钳到 16ms, e2e RPC 命令写在文件里，纯事件阻塞不会被唤醒。
+    /// display-link mode pump timeout: min(idle_wait_ms, distance to nearest wake deadline).
+    /// Test harness clamps to 16ms; e2e RPC commands live in files, pure event block
+    /// won't wake.
     fn computeIdleTimeoutMs(self: *App) u32 {
         var timeout_ms: u64 = self.config.idle_wait_ms;
         if (test_harness.enabled) timeout_ms = @min(timeout_ms, 16);
+        // A just-submitted backdrop measurement may finish after the last UI
+        // frame. Poll it promptly without keeping GPU rendering awake.
+        if (self.renderer.hasPendingBackdropLuminance()) timeout_ms = @min(timeout_ms, 16);
         if (self.cx.nextWakeDelayNs()) |delay_ns| {
-            // 向上取整 + 至少 1ms：提前醒会空转一轮再睡，晚醒才是可感知的延迟
+            // Ceil + at least 1ms: premature wake idles one cycle then sleeps; late wake
+            // perceptible
+            // latency.
             const delay_ms = (delay_ns + std.time.ns_per_ms - 1) / std.time.ns_per_ms;
             timeout_ms = @min(timeout_ms, @max(delay_ms, 1));
         }
         return @intCast(timeout_ms);
     }
 
-    /// 每轮唤醒按 want 沿启停 CVDisplayLink。
-    /// 启动即时（保证下一 vsync 就有节拍）；停止带 2 次防抖，动画收尾帧常在
-    /// clean/dirty 边界抖动，立即 stop 会造成 link 频繁启停。
+    /// Each wake start/stop CVDisplayLink by want. Start immediate (next vsync guaranteed);
+    /// stop debounced 2x, animation finish frames often jitter at clean/dirty boundary,
+    /// immediate stop causes rapid link churn.
     fn syncDisplayLink(self: *App, want: bool) void {
         if (want) {
             self.idle_streak = 0;
@@ -943,10 +1014,46 @@ pub const App = struct {
         }
     }
 
-    /// 把 sdk 事件队列 dispatch 到 ui.Cx，处理 quit / resize 信号。
+    fn displayRenderTick(self: *const App) ?u64 {
+        if (self.config.frame_pacing != .display_link) return null;
+        if (comptime @hasDecl(Window, "getDisplayTick")) return self.win.getDisplayTick();
+        return null;
+    }
+
+    fn displayPresentationSample(self: *const App) ?ui.Cx.PresentationSample {
+        if (self.config.frame_pacing != .display_link) return null;
+        if (comptime @hasDecl(Window, "getDisplayTiming")) {
+            const timing = self.win.getDisplayTiming();
+            return .{
+                .tick = timing.tick,
+                .target_time_ms = if (timing.target_time_seconds > timing.current_time_seconds and timing.current_time_seconds > 0)
+                    timing.target_time_seconds * 1000
+                else
+                    null,
+                .period_ms = 1000.0 / @as(f64, @floatCast(@max(1.0, self.cx.display_refresh_hz))),
+            };
+        }
+        return null;
+    }
+
+    fn shouldRenderAutomaticFrame(self: *App, forced: bool) bool {
+        // Read before wantsFrame consumes an expired scheduled-redraw deadline.
+        const deadline_due = if (self.cx.nextWakeDelayNs()) |delay| delay == 0 else false;
+        const force_frame = forced or self.resize_frame_pending or !self.config.idle_skip_frames;
+        const want = force_frame or self.cx.wantsFrame() or self.renderer.recording_active;
+        // Denying a duplicate tick must keep an active display link running.
+        if (self.config.frame_pacing == .display_link) self.syncDisplayLink(want);
+        return self.display_tick_gate.shouldRender(self.displayRenderTick(), .{
+            .wants_frame = want,
+            .forced = force_frame,
+            .deadline_due = deadline_due,
+        });
+    }
+
+    /// Dispatch sdk event queue to ui.Cx, handle quit / resize signals.
     pub fn processEvents(self: *App) void {
-        // 遍历的是 event_queue 的借用切片：期间任何 handler 重入 pump()
-        // 都会 clear() 释放正被遍历的 payload。标志 + pump 侧断言钉住契约。
+        // Traversing borrowed slice of event_queue: any handler reentrant pump() calls
+        // clear() releasing payload mid-traverse. Flag + pump assert pin contract.
         self.sdk.dispatching = true;
         defer self.sdk.dispatching = false;
         for (self.sdk.events()) |evt| _ = self.processEvent(evt);
@@ -959,25 +1066,44 @@ pub const App = struct {
         if (evt.targetWindowId()) |target| {
             if (target != self.windowId()) return false;
         }
-        // e2e 输入隔离：harness 直接向 Cx 注入指针事件（不经这里）；机器上真实鼠标的
-        // move/button/wheel/magnify 若也进来，会覆盖注入的 hover 位置、打断点击
-        // （开发者边跑 e2e 边用电脑时，zindex 等浮层用例偶发红的实锤根因）。
-        // 只在 test-mode 构建且显式开启时丢弃，手工操作 test-mode app 不受影响。
-        if (test_harness.enabled and isolateOsPointer()) switch (evt) {
-            .mouse_move, .mouse_button, .mouse_wheel, .magnify => return true,
-            else => {},
-        };
+        // e2e input isolation: the harness injects pointer events directly into Cx (bypassing
+        // here).
+        // Real mouse move/button/wheel/magnify from the machine, if also handled here, would
+        // overwrite
+        // the injected hover position and break clicks (e.g. zindex floater tests fail flakily
+        // while a
+        // dev uses the computer). Only dropped when built in test-mode AND explicitly enabled;
+        // manual
+        // operation of a test-mode app is unaffected.
+        if (test_harness.enabled and isolateOsPointer() and pointer_isolation.isOsPointerEvent(evt)) return true;
         switch (evt) {
             .quit, .window_close_requested => self.should_quit = true,
             .frame_requested, .window_resized, .system_theme_changed => self.cx.needs_redraw = true,
             .window_focused => |e| {
                 self.cx.needs_redraw = true;
-                // 失焦取消进行中的 pointer 交互（drag 等）：blur 由轮询边沿
-                // 产生，帧级延迟可接受（docs/DRAG_INTERACTION_DESIGN.md §11.2）。
+                // Test-mode app resides in background: unless explicit real activation request (for
+                // inactive appearance baseline), always treat as active, else all e2e baselines
+                // land on
+                // inactive material.
+                const appears_active = if (test_harness.enabled and @import("zenit_environment").getBorrowed("ZENIT_E2E_REAL_ACTIVATION") == null) true else e.appears_active;
+                if (self.cx.window_active != appears_active) {
+                    self.cx.window_active = appears_active;
+                    // Inactive window glass material differs (Glass.tint desaturates): re-parse all
+                    // GlassBox
+                    // hooks.
+                    if (self.cx.root) |root| root.markSubtreeBeforeRenderHook();
+                }
+                // Blur cancels in-flight pointer interactions (drag, etc.): blur from polling edge,
+                // frame latency acceptable (docs/DRAG_INTERACTION_DESIGN.md section 11.2).
                 if (!e.focused) self.cx.cancelPointerInteractions(.window_blur) else self.cx.replayCursor();
             },
             .mouse_move => |e| self.cx.handleMouseMoveEx(e.x, e.y, sdkModifiersToUi(e.modifiers)),
             .mouse_button => |e| {
+                if (e.cancelled) {
+                    self.cx.needs_redraw = true;
+                    self.cx.cancelPointerInteractions(.pointer_cancel);
+                    return true;
+                }
                 const ui_btn = sdkMouseButtonToUi(e.button) orelse return true;
                 const ui_mods = sdkModifiersToUi(e.modifiers);
                 if (e.pressed) {
@@ -987,24 +1113,27 @@ pub const App = struct {
                 }
             },
             .mouse_wheel => |e| self.cx.handleSdkWheel(e),
-            .magnify => |e| self.cx.handleMagnify(e.magnification, e.x, e.y, @enumFromInt(e.phase)),
+            .magnify => |e| self.cx.handleMagnify(e.magnification, e.x, e.y, @fromBackingInt(@intCast(e.phase))),
             .drag => |e| {
-                // kind=4 = 拖拽源完成回执（cx.handleDrag 侧防御性忽略）。
-                // 排障可见性：ZENIT_DEBUG_DRAG=1 下打印实际 operation
-                // （0=cancelled 1=copy 2=move 4=link）。
-                if (e.kind == 4 and std.posix.getenv("ZENIT_DEBUG_DRAG") != null) {
+                // kind=4 = drag source completion receipt (cx.handleDrag defensive ignore). Debug
+                // visibility: ZENIT_DEBUG_DRAG=1 logs actual operation (0=cancelled 1=copy 2=move
+                // 4=link).
+                if (e.kind == 4 and @import("zenit_environment").has("ZENIT_DEBUG_DRAG")) {
                     std.debug.print("[DRAG] source-completed token={d} op={d}\n", .{ e.source_token, e.operation });
                 }
                 self.cx.handlePlatformDrag(e.x, e.y, e.kind, e.paths, e.payload_kind, e.payload_truncated, e.payload_is_untrusted);
             },
             .menu_command => |e| {
-                if (std.posix.getenv("ZENIT_DEBUG_MENU") != null) {
+                if (@import("zenit_environment").has("ZENIT_DEBUG_MENU")) {
                     std.debug.print("[MENU] command_id={d} window_id={d} (self={d})\n", .{ e.command_id, e.window_id, self.windowId() });
                 }
                 self.cx.handleCommand(e.command_id);
             },
             .key => |e| {
-                const key = ui.events.KeyCode.fromRawKeycode(e.keycode);
+                const key = if (builtin.target.os.tag == .windows)
+                    ui.events.KeyCode.fromWindowsVirtualKey(e.keycode)
+                else
+                    ui.events.KeyCode.fromRawKeycode(e.keycode);
                 const ui_mods = sdkModifiersToUi(e.modifiers);
                 if (e.pressed) self.cx.handleKeyDown(key, ui_mods) else self.cx.handleKeyUp(key, ui_mods);
             },
@@ -1015,68 +1144,81 @@ pub const App = struct {
         return true;
     }
 
-    /// surface 配置的单一出口：init 与 resize 重配必须产出一致的配置。
-    /// usage 依赖 test-mode, test 下 drawable 必须 CPU 可读（framebufferOnly=false），
-    /// 否则 e2e 截图的 getBytes 读不到像素；此前 resize 路径硬编码
-    /// .color_target_only，重配后 readback 花屏。生产构建仍走快路径。
+    /// Single surface config outlet: init and resize reconfig must produce identical config.
+    /// The drawable must be readable (framebufferOnly=false): glass blits the current target each
+    /// frame to sample the backplate, and native blur groups also sample it directly; a
+    /// framebufferOnly drawable is illegal for both (Metal validation: "sourceTexture must not be
+    /// framebufferOnly texture", missing ShaderRead), and only happens to work with validation
+    /// disabled. test-mode e2e screenshots also need CPU readback. Matches Windows render.
     fn surfaceConfigFor(width: u32, height: u32) gpu.Backend.SurfaceConfiguration {
         return .{
-            .format = .bgra8_unorm_srgb,
+            // Not _sRGB: blend in sRGB-encoded values (matches AppKit, docs/SRGB_BLENDING_PLAN.md);
+            // layer colorspace set explicitly to sRGB in window_bridge.
+            .format = .bgra8_unorm,
             .width = width,
             .height = height,
-            .usage = if (test_harness.enabled) .color_target_and_read else .color_target_only,
+            .usage = .color_target_and_read,
             .present_mode = .fifo,
             .alpha_mode = .fully_opaque,
             .maximum_frame_latency = 2,
         };
     }
 
-    /// 检测窗口大小变化，必要时重新配置 surface 和视口。
+    /// Detect window size change, reconfigure surface and viewport as needed.
     pub fn maybeReconfigureSurface(self: *App) !void {
         const new_drawable = self.win.getDrawableSize();
         if (new_drawable[0] != self.current_drawable_w or new_drawable[1] != self.current_drawable_h) {
             self.current_drawable_w = new_drawable[0];
             self.current_drawable_h = new_drawable[1];
             try self.surface.configure(self.allocator, &self.device, surfaceConfigFor(self.current_drawable_w, self.current_drawable_h));
-            // drawable 尺寸/DPI 变化必须重绘，否则纯 DPI 切换只重配 surface 会花屏
+            // Drawable size/DPI change must redraw, else pure DPI switch only reconfigs surface,
+            // screen corrupts.
             self.cx.needs_redraw = true;
+            self.resize_frame_pending = true;
         }
-        // HiDPI：backing scale 变化（把窗口拖到另一块 DPI 不同的屏幕、或系统
-        // 改分辨率）必须传导下去。此前 `self.scale` 只在 App.init 赋值一次，
-        // 于是 scale 变化后全链路继续用旧值：字体按旧 scale 光栅化、
-        // cx.window_scale 用于 SVG 光栅尺寸也停在旧值。
+        // HiDPI: a backing scale change (window dragged to a different DPI screen, or system
+        // resolution
+        // change) must flow through the whole chain: fonts rasterize at the new scale and
+        // cx.window_scale (SVG raster size) must follow it.
         //
-        // 这里用**每帧轮询**而非 windowDidChangeBackingProperties 观察者：
-        // 本函数已经每帧跑、且已经在处理由同一事件引起的 drawable 尺寸变化，
-        // 轮询一个 CGFloat 的成本可忽略，而加观察者要跨 ObjC->Zig 再引一套
-        // 事件队列，多一条独立的时序路径（观察者先到、drawable 后到）反而更难
-        // 保证两者同帧一致。system_sdk 侧本来也已经是轮询 getScaleFactor 的。
+        // Per-frame polling rather than a windowDidChangeBackingProperties observer: this function
+        // already runs every frame and already handles the drawable size change from the same
+        // event;
+        // polling one CGFloat is negligible, whereas an observer adds cross-ObjC->Zig event queue
+        // coupling and a separate timing path (observer first, drawable later) that is harder to
+        // keep
+        // in sync within a frame. system_sdk polls getScaleFactor anyway.
         const new_scale = self.win.getScaleFactor();
         const scale_changed = new_scale > 0 and new_scale != self.scale;
         if (scale_changed) {
             self.scale = new_scale;
-            // 字体必须按新 scale 重新光栅化。Font.scale_factor 就地可变、
-            // 不改变 Font 指针，glyph atlas 的 GlyphKey 含 scale_q，所以
-            // 新 scale 会自然产生新缓存条目，旧条目则随页面 age-based GC
-            // （EVICT_THRESHOLD）被回收，无需在此手动清空图集。
+            // Fonts must rasterize at the new scale. Font.scale_factor is mutable in place, the
+            // pointer is
+            // unchanged; glyph atlas GlyphKey contains scale_q, so a new scale naturally creates
+            // new cache
+            // entries and old entries are recycled by page age-based GC (EVICT_THRESHOLD); no
+            // manual atlas
+            // clear needed.
             //
-            // 走 font_selector 而非只遍历 self.fonts：后者只有 small/medium/
-            // large 三个基准字体，而非标准字号的文本实际用的是 FontSelector
-            // 里的扩展槽位与 lazy derived font，漏掉它们会表现为"部分字号
-            // 变清晰了、另一些依旧糊"。
-            // 宿主经 setFontSelector 换上的 selector（renderer.fonts）才是真正
-            // 画字/测量的那份，必须一并更新，只改内建那份时换屏后宿主字体
-            // 停在旧 scale。
+            // Use font_selector, not just self.fonts: the latter only has small/medium/large base
+            // fonts,
+            // while non-standard sizes use FontSelector extension slots and lazily derived fonts;
+            // missing
+            // them gives "some sizes sharpened, others still blurry". The host's selector installed
+            // via
+            // setFontSelector (renderer.fonts) is what actually draws/measures and must be updated
+            // too;
+            // updating only the built-in one leaves host fonts at the old scale.
             selector_scale.syncSelectorScale(&self.font_selector, self.renderer.fonts, new_scale);
-            // 字体族注册表的 face 是独立创建的,不在 font_selector 的槽位链上,
-            // 必须单独跟 scale，否则换屏后画布上自定义字体的文字继续糊。
+            // Font registry faces independently created, not in font_selector slot chain; must
+            // scale separately, else custom fonts on canvas stay blurry after screen change.
             if (self.font_registry) |reg| reg.setScaleFactor(new_scale);
         }
 
-        // 刷新率同步给 Cx：DevTools Performance 面板的目标线/柱高基准、
-        // renderer 的帧间隔钳制都读 cx.display_refresh_hz。与 scale 同为
-        // 每帧轮询，把窗口拖到 ProMotion↔60Hz 混合屏之间必须跟上，
-        // 且读一个 f32 的成本可忽略。
+        // Sync refresh rate to Cx: DevTools Performance panel target line / bar height baseline,
+        // renderer frame interval clamping both read cx.display_refresh_hz. Like scale, per-
+        // frame poll; dragging window between ProMotion<->60Hz mixed must keep up; CGFloat
+        // read cost negligible.
         const refresh_hz = self.win.getDisplayRefreshRate();
         if (refresh_hz > 0 and refresh_hz != self.cx.display_refresh_hz) {
             self.cx.display_refresh_hz = refresh_hz;
@@ -1088,24 +1230,45 @@ pub const App = struct {
         if (new_w != self.viewport_w or new_h != self.viewport_h or scale_changed) {
             self.viewport_w = new_w;
             self.viewport_h = new_h;
-            // 注意用 setWindowMetrics 而非 setViewport：后者把 scale 硬编码成
-            // 1.0，在 Retina 上每次 resize 都会把 cx.window_scale 打回 1.0，
-            // 导致 SVG 按 1x 光栅化（resolveSvgRasterSize 读的正是它）。
+            // Note: use setWindowMetrics not setViewport: latter hardcodes scale to 1.0; on Retina
+            // every resize resets cx.window_scale to 1.0, SVG rasterizes at 1x
+            // (resolveSvgRasterSize
+            // reads it).
             self.cx.setWindowMetrics(self.viewport_w, self.viewport_h, self.scale);
             self.cx.needs_redraw = true;
+            self.resize_frame_pending = true;
         }
     }
 
-    /// 渲染一帧。
+    /// Render one frame.
     pub fn frame(self: *App) !void {
-        // 手写主循环（pump + frame 自己控制 cadence）的宿主同样需要 pool；
-        // run()/tick() 外层已有一层，这里嵌套一层无害。
+        // Host writing custom main loop (pump + frame, control cadence) also needs pool;
+        // outside run()/tick() is already one, nesting another harmless.
         const pool = AutoreleasePool.push();
         defer pool.pop();
-        try self.renderer.frame(self.cx, self.viewport_w, self.viewport_h, self.scale);
+        const presentation_sample = self.displayPresentationSample();
+        const render_tick = if (presentation_sample) |sample| sample.tick else self.displayRenderTick();
+        const frame_count_before = self.renderer.frame_count;
+        try self.renderer.frameWithPresentation(self.cx, self.viewport_w, self.viewport_h, self.scale, presentation_sample);
+        if (self.renderer.frame_count != frame_count_before) {
+            self.display_tick_gate.didRender(render_tick);
+            self.resize_frame_pending = false;
+        }
+        // e2e per-frame observation: after submit, locally record target node geometry
+        // (mirrors Windows paint path), test reads once at leisure, sample timing no longer
+        // depends on RPC roundtrip.
+        if (test_harness.enabled) test_harness.observeSubmittedFrame(self.cx);
     }
 
-    /// 主动退出主循环（事件 handler 里调用）。
+    /// Actively exit main loop (call from event handler).
+    pub fn setVisualQuality(self: *App, quality: @import("render").visual_quality.Quality) void {
+        self.renderer.setVisualQuality(quality);
+        self.cx.renderer_reduced_motion = self.renderer.visual_quality == .basic;
+        self.cx.backdrop_luminance_readback = self.renderer.visual_quality != .basic;
+        self.cx.needs_redraw = true;
+        if (self.cx.root) |root| root.markRenderDirty();
+    }
+
     pub fn quit(self: *App) void {
         self.should_quit = true;
     }
@@ -1139,7 +1302,7 @@ pub const MultiWindowApp = struct {
 
     allocator: Allocator,
     config: MultiWindowConfig,
-    windows: std.ArrayList(ManagedWindow) = .{},
+    windows: std.ArrayList(ManagedWindow) = .empty,
     lifecycle: window_lifecycle.State = .{},
     iterating: bool = false,
 
@@ -1267,14 +1430,16 @@ pub const MultiWindowApp = struct {
             self.iterating = true;
             defer self.iterating = false;
 
+            const jank_debug = @import("zenit_environment").getBorrowed("ZENIT_DEBUG_JANK") != null;
             for (self.windows.items) |*managed| {
                 const app = managed.app;
                 try app.maybeReconfigureSurface();
-                const want = !app.config.idle_skip_frames or managed.force_frame or app.cx.wantsFrame() or app.renderer.recording_active;
-                if (app.config.frame_pacing == .display_link) app.syncDisplayLink(want);
-                if (want) {
+                _ = app.renderer.pollBackdropLuminance(app.cx);
+                if (app.shouldRenderAutomaticFrame(managed.force_frame)) {
                     managed.force_frame = false;
+                    const t0 = if (jank_debug) @import("zenit_time").Instant.now(app.config.io) catch null else null;
                     try app.frame();
+                    if (jank_debug) jankProbe(app.config.io, &app.debug_jank_prev, t0);
                 }
             }
         }
@@ -1288,9 +1453,14 @@ pub const MultiWindowApp = struct {
         // MultiWindowApp owns the event loop just like App.run(). Drain the
         // process-global Harness queue exactly once after platform events so
         // DevTools and other auxiliary-window apps remain automatable.
-        if (test_harness.enabled) test_harness.drainCommands();
+        if (test_harness.enabled and test_harness.drainCommandsRequestFrame()) {
+            for (self.windows.items) |*managed| {
+                if (managed.app.cx == g_test_cx) managed.force_frame = true;
+            }
+        }
         if (!self.shouldContinue()) return false;
         try self.frame();
+        if (test_harness.enabled) test_harness.afterFrame();
         return self.shouldContinue();
     }
 
@@ -1404,12 +1574,13 @@ pub const MultiWindowApp = struct {
 };
 
 // ============================================================================
-// 私有 helpers
+// private helpers
 // ============================================================================
 
-/// live resize 期间由 MetalView.setFrameSize 同步调入：重配 surface/viewport 并渲染，
-/// 让内容跟随窗口逐帧重排（native 行为），而不是被 CoreAnimation 拉伸旧帧。
-/// 非 live-resize 的 setFrameSize（程序化改尺寸）交回主循环处理，避免 frame() 重入。
+/// Synced from MetalView.setFrameSize during live resize: reconfigure surface/viewport
+/// and render so content reflows frame-by-frame (native behavior), not CoreAnimation
+/// stretch of old frame. Programmatic setFrameSize goes back to main loop, avoid frame()
+/// reentrancy.
 fn liveResizeRender(ctx: ?*anyopaque) callconv(.c) void {
     const app: *App = @ptrCast(@alignCast(ctx orelse return));
     if (!app.win.isInLiveResize()) return;
@@ -1420,25 +1591,46 @@ fn liveResizeRender(ctx: ?*anyopaque) callconv(.c) void {
         std.log.scoped(.zenit_runtime).warn("live-resize surface reconfigure failed: {s}", .{@errorName(err)});
         return;
     };
-    // 既被 setFrameSize:（尺寸变了 -> maybeReconfigureSurface 置 needs_redraw）调用，
-    // 也被原生 live-resize ticker 按刷新率调用（拖动按住期间驱动动画）；
-    // 静止且尺寸未变时不重画。
+    // Called both by setFrameSize: (size changed -> maybeReconfigureSurface sets needs_redraw)
+    // and by native live-resize ticker at refresh rate (drives animation during drag hold);
+    // skips redraw when static and size unchanged.
     if (!app.cx.wantsFrame()) return;
     app.frame() catch |err| {
         std.log.scoped(.zenit_runtime).warn("live-resize frame failed: {s}", .{@errorName(err)});
     };
 }
 
-/// 字体 fallback 链，找到第一个能用的就返回。
-/// macOS 还会尝试系统字体目录绝对路径作为最后兜底。
+/// ZENIT_DEBUG_JANK=1: logs line when consecutive render dt > 20ms (and < 100ms, longer is
+/// idle gap): [jank] dt=... frame_wall=... : dt wall-clock vs prior frame, frame_wall
+/// this frame's own cost.
+fn jankProbe(io: std.Io, prev: *?@import("zenit_time").Instant, t0: ?@import("zenit_time").Instant) void {
+    const now = @import("zenit_time").Instant.now(io) catch return;
+    defer prev.* = now;
+    const p = prev.* orelse return;
+    const dt_ms = @as(f64, @floatFromInt(now.since(p))) / 1e6;
+    const wall_ms = if (t0) |t| @as(f64, @floatFromInt(now.since(t))) / 1e6 else 0;
+    if (dt_ms > 20.0 and dt_ms < 100.0) std.debug.print("[jank] dt={d:.1}ms frame_wall={d:.1}ms\n", .{ dt_ms, wall_ms });
+}
+
+/// Font fallback chain; return first usable. macOS also tries system font dir absolute
+/// path as last backstop.
 const ResolvedFont = struct { font: *Font, family: []const u8 };
 
 fn loadWeightedFont(context: *anyopaque, font_size: f32, font_weight: u16) ?*Font {
     const app: *App = @ptrCast(@alignCast(context));
     const family = app.resolved_font_family orelse return null;
-    const Desc = @typeInfo(@TypeOf(FontManager.findFont)).@"fn".params[1].type.?;
+    const Desc = @import("zenit_reflection").params(@TypeOf(FontManager.findFont))[1].type.?;
     const weight: @FieldType(Desc, "weight") = if (font_weight <= 100) .thin else if (font_weight <= 300) .light else if (font_weight <= 400) .regular else if (font_weight <= 500) .medium else if (font_weight <= 600) .semibold else if (font_weight <= 700) .bold else if (font_weight <= 800) .heavy else .black;
     return app.font_manager.findFont(.{ .family = family, .size = font_size, .weight = weight, .style = .normal }) catch null;
+}
+
+/// The platform UI font (TextProps.font_family = system UI): CoreText's system font, whose
+/// optical size and tracking follow the point size (native controls' labels).
+fn loadSystemUiFont(context: *anyopaque, font_size: f32, font_weight: u16) ?*Font {
+    const app: *App = @ptrCast(@alignCast(context));
+    const Desc = @import("zenit_reflection").params(@TypeOf(FontManager.findFont))[1].type.?;
+    const weight: @FieldType(Desc, "weight") = if (font_weight <= 100) .thin else if (font_weight <= 300) .light else if (font_weight <= 400) .regular else if (font_weight <= 500) .medium else if (font_weight <= 600) .semibold else if (font_weight <= 700) .bold else if (font_weight <= 800) .heavy else .black;
+    return app.font_manager.findFont(.{ .family = "system-ui", .size = font_size, .weight = weight, .style = .normal }) catch null;
 }
 
 fn findFontWithFallback(fm: *FontManager, size: u32, families: []const []const u8) !ResolvedFont {
@@ -1467,17 +1659,18 @@ fn findFontWithFallback(fm: *FontManager, size: u32, families: []const []const u
     return error.FontLoadFailed;
 }
 
-// measure_fn 签名 (`*const fn ([*]const u8, usize, f32, u16, bool) f32`) 不接受
-// context 参数，只能走全局静态指针。它只保留给直接读取旧 `Cx.measure_fn`
-// 的兼容代码；框架内部和布局主路径使用 `measure_ctx_fn` / `Cx.measureTextWidth`
-// 来保证多窗口字体上下文隔离。
+// measure_fn signature (fn([*]const u8, usize, f32, u16, bool) f32) takes no context
+// param, only global static pointer. Retained for compat reading old Cx.measure_fn;
+// framework internals and layout main path use measure_ctx_fn / Cx.measureTextWidth
+// to isolate multi-window font context.
 var g_font_selector_for_measure: ?*FontSelector = null;
 
-/// 进程级文本钩子的归属栈：钩子恒指向栈顶 App 的 selector。
+/// Process-level text hook ownership stack: hooks always point to top-of-stack App's
+/// selector.
 var g_text_hook_owners: text_hook_owners.OwnerStack(MultiWindowApp.max_windows) = .{};
 
-/// 把三个进程级文本出口（无 context measure 兜底 / GlyphRun 字体解析器 /
-/// drawn-width 测量）一起指向 `ctx`（一个 *FontSelector），null 则全部卸载。
+/// Point three process-level text outlets (no-context measure fallback / GlyphRun font
+/// parser / drawn-width measure) all to ctx (a *FontSelector), or null to unwind all.
 fn installProcessTextHooks(ctx: ?*anyopaque) void {
     if (ctx) |c| {
         g_font_selector_for_measure = @ptrCast(@alignCast(c));
@@ -1490,27 +1683,27 @@ fn installProcessTextHooks(ctx: ?*anyopaque) void {
     }
 }
 
-/// 带 context 的测量，context 是本 App 的 FontSelector，故多 App 并存
-/// 时不会互相覆盖（对比下面读全局静态指针的 measureText）。
+/// Context-aware measure: context is this App's FontSelector, so concurrent Apps don't
+/// clobber each other (contrast global static pointer measure below).
 fn measureTextWithCtx(ctx: *anyopaque, text_ptr: [*]const u8, text_len: usize, font_size: f32, font_weight: u16, use_italic: bool) f32 {
     const fs: *FontSelector = @ptrCast(@alignCast(ctx));
     return fs.measureTextWidth(text_ptr[0..text_len], font_size, font_weight, use_italic);
 }
 
-/// GlyphRun 管线的字体解析器：与渲染共用 FontSelector.resolveFonts，
-/// 且**带 content**，含汉字/假名/谚文时和渲染一样切到回退字体。
+/// GlyphRun pipeline font parser: shares FontSelector.resolveFonts with render, and passes
+/// **content**, so it cuts to fallback for CJK/hiragana/Hangul exactly as render does.
 ///
-/// == 为什么用 shapingFont() 而不是 `fallback orelse primary` ==
-/// 渲染端（command_encoder.encodeText）把 `primary` 交给 shaper 当**整段
-/// 的字体**，`fallback` 只是逐字形补漏的提示（CoreText 自己按 run 属性挑，
-/// 见 text_renderer.getOrCreateGlyphFallbackFont）。测量端若反过来优先
-/// 取 fallback，就会拿一个与绘制不同的字体去 shape 整段。
+/// == Why shapingFont(), not fallback orelse primary ==
+/// Render (command_encoder.encodeText) passes primary to the shaper as the font for the entire
+/// segment; fallback is only a per-glyph supplemental hint (CoreText picks per run attribute, see
+/// text_renderer.getOrCreateGlyphFallbackFont). Preferring fallback in measure would shape the
+/// whole segment with a font differing from render.
 ///
-/// 斜体是这条错路唯一必然踩中的场景：resolveContentFallback 对 italic
-/// 恒返回 upright 的 regular_font（给 italic 面缺字形时兜底），于是
-/// **每一段斜体文本**都按直立字体测量、按斜体字体绘制。Inter Italic 比
-/// upright 宽，`.fit` 容器因此照直立宽度收紧，斜体字被裁在右缘,
-/// 下游编辑器的 preview file tab（单击预览＝斜体）长文件名尾部丢字即此因。
+/// Italic is where the wrong path always bites: resolveContentFallback always returns the upright
+/// regular_font for italic (fallback when the italic face lacks glyphs), so every italic segment
+/// measures with the upright font but renders italic. Inter Italic is wider than upright, so a
+/// .fit container tightens to upright width and italic glyphs clip at the right edge (long
+/// filenames lose end chars in an italic preview file tab).
 fn resolveFamilyFont(
     ctx: *anyopaque,
     family: u16,
@@ -1519,7 +1712,7 @@ fn resolveFamilyFont(
     italic: bool,
 ) ?*Font {
     const reg: *render.FontRegistry = @ptrCast(@alignCast(ctx));
-    return reg.resolve(@enumFromInt(family), size, weight, italic);
+    return reg.resolve(@fromBackingInt(@intCast(family)), size, weight, italic);
 }
 
 fn resolveShapeFont(
@@ -1535,8 +1728,8 @@ fn resolveShapeFont(
     return fs.resolveFonts(content, .{
         .font_size = font_size,
         .font_weight = font_weight,
-        // 必须原样传下去，这是出口 4,漏了它测量端就用默认族、
-        // 渲染端用用户选的族,光标/选区系统性偏移。
+        // Must pass as-is; this is outlet 4. Skip it and measure uses default family, render
+        // uses user choice, cursor/selection systematically offset.
         .font_family = font_family,
         .use_italic = use_italic,
         .use_monospace = use_monospace,

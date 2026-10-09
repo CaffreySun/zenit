@@ -1,11 +1,11 @@
 /// AnimatedValue
 ///
-/// 可动画的值包装器，提供多种动画模式
+/// Animatable value wrapper with multiple animation modes.
 ///
-/// 特性:
-/// - 统一接口: 可以选择 tween 或 spring 动画
-/// - 自动插值: 设置值时自动开始动画
-/// - Signal 风格: 可与响应式系统集成
+/// Features:
+/// - unified interface: choose tween or spring animation
+/// - auto-interpolation: value changes auto-start animation
+/// - Signal-style: can integrate with the reactive system
 const std = @import("std");
 const Tween = @import("tween.zig").Tween;
 const TweenConfig = @import("tween.zig").TweenConfig;
@@ -16,32 +16,32 @@ const Transition = @import("transition.zig").Transition;
 const TransitionConfig = @import("transition.zig").TransitionConfig;
 const Easing = @import("easing.zig").Easing;
 
-/// 动画类型
+/// animation type
 pub const AnimationType = enum {
     tween,
     spring,
     transition,
-    none, // 立即更新，无动画
+    none, // immediate update, no animation
 };
 
-/// AnimatedValue 配置
+/// AnimatedValue config
 pub const AnimatedValueConfig = struct {
-    /// 动画类型
+    /// animation type
     animation_type: AnimationType = .transition,
-    /// Tween 配置
+    /// tween config
     tween_config: TweenConfig = .{},
-    /// Spring 配置
+    /// spring config
     spring_config: SpringConfig = SpringPreset.default,
-    /// Transition 配置
+    /// transition config
     transition_config: TransitionConfig = .{},
 };
 
-/// 可动画的值
+/// animatable value
 pub const AnimatedValue = struct {
     current_value: f32,
     target_value: f32,
 
-    /// 内部动画状态，tagged union，只存储活跃的动画类型
+    /// internal animation state, tagged union, stores only active animation type
     animator: Animator,
 
     const Animator = union(AnimationType) {
@@ -51,7 +51,7 @@ pub const AnimatedValue = struct {
         none: void,
     };
 
-    /// 创建 AnimatedValue
+    /// create AnimatedValue
     pub fn init(initial_value: f32, config: AnimatedValueConfig) AnimatedValue {
         return AnimatedValue{
             .current_value = initial_value,
@@ -65,14 +65,14 @@ pub const AnimatedValue = struct {
         };
     }
 
-    /// Builder 风格创建
+    /// builder-style creation
     pub fn create(initial_value: f32) AnimatedValueBuilder {
         return AnimatedValueBuilder{ .initial = initial_value };
     }
 
-    /// 设置目标值 (触发动画)
+    /// set target value (triggers animation)
     pub fn setTo(self: *AnimatedValue, value: f32, now_ms: f64) void {
-        // 使用相对+绝对混合阈值
+        // use relative+absolute hybrid threshold
         const delta = @abs(value - self.target_value);
         const scale = @max(@abs(self.target_value), 1.0);
         if (delta / scale < 1e-5) {
@@ -100,7 +100,7 @@ pub const AnimatedValue = struct {
         }
     }
 
-    /// 立即设置值
+    /// set value immediately
     pub fn setImmediate(self: *AnimatedValue, value: f32) void {
         self.current_value = value;
         self.target_value = value;
@@ -112,14 +112,15 @@ pub const AnimatedValue = struct {
         }
     }
 
-    /// 更新动画 (now_ms: 绝对时间戳 ms; dt_s 已无消费者，保留签名兼容)
+    /// update animation (now_ms: absolute timestamp ms; dt_s no longer used, kept for signature
+    /// compat)
     pub fn update(self: *AnimatedValue, now_ms: f64, dt_s: f32) void {
         _ = dt_s;
         switch (self.animator) {
             .tween => |*tw| {
-                // Tween.update 吃绝对 ms 时间戳（与 spring/transition 同轨）。
-                // 曾误传 dt_s（~0.016）：elapsed = 0.016 − 绝对ms 恒为巨大负数，
-                // 被 delay 判断挡住 -> tween 永远冻在 from。
+                // Tween.update takes absolute ms timestamp (same track as spring/transition).
+                // Misguided dt_s (~0.016): elapsed = 0.016 - absolute_ms always huge negative,
+                // blocked by delay check -> tween frozen at from.
                 tw.update(now_ms);
                 self.current_value = tw.getValue();
             },
@@ -135,17 +136,17 @@ pub const AnimatedValue = struct {
         }
     }
 
-    /// 获取当前值
+    /// get current value
     pub fn get(self: *const AnimatedValue) f32 {
         return self.current_value;
     }
 
-    /// 获取目标值
+    /// get target value
     pub fn getTarget(self: *const AnimatedValue) f32 {
         return self.target_value;
     }
 
-    /// 是否正在动画
+    /// is animating
     pub fn isAnimating(self: *const AnimatedValue) bool {
         return switch (self.animator) {
             .tween => |tw| tw.isRunning(),
@@ -210,19 +211,19 @@ pub const AnimatedValueBuilder = struct {
     }
 };
 
-// ========== 便捷函数 ==========
+// ========== convenience functions ==========
 
-/// 创建一个使用 transition 的动画值
+/// create animated value using transition
 pub fn animated(initial: f32) AnimatedValue {
     return AnimatedValue.create(initial).useTransition().build();
 }
 
-/// 创建一个使用 spring 的动画值
+/// create animated value using spring
 pub fn springValue(initial: f32) AnimatedValue {
     return AnimatedValue.create(initial).useSpring().build();
 }
 
-// ========== 测试 ==========
+// ========== tests ==========
 
 test "AnimatedValue: transition mode" {
     var value = AnimatedValue.create(0.0)
@@ -256,7 +257,7 @@ test "AnimatedValue: spring mode" {
     value.setTo(10.0, 0);
     try std.testing.expect(value.isAnimating());
 
-    // 运行足够多的帧
+    // run enough frames
     var i: usize = 0;
     var t: f64 = 0;
     while (i < 300 and value.isAnimating()) : (i += 1) {
@@ -285,9 +286,9 @@ test "AnimatedValue: immediate set" {
 
     const t0: f64 = 1000.0;
     value.setTo(50.0, t0);
-    value.update(t0 + 100.0, 0.1); // 开始动画
+    value.update(t0 + 100.0, 0.1); // start animation
 
-    // 立即设置
+    // set immediately
     value.setImmediate(100.0);
     try std.testing.expect(!value.isAnimating());
     try std.testing.expectEqual(@as(f32, 100.0), value.get());
@@ -306,22 +307,22 @@ test "springValue convenience function" {
 }
 
 test "AnimatedValue: tween mode 真的会动（now_ms 轨道回归）" {
-    // 回归：update 曾把 dt_s（帧间隔秒）当绝对 ms 传给 Tween，
-    // elapsed 恒为巨大负数被 delay 挡住，tween 永远冻在 from。
-    // 该模式当前无 builder 入口（零消费者），直接 init 构造。
+    // regression: update misused dt_s (frame interval seconds) as absolute ms passed to Tween,
+    // elapsed always huge negative blocked by delay, tween frozen at from. This pattern currently
+    // has no builder entry (zero consumers), construct directly via init.
     var value = AnimatedValue.init(0.0, .{
         .animation_type = .tween,
         .tween_config = .{ .from = 0, .to = 100, .duration = 0.5, .easing = .linear },
     });
 
-    // Tween.start 锚定全局帧时钟，显式设定，消除测试顺序依赖
+    // Tween.start anchors global frame clock, set explicitly, eliminate test order dependency
     const t0: f64 = 1000.0;
     @import("../core/render_engine/mod.zig").current_frame_time_ms = t0;
     value.setTo(100.0, t0);
-    // 250ms 后应约走到一半，绝不允许还钉在 0
+    // should reach ~50% by 250ms, must never stick at 0
     value.update(t0 + 250.0, 1.0 / 60.0);
     try std.testing.expect(value.get() > 10.0);
-    // 跑满后到达 to
+    // reach target after full run
     value.update(t0 + 600.0, 1.0 / 60.0);
     try std.testing.expectApproxEqAbs(@as(f32, 100.0), value.get(), 0.5);
 }

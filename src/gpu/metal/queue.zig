@@ -1,6 +1,6 @@
-/// Metal Queue 实现
+/// Metal Queue implementation
 ///
-/// 用于提交命令缓冲区
+/// Used to submit command buffers
 const mtl = @import("metal_bindings.zig");
 
 pub const Queue = struct {
@@ -18,7 +18,7 @@ pub const Queue = struct {
     }
 };
 
-// 占位类型（在阶段 4 实现）
+// Placeholder type (implemented in Phase 4)
 pub const CommandBuffer = struct {
     raw: *mtl.MTLCommandBuffer,
 };

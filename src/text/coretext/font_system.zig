@@ -2,7 +2,7 @@ const std = @import("std");
 const ct = @import("coretext_bridge.zig");
 const types = @import("../types.zig");
 
-// 全局 shape profiling
+// Global shape profiling.
 var g_shape_calls: u64 = 0;
 var g_shape_total_us: u64 = 0;
 var g_shape_frame_calls: u32 = 0;
@@ -32,8 +32,8 @@ pub fn fallbackFontRefSize(font_ref: *anyopaque) f32 {
     return ct.coretext_font_get_size(font_ref);
 }
 
-/// fallback CTFontRef 的稳定身份（PS 名+size+traits hash）。
-/// 指针不稳定，身份稳定，见 coretext_bridge.m 同名函数的注释。
+/// Fallback CTFontRef stable identity (PS name + size + traits hash). Pointer unstable, identity
+/// stable, see comment in same-named function in coretext_bridge.m.
 pub fn fallbackFontRefIdentityHash(font_ref: *anyopaque) u64 {
     return ct.coretext_font_identity_hash(font_ref);
 }
@@ -48,18 +48,18 @@ pub fn fallbackFontRefDebugName(allocator: std.mem.Allocator, font_ref: *anyopaq
 /// Font system using macOS CoreText
 pub const FontSystem = struct {
     allocator: std.mem.Allocator,
-    /// "system" family 的实际映射目标。zenit_app 解析 fallback_families 后
-    /// 写入（如 "Helvetica Neue"）。不设置时 "system" 交给 CoreText descriptor
-    /// 兜底，macOS 上会解析成 **Helvetica**，与渲染用字（FontSelector 的
-    /// fallback_families 首选）不同：拉丁 kerning 有 ~1% 细差；且两个基字体的
-    /// fallback 级联对 🈶 一类带框符号 emoji 会解析到不同字体（PingFang 16px
-    /// vs Apple Color Emoji ~21px），光标/选区与实际字形错位的根源。
-    /// slice 需比 FontSystem 活得久（family 字符串常量即可）。
+    io: std.Io,
+    /// Actual mapping target of "system" family. zenit_app writes after parsing fallback_families
+    /// (e.g., "Helvetica Neue"). Unset, "system" falls back to CoreText descriptor, macOS resolves
+    /// to **Helvetica**, differing from render font (FontSelector's fallback_families first
+    /// choice). Latin kerning ~1% difference; two fonts' fallback cascade resolves emoji like 🈶 to
+    /// different fonts (PingFang 16px vs Apple Color Emoji ~21px), root cause of cursor/selection
+    /// misalignment with actual glyphs. Slice must outlive FontSystem (family const string OK).
     default_family: ?[]const u8 = null,
 
-    pub fn init(allocator: std.mem.Allocator) !FontSystem {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io) !FontSystem {
         std.log.info("[FontSystem/CoreText] Initialized", .{});
-        return FontSystem{ .allocator = allocator };
+        return FontSystem{ .allocator = allocator, .io = io };
     }
 
     pub fn setDefaultFamily(self: *FontSystem, family: ?[]const u8) void {
@@ -81,6 +81,7 @@ pub const FontSystem = struct {
         const font = try self.allocator.create(Font);
         font.* = .{
             .allocator = self.allocator,
+            .io = self.io,
             .ct_font = ct_font,
             .size = size,
             .size_px = @floatFromInt(size),
@@ -108,7 +109,7 @@ pub const FontSystem = struct {
         const italic: c_int = if (descriptor.style == .italic) 1 else 0;
 
         // We need a null-terminated family name
-        const family_z = try self.allocator.dupeZ(u8, descriptor.family);
+        const family_z = try self.allocator.dupeSentinel(u8, descriptor.family, 0);
         defer self.allocator.free(family_z);
 
         const ct_font = ct.coretext_find_font(
@@ -124,6 +125,7 @@ pub const FontSystem = struct {
         const font = try self.allocator.create(Font);
         font.* = .{
             .allocator = self.allocator,
+            .io = self.io,
             .ct_font = ct_font,
             .size = @intFromFloat(descriptor.size),
             .size_px = descriptor.size,
@@ -139,11 +141,15 @@ pub const FontManager = FontSystem;
 /// Font represents a loaded font at a specific size (CoreText backend)
 pub const Font = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     ct_font: *anyopaque,
     size: u32,
     size_px: f32,
     weight: u16 = 400,
     scale_factor: f32 = 1.0,
+    /// Platform font smoothing when rasterizing (TextProps.font_smoothing); part of the glyph
+    /// atlas key (glyph_atlas.rasterKey).
+    smooth_fonts: bool = true,
 
     pub fn setScaleFactor(self: *Font, scale: f32) void {
         self.scale_factor = scale;
@@ -156,8 +162,8 @@ pub const Font = struct {
         return allocator.dupe(u8, slice) catch null;
     }
 
-    /// 派生同字体族（相同 variation axes）的新字号 Font
-    /// 用于 lazy font loading：base_font_size 变化时按需创建精确字号
+    /// Derive new font size from same font family (same variation axes). Used for lazy font
+    /// loading: create exact size on demand when base_font_size changes.
     pub fn derive(self: *const Font, new_size: f32) !*Font {
         const clamped_size = @max(new_size, 1.0);
         const ct_font = ct.coretext_derive_font(self.ct_font, clamped_size) orelse {
@@ -166,6 +172,7 @@ pub const Font = struct {
         const font = try self.allocator.create(Font);
         font.* = .{
             .allocator = self.allocator,
+            .io = self.io,
             .ct_font = ct_font,
             .size = @max(@as(u32, 1), @as(u32, @intFromFloat(@round(clamped_size)))),
             .size_px = clamped_size,
@@ -194,10 +201,13 @@ pub const Font = struct {
         var c_advance: c_int = 0;
         var c_is_color: c_int = 0;
 
-        const result = ct.coretext_rasterize_glyph(
+        const result = ct.coretext_rasterize_glyph_ex(
             self.ct_font,
             @intCast(glyph_index),
             self.scale_factor,
+            0,
+            0,
+            @intFromBool(self.smooth_fonts),
             &c_pixels,
             &c_width,
             &c_height,
@@ -228,9 +238,9 @@ pub const Font = struct {
             };
         }
 
-        // Copy pixels to Zig-managed memory（彩色是 BGRA，4 字节/像素）
-        // alloc 失败也必须归还 C 侧位图，GPA 看不见 C 分配，这是生产后端的
-        // OOM 净泄漏路径
+        // Copy pixels to Zig-managed memory (color is BGRA, 4 bytes/pixel). Must return C bitmap
+        // even on alloc failure; GPA can't see C allocations, this is production backend OOM leak
+        // path.
         errdefer ct.coretext_free_bitmap(c_pixels);
         const pixel_count = width * height * (if (is_color) @as(u32, 4) else 1);
         const pixels = try self.allocator.alloc(u8, pixel_count);
@@ -250,19 +260,19 @@ pub const Font = struct {
         };
     }
 
-    /// 码点 -> 字形索引（该字体内）。0 = 该字体不含此码点。
+    /// Codepoint -> glyph index (in this font). 0 = font lacks this codepoint.
     pub fn glyphIndexForCodepoint(self: *const Font, codepoint: u32) u32 {
         return ct.coretext_font_get_glyph_index(self.ct_font, @intCast(codepoint));
     }
 
-    /// 该字体是否含彩色字形表（sbix/COLR/CBDT）。
-    /// 用于在光栅化前就决定走哪条 atlas 路径（灰度页 vs BGRA 页）。
+    /// Whether font has color glyph table (sbix/COLR/CBDT). Determines atlas path (grayscale page
+    /// vs BGRA page) before rasterization.
     pub fn hasColorGlyphs(self: *const Font) bool {
         return ct.coretext_font_has_color_glyphs(self.ct_font) != 0;
     }
 
-    /// R6: Rasterize glyph with subpixel offset for sharper rendering
-    /// subpixel_offset_x/y: 物理像素内的亚像素偏移 [0.0, 1.0)
+    /// R6: Rasterize glyph with subpixel offset for sharper rendering. subpixel_offset_x/y:
+    /// subpixel offset within physical pixel [0.0, 1.0).
     pub fn rasterizeGlyphSubpixel(self: *Font, glyph_index: u32, subpixel_offset_x: f32, subpixel_offset_y: f32) !GlyphBitmap {
         var c_pixels: ?[*]u8 = null;
         var c_width: c_uint = 0;
@@ -272,12 +282,13 @@ pub const Font = struct {
         var c_advance: c_int = 0;
         var c_is_color: c_int = 0;
 
-        const result = ct.coretext_rasterize_glyph_subpixel(
+        const result = ct.coretext_rasterize_glyph_ex(
             self.ct_font,
             @intCast(glyph_index),
             self.scale_factor,
             subpixel_offset_x,
             subpixel_offset_y,
+            @intFromBool(self.smooth_fonts),
             &c_pixels,
             &c_width,
             &c_height,
@@ -307,7 +318,7 @@ pub const Font = struct {
             };
         }
 
-        // 同 rasterizeGlyph：alloc 失败也要归还 C 侧位图
+        // Same as rasterizeGlyph: must return C bitmap even on alloc failure.
         errdefer ct.coretext_free_bitmap(c_pixels);
         const pixel_count = width * height * (if (is_color) @as(u32, 4) else 1);
         const pixels = try self.allocator.alloc(u8, pixel_count);
@@ -377,7 +388,7 @@ pub const Font = struct {
         };
     }
 
-    /// 使用该 Font 的 CTFontRef 测量文本宽度（与渲染完全一致）
+    /// Measure text width using this Font's CTFontRef (perfectly matches rendering).
     pub fn measureWidth(self: *const Font, text: []const u8) f32 {
         if (text.len == 0) return 0;
         return ct.coretext_measure_text_width_with_font(self.ct_font, text.ptr, @intCast(text.len));
@@ -416,9 +427,9 @@ pub const TextShaper = struct {
         var c_glyphs: ?[*]ct.CoreTextShapedGlyph = null;
         var c_count: c_uint = 0;
 
-        var timer = std.time.Timer.start() catch undefined;
+        var timer: ?@import("zenit_time").Timer = @import("zenit_time").Timer.start(font.io) catch null;
         defer {
-            const elapsed = timer.read() / 1000;
+            const elapsed = if (timer) |*t| t.read() / 1000 else 0;
             g_shape_calls += 1;
             g_shape_total_us += elapsed;
             g_shape_frame_calls += 1;
@@ -443,10 +454,9 @@ pub const TextShaper = struct {
             return &[_]ShapedGlyph{};
         }
 
-        // Convert to Zig structs。
-        // alloc 失败时：桥为每个 fallback_font_ref 做的 +1 retain 尚未转交
-        // （free_shaped_glyphs 刻意不 release 它们），必须逐个归还再释放数组，
-        // 否则 CTFont 引用与 C 数组双双失联。
+        // Convert to Zig structs. On alloc failure: bridge did +1 retain for each fallback_font_ref
+        // not yet transferred (free_shaped_glyphs deliberately doesn't release); must return each
+        // then free array, else CTFont refs and C array both disconnect.
         errdefer {
             for (c_glyphs.?[0..glyph_count]) |cg| {
                 if (cg.fallback_font_ref) |ref| ct.coretext_release_font(ref);

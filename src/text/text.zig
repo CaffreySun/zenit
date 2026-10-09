@@ -9,16 +9,17 @@ pub const FontDescriptor = @import("types.zig").FontDescriptor;
 pub const FontWeight = @import("types.zig").FontWeight;
 pub const FontStyle = @import("types.zig").FontStyle;
 
-// 系统字体目录（字体选择器的数据层）。只做枚举与元数据，
-// 不负责把字体接到渲染管线，family 轴在管线里还不存在。
+// System font directory (data layer for font picker). Only enumerate and metadata,
+// doesn't connect fonts to render pipeline, family axis doesn't exist in pipeline yet.
 pub const font_catalog = @import("font_catalog.zig");
 pub const FontCatalog = font_catalog.FontCatalog;
 
 // Backend selection: CoreText on macOS, FreeType elsewhere
-pub const Backend = if (builtin.target.os.tag == .macos)
-    @import("coretext/font_system.zig")
-else
-    @import("freetype/font_system.zig");
+pub const Backend = switch (builtin.target.os.tag) {
+    .macos => @import("coretext/font_system.zig"),
+    .windows => @import("windows/font_system.zig"),
+    else => @import("freetype/font_system.zig"),
+};
 
 // Re-export backend types
 pub const FontSystem = Backend.FontSystem;
@@ -31,3 +32,9 @@ pub const retainFallbackFontRef = Backend.retainFallbackFontRef;
 pub const fallbackFontRefSize = Backend.fallbackFontRefSize;
 pub const fallbackFontRefIdentityHash = Backend.fallbackFontRefIdentityHash;
 pub const fallbackFontRefDebugName = Backend.fallbackFontRefDebugName;
+
+// Explicit snapshots currently have a native implementation on Windows only.
+// Opaque types keep cross-platform hook declarations possible without exposing
+// unsupported constructors on other backends.
+pub const FontRange = if (@hasDecl(Backend, "FontRange")) Backend.FontRange else opaque {};
+pub const FontRanges = if (@hasDecl(Backend, "FontRanges")) Backend.FontRanges else opaque {};

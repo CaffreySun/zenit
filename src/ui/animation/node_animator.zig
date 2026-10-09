@@ -1,21 +1,21 @@
-/// 节点命令式动画，animateNode
+/// Node imperative animation, animateNode
 ///
-/// 直接对节点属性发起命令式动画，支持多属性并行，冲突自动覆盖 (overwrite)。
-/// 与 TransitionSlots (声明式) 互补：TransitionSlots 是 "设了 transition 后属性变化自动过渡"，
-/// animateNode 是 "主动发起一个从 A 到 B 的动画"。
+/// Issues imperative animations directly on node properties; supports multi-property parallel,
+/// conflicts auto-overwrite. Complements TransitionSlots (declarative, auto-transitions property
+/// changes once a transition is set); animateNode actively starts A->B animations.
 ///
-/// 用法:
+/// Usage:
 /// ```zig
 /// const node_animator = @import("animation/node_animator.zig");
 ///
-/// // 单属性动画
+/// // single property animation
 /// node_animator.animateNode(node, allocator, .{
 ///     .prop = .opacity,
 ///     .from = 0, .to = 1,
 ///     .duration = 0.3,
 /// });
 ///
-/// // 多属性并行
+/// // multi-property parallel
 /// node_animator.animateNode(node, allocator, .{ .prop = .translate_y, .from = 20, .to = 0 });
 /// node_animator.animateNode(node, allocator, .{ .prop = .opacity, .to = 1 });
 /// ```
@@ -26,9 +26,9 @@ const AnimationController = ctrl_mod.AnimationController;
 const Easing = @import("easing.zig").Easing;
 const render_engine = @import("../core/render_engine/mod.zig");
 
-/// 可动画属性
+/// Animatable properties.
 pub const AnimatableProp = enum(u6) {
-    // 与 TransitionProp 对齐的基础属性
+    // Base properties aligned with TransitionProp.
     opacity = 0,
     translate_x = 1,
     translate_y = 2,
@@ -37,7 +37,7 @@ pub const AnimatableProp = enum(u6) {
     corner_radius = 5,
     border_width = 6,
     width = 7,
-    // 扩展属性
+    // Extended properties.
     height = 8,
     margin_top = 9,
     margin_left = 10,
@@ -45,26 +45,26 @@ pub const AnimatableProp = enum(u6) {
     rotate = 12,
 };
 
-/// 动画配置
+/// Animation config.
 pub const AnimateConfig = struct {
-    /// 目标属性
+    /// Target property.
     prop: AnimatableProp,
-    /// 起始值 (null = 从当前值自动获取)
+    /// Start value (null = auto-get from current).
     from: ?f32 = null,
-    /// 目标值
+    /// Target value.
     to: f32,
-    /// 持续时间（秒）
+    /// Duration (seconds).
     duration: f32 = 0.3,
-    /// 缓动函数
+    /// Easing function.
     easing: Easing = .ease_out_quad,
-    /// 延迟（秒）
+    /// Delay (seconds).
     delay: f32 = 0,
-    /// 完成回调
+    /// Completion callback.
     on_complete: ?ctrl_mod.CallbackFn = null,
     on_complete_ctx: ?*anyopaque = null,
 };
 
-/// 节点上的活跃动画列表（固定大小，零分配 tick）
+/// Active animation list on node (fixed size, zero-alloc tick).
 pub const NodeAnimations = struct {
     entries: [max_entries]Entry = undefined,
     count: u8 = 0,
@@ -80,9 +80,9 @@ pub const NodeAnimations = struct {
         generation: u64 = 0,
     };
 
-    /// 添加或替换属性动画（同属性自动 overwrite）。
-    /// 若同 prop 已有正在跑的 controller，先取它的 current_value + velocity
-    /// 调新 controller.seed, interruption-safe，避免 hover/active 切换时数值跳变。
+    /// Add or replace property animation (same prop auto-overwrites). If same prop has running
+    /// controller, take its current_value + velocity, seed new controller, interruption-safe, avoid
+    /// value jumps on hover/active switch.
     pub fn set(self: *NodeAnimations, prop: AnimatableProp, ctrl: AnimationController) void {
         if (ctrl.isScopeRetiring()) return;
         var accepted = ctrl.cloneForNode();
@@ -93,10 +93,10 @@ pub const NodeAnimations = struct {
         // property. That property's old callback is no longer authoritative.
         self.pending_completions &= ~propBit(prop);
         self.next_generation +%= 1;
-        // 查找已有同属性动画
+        // Find existing same-property animation.
         for (self.entries[0..self.count]) |*entry| {
             if (entry.prop == prop) {
-                // 中断 seed: 从 old 读 value/velocity
+                // Interrupt seed: read value/velocity from old.
                 const old_value = entry.controller.value;
                 const old_velocity = entry.controller.currentVelocity();
                 entry.controller.releaseLifetime();
@@ -104,18 +104,18 @@ pub const NodeAnimations = struct {
                 stored = true;
                 entry.controller.ticking = false;
                 entry.generation = self.next_generation;
-                // play() 必须先调 (spring.start 内部 reset current_value=from / velocity=0
-                // 等 driver-specific 锚点)；之后再 seed 把 old current/velocity 写进去，
-                // 让真正的 tick 时序从 old 状态续衔。
+                // play() must be called first (spring.start internally resets current_value=from /
+                // velocity=0 etc driver-specific anchors); then seed writes old current/velocity,
+                // lets real tick sequence pick up from old state.
                 entry.controller.play();
                 entry.controller.seed(old_value, old_velocity);
                 return;
             }
         }
-        // 新增。满额时先驱逐一个已终结条目（completed/idle 的最终值早已写进
-        // style，条目只是等外部 restart 的占位），此前静默丢弃新动画，而
-        // animateNode 在 set 之前已把 from 值写进节点：节点被永久钉在 from，
-        // 比不调用还糟。
+        // Add new. When full, first evict completed entry (final value already written to style,
+        // entry just placeholder for external restart); previously silently discarded new
+        // animation, but animateNode pre-wrote from to node style, node stuck at from, worse than
+        // not calling.
         if (self.count >= max_entries) {
             var evict: ?u8 = null;
             for (self.entries[0..self.count], 0..) |*entry, idx| {
@@ -130,7 +130,8 @@ pub const NodeAnimations = struct {
                 self.entries[idx] = self.entries[self.count - 1];
                 self.count -= 1;
             } else {
-                // 16 条全部活跃仍要加第 17 条：真实场景不该出现，出声再丢
+                // All 16 active still adding 17th: shouldn't happen in real scenarios, log then
+                // drop.
                 std.log.warn("[node_animator] 属性动画槽满（{d}），丢弃 prop={any}", .{ max_entries, prop });
                 return;
             }
@@ -147,8 +148,8 @@ pub const NodeAnimations = struct {
         self.count = 0;
     }
 
-    /// 每帧 tick 所有属性动画，返回 true 表示仍有活跃动画
-    /// now_ms: 当前帧的绝对时间戳（毫秒）
+    /// Tick all property animations each frame, return true if still active.
+    /// now_ms: current frame absolute timestamp (milliseconds).
     pub fn tick(self: *NodeAnimations, node: anytype, allocator: Allocator, now_ms: f64) bool {
         if (nodeIsRetiring(node)) return false;
         if (self.ticking) return self.hasActive();
@@ -257,7 +258,7 @@ pub const NodeAnimations = struct {
     }
 
     fn propBit(prop: AnimatableProp) u64 {
-        return @as(u64, 1) << @intFromEnum(prop);
+        return @as(u64, 1) << @backingInt(prop);
     }
 
     fn hasActive(self: *const NodeAnimations) bool {
@@ -267,13 +268,13 @@ pub const NodeAnimations = struct {
         return false;
     }
 
-    /// 按属性类型应用值到节点 style
+    /// Apply value to node style by property type.
     fn applyValue(node: anytype, allocator: Allocator, entry: *const Entry) void {
         const v = entry.controller.value;
         switch (entry.prop) {
             .opacity => {
-                // generic over MockNode (plain .style.opacity field)
-                // vs real Node (字段已删 -> setOpacityRaw 路由 World.paint_state)。
+                // generic over MockNode (plain .style.opacity field) vs real Node (field deleted ->
+                // setOpacityRaw routes to World.paint_state).
                 if (comptime @hasDecl(@TypeOf(node.*), "setOpacityRaw")) {
                     node.setOpacityRaw(v);
                 } else {
@@ -285,7 +286,8 @@ pub const NodeAnimations = struct {
             },
             .translate_x => {
                 node.style.translate_x = v;
-                // 权威失效组合（= markCompositePropDirty；anytype MockNode 兼容故展开写）
+                // Authoritative invalidation combo (= markCompositePropDirty; anytype MockNode
+                // compatible, so expanded).
                 node.markInteractionDirty();
                 node.markCompositeDirty();
                 node.invalidateRenderCache();
@@ -345,11 +347,11 @@ pub const NodeAnimations = struct {
         }
     }
 
-    /// 获取节点当前属性值
+    /// Get node current property value.
     pub fn getCurrentPropValue(node: anytype, prop: AnimatableProp) f32 {
         return switch (prop) {
-            // real Node 字段已删 -> getOpacity 路由 World；
-            // MockNode/TestNode 仍有 plain .style.opacity 字段。
+            // real Node field deleted -> getOpacity routes to World; MockNode/TestNode still have
+            // plain .style.opacity field.
             .opacity => if (comptime @hasDecl(@TypeOf(node.*), "getOpacity"))
                 node.getOpacity()
             else
@@ -365,8 +367,8 @@ pub const NodeAnimations = struct {
             .border_width => node.style.border.width,
             .width => switch (node.style.width) {
                 .px => |v| v,
-                // node 是 generic (anytype)，MockNode 有 frame_state.rect 字段；
-                // 真 Node 的字段已删，走 rectFromWorldOrFallback。comptime 分支。
+                // node is generic (anytype), MockNode has frame_state.rect field; real Node's field
+                // deleted, uses rectFromWorldOrFallback. comptime branch.
                 else => if (comptime @hasDecl(@TypeOf(node.*), "rectFromWorldOrFallback"))
                     node.rectFromWorldOrFallback().w
                 else
@@ -398,7 +400,7 @@ fn animPropAffectsTransform(prop: AnimatableProp) bool {
     };
 }
 
-/// 便捷函数：对节点发起属性动画
+/// Convenience function: initiate property animation on node.
 // Real Nodes are protected by Cx's deferred reclamation while ticking. Mock
 // animation hosts have no lifetime fields and retain their existing contract.
 fn nodeIsRetiring(node: anytype) bool {
@@ -413,7 +415,7 @@ fn nodeIsRetiring(node: anytype) bool {
 
 pub fn animateNode(node: anytype, allocator: Allocator, config: AnimateConfig) void {
     if (nodeIsRetiring(node)) return;
-    // 确保节点有 NodeAnimations
+    // Ensure node has NodeAnimations.
     const anims = blk: {
         if (node.frame_state.frame_local.runtime.commands) |a| break :blk a;
         const a = allocator.create(NodeAnimations) catch return;
@@ -445,9 +447,9 @@ pub fn animateNode(node: anytype, allocator: Allocator, config: AnimateConfig) v
     }
 }
 
-// ========== 测试 ==========
+// ========== Tests ==========
 
-// 测试用的 Mock Node
+// Test Mock Node.
 const MockStyle = struct {
     opacity: f32 = 1.0,
     translate_x: f32 = 0,
@@ -540,7 +542,7 @@ const MockNode = struct {
     }
 };
 
-/// 测试辅助：设置全局模拟时间
+/// Test helper: set global mock time.
 fn setTestTime(ms: f64) void {
     render_engine.current_frame_time_ms = ms;
 }
@@ -560,17 +562,17 @@ test "NodeAnimations: single property" {
 
     try std.testing.expect(anims.count == 1);
 
-    // tick 到中途
+    // Tick to midpoint.
     setTestTime(1250.0);
     _ = anims.tick(&node, std.testing.allocator, 1250.0);
     try std.testing.expectApproxEqAbs(@as(f32, 0.5), node.style.opacity, 0.1);
     try std.testing.expect(node.render_dirty);
 
-    // tick 到完成
+    // Tick to completion.
     setTestTime(1500.0);
     _ = anims.tick(&node, std.testing.allocator, 1500.0);
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), node.style.opacity, 0.01);
-    try std.testing.expect(anims.count == 0); // 完成后移除
+    try std.testing.expect(anims.count == 0); // Remove after completion.
 }
 
 test "NodeAnimations: multi property parallel" {
@@ -611,11 +613,11 @@ test "NodeAnimations: overwrite same prop" {
         .easing = .linear,
     }));
 
-    // tick 一点
+    // Tick a bit.
     setTestTime(1100.0);
     _ = anims.tick(&node, std.testing.allocator, 1100.0);
 
-    // 覆盖：新的动画
+    // Overwrite: new animation.
     anims.set(.opacity, AnimationController.initTween(.{
         .from = node.style.opacity,
         .to = 0,
@@ -623,10 +625,10 @@ test "NodeAnimations: overwrite same prop" {
         .easing = .linear,
     }));
 
-    // 仍然只有 1 个 entry
+    // Still only 1 entry.
     try std.testing.expect(anims.count == 1);
 
-    // 运行到完成
+    // Run to completion.
     const dt_ms: f32 = 1000.0 / 60.0;
     var now: f64 = 1100.0;
     var i: usize = 0;
@@ -735,7 +737,7 @@ test "NodeAnimations: completion callback can switch height back to fit" {
 }
 
 // ============================================================================
-// v0.7 §2.3, NodeAnimations.set 自动 seed (interrupt-safe) tests
+// v0.7 section 2.3, NodeAnimations.set auto-seed (interrupt-safe) tests
 // ============================================================================
 
 test "tween 中断 — 新 controller 从 old current_value 起步，无跳变" {
@@ -744,33 +746,33 @@ test "tween 中断 — 新 controller 从 old current_value 起步，无跳变" 
     var node = MockNode{};
     node.style.opacity = 0;
 
-    // 第 1 段：0 -> 1，duration 1s，linear
+    // Segment 1: 0 -> 1, duration 1s, linear.
     anims.set(.opacity, AnimationController.initTween(.{
         .from = 0,
         .to = 1,
         .duration = 1.0,
         .easing = .linear,
     }));
-    // tick 到 t=0.3s，opacity 应 ≈ 0.3
+    // Tick to t=0.3s, opacity should ~= 0.3.
     setTestTime(1300.0);
     _ = anims.tick(&node, std.testing.allocator, 1300.0);
     const v_at_interrupt = node.style.opacity;
     try std.testing.expectApproxEqAbs(@as(f32, 0.3), v_at_interrupt, 0.05);
 
-    // 中断：不指定 from (旧 API 需要 caller 自己读 node.style.opacity)，让 seed 自动接管
+    // Interrupt: omit from (old API required caller to read node.style.opacity), let seed auto-take
+    // over.
     anims.set(.opacity, AnimationController.initTween(.{
-        .from = 0, // 故意填 0 — seed 应把它覆盖成 v_at_interrupt
+        .from = 0, // Deliberately fill 0 -- seed should override to v_at_interrupt.
         .to = 0,
         .duration = 0.5,
         .easing = .linear,
     }));
 
-    // 第一 tick 后 (very small dt)，opacity 应该 still ≈ v_at_interrupt，
-    // 而不是跳到 from=0
-    setTestTime(1316.0); // +16ms 一帧
+    // After first tick (very small dt), opacity should still ~= v_at_interrupt, not jump to from=0.
+    setTestTime(1316.0); // +16ms per frame.
     _ = anims.tick(&node, std.testing.allocator, 1316.0);
-    // 0.5s 内从 v_at_interrupt -> 0；16ms 后大约走 16/500 ≈ 3% 的路 ≈ 0.291
-    // 总之绝不应该跳到 0 附近（误差应远小于 v_at_interrupt 的 50%）
+    // 0.5s from v_at_interrupt -> 0; after 16ms ~= 3% of path ~= 0.291. Should never jump near 0
+    // (error much less than v_at_interrupt's 50%).
     try std.testing.expect(node.style.opacity > v_at_interrupt * 0.85);
     try std.testing.expect(node.style.opacity < v_at_interrupt * 1.01);
 }
@@ -788,12 +790,12 @@ test "spring 中断 — velocity 续衔，不视觉抖动" {
         .damping = 26,
         .mass = 1,
     }));
-    // tick 100ms，spring 应该已经有非 0 速度
+    // Tick 100ms, spring should have non-0 velocity.
     setTestTime(1100.0);
     _ = anims.tick(&node, std.testing.allocator, 1100.0);
     const v_at_interrupt = node.style.opacity;
 
-    // 反向 spring 接管
+    // Reverse spring takes over.
     anims.set(.opacity, AnimationController.initSpring(.{
         .from = 0,
         .to = 0,
@@ -802,10 +804,11 @@ test "spring 中断 — velocity 续衔，不视觉抖动" {
         .mass = 1,
     }));
 
-    // 第一 tick 之后 opacity 不应跳变，seed 接管使新 spring 从 v_at_interrupt 起步
+    // After first tick opacity should not jump, seed takes over to start new spring from
+    // v_at_interrupt.
     setTestTime(1116.0);
     _ = anims.tick(&node, std.testing.allocator, 1116.0);
-    // 误差容忍 30% (spring 一帧内有惯性 + damping，但绝对不能跳到 from=0)
+    // Error tolerance 30% (spring has inertia + damping per frame, but must never jump to from=0).
     try std.testing.expect(node.style.opacity > v_at_interrupt * 0.7);
 }
 
@@ -836,30 +839,31 @@ test "currentVelocity — spring 0 起步速度 = 0" {
 }
 
 test "NodeAnimations: 槽满时驱逐已终结条目而非静默丢弃新动画" {
-    // 回归：set 满额后无 else 静默丢弃，而 animateNode 已提前把 from 写进
-    // 节点 style，节点被永久钉在 from。当前 13 个 prop < 16 槽，公开 API
-    // 尚打不满；手工构造满额态锁住驱逐语义，防 prop 扩容后地雷复活。
+    // Regression: set when full had no else, silently discarded, but animateNode pre-wrote from to
+    // node style, node stuck at from. Currently 13 props < 16 slots, public API won't fill;
+    // manually construct full-state to lock eviction semantics, prevent landmine reactivation after
+    // prop expansion.
     setTestTime(1000.0);
     var anims = NodeAnimations{};
 
-    // 手工填满 16 槽（prop 用 1..12 循环，避开 .opacity 让 set 走新增分支）
+    // Manually fill 16 slots (prop cycles 1..12, avoid .opacity to let set take new-add branch).
     for (0..16) |i| {
         anims.entries[i] = .{
-            .prop = @enumFromInt(1 + (i % 12)),
+            .prop = @fromBackingInt(@intCast(1 + (i % 12))),
             .controller = AnimationController.initTween(.{ .from = 0, .to = 1, .duration = 10.0, .easing = .linear }),
         };
         anims.entries[i].controller.play();
     }
     anims.count = 16;
 
-    // 把第 3 条置为 completed（短动画跑完）
+    // Set entry 3 to completed (short animation finished).
     anims.entries[3].controller = AnimationController.initTween(.{ .from = 0, .to = 1, .duration = 0.05, .easing = .linear });
     anims.entries[3].controller.play();
     setTestTime(2000.0);
     _ = anims.entries[3].controller.tick(2000.0);
     try std.testing.expect(anims.entries[3].controller.isCompleted());
 
-    // 新 prop 必须挤进来（驱逐 completed 条目），不得静默丢弃
+    // New prop must squeeze in (evict completed entry), not silently discard.
     anims.set(.opacity, AnimationController.initTween(.{ .from = 5, .to = 6, .duration = 1.0, .easing = .linear }));
     try std.testing.expectEqual(@as(u8, 16), anims.count);
     var found = false;

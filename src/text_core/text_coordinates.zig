@@ -38,6 +38,29 @@ pub const SelectionRect = struct {
     width: f32,
 };
 
+/// One visual piece with its canonical logical span. Bidi pieces are ordered
+/// by visual x, not by byte offset; callers must preserve that ordering.
+pub const SelectionSegment = struct { start: ByteOffset, end: ByteOffset, rect: SelectionRect };
+pub const SelectionSegments = struct {
+    stops: []const CaretStop,
+    index: usize = 0,
+
+    pub fn next(self: *SelectionSegments) ?SelectionSegment {
+        while (self.index + 1 < self.stops.len) {
+            const left = self.stops[self.index];
+            const right = self.stops[self.index + 1];
+            self.index += 1;
+            const lo = @min(left.position.byte.value, right.position.byte.value);
+            const hi = @max(left.position.byte.value, right.position.byte.value);
+            if (lo == hi) continue;
+            const x0 = @min(left.x.value, right.x.value);
+            const x1 = @max(left.x.value, right.x.value);
+            return .{ .start = .{ .value = lo }, .end = .{ .value = hi }, .rect = .{ .x = x0, .width = x1 - x0 } };
+        }
+        return null;
+    }
+};
+
 pub const VisualLine = struct {
     source_start: ByteOffset,
     source_end: ByteOffset,
@@ -101,12 +124,11 @@ pub const VisualLine = struct {
         if (lo == hi or self.caret_stops.len < 2) return output[0..0];
 
         var count: usize = 0;
-        for (self.caret_stops[0 .. self.caret_stops.len - 1], self.caret_stops[1..]) |left, right| {
-            const seg_lo = @min(left.position.byte.value, right.position.byte.value);
-            const seg_hi = @max(left.position.byte.value, right.position.byte.value);
-            if (seg_hi <= lo or seg_lo >= hi or seg_lo == seg_hi) continue;
-            const x0 = @min(left.x.value, right.x.value);
-            const x1 = @max(left.x.value, right.x.value);
+        var segments = self.selectionSegments();
+        while (segments.next()) |segment| {
+            if (segment.end.value <= lo or segment.start.value >= hi) continue;
+            const x0 = segment.rect.x;
+            const x1 = x0 + segment.rect.width;
             if (count > 0 and output[count - 1].x + output[count - 1].width == x0) {
                 output[count - 1].width = x1 - output[count - 1].x;
             } else {
@@ -116,6 +138,12 @@ pub const VisualLine = struct {
             }
         }
         return output[0..count];
+    }
+
+    /// Linear, allocation-free geometry extraction for owned accessibility
+    /// snapshots. Uses exactly the same visual pieces as selectionRects.
+    pub fn selectionSegments(self: VisualLine) SelectionSegments {
+        return .{ .stops = self.caret_stops };
     }
 };
 

@@ -1,378 +1,132 @@
-//! Storybook application chrome.
-//!
-//! Keep the showcase shell visually independent from the individual stories:
-//! stories own component demos, while this file owns navigation, hierarchy,
-//! preview framing, and workspace chrome.
+//! Storybook navigation and content layout. Stories render directly on the canvas.
 const ui = @import("ui");
+const TOKENS = ui.theme.refs;
 
-pub fn root(t: *const ui.ThemeTokens) ui.BoxStyle {
-    return .{
-        .width = .{ .grow = .{} },
-        .height = .{ .grow = .{} },
-        .direction = .row,
-        .background = t.color.bg_base,
-    };
+pub const root = ui.css(.{ .width = .fill, .height = .fill, .direction = .row, .background = TOKENS.color.bg_primary });
+pub const sidebar = ui.css(.{
+    .width = ui.arb.px(216),
+    .height = .fill,
+    .direction = .column,
+    .background = TOKENS.color.bg_secondary,
+    .border_right_width = TOKENS.border_width.thin,
+    .border_right_color = TOKENS.color.border,
+});
+pub const brand = ui.css(.{
+    .direction = .row,
+    .align_items = .center,
+    .gap = TOKENS.space.space200,
+    .padding = .{ .x = TOKENS.space.space400, .top = TOKENS.space.space600, .bottom = TOKENS.space.space400 },
+});
+pub const logoMark = ui.css(.{
+    .width = ui.arb.px(24),
+    .height = ui.arb.px(24),
+    .align_items = .center,
+    .justify = .center,
+    .background = TOKENS.color.accent,
+    .corner_radius = TOKENS.radius.lg,
+});
+pub const logoLetter = ui.css(.{ .font_size = TOKENS.font_size.lg, .font_weight = 700, .color = TOKENS.color.fg_inverse });
+pub const brandName = ui.css(.{ .font_size = TOKENS.font_size.lg, .font_weight = 600, .color = TOKENS.color.fg_primary });
+pub const searchWrap = ui.css(.{ .padding = .{ .x = TOKENS.space.space300, .bottom = TOKENS.space.space200 } });
+pub const searchField = ui.css(.{
+    .width = .fill,
+    .height = ui.arb.px(32),
+    .direction = .row,
+    .align_items = .center,
+    .gap = TOKENS.space.space200,
+    .padding = .{ .x = TOKENS.space.space200 },
+    .background = TOKENS.color.bg_primary,
+    .border = .{ .width = .thin, .color = TOKENS.color.border, .radius = .lg },
+});
+pub const searchIcon = ui.css(.{ .width = TOKENS.size.sm, .height = TOKENS.size.sm });
+pub fn searchIconTint(t: *const ui.theme.Values) ui.Color {
+    return t.tokens.color.fg_tertiary;
+}
+pub const searchInput = ui.css(.{ .width = .{ .grow = .{ .min = 0 } } });
+pub const navEmptyHint = ui.css(.{ .font_size = TOKENS.font_size.sm, .color = TOKENS.color.fg_tertiary });
+pub const navSection = ui.css(.{ .padding = .{ .x = TOKENS.space.space200, .top = TOKENS.space.space400, .bottom = TOKENS.space.space200 } });
+pub const navSectionText = ui.css(.{ .font_size = TOKENS.font_size.xs, .font_weight = 500, .color = TOKENS.color.fg_tertiary });
+pub const Nav = ui.sva(.{
+    .slots = .{ .root, .label },
+    .base = .{
+        .root = .{
+            .width = .fill,
+            .height = ui.arb.px(32),
+            .direction = .row,
+            .align_items = .center,
+            .padding = .{ .x = TOKENS.space.space200 },
+            .corner_radius = TOKENS.radius.lg,
+            .cursor = .pointer,
+            ._hover = .{ .background = TOKENS.color.bg_hover },
+        },
+        .label = .{ .font_size = TOKENS.font_size.md, .font_weight = 400, .color = TOKENS.color.fg_secondary },
+    },
+    .variants = .{ .selected = .{
+        .false = .{},
+        .true = .{
+            .root = .{ .background = TOKENS.color.bg_tertiary },
+            .label = .{ .font_weight = 600, .color = TOKENS.color.fg_primary },
+        },
+    } },
+    .defaults = .{ .selected = false },
+});
+pub const sidebarFooter = ui.css(.{ .padding = TOKENS.space.space400 });
+pub const sidebarFooterText = ui.css(.{ .font_size = TOKENS.font_size.xs, .color = TOKENS.color.fg_tertiary });
+pub const workspace = ui.css(.{ .width = .fill, .height = .fill, .direction = .column, .background = TOKENS.color.bg_primary });
+pub const toolbar = ui.css(.{
+    .width = .fill,
+    .height = ui.arb.px(64),
+    .direction = .row,
+    .align_items = .center,
+    .justify = .space_between,
+    .padding = .{ .x = TOKENS.space.space800 },
+    .border_bottom_width = TOKENS.border_width.thin,
+    .border_bottom_color = TOKENS.color.border,
+});
+pub const heading = ui.css(.{ .direction = .row, .align_items = .center, .gap = TOKENS.space.space300 });
+pub const category = ui.css(.{ .font_size = TOKENS.font_size.xs, .font_weight = 500, .color = TOKENS.color.fg_tertiary });
+pub const title = ui.css(.{ .font_size = TOKENS.font_size.xxl, .font_weight = 600, .color = TOKENS.color.fg_primary });
+pub const devtoolsButton = ui.css(.{
+    .direction = .row,
+    .align_items = .center,
+    .padding = .{ .x = TOKENS.space.space200, .y = TOKENS.space.space150 },
+    .corner_radius = TOKENS.radius.lg,
+    .cursor = .pointer,
+    ._hover = .{ .background = TOKENS.color.bg_hover },
+});
+pub const devtoolsLabel = ui.css(.{ .font_size = TOKENS.font_size.sm, .color = TOKENS.color.fg_secondary });
+/// Content column: the story note above the story panel. The gap (32) keeps the note out of the
+/// website's frames (the story root padded 28).
+pub const contentColumn = ui.css(.{ .width = .fill, .gap = TOKENS.space.space800 });
+/// Non-scrolling content area (WidgetSpec.scrolls = false): padding and bg color
+/// same as ScrollArea
+pub const plainContent = ui.css(.{ .width = .fill, .height = .fill, .padding = TOKENS.space.space800, .gap = TOKENS.space.space800, .background = TOKENS.color.bg_primary });
+pub const panel = ui.css(.{ .width = .fill, .direction = .column });
+/// Story panel whose root hugs its content, centred (WidgetSpec.wide = false).
+pub const panelCentred = ui.css(.{ .width = .fill, .direction = .column, .align_items = .center });
+/// The story note (WidgetSpec.note): secondary text above the panel, wrapping.
+/// Wraps at a readable measure (and stays clear of stories that draw over the window's right side).
+pub const storyNote = ui.css(.{ .font_size = TOKENS.font_size.sm, .color = TOKENS.color.fg_secondary, .wrap = .word, .width = .fill, .max_width = 480 });
+
+// -- Story content common styles (shared by stories.zig and other story files) --
+
+/// Vertical layout, gap spacing (px)
+pub fn stack(comptime gap: f32) @TypeOf(ui.css(.{ .gap = gap })) {
+    return .{};
 }
 
-pub fn sidebar(t: *const ui.ThemeTokens) ui.BoxStyle {
-    return .{
-        .width = .{ .px = ui.arb.px(232) },
-        .height = .{ .grow = .{} },
-        .direction = .column,
-        .background = t.color.bg_secondary,
-        .border_right_width = t.border_width.thin,
-        .border_right_color = t.color.border,
-    };
+/// Horizontal layout, vertically centered, gap spacing (px)
+pub fn line(comptime gap: f32) @TypeOf(ui.css(.{ .gap = gap, .align_items = .center })) {
+    return .{};
 }
 
-pub fn brand(t: *const ui.ThemeTokens) ui.BoxStyle {
-    return .{
-        .direction = .row,
-        .align_items = .center,
-        .gap = t.space._3,
-        .padding = .{ .top = ui.arb.px(34), .right = t.space._4, .bottom = t.space._3, .left = t.space._4 },
-    };
+/// Fixed width (px)
+pub fn fixedWidth(comptime px: f32) @TypeOf(ui.css(.{ .width = px })) {
+    return .{};
 }
 
-pub fn logoMark(t: *const ui.ThemeTokens) ui.BoxStyle {
-    return .{
-        .width = .{ .px = ui.arb.px(32) },
-        .height = .{ .px = ui.arb.px(32) },
-        .align_items = .center,
-        .justify = .center,
-        .background = t.color.accent,
-        .corner_radius = t.radius.xl,
-        .shadow = t.shadow.sm,
-    };
-}
+/// Story subsection label / state echo text (13px secondary color)
+pub const storyLabel = ui.css(.{ .font_size = 13, .color = TOKENS.color.fg_secondary });
 
-pub fn logoLetter(t: *const ui.ThemeTokens) ui.TextStyle {
-    return .{
-        .font_size = t.font_size.xl,
-        .font_weight = 700,
-        .color = t.color.fg_inverse,
-    };
-}
-
-pub fn brandCopy(t: *const ui.ThemeTokens) ui.BoxStyle {
-    return .{ .direction = .column, .gap = t.space._0_5 };
-}
-
-pub fn brandName(t: *const ui.ThemeTokens) ui.TextStyle {
-    return .{
-        .font_size = t.font_size.lg,
-        .font_weight = 700,
-        .color = t.color.fg_primary,
-    };
-}
-
-pub fn brandLabel(t: *const ui.ThemeTokens) ui.TextStyle {
-    return .{
-        .font_size = t.font_size.xxs,
-        .font_weight = 600,
-        .color = t.color.fg_tertiary,
-    };
-}
-
-pub fn searchWrap(t: *const ui.ThemeTokens) ui.BoxStyle {
-    return .{
-        .padding = .{ .top = t.space._1, .right = t.space._3, .bottom = t.space._3, .left = t.space._3 },
-    };
-}
-
-pub fn searchField(t: *const ui.ThemeTokens) ui.BoxStyle {
-    return .{
-        .width = .{ .grow = .{} },
-        .height = .{ .px = ui.arb.px(32) },
-        .direction = .row,
-        .align_items = .center,
-        .gap = t.space._2,
-        .padding = .{ .top = 0, .right = t.space._2, .bottom = 0, .left = t.space._3 },
-        .background = t.color.bg_primary,
-        .border = .{ .width = t.border_width.thin, .color = t.color.border, .radius = t.radius.lg },
-    };
-}
-
-pub fn searchText(t: *const ui.ThemeTokens) ui.TextStyle {
-    return .{ .font_size = t.font_size.sm, .color = t.color.fg_tertiary };
-}
-
-pub fn navEmptyHint(t: *const ui.ThemeTokens) ui.TextStyle {
-    return .{ .font_size = t.font_size.sm, .color = t.color.fg_tertiary };
-}
-
-pub fn libraryMeta(t: *const ui.ThemeTokens) ui.BoxStyle {
-    return .{
-        .direction = .row,
-        .align_items = .center,
-        .justify = .space_between,
-        .padding = .{ .top = 0, .right = t.space._4, .bottom = t.space._2, .left = t.space._4 },
-    };
-}
-
-pub fn libraryLabel(t: *const ui.ThemeTokens) ui.TextStyle {
-    return .{ .font_size = t.font_size.xxs, .font_weight = 700, .color = t.color.fg_secondary };
-}
-
-pub fn libraryCount(t: *const ui.ThemeTokens) ui.TextStyle {
-    return .{ .font_size = t.font_size.xxs, .font_weight = 500, .color = t.color.fg_tertiary };
-}
-
-pub fn navSection(t: *const ui.ThemeTokens) ui.BoxStyle {
-    return .{
-        .padding = .{ .top = t.space._4, .right = t.space._2, .bottom = t.space._1, .left = t.space._2 },
-    };
-}
-
-pub fn navSectionText(t: *const ui.ThemeTokens) ui.TextStyle {
-    return .{
-        .font_size = t.font_size.xxs,
-        .font_weight = 700,
-        .color = t.color.fg_tertiary,
-    };
-}
-
-pub fn navRow(comptime selected: bool) fn (*const ui.ThemeTokens) ui.BoxStyle {
-    return struct {
-        fn style(t: *const ui.ThemeTokens) ui.BoxStyle {
-            return .{
-                .width = .{ .grow = .{} },
-                .height = .{ .px = ui.arb.px(30) },
-                .direction = .row,
-                .align_items = .center,
-                .gap = t.space._2,
-                .padding = .{ .top = 0, .right = t.space._2, .bottom = 0, .left = t.space._2 },
-                .background = if (selected) t.color.accent_subtle else ui.Color.TRANSPARENT,
-                .corner_radius = t.radius.lg,
-                .cursor = .pointer,
-            };
-        }
-    }.style;
-}
-
-pub fn navIndicator(comptime selected: bool) fn (*const ui.ThemeTokens) ui.BoxStyle {
-    return struct {
-        fn style(t: *const ui.ThemeTokens) ui.BoxStyle {
-            return .{
-                .width = .{ .px = ui.arb.px(3) },
-                .height = .{ .px = ui.arb.px(14) },
-                .background = if (selected) t.color.accent else ui.Color.TRANSPARENT,
-                .corner_radius = t.radius.full,
-            };
-        }
-    }.style;
-}
-
-pub fn navLabel(comptime selected: bool) fn (*const ui.ThemeTokens) ui.TextStyle {
-    return struct {
-        fn style(t: *const ui.ThemeTokens) ui.TextStyle {
-            return .{
-                .font_size = t.font_size.md,
-                .font_weight = if (selected) 600 else 400,
-                .color = if (selected) t.color.fg_primary else t.color.fg_secondary,
-            };
-        }
-    }.style;
-}
-
-pub fn sidebarFooter(t: *const ui.ThemeTokens) ui.BoxStyle {
-    return .{
-        .direction = .row,
-        .align_items = .center,
-        .gap = t.space._2,
-        .padding = .{ .top = t.space._3, .right = t.space._4, .bottom = t.space._3, .left = t.space._4 },
-        .border_top_width = t.border_width.thin,
-        .border_top_color = t.color.border,
-    };
-}
-
-pub fn onlineDot(t: *const ui.ThemeTokens) ui.BoxStyle {
-    return .{
-        .width = .{ .px = ui.arb.px(7) },
-        .height = .{ .px = ui.arb.px(7) },
-        .background = t.color.success,
-        .corner_radius = t.radius.full,
-    };
-}
-
-pub fn sidebarFooterText(t: *const ui.ThemeTokens) ui.TextStyle {
-    return .{ .font_size = t.font_size.xs, .font_weight = 500, .color = t.color.fg_secondary };
-}
-
-pub fn sidebarVersion(t: *const ui.ThemeTokens) ui.TextStyle {
-    return .{ .font_size = t.font_size.xs, .color = t.color.fg_tertiary };
-}
-
-pub fn workspace(t: *const ui.ThemeTokens) ui.BoxStyle {
-    return .{
-        .width = .{ .grow = .{} },
-        .height = .{ .grow = .{} },
-        .direction = .column,
-        .background = t.color.bg_base,
-    };
-}
-
-pub fn toolbar(t: *const ui.ThemeTokens) ui.BoxStyle {
-    return .{
-        .width = .{ .grow = .{} },
-        .height = .{ .px = ui.arb.px(56) },
-        .direction = .row,
-        .align_items = .center,
-        .justify = .space_between,
-        .padding = .{ .top = 0, .right = t.space._6, .bottom = 0, .left = t.space._6 },
-        .background = t.color.bg_primary,
-        .border_bottom_width = t.border_width.thin,
-        .border_bottom_color = t.color.border,
-    };
-}
-
-pub fn breadcrumb(t: *const ui.ThemeTokens) ui.BoxStyle {
-    return .{ .direction = .row, .align_items = .center, .gap = t.space._2 };
-}
-
-pub fn breadcrumbRoot(t: *const ui.ThemeTokens) ui.TextStyle {
-    return .{ .font_size = t.font_size.sm, .font_weight = 500, .color = t.color.fg_tertiary };
-}
-
-pub fn breadcrumbSection(t: *const ui.ThemeTokens) ui.TextStyle {
-    return .{ .font_size = t.font_size.sm, .font_weight = 600, .color = t.color.fg_secondary };
-}
-
-pub fn breadcrumbCurrent(t: *const ui.ThemeTokens) ui.TextStyle {
-    return .{ .font_size = t.font_size.sm, .font_weight = 650, .color = t.color.fg_primary };
-}
-
-pub fn toolbarActions(t: *const ui.ThemeTokens) ui.BoxStyle {
-    return .{ .direction = .row, .align_items = .center, .gap = t.space._2 };
-}
-
-pub fn toolbarPill(t: *const ui.ThemeTokens) ui.BoxStyle {
-    return .{
-        .direction = .row,
-        .align_items = .center,
-        .gap = t.space._1_5,
-        .padding = ui.Padding.symmetric(t.space._1, t.space._2),
-        .background = t.color.bg_secondary,
-        .border = .{ .width = t.border_width.thin, .color = t.color.border, .radius = t.radius.full },
-    };
-}
-
-pub fn toolbarPillText(t: *const ui.ThemeTokens) ui.TextStyle {
-    return .{ .font_size = t.font_size.xs, .font_weight = 600, .color = t.color.fg_secondary };
-}
-
-pub fn panel(t: *const ui.ThemeTokens) ui.BoxStyle {
-    return .{
-        .width = .{ .grow = .{} },
-        .direction = .column,
-        .gap = t.space._6,
-    };
-}
-
-pub fn panelHeader(t: *const ui.ThemeTokens) ui.BoxStyle {
-    return .{ .width = .{ .grow = .{} }, .direction = .column, .gap = t.space._2 };
-}
-
-pub fn sectionEyebrow(t: *const ui.ThemeTokens) ui.TextStyle {
-    return .{
-        .font_size = t.font_size.xs,
-        .font_weight = 700,
-        .color = t.color.fg_tertiary,
-    };
-}
-
-pub fn titleRow(t: *const ui.ThemeTokens) ui.BoxStyle {
-    return .{
-        .width = .{ .grow = .{} },
-        .direction = .row,
-        .align_items = .center,
-        .justify = .space_between,
-        .gap = t.space._4,
-    };
-}
-
-pub fn panelTitle(t: *const ui.ThemeTokens) ui.TextStyle {
-    return .{
-        .font_size = t.font_size.xxxl,
-        .font_weight = 700,
-        .color = t.color.fg_primary,
-    };
-}
-
-pub fn description(t: *const ui.ThemeTokens) ui.TextStyle {
-    return .{
-        .font_size = t.font_size.lg,
-        .color = t.color.fg_secondary,
-        .line_height = 1.5,
-    };
-}
-
-pub fn stablePill(t: *const ui.ThemeTokens) ui.BoxStyle {
-    return .{
-        .direction = .row,
-        .align_items = .center,
-        .gap = t.space._1_5,
-        .padding = ui.Padding.symmetric(t.space._1, t.space._2),
-        .background = t.color.success_subtle,
-        .corner_radius = t.radius.full,
-    };
-}
-
-pub fn stableText(t: *const ui.ThemeTokens) ui.TextStyle {
-    return .{ .font_size = t.font_size.xs, .font_weight = 650, .color = t.color.success };
-}
-
-pub fn previewCard(t: *const ui.ThemeTokens) ui.BoxStyle {
-    return .{
-        .width = .{ .grow = .{} },
-        .direction = .column,
-        .background = t.color.bg_primary,
-        .border = .{ .width = t.border_width.thin, .color = t.color.border, .radius = t.radius.xl },
-        .corner_radius = t.radius.xl,
-        .shadow = t.shadow.sm,
-        .overflow_hidden = true,
-    };
-}
-
-pub fn previewToolbar(t: *const ui.ThemeTokens) ui.BoxStyle {
-    return .{
-        .width = .{ .grow = .{} },
-        .height = .{ .px = ui.arb.px(44) },
-        .direction = .row,
-        .align_items = .center,
-        .justify = .space_between,
-        .padding = .{ .top = 0, .right = t.space._4, .bottom = 0, .left = t.space._4 },
-        .background = t.color.bg_secondary,
-        .border_bottom_width = t.border_width.thin,
-        .border_bottom_color = t.color.border,
-    };
-}
-
-pub fn previewStatus(t: *const ui.ThemeTokens) ui.BoxStyle {
-    return .{ .direction = .row, .align_items = .center, .gap = t.space._2 };
-}
-
-pub fn previewLabel(t: *const ui.ThemeTokens) ui.TextStyle {
-    return .{ .font_size = t.font_size.sm, .font_weight = 650, .color = t.color.fg_primary };
-}
-
-pub fn themePill(t: *const ui.ThemeTokens) ui.BoxStyle {
-    return .{
-        .padding = ui.Padding.symmetric(t.space._1, t.space._2),
-        .background = t.color.bg_tertiary,
-        .corner_radius = t.radius.full,
-    };
-}
-
-pub fn themePillText(t: *const ui.ThemeTokens) ui.TextStyle {
-    return .{ .font_size = t.font_size.xxs, .font_weight = 700, .color = t.color.fg_secondary };
-}
-
-pub fn previewBody(t: *const ui.ThemeTokens) ui.BoxStyle {
-    return .{
-        .width = .{ .grow = .{} },
-        .direction = .column,
-        .padding = ui.Padding.all(t.space._6),
-        .background = t.color.bg_primary,
-    };
-}
+/// Story body text (13-14px primary color)
+pub const storyBody = ui.css(.{ .font_size = 14, .color = TOKENS.color.fg_primary });

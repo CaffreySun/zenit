@@ -1,22 +1,20 @@
-//! GlassBox 样式层，header 文本样式。
-//! glass 材质本体（surface border/tint/blur 的 Resolved* 插值链）是运行时
-//! 渲染逻辑，留在 mod.zig（改动它必须肉眼看截图，见 memory）。
+//! GlassBox style layer, header text style.
+//! Glass material itself (surface border/tint/blur Resolved* interpolation chain) is runtime
+//! rendering logic, stays in mod.zig (changes must eyeball screenshots, see memory).
 const core = @import("../../core.zig");
 const theme = core.theme;
 
-pub fn glassTitleStyle(t: *const theme.ThemeTokens) core.TextProps {
+pub fn glassTitleStyle(t: *const theme.ThemeTokens) core.TextStyle {
     return .{
-        .content = "",
-        .color = t.color.fg_primary,
+        .color = t.tokens.color.fg_primary,
         .font_size = 15,
         .font_weight = 650,
     };
 }
 
-pub fn glassSubtitleStyle(t: *const theme.ThemeTokens) core.TextProps {
+pub fn glassSubtitleStyle(t: *const theme.ThemeTokens) core.TextStyle {
     return .{
-        .content = "",
-        .color = t.color.fg_secondary,
+        .color = t.tokens.color.fg_secondary,
         .font_size = 12,
         .font_weight = 450,
     };

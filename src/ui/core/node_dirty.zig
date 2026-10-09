@@ -1,20 +1,18 @@
-//! node_dirty, v0.12 §N1 god-object split: 从 node.zig 抽出 dirty
-//! 传播子域（15 方法：12 pub + 3 private helper）。
+//! node_dirty: dirty-propagation subdomain extracted from node.zig (15 methods: 12 pub + 3
+//! private).
 //!
-//! 与 v0.9 paint_content_accessor.zig（pca）范式的本质差异：pca 是
-//! SoA accessor，free function 收 element_id_raw + POD，Node-agnostic。
-//! dirty 传播深度操作 self.parent 链 / frame_state.state_bits / meta，
-//! 必须 *Node 类型 -> 本模块用 **Node-typed free function**，
-//! @import("node.zig") 取 Node 类型（与 node.zig 循环 import；Zig
-//! 惰性求值，多个 sibling 早已这样做，成立）。
+//! Unlike paint_content_accessor.zig (pca), a SoA accessor whose free functions take element_id_raw
+//! + POD and are Node-agnostic, dirty propagation walks the self.parent chain /
+//! frame_state.state_bits
+//! / meta and needs `*Node`. So this module uses **Node-typed free functions** and
+//! @import("node.zig") for the type (cyclic import with node.zig; valid under Zig lazy evaluation).
 //!
-//! node.zig 保留全部 15 个 dirty 方法的 thin delegate（按原 pub/private
-//! 可见性），方法体一行转发到本模块。node.zig 内 self.markX() caller
-//! 极多且散落别的子域，保留本地 delegate -> 零改 caller。
+//! node.zig keeps thin delegates for all 15 methods (original visibility), each forwarding in one
+//! line, so the many self.markX() callers across domains need no changes.
 //!
-//! dirty-notify callback 单元（DirtyKind / DirtyNotifyFn / g_dirty_notify
-//! / setDirtyNotifyCallback）一并搬入（markRenderDirty 用 g_dirty_notify
-//! 推 dirty 到 World.dirty_set）；node.zig re-export 保持公开 API 不破。
+//! The dirty-notify callback unit (DirtyKind / DirtyNotifyFn / g_dirty_notify /
+//! setDirtyNotifyCallback) lives here too (markRenderDirty pushes dirty to World.dirty_set via
+//! g_dirty_notify); node.zig re-exports it to keep the public API intact.
 
 const std = @import("std");
 const world_mod = @import("world.zig");
@@ -24,20 +22,20 @@ const debug_trace = @import("debug_trace.zig");
 
 const Node = node_mod.Node;
 
-// ─────────────────────────────────────────────────────────────────────
-// dirty-notify callback 单元（自 node.zig 整体搬入）
-// 同步通过 callback 把 dirty 推到 World.dirty_set。
-// 不直接 import core.zig（避免循环）；core.zig 在 Cx.init 时设 callback。
-// ─────────────────────────────────────────────────────────────────────
+// ----------------------------------------------------------------------
+// dirty-notify callback unit
+// Synchronously pushes dirty to World.dirty_set via callback.
+// Does not import core.zig (avoids a cycle); core.zig sets the callback at Cx.init.
+// ----------------------------------------------------------------------
 
 pub const DirtyKind = enum(u8) { layout, style, structure, interaction };
 pub const DirtyNotifyFn = *const fn (element_id_raw: u32, kind: DirtyKind) void;
 var g_dirty_notify: ?DirtyNotifyFn = null;
 
-/// 把一次 dirty 标记推给节点所属 World 的 dirty_set。
+/// Push one dirty mark to the node's owning World's dirty_set.
 ///
-/// P0-3 阶段 3：优先直连 `node.world_ref`；world_ref == null（cx-less mock）
-/// 时退回旧的进程级回调。语义与原 core.zig:onNodeDirty 逐行一致。
+/// P0-3 phase 3: prefer direct `node.world_ref`; fall back to old process-level callback when
+/// world_ref == null (cx-less mock). Semantics match core.zig:onNodeDirty line-for-line.
 fn markWorldDirty(node: anytype, kind: DirtyKind) void {
     if (node.element_id_raw == 0xFFFFFFFF) return;
     const flags: world_mod.DirtyFlags = switch (kind) {
@@ -47,7 +45,7 @@ fn markWorldDirty(node: anytype, kind: DirtyKind) void {
         .interaction => .{ .input = .{ .interaction_changed = true } },
     };
     if (node.world_ref) |w| {
-        // OOM 容错，dirty 丢一次，本帧仍走旧路径重建。
+        // OOM fault tolerance: drop one dirty, frame still uses old path rebuild.
         w.markDirty(world_mod.ElementId.fromRaw(node.element_id_raw), flags) catch {};
         return;
     }
@@ -58,16 +56,16 @@ pub fn setDirtyNotifyCallback(notify: ?DirtyNotifyFn) void {
     g_dirty_notify = notify;
 }
 
-// ─────────────────────────────────────────────────────────────────────
-// dirty 传播方法（Node-typed free function）
-// ─────────────────────────────────────────────────────────────────────
+// ----------------------------------------------------------------------
+// dirty propagation methods (Node-typed free functions)
+// ----------------------------------------------------------------------
 
-/// loose interaction 位（pipeline.interaction / hit.geometry / hit.semantics）
-/// 的翻转代数。这三个位不冒泡，历史上只能靠全树递归扫描
-/// （subtreeHasLooseInteractionDirty，曾是帧结构采样最大单项）。所有
-/// 置位/清位点都 bump 本代数,扫描按 (root, gen) 记忆,任何翻转自动失效,
-/// 语义与逐次扫描精确等价。新增这三个位的写点时必须一并 bump（core.zig
-/// 的 memo 注释同此约定）。
+/// Flip generation counter for the loose interaction bits (pipeline.interaction / hit.geometry /
+/// hit.semantics). These bits don't bubble, so they could only be found by a full-tree recursive
+/// scan (subtreeHasLooseInteractionDirty, once the largest single item in frame-structure
+/// sampling). Every set/clear site bumps this generation; scans memoize by (root, generation) and
+/// any flip auto-invalidates, so semantics are exactly equivalent to a fresh scan each time. Any
+/// new write site for these bits must bump it too (core.zig memo comments share this contract).
 pub var g_loose_interaction_gen: u64 = 1;
 
 pub inline fn bumpLooseInteractionGen() void {
@@ -101,8 +99,8 @@ pub fn markLayoutDirty(self: *Node) void {
     }
 }
 
-/// 标脏自身和父节点的布局。用于子节点 sizing 属性（width/height）被动态修改后，
-/// 需要父容器重新跑 layoutChildren 来重新计算子节点尺寸的场景。
+/// Mark self and parent layout dirty. Used when child sizing properties (width/height) dynamically
+/// change, requiring parent container to re-run layoutChildren to recalculate child sizes.
 pub fn markSizingDirty(self: *Node) void {
     bumpLooseInteractionGen();
     self.invalidateCustomClipGeometryCache();
@@ -126,8 +124,9 @@ pub fn markSizingDirty(self: *Node) void {
         parent_node.frame_state.state_bits.dirty.pipeline.composite = true;
         parent_node.frame_state.state_bits.dirty.pipeline.subtree_composite = true;
 
-        // 从 grandparent 开始冒泡 subtree_dirty
-        // （parent 已经在上面处理过了，从 parent 开始会立即 break 导致 grandparent 不被标脏）
+        // Bubble subtree_dirty from grandparent (parent already handled above; starting from parent
+        // would
+        // immediate break, leaving grandparent unmarked).
         if (!parent_node.style.layout_isolation) {
             var p = parent_node.parent;
             while (p) |ancestor| {
@@ -142,8 +141,9 @@ pub fn markSizingDirty(self: *Node) void {
     }
 }
 
-/// 标脏运行时索引（registry/focus order/interaction entries），用于结构变化场景。
-/// 与普通 layout dirty 分离，避免仅位置/尺寸变化时全树重建运行时索引。
+/// Mark runtime indices dirty (registry/focus order/interaction entries) for structural changes.
+/// Separate from normal layout dirty to avoid full-tree runtime index rebuild on mere position/size
+/// changes.
 pub fn markRuntimeIndexDirty(self: *Node) void {
     if (!self.frame_state.state_bits.dirty.runtime.dirty) {
         self.frame_state.state_bits.dirty.runtime.dirty = true;
@@ -228,10 +228,10 @@ pub fn bubbleChildRuntimeIndexDirty(self: *Node, full_rebuild: bool) void {
     }
 }
 
-/// 标脏子树但不标脏自身布局。向上冒泡 subtree_dirty。
-/// 用于"只有子节点需要重新布局，而当前节点本身的布局不需要重算"的场景。
-/// 例如：VirtualList 的 content_node，其所有子节点都是 absolute 定位，
-/// rebind 后只需递归布局 dirty 的子节点，不需要重跑 content_node 自身的 layoutChildren。
+/// Mark subtree dirty without marking self layout dirty. Bubble subtree_dirty upward. For scenarios
+/// where only children need relayout, not self. Example: VirtualList's content_node with all
+/// absolute-positioned children; after rebind, only recursively relayout dirty children without
+/// re-running content_node's own layoutChildren.
 pub fn markSubtreeDirty(self: *Node) void {
     if (self.frame_state.state_bits.dirty.core.subtree_layout and self.frame_state.state_bits.dirty.core.subtree_render) return;
     self.invalidateCustomClipGeometryCache();
@@ -267,9 +267,12 @@ pub fn markCompositeDirty(self: *Node) void {
     }
     redraw.requested = true;
 
-    // subtree_render 逐跳冒泡：带外跳（child 对 parent 是带外单元）不标 parent，但**继续
-    // 往上走**，更上层的缓存祖先里仍含 child 的旧命令（方案 §5.4 C3）。旧实现在第一个
-    // 带外跳处整体停止冒泡，promoted / legacy 祖先因此永久替放旧画面（V2）。
+    // subtree_render bubbles per-hop: out-of-band hop (child is out-of-band unit for parent)
+    // doesn't
+    // mark parent, but **continues upward**; higher cached ancestors still hold child's old
+    // commands
+    // (scheme §5.4 C3). Old impl stopped bubbling entirely at first out-of-band hop, leaving
+    // promoted/legacy ancestors permanently replaying old frames (V2).
     var child: *Node = self;
     var p = self.parent;
     while (p) |parent| {
@@ -280,7 +283,7 @@ pub fn markCompositeDirty(self: *Node) void {
             if (!isOutOfBandRenderUnit(child)) {
                 parent.frame_state.state_bits.dirty.core.subtree_render = true;
             }
-            // layout_isolation 作为 render dirty 边界（与 markLayoutDirty 一致）
+            // layout_isolation as render dirty boundary (consistent with markLayoutDirty).
             if (parent.style.layout_isolation) {
                 bubble_render_dirty = false;
             }
@@ -291,48 +294,52 @@ pub fn markCompositeDirty(self: *Node) void {
     }
 }
 
-/// composite 类属性（opacity/translate/scale/rotate）动画写入后的**唯一权威**失效组合：
-/// interaction（hit-test 几何）+ composite（layer 属性/重合成）+ invalidateRenderCache
-/// （content 版本，防 promoted/payload 缓存 stale）。所有动画驱动器（transition tick、
-/// node_animator、hooks before_render）与 Node setter 必须统一走这里，历史上四条写入
-/// 路径各标各的 dirty（有的漏 composite、有的漏 cache 失效）是动画期偶发视觉 bug 的
-/// 结构性来源。
+/// **Single authoritative** invalidation combo after a composite-property (opacity/translate/
+/// scale/rotate) animation write: interaction (hit-test geometry) + composite (layer props/
+/// recompose) + invalidateRenderCache (content version, prevents stale promoted/payload).
+/// All animation drivers (transition tick, node_animator, hooks before_render) and Node setters
+/// must converge here; separate per-path dirty marking misses composite or cache invalidation and
+/// causes visual bugs during animation.
 pub fn markCompositePropDirty(self: *Node) void {
     markInteractionDirty(self);
     markCompositeDirty(self);
     @import("node_render_cache.zig").invalidateRenderCache(self);
 }
 
-/// composite 属性**逐帧动画驱动**专用组合：interaction + composite，**不** bump
-/// content 版本。动画帧内容未变、只有 layer 属性变，bump content 版本会让
-/// canReusePromotedSurface 每帧失效、打死动画期 surface 复用（文本 shimmer +
-/// 全量重建）。一次性写入（定位、setter、状态切换）用 markCompositePropDirty；
-/// 每帧插值写入用本函数。除这两个具名组合外，禁止手写 dirty 组合。
+/// Combo for **per-frame animation driving** of composite props: interaction + composite,
+/// **does not** bump content version. Frame content is unchanged, only layer props change; bumping
+/// content version would invalidate canReusePromotedSurface every frame, killing surface reuse
+/// during animation (text shimmer + full rebuild). Use markCompositePropDirty for one-shot writes
+/// (positioning, setters, state switches); use this for per-frame interpolation. No manual dirty
+/// combos outside these two named ones.
 pub fn markCompositeAnimFrameDirty(self: *Node) void {
     markInteractionDirty(self);
     markCompositeDirty(self);
 }
 
-/// 带外渲染单元（原名 escapesAncestorRenderPass；方案 §5.4 C3）：`self` 对它的**直接父节点**
-/// 而言，是不是"父节点的缓存替放时会被剔除、再 fresh 补渲染"的单元。是 -> self 的 render
-/// dirty 不必让父节点失效（防止 overlay 闪烁拖着父节点的 legacy overflow 快照每帧重建）。
+/// Out-of-band render unit: whether `self` is **excluded from replay and freshly redrawn** when its
+/// **immediate parent's** cache replays. If so, self's render dirty need not invalidate the parent
+/// (prevents overlay flicker from forcing the parent's legacy overflow snapshot to rebuild per
+/// frame).
 ///
-/// 判据必须与渲染侧逐条对上：
-///   - legacy overflow 替放（tryReplayLegacyOverflowCacheHit）剔除父节点的全部 z>0 直接
-///     子节点子树（appendLegacyCachedCommandsWithoutEscapedOverlays），再由
-///     renderOverlayChildrenAfterCacheHit 按 `!use_opacity_layer` fresh 补渲染；legacy
-///     缓存只在父节点没有 effect（-> 不开 opacity layer）时才会写/读，两者恒一致。
-///   - promoted 替放（tryReplayPromotedCacheHit）整段替放、**不**剔除也不补渲染 z>0 子节点
-///     （promoted 节点开 surface -> use_opacity_layer）。所以父节点持有 promoted 缓存时，
-///     self 不是带外单元，必须让父节点失效。这里读的是父节点**实际持有**的缓存，而不是
-///     "父节点会不会开 layer"的近似判据，旧判据只看 opacity，composited_group /
-///     will_change 等 opacity=1 的 promoted 父节点被误判为带外（V2 第一种形态）。
-///   - opacity < 0.999 的父节点保持旧行为（照常冒泡）：它开 opacity layer，本来就没有
-///     legacy 缓存，冒泡只是保守。
+/// Criteria must match the render side line by line:
+///   - legacy overflow replay (tryReplayLegacyOverflowCacheHit) excludes all z>0 direct children
+///     (appendLegacyCachedCommandsWithoutEscapedOverlays), then renderOverlayChildrenAfterCacheHit
+///     redraws them by `!use_opacity_layer`; legacy cache is used only when the parent has no
+///     effect (-> no opacity layer).
+///   - promoted replay (tryReplayPromotedCacheHit) replays the whole span and **doesn't** exclude
+///     or
+///     redraw z>0 children (a promoted node opens a surface -> use_opacity_layer). So when the
+///     parent
+///     holds a promoted cache, self is not out-of-band and must invalidate the parent. Read the
+///     parent's **actually held** cache, not a "will it open a layer" heuristic: opacity=1 promoted
+///     parents (composited_group/will_change) would be misclassified.
+///   - parents with opacity < 0.999 use normal bubbling: they open an opacity layer with no legacy
+///     cache, so bubbling is conservative.
 ///
-/// 这只是**一跳**的判定。带外不等于"整条祖先链都不用失效"：父节点之上的缓存祖先
-/// （promoted 整段、legacy 快照）照样含 self 的旧命令，冒泡必须越过这一跳继续往上
-/// （markRenderDirty / markCompositeDirty 的逐跳循环）。
+/// This is a **one-hop** check only. Out-of-band != "skip whole ancestor chain": cached ancestors
+/// above the parent (promoted spans, legacy snapshots) still hold self's old commands; the bubble
+/// must skip this hop and continue up (per-hop loop in markRenderDirty / markCompositeDirty).
 pub fn isOutOfBandRenderUnit(self: *const Node) bool {
     const parent = self.parent orelse return false;
     if (self.style.z_index() <= 0) return false;
@@ -341,10 +348,13 @@ pub fn isOutOfBandRenderUnit(self: *const Node) bool {
     return true;
 }
 
-/// 带外单元自身 render dirty 时的 subtree_render 冒泡：逐跳判定，带外跳不标 parent 但
-/// 继续向上；非带外跳照常标记，遇到已脏的祖先停（它之上已按同一规则冒泡过，逐跳判定
-/// 只取决于 (child, parent) 这一对，与从哪条路径来无关）；layout_isolation 为边界。
-/// 代价 O(祖先深度)，与 subtree_composite 冒泡同阶；空闲帧不走这里。
+/// subtree_render bubble when an out-of-band unit is itself render-dirty: judged per hop. An
+/// out-of-band hop doesn't mark the parent but continues up; a normal hop marks and stops at an
+/// already-dirty ancestor (it already bubbled by the same rule; the per-hop judgment depends only
+/// on
+/// the (child, parent) pair, not the path taken); layout_isolation is a boundary. Cost is
+/// O(ancestor
+/// depth), same order as the subtree_composite bubble; idle frames skip this.
 fn bubbleSubtreeRenderAcrossOutOfBandHops(self: *Node) void {
     var child: *Node = self;
     var p = self.parent;
@@ -366,12 +376,15 @@ pub fn markRenderDirty(self: *Node) void {
     self.frame_state.state_bits.dirty.core.subtree_render = true;
     redraw.requested = true;
 
-    // P0-3 阶段 3：直连 owner World 推 dirty，不再经过进程级 g_dirty_notify。
+    // P0-3 phase 3: push dirty directly to owner World, no longer through process-level
+    // g_dirty_notify.
     markWorldDirty(self, .style);
 
-    // 带外渲染单元（isOutOfBandRenderUnit）：父节点的缓存替放会剔除它再 fresh 补渲染，
-    // 所以不标父节点的 subtree_render（防止 overlay 闪烁拖着父节点快照重建）；但更上层
-    // 的缓存祖先含它的旧命令，subtree_render 必须越过带外跳继续冒泡（方案 §5.4 C3）。
+    // Out-of-band render unit (isOutOfBandRenderUnit): parent's cache replay excludes it and
+    // freshly
+    // redraws, so don't mark parent's subtree_render (prevent overlay flicker from parent snapshot
+    // rebuild); higher cached ancestors hold its old commands, subtree_render must hop-skip and
+    // continue bubbling (scheme §5.4 C3).
     if (isOutOfBandRenderUnit(self)) {
         var p = self.parent;
         while (p) |parent| {
@@ -384,9 +397,9 @@ pub fn markRenderDirty(self: *Node) void {
         return;
     }
 
-    // 普通节点：向上冒泡 subtree_render_dirty
-    // 遇到 layout_isolation=true 的祖先时停止（与 markLayoutDirty/markSizingDirty 一致）：
-    // isolation 节点作为 dirty 边界，让 render_engine 的 fast-skip 能在 isolation 外生效。
+    // Normal node: bubble subtree_render_dirty upward, stop at ancestor with layout_isolation=true
+    // (consistent with markLayoutDirty/markSizingDirty): isolation node as dirty boundary lets
+    // render_engine's fast-skip work outside isolation.
     var p = self.parent;
     while (p) |parent| {
         if (parent.frame_state.state_bits.dirty.core.subtree_render) break;
@@ -396,7 +409,7 @@ pub fn markRenderDirty(self: *Node) void {
     }
 }
 
-/// markRenderDirty + 追踪渲染原因（DevTools trace）
+/// markRenderDirty + track render reason (DevTools trace).
 pub fn markRenderDirtyTracked(self: *Node, reason: debug_trace.RenderReason, comptime source: []const u8) void {
     markRenderDirty(self);
     debug_trace.maybeRecordRender(self.id, reason, source);

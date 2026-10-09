@@ -1,22 +1,19 @@
-/// Metal BindGroup 实现
-///
-/// Metal 没有原生 BindGroup 概念。本模块通过逻辑绑定表实现 wgpu 风格的
-/// BindGroup/BindGroupLayout/PipelineLayout API。
-///
-/// 在 RenderPass/ComputePass 中 setBindGroup 时，展开为对应的
-/// setVertexBuffer / setFragmentBuffer / setFragmentTexture 等 Metal 调用。
+/// Metal BindGroup implementation.
+/// Metal has no native BindGroup concept. This module implements wgpu-style
+/// BindGroup/BindGroupLayout/PipelineLayout API via logical binding tables.
+/// setBindGroup in RenderPass/ComputePass expands to setVertexBuffer / setFragmentBuffer
+/// / setFragmentTexture etc. Metal calls.
 const std = @import("std");
 const gpu = @import("../gpu.zig");
 const mtl = @import("metal_bindings.zig");
 
-/// BindGroupLayout，描述一组绑定的布局
-///
-/// 存储每个 binding slot 的类型和可见性信息，用于验证和 pipeline 创建。
+/// BindGroupLayout: describes layout of binding group.
+/// Stores type and visibility info per binding slot; used for validation and pipeline creation.
 pub const BindGroupLayout = struct {
     entries: []const gpu.BindGroupLayoutEntry,
     label: ?[]const u8 = null,
 
-    /// 从描述符创建 BindGroupLayout
+    /// Create BindGroupLayout from descriptor.
     pub fn init(allocator: std.mem.Allocator, desc: gpu.BindGroupLayoutDescriptor) !BindGroupLayout {
         const entries = try allocator.dupe(gpu.BindGroupLayoutEntry, desc.entries);
         return .{
@@ -30,7 +27,7 @@ pub const BindGroupLayout = struct {
     }
 };
 
-/// PipelineLayout，组合多个 BindGroupLayout
+/// PipelineLayout: combines multiple BindGroupLayouts.
 pub const PipelineLayout = struct {
     bind_group_layouts: []const BindGroupLayout,
     label: ?[]const u8 = null,
@@ -48,7 +45,7 @@ pub const PipelineLayout = struct {
     }
 };
 
-/// 绑定资源的具体引用 (运行时数据)
+/// Concrete resource references (runtime data).
 pub const BoundResource = union(enum) {
     buffer: struct {
         raw: *mtl.MTLBuffer,
@@ -63,10 +60,9 @@ pub const BoundResource = union(enum) {
     },
 };
 
-/// BindGroup，一组已绑定的资源
-///
-/// 在 Metal 中，setBindGroup 会被展开为一系列 setVertexBuffer/setFragmentTexture 调用。
-/// binding 号直接映射到 Metal 的 buffer/texture/sampler index。
+/// BindGroup: set of bound resources.
+/// In Metal, setBindGroup expands to series of setVertexBuffer/setFragmentTexture calls.
+/// Binding number maps directly to Metal buffer/texture/sampler index.
 pub const BindGroup = struct {
     layout: BindGroupLayout,
     bindings: []const Binding,
@@ -77,7 +73,7 @@ pub const BindGroup = struct {
         resource: BoundResource,
     };
 
-    /// 从描述符创建 BindGroup
+    /// Create BindGroup from descriptor.
     pub fn init(allocator: std.mem.Allocator, desc: gpu.BindGroupDescriptor) !BindGroup {
         const layout = desc.layout;
 
@@ -99,7 +95,7 @@ pub const BindGroup = struct {
         errdefer allocator.free(bindings);
 
         for (desc.entries, 0..) |entry, i| {
-            // 从 layout 中查找 visibility
+            // Look up visibility from layout.
             const visibility = findVisibility(layout, entry.binding);
 
             bindings[i] = .{
@@ -140,15 +136,13 @@ pub const BindGroup = struct {
         allocator.free(self.bindings);
     }
 
-    /// 将 BindGroup 应用到 Metal RenderEncoder
-    ///
-    /// group_index: BindGroup 在 PipelineLayout 中的序号，用于偏移 buffer slot
-    /// 避免与其他 BindGroup 冲突。
-    ///
-    /// 偏移策略:
+    /// Apply BindGroup to Metal RenderEncoder.
+    /// group_index: BindGroup index in PipelineLayout; offsets buffer slot to avoid
+    /// collision with other BindGroups.
+    /// Offset strategy:
     ///   - buffer slot = group_index * MAX_BINDINGS_PER_GROUP + binding
-    ///   - texture slot = binding (无偏移，Metal texture slots 独立于 buffer)
-    ///   - sampler slot = binding (同上)
+    ///   - texture slot = binding (no offset; Metal texture slots independent)
+    ///   - sampler slot = binding (same).
     pub fn applyToRenderEncoder(
         self: *const BindGroup,
         encoder: *mtl.MTLRenderCommandEncoder,
@@ -213,7 +207,7 @@ pub const BindGroup = struct {
         }
     }
 
-    /// 将 BindGroup 应用到 Metal ComputeEncoder
+    /// Apply BindGroup to Metal ComputeEncoder.
     pub fn applyToComputeEncoder(
         self: *const BindGroup,
         encoder: *mtl.MTLComputeCommandEncoder,
@@ -239,28 +233,28 @@ pub const BindGroup = struct {
                     );
                 },
                 .sampler => {
-                    // Metal compute encoder 没有 setSampler，
-                    // sampler 通常通过 argument buffer 传入
+                    // Metal compute encoder has no setSampler; samplers passed via argument buffer
+                    // typically.
                 },
             }
         }
     }
 };
 
-/// 每个 BindGroup 的最大 binding 数（用于 buffer slot 偏移）
+/// Max binding count per BindGroup (for buffer slot offset).
 const MAX_BINDINGS_PER_GROUP: u32 = 16;
 
-/// 在 layout 中查找指定 binding 的 visibility
+/// Look up visibility for binding in layout.
 fn findVisibility(layout: BindGroupLayout, binding: u32) gpu.ShaderStages {
     for (layout.entries) |entry| {
         if (entry.binding == binding) return entry.visibility;
     }
-    // 默认: vertex + fragment
+    // Default: vertex + fragment.
     return .{ .vertex = true, .fragment = true };
 }
 
 // ============================================================================
-// 测试
+// Tests
 // ============================================================================
 
 test "BindGroupLayout: init and deinit" {
@@ -340,7 +334,7 @@ test "findVisibility: returns correct stages" {
     try std.testing.expect(!vis1.vertex);
     try std.testing.expect(vis1.fragment);
 
-    // 不存在的 binding 返回默认
+    // Non-existent binding returns default.
     const vis_default = findVisibility(layout, 99);
     try std.testing.expect(vis_default.vertex);
     try std.testing.expect(vis_default.fragment);

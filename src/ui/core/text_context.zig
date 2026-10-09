@@ -1,25 +1,17 @@
-//! 文本上下文，从 `Cx` 析出的字体/塑形/测量子系统。
+//! Text context, font/shaping/measure subsystem derived from `Cx`. Aggregated five fields
+//! previously flat on `Cx`: `font_system` (host-injected font backend, null->fallback shaping),
+//! `shaping_cache` (results + VisualLine cache), `measure_fn` (legacy no-context hook, per-process,
+//! multi-window collision), `measure_ctx_fn` / `measure_ctx` (context-aware hook, multi-window
+//! correct). Why: these five fields and methods form closed loop, hung on `Cx` means any
+//! text-measure code needs full `Cx` first. Review D noted '`layoutChildren` depends
+//! `Cx.visualLine` / `Cx.measureTextWidth`, can't unit-test without full `Cx`'—direct coupling
+//! result. Post-extraction `TextContext` standalone-constructible (`init(allocator)` only, font
+//! backend and measure hooks optional), measure fallback chain finally has real unit tests.
 //!
-//! 聚了五个原本平铺在 `Cx` 上的字段：
-//!   - `font_system`    宿主注入的字体后端（null 时塑形走 fallback）
-//!   - `shaping_cache`  塑形结果与 VisualLine 缓存
-//!   - `measure_fn`     legacy 无 context 测量钩子（进程级，多窗口会串台）
-//!   - `measure_ctx_fn` / `measure_ctx`  带 context 的测量钩子（多窗口正确的那个）
-//!
-//! 为什么要搬：这五个字段和它们的方法是一个闭环，但因为挂在 `Cx` 上，
-//! 任何要测文本测量的代码都得先造一个完整的 `Cx`。D 号审查指出的
-//! 「`layoutChildren` 依赖 `Cx.visualLine` / `Cx.measureTextWidth` 而无法
-//! 脱离完整 `Cx` 单测」正是这条耦合的直接后果。
-//!
-//! 搬出来之后 `TextContext` 可以单独构造（`init(allocator)` 即可，字体后端
-//! 与测量钩子都是可选的），测量降级链路因此第一次有了真正的单测。
-//!
-//! **测量优先级**（`measureTextWidth`）：
-//!   1. GlyphRun pipeline（有 `font_system` 时），与渲染、光标/选区同一套
-//!      字体与塑形，是唯一不会产生排版漂移的那条
-//!   2. `measure_ctx_fn` + `measure_ctx`，多窗口安全的宿主钩子
-//!   3. `measure_fn`, legacy 进程级钩子
-//!   4. `text_layout.measureTextWidthByFontKind`，最后的估算兜底
+//! **Measure priority** (`measureTextWidth`): 1. GlyphRun pipeline (with `font_system`), same
+//! font/shaping as render, cursor/selection, only path without typographic drift. 2.
+//! `measure_ctx_fn` + `measure_ctx`, multi-window-safe host hook. 3. `measure_fn`, legacy
+//! per-process hook. 4. `text_layout.measureTextWidthByFontKind`, final estimate fallback.
 
 const std = @import("std");
 const text_module = @import("text");
@@ -41,7 +33,8 @@ const GlyphRun = @import("glyph_run.zig").GlyphRun;
 
 pub const ShapeTextOpts = text_shaping.ShapeTextOpts;
 
-/// 释放 shape 产物里 fallback 字体的引用（与 core.zig 同名 helper 一致）。
+/// Release reference to fallback font in shape result (consistent with same-name helper in
+/// core.zig).
 fn releaseShapedFallbackFontRefs(glyphs: []const ShapedGlyph) void {
     for (glyphs) |glyph| {
         if (glyph.fallback_font_ref) |font_ref| {
@@ -53,16 +46,32 @@ fn releaseShapedFallbackFontRefs(glyphs: []const ShapedGlyph) void {
 pub const TextContext = struct {
     allocator: std.mem.Allocator,
 
-    /// 外部注入的字体测量函数（统一测量与渲染字体）
+    /// Font measurement function injected externally (unified for both measuring and rendering
+    /// text).
     measure_fn: ?text_layout.MeasureFn = null,
-    /// 带 context 的测量回调（多窗口所需，无 context 版本只能读进程级全局，
-    /// 两个 App 并存时会串台）。设了它就优先于 measure_fn。
+    /// Context-aware measurement callback (required for multi-window; context-free version can only
+    /// read
+    /// process-global state, causing cross-talk when two apps coexist). Takes precedence over
+    /// measure_fn when set.
     measure_ctx_fn: ?text_layout.MeasureCtxFn = null,
     measure_ctx: ?*anyopaque = null,
-    /// CoreText shape 调用缓存。
+    /// CoreText shape call cache.
     shaping_cache: shaping_cache_mod.ShapingCache,
-    /// 宿主注入的字体后端；null 时 shapeText 返 error.NoFontProvider。
+    /// Font backend injected by host; shapeText returns error.NoFontProvider when null.
     font_system: ?*FontSystem = null,
+    /// Per-window font resolver, shared with the window painter.
+    font_resolve_fn: ?*const fn (*anyopaque, ShapeTextOpts) ?*text_module.Font = null,
+    font_resolve_ctx: ?*anyopaque = null,
+    /// Optional per-window explicit font-selection provider (Windows).
+    /// Returns a snapshot allocated with the supplied allocator; TextContext
+    /// releases and destroys it after the native call. Range sizes are logical
+    /// pixels; uncovered spans use the primary font at opts.font_size.
+    font_ranges_fn: ?*const fn (*anyopaque, ShapeTextOpts, *text_module.Font, std.mem.Allocator) anyerror!?*text_module.FontRanges = null,
+    font_ranges_ctx: ?*anyopaque = null,
+    /// Native runtime owns these legacy hooks and rebinds them at each Cx frame.
+    manage_legacy_font_hooks: bool = false,
+    legacy_font_resolve_fn: ?layout_engine.ShapeFontResolveFn = null,
+    font_props_measure_fn: ?layout_engine.DrawnTextMeasureFn = null,
 
     pub fn init(allocator: std.mem.Allocator, cache_capacity: u32) TextContext {
         return .{
@@ -72,41 +81,99 @@ pub const TextContext = struct {
     }
 
     pub fn deinit(self: *TextContext) void {
+        self.clearManagedFontHooks();
         self.shaping_cache.deinit();
     }
 
-    /// 帧开始时推进缓存的代际。
+    /// Advance cache generation at frame start.
     pub fn beginFrame(self: *TextContext) void {
         self.shaping_cache.beginFrame();
     }
 
-    /// 把当前测量钩子同步进 text_layout 的进程级槽位（legacy 布局路径要用）。
-    pub fn syncLegacyMeasureHooks(self: *const TextContext) void {
+    /// Sync current measurement hook into text_layout's process-level slot (required by legacy
+    /// layout path).
+    pub fn syncLegacyMeasureHooks(self: *TextContext) void {
         text_layout.setMeasureFn(self.measure_fn);
         text_layout.setMeasureCtxFn(self.measure_ctx_fn, self.measure_ctx);
+        if (self.manage_legacy_font_hooks) {
+            layout_engine.setContextFontHooks(self, self.legacy_font_resolve_fn, self.font_props_measure_fn, self.font_resolve_ctx);
+        }
     }
 
-    /// 挂载 FontSystem，让 cx.shapeText 能找 Font + 调 TextShaper。
-    /// zenit_app 在 init 后调用（与 setSystemSdk 同时序）。
+    /// Mount FontSystem to enable cx.shapeText to find Font and invoke TextShaper.
+    /// Called by zenit_app after init (same sequence as setSystemSdk).
     pub fn setFontSystem(self: *TextContext, fs: *FontSystem) void {
         self.font_system = fs;
+    }
+
+    pub fn clearManagedFontHooks(self: *TextContext) void {
+        if (self.manage_legacy_font_hooks) layout_engine.clearContextFontHooks(self);
+    }
+
+    pub fn resetShapingCache(self: *TextContext) void {
+        const capacity = self.shaping_cache.capacity;
+        self.shaping_cache.deinit();
+        self.shaping_cache = shaping_cache_mod.ShapingCache.init(self.allocator, capacity);
+    }
+
+    pub fn setFontRangesProvider(self: *TextContext, ctx: ?*anyopaque, provider: @TypeOf(@as(TextContext, undefined).font_ranges_fn)) void {
+        self.font_ranges_ctx = ctx;
+        self.font_ranges_fn = provider;
+        // Rebind after changing the provider's selection rules or fonts too.
+        self.resetShapingCache();
+    }
+
+    fn resolveFontRanges(self: *TextContext, opts: ShapeTextOpts, font: *text_module.Font) !?*text_module.FontRanges {
+        const provider = self.font_ranges_fn orelse return null;
+        const ctx = self.font_ranges_ctx orelse return error.MissingFontRangesContext;
+        if (!@hasDecl(TextShaper, "shapeWithRanges")) return error.UnsupportedFontRanges;
+        return provider(ctx, opts, font, self.allocator);
+    }
+
+    fn rangeBaseFont(font: *text_module.Font, size: f32, ranges: ?*text_module.FontRanges) !?*text_module.Font {
+        if (@hasDecl(text_module.Font, "lineCaretStopsWithRanges")) {
+            // DirectWrite lays out selected ranges at their requested sizes.
+            // Resize the primary too, instead of scaling the entire mixed run.
+            if (ranges != null and font.pixelSize() != size) return try font.derive(size);
+        }
+        return null;
+    }
+
+    fn releaseFontRanges(self: *TextContext, ranges: ?*text_module.FontRanges) void {
+        if (@hasDecl(text_module.FontRanges, "deinit")) {
+            if (ranges) |snapshot| {
+                snapshot.deinit();
+                self.allocator.destroy(snapshot);
+            }
+        }
+    }
+
+    fn resolveDefaultFont(self: *TextContext, opts: ShapeTextOpts) ?*text_module.Font {
+        if (self.font_resolve_fn) |resolve| {
+            if (self.font_resolve_ctx) |ctx| return resolve(ctx, opts);
+        }
+        // A managed native context without a selector must not borrow another window's active hooks.
+        if (self.manage_legacy_font_hooks) return null;
+        return layout_engine.resolveTextFont(opts.text, opts.font_size, opts.font_weight, opts.use_italic, opts.use_monospace, opts.font_family_id);
     }
 
     pub fn clearFontSystem(self: *TextContext) void {
         self.font_system = null;
     }
 
-    /// GlyphRun pipeline 入口，取代 text_layout 旧 measure API。
+    /// GlyphRun pipeline entry point (replaces text_layout's old measure API).
     ///
-    /// 内部：1) build ShapingKey；2) ShapingCache lookup；3) miss 时 TextShaper
-    /// .shape() 出 []ShapedGlyph，经 text_shaper_adapter.fromShapedGlyphs 翻成
-    /// GlyphRun，存进 ShapingCache 的 arena；4) hit/miss 都返 GlyphRun。
+    /// Internally: 1) build ShapingKey; 2) ShapingCache lookup; 3) on miss, TextShaper.shape()
+    /// yields
+    /// []ShapedGlyph, converted via text_shaper_adapter.fromShapedGlyphs into a GlyphRun stored in
+    /// the
+    /// ShapingCache arena; 4) hit and miss both return a GlyphRun.
     ///
-    /// 当前 ShapingCache.insert 把 GlyphRun.glyphs/clusters 复制到内部 arena，
-    /// 所以 caller 无需关心 slice lifetime。返回的 GlyphRun 有效到下次
-    /// beginFrame 后阈值帧（默认 2 帧）。
+    /// ShapingCache.insert copies GlyphRun.glyphs/clusters into its internal arena, so callers need
+    /// not worry about slice lifetime. The returned GlyphRun is valid until the threshold frames
+    /// (default 2) after the next beginFrame.
     ///
-    /// 错误:
+    /// Errors:
     ///   - error.NoFontProvider: cx.font_system == null
     ///   - error.FontLookupFailed / TextShapingFailed / OutOfMemory: passthrough
     pub fn shapeText(self: *TextContext, opts: ShapeTextOpts) !GlyphRun {
@@ -121,21 +188,23 @@ pub const TextContext = struct {
             };
         }
 
-        // ShapingKey 当前 schema 不区分 weight/italic（v0.5 设计 limitation）。
-        // 用 text_hash 把 weight + italic 信息塞进去，避免 different style 命中
-        // 同 entry。font_id 暂全 0（FontSystem 内部 *Font 句柄当前不暴露 id）。
+        // ShapingKey's current schema does not distinguish weight/italic (v0.5 design limitation).
+        // Use
+        // text_hash to embed weight + italic info to avoid different styles hitting same entry.
+        // font_id
+        // currently all 0 (FontSystem's internal *Font handle does not yet expose id).
         const key = text_shaping.shapingKey(opts);
         if (self.shaping_cache.lookup(key)) |run| return run;
 
-        // miss: 找 Font -> shape -> adapt -> cache.insert
+        // miss: find Font -> shape -> adapt -> cache.insert
         const desc = FontDescriptor{
             .family = opts.font_family,
             .size = opts.font_size,
             .weight = text_shaping.mapFontWeight(opts.font_weight),
             .style = if (opts.use_italic) .italic else .normal,
         };
-        const borrowed = if (std.mem.eql(u8, opts.font_family, "system"))
-            layout_engine.resolveDefaultTextFont(opts.text, opts.font_size, opts.font_weight, opts.use_italic)
+        const borrowed = if (opts.font_family_id != 0 or std.mem.eql(u8, opts.font_family, "system"))
+            self.resolveDefaultFont(opts)
         else
             null;
         const font = borrowed orelse try fs.findFont(desc);
@@ -143,12 +212,21 @@ pub const TextContext = struct {
 
         var shaper = try TextShaper.init(self.allocator);
         defer shaper.deinit();
-        const shaped = try shaper.shapeWithOptions(opts.text, font, opts.use_italic);
+        const ranges = try self.resolveFontRanges(opts, font);
+        defer self.releaseFontRanges(ranges);
+        const ranged_base = try rangeBaseFont(font, opts.font_size, ranges);
+        defer if (ranged_base) |owned| owned.deinit();
+        const native_font = ranged_base orelse font;
+        const shaped = if (@hasDecl(TextShaper, "shapeWithRanges"))
+            try shaper.shapeWithRanges(opts.text, native_font, opts.use_italic, ranges)
+        else
+            try shaper.shapeWithOptions(opts.text, font, opts.use_italic);
         defer self.allocator.free(shaped);
         defer releaseShapedFallbackFontRefs(shaped);
 
-        // FontMetrics: 当前 Font 没暴露 ascent/descent；先用 0 占位（caller 主要
-        // 关心 total_advance）。Phase B/C 切换后再补 Font.metrics()。
+        // FontMetrics: Font does not yet expose ascent/descent; placeholder 0 for now (caller
+        // mainly
+        // cares about total_advance). Add Font.metrics() after Phase B/C switch.
         const metrics = FontMetrics{
             .ascent = 0,
             .descent = 0,
@@ -156,7 +234,7 @@ pub const TextContext = struct {
             .font_size = opts.font_size,
         };
         var run = try text_shaper_adapter.fromShapedGlyphs(self.allocator, shaped, metrics, .ltr);
-        const scale = if (font.pixelSize() > 0) opts.font_size / font.pixelSize() else 1;
+        const scale = if (ranges != null) 1 else if (font.pixelSize() > 0) opts.font_size / font.pixelSize() else 1;
         for (@constCast(run.glyphs)) |*glyph| {
             glyph.x_advance *= scale;
             glyph.y_advance *= scale;
@@ -164,14 +242,16 @@ pub const TextContext = struct {
             glyph.y_offset *= scale;
         }
         run.total_advance *= scale;
-        // adapter alloc 的 glyphs/clusters 在 cache.insert 后由 cache 的 arena
-        // 复制管理，原 slice 释放。
+        // glyphs/clusters allocated by adapter are copied and managed by cache's arena after
+        // cache.insert;
+        // original slice freed.
         defer self.allocator.free(run.glyphs);
         defer self.allocator.free(run.clusters);
 
         try self.shaping_cache.insert(key, run.glyphs, run.clusters, run.metrics, run.direction, run.total_advance);
-        // cache.insert 把 slice 复制到 arena 后，再 lookup 一次拿 cache 内副本。
-        // (避免返回 caller-allocator slice 已 free。)
+        // cache.insert copies slice to arena, then lookup again to get cache's copy. (Avoid
+        // returning
+        // caller-allocator slice already freed.)
         return self.shaping_cache.lookup(key) orelse unreachable;
     }
 
@@ -186,13 +266,18 @@ pub const TextContext = struct {
             .weight = text_shaping.mapFontWeight(opts.font_weight),
             .style = if (opts.use_italic) .italic else .normal,
         };
-        const borrowed = if (std.mem.eql(u8, opts.font_family, "system"))
-            layout_engine.resolveDefaultTextFont(opts.text, opts.font_size, opts.font_weight, opts.use_italic)
+        const borrowed = if (opts.font_family_id != 0 or std.mem.eql(u8, opts.font_family, "system"))
+            self.resolveDefaultFont(opts)
         else
             null;
         const font = borrowed orelse try fs.findFont(desc);
         defer if (borrowed == null) font.deinit();
-        const scale = if (font.pixelSize() > 0) opts.font_size / font.pixelSize() else 1;
+        const ranges = try self.resolveFontRanges(opts, font);
+        defer self.releaseFontRanges(ranges);
+        const ranged_base = try rangeBaseFont(font, opts.font_size, ranges);
+        defer if (ranged_base) |owned| owned.deinit();
+        const native_font = ranged_base orelse font;
+        const scale = if (ranges != null) 1 else if (font.pixelSize() > 0) opts.font_size / font.pixelSize() else 1;
 
         var boundary_count: usize = 1;
         var byte: usize = 0;
@@ -213,7 +298,10 @@ pub const TextContext = struct {
 
         const native_stops = try self.allocator.alloc(text_module.LineCaretStop, boundary_count);
         defer self.allocator.free(native_stops);
-        const metrics = try font.lineCaretStops(opts.text, boundaries, native_stops);
+        const metrics = if (@hasDecl(text_module.Font, "lineCaretStopsWithRanges"))
+            try native_font.lineCaretStopsWithRanges(opts.text, boundaries, native_stops, ranges)
+        else
+            try font.lineCaretStops(opts.text, boundaries, native_stops);
         var stop_count: usize = boundary_count;
         for (native_stops) |stop| if (stop.has_secondary) {
             stop_count += 1;
@@ -303,19 +391,25 @@ pub const TextContext = struct {
     /// several Cx instances coexist in one process.
     pub fn measureTextWidth(self: *TextContext, content: []const u8, font_size: f32, font_weight: u16, italic: bool) f32 {
         if (content.len == 0) return 0;
-        // 调用方按字节切前缀时可能落在多字节序列中间（半个 CJK/emoji）。非法
-        // UTF-8 让 CoreText NSString 构造失败：shape 层报 TextShapingFailed、
-        // FontSelector 桥（coretext_measure_text_width_with_font）静默返 0.0f，
-        // 最终宽度 0.00 直接塌掉 bbox（下游应用实测：emoji 后切在 CJK 首字节
-        // 的"前缀"全部量出 0.00）。先裁到最长合法前缀，与渲染端实际能显示
-        // 的内容一致；合法输入零开销原样通过。
+        // Callers may slice mid-multibyte sequence (half a CJK/emoji) when cutting a prefix by
+        // byte. Invalid
+        // UTF-8 fails CoreText NSString construction: the shape layer reports TextShapingFailed and
+        // the
+        // FontSelector bridge (coretext_measure_text_width_with_font) silently returns 0.0f,
+        // collapsing the
+        // bbox to 0.00. Trim to the longest valid prefix, matching what render displays; valid
+        // input
+        // passes through unchanged at zero cost.
         const safe = text_shaping.validUtf8Prefix(content);
         if (safe.len == 0) return 0;
-        // GlyphRun pipeline 优先：与渲染（text_item_render 的 visualLine）和输入
-        // 光标/选区（input/text_utils 的 shapeText）同一字体与塑形。旧 FontSelector
-        // 桥用的是 fallback_families 首选字体（Helvetica Neue），拉丁字宽比 "system"
-        // 宽 ~1.5%, WrapMap 换行点与显示排版漂移、编辑提交 bbox 偏宽皆源于此。
-        // pipeline 不可用（无 font_system / shape 失败）时保留旧路径兜底。
+        // Prefer the GlyphRun pipeline: one font and shaping for both rendering (visualLine in
+        // text_item_render) and input cursor/selection (shapeText in input/text_utils). The old
+        // FontSelector
+        // bridge used fallback_families' preferred font (Helvetica Neue), whose Latin width is
+        // ~1.5% wider
+        // than 'system', causing WrapMap line-break drift and bbox width mismatch. Falls back to
+        // the old
+        // path when the pipeline is unavailable (no font_system / shape failure).
         if (self.font_system != null) {
             if (self.shapeText(.{
                 .text = safe,
@@ -338,28 +432,29 @@ pub const TextContext = struct {
         return text_layout.measureTextWidthByFontKind(safe, font_size, font_weight, italic, false);
     }
 
-    // 这里**刻意不提供** measureTextWidthCallback（擦除指针的回调适配器）。
+    // Intentionally NOT providing measureTextWidthCallback (pointer-erasing callback adapter).
     //
-    // 它只能存在一个版本：WrapMap 那类 API 收的是 `*anyopaque` + 一个函数
-    // 指针，两者必须配对。既有调用点传的 ctx 全是 `cx`（见 input/textarea.zig
-    // 与 input/editable_text.zig），所以适配器留在 `Cx` 上、强转 `*Cx`。
+    // WrapMap-like APIs take `*anyopaque` + function pointer, which must be paired. All callers
+    // pass
+    // `cx` (see input/textarea.zig and input/editable_text.zig), so the adapter stays on `Cx`, cast
+    // to `*Cx`.
     //
-    // 若这里再放一个强转 `*TextContext` 的同名函数，它和 `Cx` 版签名完全
-    // 相同、编译期无从区分，配错不会报错，`text` 字段在 Cx 里不在偏移 0，
-    // 拿 `*Cx` 当 `*TextContext` 解引用读到的是别的字段，静默算出垃圾宽度。
-    // 与其留个陷阱，不如不提供。
-    /// 外部（非 layout pass 内）做塑形测量时的守卫，保证用的是本上下文的
-    /// 缓存与字体后端。
+    // A same-named function casting to `*TextContext` would have an identical signature, so a
+    // mispair
+    // would not fail to compile. `text` is not at offset 0 in Cx; casting `*Cx` as `*TextContext`
+    // dereferences the wrong field and silently yields garbage widths. Better not to provide it.
+    /// Guard for external (non-layout-pass) shaping measurement, ensuring use of this context's
+    /// cache
+    /// and font backend.
     pub fn beginExternalTextMeasure(self: *TextContext) layout_engine.ExternalShapeMeasureGuard {
         return layout_engine.beginExternalShapeMeasure(&self.shaping_cache, self.font_system);
     }
 };
 
-// ── 测试 ───────────────────────────────────────────────────────────────
+// -- Tests
 //
-// 这些测试此前一条都写不了：measureTextWidth 的降级链路挂在 Cx 上，要测它
-// 得先造一个完整的 Cx（含节点树、focus、dispatcher…）。现在 TextContext
-// 可以独立构造，降级链路终于可以被钉住。
+// The measureTextWidth fallback chain is testable here because TextContext can be constructed
+// independently, without building a complete Cx (node tree, focus, dispatcher...).
 
 const TestHooks = struct {
     var ctx_calls: u32 = 0;
@@ -410,7 +505,7 @@ test "TextContext: 带 context 的钩子优先于 legacy 钩子（多窗口正�
     tc.measure_ctx_fn = TestHooks.withCtx;
     tc.measure_ctx = @ptrCast(&TestHooks.marker);
 
-    // 7/字符 = ctx 版；3/字符 = legacy 版
+    // 7/char = ctx version; 3/char = legacy version
     try std.testing.expectEqual(@as(f32, 28), tc.measureTextWidth("abcd", 14, 400, false));
     try std.testing.expectEqual(@as(u32, 1), TestHooks.ctx_calls);
     try std.testing.expectEqual(@as(u32, 0), TestHooks.plain_calls);
@@ -422,7 +517,7 @@ test "TextContext: 设了 measure_ctx_fn 但没给 ctx 时不当作可用" {
     defer tc.deinit();
     tc.measure_fn = TestHooks.plain;
     tc.measure_ctx_fn = TestHooks.withCtx;
-    tc.measure_ctx = null; // 半配置状态
+    tc.measure_ctx = null; // partially configured state
 
     try std.testing.expectEqual(@as(f32, 12), tc.measureTextWidth("abcd", 14, 400, false));
     try std.testing.expectEqual(@as(u32, 0), TestHooks.ctx_calls);
@@ -435,7 +530,7 @@ test "TextContext: 非法 UTF-8 前缀先裁再测（不把半个字符喂给钩
     defer tc.deinit();
     tc.measure_fn = TestHooks.plain;
 
-    // "a" + 半个 "中" -> 只应量 "a" 这 1 字节
+    // 'a' + half of 'zhong' -> should measure only 1 byte of 'a'
     try std.testing.expectEqual(@as(f32, 3), tc.measureTextWidth("a\xE4\xB8", 14, 400, false));
 }
 
@@ -459,7 +554,7 @@ test "TextContext: 没有字体后端时 shapeText 明确报错" {
 }
 
 test "TextContext: host face and logical size govern mixed input caret and glyph widths" {
-    var fs = try FontSystem.init(std.testing.allocator);
+    var fs = try FontSystem.init(std.testing.allocator, @import("std").testing.io);
     defer fs.deinit();
     const font = try fs.findFont(.{ .family = "Helvetica Neue", .size = 26 });
     defer font.deinit();
@@ -487,8 +582,8 @@ test "TextContext: host face and logical size govern mixed input caret and glyph
 test "TextContext: 无字体后端时连空文本也报错（取后端在长度短路之前）" {
     var tc = TextContext.init(std.testing.allocator, 64);
     defer tc.deinit();
-    // 钉住现有求值顺序：font_system 检查在 text.len == 0 短路之前。
-    // 调换两者会改变无后端宿主看到的行为，这里当作合同锁住。
+    // Pin current evaluation order: font_system check before text.len == 0 short-circuit. Swapping
+    // changes behavior for hostless backends; lock as contract here.
     try std.testing.expectError(
         error.NoFontProvider,
         tc.shapeText(.{ .text = "", .font_family = "system", .font_size = 14 }),

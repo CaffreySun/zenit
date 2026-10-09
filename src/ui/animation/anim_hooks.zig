@@ -1,23 +1,23 @@
-/// 动画 Hooks, Scope 绑定的声明式动画创建
+/// Animation Hooks: declarative animation creation bound to Scope
 ///
-/// 所有 hook 创建的资源跟随 Scope 生命周期自动释放。
+/// All resources created by hooks are automatically freed with Scope lifecycle.
 ///
-/// 用法:
+/// Usage:
 /// ```zig
 /// const anim = @import("animation/anim_hooks.zig");
 ///
-/// // Scope 绑定的 tween 动画
+/// // Scope-bound tween animation
 /// const ctrl = try anim.useAnimation(scope, .{
 ///     .from = 0, .to = 100, .duration = 0.5,
 /// });
-/// // ctrl.value 每帧自动更新
+/// // ctrl.value updates automatically each frame
 ///
-/// // Scope 绑定的 spring 动画
+/// // Scope-bound spring animation
 /// const spring_ctrl = try anim.useSpringAnimation(scope, .{
 ///     .from = 0, .to = 100, .stiffness = 200, .damping = 20,
 /// });
 ///
-/// // Scope 绑定的 timeline
+/// // Scope-bound timeline
 /// const tl = try anim.useTimeline(scope);
 /// try tl.add(&ctrl1, .start);
 /// tl.play();
@@ -29,10 +29,10 @@ const timeline_mod = @import("timeline.zig");
 const Timeline = timeline_mod.Timeline;
 const Easing = @import("easing.zig").Easing;
 
-/// 获取 Scope 类型（延迟解析避免循环依赖）
+/// Get Scope type (defer resolution to avoid circular dependencies)
 const Scope = @import("../reactive/scope.zig").Scope;
 
-/// Tween 动画配置
+/// Tween animation configuration
 pub const UseAnimationConfig = struct {
     from: f32 = 0,
     to: f32 = 1,
@@ -44,7 +44,7 @@ pub const UseAnimationConfig = struct {
     auto_play: bool = true,
 };
 
-/// 创建 Scope 绑定的 Tween 动画控制器
+/// Create a Scope-bound Tween animation controller
 pub fn useAnimation(scope: *Scope, config: UseAnimationConfig) !*AnimationController {
     const ctrl = try scope.allocator.create(AnimationController);
     errdefer scope.allocator.destroy(ctrl);
@@ -67,7 +67,7 @@ pub fn useAnimation(scope: *Scope, config: UseAnimationConfig) !*AnimationContro
     return ctrl;
 }
 
-/// Spring 动画配置
+/// Spring animation configuration
 pub const UseSpringConfig = struct {
     from: f32 = 0,
     to: f32 = 1,
@@ -77,7 +77,7 @@ pub const UseSpringConfig = struct {
     auto_play: bool = true,
 };
 
-/// 创建 Scope 绑定的 Spring 动画控制器
+/// Create a Scope-bound Spring animation controller
 pub fn useSpringAnimation(scope: *Scope, config: UseSpringConfig) !*AnimationController {
     const ctrl = try scope.allocator.create(AnimationController);
     errdefer scope.allocator.destroy(ctrl);
@@ -98,7 +98,7 @@ pub fn useSpringAnimation(scope: *Scope, config: UseSpringConfig) !*AnimationCon
     return ctrl;
 }
 
-/// 创建 Scope 绑定的 Timeline
+/// Create a Scope-bound Timeline
 ///
 /// Scope cleanup calls Timeline.deinit, which automatically unregisters it
 /// from every AnimationManager before releasing the allocation. Registered
@@ -114,7 +114,7 @@ pub fn useTimeline(scope: *Scope) !*Timeline {
     return tl;
 }
 
-// ── 清理函数 ──
+// -- Cleanup functions --
 
 fn destroyController(ptr: *anyopaque, allocator: std.mem.Allocator) void {
     const ctrl: *AnimationController = @ptrCast(@alignCast(ptr));

@@ -1,12 +1,12 @@
 /// Tag Component
 ///
-/// 标签/标记组件，用于分类、过滤等场景
+/// Tag/label component for categorization, filtering, etc.
 ///
-/// 特性:
-/// - 多种颜色变体
-/// - 可关闭
-/// - outline 模式
-/// - 两种尺寸
+/// Features:
+/// - Multiple color variants
+/// - Closable
+/// - Outline mode
+/// - Two sizes.
 const std = @import("std");
 const core = @import("../../core.zig");
 const Cx = core.Cx;
@@ -14,15 +14,10 @@ const Node = core.Node;
 const box = core.box;
 const Color = core.Color;
 const theme = core.theme;
-const Padding = core.Padding;
-const ConditionalStyle = core.ConditionalStyle;
-const Border = core.Border;
-const svg_assets = @import("../../svg_assets.zig");
-const Scope = @import("../../reactive.zig").Scope;
-const hooks = @import("../../hooks.zig");
-const recipe_mod = @import("../../recipe.zig");
+const reactive = @import("../../reactive.zig");
+const Scope = reactive.Scope;
 
-/// Tag 颜色
+/// Tag color.
 pub const TagColor = enum {
     neutral,
     accent,
@@ -32,199 +27,24 @@ pub const TagColor = enum {
     info,
 };
 
-/// Tag 变体
+/// Tag variant.
 pub const TagVariant = enum {
     default,
     outline,
 };
 
-/// Tag 尺寸
-pub const TagSize = enum {
-    sm,
-    md,
+/// Tag size.
+pub const TagSize = enum { sm, md };
 
-    pub fn height(self: TagSize) f32 {
-        return switch (self) {
-            .sm => 22,
-            .md => 26,
-        };
-    }
+/// Create Tag: `W.Tag(.{ .label = "Beta", .color = .accent })`. Props: text (empty = no text) /
+/// variant / color (can toggle by state) / size / closable / on_close / close_icon_asset. View in
+/// tag.yix, styles in styles.yss.
+pub const Tag = @import("_tag.yix.zig").Tag;
 
-    pub fn fontSize(self: TagSize) f32 {
-        return switch (self) {
-            .sm => 11,
-            .md => 12,
-        };
-    }
-
-    pub fn padding(self: TagSize) Padding {
-        return switch (self) {
-            .sm => Padding.symmetric(2, 6),
-            .md => Padding.symmetric(3, 8),
-        };
-    }
-};
-
-// 样式层析出至 styles.zig；下列别名保持调用点与公共 API 不变。
-const styles = @import("styles.zig");
-pub const TagRecipe = styles.TagRecipe;
-const tagCloseButtonStyle = styles.tagCloseButtonStyle;
-const tagCloseIconStyle = styles.tagCloseIconStyle;
-const tagCloseTextStyle = styles.tagCloseTextStyle;
-const tagCloseHoverBg = styles.tagCloseHoverBg;
-
-/// Tag 属性
-pub const TagProps = struct {
-    text: []const u8 = "",
-    variant: TagVariant = .default,
-    color: TagColor = .neutral,
-    size: TagSize = .md,
-    closable: bool = false,
-    on_close: ?core.HandlerRef = null,
-    close_icon_asset: ?svg_assets.Asset = null,
-};
-
-/// 创建 Tag
-pub fn Tag(props: TagProps) TagBuilder {
-    return TagBuilder{ .props = props };
-}
-
-pub const TagBuilder = struct {
-    props: TagProps,
-
-    pub fn text(self: TagBuilder, t: []const u8) TagBuilder {
-        var new = self;
-        new.props.text = t;
-        return new;
-    }
-
-    pub fn variant(self: TagBuilder, v: TagVariant) TagBuilder {
-        var new = self;
-        new.props.variant = v;
-        return new;
-    }
-
-    pub fn color(self: TagBuilder, c: TagColor) TagBuilder {
-        var new = self;
-        new.props.color = c;
-        return new;
-    }
-
-    pub fn size(self: TagBuilder, s: TagSize) TagBuilder {
-        var new = self;
-        new.props.size = s;
-        return new;
-    }
-
-    pub fn closable(self: TagBuilder, c: bool) TagBuilder {
-        var new = self;
-        new.props.closable = c;
-        return new;
-    }
-
-    pub fn onClose(self: TagBuilder, handler_ref: core.HandlerRef) TagBuilder {
-        var new = self;
-        new.props.on_close = handler_ref;
-        return new;
-    }
-
-    /// 保留模式: mount
-    pub fn mount(self: TagBuilder, scope: *Scope, cx: *Cx) !*Node {
-        const my_scope = try scope.childScope();
-        // 绑定成功之前 my_scope 无人持有；绑定后 tag_node 归 my_scope、
-        // my_scope 归父 scope（下游编辑器 git_diff sweep index 373 实测）。
-        var scope_bound = false;
-        errdefer if (!scope_bound) my_scope.dispose();
-        const allocator = cx.allocator;
-        const t = cx.tokens;
-        const p = self.props;
-
-        // Recipe resolve：color × variant × size 三维度统一合并
-        const cs = TagRecipe.resolve(.{
-            .color = p.color,
-            .variant = p.variant,
-            .size = p.size,
-        }, t);
-        const resolved = cs.resolve(.{});
-
-        const fg = resolved.text_color orelse t.color.fg_primary;
-
-        // 几何来自 recipe derived；pill 圆角 = height/2 从 resolved 高度折算
-        const tag_height: f32 = if (resolved.height) |h| h.px else p.size.height();
-
-        // border: radius = height/2（pill 形状），color/width 来自 recipe
-        // 用细粒度字段组合，不做整体 Border 覆盖
-        var final_border = Border{ .radius = tag_height / 2 };
-        if (resolved.border_width) |bw| final_border.width = bw;
-        if (resolved.border_color) |bc| final_border.color = bc;
-
-        const tag_node = try box(cx, .{
-            .width = .{ .fit = .{} },
-            .height = .{ .px = tag_height },
-            .direction = .row,
-            .align_items = .center,
-            .gap = resolved.gap orelse 4,
-            .padding = resolved.padding,
-            .background = resolved.background orelse Color.TRANSPARENT,
-            .border = final_border,
-        }, .{});
-        tag_node.meta.ownership.meta.component_name = "Tag";
-        // ⚠️ 这条守卫**不能**随 bindScopeToNode 成功而解除：
-        // ScopeBinding 的 destroy 只解绑、从不释放节点，所以绑定之后
-        // tag_node 依然无人回收，而下面 label / close_btn 都可失败
-        // （index 375 实测：绑定后解除守卫仍漏 tag_node）。
-        // freeNode 会顺带 dispose 绑定的 my_scope，故两者合成一条。
-        errdefer cx.freeNode(tag_node);
-        try core.bindScopeToNode(my_scope, tag_node);
-        scope_bound = true;
-
-        // 文本标签
-        if (p.text.len > 0) {
-            const label_node = try box(cx, .{
-                .width = .{ .fit = .{} },
-                .height = .{ .fit = .{} },
-            }, .{});
-            label_node.setText(.{
-                .content = p.text,
-                .color = fg,
-                .font_size = resolved.font_size orelse p.size.fontSize(),
-            });
-            _ = try adoptTagChild(cx, allocator, tag_node, label_node);
-        }
-
-        // 关闭按钮
-        if (p.closable) {
-            // 建好即挂：下面 icon / txt_node / useAnimatedBackground 全可失败。
-            const close_btn = try adoptTagChild(cx, allocator, tag_node, try box(cx, tagCloseButtonStyle(t), .{}));
-            close_btn.style.cursor = .pointer;
-
-            if (p.close_icon_asset) |asset| {
-                _ = try adoptTagChild(cx, allocator, close_btn, try core.iconTint(cx, asset, fg, tagCloseIconStyle()));
-            } else {
-                const txt_node = try box(cx, .{
-                    .width = .{ .fit = .{} },
-                    .height = .{ .fit = .{} },
-                }, .{});
-                txt_node.setText(tagCloseTextStyle(fg));
-                _ = try adoptTagChild(cx, allocator, close_btn, txt_node);
-            }
-
-            _ = try hooks.useAnimatedBackground(my_scope, cx, close_btn, .{
-                .normal = Color.TRANSPARENT,
-                .hover = tagCloseHoverBg(fg),
-            });
-
-            close_btn.behavior.events.on_click = p.on_close;
-        }
-
-        return tag_node;
-    }
-};
-
-// ========== 测试 ==========
+// ========== Tests ==========
 
 test "Tag: basic text" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 200 }, .height = .{ .px = 50 } }, .{});
@@ -233,19 +53,16 @@ test "Tag: basic text" {
     const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
     defer scope.dispose();
 
-    const tag_node = try Tag(.{})
-        .text("Hello")
-        .color(.accent)
-        .mount(scope, ctx);
+    const tag_node = try Tag(.{ .label = "Hello", .color = .accent }).mount(scope, ctx);
 
     try root.appendChild(std.testing.allocator, tag_node);
 
-    // 有 1 个子节点: label_text
+    // Has 1 child: label_text.
     try std.testing.expectEqual(@as(usize, 1), tag_node.children.items.len);
 }
 
 test "Tag: closable" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 200 }, .height = .{ .px = 50 } }, .{});
@@ -254,19 +71,16 @@ test "Tag: closable" {
     const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
     defer scope.dispose();
 
-    const tag_node = try Tag(.{})
-        .text("Closable")
-        .closable(true)
-        .mount(scope, ctx);
+    const tag_node = try Tag(.{ .label = "Closable", .closable = true }).mount(scope, ctx);
 
     try root.appendChild(std.testing.allocator, tag_node);
 
-    // 有 2 个子节点: label_text + close_btn
+    // Has 2 children: label_text + close_btn.
     try std.testing.expectEqual(@as(usize, 2), tag_node.children.items.len);
 }
 
 test "Tag: outline variant" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 200 }, .height = .{ .px = 50 } }, .{});
@@ -275,20 +89,16 @@ test "Tag: outline variant" {
     const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
     defer scope.dispose();
 
-    const tag_node = try Tag(.{})
-        .text("Outline")
-        .variant(.outline)
-        .color(.success)
-        .mount(scope, ctx);
+    const tag_node = try Tag(.{ .label = "Outline", .variant = .outline, .color = .success }).mount(scope, ctx);
 
     try root.appendChild(std.testing.allocator, tag_node);
 
-    // outline 有边框
+    // Outline has border.
     try std.testing.expectEqual(@as(f32, 1), tag_node.style.border.width);
 }
 
 test "Tag: sizes" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 200 }, .height = .{ .px = 100 } }, .{});
@@ -297,8 +107,8 @@ test "Tag: sizes" {
     const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
     defer scope.dispose();
 
-    const sm = try Tag(.{}).text("SM").size(.sm).mount(scope, ctx);
-    const md = try Tag(.{}).text("MD").size(.md).mount(scope, ctx);
+    const sm = try Tag(.{ .label = "SM", .size = .sm }).mount(scope, ctx);
+    const md = try Tag(.{ .label = "MD", .size = .md }).mount(scope, ctx);
 
     try root.appendChild(std.testing.allocator, sm);
     try root.appendChild(std.testing.allocator, md);
@@ -308,7 +118,7 @@ test "Tag: sizes" {
 }
 
 test "Tag: background color is set" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 200 }, .height = .{ .px = 50 } }, .{});
@@ -317,39 +127,114 @@ test "Tag: background color is set" {
     const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
     defer scope.dispose();
 
-    const tag_node = try Tag(.{})
-        .text("Test")
-        .color(.accent)
-        .mount(scope, ctx);
+    const tag_node = try Tag(.{ .label = "Test", .color = .accent }).mount(scope, ctx);
 
     try root.appendChild(std.testing.allocator, tag_node);
 
-    // 验证背景色不是透明的
+    // Validate background not transparent.
     try std.testing.expect(tag_node.getBackground().a > 0);
     try std.testing.expect(tag_node.style.height.px > 0);
 
-    // 验证背景色是预期的颜色 (accent 颜色使用 lerp 计算)
+    // Validate background is expected color (accent color computed with lerp).
     try std.testing.expect(tag_node.getBackground().r > 0);
     try std.testing.expect(tag_node.getBackground().g > 0);
     try std.testing.expect(tag_node.getBackground().b > 0);
 }
 
-// styles.zig 的测试收集，这行是必需的，见 docs/STYLING.md
-test {
-    _ = @import("styles.zig");
+fn label(n: *Node) ?*Node {
+    if (n.getText() != null) return n;
+    for (n.children.items) |c| if (label(c)) |t| return t;
+    return null;
 }
 
-/// 一次性收养：append 失败时自己释放 child。
-fn adoptTagChild(cx: *Cx, allocator: std.mem.Allocator, parent: *Node, child: *Node) !*Node {
-    errdefer cx.freeNode(child);
-    try parent.appendChild(allocator, child);
-    return child;
+test "Tag: 静态 props 不建 effect；关闭按钮调 on_close" {
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
+    const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
+    defer scope.dispose();
+    const closed = try scope.createSignal(bool, false);
+    const before = ctx.owner.graph.countByKind();
+    const plain = try Tag(.{ .label = "Beta", .color = .accent, .variant = .outline }).mount(scope, ctx);
+    defer ctx.freeNode(plain);
+    try std.testing.expectEqual(before.get(.effect), ctx.owner.graph.countByKind().get(.effect));
+    const t = try Tag(.{ .label = "Beta", .color = .accent, .closable = true, .on_close = @import("../../on.zig").set(closed, true) }).mount(scope, ctx);
+    defer ctx.freeNode(t);
+    const after = ctx.owner.graph.countByKind();
+    // Only effect is close button _hover (hover is real interaction state).
+    try std.testing.expectEqual(before.get(.effect) + 1, after.get(.effect));
+    try std.testing.expectEqual(before.get(.memo), after.get(.memo));
+    try std.testing.expectEqualStrings("Tag", t.meta.ownership.meta.component_name.?);
+    const close = t.children.items[1];
+    const h = close.behavior.events.on_click.?;
+    h.callback(h.context);
+    try std.testing.expect(closed.get());
+}
+
+// Test collection from styles output (see docs/STYLING.md).
+test {
+    _ = @import("_styles.yss.zig");
 }
 
 test "Tag: mount 在任意分配点失败时不泄漏（sweep）" {
     try @import("../oom_sweep.zig").sweepMount("tag", struct {
         fn m(scope: *Scope, cx: *Cx) anyerror!?*Node {
-            return try Tag(.{}).text("Hello").color(.accent).closable(true).mount(scope, cx);
+            return try Tag(.{ .label = "Hello", .color = .accent, .closable = true }).mount(scope, cx);
         }
     }.m);
+}
+
+test "Tag: dynamic text and color" {
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
+    const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
+    defer scope.dispose();
+
+    const status = try scope.createText("Queued", .{});
+    const tone = try scope.createSignal(TagColor, .neutral);
+    const tag_node = try Tag(.{ .label = status, .color = tone, .closable = true }).mount(scope, ctx);
+    defer ctx.freeNode(tag_node);
+    status.set("Running");
+    tone.set(.success);
+    const text_node = label(tag_node).?;
+    try std.testing.expectEqualStrings("Running", text_node.getText().?.content);
+    const k = ctx.tokens.tokens.color;
+    try std.testing.expect(Color.eql(tag_node.getBackground(), Color.lerp(k.bg_primary, k.success, 0.25)));
+    try std.testing.expect(Color.eql(text_node.getText().?.color, k.success));
+}
+
+test "tag: 动态文本 / 颜色的 mount 在任意分配点失败时不泄漏（sweep）" {
+    try @import("../oom_sweep.zig").sweepMount("tag(dynamic)", struct {
+        fn m(scope: *Scope, cx: *Cx) anyerror!?*Node {
+            const status = try scope.createText("Queued", .{});
+            const tone = try scope.createSignal(TagColor, .accent);
+            return try Tag(.{ .label = status, .color = tone, .closable = true }).mount(scope, cx);
+        }
+    }.m);
+}
+
+test "Tag: recipe follows current theme materials and then color state" {
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
+    ctx.setTheme(&theme.light);
+    const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
+    defer scope.dispose();
+    const color = try scope.createSignal(TagColor, .accent);
+    const tag = try Tag(.{ .label = "New", .color = color, .size = .md }).mount(scope, ctx);
+    ctx.root = tag;
+    var custom = theme.light;
+    custom.tokens.font_size.sm = 15;
+    custom.tokens.space.space200 = 10;
+    custom.tokens.space.space100 = 7;
+    custom.tokens.color.accent = Color.hex(0x123456);
+    custom.tokens.color.success = Color.hex(0x456789);
+    ctx.setTheme(&custom);
+    const text_node = label(tag).?;
+    try std.testing.expectEqual(@as(f32, 15), text_node.getText().?.font_size);
+    try std.testing.expectEqual(@as(f32, 10), tag.style.padding.left);
+    try std.testing.expectEqual(@as(f32, 7), tag.style.gap);
+    try std.testing.expectEqual(custom.tokens.color.accent, text_node.getText().?.color);
+    color.set(.success);
+    try std.testing.expectEqual(custom.tokens.color.success, text_node.getText().?.color);
+    ctx.root = null;
+    ctx.freeNode(tag);
 }

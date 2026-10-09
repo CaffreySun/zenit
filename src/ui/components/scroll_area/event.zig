@@ -1,6 +1,5 @@
-/// ScrollArea 滚动事件处理
-///
-/// scrollEventHandler + 嵌套滚动链委托 + 惯性归属 + 辅助判断函数
+/// ScrollArea scroll event handling - scrollEventHandler + nested scroll chain delegation +
+/// momentum ownership + helper functions
 const std = @import("std");
 const core = @import("../../core.zig");
 const Node = core.Node;
@@ -53,7 +52,7 @@ pub fn scrollEventHandler(event: Event, context: ?*anyopaque) EventResult {
             if (!state.external_content_height and cr.h > 0) state.content_height = cr.h;
             if (!state.external_content_width and cr.w > 0) state.content_width = cr.w;
 
-            // viewport 还没初始化（未经过任何 layout），暂不处理
+            // viewport not initialized (no layout yet), defer handling
             if (state.viewport_height <= 0 and state.viewport_width <= 0) {
                 return .ignored;
             }
@@ -65,18 +64,18 @@ pub fn scrollEventHandler(event: Event, context: ?*anyopaque) EventResult {
             else
                 .gesture;
 
-            // 开始信号只由手指下的这一层处理（owner），不冒泡：外层若在回弹，
-            // 冒泡会让它"接住回弹"而被当成持有手势，把内层的手势抢走。外层上的
-            // 旧惯性由调度器补发的惯性 ended 结束；手势委托给外层时，外层在第一次
-            // 实际滚动时 beginTouch。
-            // 结束信号则继续冒泡：手势可能中途委托给了外层，必须到达真正持有它的那层。
+            // begin signal only handled by this layer (owner), don't bubble: if outer layer
+            // rubber-banding, bubble would "catch" it and steal inner gesture. outer's old momentum
+            // ended by scheduler-injected momentum ended; when gesture delegates to outer, outer
+            // beginTouch on first actual scroll. end signal bubbles: gesture may delegate mid-way
+            // to outer, must reach true holder.
             switch (scroll.phase) {
                 .may_begin, .began => {
                     state.momentum_active = false;
                     state.momentum_spent_y = false;
                     state.momentum_spent_x = false;
                     state.latched = false;
-                    // 手指放下接住本层进行中的回弹
+                    // finger down catches ongoing rubber-band in this layer
                     if (state.bonus_y != 0 or state.bonus_x != 0 or state.bounce_active_y or state.bounce_active_x) {
                         state.beginTouch();
                     }
@@ -85,19 +84,20 @@ pub fn scrollEventHandler(event: Event, context: ?*anyopaque) EventResult {
                 .ended, .cancelled => {
                     if (state.touching) {
                         state.touching = false;
-                        // 松手时已越界：这一轴随后朝外的惯性交给弹簧
+                        // release while overscrolled: outward momentum on this axis handed to
+                        // spring
                         if (state.bonus_y != 0) state.momentum_spent_y = true;
                         if (state.bonus_x != 0) state.momentum_spent_x = true;
                         logScroll("touch end id={d} phase={s} bonus_y={d:.2} bonus_x={d:.2}", .{ container.id, @tagName(scroll.phase), state.bonus_y, state.bonus_x });
                     }
-                    // cancelled 之后没有惯性，手势归属到此为止
+                    // no momentum after cancel, gesture ownership ends
                     if (scroll.phase == .cancelled) state.latched = false;
                     return .ignored;
                 },
                 .none, .changed => {},
             }
             if (kind == .momentum) {
-                // 有惯性说明手指已经离开
+                // momentum means finger already released
                 state.touching = false;
                 if (scroll.momentum == .ended) {
                     state.momentum_active = false;
@@ -106,8 +106,9 @@ pub fn scrollEventHandler(event: Event, context: ?*anyopaque) EventResult {
                 }
             }
 
-            // 嵌套滚动链：边界向外滚时，让外层 ScrollArea 处理（更接近 iOS/macOS 原生手感）
-            // .both 模式：两轴独立 delegate，一个轴 delegate 不影响另一轴正常滚动
+            // nested scroll chain: delegate to outer ScrollArea at boundary (closer to native
+            // iOS/macOS feel). .both mode: axes delegate independently, one axis delegating doesn't
+            // affect other axis normal scroll
             var skip_y = false;
             var skip_x = false;
             const wants_v = scroll.dy != 0;
@@ -142,9 +143,10 @@ pub fn scrollEventHandler(event: Event, context: ?*anyopaque) EventResult {
                 if (can_h) {
                     skip_x = skip_x or shouldDelegateHorizontalToAncestor(state, ctx, scroll.dx, is_momentum);
                 }
-                // 一个轴要交给外层、另一个轴本层能滚：按主导轴决定整个事件的归属（与单轴
-                // 的 cross-dominant passthrough 同一规则），否则本层吃掉一轴、另一轴凭空
-                // 消失。本层已持有手势（或它的惯性）时不换手，次要轴随之留在本层。
+                // one axis delegates to outer, other scrolls here: use dominant axis to decide
+                // whole event ownership (same cross-dominant passthrough rule), else this layer
+                // eats one axis and other disappears. don't switch when already holding gesture (or
+                // its momentum), secondary axis stays with this layer.
                 const y_leaves = wants_v and skip_y;
                 const x_leaves = wants_h and skip_x;
                 const holds_stream = state.touching or (is_momentum and state.latched);
@@ -184,7 +186,7 @@ pub fn scrollEventHandler(event: Event, context: ?*anyopaque) EventResult {
                         scroll.dy,
                         scroll.dx,
                     });
-                    // 手势归属上抛 -> 本层放弃 latch
+                    // gesture ownership bubbles up -> this layer relinquishes latch
                     if (kind == .gesture) {
                         state.latched = false;
                         state.touching = false;
@@ -194,7 +196,8 @@ pub fn scrollEventHandler(event: Event, context: ?*anyopaque) EventResult {
                 }
             }
 
-            // 惯性：越界部分归弹簧；本段惯性已撞过边界的轴不再朝外推。
+            // momentum: overscroll portion goes to spring; axes that already hit boundary this
+            // segment don't push outward.
             if (kind == .momentum) {
                 state.momentum_active = true;
                 const block_y = momentumBlockedY(state, scroll.dy, ctx.scroll_speed);
@@ -222,8 +225,8 @@ pub fn scrollEventHandler(event: Event, context: ?*anyopaque) EventResult {
             if (kind == .gesture) state.beginTouch();
 
             var handled_axis = false;
-            // 分轴跟踪，scrollbar fade 必须知道哪个轴被实际滚动，
-            // 否则纯 Y 滚动也会让 X scrollbar 闪现（VSCode/Zed 行为：只显示活跃轴）。
+            // per-axis tracking, scrollbar fade must know which axis actually scrolled, else pure Y
+            // scroll also flashes X scrollbar (VSCode/Zed behavior: show only active axes).
             var applied_y = false;
             var applied_x = false;
             switch (ctx.direction) {
@@ -271,7 +274,8 @@ pub fn scrollEventHandler(event: Event, context: ?*anyopaque) EventResult {
                 state.input_serial +%= 1;
                 state.onScrollActivityAxes(applied_y, applied_x);
                 switch (kind) {
-                    // 本层实际处理了这轮手势 -> 持有 latch，momentum 跟随本层
+                    // this layer actually handled this gesture -> holds latch, momentum follows
+                    // this layer
                     .gesture => state.latched = true,
                     .momentum => {
                         if (applied_y and state.bonus_y != 0) state.momentum_spent_y = true;
@@ -288,13 +292,13 @@ pub fn scrollEventHandler(event: Event, context: ?*anyopaque) EventResult {
             return .stop;
         },
         .mouse_move => |move| {
-            // 垂直条 hover 检测：视觉更细，但保留更宽的交互热区。
+            // vertical bar hover: visual fine, but keep wider interaction hotzone.
             const sb = ctx.scrollbar orelse return .ignored;
             const was_hovered = state.scrollbar_hovered;
             state.scrollbar_hovered = state.needsScrollbar() and sb.rectFromWorldOrFallback().w > 0 and
                 move.x >= sb.rectFromWorldOrFallback().x - state_mod.ScrollbarVisual.hover_slop and move.x <= sb.rectFromWorldOrFallback().x + sb.rectFromWorldOrFallback().w + state_mod.ScrollbarVisual.hover_slop;
             if (state.scrollbar_hovered and !was_hovered) state.onScrollActivity();
-            // 水平条 hover 检测：同样使用热区放大，避免细条难命中。
+            // horizontal bar hover: also use hotzone expansion, avoid fine bar hard-hit.
             const sb_h = ctx.scrollbar_h orelse return .ignored;
             const was_hovered_h = state.scrollbar_hovered_h;
             state.scrollbar_hovered_h = state.needsHScrollbar() and sb_h.rectFromWorldOrFallback().h > 0 and
@@ -303,14 +307,14 @@ pub fn scrollEventHandler(event: Event, context: ?*anyopaque) EventResult {
             return .ignored;
         },
         .mouse_down => {
-            // container 不处理 mouse_down，scrollbar 的 hitTest 会处理
+            // container doesn't handle mouse_down, scrollbar's hitTest does
             return .ignored;
         },
         else => return .ignored,
     }
 }
 
-// ========== 辅助判断函数 ==========
+// ========== helper functions ==========
 
 pub fn isAtVerticalBoundary(state: *const ScrollState) bool {
     const epsilon = ScrollState.scroll_tuning.jitter_snap_epsilon;
@@ -353,7 +357,7 @@ fn isOutwardAtBoundaryX(state: *const ScrollState, delta: f32) bool {
     return (at_left and delta < 0) or (at_right and delta > 0);
 }
 
-/// 回弹动画是否活跃（duration 内 outward momentum 被拒绝）
+/// rubber-band animation active (outward momentum rejected within duration)
 pub fn hasBounceActive(state: *const ScrollState, direction: ScrollDirection) bool {
     return switch (direction) {
         .vertical => state.bounce_active_y,
@@ -376,8 +380,8 @@ pub fn isOutwardAtBoundary(state: *const ScrollState, direction: ScrollDirection
     return switch (direction) {
         .vertical => isOutwardAtBoundaryY(state, v_delta),
         .horizontal => isOutwardAtBoundaryX(state, h_delta),
-        // .both: delta=0 的轴视为中性（不参与判断），
-        // 只对有非零 delta 的轴做 outward 检查
+        // .both: axes with delta=0 treated neutral (don't participate), only check outward for
+        // non-zero delta axes
         .both => blk: {
             const has_v = canScrollVerticalAxis(state);
             const has_h = canScrollHorizontalAxis(state);
@@ -388,7 +392,7 @@ pub fn isOutwardAtBoundary(state: *const ScrollState, direction: ScrollDirection
             }
             if (v_active) break :blk isOutwardAtBoundaryY(state, v_delta);
             if (h_active) break :blk isOutwardAtBoundaryX(state, h_delta);
-            break :blk false; // 两个轴都没活跃 delta
+            break :blk false; // neither axis has active delta
         },
     };
 }
@@ -406,11 +410,11 @@ fn supportsAxis(direction: ScrollDirection, axis: ScrollAxis) bool {
     };
 }
 
-/// 单次遍历祖先链，同时检查是否存在支持该轴的祖先 ScrollArea 及其是否活跃
+/// single ancestor chain traverse, check if ancestor ScrollArea supports axis and is active
 const AncestorCheckResult = struct {
     exists: bool,
     is_active: bool,
-    /// 是否有祖先持有当前手势的 latch（momentum 归属判断用）
+    /// does any ancestor hold current gesture's latch (for momentum ownership)
     has_latch: bool,
 };
 
@@ -426,10 +430,10 @@ fn checkAncestorScrollArea(container: *Node, axis: ScrollAxis) AncestorCheckResu
                     result.exists = true;
                     const s = ancestor_ctx.state;
                     if (s.latched) result.has_latch = true;
-                    // 祖先正持有当前触控板手势（手指在板上）
+                    // ancestor holding current trackpad gesture (finger on pad)
                     if (s.touching) {
                         result.is_active = true;
-                        break; // 找到活跃祖先，无需继续
+                        break; // found active ancestor, no need continue
                     }
                 }
             }
@@ -447,15 +451,15 @@ fn shouldDelegateVerticalToAncestor(state: *ScrollState, ctx: *const ScrollEvent
     const delta = -dy * ctx.scroll_speed;
     const epsilon = ScrollState.scroll_tuning.jitter_snap_epsilon;
     if (@abs(delta) <= epsilon) return false;
-    // macOS 手势 latching：momentum 归 latch 持有者；本层 latch 则永不上抛，
-    // 否则若有活跃/latch 的祖先则冒泡（惯性跟随发起手势的那一层）。
+    // macOS gesture latching: momentum goes to latch holder; this layer's latch never bubbles, else
+    // bubbles if active/latch ancestor (momentum follows gesture initiator).
     if (is_momentum) {
         if (state.latched) return false;
         return ancestor.is_active or ancestor.has_latch;
     }
     if (ancestor.is_active) return true;
-    // 手势中段不换手（NSScrollView 10.9+ latch 语义）：
-    // 本层已开始处理这轮手势后，即使滚到边界也留在本层 rubber-band，不上抛。
+    // no hand-off mid-gesture (NSScrollView 10.9+ latch semantics): once this layer starts
+    // handling, stay rubber-band even at boundary, don't bubble.
     if (state.touching) return false;
 
     const max = state.maxScrollY();
@@ -491,7 +495,7 @@ fn shouldDelegateHorizontalToAncestor(state: *ScrollState, ctx: *const ScrollEve
         return ancestor.is_active or ancestor.has_latch;
     }
     if (ancestor.is_active) return true;
-    // 手势中段不换手（latch 语义），到边界后本层 rubber-band
+    // no hand-off mid-gesture (latch), rubber-band when at boundary
     if (state.touching) return false;
 
     const max = state.maxScrollX();
@@ -526,12 +530,14 @@ fn syncContentTranslate(state: *const ScrollState, content: *Node) void {
     if (new_ty != content.style.translate_y or new_tx != content.style.translate_x) {
         content.style.translate_y = new_ty;
         content.style.translate_x = new_tx;
-        // 滚动逐帧平移（内容未变）：anim-frame 组合（interaction+composite）。
+        // scroll frame-by-frame offset (content unchanged): anim-frame combo
+        // (interaction+composite).
         content.markCompositeAnimFrameDirty();
     }
 }
 
-/// 惯性在 Y 轴是否不再作用于内容：越界量由弹簧独占；或本段惯性已撞过边界且仍朝外。
+/// does momentum on Y axis no longer affect content: overscroll owned by spring; or this segment's
+/// momentum already hit boundary and still pushing out.
 fn momentumBlockedY(state: *const ScrollState, dy: f32, speed: f32) bool {
     if (dy == 0) return false;
     if (state.bonus_y != 0) return true;

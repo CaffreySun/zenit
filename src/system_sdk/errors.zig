@@ -1,4 +1,4 @@
-/// System SDK 错误集合
+/// System SDK error set
 pub const SdkError = error{
     NotSupported,
     Unavailable,

@@ -139,7 +139,7 @@ const PreserveAspectRatio = struct {
 const MAX_RASTER_DIMENSION: u32 = 8192;
 
 const SvgDocument = struct {
-    drawables: std.ArrayList(Drawable) = .{},
+    drawables: std.ArrayList(Drawable) = .empty,
     view_min_x: f32 = 0,
     view_min_y: f32 = 0,
     view_width: f32 = 0,
@@ -166,7 +166,7 @@ pub fn rasterize(
 
     const out = determineOutputSize(&doc, options);
 
-    // 防止极端尺寸导致整数溢出或 OOM（最大 8192x8192）
+    // Prevent integer overflow or OOM from extreme sizes (max 8192x8192)
     if (out.width == 0 or out.height == 0) return error.InvalidSvg;
     if (out.width > MAX_RASTER_DIMENSION or out.height > MAX_RASTER_DIMENSION) return error.InvalidSvg;
 
@@ -349,8 +349,8 @@ fn roundedOutputDimension(value: f32) u32 {
     return @max(1, @as(u32, @intFromFloat(rounded)));
 }
 
-/// 元素级解析结果的处理：畸形元素（error.InvalidSvg）按 SVG 惯例跳过，
-/// 但分配失败必须冒泡，吞掉 OOM 会让图标静默少画几笔，看起来像渲染 bug。
+/// Per-element parse: malformed (error.InvalidSvg) skip per spec, but allocation failures
+/// bubble up. Swallowing OOM silently renders partial icons (looks like render bug).
 fn skipMalformed(result: anyerror!void) error{OutOfMemory}!void {
     result catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -366,7 +366,7 @@ fn parseDocument(allocator: std.mem.Allocator, svg_data: []const u8) !SvgDocumen
         name: []const u8,
         style: ElementStyle,
     };
-    var style_stack = std.ArrayList(StyleFrame){};
+    var style_stack = @as(std.ArrayList(StyleFrame), .empty);
     defer style_stack.deinit(allocator);
     try style_stack.append(allocator, .{
         .name = "__root__",
@@ -549,7 +549,7 @@ fn parseRectElement(
     pts[2] = .{ .x = x + w, .y = y + h };
     pts[3] = .{ .x = x, .y = y + h };
 
-    // contours 分配失败时 pts 尚未被任何容器接管，必须就地释放。
+    // When contours allocation fails, pts not yet owned by any container; must free in place.
     const contours = allocator.alloc(Contour, 1) catch |e| {
         allocator.free(pts);
         return e;
@@ -578,7 +578,7 @@ fn parseCircleElement(
     if (r <= 0) return;
 
     const pts = try buildEllipsePoints(allocator, cx, cy, r, r);
-    // contours 分配失败时 pts 尚未被任何容器接管，必须就地释放。
+    // When contours allocation fails, pts not yet owned by any container; must free in place.
     const contours = allocator.alloc(Contour, 1) catch |e| {
         allocator.free(pts);
         return e;
@@ -607,7 +607,7 @@ fn parseEllipseElement(
     if (rx <= 0 or ry <= 0) return;
 
     const pts = try buildEllipsePoints(allocator, cx, cy, rx, ry);
-    // contours 分配失败时 pts 尚未被任何容器接管，必须就地释放。
+    // When contours allocation fails, pts not yet owned by any container; must free in place.
     const contours = allocator.alloc(Contour, 1) catch |e| {
         allocator.free(pts);
         return e;
@@ -637,7 +637,7 @@ fn parseLineElement(
     pts[0] = .{ .x = x1, .y = y1 };
     pts[1] = .{ .x = x2, .y = y2 };
 
-    // contours 分配失败时 pts 尚未被任何容器接管，必须就地释放。
+    // When contours allocation fails, pts not yet owned by any container; must free in place.
     const contours = allocator.alloc(Contour, 1) catch |e| {
         allocator.free(pts);
         return e;
@@ -673,7 +673,7 @@ fn parsePolyElement(
         return;
     }
 
-    // contours 分配失败时 pts 尚未被任何容器接管，必须就地释放。
+    // When contours allocation fails, pts not yet owned by any container; must free in place.
     const contours = allocator.alloc(Contour, 1) catch |e| {
         allocator.free(pts);
         return e;
@@ -715,7 +715,8 @@ fn appendDrawableOwned(
         return;
     }
 
-    // 所有权合同：本函数接管 contours，成功时交给 drawables，失败时释放。
+    // Ownership contract: function takes ownership of contours, transfers to drawables on success,
+    // frees on failure.
     drawables.append(allocator, .{
         .contours = contours,
         .fill = fill_color,
@@ -769,13 +770,13 @@ fn buildEllipsePoints(allocator: std.mem.Allocator, cx: f32, cy: f32, rx: f32, r
 }
 
 fn parsePathContours(allocator: std.mem.Allocator, d: []const u8) ![]Contour {
-    var contours = std.ArrayList(Contour){};
+    var contours = @as(std.ArrayList(Contour), .empty);
     errdefer {
         for (contours.items) |c| allocator.free(c.points);
         contours.deinit(allocator);
     }
 
-    var points = std.ArrayList(Point){};
+    var points = @as(std.ArrayList(Point), .empty);
     defer points.deinit(allocator);
 
     var i: usize = 0;
@@ -1023,8 +1024,8 @@ fn appendContourOwned(
     points: *std.ArrayList(Point),
     closed: bool,
 ) !void {
-    // 先预留槽位再转移点集：toOwnedSlice 之后的 append 若失败，点集已脱离
-    // `points` 又没进 `contours`，两边的清理都够不着，泄漏。
+    // Reserve slot before transferring points: if append after toOwnedSlice fails, points
+    // are disconnected from `points` but not in `contours`; both cleanups miss it (leak).
     try contours.ensureUnusedCapacity(allocator, 1);
     const owned_points = try points.toOwnedSlice(allocator);
     contours.appendAssumeCapacity(.{
@@ -1312,7 +1313,7 @@ fn drawDrawable(
             }
 
             const idx = (@as(usize, @intCast(py)) * @as(usize, out_w) + @as(usize, @intCast(px))) * 4;
-            if (idx + 4 > pixels.len) continue; // 边界保护
+            if (idx + 4 > pixels.len) continue; // Boundary check
 
             if (drawable.fill) |fill_color| {
                 if (fill_hits > 0) {
@@ -1845,7 +1846,7 @@ fn nextCsvToken(s: []const u8, index: *usize) ?[]const u8 {
 }
 
 fn parsePointList(allocator: std.mem.Allocator, raw: []const u8) ![]Point {
-    var points = std.ArrayList(Point){};
+    var points = @as(std.ArrayList(Point), .empty);
     errdefer points.deinit(allocator);
 
     var i: usize = 0;
@@ -1933,16 +1934,12 @@ fn parseDimension(value: []const u8) ?f32 {
     return parseUnitFloat(value);
 }
 
-/// 解析带单位的 CSS 属性值（`width="10px"`）：解析前导数字，忽略尾部单位。
+/// Parse CSS attribute values with units: extract number, ignore unit (width="10px").
 ///
-/// ⚠ 这是 `svg_safety.parseFiniteNumber` 的**近似重复**，但**不能**直接合并：
-/// 两者对分隔符的语义不同，parseFiniteNumber 服务 path data（`M 10,20`），
-/// 会先 skipNumberSeparators 吃掉前导逗号/空白；而 CSS 属性值里前导逗号是
-/// 非法的，必须拒绝（`width=",10"` 不是 10）。
-///
-/// 数值解析核心（符号/小数点/指数/isFinite 拒绝）实测与 parseFiniteNumber
-/// **完全一致**：排除分隔符字符后 20 万轮随机输入零差异（2026-09-22）。
-/// 改动任何一边的数值逻辑时，另一边必须同步，下面的测试锁住这条等价性。
+/// Duplicates svg_safety.parseFiniteNumber but can't merge due to different separator
+/// semantics: path data skips leading comma/space; CSS rejects it (width=",10" invalid).
+/// Numeric core verified identical. Changes to numeric logic must sync both; test locks
+/// equivalence.
 fn parseUnitFloat(value: []const u8) ?f32 {
     const v = trimAscii(value);
     if (v.len == 0) return null;
@@ -2202,17 +2199,17 @@ test "svg rasterization bounds extreme dimensions and curve geometry" {
 }
 
 test "parseUnitFloat 与 svg_safety.parseFiniteNumber 的数值核心必须保持一致" {
-    // 两份实现逐字节重复（见 parseUnitFloat 的文档注释：分隔符语义不同，
-    // 不能合并）。这个测试锁住「除分隔符外行为一致」，让任何一边的数值
-    // 逻辑改动都会在另一边暴露出来，安全修复最怕的就是悄悄分叉。
+    // Two implementations replicate bytewise (see parseUnitFloat docstring: separator
+    // semantics differ, can't merge). This test locks behavior parity excluding separators;
+    // any numeric logic change exposes on the other side. Safe fixes fear silent divergence.
     //
-    // 用例不含逗号/空白：那是两者**有意**分歧的地方。
+    // Test cases omit comma/space: intentional divergence point.
     const cases = [_][]const u8{
         "0",   "1",   "-1",   "+1",   "1.5",   "-1.5",  ".5",   "-.5",
         "1e3", "1E3", "1e+3", "1e-3", "-1e-3", "1.5e2", "10px", "2.5em",
         "50%", "3pt", "e5",   "E",    "+",     "-",     ".",    "+.",
         "-.",  "1e",  "1e+",  "1e-",  "..",    "--1",   "++1",
-        "1e999999", "-1e999999", // 溢出 ⇒ 两边都必须靠 isFinite 拒绝
+        "1e999999", "-1e999999", // Overflow -> both sides reject via isFinite
         "",         "px",
         "abc",
     };
@@ -2226,16 +2223,16 @@ test "parseUnitFloat 与 svg_safety.parseFiniteNumber 的数值核心必须保�
         if (via_unit) |a| {
             const b = via_safety.?;
             try std.testing.expectEqual(a, b);
-            // 两边都只放行有限值
+            // Both sides pass only finite values
             try std.testing.expect(std.math.isFinite(a));
         }
     }
 }
 
 test "parseUnitFloat 拒绝前导分隔符（与 path data 的有意分歧）" {
-    // CSS 属性值里前导逗号非法：`width=",10"` 不是 10。
-    // 而 path data 的 parseFiniteNumber 会吃掉它，这是两者唯一的分歧点，
-    // 显式锁住，免得日后有人"统一"时把它抹平。
+    // Leading comma illegal in CSS attributes: width=",10" is not 10.
+    // Path data parseFiniteNumber eats it; intentional single divergence point.
+    // Lock explicitly to prevent future unification attempts.
     try std.testing.expectEqual(@as(?f32, null), parseUnitFloat(",10"));
 
     var i: usize = 0;
@@ -2243,9 +2240,10 @@ test "parseUnitFloat 拒绝前导分隔符（与 path data 的有意分歧）" {
 }
 
 test "svg 解析在任意一次分配失败时不泄漏（checkAllAllocationFailures）" {
-    // 回归：rect/circle/ellipse 先分配 points 再分配 contours，后者失败时
-    // points 泄漏；appendDrawableOwned 的 drawables.append 失败时 contours
-    // 泄漏；appendContourOwned toOwnedSlice 之后 append 失败时点集泄漏。
+    // Regression: (1) rect/circle/ellipse allocate points then contours - contours fail leaks
+    // points
+    // (2) appendDrawableOwned - drawables.append fail leaks contours
+    // (3) appendContourOwned - toOwnedSlice then append fail leaks points
     const svg =
         \\<svg viewBox="0 0 24 24" stroke="#000" stroke-width="2">
         \\  <g fill="#123456">

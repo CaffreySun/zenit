@@ -34,13 +34,13 @@ const IconEntry = struct {
     ident: []const u8,
 };
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
 
-    const args = try std.process.argsAlloc(alloc);
-    defer std.process.argsFree(alloc, args);
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
     if (args.len < 3) {
         std.debug.print("usage: gen_svg_assets <icons_dir> <output_file> [embed_prefix] [base_icon_id]\n", .{});
         return error.BadArgs;
@@ -54,7 +54,7 @@ pub fn main() !void {
         1000;
 
     // 1. Collect *.svg file stems, sorted for stable icon_id assignment.
-    var entries = std.ArrayList(IconEntry){};
+    var entries = @as(std.ArrayList(IconEntry), .empty);
     defer {
         for (entries.items) |e| {
             alloc.free(e.file_stem);
@@ -63,10 +63,10 @@ pub fn main() !void {
         entries.deinit(alloc);
     }
 
-    var dir = try std.fs.cwd().openDir(icons_dir_path, .{ .iterate = true });
-    defer dir.close();
+    var dir = try std.Io.Dir.cwd().openDir(io, icons_dir_path, .{ .iterate = true });
+    defer dir.close(io);
     var it = dir.iterate();
-    while (try it.next()) |entry| {
+    while (try it.next(io)) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.name, ".svg")) continue;
         const stem = entry.name[0 .. entry.name.len - ".svg".len];
@@ -99,7 +99,7 @@ pub fn main() !void {
     );
 
     // 3. Emit one named const per icon.
-    var generated_entries = std.ArrayList(IconEntry){};
+    var generated_entries = @as(std.ArrayList(IconEntry), .empty);
     defer generated_entries.deinit(alloc);
 
     var icon_id: u16 = base_icon_id;
@@ -110,7 +110,7 @@ pub fn main() !void {
         const svg_full = try std.fmt.allocPrint(alloc, "{s}.svg", .{svg_path});
         defer alloc.free(svg_full);
 
-        const svg_data = std.fs.cwd().readFileAlloc(alloc, svg_full, 1 << 20) catch |err| {
+        const svg_data = std.Io.Dir.cwd().readFileAlloc(io, svg_full, alloc, .limited(1 << 20)) catch |err| {
             std.debug.print("WARN: read {s}: {s}\n", .{ svg_full, @errorName(err) });
             skipped += 1;
             continue;
@@ -175,7 +175,7 @@ pub fn main() !void {
         \\
     );
 
-    try std.fs.cwd().writeFile(.{ .sub_path = output_path, .data = aw.written() });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = output_path, .data = aw.written() });
     std.debug.print("gen-icons: wrote {d} icons (ids {d}..{d}, {d} skipped) → {s}\n", .{ icon_id - base_icon_id, base_icon_id, icon_id - 1, skipped, output_path });
 }
 
@@ -227,16 +227,16 @@ fn emitAsset(
     try w.writeAll("};\n");
 }
 
-/// Convert an icon file stem to a valid Zig identifier:
-/// hyphens -> underscores, uppercase -> lowercase. Dataset is known-clean
-/// (only `-` and one capital), so no leading-digit or keyword handling needed.
-/// Zig 关键字与基础类型名，与之同名的图标必须走 `@"..."` 转义，
-/// 否则生成物编译不过。真实踩坑：Lucide 有个 `type.svg`，直接生成
-/// `pub const type = ...` 报 "name shadows primitive 'type'"。
-/// 图标集是外部输入，不能假设文件名一定是合法 Zig 标识符。
+/// Convert icon file stem to valid Zig identifier: hyphens -> underscores,
+/// uppercase -> lowercase. Dataset is known-clean (only `-` and one capital), so no
+/// leading-digit or keyword handling. Zig keywords and primitive names must use the
+/// `@"..."` without backslashes, else generated code won't compile. Real pitfall: Lucide has
+/// `type.svg`; direct generation makes `pub const type = ...` fail with "name shadows
+/// primitive 'type'". Icon set is external input, can't assume file names are valid
+/// Zig identifiers.
 fn needsEscape(ident: []const u8) bool {
     const reserved = [_][]const u8{
-        // 关键字
+        // Keywords
         "addrspace",      "align",       "allowzero",    "and",       "anyframe",
         "anytype",        "asm",         "async",        "await",     "break",
         "callconv",       "catch",       "comptime",     "const",     "continue",
@@ -247,7 +247,7 @@ fn needsEscape(ident: []const u8) bool {
         "resume",         "return",      "struct",       "suspend",   "switch",
         "test",           "threadlocal", "try",          "union",     "unreachable",
         "usingnamespace", "var",         "volatile",     "while",
-        // 基础类型 / 值
+        // Primitive types / values
             "bool",
         "void",           "type",        "anyerror",     "anyopaque", "comptime_int",
         "comptime_float", "noreturn",    "null",         "true",      "false",
@@ -259,7 +259,7 @@ fn needsEscape(ident: []const u8) bool {
     for (reserved) |r| {
         if (std.mem.eql(u8, ident, r)) return true;
     }
-    // i32 / u8 / i0 这类整型基础类型是无穷集，按模式识别
+    // Integer primitives like i32 / u8 / i0 are infinite set, recognize by pattern
     if (ident.len >= 2 and (ident[0] == 'i' or ident[0] == 'u')) {
         for (ident[1..]) |c| {
             if (c < '0' or c > '9') return false;
@@ -280,7 +280,7 @@ fn toIdent(alloc: std.mem.Allocator, stem: []const u8) ![]const u8 {
         };
     }
 
-    // 数字开头同样不是合法标识符（Lucide 有 `4k.svg`、`123.svg` 这类）
+    // Leading digit also invalid identifier (Lucide has `4k.svg`, `123.svg` etc)
     const digit_leading = lowered.len > 0 and lowered[0] >= '0' and lowered[0] <= '9';
     if (needsEscape(lowered) or digit_leading) {
         return std.fmt.allocPrint(alloc, "@\"{s}\"", .{lowered});

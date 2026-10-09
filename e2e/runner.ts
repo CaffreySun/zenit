@@ -1,4 +1,4 @@
-/// E2E Test Runner，极简测试框架
+/// E2E Test Runner, minimal test framework
 import { mkdirSync, writeFileSync, appendFileSync } from "fs";
 import { randomUUID } from "crypto";
 
@@ -16,7 +16,9 @@ let failed = 0;
 const failures: { name: string; error: string }[] = [];
 
 const SESSION_ID = randomUUID().slice(0, 8);
-const SESSION_DIR = `/tmp/zenit_e2e_test/${SESSION_ID}`;
+// ZENIT_E2E_SESSION_ROOT: a suite run on the Windows worker keeps its output
+// beside the job so the worker can archive it.
+const SESSION_DIR = `${process.env.ZENIT_E2E_SESSION_ROOT ?? "/tmp/zenit_e2e_test"}/${SESSION_ID}`;
 
 function ensureSessionDir(): void {
   mkdirSync(SESSION_DIR, { recursive: true });

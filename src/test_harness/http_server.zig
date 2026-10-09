@@ -1,8 +1,9 @@
-/// http_server，测试 HTTP 服务器（file RPC 模式）
+/// http_server: test HTTP server (file RPC mode)
 ///
-/// 监听 file RPC dir，TS 客户端写 req-XXX.json，server 读后写 res-XXX.json。
-/// 不用真 TCP socket 因为 zig 0.15 stdlib 上 TCP server API 不稳定。
+/// Listens to file RPC dir; TS client writes req-XXX.json, server reads then writes res-XXX.json.
+/// No real TCP socket: Zig 0.15 stdlib TCP server API unstable.
 const std = @import("std");
+const builtin = @import("builtin");
 const build_options = @import("build_options");
 const command_queue = @import("command_queue.zig");
 const ui = @import("ui");
@@ -17,19 +18,24 @@ const KeyPayload = command_queue.KeyPayload;
 const PORT: u16 = build_options.e2e_port;
 const MAX_BODY_SIZE = 2 * 1024 * 1024;
 const FILE_RPC_POLL_MS: u64 = 10;
+const OwnerPid = if (builtin.os.tag == .windows) u32 else std.c.pid_t;
+
+extern "kernel32" fn OpenProcess(u32, i32, u32) callconv(.winapi) ?*anyopaque;
+extern "kernel32" fn GetExitCodeProcess(?*anyopaque, *u32) callconv(.winapi) i32;
+extern "kernel32" fn CloseHandle(?*anyopaque) callconv(.winapi) i32;
+
+fn ownerPid() OwnerPid {
+    if (comptime builtin.os.tag == .windows) return std.os.windows.GetCurrentProcessId();
+    return std.c.getpid();
+}
 
 const RequestResult = struct {
     status: u16,
     body: []const u8,
 };
 
-fn readFileCompat(dir: std.fs.Dir, path: []const u8, allocator: std.mem.Allocator) ![]u8 {
-    const f = @typeInfo(@TypeOf(std.fs.Dir.readFileAlloc)).@"fn";
-    if (f.params.len >= 3 and f.params[1].type == std.mem.Allocator) {
-        return dir.readFileAlloc(allocator, path, MAX_BODY_SIZE);
-    } else {
-        return dir.readFileAlloc(path, allocator, .limited(MAX_BODY_SIZE));
-    }
+fn readFileCompat(dir: std.Io.Dir, io: std.Io, path: []const u8, allocator: std.mem.Allocator) ![]u8 {
+    return dir.readFileAlloc(io, path, allocator, .limited(MAX_BODY_SIZE));
 }
 
 fn fileRpcDirFromEnv() []const u8 {
@@ -55,48 +61,46 @@ pub fn serverThread(queue: *CommandQueue) void {
 
 const OWNER_FILE = "owner.json";
 
-/// 单主锁：一个 file-RPC 目录同一时刻只允许一个 server 实例应答。
+/// Single-owner lock: one file-RPC dir, one active server instance at a time.
 ///
-/// 背景（2026-08-16 实测事故）：两份 e2e 并发共用默认目录时，server 用
-/// `rename(req->wrk)` 原子抢单，每个请求被**随机一个**实例应答，query 打到
-/// 另一实例的树，呈现为大面积 "test_id not found" 假失败。泄漏的旧实例
-/// 同理。冲突必须显式失败，不能静默错答。
+/// Concurrent e2e runs sharing one dir let a random instance serve each request, giving false
+/// 'test_id not found' failures. Conflicts must fail explicitly.
 ///
-/// 协议：启动时以 O_EXCL 原子创建 owner.json（pid + 时间戳）。已存在则
-/// 探活 owner pid：活着 -> 返回 error.FileRpcDirAlreadyOwned（调用方拒绝
-/// 服务并大声报错）；死了 -> 视为 crash 残留，删除后重新竞争。owner.json
-/// 不匹配 req-*.json 前缀，对请求扫描零干扰；进程退出不删（crash 留痕，
-/// 由下一个实例探活接管）。
-fn claimFileRpcOwnership(rpc_dir: []const u8) !void {
-    var dir = try std.fs.cwd().openDir(rpc_dir, .{});
-    defer dir.close();
+/// Protocol: atomic O_EXCL create of owner.json (pid + timestamp) at startup. If it exists, probe
+/// the owner pid: alive -> error.FileRpcDirAlreadyOwned (caller rejects, logs error);
+/// dead -> crash residue, delete + retry lock. On exit don't delete (leave crash trace
+/// for the next instance to detect).
+fn claimFileRpcOwnership(io: std.Io, rpc_dir: []const u8) !void {
+    var dir = try std.Io.Dir.cwd().openDir(io, rpc_dir, .{});
+    defer dir.close(io);
 
     var attempts: u8 = 0;
     while (attempts < 4) : (attempts += 1) {
-        if (dir.createFile(OWNER_FILE, .{ .exclusive = true })) |f| {
-            defer f.close();
+        if (dir.createFile(io, OWNER_FILE, .{ .exclusive = true })) |f| {
+            defer f.close(io);
             var buf: [128]u8 = undefined;
-            // pid 写成 JSON 字符串以复用 findJsonString（本文件的极简解析器只认字符串值）。
+            // pid written as JSON string to reuse findJsonString (file's minimal parser only
+            // recognizes string values).
             const body = std.fmt.bufPrint(&buf, "{{\"pid\":\"{d}\",\"claimed_at_ns\":\"{d}\"}}", .{
-                std.c.getpid(),
-                std.time.nanoTimestamp(),
+                ownerPid(),
+                @import("zenit_time").nanoTimestamp(io),
             }) catch unreachable;
-            try f.writeAll(body);
+            try f.writeStreamingAll(io, body);
             return;
         } else |err| switch (err) {
             error.PathAlreadyExists => {
-                const text = readFileCompat(dir, OWNER_FILE, std.heap.page_allocator) catch {
-                    // 读失败（如恰好被删）：下一轮重新竞争创建。
+                const text = readFileCompat(dir, io, OWNER_FILE, std.heap.page_allocator) catch {
+                    // Read fails (e.g. file just deleted): retry lock creation next round.
                     continue;
                 };
                 defer std.heap.page_allocator.free(text);
                 const pid = parseOwnerPid(text) orelse {
-                    // 坏 owner.json：视为残留，接管。
-                    dir.deleteFile(OWNER_FILE) catch {};
+                    // Malformed owner.json: treat as residue, take over.
+                    dir.deleteFile(io, OWNER_FILE) catch {};
                     continue;
                 };
                 if (pidIsAlive(pid)) return error.FileRpcDirAlreadyOwned;
-                dir.deleteFile(OWNER_FILE) catch {};
+                dir.deleteFile(io, OWNER_FILE) catch {};
                 continue;
             },
             else => return err,
@@ -105,23 +109,29 @@ fn claimFileRpcOwnership(rpc_dir: []const u8) !void {
     return error.FileRpcOwnershipRace;
 }
 
-fn parseOwnerPid(text: []const u8) ?std.c.pid_t {
+fn parseOwnerPid(text: []const u8) ?OwnerPid {
     const pid_str = findJsonString(text, "pid") orelse return null;
-    return std.fmt.parseInt(std.c.pid_t, pid_str, 10) catch null;
+    return std.fmt.parseInt(OwnerPid, pid_str, 10) catch null;
 }
 
-fn pidIsAlive(pid: std.c.pid_t) bool {
-    std.posix.kill(pid, 0) catch |err| switch (err) {
-        // EPERM：进程存在但无权限发信号，算活着。
-        error.PermissionDenied => return true,
-        else => return false,
+fn pidIsAlive(pid: OwnerPid) bool {
+    if (comptime builtin.os.tag == .windows) {
+        const process = OpenProcess(0x1000, 0, pid) orelse
+            return std.os.windows.GetLastError() == .ACCESS_DENIED;
+        defer _ = CloseHandle(process);
+        var code: u32 = 0;
+        return GetExitCodeProcess(process, &code) != 0 and code == 259;
+    }
+    const result = std.c.kill(pid, @fromBackingInt(0));
+    return switch (std.posix.errno(result)) {
+        .SUCCESS, .PERM => true,
+        else => false,
     };
-    return true;
 }
 
 fn runFileRpcServer(queue: *CommandQueue, rpc_dir: []const u8) !void {
-    try std.fs.cwd().makePath(rpc_dir);
-    claimFileRpcOwnership(rpc_dir) catch |err| switch (err) {
+    try std.Io.Dir.cwd().createDirPath(queue.io, rpc_dir);
+    claimFileRpcOwnership(queue.io, rpc_dir) catch |err| switch (err) {
         error.FileRpcDirAlreadyOwned => {
             std.debug.print(
                 "[test_harness] REFUSING to serve file RPC: {s} is already owned by a live " ++
@@ -133,20 +143,20 @@ fn runFileRpcServer(queue: *CommandQueue, rpc_dir: []const u8) !void {
         },
         else => return err,
     };
-    std.debug.print("[test_harness] File RPC server listening at {s} (owner pid {d})\n", .{ rpc_dir, std.c.getpid() });
+    std.debug.print("[test_harness] File RPC server listening at {s} (owner pid {d})\n", .{ rpc_dir, ownerPid() });
 
     while (true) {
         try processFileRpcRequests(queue, rpc_dir);
-        std.posix.nanosleep(0, FILE_RPC_POLL_MS * std.time.ns_per_ms);
+        try std.Io.sleep(queue.io, .fromNanoseconds(FILE_RPC_POLL_MS * std.time.ns_per_ms), .awake);
     }
 }
 
 fn processFileRpcRequests(queue: *CommandQueue, rpc_dir: []const u8) !void {
-    var dir = try std.fs.cwd().openDir(rpc_dir, .{ .iterate = true });
-    defer dir.close();
+    var dir = try std.Io.Dir.cwd().openDir(queue.io, rpc_dir, .{ .iterate = true });
+    defer dir.close(queue.io);
 
     var iter = dir.iterate();
-    while (try iter.next()) |entry| {
+    while (try iter.next(queue.io)) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.startsWith(u8, entry.name, "req-")) continue;
         if (!std.mem.endsWith(u8, entry.name, ".json")) continue;
@@ -160,15 +170,15 @@ fn handleFileRpcRequest(queue: *CommandQueue, rpc_dir: []const u8, entry_name: [
     if (entry_name.len <= 9) return;
     const id = entry_name[4 .. entry_name.len - 5];
 
-    var dir = try std.fs.cwd().openDir(rpc_dir, .{});
-    defer dir.close();
+    var dir = try std.Io.Dir.cwd().openDir(queue.io, rpc_dir, .{});
+    defer dir.close(queue.io);
 
     var work_name_buf: [128]u8 = undefined;
     const work_name = try std.fmt.bufPrint(&work_name_buf, "wrk-{s}.json", .{id});
-    dir.rename(entry_name, work_name) catch return;
-    defer dir.deleteFile(work_name) catch {};
+    dir.rename(entry_name, dir, work_name, queue.io) catch return;
+    defer dir.deleteFile(queue.io, work_name) catch {};
 
-    const req_text = try readFileCompat(dir, work_name, std.heap.page_allocator);
+    const req_text = try readFileCompat(dir, queue.io, work_name, std.heap.page_allocator);
     defer std.heap.page_allocator.free(req_text);
 
     const method = findJsonString(req_text, "method") orelse "GET";
@@ -189,13 +199,13 @@ fn handleFileRpcRequest(queue: *CommandQueue, rpc_dir: []const u8, entry_name: [
     // this as random `{ raw: ... }` results even though the app stayed alive.
     // Publish exactly like requests do: complete a private temp file, then
     // atomically rename it into the namespace watched by the client.
-    dir.deleteFile(res_tmp_name) catch {};
-    errdefer dir.deleteFile(res_tmp_name) catch {};
-    try dir.writeFile(.{
+    dir.deleteFile(queue.io, res_tmp_name) catch {};
+    errdefer dir.deleteFile(queue.io, res_tmp_name) catch {};
+    try dir.writeFile(queue.io, .{
         .sub_path = res_tmp_name,
         .data = result.body,
     });
-    try dir.rename(res_tmp_name, res_name);
+    try dir.rename(res_tmp_name, dir, res_name, queue.io);
 }
 
 fn dispatchRequest(queue: *CommandQueue, method: []const u8, path: []const u8, body: []const u8) RequestResult {
@@ -296,6 +306,19 @@ fn dispatchRequest(queue: *CommandQueue, method: []const u8, path: []const u8, b
             }
             return .{ .status = 400, .body = "{\"error\":\"missing test_id\"}" };
         }
+        if (std.mem.eql(u8, path, "/track_start")) {
+            if (findJsonString(body, "test_id")) |test_id| {
+                var payload = TestIdPayload{};
+                copyTestId(test_id, &payload);
+                const result = queue.submitAndWait(.{ .track_start = payload });
+                return .{ .status = 200, .body = result.getData() };
+            }
+            return .{ .status = 400, .body = "{\"error\":\"missing test_id\"}" };
+        }
+        if (std.mem.eql(u8, path, "/track_stop")) {
+            const result = queue.submitAndWait(.{ .track_stop = {} });
+            return .{ .status = 200, .body = result.getData() };
+        }
         if (std.mem.eql(u8, path, "/scroll")) {
             if (parseScroll(body)) |cmd| {
                 const result = queue.submitAndWait(cmd);
@@ -333,6 +356,94 @@ fn dispatchRequest(queue: *CommandQueue, method: []const u8, path: []const u8, b
             const result = queue.submitAndWait(.{ .frame_stats = {} });
             return .{ .status = 200, .body = result.getData() };
         }
+        if (std.mem.eql(u8, path, "/frames/capture/finish")) {
+            const result = queue.submitAndWait(.{ .finish_frame_capture = {} });
+            return .{ .status = 200, .body = result.getData() };
+        }
+        if (std.mem.eql(u8, path, "/frames/capture")) {
+            const Payload = struct { test_id: []const u8, click_test_id: []const u8, path: []const u8, after_ms: std.json.Value };
+            const parsed = std.json.parseFromSlice(Payload, std.heap.page_allocator, body, .{ .ignore_unknown_fields = true }) catch
+                return .{ .status = 400, .body = "{\"error\":\"invalid timed capture payload\"}" };
+            defer parsed.deinit();
+            const v = parsed.value;
+            const after_ms: f64 = switch (v.after_ms) {
+                .integer => |value| @floatFromInt(value),
+                .float => |value| value,
+                else => return .{ .status = 400, .body = "{\"error\":\"capture delay must be numeric\"}" },
+            };
+            if (!std.math.isFinite(after_ms) or after_ms < 1 or after_ms > 2000)
+                return .{ .status = 400, .body = "{\"error\":\"invalid capture delay\"}" };
+            for ([_][]const u8{ v.test_id, v.click_test_id, v.path }) |value| {
+                if (value.len == 0 or value.len > 256 or std.mem.indexOfScalar(u8, value, 0) != null)
+                    return .{ .status = 400, .body = "{\"error\":\"invalid capture identifier/path\"}" };
+            }
+            var target: TestIdPayload = .{};
+            var click: TestIdPayload = .{};
+            var output: TestIdPayload = .{};
+            copyTestId(v.test_id, &target);
+            copyTestId(v.click_test_id, &click);
+            copyTestId(v.path, &output);
+            if (builtin.os.tag != .windows) return .{ .status = 400, .body = "{\"error\":\"timed capture requires Windows\"}" };
+            const started = queue.submitAndWait(.{ .frames_start = .{ .target = target, .click_target = click, .capture_path = output, .capture_after_ms = after_ms } });
+            if (!started.success) return .{ .status = 400, .body = started.getData() };
+            // File-RPC thread waits; the UI/render thread keeps animating. No
+            // clock stepping, redraw request or host-timed screenshot call.
+            const began = @import("zenit_time").monotonicTimestamp(queue.io);
+            while (@import("zenit_time").monotonicTimestamp(queue.io) - began < 5 * std.time.ns_per_s) {
+                const sampled = queue.submitAndWait(.{ .frames_capture_read = {} });
+                if (!sampled.success or std.mem.indexOf(u8, sampled.getData(), "\"ok\":true") != null)
+                    return .{ .status = 200, .body = sampled.getData() };
+                std.Io.sleep(queue.io, .fromNanoseconds(8 * std.time.ns_per_ms), .awake) catch return .{ .status = 503, .body = "{\"error\":\"capture canceled\"}" };
+            }
+            _ = queue.submitAndWait(.{ .frames_read = {} });
+            return .{ .status = 408, .body = "{\"error\":\"timed frame capture timeout\"}" };
+        }
+        if (std.mem.eql(u8, path, "/frames/start")) {
+            const FrameStart = struct { test_id: []const u8, action: ?[]const u8 = null, click_test_id: ?[]const u8 = null };
+            const parsed = std.json.parseFromSlice(FrameStart, std.heap.page_allocator, body, .{ .ignore_unknown_fields = true }) catch
+                return .{ .status = 400, .body = "{\"error\":\"invalid frame observation payload\"}" };
+            defer parsed.deinit();
+            const id = parsed.value.test_id;
+            var payload: TestIdPayload = .{};
+            if (id.len == 0 or id.len > payload.buf.len) return .{ .status = 400, .body = "{\"error\":\"invalid test_id length\"}" };
+            copyTestId(id, &payload);
+            const action = parsed.value.action;
+            if (action) |value| {
+                if (!std.mem.eql(u8, value, "escape_on_enter")) return .{ .status = 400, .body = "{\"error\":\"unsupported frame action\"}" };
+            }
+            var click_target: ?TestIdPayload = null;
+            if (parsed.value.click_test_id) |click_id| {
+                var click_payload: TestIdPayload = .{};
+                if (click_id.len == 0 or click_id.len > click_payload.buf.len) return .{ .status = 400, .body = "{\"error\":\"invalid click_test_id length\"}" };
+                copyTestId(click_id, &click_payload);
+                click_target = click_payload;
+            }
+            const result = queue.submitAndWait(.{ .frames_start = .{ .target = payload, .escape_on_enter = action != null, .click_target = click_target } });
+            return .{ .status = 200, .body = result.getData() };
+        }
+        if (std.mem.eql(u8, path, "/redraw")) {
+            const on = std.mem.indexOf(u8, body, "\"continuous\":true") != null or std.mem.indexOf(u8, body, "\"continuous\": true") != null;
+            const result = queue.submitAndWait(.{ .force_frames = on });
+            return .{ .status = 200, .body = result.getData() };
+        }
+        if (std.mem.eql(u8, path, "/clock")) {
+            const step = findJsonNumber(body, "step_ms") orelse return .{ .status = 400, .body = "{\"error\":\"step_ms required\"}" };
+            if (!std.math.isFinite(step) or (step != 0 and (step < 1 or step > 100))) return .{ .status = 400, .body = "{\"error\":\"invalid step_ms\"}" };
+            const locked = findJsonBool(body, "locked") orelse false;
+            if (locked and step == 0) return .{ .status = 400, .body = "{\"error\":\"locked clock needs step_ms\"}" };
+            const result = queue.submitAndWait(if (locked) .{ .animation_clock_locked = @floatCast(step) } else .{ .animation_clock = @floatCast(step) });
+            return .{ .status = 200, .body = result.getData() };
+        }
+        if (std.mem.eql(u8, path, "/clock/advance")) {
+            const ms = findJsonNumber(body, "ms") orelse return .{ .status = 400, .body = "{\"error\":\"ms required\"}" };
+            if (!std.math.isFinite(ms) or ms < 0 or ms > 60_000) return .{ .status = 400, .body = "{\"error\":\"invalid ms\"}" };
+            const result = queue.submitAndWait(.{ .clock_advance = @floatCast(ms) });
+            return .{ .status = 200, .body = result.getData() };
+        }
+        if (std.mem.eql(u8, path, "/frames/read")) {
+            const result = queue.submitAndWait(.{ .frames_read = {} });
+            return .{ .status = 200, .body = result.getData() };
+        }
         if (std.mem.eql(u8, path, "/stats/reset")) {
             const result = queue.submitAndWait(.{ .reset_timing = {} });
             return .{ .status = 200, .body = result.getData() };
@@ -358,6 +469,13 @@ fn dispatchRequest(queue: *CommandQueue, method: []const u8, path: []const u8, b
             const result = queue.submitAndWait(.{ .screenshot = payload });
             return .{ .status = 200, .body = result.getData() };
         }
+        if (std.mem.eql(u8, path, "/visual-quality")) {
+            const value = findJsonString(body, "mode") orelse "status";
+            const mode = std.meta.stringToEnum(@import("command_queue.zig").VisualQualityCommand, value) orelse
+                return .{ .status = 400, .body = "{\"error\":\"invalid visual quality\"}" };
+            const result = queue.submitAndWait(.{ .visual_quality = mode });
+            return .{ .status = 200, .body = result.getData() };
+        }
         if (std.mem.eql(u8, path, "/recording/start")) {
             const command = parseRecordingStart(body) orelse
                 return .{ .status = 400, .body = "{\"error\":\"invalid recording payload\"}" };
@@ -374,8 +492,8 @@ fn dispatchRequest(queue: *CommandQueue, method: []const u8, path: []const u8, b
         }
     }
 
-    // 宿主自定义路由：任何未被内建路由认领的 `/app/...` 或宿主前缀路径，
-    // 原样转交给宿主注册的 handler（GET/POST 都接受）。
+    // Custom host routes: any `/app/...` or host-prefix path not claimed by builtin routes
+    // forwarded as-is to host-registered handler (GET/POST accepted).
     if (command_queue.AppRoutePayload.init(path, body)) |payload| {
         const result = queue.submitAndWait(.{ .app_route = payload });
         if (result.success) return .{ .status = 200, .body = result.getData() };
@@ -392,15 +510,20 @@ fn parseClick(body: []const u8) ?TestCommand {
         copyTestId(test_id, &payload);
         return .{ .click_test_id = payload };
     }
-    return .{ .click = parseMousePayload(body) orelse return null };
+    var payload = parseMousePayload(body) orelse return null;
+    if (findJsonNumber(body, "count")) |count| {
+        if (!(count >= 1 and count <= 4) or @floor(count) != count) return null;
+        payload.count = @intFromFloat(count);
+    }
+    return .{ .click = payload };
 }
 
-/// x/y + 四个修饰键。`/click` 与 `/mouse_*` 共用，避免两份判定逻辑漂移。
+/// x/y plus four modifier keys. `/click` and `/mouse_*` share logic to prevent divergence.
 fn parseMousePayload(body: []const u8) ?MousePayload {
     const x = findJsonNumber(body, "x") orelse return null;
     const y = findJsonNumber(body, "y") orelse return null;
-    // 修饰键沿用 key_down 的约定：字段出现即为 true（值不参与判定）。
-    // 省略时全 false ⇒ 与旧的 `{x, y}` 请求行为完全一致。
+    // Modifiers use key_down convention: field presence = true (value irrelevant).
+    // Omitted -> all false -> identical to old `{x, y}` request behavior.
     return .{
         .x = x,
         .y = y,
@@ -479,9 +602,9 @@ fn parseKeyDown(body: []const u8) ?TestCommand {
     return .{ .key_down = payload };
 }
 
-/// phase 缺省 = 鼠标滚轮（none）。触控板手势须显式给出 may_begin/began ->
-/// changed... -> ended/cancelled，与真实设备一致；松手后的惯性用
-/// "momentum": "began" | "changed" | "ended"。未知名称返回 400。
+/// phase defaults to mouse wheel (none). Trackpad gestures require explicit may_begin/began
+/// -> changed... -> ended/cancelled matching real device; inertia after release uses
+/// "momentum": "began" | "changed" | "ended". Unknown names return 400.
 fn parseScroll(body: []const u8) ?TestCommand {
     const x = findJsonNumber(body, "x") orelse return null;
     const y = findJsonNumber(body, "y") orelse return null;
@@ -500,8 +623,8 @@ fn parseScroll(body: []const u8) ?TestCommand {
         .y = y,
         .dx = dx,
         .dy = dy,
-        .phase = @intFromEnum(phase),
-        .momentum = @intFromEnum(momentum),
+        .phase = @backingInt(phase),
+        .momentum = @backingInt(momentum),
         .shift = std.mem.indexOf(u8, body, "\"shift\"") != null,
         .ctrl = std.mem.indexOf(u8, body, "\"ctrl\"") != null,
         .alt = std.mem.indexOf(u8, body, "\"alt\"") != null,
@@ -527,9 +650,9 @@ fn parseDrag(body: []const u8, allocator: std.mem.Allocator) ?TestCommand {
     const y = findJsonNumber(body, "y") orelse return null;
     const kind = findJsonNumber(body, "kind") orelse return null;
     var payload = command_queue.DragPayload{ .x = x, .y = y, .kind = @intFromFloat(kind) };
-    // 必须走 escape-aware 的 Large 变体：多文件拖放的 paths 是 '\n' 分隔的，
-    // findJsonString 不解转义，会把字面 "\\n" 原样交出去，于是整串被当成
-    // 单个路径，只有最后一段的 basename 显示出来（实测丢掉第一个文件）。
+    // Must use escape-aware Large variant: multi-file drag paths are '\n'-separated,
+    // findJsonString doesn't unescape, returns literal "\\n" as-is -> treated as single
+    // path, only last basename shown (empirically loses first file).
     if (findJsonStringLarge(body, "paths")) |paths| {
         defer std.heap.page_allocator.free(paths);
         payload.paths = TextPayload.initFromText(allocator, paths) catch return null;
@@ -631,6 +754,16 @@ fn findJsonStringLarge(body: []const u8, key: []const u8) ?[]u8 {
     return result;
 }
 
+fn findJsonBool(body: []const u8, key: []const u8) ?bool {
+    var search_buf: [64]u8 = undefined;
+    const pattern = std.fmt.bufPrint(&search_buf, "\"{s}\":", .{key}) catch return null;
+    var pos = (std.mem.indexOf(u8, body, pattern) orelse return null) + pattern.len;
+    while (pos < body.len and body[pos] == ' ') pos += 1;
+    if (std.mem.startsWith(u8, body[pos..], "true")) return true;
+    if (std.mem.startsWith(u8, body[pos..], "false")) return false;
+    return null;
+}
+
 fn findJsonNumber(body: []const u8, key: []const u8) ?f32 {
     var search_buf: [64]u8 = undefined;
     const pattern = std.fmt.bufPrint(&search_buf, "\"{s}\":", .{key}) catch return null;
@@ -661,22 +794,22 @@ test "recording start parser validates path and target fps" {
     try std.testing.expect(parseRecordingStart("{\"path\":\"/tmp/demo.mp4\",\"fps\":121}") == null);
 }
 
-// ── file-RPC 单主锁（owner.json）──
+// ── file-RPC single-owner lock (owner.json) ──
 
 fn testTmpRpcDir(tmp: *std.testing.TmpDir, buf: []u8) ![]const u8 {
-    const real = try tmp.dir.realpath(".", buf);
-    return real;
+    const len = try tmp.dir.realPath(std.testing.io, buf);
+    return buf[0..len];
 }
 
 test "file-RPC owner: 空目录首次 claim 成功并写入自身 pid" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const dir_path = try testTmpRpcDir(&tmp, &buf);
 
-    try claimFileRpcOwnership(dir_path);
+    try claimFileRpcOwnership(std.testing.io, dir_path);
 
-    const text = try readFileCompat(tmp.dir, OWNER_FILE, std.testing.allocator);
+    const text = try readFileCompat(tmp.dir, std.testing.io, OWNER_FILE, std.testing.allocator);
     defer std.testing.allocator.free(text);
     const pid = parseOwnerPid(text) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(std.c.getpid(), pid);
@@ -685,25 +818,26 @@ test "file-RPC owner: 空目录首次 claim 成功并写入自身 pid" {
 test "file-RPC owner: 活 pid 持有时二次 claim 被拒绝" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const dir_path = try testTmpRpcDir(&tmp, &buf);
 
-    // 第一次 claim 写入的是本进程 pid，必然活着，模拟"另一个活实例持有"。
-    try claimFileRpcOwnership(dir_path);
-    try std.testing.expectError(error.FileRpcDirAlreadyOwned, claimFileRpcOwnership(dir_path));
+    // First claim writes this process pid (necessarily alive), simulating another active instance
+    // holding it.
+    try claimFileRpcOwnership(std.testing.io, dir_path);
+    try std.testing.expectError(error.FileRpcDirAlreadyOwned, claimFileRpcOwnership(std.testing.io, dir_path));
 }
 
 test "file-RPC owner: 死 pid 残留被接管" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const dir_path = try testTmpRpcDir(&tmp, &buf);
 
-    // macOS pid_max = 99998，4000000 必不存在 -> kill 得 ESRCH -> 判死。
-    try tmp.dir.writeFile(.{ .sub_path = OWNER_FILE, .data = "{\"pid\":\"4000000\"}" });
-    try claimFileRpcOwnership(dir_path);
+    // macOS pid_max = 99998; 4000000 doesn't exist -> kill returns ESRCH -> detected dead.
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = OWNER_FILE, .data = "{\"pid\":\"4000000\"}" });
+    try claimFileRpcOwnership(std.testing.io, dir_path);
 
-    const text = try readFileCompat(tmp.dir, OWNER_FILE, std.testing.allocator);
+    const text = try readFileCompat(tmp.dir, std.testing.io, OWNER_FILE, std.testing.allocator);
     defer std.testing.allocator.free(text);
     try std.testing.expectEqual(std.c.getpid(), parseOwnerPid(text) orelse return error.TestUnexpectedResult);
 }
@@ -711,12 +845,12 @@ test "file-RPC owner: 死 pid 残留被接管" {
 test "file-RPC owner: 坏 owner.json 被接管" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const dir_path = try testTmpRpcDir(&tmp, &buf);
 
-    try tmp.dir.writeFile(.{ .sub_path = OWNER_FILE, .data = "not json at all" });
-    try claimFileRpcOwnership(dir_path);
-    const text = try readFileCompat(tmp.dir, OWNER_FILE, std.testing.allocator);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = OWNER_FILE, .data = "not json at all" });
+    try claimFileRpcOwnership(std.testing.io, dir_path);
+    const text = try readFileCompat(tmp.dir, std.testing.io, OWNER_FILE, std.testing.allocator);
     defer std.testing.allocator.free(text);
     try std.testing.expectEqual(std.c.getpid(), parseOwnerPid(text) orelse return error.TestUnexpectedResult);
 }

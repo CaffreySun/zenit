@@ -1,16 +1,14 @@
 const std = @import("std");
 
-/// macOS 原生窗口 - 直接使用 Cocoa API
-///
-/// 完全绕过 GLFW，直接调用 macOS 原生 API
-/// 解决了窗口拖拽时渲染停止的问题
+/// macOS native window using Cocoa API. Bypasses GLFW entirely to solve rendering stall during
+/// window drag.
 pub const MacOSWindow = struct {
     window_ptr: *anyopaque,
     view_ptr: *anyopaque,
     width: u32,
     height: u32,
 
-    // Objective-C C API 函数声明
+    // Objective-C C API function declarations
     extern fn macos_init_app() void;
     extern fn macos_init_app_with_delegate() void;
     extern fn macos_show_blocking_alert(title: [*:0]const u8, message: [*:0]const u8) void;
@@ -68,11 +66,11 @@ pub const MacOSWindow = struct {
     extern fn macos_begin_window_close(window_ptr: *anyopaque) c_int;
     extern fn macos_window_close_completed(window_ptr: *anyopaque) c_int;
     extern fn macos_get_pending_open_file(buffer: ?[*]u8, buffer_size: c_int) c_int;
-    // 菜单动作 API
+    // Menu action API
     extern fn macos_get_menu_action() c_int;
     extern fn macos_get_menu_action_event(window_id: *u64, action: *c_int) c_int;
 
-    // 多窗口架构 API
+    // Multi-window architecture API
     extern fn macos_pump_app_events() void;
     extern fn macos_pump_app_events_timeout(timeout_ms: c_uint) void;
     extern fn macos_should_quit() c_int;
@@ -81,11 +79,14 @@ pub const MacOSWindow = struct {
     extern fn macos_reset_window_should_close(window_ptr: *anyopaque) void;
     extern fn macos_update_window_mouse(window_ptr: *anyopaque) void;
     extern fn macos_is_window_focused(window_ptr: *anyopaque) c_int;
+    extern fn macos_window_appears_active(window_ptr: *anyopaque) c_int;
 
-    // CVDisplayLink (C6), vsync 驱动帧调度
+    // CVDisplayLink (C6): vsync-driven frame scheduling
     extern fn macos_start_display_link(window_ptr: *anyopaque) void;
     extern fn macos_stop_display_link(window_ptr: *anyopaque) void;
     extern fn macos_get_display_refresh_rate(window_ptr: *anyopaque) f32;
+    extern fn macos_get_display_tick(window_ptr: *anyopaque) u64;
+    extern fn macos_get_presentation_clock(window_ptr: *anyopaque, times: *[3]f64) u64;
     extern fn macos_post_empty_event() void;
     extern fn macos_window_recording_start(window_id: u32, path: [*:0]const u8, fps: u32, width: u32, height: u32, out: *WindowRecordingState) c_int;
     extern fn macos_window_recording_append(window_id: u32, texture: *anyopaque) c_int;
@@ -105,8 +106,8 @@ pub const MacOSWindow = struct {
         file_size: u64 = 0,
         frame_count: u64 = 0,
         dropped_frames: u64 = 0,
-        path: [768]u8 = [_]u8{0} ** 768,
-        error_message: [256]u8 = [_]u8{0} ** 256,
+        path: [768]u8 = @as([768]u8, @splat(0)),
+        error_message: [256]u8 = @as([256]u8, @splat(0)),
 
         pub fn pathText(self: *const WindowRecordingState) []const u8 {
             return self.path[0..(std.mem.indexOfScalar(u8, &self.path, 0) orelse self.path.len)];
@@ -119,8 +120,8 @@ pub const MacOSWindow = struct {
 
     var app_initialized = false;
 
-    /// 初始化 Cocoa 应用并设置 NSApplicationDelegate + 菜单栏。
-    /// 在创建窗口前调用。适用于 App Bundle 模式。
+    /// Initialize Cocoa app and set NSApplicationDelegate + menu bar. Call before creating windows.
+    /// For App Bundle mode.
     pub fn initAppWithDelegate() void {
         if (!app_initialized) {
             macos_init_app_with_delegate();
@@ -179,20 +180,40 @@ pub const MacOSWindow = struct {
         return macos_window_close_completed(self.window_ptr) != 0;
     }
 
-    /// 启动 CVDisplayLink：每个 vsync 在 CV 线程 post 空事件唤醒主线程 pump。
-    /// 幂等，已在跑时是 no-op。
+    /// Start CVDisplayLink: posts empty event to main thread on each vsync from CV thread.
+    /// Idempotent, no-op if already running.
     pub fn startDisplayLink(self: *MacOSWindow) void {
         macos_start_display_link(self.window_ptr);
     }
 
-    /// 停止 CVDisplayLink（idle 时省电）。幂等。link 对象保留，下次 start 复用。
+    /// Stop CVDisplayLink (save power on idle). Idempotent. Link object retained for reuse on next
+    /// start.
     pub fn stopDisplayLink(self: *MacOSWindow) void {
         macos_stop_display_link(self.window_ptr);
     }
 
-    /// 窗口所在显示器的标称刷新率（Hz）。link 未创建时返回 60。
+    /// Nominal refresh rate (Hz) of display containing this window. Returns 60 if link not created.
     pub fn getDisplayRefreshRate(self: *MacOSWindow) f32 {
         return macos_get_display_refresh_rate(self.window_ptr);
+    }
+
+    /// Monotonic, per-window CVDisplayLink callback token. Zero means no
+    /// callback yet; starting/stopping the link never rewinds the token.
+    pub fn getDisplayTick(self: *const MacOSWindow) u64 {
+        return macos_get_display_tick(self.window_ptr);
+    }
+
+    pub const DisplayTiming = struct {
+        tick: u64,
+        callback_time_seconds: f64,
+        target_time_seconds: f64,
+        current_time_seconds: f64,
+    };
+
+    pub fn getDisplayTiming(self: *const MacOSWindow) DisplayTiming {
+        var times: [3]f64 = .{ 0, 0, 0 };
+        const tick = macos_get_presentation_clock(self.window_ptr, &times);
+        return .{ .tick = tick, .callback_time_seconds = times[0], .target_time_seconds = times[1], .current_time_seconds = times[2] };
     }
 
     /// Thread-safe event-pump wakeup. The native display-link callback uses the
@@ -204,7 +225,7 @@ pub const MacOSWindow = struct {
     pub fn pollEvents(self: *MacOSWindow) bool {
         const should_continue = macos_poll_events(self.window_ptr);
 
-        // 更新窗口尺寸
+        // Update window size
         var w: c_int = 0;
         var h: c_int = 0;
         macos_get_window_size(self.window_ptr, &w, &h);
@@ -223,21 +244,21 @@ pub const MacOSWindow = struct {
         return .{ self.width, self.height };
     }
 
-    /// 设置窗口尺寸（content size，与 getSize 同一坐标系）。窗口中心保持不动。
+    /// Set window size (content size, same coordinate system as getSize). Window center unchanged.
     pub fn setSize(self: *MacOSWindow, width: u32, height: u32) void {
         macos_set_window_size(self.window_ptr, @intCast(width), @intCast(height));
         self.width = width;
         self.height = height;
     }
 
-    /// 获取 DPI 缩放因子 (Retina: 2.0, 普通: 1.0)
+    /// Get DPI scale factor (Retina: 2.0, normal: 1.0)
     pub fn getScaleFactor(self: *MacOSWindow) f32 {
         return @floatCast(macos_get_scale_factor(self.window_ptr));
     }
 
-    /// 本窗口的系统 id（macOS = NSWindow.windowNumber）。多窗口下用它给
-    /// Cx.window_id 赋值，让 a11y / 系统 API 路由到本窗口而非"第一个窗口"。
-    /// 窗口无效时返 0。
+    /// System ID of this window (macOS = NSWindow.windowNumber). In multi-window, use to set
+    /// Cx.window_id
+    /// so a11y / system APIs route to this window not first window. Returns 0 if window invalid.
     pub fn getWindowId(self: *MacOSWindow) u32 {
         return macos_window_id(self.window_ptr);
     }
@@ -288,20 +309,21 @@ pub const MacOSWindow = struct {
         return .{ @intCast(w), @intCast(h) };
     }
 
-    /// 不透明的原生绘制表面句柄，交给 GPU 后端解释（Metal 后端拿到的是
-    /// `CAMetalLayer*`）。刻意不叫 `getMetalLayer`：平台窗口层不该把某个
-    /// GPU 后端的名字写进接口，否则将来第二个后端会出现
-    /// "Windows 窗口也在调 getMetalLayer" 这种语义矛盾。
+    /// Opaque native draw surface handle for GPU backend to interpret (Metal backend receives
+    /// CAMetalLayer*).
+    /// Not named getMetalLayer intentionally: platform window layer should not hardcode a GPU
+    /// backend name,
+    /// else second backend gets "Windows window calls getMetalLayer" semantic contradiction.
     pub fn getNativeSurfaceHandle(self: *MacOSWindow) *anyopaque {
         return macos_get_metal_layer(self.view_ptr).?;
     }
 
-    /// 同上，返回不透明的原生设备句柄（Metal 后端为 `MTLDevice*`）。
+    /// Like above, return opaque native device handle (Metal backend: MTLDevice*).
     pub fn getNativeDeviceHandle(self: *MacOSWindow) *anyopaque {
         return macos_get_metal_device(self.view_ptr).?;
     }
 
-    /// 设置 live resize 渲染回调
+    /// Set live-resize render callback
     pub fn setRenderCallback(
         self: *MacOSWindow,
         callback: ?*const fn (?*anyopaque) callconv(.c) void,
@@ -310,21 +332,23 @@ pub const MacOSWindow = struct {
         macos_set_render_callback(self.window_ptr, callback, ctx);
     }
 
-    /// 请求重绘
+    /// Request redraw
     pub fn requestRedraw(self: *MacOSWindow) void {
         macos_request_redraw(self.window_ptr);
     }
 
-    /// 是否处于 live resize
+    /// Is window in live resize
     pub fn isInLiveResize(self: *MacOSWindow) bool {
         return macos_is_live_resize(self.window_ptr) != 0;
     }
 
-    /// 鼠标按钮枚举。
-    /// .other 兜底：桥当前用 buttonNumber == 2 过滤 otherMouse 事件，但该
-    /// 不变式只靠 ObjC 侧两处 switch 的自律维持，任何一处将来放宽（back/
-    /// forward 侧键是很自然的需求），未校验的 @enumFromInt 就是 Debug panic /
-    /// ReleaseFast UB。events.zig 早已定义 .other、runtime 映射为 null。
+    /// Mouse button enum. .other catchall: bridge filters otherMouse with buttonNumber == 2, but
+    /// invariant
+    /// relies on self-discipline in two ObjC switch statements; if either relaxes (back/forward
+    /// side keys
+    /// natural request) unchecked @enumFromInt is Debug panic / ReleaseFast UB. events.zig already
+    /// defines
+    /// .other, runtime maps to null.
     pub const MouseButton = enum(c_int) {
         left = 0,
         right = 1,
@@ -332,7 +356,7 @@ pub const MacOSWindow = struct {
         other = 3,
     };
 
-    /// 获取鼠标位置（逻辑像素，相对于窗口内容，Y 轴向下）
+    /// Get mouse position (logical pixels, relative to window content, Y down)
     pub fn getMousePosition(self: *MacOSWindow) [2]f32 {
         var x: f32 = 0;
         var y: f32 = 0;
@@ -382,18 +406,19 @@ pub const MacOSWindow = struct {
         };
     }
 
-    /// 当前硬件修饰键状态（进程级）。轮询式 mouse_move 取不到事件级
-    /// flags，用它补移动时刻的真实修饰键。
+    /// Current hardware modifier state (process-level). Polling-style mouse_move cannot get
+    /// event-level
+    /// flags; use this to supplement move-time true modifiers.
     pub fn currentModifiers() Modifiers {
         return Modifiers.fromRaw(macos_current_modifier_flags());
     }
 
-    /// 检查鼠标按钮是否按下
+    /// Check if mouse button pressed
     pub fn isMouseButtonPressed(self: *MacOSWindow, button: MouseButton) bool {
-        return macos_is_mouse_button_pressed(self.window_ptr, @intFromEnum(button)) != 0;
+        return macos_is_mouse_button_pressed(self.window_ptr, @backingInt(button)) != 0;
     }
 
-    /// 键盘事件
+    /// Keyboard events
     pub const KeyEvent = struct {
         sequence: u64,
         keycode: u16,
@@ -402,7 +427,7 @@ pub const MacOSWindow = struct {
         character: ?u8,
     };
 
-    /// 修饰键
+    /// Modifier keys
     pub const Modifiers = packed struct {
         shift: bool = false,
         ctrl: bool = false,
@@ -420,7 +445,7 @@ pub const MacOSWindow = struct {
         }
     };
 
-    /// macOS 键码常量
+    /// macOS key code constants
     pub const KeyCode = struct {
         pub const RETURN: u16 = 36;
         pub const TAB: u16 = 48;
@@ -443,7 +468,7 @@ pub const MacOSWindow = struct {
         pub const Z: u16 = 6;
     };
 
-    /// 获取按键事件（如果有）
+    /// Get key event if any
     pub fn getKeyEvent(self: *MacOSWindow) ?KeyEvent {
         var keycode: u16 = 0;
         var modifiers: u32 = 0;
@@ -468,7 +493,7 @@ pub const MacOSWindow = struct {
         text: []const u8,
     };
 
-    /// 获取输入的文本事件（UTF-8）
+    /// Get text input event (UTF-8)
     pub fn getInputText(self: *MacOSWindow, buffer: []u8) ?TextInputEvent {
         if (buffer.len == 0) return null;
         var sequence: u64 = 0;
@@ -479,15 +504,16 @@ pub const MacOSWindow = struct {
         return null;
     }
 
-    /// IME replacementRange 哨兵：本次事件不修订已提交文本（现行为）。
+    /// IME replacementRange sentinel: this event does not revise already-committed text (current
+    /// behavior).
     pub const ime_no_replacement: u32 = 0xFFFF_FFFF;
 
     pub const ImePreeditEvent = struct {
         sequence: u64,
         text: []const u8,
         cursor_utf8_offset: u32,
-        /// replacementRange 换算成的 UTF-8 字节区间（相对文档）；
-        /// ime_no_replacement 哨兵 = 无 replacement。
+        /// replacementRange converted to UTF-8 byte range (relative to document);
+        /// ime_no_replacement sentinel = no replacement.
         replace_start_utf8: u32 = ime_no_replacement,
         replace_end_utf8: u32 = ime_no_replacement,
     };
@@ -507,12 +533,12 @@ pub const MacOSWindow = struct {
         var bytes: ?[*]const u8 = null;
         var length: usize = 0;
         var event: ImePreeditEvent = .{ .sequence = 0, .text = "", .cursor_utf8_offset = 0 };
-        const status = macos_peek_text_event(self.window_ptr, @intFromEnum(kind), &bytes, &length, &event.cursor_utf8_offset, &event.replace_start_utf8, &event.replace_end_utf8, &event.sequence);
+        const status = macos_peek_text_event(self.window_ptr, @backingInt(kind), &bytes, &length, &event.cursor_utf8_offset, &event.replace_start_utf8, &event.replace_end_utf8, &event.sequence);
         if (status == 0) return null;
         if (status != 1 or event.sequence == 0 or (length > 0 and bytes == null)) return error.BackendFailure;
         const owned = try allocator.dupe(u8, if (length == 0) "" else bytes.?[0..length]);
         errdefer allocator.free(owned);
-        if (macos_consume_text_event(self.window_ptr, @intFromEnum(kind), event.sequence) != 1) return error.BackendFailure;
+        if (macos_consume_text_event(self.window_ptr, @backingInt(kind), event.sequence) != 1) return error.BackendFailure;
         event.text = owned;
         return event;
     }
@@ -555,22 +581,24 @@ pub const MacOSWindow = struct {
         return null;
     }
 
-    /// 设置 IME 候选窗口锚点矩形（逻辑像素，左上原点）
+    /// Set IME candidate window anchor rect (logical pixels, top-left origin)
     pub fn setImeCursorRect(self: *MacOSWindow, x: f32, y: f32, width: f32, height: f32) void {
         macos_set_ime_cursor_rect(self.window_ptr, x, y, width, height);
     }
 
-    /// 仅控制文本解释/IME；原始 keyDown/keyUp 始终由窗口事件队列派发。
+    /// Controls text interpretation / IME only; raw keyDown/keyUp always dispatched from window
+    /// event queue.
     pub fn setTextInputEnabled(self: *MacOSWindow, enabled: bool) void {
         macos_set_text_input_enabled(self.window_ptr, @intFromBool(enabled));
     }
 
-    /// 放弃当前 IME 合成（关候选窗 + 清 marked text）；widget blur 时调用
+    /// Discard current IME composition (close candidate window + clear marked text); call on widget
+    /// blur
     pub fn discardIme(self: *MacOSWindow) void {
         macos_ime_discard(self.window_ptr);
     }
 
-    /// 设置鼠标光标形状
+    /// Set mouse cursor shape
     pub fn setCursorShape(self: *MacOSWindow, shape: u8) void {
         macos_set_cursor_shape(self.window_ptr, @intCast(shape));
     }
@@ -587,15 +615,15 @@ pub const MacOSWindow = struct {
         y: f32,
         dx: f32,
         dy: f32,
-        /// NSEvent.phase 编码：0 none, 1 may_begin, 2 began, 3 changed, 4 ended, 5 cancelled
+        /// NSEvent.phase encoding: 0=none, 1=may_begin, 2=began, 3=changed, 4=ended, 5=cancelled
         phase: u8,
-        /// NSEvent.momentumPhase 编码：0 none, 1 began, 2 changed, 3 ended
+        /// NSEvent.momentumPhase encoding: 0=none, 1=began, 2=changed, 3=ended
         momentum: u8,
-        /// 事件发生时的修饰键状态（Cmd+滚轮缩放等场景需要）
+        /// Modifier state at event time (needed for Cmd+scroll zoom etc.)
         modifiers: Modifiers = .{},
     };
 
-    /// 获取滚轮事件（如果有）
+    /// Get scroll event if any
     pub fn getScrollDelta(self: *MacOSWindow) ?ScrollEvent {
         var x: f32 = -1;
         var y: f32 = -1;
@@ -620,18 +648,18 @@ pub const MacOSWindow = struct {
         return null;
     }
 
-    /// 触控板捏合手势事件
+    /// Trackpad pinch-gesture event
     pub const MagnifyEvent = struct {
         sequence: u64,
         x: f32,
         y: f32,
-        /// 相对增量：new_scale = old_scale * (1 + magnification)
+        /// Relative delta: new_scale = old_scale * (1 + magnification)
         magnification: f32,
         /// 0=began 1=changed 2=ended 3=cancelled
         phase: u8,
     };
 
-    /// 获取捏合事件（如果有）
+    /// Get pinch event if any
     pub fn getMagnifyEvent(self: *MacOSWindow) ?MagnifyEvent {
         var x: f32 = 0;
         var y: f32 = 0;
@@ -644,13 +672,13 @@ pub const MacOSWindow = struct {
         return null;
     }
 
-    /// 拖放事件
+    /// Drag and drop events
     pub const DragEvent = struct {
         x: f32,
         y: f32,
         /// 0=entered 1=updated 2=exited 3=dropped 4=source completion
         kind: u8,
-        /// dropped 时有效：写入 buffer 的换行分隔路径 / URL 列表
+        /// Valid on dropped: writes newline-separated paths / URL list to buffer
         paths: []const u8,
         payload_kind: u8,
         source_token: u64,
@@ -682,7 +710,7 @@ pub const MacOSWindow = struct {
         if (macos_consume_drag_event(self.window_ptr, token) != 1) return error.BackendFailure;
     }
 
-    /// 获取拖放事件（如果有）。paths 写入调用方提供的 buffer。
+    /// Get drag and drop event if any. paths writes to caller-provided buffer.
     pub fn getDragEvent(self: *MacOSWindow, paths_buf: []u8) ?DragEvent {
         if (paths_buf.len == 0 or paths_buf.len > std.math.maxInt(c_int)) return null;
         var x: f32 = 0;
@@ -699,18 +727,19 @@ pub const MacOSWindow = struct {
         return null;
     }
 
-    /// 鼠标按键事件（队列式，每次消费一个，不会 miss 同帧 press+release）
+    /// Mouse button event queue (queue-style, consume one per call, will not miss press+release
+    /// same frame)
     pub const MouseButtonEvent = struct {
         sequence: u64,
         x: f32,
         y: f32,
         button: MouseButton,
         pressed: bool,
-        /// 原始 NSEventModifierFlags 位掩码（见 macos_modifiers）。
+        /// Raw NSEventModifierFlags bitmask (see macos_modifiers).
         modifiers: u32 = 0,
     };
 
-    /// 获取鼠标按键事件（如果有）
+    /// Get mouse button event if any
     pub fn getMouseButtonEvent(self: *MacOSWindow) ?MouseButtonEvent {
         var x: f32 = 0;
         var y: f32 = 0;
@@ -723,7 +752,7 @@ pub const MacOSWindow = struct {
                 .sequence = sequence,
                 .x = x,
                 .y = y,
-                .button = std.meta.intToEnum(MouseButton, button) catch .other,
+                .button = std.enums.fromInt(MouseButton, button) orelse .other,
                 .pressed = pressed != 0,
                 .modifiers = mods,
             };
@@ -731,46 +760,49 @@ pub const MacOSWindow = struct {
         return null;
     }
 
-    /// 查询窗口是否应该关闭
+    /// Check if window should close
     pub fn shouldClose(self: *MacOSWindow) bool {
         return macos_should_close(self.window_ptr) != 0;
     }
 
-    /// 更新鼠标位置（给不调 pollEvents 的窗口用）
+    /// Update mouse position (for windows not polling events)
     pub fn updateMousePosition(self: *MacOSWindow) void {
         macos_update_mouse_position(self.window_ptr);
     }
 
-    /// 设置非活跃窗口是否接受鼠标移动（inspector pick 模式跨窗口 hover）
+    /// Set whether inactive window accepts mouse move (inspector pick mode crosses windows)
     pub fn setAcceptsMouseWhileInactive(self: *MacOSWindow, accepts: bool) void {
         macos_set_accepts_mouse_while_inactive(self.window_ptr, if (accepts) 1 else 0);
     }
 
-    /// 检查窗口是否需要渲染（可见且未被完全遮挡）
+    /// Check if window needs rendering (visible and not fully occluded)
     pub fn shouldRender(self: *MacOSWindow) bool {
         return macos_should_render_window(self.window_ptr) != 0;
     }
 
-    /// 获取系统标题栏高度（traffic lights 区域高度，通常 28-38px）
+    /// Get system titlebar height (traffic-light area height, typically 28-38px)
     pub fn getTitlebarHeight(self: *MacOSWindow) f32 {
         return macos_get_titlebar_height(self.window_ptr);
     }
 
-    /// 开始窗口拖拽（在自绘 TitleBar 的 mouseDown 中调用）
+    /// Begin window drag (call in custom TitleBar mouseDown)
     pub fn performWindowDrag(self: *MacOSWindow) void {
         macos_perform_window_drag(self.window_ptr);
     }
 
-    /// 设置 traffic lights（红黄绿按钮）在自绘标题栏中的位置
-    /// inset_x: 第一个按钮左边距, inset_y: 按钮中心距窗口顶部的距离
+    /// Set traffic-light button positions in custom titlebar. inset_x: left margin of first button,
+    /// inset_y: distance from window top to button center
     pub fn setTrafficLightsInset(self: *MacOSWindow, inset_x: f32, inset_y: f32) void {
         macos_set_traffic_lights_inset(self.window_ptr, inset_x, inset_y);
     }
 
-    /// 设置自定义 TitleBar 拖拽区域高度（逻辑像素，从窗口顶部算起）
-    /// 设为 > 0 后，mouseDown 落在此区域内会自动触发窗口拖拽
-    /// 命中驱动拖拽区：拖拽带内 mouseDown 先经回调判定该点是否落在交互控件上
-    /// （非 0 = 是，事件正常下发不拖窗口）。传 null 清除，退回纯矩形模型。
+    /// Set custom titlebar drag area height (logical pixels from window top). When > 0, mouseDown
+    /// in area
+    /// auto-triggers window drag. Hit-driven drag: mouseDown in drag band first asks callback if
+    /// point hits
+    /// interactive control (nonzero = yes, event routes normally no window drag). Pass null to
+    /// clear,
+    /// fall back to pure-rect model.
     pub fn setTitlebarHitCallback(self: *MacOSWindow, cb: ?*const fn (?*anyopaque, f32, f32) callconv(.c) c_int, ctx: ?*anyopaque) void {
         macos_set_titlebar_hit_callback(self.window_ptr, cb, ctx);
     }
@@ -779,20 +811,21 @@ pub const MacOSWindow = struct {
         macos_set_titlebar_drag_height(self.window_ptr, height);
     }
 
-    /// 设置 TitleBar 右侧排除拖拽区域宽度（逻辑像素）。
-    /// 用于让 titlebar 右侧的 action buttons 正常接收 click，
-    /// 而不是被窗口拖拽吞掉。
+    /// Set titlebar right exclusion width (logical pixels). Lets titlebar right action buttons
+    /// receive click
+    /// without window drag intercepting.
     pub fn setTitlebarDragRightInset(self: *MacOSWindow, inset: f32) void {
         macos_set_titlebar_drag_right_inset(self.window_ptr, inset);
     }
 
-    /// 获取 macOS openFile 事件的 pending 路径（Finder 双击 / open -a）
-    /// 返回的 slice 指向 caller 提供的 buffer；null = 队列为空。
-    /// buffer 放不下完整路径时返回 error.BufferTooSmall 且**不出队**（路径留在
-    /// 队首，换更大的 buffer 重试即可）；所需大小见 `pendingOpenFileRequiredSize`。
-    /// 此前会先出队再按 buffer 截断路径，文件被静默丢弃或打开错误路径。
+    /// Get macOS openFile event pending path (Finder double-click / open -a). Returned slice points
+    /// to caller's buffer;
+    /// null = queue empty. If buffer too small, returns error.BufferTooSmall and does not dequeue
+    /// (retry with larger buffer);
+    /// see pendingOpenFileRequiredSize for needed size. Previously dequeued then truncated,
+    /// silently losing files.
     pub fn getPendingOpenFile(self: *MacOSWindow, buf: []u8) error{BufferTooSmall}!?[]const u8 {
-        _ = self; // polling 不需要 window 参数，但保持 API 一致
+        _ = self; // polling does not need window param but keeping API consistent
         const size: c_int = @intCast(@min(buf.len, std.math.maxInt(c_int)));
         const len = macos_get_pending_open_file(buf.ptr, size);
         if (len < 0) return error.BufferTooSmall;
@@ -800,7 +833,7 @@ pub const MacOSWindow = struct {
         return buf[0..@intCast(len)];
     }
 
-    /// 队首 pending 路径所需的 buffer 字节数（含 NUL）；队列为空返回 null。
+    /// Buffer byte count needed for queue-head pending path (including NUL); null if queue empty.
     pub fn pendingOpenFileRequiredSize(self: *MacOSWindow) ?usize {
         _ = self;
         const rc = macos_get_pending_open_file(null, 0);
@@ -808,10 +841,10 @@ pub const MacOSWindow = struct {
         return @intCast(-@as(i64, rc));
     }
 
-    // ========== 多窗口架构 API ==========
+    // ========== Multi-window architecture API ==========
 
-    /// 纯事件泵：拉取所有 NSApp 事件，分发到各 WindowWrapper
-    /// 不绑定任何特定窗口（静态方法）
+    /// Pure event pump: pull all NSApp events, dispatch to each WindowWrapper.
+    /// Not bound to any specific window (static method).
     pub fn pumpAppEvents() void {
         macos_pump_app_events();
     }
@@ -820,32 +853,33 @@ pub const MacOSWindow = struct {
         macos_pump_app_events_timeout(timeout_ms);
     }
 
-    /// 检查全局退出标志（Cmd+Q 或 terminate:）
+    /// Check global exit flag (Cmd+Q or terminate:)
     pub fn appShouldQuit() bool {
         return macos_should_quit() != 0;
     }
 
-    /// 消费"app 变为前台"标志：返回 true 且内部重置（每次激活只返回一次 true）
+    /// Consume "app became foreground" flag: returns true and resets internally (one true per
+    /// activation)
     pub fn consumeAppBecameActive() bool {
         return macos_consume_app_became_active() != 0;
     }
 
-    /// 查询当前系统是否为暗色模式
+    /// Query whether system is in dark mode
     pub fn isDarkMode() bool {
         return macos_is_dark_mode() != 0;
     }
 
-    /// 检查此窗口是否请求关闭（Cmd+W 或 windowShouldClose:）
+    /// Check if this window requested close (Cmd+W or windowShouldClose:)
     pub fn checkShouldClose(self: *MacOSWindow) bool {
         return macos_check_window_should_close(self.window_ptr) != 0;
     }
 
-    /// 重置窗口关闭请求标志
+    /// Reset window close-request flag
     pub fn resetShouldClose(self: *MacOSWindow) void {
         macos_reset_window_should_close(self.window_ptr);
     }
 
-    /// 更新此窗口的鼠标位置（多窗口模式下每窗口独立调用）
+    /// Update this window's mouse position (multi-window mode calls once per window)
     pub fn updateWindowMouse(self: *MacOSWindow) void {
         macos_update_window_mouse(self.window_ptr);
     }
@@ -854,7 +888,13 @@ pub const MacOSWindow = struct {
         return macos_is_window_focused(self.window_ptr) != 0;
     }
 
-    /// 菜单动作枚举（与 ObjC 侧 MenuActionType 一一对应）
+    /// System appearance sense of active (app foreground and key window); background e2e defaults
+    /// to active.
+    pub fn appearsActive(self: *MacOSWindow) bool {
+        return macos_window_appears_active(self.window_ptr) != 0;
+    }
+
+    /// Menu action enum (one-to-one with ObjC MenuActionType)
     pub const MenuAction = enum(c_int) {
         none = 0,
         new_file = 1,
@@ -880,13 +920,13 @@ pub const MacOSWindow = struct {
         var window_id: u64 = 0;
         var action: c_int = 0;
         if (macos_get_menu_action_event(&window_id, &action) == 0) return null;
-        return .{ .native_window_id = window_id, .action = std.meta.intToEnum(MenuAction, action) catch return null };
+        return .{ .native_window_id = window_id, .action = std.enums.fromInt(MenuAction, action) orelse return null };
     }
 
-    /// 消费下一个菜单动作（全局，不绑定窗口）
+    /// Consume next menu action (global, not window-bound)
     pub fn getMenuAction() ?MenuAction {
         const raw = macos_get_menu_action();
         if (raw == 0) return null;
-        return std.meta.intToEnum(MenuAction, raw) catch null;
+        return std.enums.fromInt(MenuAction, raw);
     }
 };

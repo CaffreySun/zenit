@@ -1,71 +1,100 @@
-/// Store, comptime 展开 struct 字段为独立 Signal，实现细粒度追踪
+/// Store: comptime-expands struct fields into independent Signals for fine-grained tracking
 ///
-/// 用法:
+/// Usage:
 /// ```zig
 /// const AppState = struct { count: i32, name: []const u8 };
 /// const store = try StoreOf(AppState).create(scope, .{ .count = 0, .name = "hello" });
-/// // 读取（自动追踪依赖）
+/// // Read (automatically tracks dependencies)
 /// const count = store.get(.count);
-/// // 设置（只通知 count 订阅者，name 订阅者不受影响）
+/// // Set (notifies only count subscribers; name subscribers unaffected)
 /// store.set(.count, 42);
 /// ```
 const std = @import("std");
 const Scope = @import("scope.zig").Scope;
 const Signal = @import("signal.zig").Signal;
 
-/// 为 struct T 生成的 Store 类型
+/// Store type generated for struct T
 pub fn StoreOf(comptime T: type) type {
-    const info = @typeInfo(T).@"struct";
+    const fields = @import("zenit_reflection").fields(T);
 
     return struct {
         const Self = @This();
 
-        /// 每个字段对应一个独立 Signal
-        signals: [info.fields.len]*anyopaque,
+        /// Each field maps to independent Signal
+        signals: [fields.len]*anyopaque,
         scope: *Scope,
 
-        /// 在 scope 上创建 Store，初始值从 initial 读取
+        /// Create Store on scope, initial values from initial; each field one signal. `[]const u8`
+        /// fields are owning-text signals (`scope.createText`): write copies content, caller can
+        /// pass temp buffer (like Input callback borrowed slice); read slice valid only in current
+        /// sync call and field not rewritten since (see `Signal.get`).
         pub fn create(scope: *Scope, initial: T) !Self {
-            var signals: [info.fields.len]*anyopaque = undefined;
-            inline for (info.fields, 0..) |f, i| {
-                signals[i] = @ptrCast(try scope.createSignal(f.type, @field(initial, f.name)));
+            var signals: [fields.len]*anyopaque = undefined;
+            inline for (fields, 0..) |f, i| {
+                signals[i] = if (f.type == []const u8)
+                    @ptrCast(try scope.createText(@field(initial, f.name), .{}))
+                else
+                    @ptrCast(try scope.createSignal(f.type, @field(initial, f.name)));
             }
             return .{ .signals = signals, .scope = scope };
         }
 
-        /// 读取单个字段（自动追踪依赖）
-        pub fn get(self: *const Self, comptime field: std.meta.FieldEnum(T)) FieldType(field) {
-            return self.signalPtr(field).get();
+        /// Field's signal: can bind directly as component Source/Model (`.value =
+        /// store.field(.email)`).
+        pub fn field(self: *const Self, comptime f: std.meta.FieldEnum(T)) *Signal(FieldType(f)) {
+            return self.signalPtr(f);
         }
 
-        /// 设置单个字段（只通知该字段订阅者）
-        pub fn set(self: *Self, comptime field: std.meta.FieldEnum(T), value: FieldType(field)) void {
-            self.signalPtr(field).set(value);
+        /// Read single field (auto-track dependencies)
+        pub fn get(self: *const Self, comptime fe: std.meta.FieldEnum(T)) FieldType(fe) {
+            return self.signalPtr(fe).get();
         }
 
-        /// 无追踪读取全部字段（snapshot）
+        /// Set single field (notify only that field's subscribers)
+        pub fn set(self: *Self, comptime fe: std.meta.FieldEnum(T), value: FieldType(fe)) void {
+            self.signalPtr(fe).set(value);
+        }
+
+        /// Read all fields without tracking (snapshot)
         pub fn snapshot(self: *const Self) T {
             var result: T = undefined;
-            inline for (info.fields, 0..) |f, i| {
+            inline for (fields, 0..) |f, i| {
                 const signal: *Signal(f.type) = @ptrCast(@alignCast(self.signals[i]));
                 @field(result, f.name) = signal.peek();
             }
             return result;
         }
 
-        /// 获取字段的类型
-        fn FieldType(comptime field: std.meta.FieldEnum(T)) type {
-            return std.meta.fieldInfo(T, field).type;
+        /// Get field type
+        fn FieldType(comptime fe: std.meta.FieldEnum(T)) type {
+            return std.meta.fieldInfo(T, fe).type;
         }
 
-        fn signalPtr(self: *const Self, comptime field: std.meta.FieldEnum(T)) *Signal(FieldType(field)) {
-            return @ptrCast(@alignCast(self.signals[@intFromEnum(field)]));
+        fn signalPtr(self: *const Self, comptime fe: std.meta.FieldEnum(T)) *Signal(FieldType(fe)) {
+            return @ptrCast(@alignCast(self.signals[@backingInt(fe)]));
         }
     };
 }
 
-// 测试位于 src/ui/ui.zig 通过完整 import 链跑（store + scope 需要 work/deferred_scheduler 模块）。
-// 这里仅做 type-level 编译验证：StoreOf 实例化即所有 method 编译。
+// Tests in src/ui/ui.zig run via full import chain (store + scope need work/deferred_scheduler
+// module). Here only type-level compile verification: StoreOf instantiation compiles all methods.
+test "StoreOf: text fields own their bytes; field() exposes the signal" {
+    const SignalOwner = @import("owner.zig").SignalOwner;
+    var owner = try SignalOwner.init(std.testing.allocator);
+    defer owner.deinit();
+    const scope = try Scope.init(std.testing.allocator, null, owner);
+    defer scope.dispose();
+    const Data = struct { name: []const u8, n: i32 };
+    var store = try StoreOf(Data).create(scope, .{ .name = "a", .n = 1 });
+    var tmp = "temporary".*;
+    store.set(.name, &tmp);
+    tmp[0] = 'X';
+    try std.testing.expectEqualStrings("temporary", store.get(.name));
+    store.field(.n).set(5);
+    try std.testing.expectEqual(@as(i32, 5), store.snapshot().n);
+    try std.testing.expect(store.field(.name).slice_store != null);
+}
+
 test "StoreOf: type instantiates" {
     const Counter = struct { n: i32, name: []const u8 };
     const T = StoreOf(Counter);

@@ -1,16 +1,13 @@
-//! node_render_cache, v0.12 §N2 god-object split: 从 node.zig 抽出
-//! 渲染缓存子域（6 方法 + TextHashSnapshot 类型）。
+//! node_render_cache: render cache domain split out of node.zig (6 methods + TextHashSnapshot
+//! type).
 //!
-//! 范式同 §N1 node_dirty.zig：Node-typed free function +
-//! @import("node.zig") 循环 import；node.zig 保留 thin delegate（原
-//! pub/private 可见性），内部 caller 零改。
+//! Pattern: Node-typed free functions + @import("node.zig") circular import; node.zig keeps thin
+//! delegates (original pub/private visibility). buildCachedRenderSlice is a module-level free fn.
+//! node.zig re-exports TextHashSnapshot (e.g., text_item_render.zig uses
+//! node.Node.TextHashSnapshot).
 //!
-//! buildCachedRenderSlice 原是 static fn（无 self）-> 本模块模块级
-//! free function。TextHashSnapshot 类型搬入，node.zig re-export
-//! （外部 text_item_render.zig 等用 node.Node.TextHashSnapshot）。
-//!
-//! source of truth = self.meta.per_frame.caches.commands.{own,promoted}
-//! / .text_hash；本模块只做 build/invalidate/hash 逻辑。
+//! Source of truth = self.meta.per_frame.caches.commands.{own,promoted} / .text_hash;
+//! this module only handles build/invalidate/hash logic.
 
 const std = @import("std");
 const node_mod = @import("node.zig");
@@ -81,7 +78,7 @@ fn buildCachedRenderSlice(
     };
 }
 
-/// 缓存渲染命令片段（深拷贝 text 的 content/spans，避免指针悬挂）
+/// Cache render command slice (deep-copy text content/spans to avoid dangling pointers).
 pub fn cacheRenderCommands(self: *Node, allocator: Allocator, commands: []const DisplayItem, scroll_ox: f32, scroll_oy: f32) void {
     if (node_mod.shouldLogBracketNode(self.id)) {
         std.debug.print("[PT-BRACKET] cache node={d} kind=legacy count={d} content_v={d} composite_v={d}\n", .{
@@ -165,7 +162,7 @@ pub fn cachePromotedRenderCommands(
     self.meta.per_frame.caches.commands.promoted = fresh;
 }
 
-/// 释放缓存的渲染命令
+/// Release cached render commands.
 pub fn invalidateRenderCache(self: *Node) void {
     if (self.meta.per_frame.caches.commands.own) |*cache| {
         if (node_mod.shouldLogBracketNode(self.id)) {
@@ -179,10 +176,10 @@ pub fn invalidateRenderCache(self: *Node) void {
     }
 }
 
-/// 下游回归：写入非 promoted 干净子树的跨帧 display payload 缓存。
-/// commands 需已物化（text_run 的 blob 引用断开、content 指向帧内字节,
-/// buildCachedRenderSlice -> duplicateDisplayItems 会深拷贝 content/spans）。
-/// stamp = 写入帧的 transform/effect/clip 链根 id + world bounds 尺寸。
+/// Write the cross-frame display payload cache for a clean, non-promoted subtree.
+/// commands must be materialized (text_run blob refs broken; content points to frame bytes;
+/// buildCachedRenderSlice -> duplicateDisplayItems deep-copies content/spans).
+/// stamp = frame-local transform/effect/clip chain root id + world bounds size.
 pub fn cacheSubtreePayloadCommands(
     self: *Node,
     allocator: Allocator,
@@ -241,23 +238,23 @@ pub fn invalidatePromotedRenderCache(self: *Node) void {
     }
 }
 
-/// 作废 text hash 缓存，每次写 text content 都必须调。
+/// Invalidate text hash cache; must call on every text content write.
 ///
-/// ⚠️ 缓存键是 (content_version, content_ptr, content_len, spans_ptr, spans_len)，
-/// 而 `Node.setText` **不撞** content_version（它只是转发给 World.content，
-/// 不碰 per_frame.caches）。于是"等长换文本"时三个键分量可以全部不变：
-///   - len 相同（"3 × 4" -> "3 × 5" 都是 6 字节）；
-///   - ptr 相同（旧 owned buffer 被 free 后 allocator 常把同一块还给新的
-///     dupe；就地改写调用方自己的 buffer 则必然同址）；
-///   - version 相同（setText 不撞，调用方若只 markRenderDirty 也未必先于
-///     本次读取发生）。
-/// 命中旧 hash 的后果不是崩溃而是**画面陈旧**：blob 指纹、paint chunk 的
-/// content_hash、retained 层指纹一路判"内容没变"而跳过重录。含字体回退的
-/// 串最扎眼，文本被按字体切成多段（"3 × 4" = ['3 ']['×'][' ']['4']），
-/// 变化落在哪段就只有那段更新，其余段留着旧字形。
+/// Cache key is (content_version, content_ptr, content_len, spans_ptr, spans_len), but
+/// `Node.setText` **does not bump** content_version (it only forwards to World.content and doesn't
+/// touch per_frame.caches). A same-length text swap can leave the key unchanged:
+///   - len same ("3 × 4" -> "3 × 5" both 6 bytes; the multiplication sign U+00D7 is 2 bytes in
+///     UTF-8);
+///   - ptr same (a freed owned buffer is often reused for the new dupe; in-place caller
+///     buffer writes keep the address);
+///   - version same (setText doesn't bump; caller may not markRenderDirty before this read).
+/// A hit returns the old hash and shows **stale** text: blob fingerprint, paint chunk content_hash
+/// and retained layer fingerprint all judge "content unchanged" and skip re-record. Most visible
+/// with fallback fonts: text split by font ("3 x 4" = ['3 ']['x'][' ']['4']) updates only the
+/// changed segment; others keep old glyphs.
 ///
-/// 把作废点放在写路径（而不是让调用方记得 markRenderDirty）是因为：hash 的
-/// 输入就是 content/spans 本身，谁改谁负责作废，不能依赖下游脏标记的时序。
+/// Invalidate in the write path (not relying on callers to markRenderDirty): the cache input is
+/// content/spans themselves, so whoever changes them must invalidate.
 pub fn invalidateTextHashCache(self: *Node) void {
     self.meta.per_frame.caches.text_hash = .{};
 }

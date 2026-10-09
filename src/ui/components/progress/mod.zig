@@ -1,15 +1,14 @@
 /// Progress Component
 ///
-/// 进度条组件，支持确定/不确定模式
+/// Progress bar component supporting determinate / indeterminate modes. View in progress.yix,
+/// styles and drawing in styles.yss.
 ///
-/// 特性:
-/// - 百分比进度
-/// - 状态颜色: normal/success/error
-/// - 不确定模式 (高品质 shimmer 动画)
-/// - 可选百分比文本
+/// Features:
+/// - Percentage progress (value / status can come from signals)
+/// - Status color: normal/success/error
+/// - Indeterminate mode (shiny bar sweeps with frame clock, custom-drawn canvas)
+/// - Optional percentage text
 const std = @import("std");
-const math = std.math;
-const Allocator = std.mem.Allocator;
 const core = @import("../../core.zig");
 const Cx = core.Cx;
 const Node = core.Node;
@@ -17,14 +16,11 @@ const box = core.box;
 const Color = core.Color;
 const theme = core.theme;
 const ConditionalStyle = core.ConditionalStyle;
-const Scope = @import("../../reactive.zig").Scope;
-const MultiGradient = core.MultiGradient;
-const GradientStop = core.GradientStop;
-const styles = @import("styles.zig");
-const render_engine = @import("../../core/render_engine/mod.zig");
-const DrawContext = render_engine.DrawContext;
+const reactive = @import("../../reactive.zig");
+const Scope = reactive.Scope;
+const styles = @import("_styles.yss.zig");
 
-/// 进度条状态
+/// Progress bar status.
 pub const ProgressStatus = enum {
     normal,
     success,
@@ -33,293 +29,16 @@ pub const ProgressStatus = enum {
     pub fn color(self: ProgressStatus, t: *const theme.ThemeTokens) Color {
         return styles.statusColor(self, t);
     }
-
-    pub fn style(self: ProgressStatus, t: *const theme.ThemeTokens) ConditionalStyle {
-        return styles.statusStyle(self, t);
-    }
 };
 
-/// Progress 属性
-pub const ProgressProps = struct {
-    /// 当前值 (0-100)
-    value: f32 = 0,
-    /// 状态
-    status: ProgressStatus = .normal,
-    /// 轨道高度
-    height: f32 = 4,
-    /// 显示百分比文本
-    show_text: bool = false,
-    /// 不确定模式
-    indeterminate: bool = false,
-    /// 总宽度 (null = grow)
-    width: ?f32 = null,
-};
+/// Create Progress: `W.Progress(.{ .value = upload_ratio, .show_text = true })`
+pub const Progress = @import("_progress.yix.zig").Progress;
+pub const ProgressProps = @import("_progress.yix.zig").ProgressProps;
 
-/// 创建 Progress
-pub fn Progress(props: ProgressProps) ProgressBuilder {
-    return ProgressBuilder{ .props = props };
-}
-
-pub const ProgressBuilder = struct {
-    props: ProgressProps,
-
-    pub fn value(self: ProgressBuilder, v: f32) ProgressBuilder {
-        var new = self;
-        new.props.value = v;
-        return new;
-    }
-
-    pub fn status(self: ProgressBuilder, s: ProgressStatus) ProgressBuilder {
-        var new = self;
-        new.props.status = s;
-        return new;
-    }
-
-    pub fn height(self: ProgressBuilder, h: f32) ProgressBuilder {
-        var new = self;
-        new.props.height = h;
-        return new;
-    }
-
-    pub fn showText(self: ProgressBuilder, s: bool) ProgressBuilder {
-        var new = self;
-        new.props.show_text = s;
-        return new;
-    }
-
-    pub fn indeterminate(self: ProgressBuilder, i: bool) ProgressBuilder {
-        var new = self;
-        new.props.indeterminate = i;
-        return new;
-    }
-
-    pub fn width(self: ProgressBuilder, w: f32) ProgressBuilder {
-        var new = self;
-        new.props.width = w;
-        return new;
-    }
-
-    /// 保留模式: mount
-    pub fn mount(self: ProgressBuilder, scope: *Scope, cx: *Cx) !*Node {
-        const my_scope = try scope.childScope();
-        const allocator = cx.allocator;
-        const t = cx.tokens;
-        const p = self.props;
-
-        const status_color = p.status.color(t);
-        const track_color = styles.trackColor(t);
-        const container_width: core.Sizing = if (p.width) |w| .{ .px = w } else .{ .grow = .{} };
-
-        // 外层容器
-        const container = try box(cx, .{
-            .width = container_width,
-            .height = .{ .fit = .{} },
-            .direction = .row,
-            .align_items = .center,
-            .gap = 8,
-        }, .{});
-        // sweep：container 守到 return；子节点建好即 adopt；可失败 mount 里不用 ensureExtPanic
-        errdefer cx.freeNode(container);
-        container.meta.ownership.meta.component_name = "Progress";
-        // role=progressbar + valuenow/min/max：AT 靠这三个数播报"70%"。
-        // 不确定模式按 ARIA 约定不报数值（值未知），改用 busy 位告诉用户
-        // "正在进行中但无法预估进度"。
-        container.behavior.interaction.a11y = if (p.indeterminate) .{
-            .role = .progressbar,
-            .busy = true,
-        } else .{
-            .role = .progressbar,
-            .value_now = math.clamp(p.value, 0, 100),
-            .value_min = 0,
-            .value_max = 100,
-            .value_range = .{ .now = math.clamp(p.value, 0, 100), .min = 0, .max = 100 },
-        };
-        try core.bindScopeToNode(my_scope, container);
-
-        // 轨道
-        const track = try core.adoptChild(cx, allocator, container, try box(cx, .{
-            .width = .{ .grow = .{} },
-            .height = .{ .px = p.height },
-            .background = track_color,
-            .border = .{ .radius = p.height / 2 },
-        }, .{}));
-        track.style.overflow_hidden = true;
-
-        // 填充条
-        const clamped = math.clamp(p.value, 0, 100);
-
-        if (p.indeterminate) {
-            // 不确定模式: custom_draw 实现高品质 shimmer 动画
-            const anim_state = try allocator.create(IndeterminateState);
-            anim_state.* = .{
-                .base_color = status_color,
-                .highlight_color = Color.lerp(status_color, Color.rgba(255, 255, 255, 255), 0.35),
-                .shadow_color = Color.lerp(status_color, Color.rgba(0, 0, 0, 255), 0.15),
-                .radius = p.height / 2,
-            };
-            try my_scope.adoptResource(@ptrCast(anim_state), struct {
-                fn cleanup(ptr: *anyopaque, alloc: Allocator) void {
-                    const s: *IndeterminateState = @ptrCast(@alignCast(ptr));
-                    alloc.destroy(s);
-                }
-            }.cleanup);
-
-            // 用 grow 撑满 track 的 custom_draw 节点
-            const draw_node = try core.adoptChild(cx, allocator, track, try box(cx, .{
-                .width = .{ .grow = .{} },
-                .height = .{ .grow = .{} },
-            }, .{}));
-            draw_node.meta.per_frame.hooks.slots.anim_state = @ptrCast(anim_state);
-            draw_node.meta.per_frame.hooks.before_render.main = indeterminateTick;
-            draw_node.setCustomDraw(indeterminateDraw, @ptrCast(anim_state));
-        } else {
-            // 确定模式: 按百分比宽度，垂直 3-stop 渐变模拟光照立体感
-            const fill = try core.adoptChild(cx, allocator, track, try box(cx, .{
-                .width = .{ .percent = clamped },
-                .height = .{ .px = p.height },
-                .border = .{ .radius = p.height / 2 },
-            }, .{}));
-            const fill_stops = [_]GradientStop{
-                .{ .color = Color.lerp(status_color, Color.rgba(255, 255, 255, 255), 0.25), .position = 0.0 },
-                .{ .color = status_color, .position = 0.5 },
-                .{ .color = Color.lerp(status_color, Color.rgba(0, 0, 0, 255), 0.10), .position = 1.0 },
-            };
-            (try fill.style.ensureExtFallible(allocator)).multi_gradient = MultiGradient.fromSlice(&fill_stops, .vertical);
-        }
-
-        // 百分比文本
-        if (p.show_text and !p.indeterminate) {
-            var text_buf: [8]u8 = undefined;
-            const text_content = std.fmt.bufPrint(&text_buf, "{d:.0}%", .{clamped}) catch "0%";
-
-            const text_node = try core.adoptChild(cx, allocator, container, try box(cx, .{
-                .width = .{ .fit = .{} },
-                .height = .{ .fit = .{} },
-            }, .{}));
-            // text_content 来自 local buf；setContent 拷贝。
-            text_node.setText(styles.percentTextStyle(t));
-            if (text_node.getText()) |old| {
-                var txt = old;
-                try txt.setContent(cx.allocator, text_content);
-                text_node.setText(txt);
-            }
-        }
-
-        return container;
-    }
-};
-
-// ========== 不确定模式动画 ==========
-
-const IndeterminateState = struct {
-    /// 当前周期内的相位时间（秒）
-    phase_seconds: f32 = 0,
-    /// 基础颜色
-    base_color: Color,
-    /// 高亮颜色（白色混合 35%），shimmer 波峰
-    highlight_color: Color,
-    /// 阴影颜色（黑色混合 15%），shimmer 波谷
-    shadow_color: Color,
-    /// 圆角
-    radius: f32 = 2,
-};
-
-/// 动画时间参数
-const CYCLE_SECONDS: f32 = 2.0;
-
-/// cubic-bezier(0.65, 0, 0.35, 1)，类似 CSS ease-in-out 但更极端
-/// 用 de Casteljau 算法计算 cubic bezier 曲线上的 y 值
-/// P0=(0,0), P1=(0.65, 0), P2=(0.35, 1), P3=(1,1)
-fn cubicBezierEase(t: f32) f32 {
-    // 近似求解：对 cubic bezier 做 Newton-Raphson 反解 x->t 太重了
-    // 用 5 次多项式拟合 cubic-bezier(0.65, 0, 0.35, 1)
-    // 特征：中段快、两端慢，比 smoothstep 更极端
-    const t2 = t * t;
-    const t3 = t2 * t;
-    // 6t^5 - 15t^4 + 10t^3 (quintic smoothstep，比 cubic 更陡)
-    return 6.0 * t2 * t3 - 15.0 * t2 * t2 + 10.0 * t3;
-}
-
-/// 计算 bar 的左右边缘位置（归一化 0~1，相对于 track 宽度）
-/// 返回 (left, right)，left < right
-fn barEdges(t: f32) struct { left: f32, right: f32 } {
-    // lead（右边缘）比 trail（左边缘）相位超前
-    // lead 更早启动、更早到达，trail 稍后追上
-    // 时间差制造宽度变化：入场展开 -> 中段最宽 -> 离场收窄
-
-    // lead: 从 t=-0.1 开始映射到 [0,1]（提前启动）
-    const lead_raw = math.clamp((t + 0.1) / 0.9, 0, 1);
-    // trail: 从 t=0.2 开始映射到 [0,1]（延迟启动）
-    const trail_raw = math.clamp((t - 0.2) / 0.9, 0, 1);
-
-    const right = cubicBezierEase(lead_raw);
-    const left = cubicBezierEase(trail_raw);
-
-    return .{ .left = left, .right = right };
-}
-
-/// 从绝对时间戳直接计算 phase，零累积误差。
-fn advanceIndeterminateState(state: *IndeterminateState, now_ms: f64) void {
-    const cycle_ms: f64 = CYCLE_SECONDS * 1000.0;
-    state.phase_seconds = @as(f32, @floatCast(@mod(now_ms, cycle_ms) / 1000.0));
-}
-
-fn indeterminateTick(node: *Node) void {
-    const state: *IndeterminateState = @ptrCast(@alignCast(node.meta.per_frame.hooks.slots.anim_state orelse return));
-    advanceIndeterminateState(state, render_engine.current_frame_time_ms);
-    node.markRenderDirty();
-}
-
-fn indeterminateDraw(ctx: DrawContext, context: ?*anyopaque) anyerror!void {
-    const state: *IndeterminateState = @ptrCast(@alignCast(context orelse return));
-
-    const t = state.phase_seconds / CYCLE_SECONDS;
-    const edges = barEdges(t);
-    const track_w = ctx.render_w;
-    const track_h = ctx.render_h;
-    _ = track_h;
-
-    const bar_left = edges.left * track_w;
-    const bar_right = edges.right * track_w;
-    const bar_w = bar_right - bar_left;
-
-    if (bar_w < 0.5) return; // 太小不画
-
-    // 绘制带 3-stop 渐变的 bar, highlight(0%) -> base(55%) -> shadow(100%)
-    // 模拟移动光泽：波峰偏左，右侧自然衰减到暗部，比 2-stop 更真实
-    var shimmer_colors = [_]Color{Color.rgba(0, 0, 0, 0)} ** 16;
-    var shimmer_positions = [_]f32{0} ** 16;
-    shimmer_colors[0] = state.highlight_color;
-    shimmer_colors[1] = state.base_color;
-    shimmer_colors[2] = state.shadow_color;
-    shimmer_positions[0] = 0.0;
-    shimmer_positions[1] = 0.55;
-    shimmer_positions[2] = 1.0;
-
-    if (ctx.display_list) |dl| {
-        if (ctx.display_header) |header| {
-            try dl.append(.{
-                .multi_gradient_rect = .{
-                    .header = header,
-                    .x = bar_left,
-                    .y = 0,
-                    .w = bar_w,
-                    .h = ctx.local_h,
-                    .direction = .horizontal,
-                    .radius = .{ state.radius, state.radius, state.radius, state.radius },
-                    .stop_colors = shimmer_colors,
-                    .stop_positions = shimmer_positions,
-                    .stop_count = 3,
-                },
-            });
-        }
-    }
-}
-
-// ========== 测试 ==========
+// ========== Tests ==========
 
 test "Progress: basic" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 300 }, .height = .{ .px = 50 } }, .{});
@@ -328,22 +47,20 @@ test "Progress: basic" {
     const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
     defer scope.dispose();
 
-    const progress = try Progress(.{})
-        .value(75)
-        .mount(scope, ctx);
+    const progress = try Progress(.{ .value = 75 }).mount(scope, ctx);
 
     try root.appendChild(std.testing.allocator, progress);
 
-    // container 有 1 个子节点: track
+    // Container has 1 child: track.
     try std.testing.expectEqual(@as(usize, 1), progress.children.items.len);
 
-    // track 有 1 个子节点: fill
+    // Track has 1 child: fill.
     const track = progress.children.items[0];
     try std.testing.expectEqual(@as(usize, 1), track.children.items.len);
 }
 
 test "Progress: indeterminate custom draw emits display list gradient" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     ctx.setViewport(300, 60);
 
@@ -353,7 +70,7 @@ test "Progress: indeterminate custom draw emits display list gradient" {
     const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
     defer scope.dispose();
 
-    const progress = try Progress(.{}).indeterminate(true).mount(scope, ctx);
+    const progress = try Progress(.{ .indeterminate = true }).mount(scope, ctx);
     try root.appendChild(std.testing.allocator, progress);
 
     ctx.layout();
@@ -375,7 +92,7 @@ test "Progress: indeterminate custom draw emits display list gradient" {
 }
 
 test "Progress: indeterminate custom draw replays own content from display list" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     ctx.setViewport(300, 60);
 
@@ -385,7 +102,7 @@ test "Progress: indeterminate custom draw replays own content from display list"
     const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
     defer scope.dispose();
 
-    const progress = try Progress(.{}).indeterminate(true).mount(scope, ctx);
+    const progress = try Progress(.{ .indeterminate = true }).mount(scope, ctx);
     try root.appendChild(std.testing.allocator, progress);
 
     ctx.layout();
@@ -398,8 +115,9 @@ test "Progress: indeterminate custom draw replays own content from display list"
     var saw_gradient = false;
     for (commands) |cmd| {
         if (cmd.isGradient() and cmd.mg_stop_count > 0) {
-            // multi_gradient_rect 在 paint_table 用 mg_stop_count > 0 区分；direction 字段
-            // 没单独存（paint_table 简化），用 geom.w/h > 0 即可代验。
+            // multi_gradient_rect in paint_table distinguished by mg_stop_count > 0; direction
+            // field not separately stored (paint_table simplification), geom.w/h > 0 suffices to
+            // validate.
             if (cmd.geom.w > 0 and cmd.geom.h > 0) {
                 saw_gradient = true;
                 break;
@@ -410,7 +128,7 @@ test "Progress: indeterminate custom draw replays own content from display list"
 }
 
 test "Progress: with text" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 300 }, .height = .{ .px = 50 } }, .{});
@@ -419,19 +137,16 @@ test "Progress: with text" {
     const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
     defer scope.dispose();
 
-    const progress = try Progress(.{})
-        .value(50)
-        .showText(true)
-        .mount(scope, ctx);
+    const progress = try Progress(.{ .value = 50, .show_text = true }).mount(scope, ctx);
 
     try root.appendChild(std.testing.allocator, progress);
 
-    // container 有 2 个子节点: track + text
+    // Container has 2 children: track + text.
     try std.testing.expectEqual(@as(usize, 2), progress.children.items.len);
 }
 
 test "Progress: status colors" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 300 }, .height = .{ .px = 100 } }, .{});
@@ -440,9 +155,9 @@ test "Progress: status colors" {
     const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
     defer scope.dispose();
 
-    const normal = try Progress(.{}).value(80).status(.normal).mount(scope, ctx);
-    const success_p = try Progress(.{}).value(100).status(.success).mount(scope, ctx);
-    const err = try Progress(.{}).value(30).status(.@"error").mount(scope, ctx);
+    const normal = try Progress(.{ .value = 80, .status = .normal }).mount(scope, ctx);
+    const success_p = try Progress(.{ .value = 100, .status = .success }).mount(scope, ctx);
+    const err = try Progress(.{ .value = 30, .status = .@"error" }).mount(scope, ctx);
 
     try root.appendChild(std.testing.allocator, normal);
     try root.appendChild(std.testing.allocator, success_p);
@@ -452,7 +167,7 @@ test "Progress: status colors" {
 }
 
 test "Progress: clamp value" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 300 }, .height = .{ .px = 50 } }, .{});
@@ -461,8 +176,8 @@ test "Progress: clamp value" {
     const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
     defer scope.dispose();
 
-    // 超过 100 应该 clamp
-    const progress = try Progress(.{}).value(150).mount(scope, ctx);
+    // Over 100 should clamp.
+    const progress = try Progress(.{ .value = 150 }).mount(scope, ctx);
     try root.appendChild(std.testing.allocator, progress);
 
     const track = progress.children.items[0];
@@ -471,7 +186,7 @@ test "Progress: clamp value" {
 }
 
 test "Progress: indeterminate" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 300 }, .height = .{ .px = 50 } }, .{});
@@ -480,45 +195,40 @@ test "Progress: indeterminate" {
     const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
     defer scope.dispose();
 
-    const progress = try Progress(.{}).indeterminate(true).mount(scope, ctx);
+    const progress = try Progress(.{ .indeterminate = true }).mount(scope, ctx);
     try root.appendChild(std.testing.allocator, progress);
 
     const track = progress.children.items[0];
-    // 不确定模式: 1 个 custom_draw 子节点
+    // Indeterminate mode: 1 custom-drawn child, redrawn each frame; reports busy not value.
     try std.testing.expectEqual(@as(usize, 1), track.children.items.len);
     const draw_node = track.children.items[0];
-    try std.testing.expect(draw_node.meta.per_frame.hooks.before_render.main != null);
+    try std.testing.expect(draw_node.hasBeforeRenderHooks());
     try std.testing.expect(draw_node.meta.per_frame.custom_hooks.draw != null);
+    const a11y = progress.behavior.interaction.a11y.?;
+    try std.testing.expect(a11y.busy);
+    try std.testing.expect(a11y.value_range == null);
 }
 
-test "Progress: indeterminate timing follows elapsed time instead of frame count" {
-    var a = IndeterminateState{
-        .base_color = Color.rgba(100, 160, 220, 255),
-        .highlight_color = Color.rgba(180, 210, 245, 255),
-        .shadow_color = Color.rgba(85, 136, 187, 255),
-        .radius = 2,
-    };
-    var b = a;
-
-    for (0..125) |_| advanceIndeterminateState(&a, 0.01);
-    for (0..25) |_| advanceIndeterminateState(&b, 0.05);
-
-    try std.testing.expectApproxEqAbs(a.phase_seconds, b.phase_seconds, 0.0001);
-    const edges_a = barEdges(a.phase_seconds / CYCLE_SECONDS);
-    const edges_b = barEdges(b.phase_seconds / CYCLE_SECONDS);
-    try std.testing.expectApproxEqAbs(edges_a.left, edges_b.left, 0.0001);
-    try std.testing.expectApproxEqAbs(edges_a.right, edges_b.right, 0.0001);
+test "Progress: 光泽条只由绝对时间决定，入场展开、离场收窄" {
+    const cycle: f64 = styles.cycle_seconds * 1000.0;
+    const start = styles.barAt(0);
+    try std.testing.expect(start.right - start.left < 0.05);
+    const mid = styles.barAt(cycle * 0.5);
+    try std.testing.expect(mid.right - mid.left > 0.2);
+    const again = styles.barAt(cycle * 3.5); // Same phase across cycles.
+    try std.testing.expectApproxEqAbs(mid.left, again.left, 0.0001);
+    try std.testing.expectApproxEqAbs(mid.right, again.right, 0.0001);
 }
 
 test "Progress: render emits visible fill and percent text" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     ctx.setViewport(320, 80);
 
     const root = try box(ctx, .{
         .width = .{ .px = 320 },
         .height = .{ .px = 80 },
-        .background = ctx.tokens.color.bg_primary,
+        .background = ctx.tokens.tokens.color.bg_primary,
     }, .{});
     ctx.root = root;
 
@@ -540,7 +250,7 @@ test "Progress: render emits visible fill and percent text" {
     var saw_track = false;
     var saw_fill = false;
     var saw_text = false;
-    const expected_track = Color.lerp(ctx.tokens.color.bg_tertiary, ctx.tokens.color.fg_primary, 0.06);
+    const expected_track = Color.lerp(ctx.tokens.tokens.color.bg_tertiary, ctx.tokens.tokens.color.fg_primary, 0.06);
     for (commands) |cmd| {
         if (cmd.isFillRect()) {
             if (Color.eql(cmd.color.toColor(), expected_track) and cmd.geom.w >= 160 and cmd.geom.h >= 4) {
@@ -560,17 +270,17 @@ test "Progress: render emits visible fill and percent text" {
     try std.testing.expect(saw_text);
 }
 
-// styles.zig 的测试收集，这行是必需的，见 docs/STYLING.md
+// Test collection from styles.yss, this line required, see docs/STYLING.md.
 test {
-    _ = @import("styles.zig");
+    _ = @import("_styles.yss.zig");
 }
 
-// 逐分配点 OOM sweep，见 src/ui/components/oom_sweep.zig
+// Per-allocation point OOM sweep, see src/ui/components/oom_sweep.zig.
 test "progress: mount 在任意分配点失败时不泄漏（sweep）" {
     const sw = @import("../oom_sweep.zig");
     try sw.sweepMount("progress", struct {
         fn m(scope: *sw.Scope, cx: *sw.Cx) anyerror!?*sw.Node {
-            return try Progress(.{}).value(75).mount(scope, cx);
+            return try Progress(.{ .value = 75 }).mount(scope, cx);
         }
     }.m);
 }
@@ -580,6 +290,62 @@ test "progress(indeterminate): mount 在任意分配点失败时不泄漏（swee
     try sw.sweepMount("progress(indeterminate)", struct {
         fn m(scope: *sw.Scope, cx: *sw.Cx) anyerror!?*sw.Node {
             return try Progress(.{ .indeterminate = true }).mount(scope, cx);
+        }
+    }.m);
+}
+
+// -- Signal-first behavior --
+
+test "Progress: value and status follow their sources" {
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
+    const root = try box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 100 } }, .{});
+    ctx.root = root;
+    const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
+    defer scope.dispose();
+
+    const done = try scope.createSignal(f32, 10);
+    const status = reactive.map(done, struct {
+        fn s(v: f32) ProgressStatus {
+            return if (v >= 100) .success else .normal;
+        }
+    }.s);
+    const progress = try Progress(.{ .value = done, .status = status, .show_text = true }).mount(scope, ctx);
+    try root.appendChild(std.testing.allocator, progress);
+    if (reactive.SignalOwner.debug_checks) try std.testing.expectEqual(@as(u32, 0), ctx.owner.debug.mount_tracked_reads);
+    const fill = progress.children.items[0].children.items[0];
+    const text_node = progress.children.items[1];
+    try std.testing.expectEqual(core.Sizing{ .percent = 10 }, fill.style.width);
+    try std.testing.expectEqualStrings("10%", text_node.getText().?.content);
+
+    done.set(64);
+    try std.testing.expectEqual(core.Sizing{ .percent = 64 }, fill.style.width);
+    try std.testing.expectEqualStrings("64%", text_node.getText().?.content);
+    try std.testing.expectEqual(@as(?f32, 64), progress.behavior.interaction.a11y.?.value_now);
+    const normal_mid = fill.style.ext.?.multi_gradient.?.stops[1].color;
+
+    done.set(250); // Clamp to 100, status switches success.
+    try std.testing.expectEqual(core.Sizing{ .percent = 100 }, fill.style.width);
+    try std.testing.expect(!Color.eql(normal_mid, fill.style.ext.?.multi_gradient.?.stops[1].color));
+    try std.testing.expect(Color.eql(ProgressStatus.success.color(ctx.tokens), fill.style.ext.?.multi_gradient.?.stops[1].color));
+}
+
+test "Progress: static props add no effects (zero-cost static)" {
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
+    const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
+    defer scope.dispose();
+    const before = ctx.owner.graph.countByKind().get(.effect);
+    const p = try Progress(.{ .value = 30, .status = .success, .show_text = true }).mount(scope, ctx);
+    defer ctx.freeNode(p);
+    try std.testing.expectEqual(before, ctx.owner.graph.countByKind().get(.effect));
+}
+
+test "progress(value signal): mount 在任意分配点失败时不泄漏（sweep）" {
+    try @import("../oom_sweep.zig").sweepMount("progress(signal)", struct {
+        fn m(scope: *Scope, cx: *Cx) anyerror!?*Node {
+            const v = try scope.createSignal(f32, 42);
+            return try Progress(.{ .value = v, .show_text = true }).mount(scope, cx);
         }
     }.m);
 }

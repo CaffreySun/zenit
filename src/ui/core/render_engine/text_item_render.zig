@@ -1,7 +1,9 @@
-/// 文本 Blob 与 DisplayList 文本项生成
+/// Text Blob and DisplayList text item generation
 ///
-/// 负责将节点的文本属性（TextProps + TextLayout）转换为 DisplayList 中的 text_run / fill_rect 项。
-/// 含多行布局、Span 分段、省略号截断、智能后缀保留等逻辑。
+/// Converts node text attributes (TextProps + TextLayout) to text_run / fill_rect items in
+/// DisplayList.
+/// Includes multiline layout, span segmentation, ellipsis truncation, and smart suffix
+/// preservation.
 const std = @import("std");
 const types = @import("../types.zig");
 const node_mod = @import("../node.zig");
@@ -108,10 +110,6 @@ fn shouldLogBracketChunk(frame: u64, node_id: u32, start: u32, end: u32) bool {
     return true;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Blob 管理
-// ─────────────────────────────────────────────────────────────────────────────
-
 pub fn appendTextBlobForNode(
     cx: *RenderContext,
     node: *Node,
@@ -179,22 +177,18 @@ pub fn appendTextBlobForNode(
     return result.blob_id;
 }
 
-/// blob-backed text_run 的**兜底文本**。
+/// Fallback text for blob-backed text_run.
 ///
-/// 正常路径由 `blob_id` 间接取字节（省一次拷贝）；但 blob_id 是帧内序号，
-/// 跨帧存活的 item（replay/cache）可能落在别的控件本帧新建的 blob 上。
-/// resolveTextRunContent 用 content_hash 识破后会回退到这里,
-/// 兜底为空就是"识破了也画不出字"（实测：终端整片空白）。
+/// Normal path reads bytes indirectly via blob_id (saves a copy); but blob_id is frame-local,
+/// and items surviving across frames (replay/cache) may land on blobs created by other controls.
+/// resolveTextRunContent detects the mismatch via content_hash and falls back here.
+/// Empty fallback means the text cannot be rendered even after detection (terminal renders blank).
 ///
-/// 切片指向节点自己的文本缓冲，不额外分配；只在越界时退化为空。
+/// Slice points to the node's own text buffer, no extra allocation; empty only on overflow.
 fn blobFallbackSlice(content: []const u8, start: u32, end: u32) []const u8 {
     if (start >= end or end > content.len) return "";
     return content[start..end];
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 基础显示项
-// ─────────────────────────────────────────────────────────────────────────────
 
 pub fn appendDisplayRect(
     cx: *RenderContext,
@@ -220,12 +214,15 @@ pub fn appendDisplayRect(
     });
 }
 
-/// 根据 UnderlineStyle 在 text pipeline 里发出下划线绘制命令。
-/// 命令和调用方 glyph blob 共享同一 ItemHeader/paint_order，flush 时 z-order 与选区高亮一致。
+/// Emits underline draw command in text pipeline based on UnderlineStyle.
+/// Command shares same ItemHeader/paint_order with caller's glyph blob; at flush, z-order matches
+/// selection highlight.
 ///
-/// `thickness <= 0` 表示使用 style 对应的默认值。
-/// 波浪线不走 GPU path stroke（避免跨 pipeline 交错丢失），而用多段窄 fill_rect 近似正弦波形，
-/// 单条 underline 一般 10-30 个 rect，总量可控。需要更高保真时升级到 path geometry，API 不变。
+/// thickness <= 0 means use default value from style.
+/// Wavy line avoids GPU path stroke (prevents cross-pipeline interleaving loss), approximates sine
+/// via multiple narrow fill_rects.
+/// A single underline typically has 10-30 rects, total is bounded. Upgrade to path geometry for
+/// higher fidelity; API unchanged.
 pub fn appendUnderline(
     cx: *RenderContext,
     header: display_list_mod.ItemHeader,
@@ -265,14 +262,16 @@ pub fn appendUnderline(
     }
 }
 
-/// 诊断波浪线的波形（由字号推导）。量级对齐 VS Code / JetBrains：14px 字号下
-/// 周期 ≈4.2px、中心线峰峰 ≈1.5px、线宽 1px，整条高约 2.5px，细而清楚。
-/// （旧参数峰峰 ≈3.9px + 线宽 ≈2px，约 6px 高，显得又粗又大。）
+/// Wavy line waveform (derived from font size). Magnitude aligned with VS Code / JetBrains: at 14px
+/// font size,
+/// period ≈ 4.2px, centerline peak-to-peak ≈ 1.5px, line width 1px, total height ≈ 2.5px: thin and
+/// clear.
+/// (Old params: peak-to-peak ≈ 3.9px + line width ≈ 2px, ~6px total, looked thick and coarse.)
 pub const WavyParams = struct {
     period: f32,
-    /// 中心线振幅（半峰峰）
+    /// Centerline amplitude (half peak-to-peak)
     amplitude: f32,
-    /// 默认线宽
+    /// Default line width
     thickness: f32,
 
     pub fn forFontSize(font_size: f32) WavyParams {
@@ -283,29 +282,34 @@ pub const WavyParams = struct {
         };
     }
 
-    /// 整条波浪线的总高度（峰峰 + 线宽）
+    /// Total height of wavy line (peak-to-peak + line width)
     pub fn totalHeight(self: WavyParams, thickness: f32) f32 {
         return self.amplitude * 2 + thickness;
     }
 };
 
-/// 沿中心线打点的步长：不超过线宽的 0.35 倍，相邻圆盘大幅重叠，并起来是一条连续、
-/// 线宽均匀的曲线（而不是阶梯）。
+/// Step size along centerline: no more than 0.35x line width; adjacent disks overlap significantly,
+/// combining into a continuous, even-width curve (not a staircase).
 pub fn wavyDotStep(thickness: f32) f32 {
     return @max(@as(f32, 0.2), thickness * 0.35);
 }
 
-/// 纯函数：中心线上横向偏移 `t` 处的点（x, y 为下划线左上角；波形落在 [y, y + totalHeight]）。
+/// Pure function: point on centerline at horizontal offset t (x, y is underline top-left; waveform
+/// spans [y, y + totalHeight]).
 pub fn wavyCenterAt(x: f32, y: f32, t: f32, thickness: f32, params: WavyParams) [2]f32 {
     const phase = (t / params.period) * std.math.pi * 2.0;
     const center_y = y + thickness * 0.5 + params.amplitude;
     return .{ x + t, center_y - std.math.sin(phase) * params.amplitude };
 }
 
-/// 波浪线 = 沿正弦中心线密集排布的 SDF 圆盘（fill_rect 全圆角，抗锯齿由 SDF 给出）。
-/// 旧实现用几十段 0.64px 宽、坐标带小数的轴对齐细矩形拼阶梯：每段各自抗锯齿，边缘发虚，
-/// 而且固定 256 段的栈缓冲会截断长诊断。这里不缓冲、不截断，和 glyph blob 共享同一
-/// header / paint_order，z-order 与选区高亮一致。
+/// Wavy line = densely packed SDF disks along sine centerline (fill_rect fully rounded,
+/// antialiasing from SDF).
+/// Old impl used ~50 segments of 0.64px-wide axis-aligned thin rects with fractional coords,
+/// stacked as stairs:
+/// each segment self-antialiased, edges soft; fixed 256-segment stack buffer truncated long
+/// underlines.
+/// Here: no buffering, no truncation, shares same header/paint_order with glyph blob; z-order
+/// matches selection highlight.
 fn appendWavyUnderline(
     cx: *RenderContext,
     header: display_list_mod.ItemHeader,
@@ -334,7 +338,7 @@ fn appendWavyUnderline(
 test "WavyParams: 14px diagnostic squiggle is thin and small (mainstream editors' scale)" {
     const p = WavyParams.forFontSize(14);
     try std.testing.expect(p.totalHeight(p.thickness) <= 3.0);
-    try std.testing.expect(p.thickness >= 1.0); // 不细到发虚
+    try std.testing.expect(p.thickness >= 1.0); // No thinner than visible
     try std.testing.expect(p.period >= 3.5 and p.period <= 5.0);
     const big = WavyParams.forFontSize(32);
     try std.testing.expect(big.period > p.period and big.amplitude > p.amplitude);
@@ -351,21 +355,19 @@ test "wavy centerline stays in its band and dots overlap into a continuous strok
         min_y = @min(min_y, c[1] - th * 0.5);
         max_y = @max(max_y, c[1] + th * 0.5);
     }
-    // 实际笔画（中心线 ± 半线宽）落在 [y, y + totalHeight] 内，且真的有起伏
+    // Actual stroke (centerline ± half line width) stays within [y, y + totalHeight], with real
+    // undulation
     try std.testing.expect(min_y >= 100 - 1e-3);
     try std.testing.expect(max_y <= 100 + p.totalHeight(th) + 1e-3);
     try std.testing.expect(max_y - min_y > th * 1.5);
-    // 相邻圆盘的中心距 ≤ 0.5 × 线宽：圆盘必然重叠成连续笔画
+    // Distance between adjacent disk centers <= 0.5 x line width: disks must overlap into
+    // continuous stroke
     const step = wavyDotStep(th);
     const a = wavyCenterAt(0, 0, 1.0, th, p);
     const b = wavyCenterAt(0, 0, 1.0 + step, th, p);
     const dist = @sqrt((b[0] - a[0]) * (b[0] - a[0]) + (b[1] - a[1]) * (b[1] - a[1]));
     try std.testing.expect(dist <= th * 0.5);
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Span 分段行渲染
-// ─────────────────────────────────────────────────────────────────────────────
 
 pub fn appendDisplayLineWithSpans(
     cx: *RenderContext,
@@ -392,8 +394,9 @@ pub fn appendDisplayLineWithSpans(
     var shape_measure_guard = layout_engine.beginExternalShapeMeasure(cx.shaping_cache, cx.font_system);
     defer shape_measure_guard.end();
 
-    // blob_id 是帧内序号，跨帧存活的 item 可能落在别人的 blob 上,
-    // 带上 content_hash 供 resolveTextRunContent 校验身份。
+    // blob_id is frame-local; cross-frame items may land on other controls' blobs.
+    // Carries content_hash for resolveTextRunContent to verify the id still points to the same
+    // text.
     const blob_content_hash: u64 = if (cx.text_blob_store.get(blob_id)) |bl|
         bl.content_hash
     else
@@ -416,7 +419,7 @@ pub fn appendDisplayLineWithSpans(
     }
     if (visual_only_spans) {
         const line_text = content[line_byte_start..line_byte_end];
-        if (cx.visualLine(line_text, font_size, base_fw, t.use_italic_font)) |visual_line| {
+        if (cx.visualLine(line_text, font_size, base_fw, t.use_italic_font, t.font_family, t.use_monospace_font, t.use_symbols_font)) |visual_line| {
             const rect_storage = try cx.frame_allocator.alloc(@import("text_core").text_coordinates.SelectionRect, @max(visual_line.caret_stops.len, 1));
             const local_spans = try cx.frame_allocator.alloc(types.TextSpan, spans.len);
             var local_span_count: usize = 0;
@@ -467,6 +470,7 @@ pub fn appendDisplayLineWithSpans(
                     .font_weight = base_fw,
                     .font_family = t.font_family,
                     .use_symbols_font = t.use_symbols_font,
+                    .font_smoothing = t.font_smoothing,
                     .use_monospace_font = false,
                     .monospace_char_width = 0,
                     .use_italic_font = t.use_italic_font,
@@ -522,11 +526,11 @@ pub fn appendDisplayLineWithSpans(
             fixed_monospace_char_width: f32,
         ) f32 {
             if (seg_start >= seg_end) return 0;
-            // Monospace + 纯 ASCII fast path，等宽文本场景下 99% 命中。
-            // 直接走 measureSegmentWidthCtx -> GlyphRun pipeline (cache hit) /
-            // measureMonospaceTextWidth (legacy fallback)。
-            // 之前每个 span 都走 prefix cache（每行 ~5 spans × 2 lookup），
-            // ph_pre spike 时 cache miss build 是主导成本。
+            // Monospace + pure ASCII fast path, hits 99% in fixed-width scenarios.
+            // Takes measureSegmentWidthCtx -> GlyphRun pipeline (cache hit) /
+            // measureMonospaceTextWidth (legacy fallback).
+            // Previously every span used prefix cache (~5 spans/line x 2 lookups); during ph_pre
+            // spike, cache-miss build was dominant cost.
             if (use_monospace_inner) {
                 var is_ascii = true;
                 for (content_inner[seg_start..seg_end]) |b| {
@@ -764,18 +768,19 @@ pub fn appendDisplayLineWithSpans(
         }
     }
 
-    // Step 1: 把相邻字体属性相同的 chunks 合并成 "runs"，
-    // 让 ligature 字体（如 JetBrains Mono）的 calt/liga 跨 token 边界能正确合成。
-    // 同 run 内仅颜色不同 -> 走 drawTextWithSpans（整体 shape + 逐 glyph 着色）。
-    // run 边界由 (font_weight, use_italic, use_monospace) 区分；
-    // 字体维度变化才会切 run（如 keyword bold vs 普通 regular）。
+    // Step 1: merge adjacent chunks with same font attributes into 'runs',
+    // so ligature fonts (e.g. JetBrains Mono) calt/liga compose correctly across token boundaries.
+    // Within a run only color differs -> drawTextWithSpans (shape once + per-glyph coloring).
+    // Run boundary is (font_weight, use_italic, use_monospace);
+    // font dimension changes split the run (e.g. keyword bold vs regular).
     var run_start: usize = 0;
     while (run_start < chunk_count) {
         const head = chunks[run_start];
-        // inline box（如 inline code 的左右 padding）会让 chunk 的文字起点
-        // (text_x) 与布局起点 (x) 错开。这样的 chunk 必须独立成 run：
-        // 一旦与邻居合并成一段连续 shaping，padding 造成的位移就丢了,
-        // 文字会贴着背景左缘画，右侧空出双倍 padding（左右不对称）。
+        // Inline box (e.g. inline code left/right padding) offsets chunk text start (text_x) from
+        // layout start (x).
+        // Such chunks must be standalone runs:
+        // once merged with neighbors into continuous shaping, padding offset is lost,
+        // text renders flush with background left edge, right side has double padding (asymmetric).
         const head_has_box = head.kind == .span and
             text_layout.spanHasInlineBox(spans[head.span_index]);
         var run_end = run_start + 1;
@@ -790,14 +795,14 @@ pub fn appendDisplayLineWithSpans(
         }
         const run_chunks = chunks[run_start..run_end];
 
-        // Run 的字节范围 + 起始 x（chunks 已按 cur_x 顺序累加）；
-        // inline box run 用 text_x（= x + 左 padding），文字才落在背景正中。
+        // Run's byte range + start x (chunks accumulated by cur_x order);
+        // inline box run uses text_x (= x + left padding), so text lands in background center.
         const run_byte_start = run_chunks[0].start;
         const run_byte_end = run_chunks[run_chunks.len - 1].end;
         const run_x = if (head_has_box) head.text_x else run_chunks[0].x;
 
-        // 收集 run 内的 ColorSpan：每个 chunk 一条
-        // （gap 用 base_text_color；span 用 span.color 或 base_text_color）
+        // Collect ColorSpans within run: one per chunk
+        // (gap uses base_text_color; span uses span.color or base_text_color)
         const run_spans = try cx.frame_allocator.alloc(types.TextSpan, run_chunks.len);
         var span_count: usize = 0;
         for (run_chunks) |c| {
@@ -823,6 +828,7 @@ pub fn appendDisplayLineWithSpans(
                 .font_weight = head.font_weight,
                 .font_family = t.font_family,
                 .use_symbols_font = t.use_symbols_font,
+                .font_smoothing = t.font_smoothing,
                 .use_monospace_font = head.use_monospace,
                 .monospace_char_width = if (head.use_monospace) t.monospace_char_width else 0,
                 .use_italic_font = head.use_italic,
@@ -836,8 +842,8 @@ pub fn appendDisplayLineWithSpans(
         run_start = run_end;
     }
 
-    // Step 2: underline / strikethrough 仍按 chunk 个体绘制
-    // （独立于 text_run 的 emit；位置已由 chunk.text_x / chunk.text_width 确定）
+    // Step 2: underline / strikethrough still drawn per chunk individually
+    // (independent of text_run emit; position determined by chunk.text_x / chunk.text_width)
     for (chunks[0..chunk_count]) |chunk| {
         if (chunk.kind != .span) continue;
         const span = spans[chunk.span_index];
@@ -878,10 +884,6 @@ pub fn appendDisplayLineWithSpans(
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 省略号截断
-// ─────────────────────────────────────────────────────────────────────────────
-
 pub fn appendDisplayEllipsisText(
     cx: *RenderContext,
     header: display_list_mod.ItemHeader,
@@ -893,8 +895,8 @@ pub fn appendDisplayEllipsisText(
     avail_w: f32,
     raster_policy: text_blob_mod.TextRasterPolicy,
 ) !void {
-    // blob_id 是帧内序号，跨帧存活的 item 可能落在别人的 blob 上,
-    // 带上 content_hash 供 resolveTextRunContent 校验身份。
+    // blob_id is frame-local; cross-frame items may land on other controls' blobs.
+    // Carries content_hash for resolveTextRunContent to verify identity.
     const blob_content_hash: u64 = if (cx.text_blob_store.get(blob_id)) |bl|
         bl.content_hash
     else
@@ -1004,6 +1006,7 @@ pub fn appendDisplayEllipsisText(
                 .font_weight = font_weight,
                 .font_family = t.font_family,
                 .use_symbols_font = t.use_symbols_font,
+                .font_smoothing = t.font_smoothing,
                 .use_monospace_font = t.use_monospace_font,
                 .monospace_char_width = t.monospace_char_width,
                 .use_italic_font = use_italic,
@@ -1025,6 +1028,7 @@ pub fn appendDisplayEllipsisText(
             .font_size = font_size,
             .font_weight = font_weight,
             .use_symbols_font = false,
+            .font_smoothing = t.font_smoothing,
             .use_monospace_font = t.use_monospace_font,
             .monospace_char_width = t.monospace_char_width,
             .use_italic_font = use_italic,
@@ -1048,6 +1052,7 @@ pub fn appendDisplayEllipsisText(
                 .font_weight = font_weight,
                 .font_family = t.font_family,
                 .use_symbols_font = t.use_symbols_font,
+                .font_smoothing = t.font_smoothing,
                 .use_monospace_font = t.use_monospace_font,
                 .monospace_char_width = t.monospace_char_width,
                 .use_italic_font = use_italic,
@@ -1058,10 +1063,6 @@ pub fn appendDisplayEllipsisText(
         });
     }
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 主入口：生成节点的完整文本 DisplayList 项
-// ─────────────────────────────────────────────────────────────────────────────
 
 pub fn appendDisplayTextItem(
     cx: *RenderContext,
@@ -1079,8 +1080,7 @@ pub fn appendDisplayTextItem(
         .static_crisp;
     const wrap_width = @max(0, exec_state.render_w - exec_state.pad_left - exec_state.pad_right);
     const blob_id = try appendTextBlobForNode(cx, node, t, tl, wrap_width, raster_policy);
-    // 与 blob_id 一起下发，供 resolveTextRunContent 校验序号是否仍指向同一段
-    // 文本（blob_id 是帧内序号，跨帧存活的 item 可能落在别人的 blob 上）。
+    // Passed with blob_id so resolveTextRunContent can verify the id still points to the same text.
     const blob_content_hash: u64 = if (cx.text_blob_store.get(blob_id)) |bl|
         bl.content_hash
     else
@@ -1088,7 +1088,8 @@ pub fn appendDisplayTextItem(
     const line_h = t.font_size * t.line_height;
     const bl_ratio = if (t.baseline_ratio > 0) t.baseline_ratio else 0.75;
 
-    // 逐视觉行对齐（TextProps.text_align）：只挪绘制起点，与宿主光标换算同一公式。
+    // Per-visual-line alignment (TextProps.text_align): only shifts draw start; uses same formula
+    // as host cursor conversion.
     const align_avail_w = @max(0, exec_state.render_w - exec_state.pad_left - exec_state.pad_right);
     if (tl) |layout| {
         var line_y = exec_state.pad_top;
@@ -1127,6 +1128,7 @@ pub fn appendDisplayTextItem(
                         .font_weight = t.font_weight,
                         .font_family = t.font_family,
                         .use_symbols_font = t.use_symbols_font,
+                        .font_smoothing = t.font_smoothing,
                         .use_monospace_font = t.use_monospace_font,
                         .monospace_char_width = t.monospace_char_width,
                         .use_italic_font = t.use_italic_font,
@@ -1170,7 +1172,8 @@ pub fn appendDisplayTextItem(
             return;
         }
     }
-    // 单行（无折行布局）也按 text_align 偏移；溢出（含省略号已在上面返回）时 alignLineOffset 给 0。
+    // Single line (no wrapping) also offsets per text_align; returns alignLineOffset = 0 on
+    // overflow (ellipsis handled above).
     const single_x = if (t.text_align == .start or t.content.len == 0) exec_state.pad_left else blk: {
         const full_w = if (cx.text_blob_store.get(blob_id)) |blob| blob.max_line_width else text_utils.measureSegmentWidthCtx(cx, t.content, t.font_size, t.font_weight, t.use_italic_font, t.use_monospace_font, t.font_family, t.use_symbols_font, t.monospace_char_width);
         break :blk exec_state.pad_left + text_layout.alignLineOffset(t.text_align, avail_w, full_w);
@@ -1207,13 +1210,14 @@ pub fn appendDisplayTextItem(
             .font_weight = t.font_weight,
             .font_family = t.font_family,
             .use_symbols_font = t.use_symbols_font,
+            .font_smoothing = t.font_smoothing,
             .use_monospace_font = t.use_monospace_font,
             .monospace_char_width = t.monospace_char_width,
             .use_italic_font = t.use_italic_font,
             .blob_id = blob_id,
             .blob_content_hash = blob_content_hash,
             .raster_policy = raster_policy,
-            // 右端淡出遮罩：窗口锚在**可用宽**的末端（相对 run 起点）。
+            // Right fade mask: window anchor at **available width** end (relative to run start).
             .fade_dx0 = if (t.fade_right > 0) @max(0, avail_w - t.fade_right) else 0,
             .fade_dx1 = if (t.fade_right > 0) avail_w else 0,
         },

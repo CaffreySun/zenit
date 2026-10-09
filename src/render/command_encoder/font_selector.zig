@@ -1,49 +1,52 @@
-//! command_encoder/font_selector.zig，字体档位选择 + lazy derived font 缓存
+//! command_encoder/font_selector.zig: font weight tier select + lazy derived font cache.
 //!
-//! 从 command_encoder.zig 析出（2026-07-31）。FontSelector 与 encoder 之间
-//! 零耦合（原文件里对 RenderCommandEncoder 的引用数为 0），只是历史上放在
-//! 同一个文件里。外部一直通过 `render.FontSelector` re-export 使用，
-//! 析出不改变任何调用方。
+//! FontSelector has zero coupling to RenderCommandEncoder. External access via the
+//! `render.FontSelector` re-export.
 //!
-//! 职责：按 font_size + font_weight 选最接近的预加载字体档位
-//! （regular / bold 各最多 12 档），未命中时 lazy 派生任意字号的精确字体
-//! 并缓存。另含等宽 ASCII advance 的小 LRU（8 槽），避免逐字符重复测量。
+//! Duty: select the closest pre-loaded font tier by font_size + font_weight (regular / bold,
+//! up to 12 tiers each), lazy-derive missing sizes + cache. Also a small LRU (8 slots) for
+//! monospace ASCII advance, avoiding repeated per-char measurement.
 
 const std = @import("std");
 const text_module = @import("text");
 const Font = text_module.Font;
 const script_detect = @import("script_detect.zig");
 
-/// 一段文本的完整字体决策结果。
+/// Complete font decision for a text segment.
 ///
-/// 渲染早就是「主字体 + 内容相关的 CJK/韩文回退」两件套，测量却只认主字体。
-/// 把两者打成一个结构体一起返回，是为了让「测量拿不到回退字体」这件事在
-/// 类型层面就不可能发生。
-/// 渲染器回答「这段文字会被画成多宽」的回调（见 FontSelector.drawn_width_fn）。
-/// 返回 null = 本次答不上来（shape 失败），调用方走 CoreText 兜底。
+/// Rendering is (primary font + content-dependent CJK/Hangul fallback), but measurement used
+/// to recognize only the primary. Bundling both into one struct makes "measurement can't
+/// access fallback" impossible at the type level.
+/// The renderer's answer to "how wide is this text going to be" (see FontSelector.drawn_width_fn).
+/// null = can't answer this time (shaping failed); caller falls back to CoreText.
 pub const DrawnWidthFn = *const fn (ctx: *anyopaque, text: []const u8, font: *Font, props: TextFontProps) ?f32;
 
-/// 按族 id + 字号/字重/斜体取 face。返回 null = 该族解析不出来,用默认族。
-/// 返回的 `*Font` 由 registry 持有,selector 借用不释放。
+/// Get face by family_id + font_size/weight/italic. null = family can't be resolved; use default.
+/// Returned `*Font` is owned by registry; selector borrows without freeing.
 pub const FamilyResolveFn = *const fn (ctx: *anyopaque, family: u16, size: f32, weight: u16, italic: bool) ?*Font;
 
+/// Reserved TextProps.font_family id: the platform UI font (see FontSelector.system_ui_loader).
+pub const system_ui_family: u16 = 0xFFFF;
+
 pub const ResolvedFonts = struct {
-    /// 主字体（symbols 覆盖 / italic / mono / regular 决策后的结果）
+    /// Primary font (after symbols override / italic / mono / regular decision)
     primary: *Font,
-    /// 内容相关回退：文本含汉字/假名/谚文时渲染会改用它画那些字形。
-    /// null = 本段文本不需要回退。
+    /// Content-dependent fallback: rendering switches to it for Han/kana/Hangul in text.
+    /// null = this text doesn't need fallback.
     fallback: ?*Font = null,
-    /// `fallback` 是不是**按内容**选出来的脚本回退（CJK / 韩文）。
-    /// false 表示它只是 italic 面缺字形时的直立兜底，那不是整段的字体。
+    /// `fallback` is script-based fallback (CJK / Hangul) selected **by content**.
+    /// false means it's upright fallback for missing glyphs in italic face, not the whole segment's
+    /// font.
     fallback_is_script: bool = false,
 
-    /// 整段 shaping / 测量该用的字体，与渲染端 encodeText 交给 shaper 的
-    /// 那一个必须完全一致。
+    /// The font to use for shaping / measuring the whole run; it must be exactly the one the render
+    /// side's encodeText hands to the shaper.
     ///
-    /// 脚本回退（CJK/韩文）沿用历史行为：整段按回退字体测，与渲染实测对齐
-    /// （"asdfasdf磊dfasdfsdfdsf" 曾差 2.38px）。
-    /// italic 的直立兜底则**不能**当整段字体：它只是给 italic 面缺的字形补漏，
-    /// 拿它测量会让每一段斜体文本按直立宽度收紧，斜体字被 `.fit` 容器裁掉。
+    /// Script fallback (CJK/Korean): the whole run is measured with the fallback font, matching
+    /// rendering (e.g. "asdfasdf<CJK>dfasdfsdfdsf" is otherwise off by 2.38px).
+    /// The upright fallback for italic must **not** be used as the whole-run font: it only fills
+    /// glyphs missing from the italic face, and measuring with it narrows every italic run to
+    /// upright width, so italic text gets clipped by `.fit` containers.
     pub fn shapingFont(self: ResolvedFonts) *Font {
         if (self.fallback_is_script) {
             if (self.fallback) |f| return f;
@@ -52,17 +55,20 @@ pub const ResolvedFonts = struct {
     }
 };
 
-/// 决定一段文本用什么字体的**全部**输入。
+/// **Complete** input for deciding what font a text uses.
 ///
-/// `content` 是必需的，不是可选优化：渲染端的 CJK/韩文回退是**按内容**选的
-/// （selectCjkFallbackFont 读 text 里有没有汉字/假名/谚文）。一个只接受
-/// (size, weight, italic, mono) 的测量函数**永远**追不上一个还看字节的
-/// 渲染器，这正是"量出来和画出来不一样宽"的结构性根因。
+/// `content` is mandatory, not an optimization: render-side CJK/Hangul fallback is **by
+/// content** (selectCjkFallbackFont scans for Han/kana/Hangul). A measurement function taking
+/// only (size, weight, italic, mono) can never match a renderer that also reads bytes; this
+/// is the structural root cause of "measure and render widths differ".
 pub const TextFontProps = struct {
+    /// Per-window override; avoids mutating a selector shared by two windows.
+    stack_mode_override: ?bool = null,
+
     font_size: f32,
     font_weight: u16 = 400,
-    /// 字体族 id(render.FontRegistry)。0 = 用本 selector 的默认族槽位。
-    /// 非 0 时由 encoder 先向 registry 要 face,要不到再退回槽位决策。
+    /// Font family id (render.FontRegistry). 0 = use this selector's default family slot.
+    /// When non-zero, encoder first asks registry for face; if absent, falls back to slot logic.
     font_family: u16 = 0,
     use_italic: bool = false,
     use_monospace: bool = false,
@@ -70,10 +76,10 @@ pub const TextFontProps = struct {
     /// normal glyph advances. It is part of measurement identity even though
     /// it does not affect font selection.
     monospace_char_width: f32 = 0,
-    /// 渲染端可以整段改用 symbols_font（Menlo，画箭头/制表符等）。
+    /// Renderer can switch whole segment to symbols_font (Menlo, for arrows/tabs etc).
     use_symbols: bool = false,
-    /// 缩放期走 *Stable 变体（避免逐帧换档位导致文字抖动）。
-    /// 渲染与测量必须传同一个值，否则两边选到不同 Font 实例。
+    /// During zoom, use *Stable variant (avoid jitter from switching buckets every frame).
+    /// Render and measure must pass the same value, else they pick different Font instances.
     force_linear: bool = false,
 };
 
@@ -87,114 +93,120 @@ const MonoAsciiAdvanceSlot = struct {
 };
 var mono_ascii_advance_lru_tick: u32 = 0;
 
-/// 字体选择器，根据 font_size + font_weight 选择最接近的字体
-/// 支持 regular (weight < 600) 和 bold (weight >= 600) 两组字体
-/// 每组最多 12 个预加载档位 + lazy derived font cache（任意字号精确匹配）
+/// Font selector: picks closest font for font_size + font_weight.
+/// Two groups: regular (weight < 600) and bold (weight >= 600).
+/// Each: up to 12 preloaded buckets + lazy derived font cache (exact match any size).
 pub const FontSelector = struct {
     const exact_size_epsilon: f32 = 0.01;
     pub const weight_miss_capacity = 16;
 
-    small: *Font, // 向后兼容：最小档 (regular)
-    medium: *Font, // 向后兼容：中档 (regular)
-    large: *Font, // 向后兼容：最大档 (regular)
-    /// 扩展字体槽位（可选，用于更精确的字号/字重匹配）
-    extra_fonts: [24]?*Font = .{null} ** 24,
+    small: *Font, // Backward compatibility: minimum bucket (regular)
+    medium: *Font, // Backward compatibility: medium bucket (regular)
+    large: *Font, // Backward compatibility: largest bucket (regular)
+    /// Extended font slots (optional; for finer size/weight matching)
+    extra_fonts: [24]?*Font = @splat(null),
     extra_count: u8 = 0,
-    /// Bold 字体槽位（weight >= 650）
-    bold_fonts: [16]?*Font = .{null} ** 16,
+    /// Bold font slots (weight >= 650)
+    bold_fonts: [16]?*Font = @splat(null),
     bold_count: u8 = 0,
-    /// 符号字体（用于渲染 list marker 等特殊 Unicode 符号）
+    /// Symbols font (for rendering list markers and special Unicode symbols)
     symbols_font: ?*Font = null,
-    /// Monospace Regular 字体槽位
+    /// Monospace Regular font slot
     mono_fonts: [12]?*Font = .{ null, null, null, null, null, null, null, null, null, null, null, null },
     mono_count: u8 = 0,
-    /// Monospace Bold 字体槽位
+    /// Monospace Bold font slot
     mono_bold_fonts: [12]?*Font = .{ null, null, null, null, null, null, null, null, null, null, null, null },
     mono_bold_count: u8 = 0,
-    /// Monospace Italic 字体槽位
+    /// Monospace Italic font slot
     mono_italic_fonts: [12]?*Font = .{ null, null, null, null, null, null, null, null, null, null, null, null },
     mono_italic_count: u8 = 0,
-    /// Monospace Bold Italic 字体槽位
+    /// Monospace Bold Italic font slot
     mono_bold_italic_fonts: [12]?*Font = .{ null, null, null, null, null, null, null, null, null, null, null, null },
     mono_bold_italic_count: u8 = 0,
-    /// Italic 字体槽位
+    /// Italic font slot
     italic_fonts: [12]?*Font = .{ null, null, null, null, null, null, null, null, null, null, null, null },
     italic_count: u8 = 0,
-    /// Bold Italic 字体槽位
+    /// Bold Italic font slot
     bold_italic_fonts: [12]?*Font = .{ null, null, null, null, null, null, null, null, null, null, null, null },
     bold_italic_count: u8 = 0,
-    /// CJK 回退字体组
+    /// CJK fallback font group
     cjk_fonts: [12]?*Font = .{ null, null, null, null, null, null, null, null, null, null, null, null },
     cjk_count: u8 = 0,
-    /// CJK Bold 回退字体组
+    /// CJK Bold fallback font group
     cjk_bold_fonts: [12]?*Font = .{ null, null, null, null, null, null, null, null, null, null, null, null },
     cjk_bold_count: u8 = 0,
-    /// 韩文字体回退组
+    /// Hangul fallback font group
     korean_fonts: [12]?*Font = .{ null, null, null, null, null, null, null, null, null, null, null, null },
     korean_count: u8 = 0,
-    /// 韩文字体 Bold 回退组
+    /// Hangul Bold fallback font group
     korean_bold_fonts: [12]?*Font = .{ null, null, null, null, null, null, null, null, null, null, null, null },
     korean_bold_count: u8 = 0,
 
-    /// Lazy derived font cache，按需派生精确字号字体
-    /// key: hash(src_font_ptr, group_idx, size_hundredths)
+    /// Lazy derived font cache, on-demand for exact size.
+    /// Key: hash(src_font_ptr, group_idx, size_hundredths)
     derived_cache: std.AutoHashMap(u64, *Font) = undefined,
     derived_cache_inited: bool = false,
-    /// 按字重加载字体（App 注入：同一字体族 + 目标字重）。未注入时常规组只能派生
-    /// 字号、拿不到真字重，600/700 会静默退回常规体（storybook 实测：所有粗体
-    /// 标题都是常规体）。加载结果进 derived_cache，随其一起管理生命周期与缩放。
+    /// Load fonts by weight (app injected: same family + target weight). Without injection,
+    /// regular group can only derive sizes, not real weights; 600/700 silently fall back to
+    /// regular (storybook measured: all bold titles are regular). Results go in derived_cache,
+    /// lifetime managed with it.
     weight_loader: ?WeightLoader = null,
-    /// weight_loader 的**负缓存**：记住「这个 (字重, 字号) 键该族没有」。
-    /// 缺字重时 loader 每次都返回 null，没有负缓存就意味着每次选字体（每帧、
-    /// 每次测量）都重走一遍 CoreText 查找，native 侧还每次 NSLog。
-    /// 定长环形表（满了覆盖最老的一条，被挤掉的键最多再查一次）；与
-    /// derived_cache 同生命周期（init/deinit 时清空），并绑定写入时的 loader
-    /// 身份，换 loader（换字体族）自动整表失效。
+    /// Negative cache for weight_loader: records "this (weight, size) key doesn't exist in family".
+    /// Without it, missing weights query CoreText on every measure (every frame, every call), plus
+    /// a native NSLog each time. Ring buffer (when full, wraps oldest; evicted keys are queried
+    /// once more); same lifetime as derived_cache (cleared on init/deinit), bound to loader
+    /// identity: changing the loader (family) invalidates the whole table.
     weight_misses: [weight_miss_capacity]u64 = undefined,
     weight_miss_len: u8 = 0,
     weight_miss_next: u8 = 0,
     weight_miss_loader: ?WeightLoader = null,
-    /// allocator 用于 derived_cache 和派生 Font 分配
+    /// Allocator for derived_cache and Font allocation
     allocator: ?std.mem.Allocator = null,
 
-    /// Monospace ASCII advance cache，缓存 (font, font_size, font_weight, italic) 对应
-    /// 的字符宽度。等宽 ASCII 文本场景下 CoreText 测量是渲染的最大热路径之一：典型代码场景
-    /// 每帧可达 600+ 次 measureMonospaceTextWidth 调用，全部走 CoreText FFI。
-    /// 由于这类场景通常只用一种 monospace 字体 + 少量 size/weight 组合，8-slot LRU
-    /// 就能 100% 命中。命中后 ASCII-only 字符串走 len * advance 算术，完全跳过 CoreText 调用。
-    ascii_advance_cache: [8]MonoAsciiAdvanceSlot = [_]MonoAsciiAdvanceSlot{.{}} ** 8,
+    /// Monospace ASCII advance cache: (font, size, weight, italic) -> character width.
+    /// CoreText measurement is a hot path for monospace (typical code hits 600+ FFI calls per
+    /// frame). Code usually uses one monospace font + few size/weight combos, so an 8-slot LRU
+    /// gets ~100% hits. On hit, ASCII-only strings use len * advance, bypassing CoreText.
+    ascii_advance_cache: [8]MonoAsciiAdvanceSlot = @as([8]MonoAsciiAdvanceSlot, @splat(.{})),
 
-    /// 「这段文字会被画成多宽」的权威回答者，由 RenderCommandEncoder.setFonts
-    /// 装上，指向该 renderer 的 TextRenderer.measureTextWidthAsDrawn。
-    /// 没装时（裸 FontSelector / 单测）退回 CoreText 的整串排版宽度，那只是兜底：
-    /// 见 measureTextWidthWithProps 的注释。
+    /// Authority on "how wide is this text going to be", wired in by
+    /// RenderCommandEncoder.setFonts, pointing to that renderer's
+    /// TextRenderer.measureTextWidthAsDrawn.
+    /// Unwired (bare FontSelector / unit tests) falls back to CoreText full-string typographic
+    /// width—that's fallback only (see measureTextWidthWithProps comment).
     drawn_width_fn: ?DrawnWidthFn = null,
     drawn_width_ctx: ?*anyopaque = null,
 
-    /// 字体族解析钩子(render.FontRegistry)。装上后 `props.font_family != 0`
-    /// 的文本会先向它要 face,要不到才退回下面的槽位决策。
+    /// Font family resolver hook (render.FontRegistry). When `props.font_family != 0`, text asks
+    /// it for the face first; on miss, falls back to the slot logic below.
     ///
-    /// ⚠ 必须挂在 **FontSelector** 上而不是 encodeText 里，resolveFonts 是
-    /// 测量与渲染**共用**的唯一入口,在调用点补 if 就会让量的和画的不是同一个
-    /// 字体(本文件上方注释记的就是这个教训)。
+    /// Warning: must live on **FontSelector**, not in encodeText. resolveFonts is the **shared**
+    /// entry point for measure and render; patching at call sites makes measure and render pick
+    /// different fonts.
     family_resolve_fn: ?FamilyResolveFn = null,
     family_resolve_ctx: ?*anyopaque = null,
 
-    /// 显式字体回退栈模式。应用把 FontFallbackStack 接到 TextRenderer
-    /// （setFallbackStack）后置 true。语义变化只有一处：内容相关的脚本回退
-    /// （CJK/韩文）不再由本 selector 按**整段内容**挑一个回退字体，而是由
-    /// 渲染器在 shaping 前**按码点**在栈内显式选（TextRenderer.
-    /// selectSegmentFont, draw 与 measureTextWidthAsDrawn 共用）。
-    /// 于是 resolveFonts 的 fallback 恒为 null（脚本场景）、shapingFont()
-    /// 恒为 primary：测量与渲染都按「主字体 + 栈内逐段显式回退」同一套
-    /// 决策走。italic 直立兜底与脚本无关，保持原样。
-    /// ⚠ 两个开关必须成对：只开 stack_mode 不接栈 = CJK 直接交级联
-    /// （行为等同回退被删）；只接栈不开 stack_mode = 测量端仍整段换字体，
-    /// 量的和画的又不是一个字体。
+    /// The platform's UI font (`font_family = system_ui_family`: SF Pro on macOS, with its
+    /// size-dependent optical size and tracking), loaded per (size, weight) by the app. Unwired
+    /// (bare selector, other platforms) the default family serves it. Results go in
+    /// derived_cache.
+    system_ui_loader: ?WeightLoader = null,
+    system_ui_unavailable: bool = false,
+
+    /// Explicit font fallback stack mode. App wires FontFallbackStack to TextRenderer
+    /// (setFallbackStack) and sets this true. Content-dependent script fallback (CJK/Hangul) then
+    /// comes from the renderer **per-codepoint** (TextRenderer.selectSegmentFont, used by both
+    /// draw and measureTextWidthAsDrawn), not from this selector **per-segment**. So
+    /// resolveFonts.fallback is always null (script case) and shapingFont() is always primary:
+    /// measure and render both follow "primary + explicit per-segment stack selection".
+    /// Upright italic fallback stays independent.
+    /// Warning: the two switches must pair: stack_mode without wiring = CJK cascades with the
+    /// fallback deleted; stack wired without stack_mode = measure still whole-segment, so measure
+    /// and render mismatch.
     stack_mode: bool = false,
 
-    /// 查找/计算单个字符的 ASCII advance（仅用于 monospace 字体 + ASCII 字符串）。
-    /// 返回 0 表示该 font/size/weight 不可缓存（罕见路径）。
+    /// Look up/compute single-char ASCII advance (monospace font + ASCII string only).
+    /// Returns 0 = that font/size/weight can't be cached (rare path).
     inline fn lookupOrInsertAsciiAdvance(
         self: *FontSelector,
         font: *Font,
@@ -220,20 +232,19 @@ pub const FontSelector = struct {
                 lru_idx = i;
             }
         }
-        // 未命中：测一次 "M" 的宽度作为 cell width，并自检字体确实是严格 monospace。
+        // Cache miss: measure "M" width once, self-check font is strictly monospace.
         const text_scale = font_size / font.pixelSize();
         const m_width = font.measureWidth("M") * text_scale;
         if (m_width <= 0) return 0;
-        // 自检：测 "MMiM " 5 字符。真等宽字体里它必须等于 5 * m_width。
-        // 如果字体被错配（如 fallback 到 proportional），i / space 的 advance 会
-        // 偏离 M，我们必须 return 0 让上层走 CoreText 全量测量。
-        // 选 "MMiM " 这种组合是为了同时覆盖 cap letter / lowercase / space 这三种最容易
-        // 偏窄的 glyph，真等宽字体不应该让它们偏离同一 cell。
+        // Self-check: measure "MMiM " (5 chars). True monospace must equal 5 * m_width.
+        // If font is misconfigured (e.g., fallback to proportional), i / space advance deviates.
+        // We return 0 to let caller use full CoreText. Choice covers cap / lowercase / space—
+        // the three most easily-undersized glyphs; true monospace shouldn't let them deviate.
         const probe_width = font.measureWidth("MMiM ") * text_scale;
         const expected = m_width * 5.0;
-        const epsilon: f32 = 0.5; // 半个像素的容差，避免子像素 rounding 误判
+        const epsilon: f32 = 0.5; // 0.5px tolerance to avoid subpixel rounding false alarm
         if (@abs(probe_width - expected) > epsilon) {
-            // 字体实际不是严格 monospace，不缓存，让上层每次走 CoreText
+            // Font isn't strictly monospace; don't cache; let caller use CoreText each time
             return 0;
         }
         self.ascii_advance_cache[lru_idx] = .{
@@ -254,27 +265,27 @@ pub const FontSelector = struct {
         return true;
     }
 
-    /// 初始化 lazy cache（setFonts 之后调用）
+    /// Initialize lazy cache (call after setFonts)
     pub fn initDerivedCache(self: *FontSelector, allocator: std.mem.Allocator) void {
         if (self.derived_cache_inited) return;
         self.allocator = allocator;
         self.derived_cache = std.AutoHashMap(u64, *Font).init(allocator);
         self.derived_cache_inited = true;
         self.clearWeightMisses();
+        self.system_ui_unavailable = false;
     }
 
-    /// HiDPI：把新的 backing scale 传播给 derived cache 里所有已派生字体。
+    /// HiDPI: propagate the new backing scale to all already-derived fonts in the cache.
     ///
-    /// 为什么必须单独做一遍：`Font.derive` 只在**创建那一刻**拷贝
-    /// `scale_factor`，而派生字体会一直留在 cache 里被复用。窗口移到另一块
-    /// DPI 不同的屏幕后，只更新 `app.fonts` 三个基准字体是不够的，任何
-    /// 非标准字号走的都是 derived font，它们会永远停在旧 scale 上，表现为
-    /// "大部分文字变清晰了，但某些字号依旧糊/错位"。
+    /// `Font.derive` copies `scale_factor` only at **creation time**, and derived fonts are
+    /// cached and reused. After moving a window to a screen with a different DPI, updating the
+    /// three base fonts in `app.fonts` is not enough: any non-standard size goes through derived
+    /// fonts stuck on the old scale (some sizes stay blurry/wrong).
     ///
-    /// 不清空 cache 而是就地改 scale：派生字体的 cache 键是 (src_ptr, 字号)，
-    /// 与 scale 无关，就地更新即可；真正按 scale 分桶的是下游 glyph atlas 的
-    /// GlyphKey.scale_q，那里会自然产生新条目。清空反而会白白丢掉 CoreText
-    /// 字体对象、下一帧再全部重建。
+    /// Update in place, don't clear: the derived cache key is (src_ptr, size), independent of
+    /// scale. Real bucketing by scale happens downstream in glyph atlas GlyphKey.scale_q, where
+    /// new entries appear naturally. Clearing wastes CoreText font objects that all get rebuilt
+    /// next frame.
     pub fn setScaleFactor(self: *FontSelector, scale: f32) void {
         self.small.setScaleFactor(scale);
         self.medium.setScaleFactor(scale);
@@ -313,19 +324,46 @@ pub const FontSelector = struct {
         load: *const fn (context: *anyopaque, font_size: f32, font_weight: u16) ?*Font,
     };
 
-    /// CSS 字重取整到 100 的整数倍（590 -> 600，650 -> 700）。
+    /// The platform UI font at (size, weight), cached in derived_cache; null = no loader wired
+    /// or it found nothing (the caller falls back to the default family).
+    fn systemUiFont(self: *FontSelector, font_size: f32, font_weight: u16) ?*Font {
+        if (!self.derived_cache_inited) return null;
+        const loader = self.system_ui_loader orelse return null;
+        const target_size = @max(font_size, 1.0);
+        const w = quantizeWeight(font_weight);
+        const size_hundredths: u32 = @intFromFloat(@round(target_size * 100));
+        // seed high bits mark the UI font, disjoint from the weight and derive key spaces
+        const seed: u64 = (@as(u64, 0xF1) << 56) | @as(u64, w);
+        const key = std.hash.Wyhash.hash(seed, std.mem.asBytes(&size_hundredths));
+        if (self.derived_cache.get(key)) |cached| return cached;
+        // (no per-key miss table: that one is bound to weight_loader's identity; the UI font is
+        // either there or not at all)
+        if (self.system_ui_unavailable) return null;
+        const font = loader.load(loader.context, target_size, w) orelse {
+            self.system_ui_unavailable = true;
+            return null;
+        };
+        font.setScaleFactor(self.small.scale_factor);
+        self.derived_cache.put(key, font) catch {
+            font.deinit();
+            return null;
+        };
+        return font;
+    }
+
+    /// CSS weight rounds to 100-multiple (590 -> 600, 650 -> 700).
     pub fn quantizeWeight(w: u16) u16 {
         const clamped = std.math.clamp(w, 100, 900);
         return @intCast(((@as(u32, clamped) + 50) / 100) * 100);
     }
 
-    /// 取指定字号 + 字重的字体（经 weight_loader，按 (字重, 字号) 缓存）。
+    /// Get font of specified size + weight (via weight_loader, cached by (weight, size)).
     fn loadWeightedCached(self: *FontSelector, font_size: f32, weight: u16) ?*Font {
         if (!self.derived_cache_inited) return null;
         const loader = self.weight_loader orelse return null;
         const target_size = @max(font_size, 1.0);
         const size_hundredths: u32 = @intFromFloat(@round(target_size * 100));
-        // seed 高位打上字重标记，与 (src_ptr, group) 派生键空间不相交。
+        // seed high bits mark weight, disjoint from (src_ptr, group) derive key space.
         const seed: u64 = (@as(u64, 0xF0) << 56) | @as(u64, weight);
         const key = std.hash.Wyhash.hash(seed, std.mem.asBytes(&size_hundredths));
         if (self.derived_cache.get(key)) |cached| return cached;
@@ -355,7 +393,7 @@ pub const FontSelector = struct {
     fn isWeightMiss(self: *FontSelector, loader: WeightLoader, key: u64) bool {
         const owner = self.weight_miss_loader orelse return false;
         if (!sameLoader(owner, loader)) {
-            // loader 换了（换字体族）：旧的「没有」不再成立。
+            // Loader changed (family changed): old "doesn't exist" no longer holds.
             self.clearWeightMisses();
             return false;
         }
@@ -372,7 +410,7 @@ pub const FontSelector = struct {
         if (self.weight_miss_len < weight_miss_capacity) self.weight_miss_len += 1;
     }
 
-    /// 释放 derived cache 中所有动态创建的字体
+    /// Free all dynamically-created fonts in derived cache
     pub fn deinitDerivedCache(self: *FontSelector) void {
         if (!self.derived_cache_inited) return;
         var it = self.derived_cache.valueIterator();
@@ -388,8 +426,8 @@ pub const FontSelector = struct {
         return self.selectWeighted(font_size, 400);
     }
 
-    /// 根据 font_size 和 font_weight 选择最佳字体
-    /// 若无精确匹配（超过 epsilon）且已初始化 lazy cache，则派生精确字号
+    /// Pick best font by font_size and font_weight.
+    /// If no exact match (exceeds epsilon) and lazy cache initialized, derive exact size.
     pub fn selectWeighted(self: *FontSelector, font_size: f32, font_weight: u16) *Font {
         if (font_weight >= 650 and self.bold_count > 0) {
             return self.selectOrDerive(&self.bold_fonts, self.bold_count, font_size, 1, font_weight);
@@ -397,35 +435,43 @@ pub const FontSelector = struct {
         return self.selectOrDeriveRegular(font_size, font_weight);
     }
 
-    /// 使用预加载字体测量文本宽度（与渲染一致）
-    /// **唯一**的字体决策点，渲染与测量都必须走它。
+    /// Measures text width using the preloaded font (consistent with rendering).
+    /// The **only** font decision point; both rendering and measurement must go through it.
     ///
-    /// == 为什么必须统一（这是本项目反复复发的一整类 bug 的根）==
-    /// 历史上渲染端（command_encoder.drawText）和测量端（measureTextWidth）
-    /// 各写了一套选字体的分支，于是同一段文字「量出来」和「画出来」用的
-    /// 不是一个字体，宽度自然对不上：光标短在字形里侧、选区高亮不到行尾。
-    /// 每次只修宽度函数都只堵住一个洞，因为**分岔在字体选择，不在测量算法**。
-    /// 三处已知分岔，全部由本函数收口：
-    ///   1. use_symbols，渲染可整段改用 symbols_font(Menlo)，测量端原先没有这个分支
-    ///   2. CJK/韩文回退，渲染**按内容**选回退字体，测量端原先完全内容盲。
-    ///      实测 "asdfasdf磊dfasdfsdfdsf" 测量(Inter)=155.894、
-    ///      渲染(PingFang 回退)=153.514，差 2.38px ≈ 用户看到的"短一个字"
-    ///   3. force_linear，缩放期走 *Stable 变体，两边不一致会选到不同实例
+    /// == Why it must be unified (root of a whole class of recurring bugs) ==
+    /// Rendering (command_encoder.drawText) and measurement (measureTextWidth) must not have
+    /// separate font-selection branches: otherwise the same text is measured with one font and
+    /// drawn with another (cursor stops short inside a glyph, selection highlight falls short of
+    /// line end). **The divergence is in font selection, not the measurement algorithm.** Known
+    /// divergences, all closed by this function:
+    ///   1. use_symbols: rendering can switch the whole run to symbols_font (Menlo)
+    ///   2. CJK/Korean fallback: rendering picks the fallback font **by content**; e.g.
+    ///      "asdfasdf<CJK>dfasdfsdfdsf" measured (Inter)=155.894 vs rendered (PingFang)=153.514,
+    ///      a 2.38px gap, the visible "one glyph short"
+    ///   3. force_linear: scaling uses the *Stable variants; a mismatch picks different instances
     ///
-    /// 加新的字体决策规则时**只改这里**；任何在调用点补 if 的做法都会
-    /// 立刻重新制造上面那类静默错位。
+    /// Add new font decision rules **only here**; an if at a call site reintroduces the silent
+    /// misalignment.
     pub fn resolveFonts(self: *FontSelector, content: []const u8, props: TextFontProps) ResolvedFonts {
         const fs = props.font_size;
         const fw = props.font_weight;
 
-        // 字体族覆写：显式指定了族就用族里的 face。
-        // symbols 优先级更高(list marker 等必须用符号字体画),mono 亦然
-        // 这两档是**语义**要求,不是用户的字体偏好。
-        if (props.font_family != 0 and !props.use_symbols and !props.use_monospace) {
+        // The platform UI font (reserved family id): its own loader, ahead of the registry.
+        if (props.font_family == system_ui_family and !props.use_symbols and !props.use_monospace) {
+            if (self.systemUiFont(fs, fw)) |f| {
+                const fb = self.resolveContentFallback(content, props, f, f);
+                return .{ .primary = f, .fallback = fb.font, .fallback_is_script = fb.is_script };
+            }
+        }
+        // Family override: explicit family uses its face.
+        // symbols and mono have higher priority (list markers need symbols; mono is semantic).
+        // These two are **semantic** requirement, not user font preference.
+        if (props.font_family != 0 and props.font_family != system_ui_family and !props.use_symbols and !props.use_monospace) {
             if (self.family_resolve_fn) |resolve| {
                 if (self.family_resolve_ctx) |ctx| {
                     if (resolve(ctx, props.font_family, fs, fw, props.use_italic)) |f| {
-                        // 脚本回退仍走原逻辑：用户选的族未必覆盖 CJK。
+                        // Script fallback still goes original logic: user's family may not cover
+                        // CJK.
                         const fb = self.resolveContentFallback(content, props, f, f);
                         return .{
                             .primary = f,
@@ -472,15 +518,16 @@ pub const FontSelector = struct {
         };
     }
 
-    /// resolveContentFallback 的返回：回退字体本身 + 它是不是脚本回退。
-    /// 两者必须一起传出去，否则调用方无从分辨「整段换字体」与「补个别字形」。
+    /// resolveContentFallback return: fallback font itself + whether it's script fallback.
+    /// Both must go out together, else caller can't distinguish "whole-segment font" from "fill
+    /// gaps".
     const ContentFallback = struct {
         font: ?*Font = null,
         is_script: bool = false,
     };
 
-    /// 内容相关回退（汉字/假名 -> CJK 族，谚文 -> 韩文族）。
-    /// 与 command_encoder.selectCjkFallbackFont 是同一套判定，收口到这里。
+    /// Content-dependent fallback (Han/kana -> CJK family; Hangul -> Hangul family).
+    /// Same logic as command_encoder.selectCjkFallbackFont; unified here.
     fn resolveContentFallback(
         self: *FontSelector,
         content: []const u8,
@@ -490,9 +537,9 @@ pub const FontSelector = struct {
     ) ContentFallback {
         const fs = props.font_size;
         const fw = props.font_weight;
-        // stack_mode：脚本回退让位给显式字体栈（见字段注释），只保留
-        // 与脚本无关的 italic 直立兜底。
-        if (self.stack_mode) {
+        // stack_mode: script fallback delegates to explicit stack (see field comment).
+        // Only preserve upright fallback independent of scripts.
+        if (props.stack_mode_override orelse self.stack_mode) {
             if (props.use_italic and primary != regular_font) return .{ .font = regular_font };
             return .{};
         }
@@ -524,14 +571,14 @@ pub const FontSelector = struct {
                     self.selectFromGroup(&self.cjk_fonts, self.cjk_count, fs) };
             }
         }
-        // italic 面缺字形时的直立兜底，逐字形补漏，**不是**整段字体。
+        // Upright fallback for missing italic glyphs, per-glyph fill-gap, **not** whole segment.
         if (props.use_italic and primary != regular_font) return .{ .font = regular_font };
         return .{};
     }
 
-    /// 保留旧签名给「确实拿不到 content」的调用点（GlyphRun shape 管线在
-    /// 拿到文本前就要选字体）。内部转发到 resolveFonts，传空 content,
-    /// 也就是**没有**内容相关回退。新代码请优先用 resolveFonts。
+    /// Keep old signature for callers that truly can't get content (GlyphRun shape pipeline
+    /// needs font before text). Forwards to resolveFonts with an empty content slice, i.e. **no**
+    /// content-dependent fallback. Prefer resolveFonts for new code.
     pub fn selectForMeasure(self: *FontSelector, font_size: f32, font_weight: u16, use_italic: bool, use_monospace: bool) *Font {
         return self.resolveFonts("", .{
             .font_size = font_size,
@@ -541,12 +588,10 @@ pub const FontSelector = struct {
         }).primary;
     }
 
-    /// 测量一段文本，与渲染同源选字体（含内容相关 CJK/韩文回退）。
+    /// Measure text with the same font choice as render (including content CJK/Hangul).
     ///
-    /// 回退字体存在时按 CoreText 的 cascade 语义测：把主字体作为 base、
-    /// 回退字体作为 fallback 交给同一个 shaper。这里的实现直接用回退字体
-    /// 测整段，与 text_renderer 在 cjk_fallback 非空时的行为一致
-    /// （见 drawTextWithOptions 的 fallback 参数）。
+    /// With fallback, the whole run is measured with the fallback font, matching text_renderer's
+    /// non-null cjk_fallback behavior (see drawTextWithOptions fallback param).
     pub fn measureTextWidth(self: *FontSelector, text: []const u8, font_size: f32, font_weight: u16, use_italic: bool) f32 {
         if (text.len == 0) return 0;
         return self.measureTextWidthWithProps(text, .{
@@ -561,17 +606,16 @@ pub const FontSelector = struct {
         self.drawn_width_ctx = ctx;
     }
 
-    /// == 为什么优先问渲染器，而不是 CoreText ==
-    /// `.fit` 容器的宽度 = 先测一次、再画一次。两次不一致，容器就按 A 收紧、
-    /// 字按 B 画，尾巴被裁。而「画成多宽」不是 (文本, 字号) 的纯函数：渲染端
-    /// 按 segmentText 逐段 shape（CJK 逐码点、ASCII 成词，跨段没有 kerning），
-    /// 再逐 glyph 累加 x_advance * scale。CoreText 的
-    /// CTLineGetTypographicBounds measure 的是**整串一次排版**的宽度,
-    /// 它在排版学上更"对"，但那不是我们要的：我们要的是**和 GPU 实际画出来
-    /// 的那一版完全相同**的数。两者对纯 ASCII 常常巧合地接近，于是这类错位
-    /// 长期只在长串/斜体/CJK 混排上零星冒头，很难归因。
+    /// == Why ask the renderer first, not CoreText ==
+    /// `.fit` width = measure once, draw once; a mismatch shrinks to A, draws B, and clips the
+    /// tail.
+    /// "Drawn width" is not a pure function of (text, size): render splits per segmentText
+    /// (Han per-codepoint, ASCII as words; no kerning across segments), then per-glyph
+    /// x_advance * scale. CoreText CTLineGetTypographicBounds measures one full pass, which is
+    /// typographically more "correct" but not **exactly what the GPU draws**. They are close for
+    /// pure ASCII; mismatches on long/italic/CJK text are rare and hard to trace.
     ///
-    /// 所以这里不再自己算，而是把问题转给渲染器 emit 循环的不 emit 版本。
+    /// So don't calculate; ask the renderer to emit the same segment loop without drawing.
     pub fn measureTextWidthWithProps(self: *FontSelector, text: []const u8, props: TextFontProps) f32 {
         if (text.len == 0) return 0;
         const font = self.resolveFonts(text, props).shapingFont();
@@ -586,10 +630,10 @@ pub const FontSelector = struct {
         return font.measureWidth(text) * text_scale;
     }
 
-    /// Monospace 文本测量（等宽字体专用快速路径）
+    /// Monospace text measure (fast path for monospace fonts)
     ///
-    /// 快速路径：纯 ASCII 字符串 -> len * cached_advance（O(1) 加 O(N) 扫描判 ASCII，
-    /// 完全跳过 CoreText FFI）。Non-ASCII 字符串走原始 CoreText 测量。
+    /// Fast path: pure ASCII string -> len * cached_advance (O(1) plus O(N) ASCII scan,
+    /// completely skip CoreText FFI). Non-ASCII uses full CoreText.
     pub fn measureMonospaceTextWidth(self: *FontSelector, text: []const u8, font_size: f32, font_weight: u16, use_italic: bool) f32 {
         if (text.len == 0) return 0;
         const font = self.selectMonospaceWeighted(font_size, font_weight, use_italic);
@@ -603,7 +647,7 @@ pub const FontSelector = struct {
         return font.measureWidth(text) * text_scale;
     }
 
-    /// monospace 字体选择（若未注册 monospace 组则回退到常规选择）
+    /// Pick monospace font (fallback to regular if no monospace group registered)
     pub fn selectMonospaceWeighted(self: *FontSelector, font_size: f32, font_weight: u16, use_italic: bool) *Font {
         if (use_italic and font_weight >= 650 and self.mono_bold_italic_count > 0) {
             return self.selectOrDerive(&self.mono_bold_italic_fonts, self.mono_bold_italic_count, font_size, 3, font_weight);
@@ -620,12 +664,12 @@ pub const FontSelector = struct {
         return self.selectWeighted(font_size, font_weight);
     }
 
-    /// 从指定字体组中按 font_size 选择最佳匹配（含 lazy derive）
+    /// From font group, pick best match by font_size (include lazy derive)
     pub fn selectFromGroup(self: *FontSelector, group: []const ?*Font, count: u8, font_size: f32) *Font {
         return self.selectOrDerive(group, count, font_size, 0, null);
     }
 
-    // ===== 内部方法 =====
+    // ===== Internal methods =====
 
     inline fn weightDelta(font_weight: u16, desired_weight: ?u16) u16 {
         const dw = desired_weight orelse return 0;
@@ -657,9 +701,9 @@ pub const FontSelector = struct {
         return candidate_font_px > best_font_px;
     }
 
-    /// regular 组 + .small/.medium/.large 三个基础槽一起参与最近匹配
+    /// Regular group + .small/.medium/.large three base slots all participate in closest match
     fn selectOrDeriveRegular(self: *FontSelector, font_size: f32, desired_weight: u16) *Font {
-        // 预载组里没有这个字重：按字重加载真字形（而不是拿常规体顶替）。
+        // Not in preload group: load true glyphs by weight (not substitute with regular).
         const want_weight = quantizeWeight(desired_weight);
         if (weightDelta(self.medium.weight, want_weight) >= 100) {
             if (self.loadWeightedCached(font_size, want_weight)) |f| return f;
@@ -697,7 +741,7 @@ pub const FontSelector = struct {
             }
         }
 
-        // 接近精确匹配直接复用，避免不必要派生。
+        // Close to exact match, reuse directly; avoid unnecessary derive.
         if (best_size_diff <= exact_size_epsilon) return best;
         return self.deriveFontCached(best, font_size, 0) orelse best;
     }
@@ -705,7 +749,8 @@ pub const FontSelector = struct {
     fn selectStableRegular(self: *FontSelector, font_size: f32, desired_weight: u16) *Font {
         const want_weight = quantizeWeight(desired_weight);
         if (weightDelta(self.medium.weight, want_weight) >= 100) {
-            // 稳定路径（缩放动画期间）不派生任意字号：按最近的预载字号加载该字重。
+            // Stable path (zoom animation): don't derive arbitrary sizes, load with closest preload
+            // by weight.
             const presets = [_]f32{ self.small.pixelSize(), self.medium.pixelSize(), self.large.pixelSize() };
             var nearest = presets[0];
             for (presets[1..]) |p| {
@@ -748,7 +793,7 @@ pub const FontSelector = struct {
         return best;
     }
 
-    /// 从任意字体组中找最近匹配，若未命中精确字号则 lazy derive
+    /// Find closest match in any group; if size misses exact, lazy derive.
     fn selectOrDerive(
         self: *FontSelector,
         group: []const ?*Font,
@@ -823,7 +868,7 @@ pub const FontSelector = struct {
         return self.selectWeightedStable(font_size, font_weight);
     }
 
-    /// 从缓存中取或派生新字号字体
+    /// Get or derive font from cache
     fn deriveFontCached(self: *FontSelector, src: *Font, font_size: f32, group_idx: u4) ?*Font {
         if (!self.derived_cache_inited) return null;
         const target_size = @max(font_size, 1.0);

@@ -1,32 +1,23 @@
-/// Animation Module, Zenit UI 动画系统
+/// Animation module: Zenit UI animation system.
 ///
-/// 架构分层:
+/// Architecture layers:
 ///
-/// ┌─────────────────────────────────────────────────┐
-/// │  Presets (fadeIn/slideUp/scaleIn/shake/...)      │ 预设动画
-/// ├─────────────────────────────────────────────────┤
-/// │  Hooks (useAnimation/useTimeline/...)            │ Scope 声明式
-/// ├─────────────────────────────────────────────────┤
-/// │  animateNode (节点命令式动画)                     │ 节点属性动画
-/// ├─────────────────────────────────────────────────┤
-/// │  Timeline + Position (GSAP 风格编排)             │ 时间线
-/// ├─────────────────────────────────────────────────┤
-/// │  AnimationController (统一播放控制)               │ 控制器
-/// ├─────────────────────────────────────────────────┤
-/// │  AnimationManager (全局管理)                     │ 全局
-/// ├─────────────────────────────────────────────────┤
-/// │  Tween / Spring / Transition / Keyframes         │ 底层驱动
-/// ├─────────────────────────────────────────────────┤
-/// │  Easing (31 预设 + CubicBezier)                  │ 缓动函数
-/// └─────────────────────────────────────────────────┘
+/// Presets (fadeIn/slideUp/scaleIn/shake/...)          preset animations
+/// Hooks (useAnimation/useTimeline/...)                scope-declarative
+/// animateNode (node command-based animations)         node property animation
+/// Timeline + Position (GSAP-style arrangement)         time line
+/// AnimationController (unified playback control)       controller
+/// AnimationManager (global management)                 global
+/// Tween / Spring / Transition / Keyframes              low-level drivers
+/// Easing (31 presets + CubicBezier)                    easing functions
 ///
-/// 设计原则:
-/// 1. 帧驱动: 每帧调用 tick(delta_time)
-/// 2. 声明式 + 命令式: TransitionSlots 自动过渡 + animateNode 主动控制
-/// 3. 可组合: Timeline 编排 + Position 相对定位
+/// Design principles:
+/// 1. Frame-driven: each frame call tick(delta_time)
+/// 2. Declarative + imperative: TransitionSlots auto-transition + animateNode manual control
+/// 3. Composable: Timeline arrangement + Position relative positioning
 const std = @import("std");
 
-// ── 底层驱动 ──
+// -- Low-level driver --
 
 pub const tween = @import("tween.zig");
 pub const Tween = tween.Tween;
@@ -56,20 +47,20 @@ pub const keyframes = @import("keyframes.zig");
 pub const Keyframe = keyframes.Keyframe;
 pub const KeyframeAnimation = keyframes.KeyframeAnimation;
 
-// ── 控制器 ──
+// -- Controller --
 
 pub const controller = @import("controller.zig");
 pub const AnimationController = controller.AnimationController;
 pub const PlayState = controller.PlayState;
 
-// ── 时间线 ──
+// -- Timeline --
 
 pub const timeline_mod = @import("timeline.zig");
 pub const Timeline = timeline_mod.Timeline;
 pub const Position = timeline_mod.Position;
 pub const TimelineEntry = timeline_mod.TimelineEntry;
 
-// ── 节点动画 ──
+// -- Node animation --
 
 pub const node_animator = @import("node_animator.zig");
 pub const NodeAnimations = node_animator.NodeAnimations;
@@ -77,7 +68,7 @@ pub const AnimatableProp = node_animator.AnimatableProp;
 pub const AnimateConfig = node_animator.AnimateConfig;
 pub const animateNode = node_animator.animateNode;
 
-// ── 全局管理 ──
+// -- Global management --
 
 pub const manager = @import("manager.zig");
 pub const AnimationManager = manager.AnimationManager;
@@ -89,13 +80,13 @@ pub const useAnimation = anim_hooks.useAnimation;
 pub const useSpringAnimation = anim_hooks.useSpringAnimation;
 pub const useTimeline = anim_hooks.useTimeline;
 
-// ── 预设 ──
+// -- Presets --
 
 pub const presets = @import("presets.zig");
 
-// ── 兼容类型 ──
+// -- Compatible types --
 
-/// 动画状态
+/// Animation state
 pub const AnimationState = enum {
     idle,
     running,

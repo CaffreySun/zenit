@@ -1,28 +1,32 @@
-/// Sheet / Drawer 组件
+/// Sheet / Drawer component.
 ///
-/// 从屏幕边缘滑入的面板（抽屉），基于 OverlayStack 框架
+/// Panel sliding in from a screen edge (drawer), based on OverlayStack.
 ///
-/// 特性:
-/// - Signal(bool) 控制显示/隐藏
-/// - 四方向滑入: left / right / top / bottom
-/// - translate_x/translate_y 隐式过渡动画
-/// - OverlayStack 自动管理 z-index、遮罩、焦点陷阱、Escape/outside-click
+/// Features:
+/// - Signal(bool) controls show/hide
+/// - Four directions: left / right / top / bottom
+/// - translate_x/translate_y implicit transition animation
+/// - OverlayStack auto-manages z-index, mask, focus trap, Escape/outside-click
 const std = @import("std");
 const core = @import("../../core.zig");
+const view = @import("../../view.zig");
 const Cx = core.Cx;
 const Node = core.Node;
 const box = core.box;
 const Color = core.Color;
 const Padding = core.Padding;
 const Signal = core.Signal;
-const Scope = @import("../../reactive.zig").Scope;
+const reactive = @import("../../reactive.zig");
+const Scope = reactive.Scope;
+const Model = reactive.Model;
+const Handler = core.Handler;
 const overlay_stack = @import("../../overlay_stack.zig");
 const render_engine = @import("../../core/render_engine/mod.zig");
 
-// ── 样式层在 styles.zig ──
+// Style layer in styles.zig.
 const styles = @import("styles.zig");
 
-/// 面板滑入方向
+/// Panel slide direction.
 pub const SheetSide = enum {
     left,
     right,
@@ -30,7 +34,7 @@ pub const SheetSide = enum {
     bottom,
 };
 
-/// Sheet 属性
+/// Sheet properties.
 pub const SheetProps = struct {
     side: SheetSide = .right,
     width: f32 = 320,
@@ -39,17 +43,38 @@ pub const SheetProps = struct {
     background: ?Color = null,
     close_on_overlay: bool = true,
     close_on_escape: bool = true,
-    visible: ?*Signal(bool) = null,
+    /// Toggle state; semantics same as ModalProps.open (X / Esc / click mask are
+    /// only suggestions).
+    open: Model(bool) = .{ .local = false },
     animation_ms: f32 = 250,
+    /// Called after user-initiated toggle (Esc / click mask) settles.
+    on_open_change: ?Handler(bool) = null,
 };
 
-/// Sheet mount 返回句柄
+/// Sheet mount returns handle.
 pub const SheetResult = struct {
     overlay: *Node,
     panel: *Node,
     content: *Node,
-    /// 见 Modal.mount：true = overlay 已挂到 portal root，caller 不要再 append。
+    /// See Modal.mount: true = overlay mounted to portal root; caller should not
+    /// append again.
     portaled: bool = false,
+    /// Parsed toggle signal (non-null when local / bound).
+    open: ?*Signal(bool) = null,
+    /// Entry for ui.view (see src/ui/view_parts.zig).
+    pub fn viewParts(self: SheetResult) core.ViewParts {
+        return .{ .root = if (self.portaled) null else self.overlay, .slot = self.content };
+    }
+};
+
+const SheetRuntime = struct {
+    open: reactive.Bound(bool),
+    on_open_change: ?Handler(bool),
+
+    fn requestClose(context: *anyopaque) void {
+        const self: *SheetRuntime = @ptrCast(@alignCast(context));
+        self.open.propose(false, self.on_open_change);
+    }
 };
 
 fn transitionForSide(side: SheetSide) overlay_stack.Transition {
@@ -61,52 +86,33 @@ fn transitionForSide(side: SheetSide) overlay_stack.Transition {
     };
 }
 
-/// 创建 Sheet
-pub fn Sheet(props: SheetProps) SheetBuilder {
-    return SheetBuilder{ .props = props };
+/// Create Sheet: `W.Sheet(.{ .side = .right, .open = panel_open })`
+pub fn Sheet(props: anytype) SheetBuilder {
+    return .{ .props = reactive.props.coerce(SheetProps, props) };
 }
 
 pub const SheetBuilder = struct {
     props: SheetProps,
 
-    pub fn side(self: SheetBuilder, s: SheetSide) SheetBuilder {
-        var new = self;
-        new.props.side = s;
-        return new;
-    }
-
-    pub fn width(self: SheetBuilder, w: f32) SheetBuilder {
-        var new = self;
-        new.props.width = w;
-        return new;
-    }
-
-    pub fn height(self: SheetBuilder, h: f32) SheetBuilder {
-        var new = self;
-        new.props.height = h;
-        return new;
-    }
-
-    pub fn visible(self: SheetBuilder, sig: *Signal(bool)) SheetBuilder {
-        var new = self;
-        new.props.visible = sig;
-        return new;
-    }
-
-    pub fn closeOnOverlay(self: SheetBuilder, c: bool) SheetBuilder {
-        var new = self;
-        new.props.close_on_overlay = c;
-        return new;
-    }
-
-    /// 保留模式: mount
+    /// Retained mode: mount.
     pub fn mount(self: SheetBuilder, scope: *Scope, cx: *Cx) !SheetResult {
+        cx.owner.enterMount();
+        defer cx.owner.exitMount();
         const my_scope = try scope.childScope();
         const allocator = cx.allocator;
         const t = cx.tokens;
         const p = self.props;
 
-        // 通过 OverlayStack 创建 modal 层
+        const open = try reactive.resolveModel(bool, my_scope, p.open);
+        const rt = try my_scope.allocator.create(SheetRuntime);
+        rt.* = .{ .open = open, .on_open_change = p.on_open_change };
+        try my_scope.adoptResource(@ptrCast(rt), struct {
+            fn destroy(ptr: *anyopaque, alloc: std.mem.Allocator) void {
+                alloc.destroy(@as(*SheetRuntime, @ptrCast(@alignCast(ptr))));
+            }
+        }.destroy);
+
+        // Create modal layer via OverlayStack.
         const panel_transition = transitionForSide(p.side);
         const ol = try overlay_stack.overlay(my_scope, cx, .{
             .kind = .modal,
@@ -118,18 +124,18 @@ pub const SheetBuilder = struct {
             .enter_transition = panel_transition,
             .exit_transition = panel_transition,
             .focus = .{ .trap = true, .auto_focus = true, .restore = true },
-            .on_dismiss = p.visible,
-            .a11y = .{ .role = .dialog, .modal = true },
+            .on_dismiss_request = core.Cx.simpleHandler(SheetRuntime.requestClose, rt),
         });
 
         const barrier = ol.barrier.?;
-        // overlay() 把 focus_scope 配在 ol.content 上，但本组件不用 ol.content，
-        // 真正 pushScope 的是 barrier，不在 barrier 上配，trap/auto_focus 全是空操作。
+        // overlay() configures focus_scope on ol.content, but this component doesn't
+        // use ol.content; actual pushScope is barrier, so no config on barrier, trap/auto_focus
+        // are no-ops.
         barrier.setFocusScope(.{ .trap = true, .auto_focus = true });
         barrier.meta.ownership.meta.component_name = "Sheet";
         try core.bindScopeToNode(my_scope, barrier);
 
-        // 根据方向设置 overlay 内部排列，使面板靠边
+        // Set overlay internal layout by direction, panel edges screen.
         switch (p.side) {
             .left => {
                 barrier.style.direction = .row;
@@ -163,39 +169,44 @@ pub const SheetBuilder = struct {
             .top, .bottom => .{ .px = p.height },
         };
 
-        // sweep：panel 建好即挂进 barrier（barrier 归 overlay 层所有），之后再做可失败的 ensureExt
-        const panel = try core.adoptChild(cx, allocator, barrier, try box(cx, .{
-            .width = panel_w,
-            .height = panel_h,
-            .background = styles.sheetPanelBackground(p.background, t),
-            .direction = .column,
-        }, .{}));
-        const panel_ext = try panel.style.ensureExtFallible(allocator);
-        panel_ext.setShadows(styles.sheetKeyShadow(t), styles.sheet_ambient_shadow);
+        // sweep: panel mounted to barrier (barrier owned by overlay layer); on failure
+        // view.mount reclaims mounted nodes.
+        var panel: *Node = undefined;
+        var content: *Node = undefined;
+        try view.mount(my_scope, cx, barrier, view.capture(&panel, view.col(.{
+            .style = .{
+                .width = panel_w,
+                .height = panel_h,
+                .background = styles.sheetPanelBackground(p.background, t),
+                .shadows = core.ShadowList.of(&.{ styles.sheetKeyShadow(t), styles.sheet_ambient_shadow }),
+            },
+            // a11y attached to visible panel (overlay-configured a11y lands on ol.content
+            // unused by this component).
+            .a11y = .{ .role = .dialog, .modal = true },
+        }, view.capture(&content, view.box(.{ .style = styles.sheetContentStyle(t) }, {})))));
 
-        // 位置过渡完全交给 OverlayStack 的 slide_* transition。
-        // 这里不要再手工写 translate 初值，否则会和 enter/exit 动画叠加，
-        // 让 panel 在查询/抓图时出现“双重偏移”的不稳定状态。
+        // Position transition entirely via OverlayStack's slide_* transition. Don't
+        // hand-write translate init here, otherwise stacks with enter/exit animation,
+        // leaving panel in unstable "double offset" state on query/screenshot.
 
-        // 将 OverlayStack 层的真实 content_node 绑定到 panel，
-        // 让层级与动画目标保持一致。
+        // Bind real content_node from OverlayStack layer to panel, keeping hierarchy
+        // and animation target aligned.
         cx.overlay_stack.bindContentNode(allocator, ol.handle, panel);
 
-        // content
-        const content = try core.adoptChild(cx, allocator, panel, try box(cx, styles.sheetContentStyle(t), .{}));
-
-        // visible Effect
-        if (p.visible) |vis| {
+        // open Effect
+        {
+            const vis = rt.open.read;
+            reactive.checkBorrow(my_scope, vis);
             const fm = &cx.focus_manager;
             const scope_pushed = try my_scope.createSignal(bool, false);
-            // 打开状态下直接卸载（Show 切走 / 父 scope dispose）不会再跑 visible
-            // effect 的 pop 分支 -> focus scope 栈残留指向已释放 barrier 的条目。
+            // Direct unmount while open (Show switched / parent scope dispose) skips visible
+            // effect pop branch -> focus scope stack leaks entry pointing to released barrier.
             const scope_guard = try my_scope.allocator.create(FocusScopeGuard);
             scope_guard.* = .{ .fm = fm, .pushed = scope_pushed, .barrier = barrier, .barrier_id = barrier.id };
             try my_scope.adoptResource(@ptrCast(scope_guard), FocusScopeGuard.destroy);
             try my_scope.onCleanup(FocusScopeGuard, scope_guard, FocusScopeGuard.cleanup);
 
-            // 初始隐藏：barrier 缩成 0 + 层挂起
+            // Initially hidden: barrier shrinks to 0 + layer suspended.
             if (!vis.peek()) {
                 barrier.style.width = .{ .px = 0 };
                 barrier.style.height = .{ .px = 0 };
@@ -249,13 +260,14 @@ pub const SheetBuilder = struct {
             }.update);
         }
 
-        return .{ .overlay = barrier, .panel = panel, .content = content, .portaled = ol.portaled };
+        return .{ .overlay = barrier, .panel = panel, .content = content, .portaled = ol.portaled, .open = rt.open.asSignal() };
     }
 };
 
-/// 卸载时弹出本组件仍压着的 focus scope。只在栈顶确实是自己时弹
-/// （popScope 只弹栈顶；嵌套时乱弹会把上层浮层的 scope 弹掉）。
-/// 只比 id / 指针，不解引用 barrier（cleanup 时它可能已在释放途中）。
+/// On unmount, pop focus scope this component still holds. Only pop if stack top
+/// really is self (popScope only pops top; nested wrong-pop removes upper
+/// floater's scope). Compare only id/pointer, don't dereference barrier (may be
+/// mid-free in cleanup).
 const FocusScopeGuard = struct {
     fm: *@FieldType(core.Cx, "focus_manager"),
     pushed: *Signal(bool),
@@ -281,10 +293,10 @@ const FocusScopeGuard = struct {
     }
 };
 
-// ========== 测试 ==========
+// ========== Tests ==========
 
 test "Sheet: basic structure" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 800 }, .height = .{ .px = 600 } }, .{});
@@ -300,16 +312,16 @@ test "Sheet: basic structure" {
 
     try root.appendChild(std.testing.allocator, result.overlay);
 
-    // overlay 包含 panel
+    // Overlay contains panel.
     try std.testing.expectEqual(@as(usize, 1), result.overlay.children.items.len);
-    // panel 包含 content
+    // Panel contains content.
     try std.testing.expectEqual(@as(usize, 1), result.panel.children.items.len);
-    // absolute 定位
+    // Absolute positioning.
     try std.testing.expectEqual(core.Position.absolute, result.overlay.style.position);
 }
 
 test "Sheet: visible signal control" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 800 }, .height = .{ .px = 600 } }, .{});
@@ -317,11 +329,12 @@ test "Sheet: visible signal control" {
 
     const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
     defer scope.dispose();
-    const vis = try ctx.createSignal(bool, false);
+    const vis = try scope.createSignal(bool, false);
 
     const result = try Sheet(.{
         .side = .left,
-    }).visible(vis).mount(scope, ctx);
+        .open = vis,
+    }).mount(scope, ctx);
 
     try root.appendChild(std.testing.allocator, result.overlay);
 
@@ -354,16 +367,16 @@ test "Sheet: visible signal control" {
 }
 
 test "Sheet: 打开状态下卸载会弹出自己的 focus scope" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     const root = try box(ctx, .{ .width = .{ .px = 800 }, .height = .{ .px = 600 } }, .{});
     ctx.root = root;
     const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
     defer scope.dispose();
-    const vis = try ctx.createSignal(bool, true);
+    const vis = try scope.createSignal(bool, true);
 
     const sub = try scope.childScope();
-    const result = try Sheet(.{ .side = .right }).visible(vis).mount(sub, ctx);
+    const result = try Sheet(.{ .side = .right, .open = vis }).mount(sub, ctx);
     if (!result.portaled) try root.appendChild(std.testing.allocator, result.overlay);
     const fm = &ctx.focus_manager;
     try std.testing.expectEqual(@as(u8, 1), fm.scope_count);
@@ -374,20 +387,20 @@ test "Sheet: 打开状态下卸载会弹出自己的 focus scope" {
 }
 
 test "Sheet: 打开时 focus trap 生效并自动聚焦到对话框内" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     const root = try box(ctx, .{ .width = .{ .px = 800 }, .height = .{ .px = 600 } }, .{});
     ctx.root = root;
     ctx.setViewport(800, 600);
     const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
     defer scope.dispose();
-    const vis = try ctx.createSignal(bool, false);
+    const vis = try scope.createSignal(bool, false);
 
     const outside = try box(ctx, .{ .width = .{ .px = 100 }, .height = .{ .px = 30 } }, .{});
     outside.behavior.interaction.focusable = true;
     try root.appendChild(std.testing.allocator, outside);
 
-    const result = try Sheet(.{ .side = .right }).visible(vis).mount(scope, ctx);
+    const result = try Sheet(.{ .side = .right, .open = vis }).mount(scope, ctx);
     if (!result.portaled) try root.appendChild(std.testing.allocator, result.overlay);
     const inside = try box(ctx, .{ .width = .{ .px = 100 }, .height = .{ .px = 30 } }, .{});
     inside.behavior.interaction.focusable = true;
@@ -404,7 +417,7 @@ test "Sheet: 打开时 focus trap 生效并自动聚焦到对话框内" {
 }
 
 test "Sheet: exiting keeps overlay visible until commit" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 800 }, .height = .{ .px = 600 } }, .{});
@@ -412,11 +425,12 @@ test "Sheet: exiting keeps overlay visible until commit" {
 
     const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
     defer scope.dispose();
-    const vis = try ctx.createSignal(bool, true);
+    const vis = try scope.createSignal(bool, true);
 
     const result = try Sheet(.{
         .side = .right,
-    }).visible(vis).mount(scope, ctx);
+        .open = vis,
+    }).mount(scope, ctx);
 
     try root.appendChild(std.testing.allocator, result.overlay);
 
@@ -437,7 +451,7 @@ test "Sheet: exiting keeps overlay visible until commit" {
 }
 
 test "Sheet: four sides" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 800 }, .height = .{ .px = 600 } }, .{});
@@ -446,8 +460,8 @@ test "Sheet: four sides" {
     const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
     defer scope.dispose();
 
-    // 有 root 时 overlay_stack.overlay() 总是把 barrier portal 化（与 Popover 同一个
-    // window portal），caller 不再 inline append，按 `portaled` 契约行事。
+    // overlay_stack.overlay() always portals barrier when root exists (same window
+    // portal as Popover); caller doesn't inline append, acts per `portaled` contract.
     inline for (.{ SheetSide.left, SheetSide.right, SheetSide.top, SheetSide.bottom }) |s| {
         const result = try Sheet(.{ .side = s }).mount(scope, ctx);
         try std.testing.expect(result.portaled);
@@ -459,12 +473,12 @@ test "Sheet: four sides" {
     try std.testing.expect(root.children.items[0] == ctx.popover_portal_root.?);
 }
 
-// styles.zig 的测试收集，这行是必需的，见 docs/STYLING.md
+// Test collection from styles.zig; this line required (see docs/STYLING.md).
 test {
     _ = @import("styles.zig");
 }
 
-// 逐分配点 OOM sweep，见 src/ui/components/oom_sweep.zig
+// Per-allocation OOM sweep (see src/ui/components/oom_sweep.zig).
 test "sheet: mount 在任意分配点失败时不泄漏（sweep）" {
     try @import("../oom_sweep.zig").sweepMount("sheet", struct {
         fn m(scope: *Scope, cx: *Cx) anyerror!?*Node {

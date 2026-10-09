@@ -1,26 +1,24 @@
-//! a11y 树投影（Node -> AccessibilityTree），从 `Cx` 析出。
+//! a11y tree projection (Node -> AccessibilityTree), split out of `Cx`.
 //!
-//! 原本散在 `Cx` 上的六样东西：`mapA11yRoleToTreeRole` / `parseLiveRegion` /
-//! `stringHash` 三个纯函数，加 `projectA11yNode` / `syncA11yNodeRecursive` /
-//! `firstSubtreeText` 三个投影函数。它们对 `Cx` 的**全部**依赖只有四项：
+//! Three pure functions `mapA11yRoleToTreeRole` / `parseLiveRegion` / `stringHash`, and three
+//! projection functions `projectA11yNode` / `syncA11yNodeRecursive` / `firstSubtreeText`.
+//! Their **entire** dependence on `Cx` is four items:
 //!
-//!   * `allocator`, a11y_label_buf 的 put；
-//!   * `accessibility_tree`, upsert / remove 的目标；
-//!   * `a11y_label_buf`, hash->字符串的旁路查找表；
-//!   * `focus_manager.current_focus`，只读「这个节点是否持焦」一个 bool。
+//!   * `allocator`, for puts into a11y_label_buf;
+//!   * `accessibility_tree`, the target of upsert / remove;
+//!   * `a11y_label_buf`, the side lookup table from hash to string;
+//!   * `focus_manager.current_focus`, read only for one bool: whether this node holds focus.
 //!
-//! 接口因此切在：**投影函数接收显式参数，不接收 `*Cx`**。焦点解析留在 Cx 侧
-//! （`FocusProbe` 函数指针注入，同 text_input_session 的 Host 手法）；9 个
-//! `cxA11y*` C-ABI 回调、macos_bridge 上下文注册、flushToBridge 也留在
-//! `Cx.syncA11yTreeFromInteractions`，那是平台适配层，不是投影逻辑。
-//! `accessibility_tree` / `a11y_label_buf` 两个字段同样留在 Cx 上（大量组件
-//! 测试直接读 `cx.accessibility_tree.get(...)`，动字段是大面积改动）。
+//! So projection functions take explicit parameters, not `*Cx`. Focus resolution stays on the Cx
+//! side (injected as a `FocusProbe` function pointer, like the Host of text_input_session); the 9
+//! `cxA11y*` C-ABI callbacks, macos_bridge context registration and flushToBridge stay in
+//! `Cx.syncA11yTreeFromInteractions`, the platform adaptation layer. The `accessibility_tree` /
+//! `a11y_label_buf` fields also stay on Cx (many component tests read
+//! `cx.accessibility_tree.get(...)` directly).
 //!
-//! 拆出来的直接收益：这些规则此前只能靠「建 Cx -> mount -> layout -> render」
-//! 整条链路驱动，现在拿一个裸 Node + 一棵 AccessibilityTree 就能断言。
-//! 这里历史上出过「十个状态位硬编码 false / value_now 恒 0」的批量事故
-//! （见 projectNode 内注释），组件即使正确声明也被原地丢弃。本文件的
-//! 逐字段测试就是为钉住那类回归而写。
+//! Benefit: these rules can be asserted with a bare Node + an AccessibilityTree, no full
+//! "create Cx -> mount -> layout -> render" chain. The per-field tests in this file pin down the
+//! regression class where correctly declared component state is dropped (see projectNode).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -32,23 +30,74 @@ const a11y_tree_mod = @import("../a11y/tree.zig");
 
 const Node = node_mod.Node;
 const ElementId = element_id_mod.ElementId;
+const AXId = a11y_tree_mod.AXId;
 const A11yProps = types.A11yProps;
 const A11yRole = types.A11yRole;
 
-/// hash->字符串旁路表。A11yNode 只存 hash 不存 slice（见 tree.zig 头注释），
-/// AT 工具读字符串时经 label_resolver 回这张表查。
-pub const LabelBuf = std.AutoHashMapUnmanaged(u64, []const u8);
+/// Side table from hash to string. A11yNode stores only the hash, not a slice (see the header
+/// comment of tree.zig); AT tools read strings back through this table via label_resolver.
+///
+/// **Strings are always copied into our own arena**, never borrowing the caller's slice. AT pulls
+/// happen between two projections (AppKit main-thread run loop callbacks), and a borrowed slice
+/// may by then be freed or rewritten: an input's `value_text` points straight at the edit buffer,
+/// and `setText` frees the old text. After copying, every string from one projection stays alive
+/// until the next projection's `clearRetainingCapacity`, so pulls read a consistent snapshot.
+/// Method signatures match the `AutoHashMapUnmanaged` subset
+/// (put/get/clearRetainingCapacity/deinit).
+pub const LabelStore = struct {
+    map: std.AutoHashMapUnmanaged(u64, []const u8) = .{},
+    arena_state: std.heap.ArenaAllocator.State = .{},
 
-/// 焦点探针：Cx 实现为「比较 focus_manager.current_focus 指针」。
-/// 投影层不需要（也不能）import Cx，于是把它做成注入，与
-/// text_input_session.Host、custom_cursor.RasterizeFn 同一手法。
+    pub fn put(self: *LabelStore, allocator: Allocator, hash: u64, str: []const u8) Allocator.Error!void {
+        const gop = try self.map.getOrPut(allocator, hash);
+        if (gop.found_existing) return;
+        var arena = self.arena_state.promote(allocator);
+        defer self.arena_state = arena.state;
+        gop.value_ptr.* = arena.allocator().dupe(u8, str) catch |err| {
+            self.map.removeByPtr(gop.key_ptr);
+            return err;
+        };
+    }
+
+    pub fn get(self: *const LabelStore, hash: u64) ?[]const u8 {
+        return self.map.get(hash);
+    }
+
+    pub fn count(self: *const LabelStore) usize {
+        return self.map.count();
+    }
+
+    /// Called at projection start: the old snapshot is invalidated wholesale; the arena keeps
+    /// capacity for reuse.
+    pub fn clearRetainingCapacity(self: *LabelStore, allocator: Allocator) void {
+        self.map.clearRetainingCapacity();
+        var arena = self.arena_state.promote(allocator);
+        _ = arena.reset(.retain_capacity);
+        self.arena_state = arena.state;
+    }
+
+    pub fn deinit(self: *LabelStore, allocator: Allocator) void {
+        self.map.deinit(allocator);
+        self.arena_state.promote(allocator).deinit();
+        self.* = .{};
+    }
+};
+
+/// Alias kept for backward compatibility.
+pub const LabelBuf = LabelStore;
+
+/// Focus probe: Cx implements it as a comparison against the `focus_manager.current_focus` pointer.
+/// The projection layer does not (and cannot) import Cx, so it is injected, the same way as
+/// text_input_session.Host and custom_cursor.RasterizeFn.
 pub const FocusProbe = struct {
     ctx: ?*const anyopaque = null,
     isFocused: *const fn (ctx: ?*const anyopaque, node: *const Node) bool,
+    isBlocked: ?*const fn (ctx: ?*const anyopaque, node: *const Node) bool = null,
 };
 
-/// types.A11yRole -> a11y_tree.Role 映射。后者更细 (40+ ARIA roles)，
-/// 前者是 Node 上的 24-variant subset。无对应时退化 .generic (focusable 容器) 或 .none。
+/// Maps types.A11yRole -> a11y_tree.Role. The latter is finer-grained (40+ ARIA roles); the
+/// former is a 24-variant subset on Node. With no match, falls back to .generic (focusable
+/// container) or .none.
 pub fn mapA11yRoleToTreeRole(role: A11yRole, focusable: bool) a11y_tree_mod.Role {
     return switch (role) {
         .none => if (focusable) a11y_tree_mod.Role.generic else a11y_tree_mod.Role.none,
@@ -56,7 +105,10 @@ pub fn mapA11yRoleToTreeRole(role: A11yRole, focusable: bool) a11y_tree_mod.Role
         .checkbox => .checkbox,
         .radio => .radio,
         .textbox => .textbox,
-        .switch_role => .checkbox, // ARIA switch 在 NSAccessibility 没原生 role；用 checkbox 近似
+        // macOS expresses this as AXCheckBox + AXSwitch subrole (window_bridge.m); it gets its own
+        // entry
+        // in the tree, otherwise the platform layer cannot tell a switch from a checkbox.
+        .switch_role => .switch_control,
         .tab => .tab,
         .tablist => .tabs,
         .dialog => .dialog,
@@ -78,7 +130,7 @@ pub fn mapA11yRoleToTreeRole(role: A11yRole, focusable: bool) a11y_tree_mod.Role
         .combobox => .combobox,
         .grid => .grid,
         .gridcell => .cell,
-        // 2026-07-31 补齐：这批在 a11y/tree.zig 里本就是一比一同名角色。
+        // These roles have identically named counterparts in a11y/tree.zig.
         .tree => .tree,
         .treeitem => .treeitem,
         .row => .row,
@@ -108,6 +160,7 @@ pub fn mapA11yRoleToTreeRole(role: A11yRole, focusable: bool) a11y_tree_mod.Role
         .banner => .banner,
         .contentinfo => .contentinfo,
         .generic => .generic,
+        .scroll_area => .scroll_area,
     };
 }
 
@@ -123,45 +176,79 @@ pub fn stringHash(s: []const u8) u64 {
     return std.hash.Wyhash.hash(0, s);
 }
 
-/// 投影一个 Node 到 A11yNode；返回是否真投影 (false 表示 caller 应 remove)。
+/// Projects a Node into an A11yNode; returns whether it was projected (false = caller should
+/// remove).
 ///
-/// 对 Cx 的依赖全部显式化在参数表里（见模块头）：tree / label_buf 由 caller
-/// 传入，焦点被压成一个 bool。hidden 是**祖先传播后**的值（含本节点自身的
-/// props.hidden），由 syncSubtree 计算。
+/// false only means 'semantically should not be projected'. An upsert OOM must not be folded into
+/// false: the caller would remove a live node that should stay, and it would be projected again
+/// next frame, making the AT-side element flicker. Consistent with the remove OOM policy, panic.
+///
+/// All Cx dependencies are explicit in the parameter list (see module header): tree / label_buf
+/// are passed in, and focus is reduced to a bool. hidden is the value **after ancestor
+/// propagation** (including the node's own props.hidden), computed by syncSubtree.
 pub fn projectNode(
     allocator: Allocator,
     tree: *a11y_tree_mod.AccessibilityTree,
     label_buf: *LabelBuf,
     node: *const Node,
-    eid: ElementId,
-    parent: ElementId,
+    eid: AXId,
+    parent: AXId,
     sibling_index: u32,
     hidden: bool,
     is_focused: bool,
 ) bool {
-    const a11y_props = node.behavior.interaction.a11y;
+    return projectNodeAs(allocator, tree, label_buf, node, node.behavior.interaction.a11y, eid, parent, sibling_index, hidden, is_focused, false);
+}
+
+/// Like projectNode, but semantics supplied by caller (inferred roles use this path, see
+/// inferredProps).
+pub fn projectNodeAs(
+    allocator: Allocator,
+    tree: *a11y_tree_mod.AccessibilityTree,
+    label_buf: *LabelBuf,
+    node: *const Node,
+    a11y_props: ?A11yProps,
+    eid: AXId,
+    parent: AXId,
+    sibling_index: u32,
+    hidden: bool,
+    is_focused: bool,
+    /// Blocked by modal boundary (modal / outside non-ancestor popup): still presented but semantic
+    /// actions disabled.
+    blocked: bool,
+) bool {
     const focusable = node.behavior.interaction.focusable;
     if (a11y_props == null and !focusable) return false;
 
-    const props = a11y_props orelse A11yProps{};
+    var props = a11y_props orelse A11yProps{};
+    props.disabled = props.disabled or blocked;
     const role = mapA11yRoleToTreeRole(props.role, focusable);
     if (role == .none and !focusable) return false;
 
-    // label fallback：组件未显式给 label，借子树文本（focus.zig 同款）。
-    const label_str = if (props.label) |l| l else firstSubtreeText(node);
+    // Accessible name (accname): explicit label wins ("" means explicitly no name); else only roles
+    // with "name from content" concatenate visible descendant text. Container roles (list/dialog/
+    // group...) do not borrow child text as name: their text is already exposed as static_text
+    // children, reading twice is wrong. (Old impl named entire VirtualList as "#0".)
+    var name_buf: [content_name_capacity]u8 = undefined;
+    const label_str = if (props.label) |l|
+        l
+    else if (nameFromContent(props.role, focusable))
+        contentText(node, &name_buf)
+    else
+        "";
     const label_hash = stringHash(label_str);
     if (label_str.len > 0) {
-        // 可降级：a11y_label_buf 只是 hash->字符串的旁路查找表，每次
-        // syncA11yTreeFromInteractions 都 clearRetainingCapacity 后整体重建。
-        // put 失败只让本次 lookupA11yString 返回 null（该条 label 这一轮读不
-        // 出来），不影响 a11y 树结构本身，下一次同步即自愈。
+        // Graceful degradation: a11y_label_buf is hash->string side table, rebuilt entire on each
+        // syncA11yTreeFromInteractions clearRetainingCapacity. put OOM only causes this lookup to
+        // return null (label unreadable this round), does not damage tree structure; next sync
+        // self-heals.
         label_buf.put(allocator, label_hash, label_str) catch {};
     }
 
     const description_str = props.description orelse "";
     const description_hash = stringHash(description_str);
     if (description_str.len > 0) {
-        // 同 label：旁路查找表，失败仅本轮读不出，下次同步自愈。
+        // Like label: side table, OOM only hides this round, next sync recovers.
         label_buf.put(allocator, description_hash, description_str) catch {};
     }
 
@@ -180,7 +267,7 @@ pub fn projectNode(
     const value_str = props.value_text orelse "";
     const value_hash = stringHash(value_str);
     if (value_str.len > 0) {
-        // 同 label：旁路查找表，失败仅本轮读不出，下次同步自愈。
+        // Like label: side table, OOM only hides this round, next sync recovers.
         label_buf.put(allocator, value_hash, value_str) catch {};
     }
 
@@ -192,20 +279,18 @@ pub fn projectNode(
     else if (props.value_text) |value|
         value
     else if (props.label) |label|
-        if (label.len > 0) label else firstSubtreeText(node)
+        if (label.len > 0) label else contentText(node, &name_buf)
     else
-        firstSubtreeText(node);
+        contentText(node, &name_buf);
     const live_text_hash = stringHash(live_text);
     if (live_text.len > 0) {
         label_buf.put(allocator, live_text_hash, live_text) catch {};
     }
 
-    // ⚠ 2026-07-31 前这里把 pressed/required/invalid/readonly/busy/
-    // selected/modal/haspopup/multiline/multiselectable 十个位全部
-    // 硬编码成 false，value_now/min/max 硬编码成 0。后果是组件即使
-    // 正确声明也被原地丢弃，ComboBox / DatePicker / SelectHeadless
-    // 都设了 has_popup，AT 侧却永远收不到；slider / progressbar 永远
-    // 报不出数值。现按 props 如实投影。
+    // Warning: pressed/required/invalid/readonly/busy/selected/modal/haspopup/multiline/
+    // multiselectable and value_now/min/max must be projected from props, never hardcoded
+    // (false / 0): otherwise correctly declared component state is silently discarded (e.g.
+    // ComboBox/DatePicker/SelectHeadless set has_popup, slider/progressbar report values).
     const a11y_state: a11y_tree_mod.State = .{
         .disabled = props.disabled,
         .checked = if (props.checked) |c| c else false,
@@ -228,30 +313,38 @@ pub fn projectNode(
         .expanded_present = props.expanded != null,
     };
 
-    const rect = node.globalRect();
+    const local_rect = node.rectFromWorldOrFallback();
+    const rect = @import("retained_scene.zig").buildAncestorWorldTransform(node, .{ .include_rotation = true }).transformRect(.{
+        .x = 0,
+        .y = 0,
+        .w = local_rect.w,
+        .h = local_rect.h,
+    });
     const has_click_route = node.behavior.events.on_click != null or node.behavior.events.on_event != null;
     const has_step_route = node.behavior.events.on_key_down != null or node.behavior.events.on_event != null;
-    const toggle_role = role == .checkbox or role == .radio or
+    const toggle_role = role == .checkbox or role == .switch_control or role == .radio or
         role == .menuitemcheckbox or role == .menuitemradio;
     const step_role = role == .slider or role == .spinbutton;
     const editable = if (props.editable_text) |editable_props| a11y_tree_mod.EditableText{
         .selection_start = editable_props.selection_start,
         .selection_end = editable_props.selection_end,
         .caret = editable_props.caret,
+        .uniform_format = editable_props.uniform_format,
+        .can_scroll = editable_props.scroll_into_view != null and !props.disabled,
         .visible_start = editable_props.visible_start,
         .visible_end = editable_props.visible_end,
-        .can_set_selection = !props.disabled and !props.readonly,
+        .can_set_selection = !props.disabled,
         .can_set_value = editable_props.set_value != null and !props.disabled and !props.readonly,
     } else null;
     const numeric = props.value_range;
 
-    // active_descendant 投影，caller 通过
-    // node.behavior.interaction.a11y.active_descendant_element_id 设
-    // 当前激活的子项 element_id_raw (combobox/listbox/grid 虚拟焦点模式)。
+    // active_descendant projection: caller sets
+    // node.behavior.interaction.a11y.active_descendant_element_id
+    // to current activated child element_id_raw (combobox/listbox/grid virtual-focus mode).
     const active_desc = if (props.active_descendant_element_id == 0xFFFFFFFF)
-        ElementId.NULL
+        AXId.NULL
     else
-        ElementId.fromRaw(props.active_descendant_element_id);
+        AXId.node(ElementId.fromRaw(props.active_descendant_element_id));
 
     tree.upsert(.{
         .element = eid,
@@ -268,11 +361,15 @@ pub fn projectNode(
         .value_now = if (numeric) |value| value.now else props.value_now,
         .value_min = if (numeric) |value| value.min else props.value_min,
         .value_max = if (numeric) |value| value.max else props.value_max,
+        .value_small_change = if (numeric) |value| validChange(value.small_change) else null,
+        .value_large_change = if (numeric) |value| validChange(value.large_change) else null,
         .numeric_value_present = numeric != null or props.value_now != 0 or props.value_min != 0 or props.value_max != 0,
         .can_set_numeric_value = if (numeric) |value|
             value.context != null and value.set_value != null and !props.disabled and !props.readonly
         else
             false,
+        .can_set_expanded = props.expanded != null and props.expansion != null and !props.disabled and !props.readonly,
+        .can_set_item_selection = props.item_selection != null and !props.disabled and !props.readonly,
         .sibling_index = sibling_index,
         .active_descendant = active_desc,
         .frame = .{ .x = rect.x, .y = rect.y, .width = rect.w, .height = rect.h },
@@ -283,62 +380,239 @@ pub fn projectNode(
             .decrement = step_role and has_step_route,
         },
         .editable_text = editable,
-        .orientation = @enumFromInt(@intFromEnum(props.orientation)),
-        .sort_direction = @enumFromInt(@intFromEnum(props.sort_direction)),
+        .orientation = @fromBackingInt(@intCast(@backingInt(props.orientation))),
+        .sort_direction = @fromBackingInt(@intCast(@backingInt(props.sort_direction))),
         .level = props.level,
         .row_index = props.row_index,
         .row_span = @max(props.row_span, 1),
         .column_index = props.column_index,
         .column_span = @max(props.column_span, 1),
-    }) catch return false;
+        .set_size = props.set_size,
+        .pos_in_set = props.pos_in_set,
+    }) catch @panic("OOM: a11y tree upsert");
     return true;
 }
 
-/// 递归同步一棵 Node 子树到 a11y 树。
-///
-/// 维护两条不变量：
-///   * a11y parent = element 树上**最近的已投影祖先**（不裁剪层级，
-///     button 包 text 时只投 button，text 内容作 label）；
-///   * sibling_index 只数**已投影**的兄弟（未投影的纯视觉容器不占位）。
-///
-/// 节点不再合格（无 a11y props 且不 focusable）时走 remove：remove 失败会
-/// 把陈旧条目留在树上，VoiceOver 会继续朗读一个界面上已经不存在的元素，
-/// 且下次同步不会再走到这里重试，故 OOM 直接 panic。
-pub fn syncSubtree(
-    allocator: Allocator,
-    tree: *a11y_tree_mod.AccessibilityTree,
-    label_buf: *LabelBuf,
-    node: *Node,
-    parent_a11y_id: ElementId,
-    sibling_counter: *u32,
-    ancestor_hidden: bool,
-    focus: FocusProbe,
-) void {
-    var next_parent = parent_a11y_id;
-    const explicitly_hidden = if (node.behavior.interaction.a11y) |props| props.hidden else false;
-    // display:none 子树与 aria-hidden 同样整棵退出无障碍树（节点仍在，只是不呈现）。
-    const subtree_hidden = ancestor_hidden or explicitly_hidden or node.style.display == .none;
-    if (node.element_id_raw != 0xFFFFFFFF) {
-        const eid: ElementId = .{
-            .index = @as(u24, @intCast(node.element_id_raw & 0x00FF_FFFF)),
-            .generation = @as(u8, @intCast((node.element_id_raw >> 24) & 0xFF)),
-        };
-        if (projectNode(allocator, tree, label_buf, node, eid, parent_a11y_id, sibling_counter.*, subtree_hidden, focus.isFocused(focus.ctx, node))) {
-            next_parent = eid;
-            sibling_counter.* += 1;
-        } else {
-            // 正确性路径：节点已不该出现在 a11y 树里（不再 focusable / 无 a11y
-            // props）。remove 失败会把陈旧条目留在树上，VoiceOver 会继续朗读一个
-            // 界面上已经不存在的元素，且下次同步不会再走到这里重试。
-            tree.remove(eid) catch @panic("OOM: a11y tree remove (stale node projection)");
-        }
-    }
-    var child_counter: u32 = 0;
-    for (node.children.items) |child| {
-        syncSubtree(allocator, tree, label_buf, child, next_parent, &child_counter, subtree_hidden, focus);
-    }
+/// Name concatenation cap. Accessible names are human-readable phrases; long content (full
+/// paragraphs) should be exposed as static_text children, not crammed into a control's name.
+pub const content_name_capacity = 1024;
+
+/// ARIA 'children presentational': these roles absorb **non-interactive** descendants into
+/// themselves instead of exposing them independently. Button text, icons and spinners belong to
+/// the button (else a loading button has an unnamed AXProgressIndicator child).
+/// Interactive descendants (focusable or roles with click routes) are still exposed; nested
+/// interaction is a structure issue that audit will report; the projection layer does not hide it.
+pub fn childrenPresentational(role: A11yRole, focusable: bool) bool {
+    return switch (role) {
+        .button,
+        .checkbox,
+        .radio,
+        .switch_role,
+        .tab,
+        .menuitem,
+        .menuitemcheckbox,
+        .menuitemradio,
+        .option,
+        .link,
+        .heading,
+        .img,
+        .progressbar,
+        .slider,
+        .spinbutton,
+        .textbox,
+        .textarea,
+        .searchbox,
+        .combobox,
+        .separator,
+        .tooltip,
+        .treeitem,
+        .gridcell,
+        .columnheader,
+        .rowheader,
+        // List items also absorb own text: real VoiceOver test, row with static text, VO walks into
+        // text, skips row, never announces "item N of M". User does not know row is a list item.
+        // Interactive elements within row still exposed (see isInteractive).
+        .listitem,
+        => true,
+        // No role but focusable custom control (clickable card): treat as button-style leaf.
+        .none, .generic => focusable,
+        else => false,
+    };
 }
 
+/// Name from content: when no explicit label, use visible descendant text as name. Input-class
+/// roles absorb descendants but name cannot be from content (would read value or placeholder
+/// as control name); containers same way.
+pub fn nameFromContent(role: A11yRole, focusable: bool) bool {
+    return switch (role) {
+        .button,
+        .checkbox,
+        .radio,
+        .switch_role,
+        .tab,
+        .menuitem,
+        .menuitemcheckbox,
+        .menuitemradio,
+        .option,
+        .link,
+        .heading,
+        .tooltip,
+        .treeitem,
+        .gridcell,
+        .columnheader,
+        .rowheader,
+        .row,
+        .listitem,
+        => true,
+        .none, .generic => focusable,
+        else => false,
+    };
+}
+
+/// ARIA widget/composite widget roles: declaring them marks interactive elements. Judge by role,
+/// not handler: zenit often routes clicks on outer wrapper node (DatePicker trigger has no
+/// on_click itself, route on Popover trigger).
+pub fn isWidgetRole(role: A11yRole) bool {
+    return switch (role) {
+        .button,
+        .link,
+        .checkbox,
+        .radio,
+        .switch_role,
+        .tab,
+        .menuitem,
+        .menuitemcheckbox,
+        .menuitemradio,
+        .option,
+        .textbox,
+        .textarea,
+        .searchbox,
+        .combobox,
+        .slider,
+        .spinbutton,
+        .treeitem,
+        .gridcell,
+        .listbox,
+        .tree,
+        .grid,
+        .tablist,
+        .menu,
+        .menubar,
+        .radiogroup,
+        => true,
+        else => false,
+    };
+}
+
+/// Interactive nodes: focusable or declare widget role. Only these survive under absorbent
+/// ancestors.
+fn isInteractive(node: *const Node) bool {
+    if (node.behavior.interaction.focusable) return true;
+    const props = node.behavior.interaction.a11y orelse return false;
+    return isWidgetRole(props.role);
+}
+
+fn isSubtreeHiddenSelf(node: *const Node) bool {
+    if (node.style.display == .none) return true;
+    // Clipped to zero area: content renders zero pixels. Modal hides this way (barrier 0x0 +
+    // overflow_hidden, not display:none); else closed dialog still readable (axprobe measured).
+    if (node.style.overflow_hidden) {
+        const r = node.globalRect();
+        if (r.w <= 0 or r.h <= 0) return true;
+    }
+    const props = node.behavior.interaction.a11y orelse return false;
+    return props.hidden;
+}
+
+/// Node's own visible text (`.text` content); blank treated as no text.
+pub fn ownText(node: *const Node) ?[]const u8 {
+    const t = node.getText() orelse return null;
+    if (std.mem.trim(u8, t.content, " \t\r\n").len == 0) return null;
+    return t.content;
+}
+
+/// Semantic inference: unannounced node with click route. Infer button only in "clean" subtree
+/// (no declared semantics or interaction anywhere), name from content. Large container around
+/// declared content (modal barrier) does not misfire as button, swallowing dialog. Inference is
+/// fallback; audit lists every inferred point; components should declare.
+pub fn inferredProps(node: *const Node) ?A11yProps {
+    return inferredPropsMemo(node, null);
+}
+
+/// Only inferredProps implementation. Projection pass memo table: "subtree has declared semantics"
+/// calculated once per node per projection. Without memo, deeply nested all-clickable subtree
+/// rescans entire tree per layer, worst case Theta(N^2)/frame. Single-call pass null.
+fn inferredPropsMemo(node: *const Node, memo: ?*DeclaredMemo) ?A11yProps {
+    if (node.behavior.interaction.a11y != null or node.behavior.interaction.focusable) return null;
+    // Scroll containers stay as group (AXScrollArea), like native NSScrollView.
+    //
+    // If all visual containers are flattened, hundreds of elements become window siblings and
+    // VoiceOver reorders them by screen position, interleaving sidebar and main content by
+    // y-coordinate. Keeping the scroll container as a group makes each a navigation unit.
+    if (node.tag == .scroll) return .{ .role = .scroll_area };
+    if (node.behavior.events.on_click == null) return null;
+    for (node.children.items) |child| {
+        if (hasDeclaredSemantics(child, memo)) return null;
+    }
+    return .{ .role = .button };
+}
+
+/// Within one projection, memo of "subtree (including self) has declared semantics or click route".
+pub const DeclaredMemo = struct {
+    allocator: Allocator,
+    map: std.AutoHashMapUnmanaged(*const Node, bool) = .{},
+
+    pub fn deinit(self: *DeclaredMemo) void {
+        self.map.deinit(self.allocator);
+    }
+};
+
+fn hasDeclaredSemantics(node: *const Node, memo: ?*DeclaredMemo) bool {
+    if (node.behavior.interaction.a11y != null or node.behavior.interaction.focusable) return true;
+    if (node.behavior.events.on_click != null) return true;
+    if (memo) |m| {
+        if (m.map.get(node)) |cached| return cached;
+    }
+    var found = false;
+    for (node.children.items) |child| {
+        if (hasDeclaredSemantics(child, memo)) {
+            found = true;
+            break;
+        }
+    }
+    // Memo write OOM only loses cache, result still correct.
+    if (memo) |m| m.map.put(m.allocator, node, found) catch {};
+    return found;
+}
+
+/// Concatenate all visible text in subtree (single space sep), skip hidden subtrees and nested
+/// interactive nodes (they have own names). Write to `buf`; cap at UTF-8 char boundary.
+pub fn contentText(node: *const Node, buf: []u8) []const u8 {
+    var len: usize = 0;
+    appendContentText(node, buf, &len, true);
+    // Truncation may have added sep space; next text not even one byte fits.
+    return std.mem.trimEnd(u8, buf[0..len], " ");
+}
+
+fn appendContentText(node: *const Node, buf: []u8, len: *usize, is_root: bool) void {
+    if (len.* >= buf.len) return;
+    if (!is_root and (isSubtreeHiddenSelf(node) or isInteractive(node))) return;
+    if (ownText(node)) |text| {
+        const trimmed = std.mem.trim(u8, text, " \t\r\n");
+        if (len.* > 0 and len.* < buf.len) {
+            buf[len.*] = ' ';
+            len.* += 1;
+        }
+        var take = @min(trimmed.len, buf.len - len.*);
+        // Truncation mid-multibyte: rewind to char start, ensure output is valid UTF-8.
+        while (take < trimmed.len and take > 0 and (trimmed[take] & 0xC0) == 0x80) take -= 1;
+        @memcpy(buf[len.*..][0..take], trimmed[0..take]);
+        len.* += take;
+    }
+    for (node.children.items) |child| appendContentText(child, buf, len, false);
+}
+
+/// Compat entry: first non-empty text span in subtree.
 pub fn firstSubtreeText(node: *const Node) []const u8 {
     if (node.getText()) |t| {
         if (t.content.len > 0) return t.content;
@@ -350,15 +624,255 @@ pub fn firstSubtreeText(node: *const Node) []const u8 {
     return "";
 }
 
-// ── 测试 ───────────────────────────────────────────────────────────────
+/// Project unlabeled text node as static_text (AXStaticText, value = text content).
+pub fn projectStaticText(
+    allocator: Allocator,
+    tree: *a11y_tree_mod.AccessibilityTree,
+    label_buf: *LabelBuf,
+    node: *const Node,
+    text: []const u8,
+    eid: AXId,
+    parent: AXId,
+    sibling_index: u32,
+    hidden: bool,
+) bool {
+    const value_hash = stringHash(text);
+    label_buf.put(allocator, value_hash, text) catch {};
+    const rect = node.globalRect();
+    tree.upsert(.{
+        .element = eid,
+        .parent = parent,
+        .role = .static_text,
+        .state = .{ .hidden = hidden },
+        .text_hash = value_hash,
+        .sibling_index = sibling_index,
+        .frame = .{ .x = rect.x, .y = rect.y, .width = rect.w, .height = rect.h },
+    }) catch @panic("OOM: a11y tree upsert");
+    return true;
+}
+
+/// Recursively sync Node subtree to a11y tree.
+///
+/// Each node falls into one of three categories:
+///  * **Element**: has a11y props or focusable (component-declared semantics);
+///  * **Static text**: unlabeled, has visible text, auto-projected as static_text so
+///    VoiceOver can read titles and body text;
+///  * **None**: pure visual container, flattened, children reparent to nearest projected ancestor.
+/// Under an absorbent ancestor (childrenPresentational), non-interactive descendants all flatten.
+///
+/// Two invariants maintained:
+///  * a11y parent = element tree **nearest projected ancestor**;
+///  * sibling_index counts **projected** siblings only (unprojected visual containers take no
+///    slot).
+///
+/// Unqualified node: remove. An OOM during remove leaves a stale entry (VoiceOver keeps reading
+/// the vanished element, next sync never retries), so OOM panics directly.
+pub fn syncSubtree(
+    allocator: Allocator,
+    tree: *a11y_tree_mod.AccessibilityTree,
+    label_buf: *LabelBuf,
+    node: *Node,
+    parent_a11y_id: AXId,
+    sibling_counter: *u32,
+    ancestor_hidden: bool,
+    focus: FocusProbe,
+) void {
+    var memo = DeclaredMemo{ .allocator = allocator };
+    defer memo.deinit();
+    const pass = Pass{
+        .allocator = allocator,
+        .tree = tree,
+        .label_buf = label_buf,
+        .modal = ModalScope.find(node),
+        .focus = focus,
+        .declared = &memo,
+    };
+    pass.sync(node, parent_a11y_id, sibling_counter, ancestor_hidden, false, pass.modal.modal == null, null);
+}
+
+/// Modal scope: visible modal dialog (role dialog/alertdialog, modal=true) latest in document
+/// order. While open, nodes outside its subtree and outside ancestors are inert, VoiceOver
+/// cannot "exit" dialog reading background.
+///
+/// Precondition: when multiple modals open, later one also later in doc order. zenit floats
+/// append to portal root in order, satisfies this; if future allows inserting float mid-portal,
+/// must instead take highest by layer, else topmost dialog inerts itself.
+///
+/// Done in two passes during projection (find modal, project with scope), not post-modify tree:
+/// post would flip hidden true/false each frame, notification storm.
+pub const ModalScope = struct {
+    modal: ?*const Node = null,
+    /// Modal node ancestors (including self). Depth exceeds cap: degrade to "no inert": better
+    /// readable background than dialog inerted.
+    ancestors: [64]*const Node = undefined,
+    ancestor_count: usize = 0,
+
+    pub fn find(root: *const Node) ModalScope {
+        var scope = ModalScope{};
+        scope.modal = lastVisibleModal(root);
+        const modal = scope.modal orelse return scope;
+        var cursor: ?*const Node = modal;
+        while (cursor) |n| : (cursor = n.parent) {
+            if (scope.ancestor_count == scope.ancestors.len) return .{};
+            scope.ancestors[scope.ancestor_count] = n;
+            scope.ancestor_count += 1;
+            if (n == root) break;
+        }
+        return scope;
+    }
+
+    fn isAncestorOrSelf(self: *const ModalScope, node: *const Node) bool {
+        for (self.ancestors[0..self.ancestor_count]) |a| {
+            if (a == node) return true;
+        }
+        return false;
+    }
+
+    fn lastVisibleModal(node: *const Node) ?*const Node {
+        if (isSubtreeHiddenSelf(node)) return null;
+        var found: ?*const Node = null;
+        if (node.behavior.interaction.a11y) |props| {
+            if (props.modal and (props.role == .dialog or props.role == .alertdialog)) found = node;
+        }
+        for (node.children.items) |child| {
+            if (lastVisibleModal(child)) |m| found = m;
+        }
+        return found;
+    }
+};
+
+/// Immutable projection context. Passed by pointer, not copied per recursion level (ModalScope
+/// has 64 pointers).
+const Pass = struct {
+    allocator: Allocator,
+    tree: *a11y_tree_mod.AccessibilityTree,
+    label_buf: *LabelBuf,
+    modal: ModalScope,
+    focus: FocusProbe,
+    declared: *DeclaredMemo,
+
+    fn sync(
+        self: *const Pass,
+        node: *Node,
+        parent_a11y_id: AXId,
+        sibling_counter: *u32,
+        ancestor_hidden: bool,
+        absorbed: bool,
+        inside_modal: bool,
+        /// Set declared by parent node (non-null only for direct children of set node).
+        parent_collection: ?u32,
+    ) void {
+        var next_parent = parent_a11y_id;
+        var child_absorbed = absorbed;
+        var child_collection: ?u32 = null;
+        var projected = false;
+        const node_inside_modal = inside_modal or (self.modal.modal == node);
+        // Modal open: subtree outside scope is inert.
+        const inert = !node_inside_modal and !self.modal.isAncestorOrSelf(node);
+        // display:none subtree and aria-hidden exit a11y tree same way (node present, not
+        // rendered).
+        const subtree_hidden = ancestor_hidden or inert or isSubtreeHiddenSelf(node);
+        if (parent_collection) |collection_idx| {
+            if (node.behavior.interaction.a11y) |props| {
+                if (props.collection_item) |index| {
+                    self.syncCollectionItem(node, collection_idx, index, subtree_hidden, node_inside_modal);
+                    return;
+                }
+            }
+        }
+        if (node.element_id_raw != 0xFFFFFFFF) {
+            const eid = AXId.node(ElementId.fromRaw(node.element_id_raw));
+            const inferred = if (absorbed) null else inferredPropsMemo(node, self.declared);
+            const semantics: ?A11yProps = node.behavior.interaction.a11y orelse inferred;
+            const declared = semantics != null or node.behavior.interaction.focusable;
+            const keep = !absorbed or isInteractive(node);
+            if (declared and keep) {
+                projected = projectNodeAs(self.allocator, self.tree, self.label_buf, node, semantics, eid, parent_a11y_id, sibling_counter.*, subtree_hidden, self.focus.isFocused(self.focus.ctx, node), if (self.focus.isBlocked) |probe| probe(self.focus.ctx, node) else false);
+                if (projected) {
+                    const props = semantics orelse A11yProps{};
+                    child_absorbed = childrenPresentational(props.role, node.behavior.interaction.focusable);
+                    if (props.collection) |provider| {
+                        child_collection = self.tree.syncCollection(eid, provider, subtree_hidden) catch
+                            @panic("OOM: a11y collection sync");
+                    }
+                }
+            } else if (!declared and !absorbed) {
+                if (ownText(node)) |text| {
+                    projected = projectStaticText(self.allocator, self.tree, self.label_buf, node, text, eid, parent_a11y_id, sibling_counter.*, subtree_hidden);
+                }
+            }
+            if (projected) {
+                next_parent = eid;
+                sibling_counter.* += 1;
+            } else {
+                // Correctness path: the node should no longer appear in the a11y tree. A failed
+                // remove leaves a stale
+                // entry in the tree, and the next sync will not reach here to retry.
+                self.tree.remove(eid) catch @panic("OOM: a11y tree remove (stale node projection)");
+            }
+        }
+        // A node that projects an element starts a new sibling order for its children; flattened
+        // nodes let
+        // children continue the parent's counter (they are siblings of the parent in the a11y
+        // tree). Decided by
+        // "is projected", not indirectly by ElementId equality (an id collision would mix up
+        // counters).
+        var child_counter: u32 = 0;
+        const counter = if (projected) &child_counter else sibling_counter;
+        for (node.children.items) |child| {
+            self.sync(child, next_parent, counter, subtree_hidden, child_absorbed, node_inside_modal, child_collection);
+        }
+    }
+
+    /// Row content container of a collection (pool node): the node itself is not projected, and its
+    /// subtree is
+    /// projected with the bound entry's cell as parent. When a pool node is rebound, the subtree's
+    /// parent moves
+    /// from the old cell to the new cell, and the tree's structure-change records emit one
+    /// child-change per cell;
+    /// the identity of the entry (row / cell) itself is unaffected.
+    fn syncCollectionItem(
+        self: *const Pass,
+        node: *Node,
+        collection_idx: u32,
+        index: u32,
+        subtree_hidden: bool,
+        inside_modal: bool,
+    ) void {
+        if (node.element_id_raw != 0xFFFFFFFF) {
+            self.tree.remove(AXId.node(ElementId.fromRaw(node.element_id_raw))) catch
+                @panic("OOM: a11y tree remove (collection row host)");
+        }
+        const cell = self.tree.bindCollectionItem(collection_idx, index) catch |err| switch (err) {
+            // A frame where the binding and the data source are out of sync (row count just
+            // changed, pool node not yet
+            // recycled): do not attach this frame; the unprojected subtree is cleared at the end of
+            // this projection
+            // and redone with the new binding next frame.
+            error.ItemOutOfRange, error.ItemTableFull => return,
+            error.OutOfMemory => @panic("OOM: a11y collection bind"),
+        };
+        // Stamp the owning table on nodes in a row subtree: after an AX callback commits a scroll,
+        // their frames
+        // shift by the committed offset.
+        const outer_host = self.tree.projection_collection_host;
+        self.tree.projection_collection_host = self.tree.collections.tableOf(collection_idx);
+        defer self.tree.projection_collection_host = outer_host;
+        var counter: u32 = 0;
+        for (node.children.items) |child| {
+            self.sync(child, cell, &counter, subtree_hidden, false, inside_modal, null);
+        }
+    }
+};
+
+// -- Tests --------------------------------------------------------------
 //
-// 全部用 standalone Node（element_id_raw == 0xFFFFFFFF，不挂任何 Cx/World）：
-// eid 是 projectNode 的显式参数，与 node.element_id_raw 无关，于是不需要
-// 建 Cx、建 element 表、跑 render。content/rect 落进程级 standalone fallback
-// 表（page_allocator，GPA leak check 看不见）。
-//
-// syncSubtree 的用例需要非 INVALID 的 element_id_raw（它靠该字段派生 eid），
-// 那里的建树顺序见该节头注释。
+// All use standalone Nodes (element_id_raw == 0xFFFFFFFF, not attached to any Cx/World):
+// eid is an explicit parameter of projectNode, independent of node.element_id_raw, so no Cx,
+// element table, or render is needed. content/rect land in the process-level fallback table
+// (page_allocator, invisible to the GPA leak check).
+// The syncSubtree cases need a non-INVALID element_id_raw (it derives eid from that field);
+// see that section's header comment for the tree-building order.
 
 const testing = std.testing;
 
@@ -370,8 +884,8 @@ var g_edit_ctx: u8 = 0;
 fn makeNode(tag: types.ElementTag) !*Node {
     g_next_node_id += 1;
     const n = try Node.create(testing.allocator, g_next_node_id, tag, .{});
-    // 强制 standalone：即使进程里有先前测试遗留的全局 hook，也固定走
-    // standalone content/rect 存储；同时清掉可能被复用地址上的陈旧文本。
+    // Force standalone mode: even with residual test global hooks in process, always use standalone
+    // content/rect storage; clear stale text at reused addresses.
     n.element_id_raw = 0xFFFFFFFF;
     n.world_id = node_mod.INVALID_WORLD_ID;
     n.world_ref = null;
@@ -392,8 +906,8 @@ fn makeText(content: []const u8) !*Node {
     return n;
 }
 
-/// standalone content 表按 node 指针 key、进程级存活，不清会把陈旧文本
-/// 泄给复用同一地址的后续节点，递归清掉再销毁。
+/// Standalone content table uses node pointer as key, process-level lifetime; without clearing,
+/// stale text leaks to subsequent nodes reusing same address; clear recursively before destroy.
 fn destroyTree(root: *Node) void {
     clearTextEntries(root);
     root.destroy(testing.allocator);
@@ -404,8 +918,13 @@ fn clearTextEntries(n: *Node) void {
     for (n.children.items) |c| clearTextEntries(c);
 }
 
-fn makeEid(index: u24) ElementId {
-    return .{ .index = index, .generation = 1 };
+fn makeEid(index: u24) AXId {
+    return AXId.node(.{ .index = index, .generation = 1 });
+}
+
+/// Look up A11y node by element_id_raw in test.
+fn axRaw(raw: u32) AXId {
+    return AXId.node(ElementId.fromRaw(raw));
 }
 
 fn noopHandler(_: *anyopaque) void {}
@@ -434,7 +953,7 @@ fn setEditTextValue(_: *anyopaque, _: []const u8) bool {
     return true;
 }
 
-/// 指向固定节点的焦点探针：只有那个节点「持焦」。
+/// Focus probe: only that node has focus.
 fn probeSingle(ctx: ?*const anyopaque, n: *const Node) bool {
     const target: *const Node = @ptrCast(@alignCast(ctx orelse return false));
     return target == n;
@@ -444,19 +963,19 @@ fn probeOf(target: *const Node) FocusProbe {
     return .{ .ctx = @ptrCast(target), .isFocused = probeSingle };
 }
 
-// ── 纯函数 ─────────────────────────────────────────────────────────────
+// Pure functions
 
 test "mapA11yRoleToTreeRole: 非同名映射逐一钉住" {
-    // 这些是两侧名字不同的映射，逐一断言（防止有人"顺手"改掉近似策略）
+    // Mappings with different names each side; assert each (prevent casual policy changes)
     try testing.expectEqual(a11y_tree_mod.Role.none, mapA11yRoleToTreeRole(.none, false));
-    try testing.expectEqual(a11y_tree_mod.Role.checkbox, mapA11yRoleToTreeRole(.switch_role, false));
+    try testing.expectEqual(a11y_tree_mod.Role.switch_control, mapA11yRoleToTreeRole(.switch_role, false));
     try testing.expectEqual(a11y_tree_mod.Role.tabs, mapA11yRoleToTreeRole(.tablist, false));
     try testing.expectEqual(a11y_tree_mod.Role.listitem, mapA11yRoleToTreeRole(.option, false));
     try testing.expectEqual(a11y_tree_mod.Role.grid, mapA11yRoleToTreeRole(.table, false));
     try testing.expectEqual(a11y_tree_mod.Role.cell, mapA11yRoleToTreeRole(.gridcell, false));
     try testing.expectEqual(a11y_tree_mod.Role.image, mapA11yRoleToTreeRole(.img, false));
 
-    // 同名映射抽查（全量见下一条 comptime 用例）
+    // Spot-check same-name mappings (full set in next comptime case)
     try testing.expectEqual(a11y_tree_mod.Role.button, mapA11yRoleToTreeRole(.button, false));
     try testing.expectEqual(a11y_tree_mod.Role.combobox, mapA11yRoleToTreeRole(.combobox, false));
     try testing.expectEqual(a11y_tree_mod.Role.alertdialog, mapA11yRoleToTreeRole(.alertdialog, false));
@@ -464,7 +983,7 @@ test "mapA11yRoleToTreeRole: 非同名映射逐一钉住" {
 }
 
 test "mapA11yRoleToTreeRole: 除 .none 外每个角色都落到非 .none（新增角色不得静默退化）" {
-    inline for (@typeInfo(A11yRole).@"enum".fields) |field| {
+    inline for (@import("zenit_reflection").fields(A11yRole)) |field| {
         if (!std.mem.eql(u8, field.name, "none")) {
             const role: A11yRole = @field(A11yRole, field.name);
             try testing.expect(mapA11yRoleToTreeRole(role, false) != .none);
@@ -475,9 +994,9 @@ test "mapA11yRoleToTreeRole: 除 .none 外每个角色都落到非 .none（新�
 test "mapA11yRoleToTreeRole: focusable 只影响 .none（.generic 容器化），不影响具体角色" {
     try testing.expectEqual(a11y_tree_mod.Role.none, mapA11yRoleToTreeRole(.none, false));
     try testing.expectEqual(a11y_tree_mod.Role.generic, mapA11yRoleToTreeRole(.none, true));
-    // focusable=true 不会把 button 改写成别的角色
+    // focusable=true does not rewrite button to another role
     try testing.expectEqual(a11y_tree_mod.Role.button, mapA11yRoleToTreeRole(.button, true));
-    try testing.expectEqual(a11y_tree_mod.Role.checkbox, mapA11yRoleToTreeRole(.switch_role, true));
+    try testing.expectEqual(a11y_tree_mod.Role.switch_control, mapA11yRoleToTreeRole(.switch_role, true));
 }
 
 test "parseLiveRegion: null/合法值/非法值" {
@@ -486,7 +1005,8 @@ test "parseLiveRegion: null/合法值/非法值" {
     try testing.expectEqual(a11y_tree_mod.LiveRegion.assertive, parseLiveRegion("assertive"));
     try testing.expectEqual(a11y_tree_mod.LiveRegion.off, parseLiveRegion("off"));
     try testing.expectEqual(a11y_tree_mod.LiveRegion.off, parseLiveRegion(""));
-    // 大小写敏感：ARIA 属性值由组件作者写字面量，不在这里做归一化
+    // Case-sensitive: ARIA attribute values are literals authored by components, no normalization
+    // here
     try testing.expectEqual(a11y_tree_mod.LiveRegion.off, parseLiveRegion("POLITE"));
     try testing.expectEqual(a11y_tree_mod.LiveRegion.off, parseLiveRegion("rude"));
 }
@@ -498,7 +1018,7 @@ test "stringHash: 空串哨兵 0、确定性、可区分" {
     try testing.expect(stringHash(" OK") != stringHash("OK"));
 }
 
-// ── projectNode：资格判定 / 角色 / 焦点 ────────────────────────────────
+// projectNode: qualification, role, focus
 
 test "projectNode: 无 a11y props 且不可聚焦 → false（caller 应 remove）" {
     var tree = a11y_tree_mod.AccessibilityTree.init(testing.allocator);
@@ -567,7 +1087,7 @@ test "projectNode: is_focused 直通 state.focused（未隐藏/未禁用节点�
     try testing.expect(!tree.get(makeEid(2)).?.state.focused);
 }
 
-// ── projectNode：label / live 文本解析 ─────────────────────────────────
+// projectNode: label/live text parsing
 
 test "projectNode: label 回退到子树文本，显式 label 优先" {
     var tree = a11y_tree_mod.AccessibilityTree.init(testing.allocator);
@@ -586,7 +1106,7 @@ test "projectNode: label 回退到子树文本，显式 label 优先" {
     try testing.expectEqual(stringHash("Submit"), a.label_hash);
     try testing.expectEqualStrings("Submit", labels.get(a.label_hash).?);
 
-    // 显式 label 赢过子树文本
+    // Explicit label wins over child text
     const btn2 = try makeBox();
     defer destroyTree(btn2);
     btn2.behavior.interaction.a11y = .{ .role = .button, .label = "OK" };
@@ -624,7 +1144,7 @@ test "projectNode: live 文本解析优先级 live_text > value_text > label > �
     var labels: LabelBuf = .{};
     defer labels.deinit(testing.allocator);
 
-    // live = off -> 不解析任何播报文本
+    // live = off -> no announce text parsed
     const off = try makeBox();
     defer destroyTree(off);
     off.behavior.interaction.a11y = .{ .role = .status, .live_text = "不应被采用" };
@@ -633,7 +1153,7 @@ test "projectNode: live 文本解析优先级 live_text > value_text > label > �
     try testing.expectEqual(a11y_tree_mod.LiveRegion.off, a_off.live);
     try testing.expectEqual(@as(u64, 0), a_off.live_text_hash);
 
-    // live_text 显式给 -> 直接用
+    // live_text explicit -> use directly
     const explicit = try makeBox();
     defer destroyTree(explicit);
     explicit.behavior.interaction.a11y = .{
@@ -649,14 +1169,14 @@ test "projectNode: live 文本解析优先级 live_text > value_text > label > �
     try testing.expectEqual(stringHash("Disk full"), a_exp.live_text_hash);
     try testing.expectEqualStrings("Disk full", labels.get(a_exp.live_text_hash).?);
 
-    // 无 live_text -> value_text
+    // No live_text -> value_text
     const by_value = try makeBox();
     defer destroyTree(by_value);
     by_value.behavior.interaction.a11y = .{ .role = .status, .live = "polite", .value_text = "3 files" };
     try testing.expect(projectNode(testing.allocator, &tree, &labels, by_value, makeEid(3), .NULL, 0, false, false));
     try testing.expectEqual(stringHash("3 files"), tree.get(makeEid(3)).?.live_text_hash);
 
-    // 无 live_text/value_text -> 非空 label；label 为空串则继续退到子树文本
+    // No live_text/value_text -> non-empty label; empty string label falls through to child text
     const by_label = try makeBox();
     defer destroyTree(by_label);
     by_label.behavior.interaction.a11y = .{ .role = .status, .live = "polite", .label = "Saved" };
@@ -694,11 +1214,11 @@ test "projectNode: description/placeholder/identifier/value_text 各自入旁路
     try testing.expectEqualStrings("name@example.com", labels.get(a.placeholder_hash).?);
     try testing.expectEqualStrings("login-email", labels.get(a.identifier_hash).?);
     try testing.expectEqualStrings("a@b.c", labels.get(a.text_hash).?);
-    // 空 description 的 hash 是 0，且不应写入任何空串条目
+    // Hash of empty description is 0; no empty-string entries should be written
     try testing.expect(labels.get(0) == null);
 }
 
-// ── projectNode：状态位逐字段（历史事故点，逐个钉死） ──────────────────
+// projectNode: state bits field-by-field (historical regression points, each pinned)
 
 test "projectNode: 状态位逐字段投影（2026-07-31 前曾整批硬编码 false）" {
     var tree = a11y_tree_mod.AccessibilityTree.init(testing.allocator);
@@ -730,7 +1250,7 @@ test "projectNode: 状态位逐字段投影（2026-07-31 前曾整批硬编码 f
 
     try testing.expect(projectNode(testing.allocator, &tree, &labels, n, makeEid(1), .NULL, 0, true, false));
     const a = tree.get(makeEid(1)).?;
-    // 十个曾被硬编码成 false 的位
+    // Ten bits once hardcoded false
     try testing.expect(a.state.selected);
     try testing.expect(a.state.pressed);
     try testing.expect(a.state.required);
@@ -741,16 +1261,16 @@ test "projectNode: 状态位逐字段投影（2026-07-31 前曾整批硬编码 f
     try testing.expect(a.state.haspopup);
     try testing.expect(a.state.multiline);
     try testing.expect(a.state.multiselectable);
-    // 一直存在的位
+    // Bits that always existed
     try testing.expect(a.state.disabled);
     try testing.expect(a.state.checked);
     try testing.expect(a.state.indeterminate);
     try testing.expect(a.state.expanded);
     try testing.expect(a.state.expanded_present);
     try testing.expect(a.state.secure);
-    try testing.expect(a.state.hidden); // hidden 参数（祖先传播后）直通
-    // focused 不在此断言：upsert 对 disabled/hidden 节点强制清零（tree 侧策略），
-    // 直通行为由上面的 "is_focused 直通" 用例单独钉。
+    try testing.expect(a.state.hidden); // hidden param (ancestor-propagated) passes through
+    // focused not in assertion: upsert forces zero on disabled/hidden nodes (tree side strategy);
+    // pass-through tested separately in "is_focused pass-through" case.
 }
 
 test "projectNode: 默认 props 下除 focusable/hidden 外所有状态位为 false" {
@@ -791,7 +1311,7 @@ test "projectNode: checked/expanded 的可选三态（null → false；expanded_
     var labels: LabelBuf = .{};
     defer labels.deinit(testing.allocator);
 
-    // checked = null / expanded = null：不声明 ⇒ false，且 expanded_present = false
+    // checked = null / expanded = null: undeclared => false, expanded_present = false
     const undeclared = try makeBox();
     defer destroyTree(undeclared);
     undeclared.behavior.interaction.a11y = .{ .role = .checkbox, .label = "u" };
@@ -801,9 +1321,9 @@ test "projectNode: checked/expanded 的可选三态（null → false；expanded_
     try testing.expect(!a1.state.expanded);
     try testing.expect(!a1.state.expanded_present);
 
-    // checked = false（显式未选中）/ expanded = false（显式折叠）：
-    // 值仍为 false，但「支持展开」这个事实必须能表达，expanded_present = true。
-    // 这正是叶 treeitem 与不支持展开元素的分界（tree.zig State 注释）。
+    // checked = false (explicitly unchecked) / expanded = false (explicitly collapsed):
+    // value still false, but "supports expand" fact must be expressible, expanded_present = true.
+    // This distinguishes leaf treeitem from non-expandable element (tree.zig State comment).
     const declared_false = try makeBox();
     defer destroyTree(declared_false);
     declared_false.behavior.interaction.a11y = .{
@@ -828,7 +1348,7 @@ test "projectNode: checked/expanded 的可选三态（null → false；expanded_
     try testing.expect(a3.state.expanded_present);
 }
 
-// ── projectNode：数值 / actions / editable / 元数据 ────────────────────
+// projectNode: numeric values, actions, editable, metadata
 
 test "projectNode: value_range 优先于 legacy value_now/min/max；present 与 setter 门控" {
     var tree = a11y_tree_mod.AccessibilityTree.init(testing.allocator);
@@ -836,7 +1356,7 @@ test "projectNode: value_range 优先于 legacy value_now/min/max；present 与 
     var labels: LabelBuf = .{};
     defer labels.deinit(testing.allocator);
 
-    // legacy 三字段原样透传，且任一非 0 即 present
+    // legacy three fields pass through as-is; any non-zero => present
     const legacy = try makeBox();
     defer destroyTree(legacy);
     legacy.behavior.interaction.a11y = .{
@@ -854,7 +1374,7 @@ test "projectNode: value_range 优先于 legacy value_now/min/max；present 与 
     try testing.expect(a1.numeric_value_present);
     try testing.expect(!a1.can_set_numeric_value);
 
-    // value_range 覆盖 legacy 字段
+    // value_range overrides legacy fields
     const ranged = try makeBox();
     defer destroyTree(ranged);
     ranged.behavior.interaction.a11y = .{
@@ -869,16 +1389,16 @@ test "projectNode: value_range 优先于 legacy value_now/min/max；present 与 
     try testing.expectEqual(@as(f32, 0), a2.value_min);
     try testing.expectEqual(@as(f32, 10), a2.value_max);
     try testing.expect(a2.numeric_value_present);
-    try testing.expect(!a2.can_set_numeric_value); // 无 context/set_value
+    try testing.expect(!a2.can_set_numeric_value); // No context/set_value
 
-    // 全零 + 无 range ⇒ 不 present（合法的全零区间 vs 未发布值）
+    // All-zero + no range => not present (valid zero range vs undeclared value)
     const none = try makeBox();
     defer destroyTree(none);
     none.behavior.interaction.a11y = .{ .role = .progressbar, .label = "N" };
     try testing.expect(projectNode(testing.allocator, &tree, &labels, none, makeEid(3), .NULL, 0, false, false));
     try testing.expect(!tree.get(makeEid(3)).?.numeric_value_present);
 
-    // setter + context + 未禁用/只读 -> can_set_numeric_value
+    // setter + context + not disabled/readonly -> can_set_numeric_value
     const settable = try makeBox();
     defer destroyTree(settable);
     settable.behavior.interaction.a11y = .{
@@ -895,7 +1415,7 @@ test "projectNode: value_range 优先于 legacy value_now/min/max；present 与 
     try testing.expect(projectNode(testing.allocator, &tree, &labels, settable, makeEid(4), .NULL, 0, false, false));
     try testing.expect(tree.get(makeEid(4)).?.can_set_numeric_value);
 
-    // disabled 或 readonly 关掉 setter 通道
+    // disabled or readonly shuts off setter path
     var disabled_props = settable.behavior.interaction.a11y.?;
     disabled_props.disabled = true;
     settable.behavior.interaction.a11y = disabled_props;
@@ -909,7 +1429,7 @@ test "projectNode: actions 只按「角色 × 实际可路由的回调」宣告"
     var labels: LabelBuf = .{};
     defer labels.deinit(testing.allocator);
 
-    // button + on_click -> press；button 不是 toggle 角色 -> toggle 关
+    // button + on_click -> press; button not toggle role -> toggle off
     const btn = try makeBox();
     defer destroyTree(btn);
     btn.behavior.interaction.a11y = .{ .role = .button, .label = "B" };
@@ -920,14 +1440,14 @@ test "projectNode: actions 只按「角色 × 实际可路由的回调」宣告"
     try testing.expect(!a1.actions.toggle);
     try testing.expect(!a1.actions.increment);
 
-    // 无任何事件路由的 button：不得向 AT 宣告 press
+    // button with no event route: must not declare press to AT
     const dead = try makeBox();
     defer destroyTree(dead);
     dead.behavior.interaction.a11y = .{ .role = .button, .label = "D" };
     try testing.expect(projectNode(testing.allocator, &tree, &labels, dead, makeEid(2), .NULL, 0, false, false));
     try testing.expect(!tree.get(makeEid(2)).?.actions.press);
 
-    // checkbox + on_click -> toggle；radio/menuitemcheckbox/menuitemradio 同类
+    // checkbox + on_click -> toggle; radio/menuitemcheckbox/menuitemradio similar
     const cb = try makeBox();
     defer destroyTree(cb);
     cb.behavior.interaction.a11y = .{ .role = .checkbox, .label = "C" };
@@ -945,7 +1465,7 @@ test "projectNode: actions 只按「角色 × 实际可路由的回调」宣告"
     try testing.expect(a4.actions.increment);
     try testing.expect(a4.actions.decrement);
 
-    // slider 无键路由：不得宣告 increment（AT 会发出无人接的命令）
+    // slider no key route: must not declare increment (AT sends unreceived command)
     const passive = try makeBox();
     defer destroyTree(passive);
     passive.behavior.interaction.a11y = .{ .role = .slider, .label = "P" };
@@ -954,7 +1474,7 @@ test "projectNode: actions 只按「角色 × 实际可路由的回调」宣告"
     try testing.expect(!a5.actions.increment);
     try testing.expect(!a5.actions.decrement);
 
-    // spinbutton 同为 step 角色
+    // spinbutton likewise step role
     const spin = try makeBox();
     defer destroyTree(spin);
     spin.behavior.interaction.a11y = .{ .role = .spinbutton, .label = "N" };
@@ -963,7 +1483,7 @@ test "projectNode: actions 只按「角色 × 实际可路由的回调」宣告"
     try testing.expect(tree.get(makeEid(6)).?.actions.increment);
 }
 
-test "projectNode: editable_text 选区透传，can_set_* 受 disabled/readonly 门控" {
+test "projectNode: editable_text 选区透传，只读保留选区，disabled 关闭动作" {
     var tree = a11y_tree_mod.AccessibilityTree.init(testing.allocator);
     defer tree.deinit();
     var labels: LabelBuf = .{};
@@ -974,6 +1494,7 @@ test "projectNode: editable_text 选区透传，can_set_* 受 disabled/readonly 
         .selection_start = 2,
         .selection_end = 5,
         .caret = 4,
+        .uniform_format = true,
         .visible_start = 1,
         .visible_end = 9,
         .set_selection = setSelection,
@@ -989,10 +1510,11 @@ test "projectNode: editable_text 选区透传，can_set_* 受 disabled/readonly 
     try testing.expectEqual(@as(u32, 4), e1.caret);
     try testing.expectEqual(@as(u32, 1), e1.visible_start);
     try testing.expectEqual(@as(u32, 9), e1.visible_end);
-    try testing.expect(e1.can_set_selection); // 未 disabled/readonly
-    try testing.expect(!e1.can_set_value); // 未发布 set_value
+    try testing.expect(e1.uniform_format);
+    try testing.expect(e1.can_set_selection); // Not disabled/readonly
+    try testing.expect(!e1.can_set_value); // set_value not published
 
-    // 发布 set_value -> can_set_value
+    // set_value published -> can_set_value
     const n2 = try makeBox();
     defer destroyTree(n2);
     var with_setter = editableProps;
@@ -1003,7 +1525,7 @@ test "projectNode: editable_text 选区透传，can_set_* 受 disabled/readonly 
     try testing.expect(e2.can_set_value);
     try testing.expect(e2.can_set_selection);
 
-    // disabled / readonly 关掉两个通道
+    // disabled shuts both paths; readonly only text write
     const n3 = try makeBox();
     defer destroyTree(n3);
     var disabled = editableProps;
@@ -1028,9 +1550,10 @@ test "projectNode: editable_text 选区透传，can_set_* 受 disabled/readonly 
         .readonly = true,
     };
     try testing.expect(projectNode(testing.allocator, &tree, &labels, n4, makeEid(4), .NULL, 0, false, false));
-    try testing.expect(!tree.get(makeEid(4)).?.editable_text.?.can_set_selection);
+    try testing.expect(tree.get(makeEid(4)).?.editable_text.?.can_set_selection);
+    try testing.expect(!tree.get(makeEid(4)).?.editable_text.?.can_set_value);
 
-    // 未发布 editable_text（只有 textbox 角色）-> null，平台桥必须 fail closed
+    // editable_text not published (textbox role only) -> null; platform bridge must fail closed
     const n5 = try makeBox();
     defer destroyTree(n5);
     n5.behavior.interaction.a11y = .{ .role = .textbox, .label = "T5" };
@@ -1054,14 +1577,14 @@ test "projectNode: active_descendant / 表格元数据 / orientation / frame" {
         .sort_direction = .ascending,
         .level = 3,
         .row_index = 2,
-        .row_span = 0, // 0 必须被夹到 1
+        .row_span = 0, // 0 must be clamped to 1
         .column_index = 4,
         .column_span = 0,
     };
     n.setLayoutRect(.{ .x = 10, .y = 20, .w = 30, .h = 40 });
     try testing.expect(projectNode(testing.allocator, &tree, &labels, n, makeEid(1), .NULL, 0, false, false));
     const a = tree.get(makeEid(1)).?;
-    try testing.expect(a.active_descendant.eql(ElementId.fromRaw(0x00000A05)));
+    try testing.expect(a.active_descendant.eql(axRaw(0x00000A05)));
     try testing.expectEqual(a11y_tree_mod.Orientation.horizontal, a.orientation);
     try testing.expectEqual(a11y_tree_mod.SortDirection.ascending, a.sort_direction);
     try testing.expectEqual(@as(u16, 3), a.level);
@@ -1069,14 +1592,14 @@ test "projectNode: active_descendant / 表格元数据 / orientation / frame" {
     try testing.expectEqual(@as(u32, 1), a.row_span);
     try testing.expectEqual(@as(u32, 4), a.column_index);
     try testing.expectEqual(@as(u32, 1), a.column_span);
-    // globalRect：x/y 沿祖先链累加自身 rect（无父 ⇒ 就是自身 rect）
+    // globalRect: x/y accumulate self rect via ancestor chain (no parent => own rect)
     try testing.expectEqual(@as(f32, 10), a.frame.x);
     try testing.expectEqual(@as(f32, 20), a.frame.y);
     try testing.expectEqual(@as(f32, 30), a.frame.width);
     try testing.expectEqual(@as(f32, 40), a.frame.height);
 
-    // 嵌套一层：child 的 frame x/y = 祖先累加 + 自身（globalRect 语义）。
-    // child 挂在 parent 下，销毁只走 parent 一份（递归）。
+    // One-level nesting: child frame x/y = ancestor sum + self (globalRect semantics).
+    // child reparents under parent, destroy walks parent only (recursive).
     const parent = try makeBox();
     defer destroyTree(parent);
     parent.setLayoutRect(.{ .x = 10, .y = 20, .w = 100, .h = 50 });
@@ -1091,7 +1614,26 @@ test "projectNode: active_descendant / 表格元数据 / orientation / frame" {
     try testing.expectEqual(@as(f32, 7), nested.frame.width);
     try testing.expectEqual(@as(f32, 8), nested.frame.height);
 
-    // 0xFFFFFFFF 哨兵 -> NULL（无 active descendant）
+    // Match render composition through a nonsemantic ancestor, including
+    // translation, nonuniform scale and a reflected child with a custom origin.
+    parent.style.ensureExtPanic(testing.allocator).scale_x = 2;
+    parent.style.ensureExtPanic(testing.allocator).scale_y = 3;
+    parent.style.ensureExtPanic(testing.allocator).transform_origin = types.TransformOrigin.topLeft();
+    parent.style.translate_x = 3;
+    parent.style.translate_y = 4;
+    child.style.ensureExtPanic(testing.allocator).scale_x = -0.5;
+    child.style.ensureExtPanic(testing.allocator).scale_y = 0.5;
+    child.style.ensureExtPanic(testing.allocator).transform_origin = types.TransformOrigin.topLeft();
+    child.style.translate_x = 2;
+    child.style.translate_y = 3;
+    try testing.expect(projectNode(testing.allocator, &tree, &labels, child, makeEid(3), .NULL, 0, false, false));
+    const scaled_frame = tree.get(makeEid(3)).?.frame;
+    try testing.expectEqual(@as(f32, 20), scaled_frame.x);
+    try testing.expectEqual(@as(f32, 51), scaled_frame.y);
+    try testing.expectEqual(@as(f32, 7), scaled_frame.width);
+    try testing.expectEqual(@as(f32, 12), scaled_frame.height);
+
+    // 0xFFFFFFFF sentinel -> NULL (no active descendant)
     const n2 = try makeBox();
     defer destroyTree(n2);
     n2.behavior.interaction.a11y = .{ .role = .combobox, .label = "cb" };
@@ -1099,12 +1641,12 @@ test "projectNode: active_descendant / 表格元数据 / orientation / frame" {
     try testing.expect(tree.get(makeEid(2)).?.active_descendant.isNull());
 }
 
-// ── syncSubtree：层级 / 顺序 / hidden 传播 / 陈旧清扫 ─────────────────
+// syncSubtree: hierarchy, order, hidden propagation, stale sweep
 //
-// 这些用例需要 node.element_id_raw 非 INVALID（syncSubtree 靠它派生 eid）。
-// 顺序刻意是：**先在全部 standalone（INVALID）状态下建好父子树，再统一赋
-// element_id_raw**。appendChild / markLayoutDirty 在 INVALID 时对进程级全局
-// 回调一律早退，于是这些测试不依赖「此刻 g_active_world 指向谁」。
+// These cases need non-INVALID node.element_id_raw (syncSubtree derives eid from that field).
+// Build order: **first build the full parent-child tree in all-INVALID state, then assign
+// element_id_raw uniformly**. appendChild/markLayoutDirty early-exit on INVALID before touching
+// global callbacks, so tests don't depend on the current g_active_world.
 
 test "syncSubtree: parent 是最近已投影祖先，sibling_index 只数已投影节点" {
     var tree = a11y_tree_mod.AccessibilityTree.init(testing.allocator);
@@ -1115,16 +1657,18 @@ test "syncSubtree: parent 是最近已投影祖先，sibling_index 只数已投�
     const root = try makeBox();
     defer destroyTree(root);
 
-    // 未投影的纯视觉容器（无 a11y、不可聚焦）
+    // Unprojected pure visual container (no a11y, not focusable)
     const plain = try makeBox();
 
+    // first is container role: button-class roles absorb non-interactive descendants
+    // (see childrenPresentational); test hierarchy and sibling order, not absorption.
     const first = try makeBox();
-    first.behavior.interaction.a11y = .{ .role = .button, .label = "one" };
+    first.behavior.interaction.a11y = .{ .role = .group, .label = "one" };
 
     const second = try makeBox();
     second.behavior.interaction.a11y = .{ .role = .button, .label = "two" };
 
-    // first 的子树里再套一层未投影容器 + 一个合格节点
+    // first's subtree has another unprojected layer + one qualified node
     const wrapper = try makeBox();
     const inner = try makeBox();
     inner.behavior.interaction.a11y = .{ .role = .button, .label = "inner" };
@@ -1135,7 +1679,7 @@ test "syncSubtree: parent 是最近已投影祖先，sibling_index 只数已投�
     try root.appendChild(testing.allocator, first);
     try root.appendChild(testing.allocator, second);
 
-    // 树建完再赋 element id（见本节头注释）
+    // Assign element id after tree built (see section header).
     root.element_id_raw = 0x00000001;
     plain.element_id_raw = 0x00000002;
     first.element_id_raw = 0x00000003;
@@ -1148,19 +1692,19 @@ test "syncSubtree: parent 是最近已投影祖先，sibling_index 只数已投�
     syncSubtree(testing.allocator, &tree, &labels, root, .NULL, &counter, false, .{ .isFocused = neverFocused });
 
     try testing.expectEqual(@as(usize, 4), tree.count()); // root/one/two/inner
-    const root_eid = ElementId.fromRaw(0x00000001);
-    const one_eid = ElementId.fromRaw(0x00000003);
-    const two_eid = ElementId.fromRaw(0x00000004);
-    const inner_eid = ElementId.fromRaw(0x00000006);
+    const root_eid = axRaw(0x00000001);
+    const one_eid = axRaw(0x00000003);
+    const two_eid = axRaw(0x00000004);
+    const inner_eid = axRaw(0x00000006);
 
-    try testing.expect(tree.get(ElementId.fromRaw(0x00000002)) == null); // 未投影
+    try testing.expect(tree.get(axRaw(0x00000002)) == null); // Not projected
     try testing.expect(tree.get(one_eid).?.parent.eql(root_eid));
     try testing.expect(tree.get(two_eid).?.parent.eql(root_eid));
-    // plain 不占位：one 是 0，two 是 1
+    // plain does not occupy slot: one is 0, two is 1
     try testing.expectEqual(@as(u32, 0), tree.get(one_eid).?.sibling_index);
     try testing.expectEqual(@as(u32, 1), tree.get(two_eid).?.sibling_index);
     try testing.expectEqual(@as(u32, 0), tree.get(root_eid).?.sibling_index);
-    // wrapper 未投影 -> inner 的 a11y parent 是 first，且在自己的兄弟序里从 0 起
+    // wrapper not projected -> inner's a11y parent is first, in own sibling sequence from 0
     try testing.expect(tree.get(inner_eid).?.parent.eql(one_eid));
     try testing.expectEqual(@as(u32, 0), tree.get(inner_eid).?.sibling_index);
 }
@@ -1175,7 +1719,8 @@ test "syncSubtree: 祖先 hidden 传播给整个子树（即使后代自身未�
     defer destroyTree(root);
 
     const child = try makeBox();
-    child.behavior.interaction.a11y = .{ .role = .button, .label = "B" }; // 自身未声明 hidden
+    // Container role: button absorbs non-interactive descendants; test hidden propagation.
+    child.behavior.interaction.a11y = .{ .role = .group, .label = "B" }; // Self does not declare hidden
 
     const grandchild = try makeBox();
     grandchild.behavior.interaction.a11y = .{ .role = .button, .label = "C" };
@@ -1191,11 +1736,11 @@ test "syncSubtree: 祖先 hidden 传播给整个子树（即使后代自身未�
     var counter: u32 = 0;
     syncSubtree(testing.allocator, &tree, &labels, root, .NULL, &counter, false, .{ .isFocused = neverFocused });
 
-    try testing.expect(tree.get(ElementId.fromRaw(0x00000011)).?.state.hidden);
-    try testing.expect(tree.get(ElementId.fromRaw(0x00000012)).?.state.hidden);
-    try testing.expect(tree.get(ElementId.fromRaw(0x00000013)).?.state.hidden);
+    try testing.expect(tree.get(axRaw(0x00000011)).?.state.hidden);
+    try testing.expect(tree.get(axRaw(0x00000012)).?.state.hidden);
+    try testing.expect(tree.get(axRaw(0x00000013)).?.state.hidden);
 
-    // 对照：同一棵树去掉祖先 hidden，后代不再隐藏
+    // Control: same tree without ancestor hidden, descendants not hidden
     var tree2 = a11y_tree_mod.AccessibilityTree.init(testing.allocator);
     defer tree2.deinit();
     var labels2: LabelBuf = .{};
@@ -1203,8 +1748,8 @@ test "syncSubtree: 祖先 hidden 传播给整个子树（即使后代自身未�
     var counter2: u32 = 0;
     root.behavior.interaction.a11y = .{ .role = .group, .label = "G" };
     syncSubtree(testing.allocator, &tree2, &labels2, root, .NULL, &counter2, false, .{ .isFocused = neverFocused });
-    try testing.expect(!tree2.get(ElementId.fromRaw(0x00000012)).?.state.hidden);
-    try testing.expect(!tree2.get(ElementId.fromRaw(0x00000013)).?.state.hidden);
+    try testing.expect(!tree2.get(axRaw(0x00000012)).?.state.hidden);
+    try testing.expect(!tree2.get(axRaw(0x00000013)).?.state.hidden);
 }
 
 test "syncSubtree: 不再合格的节点被 remove（陈旧条目不能留给 VoiceOver）" {
@@ -1222,13 +1767,13 @@ test "syncSubtree: 不再合格的节点被 remove（陈旧条目不能留给 Vo
     syncSubtree(testing.allocator, &tree, &labels, root, .NULL, &counter, false, .{ .isFocused = neverFocused });
     try testing.expectEqual(@as(usize, 1), tree.count());
 
-    // 节点失去 a11y props 与 focusable -> 下一次同步必须把它摘掉
+    // Node loses a11y props and focusable -> next sync must remove it
     root.behavior.interaction.a11y = null;
     root.behavior.interaction.focusable = false;
     var counter2: u32 = 0;
     syncSubtree(testing.allocator, &tree, &labels, root, .NULL, &counter2, false, .{ .isFocused = neverFocused });
     try testing.expectEqual(@as(usize, 0), tree.count());
-    try testing.expect(tree.get(ElementId.fromRaw(0x00000021)) == null);
+    try testing.expect(tree.get(axRaw(0x00000021)) == null);
 }
 
 test "syncSubtree: FocusProbe 决定 state.focused（Cx 侧只注入一次比较）" {
@@ -1257,10 +1802,146 @@ test "syncSubtree: FocusProbe 决定 state.focused（Cx 侧只注入一次比较
     var counter: u32 = 0;
     syncSubtree(testing.allocator, &tree, &labels, root, .NULL, &counter, false, probeOf(a));
 
-    try testing.expect(tree.get(ElementId.fromRaw(0x00000032)).?.state.focused);
-    try testing.expect(!tree.get(ElementId.fromRaw(0x00000033)).?.state.focused);
+    try testing.expect(tree.get(axRaw(0x00000032)).?.state.focused);
+    try testing.expect(!tree.get(axRaw(0x00000033)).?.state.focused);
 }
 
 fn neverFocused(_: ?*const anyopaque, _: *const Node) bool {
     return false;
+}
+
+// Semantic merging, static text, inferred button, sibling order
+//
+// These cases pin issues found on a real app via the external AXUIElement probe (tools/axprobe):
+//  * text nodes not projected: titles and click counts invisible to VoiceOver;
+//  * loading button had an unnamed AXProgressIndicator beneath (button did not absorb descendants);
+//  * nav item readable but not clickable (on_click exists, no semantic declared);
+//  * button matrix read by "column" (flattening layer reset sibling sequence to 0).
+// Cases needing text content live in core/tests.zig (real Cx: once a node has an element id,
+// text reads go through the process-level World hook, so results depend on prior global state).
+
+fn assignIds(nodes: []const *Node, first: u32) void {
+    for (nodes, 0..) |n, i| n.element_id_raw = first + @as(u32, @intCast(i));
+}
+
+test "syncSubtree: 多个扁平化包装层下的兄弟序连续（不再按列朗读）" {
+    var tree = a11y_tree_mod.AccessibilityTree.init(testing.allocator);
+    defer tree.deinit();
+    var labels: LabelBuf = .{};
+    defer labels.deinit(testing.allocator);
+
+    // root(group) -> row1(plain) -> [a1, a2]; row2(plain) -> [b1, b2]
+    const root = try makeBox();
+    defer destroyTree(root);
+    const row1 = try makeBox();
+    const row2 = try makeBox();
+    const a1 = try makeBox();
+    const a2 = try makeBox();
+    const b1 = try makeBox();
+    const b2 = try makeBox();
+    for ([_]*Node{ a1, a2, b1, b2 }) |n| n.behavior.interaction.a11y = .{ .role = .button, .label = "x" };
+    try row1.appendChild(testing.allocator, a1);
+    try row1.appendChild(testing.allocator, a2);
+    try row2.appendChild(testing.allocator, b1);
+    try row2.appendChild(testing.allocator, b2);
+    try root.appendChild(testing.allocator, row1);
+    try root.appendChild(testing.allocator, row2);
+    assignIds(&.{ root, row1, row2, a1, a2, b1, b2 }, 0x100);
+    root.behavior.interaction.a11y = .{ .role = .group, .label = "matrix" };
+
+    var counter: u32 = 0;
+    syncSubtree(testing.allocator, &tree, &labels, root, .NULL, &counter, false, .{ .isFocused = neverFocused });
+
+    const kids = tree.exposedChildren(axRaw(0x100));
+    try testing.expectEqual(@as(usize, 4), kids.len);
+    // Doc order: a1 a2 b1 b2. Old impl recount from 0 per wrapper layer, reordered to a1 b1 a2 b2.
+    try testing.expect(kids[0].eql(axRaw(a1.element_id_raw)));
+    try testing.expect(kids[1].eql(axRaw(a2.element_id_raw)));
+    try testing.expect(kids[2].eql(axRaw(b1.element_id_raw)));
+    try testing.expect(kids[3].eql(axRaw(b2.element_id_raw)));
+}
+
+test "contentText: 拼接可见文字、跳过隐藏与嵌套交互、截断落在 UTF-8 边界" {
+    const root = try makeBox();
+    defer destroyTree(root);
+    const first = try makeText(" 保存 ");
+    const hidden = try makeText("SECRET");
+    hidden.behavior.interaction.a11y = .{ .hidden = true };
+    const nested = try makeBox();
+    nested.behavior.interaction.a11y = .{ .role = .button, .label = "close" };
+    const nested_text = try makeText("×");
+    try nested.appendChild(testing.allocator, nested_text);
+    const second = try makeText("draft");
+    try root.appendChild(testing.allocator, first);
+    try root.appendChild(testing.allocator, hidden);
+    try root.appendChild(testing.allocator, nested);
+    try root.appendChild(testing.allocator, second);
+
+    var buf: [content_name_capacity]u8 = undefined;
+    try testing.expectEqualStrings("保存 draft", contentText(root, &buf));
+
+    // Capacity 4: fits 'bao' (3 bytes), not 'cun'; cannot cut mid-char.
+    var tiny: [4]u8 = undefined;
+    const cut = contentText(root, &tiny);
+    try testing.expect(std.unicode.utf8ValidateSlice(cut));
+    try testing.expectEqualStrings("保", cut);
+}
+
+test "LabelStore: put 复制字符串，源缓冲区之后被改写也读到投影时的值" {
+    var store: LabelStore = .{};
+    defer store.deinit(testing.allocator);
+    var source = "editing".*;
+    const h = stringHash(&source);
+    try store.put(testing.allocator, h, &source);
+    // Simulate input edit buffer modified between projections (old impl borrowed slice, AT read
+    // stale).
+    @memcpy(&source, "XXXXXXX");
+    try testing.expectEqualStrings("editing", store.get(h).?);
+
+    store.clearRetainingCapacity(testing.allocator);
+    try testing.expect(store.get(h) == null);
+    try store.put(testing.allocator, h, "again");
+    try testing.expectEqualStrings("again", store.get(h).?);
+}
+
+test "syncSubtree: 深层全部可点的嵌套里，带备忘的推断与逐层重扫结论一致" {
+    var tree = a11y_tree_mod.AccessibilityTree.init(testing.allocator);
+    defer tree.deinit();
+    var labels: LabelBuf = .{};
+    defer labels.deinit(testing.allocator);
+
+    // root(group) -> c0 -> c1 -> ... -> c39, each layer only click route, no declared semantics.
+    const depth = 40;
+    var chain: [depth]*Node = undefined;
+    const root = try makeBox();
+    defer destroyTree(root);
+    var parent = root;
+    for (&chain) |*slot| {
+        const n = try makeBox();
+        n.behavior.events.on_click = handlerRef();
+        try parent.appendChild(testing.allocator, n);
+        slot.* = n;
+        parent = n;
+    }
+    root.element_id_raw = 0x500;
+    for (chain, 0..) |n, i| n.element_id_raw = 0x501 + @as(u32, @intCast(i));
+    root.behavior.interaction.a11y = .{ .role = .group, .label = "chain" };
+
+    var counter: u32 = 0;
+    syncSubtree(testing.allocator, &tree, &labels, root, .NULL, &counter, false, .{ .isFocused = neverFocused });
+
+    // Only innermost (clean subtree) inferred as button; outer layers each have click route in
+    // subtree, not inferred.
+    for (chain[0 .. depth - 1]) |n| {
+        try testing.expect(tree.get(axRaw(n.element_id_raw)) == null);
+        try testing.expect(inferredProps(n) == null);
+    }
+    const leaf = chain[depth - 1];
+    try testing.expectEqual(a11y_tree_mod.Role.button, tree.get(axRaw(leaf.element_id_raw)).?.role);
+    try testing.expectEqual(A11yRole.button, inferredProps(leaf).?.role);
+}
+
+fn validChange(change: ?f32) ?f32 {
+    const value = change orelse return null;
+    return if (std.math.isFinite(value) and value >= 0) value else null;
 }

@@ -95,21 +95,22 @@ pub fn createSvgDocumentPathGeometry(allocator: Allocator, svg_data: []const u8,
     };
 }
 
-/// 单个 `d` 属性、以及整份 SVG 文档累计可产出的 PathCommand 条数上限。
+/// Per-`d` attribute and cumulative PathCommand limit for a single SVG document.
 ///
-/// 这两条解析路径是运行时可达的（`ui.createSvgDocumentPathGeometry` /
-/// `cx.registerTextureSvgHit`），宿主完全可能把用户粘贴、导入或网络下载来的
-/// SVG 喂进来。没有上限时，一串几十 MB 的 `M0 0 L1 1 L2 2 ...` 就能让每个
-/// 坐标对变成一条 PathCommand，造成无界内存增长（CWE-400/770 资源耗尽）。
+/// Both parse paths are runtime-reachable (`ui.createSvgDocumentPathGeometry` /
+/// `cx.registerTextureSvgHit`) and the host can feed in pasted, imported or downloaded SVG. Without
+/// a limit, a tens-of-MB string like `M0 0 L1 1 L2 2 ...` becomes one PathCommand per coordinate
+/// pair, unbounded memory growth (CWE-400/770).
 ///
-/// 取值给真实图标留了几个数量级的余量：复杂的 24×24 描边图标通常在几百条以内，
-/// 整页插画级 SVG 也远低于文档上限。命中上限说明输入已经不像是要拿来渲染的图形。
+/// The limits leave orders of magnitude of headroom for real icons (complex 24x24 stroked icons are
+/// typically under a few hundred commands). Hitting a limit means the input is not graphics worth
+/// rendering.
 pub const MAX_PATH_COMMANDS_PER_ATTR: usize = 64 * 1024;
 pub const MAX_PATH_COMMANDS_PER_DOCUMENT: usize = 256 * 1024;
 
 /// Parse a single `d="..."` attribute value into PathCommands.
 pub fn parseSvgPathCommands(allocator: Allocator, d: []const u8) ![]PathCommand {
-    var commands = std.ArrayList(PathCommand){};
+    var commands = @as(std.ArrayList(PathCommand), .empty);
     errdefer commands.deinit(allocator);
 
     var i: usize = 0;
@@ -120,8 +121,8 @@ pub fn parseSvgPathCommands(allocator: Allocator, d: []const u8) ![]PathCommand 
     var last_quad_ctrl: ?Point = null;
 
     while (true) {
-        // 单条 `d` 的产出上限。放在循环顶部是因为每轮最多再追加常数条命令，
-        // 这一个检查点就能兜住下面所有 append 分支。
+        // Per-`d` output limit. At loop top because each iteration appends only constant commands,
+        // this check stops all append branches below.
         if (commands.items.len > MAX_PATH_COMMANDS_PER_ATTR) return error.SvgPathTooComplex;
         skipNumberSeparators(d, &i);
         if (i >= d.len) break;
@@ -351,7 +352,7 @@ fn parseSvgNumber(s: []const u8, index: *usize) !f32 {
 /// Parse all `<path d="...">` elements in an SVG document into a single
 /// concatenated PathCommand slice.
 pub fn parseSvgDocumentPathCommands(allocator: Allocator, svg_data: []const u8) ![]PathCommand {
-    var all = std.ArrayList(PathCommand){};
+    var all = @as(std.ArrayList(PathCommand), .empty);
     errdefer all.deinit(allocator);
 
     var cursor: usize = 0;
@@ -365,7 +366,8 @@ pub fn parseSvgDocumentPathCommands(allocator: Allocator, svg_data: []const u8) 
 
         const commands = try parseSvgPathCommands(allocator, d_attr);
         defer allocator.free(commands);
-        // 整份文档的累计上限：单条 `d` 合规不代表几千个 <path> 拼起来也合规。
+        // Cumulative limit for entire document: single valid `d` doesn't mean thousands of <path>
+        // combined is valid.
         if (all.items.len + commands.len > MAX_PATH_COMMANDS_PER_DOCUMENT) {
             return error.SvgPathTooComplex;
         }
@@ -377,9 +379,10 @@ pub fn parseSvgDocumentPathCommands(allocator: Allocator, svg_data: []const u8) 
     return all.toOwnedSlice(allocator);
 }
 
-/// 委托 svg_geometry 的实现，它有本函数曾缺失的"前一字符必须是空白或 <"
-/// 校验。旧的等价实现只查匹配后是否为 `=`，`<path id="foo" d="M0 0">`
-/// 会把 `id` 里的 `d` 当属性名，返回 "foo" 使整个节点构建失败。
+/// Delegate to svg_geometry implementation, which has the 'previous char must be whitespace or <'
+/// check this function lacked. Old equivalent only checked if following char is `=`; `<path
+/// id="foo" d="M0 0">` would take `d` in id as property name, return "foo" and break the whole node
+/// build.
 fn findSvgAttribute(tag: []const u8, name: []const u8) ?[]const u8 {
     return @import("svg_geometry.zig").findSvgAttributeValue(tag, name);
 }
@@ -469,8 +472,8 @@ fn appendArcToCommands(
 }
 
 test "findSvgAttribute: 前置属性名含子串 d 时不误匹配" {
-    // 回归：<path id="foo" d="M0 0"> 曾匹配 id 里的 d 返回 "foo"，
-    // parseSvgPathCommands("foo") 失败中止整个节点构建
+    // Regression: <path id="foo" d="M0 0"> once matched d in id returning "foo",
+    // parseSvgPathCommands("foo") failed and stopped the entire node build.
     const tag = "path id=\"foo\" d=\"M0 0 L10 10\"";
     const d = findSvgAttribute(tag, "d");
     try std.testing.expect(d != null);
@@ -498,8 +501,8 @@ test "parseSvgPathCommands rejects non-finite coordinates" {
 test "parseSvgPathCommands 对超量命令的 d 属性设上限" {
     const alloc = std.testing.allocator;
 
-    // 每个 "L1 1" 产出一条 line_to，堆到超过单属性上限
-    var d = std.ArrayList(u8){};
+    // Each "L1 1" emits one line_to, stacking past per-attribute limit.
+    var d = @as(std.ArrayList(u8), .empty);
     defer d.deinit(alloc);
     try d.appendSlice(alloc, "M0 0");
     for (0..MAX_PATH_COMMANDS_PER_ATTR + 16) |_| {
@@ -515,14 +518,14 @@ test "parseSvgPathCommands 对超量命令的 d 属性设上限" {
 test "parseSvgDocumentPathCommands 对累计命令数设上限" {
     const alloc = std.testing.allocator;
 
-    // 单条 d 各自合规，但 <path> 数量堆上去后累计超文档上限
+    // Individual d's valid, but <path> count stacks cumulative over doc limit.
     const per_path = 4096;
-    var one_d = std.ArrayList(u8){};
+    var one_d = @as(std.ArrayList(u8), .empty);
     defer one_d.deinit(alloc);
     try one_d.appendSlice(alloc, "M0 0");
     for (0..per_path) |_| try one_d.appendSlice(alloc, "L1 1");
 
-    var doc = std.ArrayList(u8){};
+    var doc = @as(std.ArrayList(u8), .empty);
     defer doc.deinit(alloc);
     try doc.appendSlice(alloc, "<svg>");
     for (0..(MAX_PATH_COMMANDS_PER_DOCUMENT / per_path) + 2) |_| {
@@ -540,7 +543,7 @@ test "parseSvgDocumentPathCommands 对累计命令数设上限" {
 
 test "上限不影响正常图标尺度的 path" {
     const alloc = std.testing.allocator;
-    // 典型 24x24 描边图标量级，远低于上限
+    // Typical 24x24 stroked icon scale, well under limit.
     const cmds = try parseSvgDocumentPathCommands(
         alloc,
         "<svg><path d=\"M3 12h18M12 3v18\"/><path d=\"M5 5L19 19\"/></svg>",

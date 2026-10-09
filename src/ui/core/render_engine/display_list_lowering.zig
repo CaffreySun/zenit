@@ -1,14 +1,10 @@
-/// DisplayList lowering：将 DisplayItem 序列从 local space lower 到 world space。
+/// DisplayList lowering: transform the DisplayItem sequence from local space to world space.
 ///
-/// 历史：本文件之前叫 display_list_replay.zig（旧 IR 时代的命名）。
-/// v0.5 §5 Stage B 把旧 IR 删了之后，这里只剩 lowering 工作,
-/// encoder 直接消费 lowered DisplayItem，没有 "replay" 语义了，所以改名。
-///
-/// 输入和输出都是 DisplayItem (apply transform + scale 字段)。负责：
-/// - appendDisplayItemsToRenderListInternal：核心 lowering 循环（17 paint variant +
-///   8 effect/clip control passthrough）
-/// - 公开 API：appendAllDisplayItemsToRenderList / appendNodeDisplayPayloadToRenderList
-/// - 内部辅助：getNodeDisplayItems / getNodeTextBlobs / getNodeDisplayPayload
+/// Input and output are both DisplayItem (with apply transform + scale fields). Handles:
+/// - appendDisplayItemsToRenderListInternal: core lowering loop (17 paint variants +
+///   8 effect/clip control passthroughs)
+/// - public API: appendAllDisplayItemsToRenderList / appendNodeDisplayPayloadToRenderList
+/// - internal helpers: getNodeDisplayItems / getNodeTextBlobs / getNodeDisplayPayload
 const std = @import("std");
 const types = @import("../types.zig");
 const node_mod = @import("../node.zig");
@@ -37,20 +33,18 @@ const ItemHeader = display_list_mod.ItemHeader;
 
 pub const CONTROL_HEADER: ItemHeader = .{ .transform_id = INVALID_ID, .node_id = std.math.maxInt(u32) };
 
-/// 改名 + 只写 paint_table.DisplayItem。
-/// v0.5 §5 epic 时 union DisplayItem 是 source of truth，paint_table 是 mirror；
-/// 现在反过来，paint_table 是 source，union 路径已废弃。
+/// Only writes paint_table.DisplayItem (paint_table is the source; the union path is deprecated).
 ///
 /// Control variants manage scopes. Literal controls are already lowered;
-/// a node_local push_clip also carries geometry that must follow its paint transform.
+/// node_local push_clip also carries geometry that must follow its paint transform.
 fn isControlItem(item: display_list_mod.DisplayItem) bool {
-    // 单一判据：与 core.zig 的 bulk quad 归属扫描共用 DisplayItem.isControl，
-    // 两边各写一份名单迟早对不上。
+    // Single criterion: share DisplayItem.isControl with core.zig bulk quad ownership scan;
+    // separate name lists on both sides will eventually get out of sync.
     return item.isControl();
 }
 
-/// inline payload (polygon / glass / icon_rep / path geometry) spill 到 frame_arena 取稳定
-/// 地址；不能用 main_paint 内部地址，因为后续 append 可能 realloc。
+/// inline payload (polygon / glass / icon_rep / path geometry) spill to frame_arena for stable
+/// addresses; cannot use main_paint internal address since later append may realloc.
 pub fn appendLoweredBoth(cx: *RenderContext, item: display_list_mod.DisplayItem) !void {
     if (cx.capture_lowered) |sink| {
         var frozen = item;
@@ -113,34 +107,31 @@ pub fn lowerNodeClip(item: display_list_mod.DisplayItem, transform: Transform2D)
     return .{ .push_clip = clip };
 }
 
-// PT-BRACKET 文本调试子系统已拆到 bracket_debug.zig（v0.5 §5 GpuDraw epic B-3
-// 子项）；本文件聚焦 lowering 核心。
+// PT-BRACKET text debug subsystem split to bracket_debug.zig (v0.5 S5 GpuDraw epic B-3
+// sub-task); this file focuses core lowering.
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 公开类型
-// ─────────────────────────────────────────────────────────────────────────────
+// Public types
 
-// 节点 display payload 的只读取址（类型 + 三个 accessor）已析出到
-// node_display_payload.zig：那边零副作用、只读 scene_runtime 下标；
-// 本文件保留 lowering 主路径（写 buffer）。以下 re-export 保证
-// 公共 API 与既有调用点不变。
+// Node display payload read-only access (type + three accessors) extracted to
+// node_display_payload.zig: zero side effects there, read-only scene_runtime indices;
+// this file keeps main lowering path (write buffer). Following re-exports ensure
+// public API unchanged from existing call sites.
 const node_display_payload = @import("node_display_payload.zig");
 
 pub const DisplayPayloadScope = node_display_payload.DisplayPayloadScope;
 pub const TextBlobPayloadScope = node_display_payload.TextBlobPayloadScope;
 pub const NodeDisplayPayloadView = node_display_payload.NodeDisplayPayloadView;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 核心回放循环
-// ─────────────────────────────────────────────────────────────────────────────
+// Core playback loop
 
-/// item 实际要落入的 clip：CSS overflow 语义下，节点自己的 overflow clip 只裁
-/// 它的后代，不裁它自己的 shadow / background / border（`owner_content_exempt`）。
-/// header.clip_id 按「每条 item 的 id == 其 node 在 scene_runtime 里的值」的
-/// 不变式（appendCachedCommands 按 node_id 改写）恒为节点**自己的** clip，
-/// 所以 owner 的自身内容在这里退回父 clip；后代 node_id 不同，照常进本层。
-/// 修前：overflow_hidden + 阴影的节点阴影被裁成 border-box 矩形（静态卡片阴影
-/// 整圈消失；圆角外露出矩形阴影灰块）。
+/// Item's actual destination clip: under CSS overflow semantics a node's own overflow clip only
+/// clips descendants, not its own shadow/background/border (`owner_content_exempt`).
+/// header.clip_id, per the invariant "each item id == its node value in scene_runtime"
+/// (appendCachedCommands rewrites per node_id), is always the node's **own** clip, so the owner's
+/// self-content falls back to the parent clip here; descendants (different node_id) use it
+/// normally.
+/// Without this, an overflow_hidden node's shadow is clipped to its border-box rect (the static
+/// card shadow ring vanishes; rounded corners expose a rectangular gray shadow block).
 pub fn paintClipIdForItem(cx: *RenderContext, header: display_list_mod.ItemHeader) u32 {
     const clips = cx.property_tree.clips.items;
     if (header.clip_id == INVALID_ID or header.clip_id >= clips.len) return header.clip_id;
@@ -164,30 +155,28 @@ fn appendDisplayItemsToRenderListInternal(
     else
         Transform2D.identity();
 
-    // ── effect scope 前缀保留（2026-08-02，下游应用残余 bug 根治）──
-    // 相邻 group 若共享同一 effect 链前缀，scope **跨组保持打开**，只对
-    // 差异部分做关/开。早先每组整链 close+reopen：begin_blur_layer 在
-    // encoder 是"立即合成玻璃背板"，同一个 blur 岛的内容被 clip_id 切成
-    // N 组时，玻璃背板被重画 N 次、每次糊掉前面组的内容 -> 岛内只有最后
-    // 一组可见（下游应用 sidebar 只剩底栏实拍）。同时每次 reopen 都跑一遍
-    // blur capture+kawase 全链，纯浪费。
-    // open_scopes/open_ids 以 **outermost-first** 存当前打开的链。
+    // Effect scope prefix is preserved: adjacent groups sharing the same effect chain prefix keep
+    // the scope open **across groups**, only the open/close difference is emitted. Closing and
+    // reopening the full chain per group is wrong: begin_blur_layer in the encoder immediately
+    // composites the glass backdrop, so one blur island split by clip_id into N groups repaints the
+    // backdrop N times, each obscuring the previous group (only the last group is visible), and
+    // every reopen reruns the full blur capture + kawase chain.
+    // open_scopes/open_ids store the current open chain **outermost-first**.
     var open_scopes: [8]DisplayEffectBridgeScope = undefined;
     var open_ids: [8]u32 = undefined;
     var open_count: usize = 0;
-    // 不可降级：Begin 已写进流，End 不写就是不配对 scope。defer 无法传播
-    // 错误 -> panic（与旧实现同策略）。
+    // Not downgradeable: Begin already in stream, no End = unclosed scope. defer can't propagate
+    // error -> panic (same strategy as old).
     defer if (include_structure and open_count > 0) {
         effect_bridge.appendDisplayEffectBridgeEnd(cx, open_scopes[0..open_count]) catch @panic("OOM: display effect bridge end (unbalanced scope)");
     };
 
-    // ── clip 前缀保留（与上面 effect scope 同构）──
-    // 主循环按 (effect_id, clip_id) 分组，虚拟列表每行一个 clip_id。旧实现
-    // 每组重发整条祖先链 -> 所有行共享的最外层（岛的圆角 clip）被逐行
-    // push/pop。实测 git diff 滚动 15 万次往返，每次都触发 flushAllPending
-    // （清空全部 pipeline + 吃一个 SDF uniform 槽），256 槽一帧内耗尽后
-    // 后续命令整批丢失（动作栏闪没），encode 也涨到 10-17ms。
-    // 这里让公共前缀跨组保持打开，只关/开差异部分。
+    // Clip prefix preserved across groups (same structure as the effect scope above).
+    // Main loop groups by (effect_id, clip_id); a virtual list has one clip_id per row. Resending
+    // the full ancestor chain per group pushes/pops the shared outermost clip (island corner) 150k
+    // times per scroll; each triggers flushAllPending (consumes an SDF uniform slot), 256 slots run
+    // out
+    // mid-frame, later commands are lost and encode jumps to 10-17ms. Only differences close/open.
     var open_clip_ids: [8]u32 = undefined;
     var open_clip_count: usize = 0;
     defer if (include_structure and open_clip_count > 0) {
@@ -207,34 +196,36 @@ fn appendDisplayItemsToRenderListInternal(
         }
 
         var chain_len: usize = 0;
-        // clip 的坐标投影依赖当前最内层 effect；effect scope 一旦变动，
-        // 已打开的 clip 前缀就不能再沿用（见下面 clip 前缀保留处的说明）。
+        // Clip coordinate projection depends on current innermost effect; effect scope change means
+        // already-open clip prefix no longer usable
+        // (see clip prefix preservation note below).
         var effect_scope_changed = false;
         if (include_structure) {
             var chain: [8]node_state.EffectBridgeEntry = undefined;
             const count = effect_bridge.collectEffectBridgeChain(cx, active_parent_effect_id, header.effect_id, &chain);
             chain_len = count;
-            // chain 是 innermost-first；求 outermost-first 的公共前缀
+            // chain is innermost-first; compute outermost-first common prefix
             var common: usize = 0;
             while (common < open_count and common < count and
                 open_ids[common] == chain[count - 1 - common].effect_id) common += 1;
-            // clip 前缀必须在 effect scope 的任何 Begin/End **之前**收拢：
-            // encoder 对 begin..end 范围要么整段跳过（GPU retained 命中），
-            // 要么在 end 恢复 begin 时的 clip 栈快照，pop 一旦落进新开的
-            // scope 里（或留到旧 scope 关闭之后），关的就是范围外的 push，
-            // 那几层 clip 永久泄漏。栈顶残留 tab 条 clip 时，该帧其后所有
-            // 内容被裁进 tab 条（编辑/hover 动画帧整屏闪白的根因）。
+            // Clip prefix must close before any Begin/End of effect scope: encoder either skips
+            // full begin..end range (GPU retained hit), or
+            // restores clip stack snapshot at begin time, both paths assume self-consistent clip.
+            // If cross-group-preserved prefix ends in new-opened
+            // scope (or left after old scope close), those clip layers permanently leak: tab clip
+            // lingering on stack causes all subsequent frame
+            // content clipped into tab (edit/hover frame full screen flash white root cause).
             if ((open_count > common or open_count < count) and open_clip_count > 0) {
                 try effect_bridge.appendDisplayClipBridgeEnd(cx, open_clip_count);
                 open_clip_count = 0;
             }
-            // 关闭不再需要的内层（innermost-first）
+            // Close no-longer-needed inner (innermost-first)
             if (open_count > common) {
                 effect_scope_changed = true;
                 try effect_bridge.appendDisplayEffectBridgeEnd(cx, open_scopes[common..open_count]);
                 open_count = common;
             }
-            // 打开缺失的（outermost -> innermost）
+            // Open missing (outermost -> innermost)
             while (open_count < count) {
                 effect_scope_changed = true;
                 const entry = chain[count - 1 - open_count];
@@ -243,22 +234,26 @@ fn appendDisplayItemsToRenderListInternal(
                 open_count += 1;
             }
         }
-        // ⚠ effect 链非空(毛玻璃岛内)时 clip 链**默认仍不发射**，曾尝试
-        // 发射(scroll 容器 clip)修"岛内容器不裁"的架构缺口,但投影帧
-        // 有未解问题:滚动条 thumb(容器 absolute 子)被裁到不可见,而行
-        // 内容正常，同域两类 item 一裁一不裁,说明 clip 投影与部分 item
-        // 的坐标帧不一致,修好前不能开。行溢出裁剪由渲染树侧的
-        // emitScrollClipBegin/End(children 包围,mod.zig)承担，实测
-        // 独立生效(首末行半行裁剪 ✓ 滚动条 ✓ 搜索框 ✓)。
-        // 显式设 ZENIT_ENABLE_EFFECT_CLIP_BRIDGE=1 可开启用于继续调查。
+        // WARNING: with a non-empty effect chain (blur island interior) the clip chain is **not
+        // emitted** by
+        // default. Emitting it (scroll container clip) targets the "island interior container not
+        // clipped"
+        // gap, but the projection frame is unresolved: the scrollbar thumb (container absolute
+        // child) is
+        // clipped invisible while row content is fine, i.e. clip projection and an item coordinate
+        // frame
+        // mismatch. Row overflow clip is handled by emitScrollClipBegin/End (children envelope,
+        // mod.zig).
+        // Set ZENIT_ENABLE_EFFECT_CLIP_BRIDGE=1 explicitly to continue investigation.
         const innermost_effect_for_clip: u32 =
             if (open_count > 0) open_ids[open_count - 1] else active_parent_effect_id;
-        const emit_in_effect = std.posix.getenv("ZENIT_ENABLE_EFFECT_CLIP_BRIDGE") != null;
+        const emit_in_effect = @import("zenit_environment").has("ZENIT_ENABLE_EFFECT_CLIP_BRIDGE");
         const want_clip = include_structure and (chain_len == 0 or emit_in_effect);
 
-        // effect scope 变化时，clip 必须整条重开：clip 的坐标是相对
-        // `innermost_effect_for_clip` 投影的（见 appendDisplayClipBridgeBeginSuffix
-        // 里的 active_parent_inverse），换了 effect 帧就不能再沿用旧的 push。
+        // On effect scope change clip must fully reopen: clip coordinates relative to
+        // `innermost_effect_for_clip` projection (see
+        // appendDisplayClipBridgeBeginSuffix active_parent_inverse), changing effect frame can't
+        // reuse old push.
         if (effect_scope_changed and open_clip_count > 0) {
             try effect_bridge.appendDisplayClipBridgeEnd(cx, open_clip_count);
             open_clip_count = 0;
@@ -267,7 +262,7 @@ fn appendDisplayItemsToRenderListInternal(
         if (want_clip) {
             var clip_chain: [8]u32 = undefined;
             const clip_len = effect_bridge.collectDisplayClipChainPublic(cx, group_clip_id, &clip_chain);
-            // chain 是 innermost-first；按 outermost-first 求公共前缀。
+            // chain is innermost-first; compute outermost-first common prefix.
             var common: usize = 0;
             while (common < open_clip_count and common < clip_len and
                 open_clip_ids[common] == clip_chain[clip_len - 1 - common]) common += 1;
@@ -283,8 +278,8 @@ fn appendDisplayItemsToRenderListInternal(
                     chain_len != 0,
                     common,
                 );
-                // only_scroll 过滤可能让实际发射数少于链长；按实际发射数记账，
-                // 否则 End 的条数会和 Begin 对不上。
+                // only_scroll filter may emit fewer than chain length; account by actual emit
+                // count, else End count won't match Begin.
                 var k: usize = 0;
                 while (k < emitted and open_clip_count < open_clip_ids.len) : (k += 1) {
                     open_clip_ids[open_clip_count] = clip_chain[clip_len - 1 - common - k];
@@ -299,23 +294,25 @@ fn appendDisplayItemsToRenderListInternal(
         for (slice[i..group_end]) |item| {
             const item_header = item.header();
 
-            // Literal controls are already lowered and may have INVALID transform IDs.
-            // Node-local clips must instead reach the same transform path as paint items.
-            //
-            // 历史 bug（2026-07-29 修）：display_list 里由 custom_draw 直接 emit 的
-            // begin/end_opacity_layer（如 Snapshot.appendTo 用来施加 anchor/scale/
-            // opacity 的包裹层）带的正是 CONTROL header，于是在这里被 `continue`
-            // 静默丢弃，包裹层没了，snapshot 恒绘制在 local (0,0) 而非 anchor。
-            // effect_bridge 那条路径没踩到是因为它走 appendLoweredBoth 直接写
-            // paint 列表，绕过了本函数。
+            // Literal controls are already lowered, may have INVALID transform IDs. Node-local
+            // clips must reach
+            // the same transform path as paint items. Control-header items (e.g.
+            // begin/end_opacity_layer from
+            // custom_draw, Snapshot.appendTo wrapping for anchor/scale/opacity) must not be
+            // silently discarded
+            // here, else the wrapping is lost and the snapshot paints at local (0,0), not its
+            // anchor. The
+            // effect_bridge path is unaffected: it uses appendLoweredBoth and writes the paint list
+            // directly.
             if (item_header.already_lowered or (isControlItem(item) and !(item == .push_clip and item.push_clip.node_local))) {
-                // 桥接 clip 前缀不得跨越 layer 边界 token：encoder 对
-                // begin..end 范围要么整段跳过（GPU retained 命中），要么在 end
-                // 恢复 begin 时的 clip 栈快照，两条路径都假设范围内 clip
-                // 自洽。若跨组保留的前缀在范围内被 End（pop 关到范围外的
-                // push），那几层 clip 就永久泄漏：栈顶残留 tab 条 clip 时，
-                // 该帧其后所有内容被裁进 tab 条（编辑/hover 动画帧整屏闪白
-                // 的根因）。遇到边界先收拢，透传后按当前组重开。
+                // Clip prefix bridge can't cross layer boundary token: encoder either skips full
+                // begin..end range (GPU retained hit), or restores clip
+                // stack snapshot at begin, both paths assume self-consistent clip. If
+                // cross-group-preserved prefix ends in range (pop closes range-external
+                // push), those clip layers permanently leak: tab clip lingering on stack causes all
+                // subsequent frame content clipped into tab
+                // (edit/hover frame full screen flash white root cause). Hit boundary, close first,
+                // defer after current group reopen.
                 const is_layer_boundary = switch (item) {
                     .begin_opacity_layer,
                     .end_opacity_layer,
@@ -353,10 +350,13 @@ fn appendDisplayItemsToRenderListInternal(
             }
 
             if (item_header.transform_id >= cx.property_tree.transforms.items.len) continue;
-            // Stage B S5.2: 当 replay_exec_state != null (subtree replay)，用 inverse_replay_base
-            // * world, paint pass 主路径走这里。replay_exec_state == null (derive 路径) 用
-            // transform.content (含 surface_inverse * world)，与 subtree replay 的 inverse 应用等价。
-            // 注：P6.3 后所有 overlay（modal + non_modal）统一走 composited_group surface。
+            // Stage B S5.2: when replay_exec_state != null (subtree replay), use
+            // inverse_replay_base
+            // world + paint main path; replay_exec_state == null (derive path) uses
+            // transform.content (includes surface_inverse * world), equivalent to subtree replay's
+            // inverse.
+            // Note: after P6.3 all overlays (modal + non_modal) use unified composited_group
+            // surface.
             const world = cx.property_tree.transforms.items[item_header.transform_id].world;
             const content = cx.property_tree.transforms.items[item_header.transform_id].content;
             const item_transform = if (replay_exec_state != null)
@@ -365,9 +365,9 @@ fn appendDisplayItemsToRenderListInternal(
                 content;
             const scale = item_transform.extractApproxScale();
 
-            // lowering 写 DisplayItem (lower 后字段)。header 沿用 item.header (含
-            // transform_id/clip_id/effect_id)，但 paint variant 的 x/y/w/h 已 lower 到
-            // world coord, encoder 不再二次变换。
+            // lowering writes DisplayItem (lower-ed fields). header reuses item.header (includes
+            // transform_id/clip_id/effect_id), but paint variant's x/y/w/h already lower-ed to
+            // world coord, encoder no longer transforms twice.
             const lowered_header = item_header;
             switch (item) {
                 .fill_rect => |it| {
@@ -381,8 +381,9 @@ fn appendDisplayItemsToRenderListInternal(
                             .h = rect.h,
                             .color = it.color,
                             .radius = scaleLocalRadii(it.radius, scale),
-                            // ⚠ 逐字段重建的 lowering：**新字段必须手动补**，
-                            // 漏掉不会报错，只会静默丢值（椭圆退回圆角矩形）。
+                            // WARNING: field-by-field reconstruction lowering: **new fields must be
+                            // manually added**,
+                            // missing field silently loses value (ellipse reverts to rounded rect).
                             .shape = it.shape,
                         },
                     });
@@ -460,7 +461,8 @@ fn appendDisplayItemsToRenderListInternal(
                             .to = it.to,
                             .direction = it.direction,
                             .radius = scaleLocalRadii(it.radius, scale),
-                            // 同 multi_gradient_rect：逐字段重建，漏一个静默丢。
+                            // Like multi_gradient_rect: field-by-field reconstruction, miss one
+                            // silently loses.
                             .radial_center_x = it.radial_center_x,
                             .radial_center_y = it.radial_center_y,
                             .conic_start_angle = it.conic_start_angle,
@@ -558,15 +560,20 @@ fn appendDisplayItemsToRenderListInternal(
                             .use_monospace_font = it.use_monospace_font,
                             .monospace_char_width = it.monospace_char_width * scale,
                             .use_italic_font = it.use_italic_font,
+                            .font_smoothing = it.font_smoothing,
                             .spans = it.spans,
                             .blob_id = it.blob_id,
                             .blob_content_hash = it.blob_content_hash,
-                            // blob_id 必须与它的 content_hash **成对**透传。
-                            // blob_id 是帧内序号，store 每帧 clear 后重新分配；
-                            // resolveTextRunContent 靠 blob_content_hash 才能识破
-                            // "这个序号已经易主"。漏传 = 恒为 0 = 身份校验被
-                            // `run.blob_content_hash == 0` 短路成永真，于是 re-lower
-                            // 出来的 item 拿旧序号去切**本帧别的 blob** 的字节。
+                            // blob_id must be transmitted together with its content_hash. blob_id
+                            // is a frame-local sequence
+                            // number (store clears and reallocates each frame);
+                            // resolveTextRunContent uses blob_content_hash
+                            // to detect "this sequence number changed owner". If it's never
+                            // transmitted it stays 0, the identity
+                            // check short-circuits to an always-true `run.blob_content_hash == 0`,
+                            // and a re-lowered item takes the
+                            // old sequence number and slices **another blob** in this frame's
+                            // bytes.
                             .raster_policy = it.raster_policy,
                             .fade_dx0 = it.fade_dx0 * scale,
                             .fade_dx1 = it.fade_dx1 * scale,
@@ -604,6 +611,7 @@ fn appendDisplayItemsToRenderListInternal(
                             .tint = it.tint,
                             .corner_clip_radius = it.corner_clip_radius * scale,
                             .opacity = it.opacity,
+                            .snap = it.snap,
                         },
                     });
                 },
@@ -636,9 +644,12 @@ fn appendDisplayItemsToRenderListInternal(
                             .stop_colors = it.stop_colors,
                             .stop_positions = it.stop_positions,
                             .stop_count = it.stop_count,
-                            // ⚠ 逐字段重建：漏一个就静默丢。下面四个原本**都漏了**,
-                            // shape 丢了让椭圆的渐变铺满包围盒；radial/conic 的中心与
-                            // 起始角、extend_mode 丢了让径向/角度渐变回落到默认参数。
+                            // WARNING: field-by-field reconstruction: miss one field silently
+                            // loses. The next four originally
+                            // **all missed**: shape missed made ellipse gradient fill bounding box;
+                            // radial/conic center and
+                            // start angle, extend_mode missed made radial/conic gradient fall back
+                            // to default params.
                             .radial_center_x = it.radial_center_x,
                             .radial_center_y = it.radial_center_y,
                             .radial_radius_x = it.radial_radius_x,
@@ -717,7 +728,8 @@ fn appendDisplayItemsToRenderListInternal(
                             .offset_x = origin.x,
                             .offset_y = origin.y,
                             .opacity = it.opacity,
-                            // ⚠ 逐字段重建：渐变漏了会让多边形填充退回纯色。
+                            // WARNING: field-by-field reconstruction: gradient missing makes
+                            // polygon fill revert to solid.
                             .gradient_direction = it.gradient_direction,
                             .gradient_stop_colors = it.gradient_stop_colors,
                             .gradient_stop_positions = it.gradient_stop_positions,
@@ -743,7 +755,7 @@ fn appendDisplayItemsToRenderListInternal(
                         },
                     });
                 },
-                // Stage B R3f: effect/clip 字面 token 1:1 passthrough (字段已 lower)
+                // Stage B R3f: effect/clip literal tokens 1:1 passthrough (fields already lower-ed)
                 .push_clip => try appendLoweredBoth(cx, lowerNodeClip(item, item_transform)),
                 .pop_clip => |it| try appendLoweredBoth(cx, .{ .pop_clip = it }),
                 .begin_opacity_layer => |it| try appendLoweredBoth(cx, .{ .begin_opacity_layer = it }),
@@ -758,17 +770,15 @@ fn appendDisplayItemsToRenderListInternal(
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 公开 API
-// ─────────────────────────────────────────────────────────────────────────────
+// Public API
 
 pub const getNodeDisplayItems = node_display_payload.getNodeDisplayItems;
 pub const getNodeTextBlobs = node_display_payload.getNodeTextBlobs;
 pub const getNodeDisplayPayload = node_display_payload.getNodeDisplayPayload;
 
-/// Stage B R3f: 把整个 cx.display_list lower 到 cx.lowering.main (世界坐标 +
-/// 字段 lower 后的 DisplayItem 流) 供 encoder 消费。当前是 cx.render() 末尾
-/// 唯一的翻译入口。
+/// Stage B R3f: lower entire cx.display_list to cx.lowering.main (world coordinate +
+/// lower-ed field DisplayItem stream) for encoder consumption. Currently only translation
+/// entry at end of cx.render().
 /// Freeze a displayed subtree without opening its ancestor effect scopes.
 pub fn appendSnapshotDisplayItems(cx: *RenderContext, start: usize, end: usize, parent_effect_id: u32) !void {
     try appendDisplayItemsToRenderListInternal(cx, start, end, true, parent_effect_id, null, null);

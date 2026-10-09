@@ -8,11 +8,12 @@ pub const GlyphBitmap = struct {
     bearing_x: i32,
     bearing_y: i32,
     advance: i32,
-    /// true = pixels 是 BGRA premultiplied（4 字节/像素，彩色字形）；
-    /// false = 单通道覆盖率掩码（1 字节/像素）。
+    /// true = pixels are BGRA premultiplied (4 bytes/pixel, color glyphs);
+    /// false = single-channel coverage mask (1 byte/pixel).
     is_color: bool = false,
 
-    /// 每像素字节数，由 is_color 唯一决定。上传纹理时算 bytes_per_row 用。
+    /// Bytes per pixel, determined solely by is_color. Used to calculate bytes_per_row when
+    /// uploading texture.
     pub fn bytesPerPixel(self: GlyphBitmap) u32 {
         return if (self.is_color) 4 else 1;
     }
@@ -32,8 +33,8 @@ pub const ShapedGlyph = struct {
     y_offset: f32,
     is_synthetic_italic: bool = false, // true if glyph needs synthetic italic skew at render time
     is_fallback_font: bool = false, // true if glyph uses a fallback font (e.g. CJK)
-    /// CoreText 实际选用的 fallback 字体 CTFontRef（retained）。
-    /// 渲染时用此字体光栅化，而非固定的 CJK fallback。
+    /// CoreText actually selected fallback font CTFontRef (retained).
+    /// Rasterize with this font at render time, not fixed CJK fallback.
     fallback_font_ref: ?*anyopaque = null,
 };
 

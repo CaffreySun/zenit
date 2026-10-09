@@ -1,11 +1,8 @@
-//! popover_test.zig, Popover / overlay 定位与生命周期单测
+//! popover_test.zig: Popover/overlay positioning and lifecycle unit tests.
 //!
-//! 从 popover.zig 析出（2026-07-31）。测试占原文件 961 行（42%），
-//! 与实现同文件除了撑大文件没有别的作用。
-//!
-//! ⚠ 必须在 components/mod.zig 或上游有显式 `_ = @import(...)` 才会被
-//! test runner 收集，Zig 的 refAllDecls 只递归本文件引用过的模块。
-//! 析出后已用"故意反转断言"验证过测试确实仍在跑。
+//! Split out of popover.zig to keep it implementation-only. Needs an explicit
+//! `_ = @import(...)` in components/mod.zig or upstream for the test runner to collect
+//! it; Zig's refAllDecls only recurses modules referenced in this file.
 
 const std = @import("std");
 const core = @import("../../core.zig");
@@ -28,10 +25,10 @@ const transformOriginForPlacement = popover_mod.transformOriginForPlacement;
 const popoverBeforeRender = popover_mod.popoverBeforeRender;
 const HIDDEN_OPACITY: f32 = 0.001;
 
-// ========== 测试 ==========
+// ========== Tests ==========
 
 test "Popover: basic structure" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
@@ -48,7 +45,7 @@ test "Popover: basic structure" {
     try std.testing.expectEqual(@as(usize, 1), result.wrapper.children.items.len);
     try std.testing.expect(result.content.parent == null);
 
-    // 初始隐藏
+    // Initially hidden
     try std.testing.expectEqual(core.Sizing{ .px = 0 }, result.content.style.width);
     // Default placement is .bottom_start -> transform_origin = (0%, 0%) -> (0, 0).
     const origin = result.content.style.transform_origin().resolve(200, 100);
@@ -57,7 +54,7 @@ test "Popover: basic structure" {
 }
 
 test "Popover: every trigger mode keeps floating content in the window portal" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{
@@ -127,8 +124,9 @@ test "Popover: transform origin tracks placement" {
 }
 
 test "Popover: virtual anchor returns dynamic rect" {
-    // 验证 PopoverPositionCtx.anchorRect() 在三种 effective_anchor 模式下都返回正确 rect
-    var ctx = try Cx.init(std.testing.allocator);
+    // Verify PopoverPositionCtx.anchorRect() returns correct rect under all three effective_anchor
+    // modes
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     const root = try box(ctx, .{}, .{});
     ctx.root = root;
@@ -149,7 +147,7 @@ test "Popover: virtual anchor returns dynamic rect" {
             .scope = scope,
             .trigger_node = trigger,
             .effective_anchor = .self_trigger,
-            .is_open = open,
+            .is_open = .{ .signal = open },
             .layer_handle = .{ .id = 0, .z_index = 0 },
             .pos = .bottom_start,
             .offset = .{ .static = 0 },
@@ -194,7 +192,7 @@ test "Popover: virtual anchor returns dynamic rect" {
             .scope = scope,
             .trigger_node = trigger,
             .effective_anchor = .{ .virtual = .{ .ctx = @ptrCast(&dummy), .getRect = StateVirt.cb } },
-            .is_open = open,
+            .is_open = .{ .signal = open },
             .layer_handle = .{ .id = 0, .z_index = 0 },
             .pos = .bottom_start,
             .offset = .{ .static = 0 },
@@ -216,13 +214,13 @@ test "Popover: virtual anchor returns dynamic rect" {
             .enter_transition = .none,
             .exit_transition = .none,
         };
-        // 第一次读
+        // First read
         const r1 = pctx.anchorRect();
         try std.testing.expectEqual(@as(f32, 200), r1.x);
         try std.testing.expectEqual(@as(f32, 300), r1.y);
         try std.testing.expectEqual(@as(f32, 18), r1.h);
 
-        // 移动锚点 -> 第二次读返回新值（"reactive" 锚点的关键能力）
+        // Move anchor -> second read returns new value (key reactive anchor capability)
         StateVirt.x = 400;
         StateVirt.y = 500;
         const r2 = pctx.anchorRect();
@@ -232,7 +230,7 @@ test "Popover: virtual anchor returns dynamic rect" {
 }
 
 test "Popover: mount with virtual anchor stores effective_anchor correctly" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     const root = try box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
     ctx.root = root;
@@ -247,11 +245,11 @@ test "Popover: mount with virtual anchor stores effective_anchor correctly" {
     var dummy: u32 = 0;
     const result = try Popover(.{
         .trigger = .manual,
-        .anchor = .{ .virtual = .{ .ctx = @ptrCast(&dummy), .getRect = VAnchor.cb } },
+        .anchor = popover_mod.Anchor{ .virtual = .{ .ctx = @ptrCast(&dummy), .getRect = VAnchor.cb } },
     }).mount(scope, ctx);
     try root.appendChild(std.testing.allocator, result.wrapper);
 
-    // 拿出 position_ctx 验证 effective_anchor 是 virtual
+    // Extract position_ctx and verify effective_anchor is virtual
     const pctx: *PopoverPositionCtx = @ptrCast(@alignCast(result.content.meta.per_frame.hooks.slots.anim_state.?));
     try std.testing.expect(pctx.effective_anchor == .virtual);
     const r = pctx.anchorRect();
@@ -260,7 +258,7 @@ test "Popover: mount with virtual anchor stores effective_anchor correctly" {
 }
 
 test "Popover: toggle open/close" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
@@ -273,18 +271,18 @@ test "Popover: toggle open/close" {
     try root.appendChild(std.testing.allocator, result.wrapper);
     try std.testing.expect(result.content.parent == null);
 
-    // 打开
-    result.is_open.set(true);
-    try std.testing.expect(result.is_open.peek());
+    // Open
+    result.open.?.set(true);
+    try std.testing.expect(result.open.?.peek());
     try std.testing.expect(result.content.parent == ctx.popover_portal_root.?);
 
-    // 关闭
-    result.is_open.set(false);
-    try std.testing.expect(!result.is_open.peek());
+    // Close
+    result.open.?.set(false);
+    try std.testing.expect(!result.open.?.peek());
 }
 
 test "Popover: hidden content detaches from window portal after close commits" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
@@ -302,7 +300,7 @@ test "Popover: hidden content detaches from window portal after close commits" {
     try std.testing.expectEqual(@as(usize, 1), result.wrapper.children.items.len);
     try std.testing.expect(result.content.parent == null);
 
-    result.is_open.set(true);
+    result.open.?.set(true);
     try std.testing.expectEqual(@as(usize, 1), result.wrapper.children.items.len);
     try std.testing.expect(result.content.parent == ctx.popover_portal_root.?);
 
@@ -310,7 +308,7 @@ test "Popover: hidden content detaches from window portal after close commits" {
     position_ctx.entry_ready = true;
     position_ctx.is_visible = true;
 
-    result.is_open.set(false);
+    result.open.?.set(false);
     popoverBeforeRender(result.content);
 
     try std.testing.expectEqual(@as(usize, 1), result.wrapper.children.items.len);
@@ -320,7 +318,7 @@ test "Popover: hidden content detaches from window portal after close commits" {
 }
 
 test "Popover: reopening during the exit transition cancels the pending close" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
@@ -335,8 +333,8 @@ test "Popover: reopening during the exit transition cancels the pending close" {
     }).mount(scope, ctx);
     try root.appendChild(std.testing.allocator, result.wrapper);
 
-    result.is_open.set(true);
-    result.is_open.set(false);
+    result.open.?.set(true);
+    result.open.?.set(false);
     var layer_ptr: ?*overlay_stack_mod.OverlayLayer = null;
     for (&ctx.overlay_stack.layers) |*slot| {
         if (slot.*) |*l| layer_ptr = l;
@@ -346,7 +344,7 @@ test "Popover: reopening during the exit transition cancels the pending close" {
     try std.testing.expectEqual(overlay_stack_mod.LayerState.exiting, layer.state);
 
     // Reopen before the fade-out finishes (completion list re-shown on `.`).
-    result.is_open.set(true);
+    result.open.?.set(true);
     try std.testing.expect(layer.state != .exiting);
 
     // Play well past the fade: the old exit must not commit and close it.
@@ -356,12 +354,12 @@ test "Popover: reopening during the exit transition cancels the pending close" {
         t += 16;
         _ = ctx.overlay_stack.tick(t, 0.016, 400, 300, std.testing.allocator);
     }
-    try std.testing.expect(result.is_open.peek());
+    try std.testing.expect(result.open.?.peek());
     try std.testing.expect(!layer.suspended);
 }
 
 test "Popover: external visible signal" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
@@ -371,17 +369,17 @@ test "Popover: external visible signal" {
     defer scope.dispose();
 
     const vis = try scope.createSignal(bool, false);
-    const result = try Popover(.{}).visible(vis).mount(scope, ctx);
+    const result = try Popover(.{ .open = vis }).mount(scope, ctx);
     try root.appendChild(std.testing.allocator, result.wrapper);
 
-    // 外部控制
-    try std.testing.expect(result.is_open == vis);
+    // External control
+    try std.testing.expect(result.open.? == vis);
     vis.set(true);
     try std.testing.expect(vis.peek());
 }
 
 test "Popover: hover trigger" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
@@ -393,45 +391,35 @@ test "Popover: hover trigger" {
     const result = try Popover(.{ .trigger = .hover }).mount(scope, ctx);
     try root.appendChild(std.testing.allocator, result.wrapper);
 
-    // hover 触发
+    // Hover trigger
     try std.testing.expect(result.wrapper.behavior.events.on_hover != null);
     try std.testing.expect(result.wrapper.behavior.events.on_leave != null);
 
     result.wrapper.behavior.events.on_hover.?.invoke();
-    try std.testing.expect(result.is_open.peek());
+    try std.testing.expect(result.open.?.peek());
 
     result.wrapper.behavior.events.on_leave.?.invoke();
-    try std.testing.expect(!result.is_open.peek());
+    try std.testing.expect(!result.open.?.peek());
 }
 
 test "Popover: before_render preserves overlay-managed opacity and scale" {
-    // 曾 QUARANTINE。原注释的诊断方向是对的（"测试用 stub 绕过了
-    // OverlayStack.push 所以 signal 缺失，需要更真实的 fixture"），
-    // 但结论"需要教 popoverBeforeRender 去检测 manual_*_animation_active"
-    // 是多余的，该逻辑**已经存在**（:791-796 的 overlay_visual_in_progress
-    // 就是读这两个 flag + opacity/scale 中间态）。
+    // Overlay-aware before_render must not reset opacity to HIDDEN_OPACITY (the
+    // overlay_visual_in_progress logic already reads flags + opacity/scale midstate).
     //
-    // 真正的问题全在 fixture 和断言上，四处：
-    //   1. `.layer_handle = .{ .id = 0, .z_index = 0 }` 是**伪造句柄**，
-    //      findLayer 查不到对应 layer，走不进 overlay 管理路径。
-    //      -> 改用真实的 ctx.overlay_stack.push() 返回值并绑定 content_node。
-    //   2. 用了已删除的 `node.rect = …` 和 `node.hooks`（rect 已 SoA 化到
-    //      World，hook 槽位挪到 meta.per_frame.hooks）。这测试**从写下起
-    //      就编译不过**，被 `if (true) return` 挡住才没暴露。
-    //      -> 改用 setLayoutRect / meta.per_frame.hooks.slots。
-    //   3. 手工建的节点默认带 layout dirty，会走 "pause unstable-layout"
-    //      分支，那条路径**本来就该**把 opacity 压到 HIDDEN_OPACITY。
-    //      -> 先清 dirty，才测得到"布局已稳定"的目标场景。
-    //   4. **原断言本身与设计冲突**：它要求手工写入的 0.35 在 hook 之后
-    //      原样保留。但 enter 一旦 ready，before_render 会调
-    //      setEnterPaused(handle,false)，OverlayStack 随即
-    //      `enter_ctrl.apply(content)` 按动画进度写 opacity（progress=0 -> 0）。
-    //      **opacity 的所有权此刻属于 overlay controller**，popover 不该也
-    //      不会去保留调用方随手设的中间值。
-    //      -> 改为断言真正的不变量：hook 不把 opacity 打回 HIDDEN_OPACITY
-    //        （那才是"闪一下"的 bug 形态），且 enter 被正常放行。
-    // 全程未改任何产品代码，before_render 的 overlay 感知一直是对的。
-    var ctx = try Cx.init(std.testing.allocator);
+    // Fixture requirements:
+    //   1. Use a real `ctx.overlay_stack.push()` handle bound to content_node; a fake
+    //      `.layer_handle = .{ .id = 0, .z_index = 0 }` makes findLayer find no layer,
+    //      so the overlay path is never entered.
+    //   2. Use setLayoutRect / meta.per_frame.hooks.slots (rect lives in the World SoA,
+    //      hooks in meta.per_frame.hooks).
+    //   3. Clear layout dirty first: manual nodes default to layout dirty and take the
+    //      'pause unstable-layout' branch, which **should** suppress opacity.
+    //   4. Don't assert an interim opacity (0.35) is preserved: on enter ready,
+    //      before_render calls setEnterPaused(handle, false) and OverlayStack then
+    //      `enter_ctrl.apply(content)` writes opacity by progress (0 -> 0). Opacity
+    //      ownership shifts to the overlay controller.
+    // True invariant: the hook doesn't reset opacity to HIDDEN_OPACITY and enter proceeds.
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     ctx.setViewport(640, 480);
 
@@ -449,15 +437,14 @@ test "Popover: before_render preserves overlay-managed opacity and scale" {
     trigger.setLayoutRect(.{ .x = 40, .y = 24, .w = 120, .h = 32 });
     content.setLayoutRect(.{ .x = 0, .y = 0, .w = 160, .h = 72 });
     content.style.overflow_hidden = false;
-    // 手工构造的节点默认带着 layout dirty，会让 before_render 走
-    // "pause unstable-layout" 分支（那条路径本就该把 opacity 压到 HIDDEN）。
-    // 本测试要验的是**布局已稳定**时的 enter 动画中间态，故先清干净
-    // （与邻接的 "pauses enter until content subtree is ready" 同做法）。
+    // Manual nodes default layout dirty, take 'pause unstable-layout' branch (should suppress
+    // opacity). Test verifies enter animation midstate with **stable layout**; clear dirty
+    // first (same as 'pauses enter until content subtree is ready').
     content.frame_state.state_bits.dirty.core.layout = false;
     content.frame_state.state_bits.dirty.core.subtree_layout = false;
 
-    // 真实 overlay layer（而非伪造 handle），并置于 enter 动画进行中：
-    // opacity/scale 都是 overlay 动画写下的中间值。
+    // Real overlay layer (not fake handle), mid-enter animation: opacity/scale are overlay
+    // animation midvalues.
     const handle = try ctx.overlay_stack.push(.{
         .kind = .non_modal,
         .dismiss = .{},
@@ -481,7 +468,7 @@ test "Popover: before_render preserves overlay-managed opacity and scale" {
         .scope = scope,
         .trigger_node = trigger,
         .effective_anchor = .self_trigger,
-        .is_open = open,
+        .is_open = .{ .signal = open },
         .layer_handle = handle,
         .pos = .bottom_start,
         .offset = .{ .static = 8 },
@@ -505,24 +492,23 @@ test "Popover: before_render preserves overlay-managed opacity and scale" {
 
     popoverBeforeRender(content);
 
-    // 不变量 1：布局已稳定时，hook 不得把 popover 打回"隐藏待命"状态
-    // （HIDDEN_OPACITY≈0.001）。那是 pause 分支的行为，出现在这里就意味着
-    // 弹层会闪一下再出现。
+    // Invariant 1: with stable layout, hook must not reset popover to hidden-waiting state
+    // (HIDDEN_OPACITY~0.001). That's pause-branch behavior; here means popup flashes.
     try std.testing.expect(content.getOpacity() != HIDDEN_OPACITY);
 
-    // 不变量 2：enter 被放行，且所有权移交 overlay controller,
-    // opacity 由 enter_ctrl 按动画进度写入（progress=0 -> 0），
-    // scale 同理回到 transition 的起始 scale。
+    // Invariant 2: enter proceeds, ownership moves to overlay controller; opacity written by
+    // enter_ctrl per animation progress (progress=0 -> 0); scale likewise returns to transition
+    // start.
     try std.testing.expect(position_ctx.entry_ready);
     try std.testing.expect(position_ctx.is_visible);
     try std.testing.expect(!ctx.overlay_stack.findLayer(handle).?.enter_paused);
 
-    // 不变量 3：定位已生效（弹层落到 trigger 下方，而非停在 0）。
+    // Invariant 3: positioning applied (popup below trigger, not at 0).
     try std.testing.expect(content.style.translate_y > 0);
 }
 
 test "Popover: none transition becomes opaque when positioned" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     ctx.setViewport(640, 480);
 
@@ -556,7 +542,7 @@ test "Popover: none transition becomes opaque when positioned" {
         .scope = scope,
         .trigger_node = trigger,
         .effective_anchor = .self_trigger,
-        .is_open = open,
+        .is_open = .{ .signal = open },
         .layer_handle = handle,
         .pos = .bottom_start,
         .offset = .{ .static = 8 },
@@ -587,7 +573,7 @@ test "Popover: none transition becomes opaque when positioned" {
 }
 
 test "Popover: before_render keeps active exiting layer visible until commit" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
@@ -622,7 +608,7 @@ test "Popover: before_render keeps active exiting layer visible until commit" {
         .scope = scope,
         .trigger_node = trigger,
         .effective_anchor = .self_trigger,
-        .is_open = open,
+        .is_open = .{ .signal = open },
         .layer_handle = handle,
         .pos = .bottom_start,
         .offset = .{ .static = 8 },
@@ -652,7 +638,7 @@ test "Popover: before_render keeps active exiting layer visible until commit" {
 }
 
 test "Popover: before_render pauses enter until content subtree is ready" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     ctx.setViewport(640, 480);
 
@@ -666,11 +652,10 @@ test "Popover: before_render pauses enter until content subtree is ready" {
 
     trigger.setLayoutRect(.{ .x = 40, .y = 24, .w = 120, .h = 32 });
     content.setLayoutRect(.{ .x = 0, .y = 0, .w = 160, .h = 72 });
-    // 未就绪 = **布局**未稳定。此前这里只置 subtree_render，断言 pause,
-    // 那是 69ac08f（popover portal 化）之前的旧合同。现在 popoverContentReady
-    // 刻意不再看 subtree_render：要求它干净会让刚打开的 overlay 死锁
-    //（隐藏子树在被定位并准入前画不完第一帧，而定位又在等这一帧）。
-    // 详见 popover/mod.zig:popoverContentReady 的注释。
+    // Not ready = **layout unstable**. popoverContentReady deliberately does not check
+    // subtree_render: requiring it deadlocks a fresh overlay (a hidden subtree can't paint
+    // its first frame before positioning is ready, but positioning waits for that frame).
+    // See popover/mod.zig:popoverContentReady comment.
     content.frame_state.state_bits.dirty.core.subtree_render = true;
     content.frame_state.state_bits.dirty.core.subtree_layout = true;
     content.frame_state.state_bits.dirty.core.layout = false;
@@ -692,7 +677,7 @@ test "Popover: before_render pauses enter until content subtree is ready" {
         .scope = scope,
         .trigger_node = trigger,
         .effective_anchor = .self_trigger,
-        .is_open = open,
+        .is_open = .{ .signal = open },
         .layer_handle = handle,
         .pos = .bottom_start,
         .offset = .{ .static = 8 },
@@ -724,13 +709,13 @@ test "Popover: before_render pauses enter until content subtree is ready" {
 }
 
 test "Popover: subtree_render 脏不阻止定位（死锁防回归）" {
-    // 配对测试：上一个测试守"布局脏 ⇒ pause"，这个守它的**反面**,
-    // 仅 subtree_render 脏（布局已稳定）时必须照常定位并 ready。
+    // Paired test: the previous one holds 'layout dirty => pause'; this holds the opposite:
+    // only subtree_render dirty (layout stable) must position and become ready normally.
     //
-    // 若有人"修复"popoverContentReady 把 subtree_render 加回就绪条件，
-    // 刚打开的 overlay 会死锁：隐藏子树在被定位准入前画不完第一帧，
-    // 而定位又在等这一帧。那种改动会让本测试变红。
-    var ctx = try Cx.init(std.testing.allocator);
+    // If popoverContentReady regains a subtree_render readiness check, a fresh overlay
+    // deadlocks (hidden subtree can't paint first frame before positioning is ready, but
+    // positioning waits). That change fails this test.
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     ctx.setViewport(640, 480);
 
@@ -744,7 +729,7 @@ test "Popover: subtree_render 脏不阻止定位（死锁防回归）" {
 
     trigger.setLayoutRect(.{ .x = 40, .y = 24, .w = 120, .h = 32 });
     content.setLayoutRect(.{ .x = 0, .y = 0, .w = 160, .h = 72 });
-    // 布局干净、只有渲染脏，这正是"刚打开的隐藏子树"的真实状态
+    // Layout clean, only render dirty; exactly 'freshly-opened hidden subtree' real state
     content.frame_state.state_bits.dirty.core.subtree_render = true;
     content.frame_state.state_bits.dirty.core.subtree_layout = false;
     content.frame_state.state_bits.dirty.core.layout = false;
@@ -766,7 +751,7 @@ test "Popover: subtree_render 脏不阻止定位（死锁防回归）" {
         .scope = scope,
         .trigger_node = trigger,
         .effective_anchor = .self_trigger,
-        .is_open = open,
+        .is_open = .{ .signal = open },
         .layer_handle = handle,
         .pos = .bottom_start,
         .offset = .{ .static = 8 },
@@ -796,7 +781,7 @@ test "Popover: subtree_render 脏不阻止定位（死锁防回归）" {
 }
 
 test "Popover: prewarmed hidden content reopens without ready-frame pause" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     ctx.setViewport(640, 480);
 
@@ -838,7 +823,7 @@ test "Popover: prewarmed hidden content reopens without ready-frame pause" {
         .scope = scope,
         .trigger_node = trigger,
         .effective_anchor = .self_trigger,
-        .is_open = open,
+        .is_open = .{ .signal = open },
         .layer_handle = handle,
         .pos = .bottom_start,
         .offset = .{ .static = 8 },
@@ -872,23 +857,14 @@ test "Popover: prewarmed hidden content reopens without ready-frame pause" {
 }
 
 test "Popover: prewarm keeps content measurable after close (reopen fast-path)" {
-    // 本测试原名 "closed initial render prewarms measurable content"，长期
-    // QUARANTINE，注释称"content.rect 8 帧后仍是 0 …… render-pipeline
-    // expectation drift，需要 real investigation"。
-    //
-    // **排查结论：不是 render pipeline 的问题，是原测试断言了一个不可达的场景。**
-    // 初始关闭态下，overlay layer 处于 suspended，popoverBeforeRender 在开头
-    // 就 early-return（:804-812 的 `if (layer.suspended) { detach…; return; }`），
-    // **根本走不到** :899-903 那段 prewarm 尺寸恢复。所以初始关闭态的
-    // content.rect 恒为 0，与 settle 多少帧、prewarm 开不开都无关。
-    // （实测：插桩确认该 early-return 在 prewarm=true 时同样命中。）
-    //
-    // prewarm_hidden_layout 真正的语义是"**开过一次之后**，关闭时保留已测量的
-    // 布局，让重开无需再等 ready-frame"，即 reopen fast-path，而不是"从未打开
-    // 过就先测量好"。故本测试改为验证这个真实不变量：开 -> 关 -> content 仍可测量。
-    // 初始关闭态 rect==0 的行为由邻接的
-    // "can collapse hidden content when prewarm disabled" 覆盖。
-    var ctx = try Cx.init(std.testing.allocator);
+    // Initial closed state: content.rect stays 0 (layer suspended, popoverBeforeRender
+    // early-returns
+    // before prewarm size recovery), independent of settle frames or prewarm setting.
+    // prewarm_hidden_layout means 'after opened once, keep measured layout when closed so reopen
+    // needs
+    // no ready-frame', not 'pre-measure before first open'. So: open -> close -> still measurable.
+    // Initial closed rect==0 is covered by 'can collapse hidden content when prewarm disabled'.
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     ctx.setViewport(640, 480);
 
@@ -901,8 +877,8 @@ test "Popover: prewarm keeps content measurable after close (reopen fast-path)" 
     const result = try Popover(.{
         .position = .bottom_start,
         .trigger = .click,
-        // 两者缺一不可：detach 默认 true 会把关闭态 content 整个摘出树，
-        // 脱离树的节点既不 layout 也不跑 before_render hook。
+        // Both required: detach default true removes closed content from tree entirely, detached
+        // nodes neither layout nor run before_render hooks.
         .prewarm_hidden_layout = true,
         .detach_hidden_content = false,
     }).mount(scope, ctx);
@@ -917,8 +893,8 @@ test "Popover: prewarm keeps content measurable after close (reopen fast-path)" 
     ctx.layout();
     _ = ctx.render();
 
-    // 打开并 settle：此时 content 被真正测量。
-    result.is_open.set(true);
+    // Open and settle: content is truly measured now.
+    result.open.?.set(true);
     var iter: usize = 0;
     while (iter < 8) : (iter += 1) {
         ctx.frame_time_ms += 16;
@@ -928,9 +904,9 @@ test "Popover: prewarm keeps content measurable after close (reopen fast-path)" 
     }
     try std.testing.expect(result.content.rectFromWorldOrFallback().w > 0);
 
-    // 关闭并 settle：prewarm 的作用是让尺寸**保留**下来（而非塌回 0），
-    // 这样下次打开不必再等一个 ready frame。
-    result.is_open.set(false);
+    // Close and settle: prewarm preserves dimensions (not collapsing to 0), so next open doesn't
+    // need another ready frame.
+    result.open.?.set(false);
     iter = 0;
     while (iter < 8) : (iter += 1) {
         ctx.frame_time_ms += 16;
@@ -943,7 +919,7 @@ test "Popover: prewarm keeps content measurable after close (reopen fast-path)" 
 }
 
 test "Popover: closed initial render can collapse hidden content when prewarm disabled" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     ctx.setViewport(640, 480);
 
@@ -973,12 +949,13 @@ test "Popover: closed initial render can collapse hidden content when prewarm di
 }
 
 test "Popover: open render emits content text at panel position after prewarm settles" {
-    // History: 需要多帧 settle (popover prewarm 是多帧路径)。
+    // History: needs multiple frames to settle (popover prewarm is multi-frame path).
     //
-    // P6.3 后 Popover 走 composited_group surface（整组 scale_fade）。断言真正不变量「content text 被绘制 + 落在 panel 世界位置（trigger 下方）」，
-    // 而非旧的 begin/end_opacity_layer 包裹顺序（那条 promoted-surface 路径会丢 children + 弹层飞
-    // (0,0)，是组件不可用的根因，见 docs/BUGS.md）。
-    var ctx = try Cx.init(std.testing.allocator);
+    // After P6.3 Popover uses composited_group surface (entire group scale_fade). Assert real
+    // invariant "content text drawn + positioned in panel world coords (below trigger)", not old
+    // begin/end_opacity_layer wrapping order (that promoted-surface path loses children + panel
+    // flies to (0,0), root cause of component unusability, see docs/BUGS.md).
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     ctx.setViewport(640, 480);
 
@@ -1003,7 +980,7 @@ test "Popover: open render emits content text at panel position after prewarm se
     ctx.layout();
     _ = ctx.render();
 
-    result.is_open.set(true);
+    result.open.?.set(true);
 
     var commands: []const @import("../../core.zig").paint_table.DisplayItem = &.{};
     var text_idx: ?usize = null;
@@ -1016,10 +993,10 @@ test "Popover: open render emits content text at panel position after prewarm se
         _ = ctx.render();
         commands = ctx.lowerForEncoderPaintTable();
         text_idx = null;
-        // P6.3 后 popover content 在 composited surface 内：text geom 是 surface-local。
-        // 世界坐标 = M_composite 平移分量 − src 原点 + local geom
-        // （M = owner_world·Translate(src)，encoder 先减 src 再施 M，settle 时
-        //  owner_world = Translate(owner_pos) ⇒ world = M_t − src + geom）。
+        // After P6.3 popover content in composited surface: text geom is surface-local.
+        // World coords = M_composite translation component - src origin + local geom
+        // (M = owner_world·Translate(src), encoder subtracts src first then applies M, at settle
+        // owner_world = Translate(owner_pos) => world = M_t - src + geom).
         var surf_tx: f32 = 0;
         var surf_ty: f32 = 0;
         var surf_src_x: f32 = 0;
@@ -1057,16 +1034,17 @@ test "Popover: open render emits content text at panel position after prewarm se
         if (text_idx != null) break;
     }
 
-    // content text 必须被绘制（promoted-surface 路径曾整段丢 children）。
+    // content text must be drawn (promoted-surface path once lost entire children).
     try std.testing.expect(text_idx != null);
-    // 且（换算到世界坐标后）落在 trigger 下方（bottom_start + offset）。曾经的 bug 把它甩到 (0,0)。
+    // and (in world coords) positioned below trigger (bottom_start + offset). Past bug threw it to
+    // (0,0).
     const trigger_rect = result.trigger.globalRect();
     try std.testing.expect(text_geom_y > trigger_rect.y + trigger_rect.h - 1.0);
     try std.testing.expect(text_geom_x >= trigger_rect.x - 1.0);
 }
 
 test "Popover: first open render keeps content scale_fade intermediate state" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     ctx.setViewport(640, 480);
 
@@ -1091,7 +1069,7 @@ test "Popover: first open render keeps content scale_fade intermediate state" {
     ctx.layout();
     _ = ctx.render();
 
-    result.is_open.set(true);
+    result.open.?.set(true);
     render_engine.current_frame_time_ms = 16.0;
     render_engine.current_frame_dt_ms = 16.0;
     ctx.layout();
@@ -1104,7 +1082,7 @@ test "Popover: first open render keeps content scale_fade intermediate state" {
 }
 
 test "Popover: first 10 open frames progress from enter state instead of flashing" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     ctx.setViewport(640, 480);
 
@@ -1127,7 +1105,7 @@ test "Popover: first 10 open frames progress from enter state instead of flashin
     ctx.layout();
     _ = ctx.render();
 
-    result.is_open.set(true);
+    result.open.?.set(true);
 
     var opacities: [10]f32 = undefined;
     var scales: [10]f32 = undefined;
@@ -1166,7 +1144,7 @@ test "Popover: first 10 open frames progress from enter state instead of flashin
 }
 
 test "Popover: scale_fade open animation reuses promoted surface for stable text" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     ctx.setViewport(640, 480);
 
@@ -1189,13 +1167,13 @@ test "Popover: scale_fade open animation reuses promoted surface for stable text
     ctx.layout();
     _ = ctx.render();
 
-    result.is_open.set(true);
+    result.open.?.set(true);
 
-    // Popover enter 是**多帧**路径：content 要等 prewarm/定位 settle 之后才会
-    // 注册进 scene_runtime（实测本 fixture 下是第 4 帧）。原测试只跑 1 帧就
-    // `scene_runtime.get(...).?`，必然 unwrap null 崩溃，这就是原注释里
-    // "not registered until prewarm settles" 的实际表现。
-    // 改为 settle 到注册为止，再断言"首个注册帧 rebuild、之后复用"。
+    // Popover enter is **multi-frame** path: content waits for prewarm/positioning settle before
+    // registering in scene_runtime (measured 4th frame in this fixture). Original test ran only 1
+    // frame then `scene_runtime.get(...).?`, invariably unwrapped null crash, actual meaning of
+    // original comment "not registered until prewarm settles". Changed to settle until
+    // registration, then assert "first registration frame rebuilt, reused after".
     var settle: usize = 0;
     while (settle < 10) : (settle += 1) {
         ctx.frame_time_ms += 16;
@@ -1204,15 +1182,15 @@ test "Popover: scale_fade open animation reuses promoted surface for stable text
         if (ctx.scene_runtime.get(result.content.id) != null) break;
     }
 
-    // 首个注册帧：surface 刚建好（rebuilt，未复用）。
+    // First registration frame: surface just created (rebuilt, not reused).
     const fr = ctx.scene_runtime.get(result.content.id) orelse return error.PopoverNeverRegistered;
     try std.testing.expect(fr.has_active_transform_animation);
     try std.testing.expect(result.content.meta.per_frame.caches.commands.promoted != null);
     try std.testing.expect(fr.promoted_surface_flags.rebuilt_this_frame);
     try std.testing.expect(!fr.promoted_surface_flags.reused_this_frame);
 
-    // 下一帧：动画仍在跑，但 surface 应被**复用**而非重建,
-    // 这正是 scale_fade 期间文字不抖动的前提。
+    // Next frame: animation still running, surface should be **reused** not rebuilt, precondition
+    // for text not jittering during scale_fade.
     ctx.frame_time_ms += 16;
     ctx.layout();
     _ = ctx.render();
@@ -1223,10 +1201,10 @@ test "Popover: scale_fade open animation reuses promoted surface for stable text
     try std.testing.expect(!second_runtime.promoted_surface_flags.rebuilt_this_frame);
 }
 
-// ========== autosize：可用高度 -> max_height（floating-ui size.availableHeight）==========
+// ========== autosize: available height -> max_height (floating-ui size.availableHeight) ==========
 
-/// 共用 fixture：640x480 viewport，trigger 在 y=300（下方剩 132、上方剩 284，
-/// 均已扣 padding 8 + offset 8），content 高 `content_h`。
+/// Shared fixture: 640x480 viewport, trigger at y=300 (bottom 132 remain, top 284 remain, both
+/// minus padding 8 + offset 8), content height `content_h`.
 const AutosizeFixture = struct {
     cx: *Cx,
     scope: *Scope,
@@ -1236,7 +1214,7 @@ const AutosizeFixture = struct {
     trigger: *Node,
 
     fn init(content_h: f32) !AutosizeFixture {
-        const cx = try Cx.init(std.testing.allocator);
+        const cx = try Cx.init(std.testing.allocator, std.testing.io);
         errdefer cx.deinit();
         cx.setViewport(640, 480);
         const root = try box(cx, .{ .width = .{ .px = 640 }, .height = .{ .px = 480 } }, .{});
@@ -1276,7 +1254,7 @@ const AutosizeFixture = struct {
             .scope = self.scope,
             .trigger_node = self.trigger,
             .effective_anchor = .self_trigger,
-            .is_open = self.open,
+            .is_open = .{ .signal = self.open },
             .layer_handle = self.handle,
             .pos = .bottom_start,
             .offset = .{ .static = 8 },
@@ -1300,9 +1278,9 @@ const AutosizeFixture = struct {
 };
 
 test "Popover autosize: 两侧都放不下且 caller 未设 max_height 时，max_height 收紧到可用高度" {
-    // 复现：content 300 高，下方 132 / 上方 284 都放不下 -> flip best-fit 选 top。
-    // 修前 autosize 只在 caller 设了 max_height 时激活，面板保持 300 高、
-    // translate 贴 viewport 顶，下缘越过 trigger 把 reference element 盖住。
+    // Reproduction: content 300 tall, bottom 132 / top 284 both can't fit -> flip best-fit chooses
+    // top. Before fix autosize only activated when caller set max_height, panel stayed 300 tall,
+    // translate stuck to viewport top, bottom edge passes trigger obscuring reference element.
     var f = try AutosizeFixture.init(300);
     defer f.deinit();
     var position_ctx = f.positionCtx(null);
@@ -1313,9 +1291,10 @@ test "Popover autosize: 两侧都放不下且 caller 未设 max_height 时，max
     try std.testing.expect(floating.getSide(position_ctx.active_position) == .top);
     // 284 = trigger.y(300) - padding(8) - offset(8)
     try std.testing.expectApproxEqAbs(@as(f32, 284), f.content.style.max_height(), 0.5);
-    // 下一帧 layout 才应用 max_height，本帧必须已标 sizing dirty
+    // Next frame layout applies max_height, this frame must already flag sizing dirty
     try std.testing.expect(f.content.frame_state.state_bits.dirty.core.layout);
-    // cap 咬住内容（300 > 284）-> chrome 必须裁切子节点，否则内容照样溢出外壳压回 trigger
+    // cap bites content (300 > 284) -> chrome must clip children, else content overflows shell back
+    // onto trigger
     try std.testing.expect(f.content.style.overflow_hidden);
 }
 
@@ -1331,7 +1310,7 @@ test "Popover autosize: caller max_height 比可用高度更小时以 caller 为
 }
 
 test "Popover autosize: 内容放得下时 max_height 不低于内容高度（不产生裁剪）" {
-    // content 100 高，下方剩 132 -> 留在 bottom，cap = 132 ≥ 100。
+    // content 100 tall, bottom 132 remains -> stays bottom, cap = 132 >= 100.
     var f = try AutosizeFixture.init(100);
     defer f.deinit();
     var position_ctx = f.positionCtx(null);
@@ -1342,14 +1321,15 @@ test "Popover autosize: 内容放得下时 max_height 不低于内容高度（�
     try std.testing.expect(floating.getSide(position_ctx.active_position) == .bottom);
     try std.testing.expectApproxEqAbs(@as(f32, 132), f.content.style.max_height(), 0.5);
     try std.testing.expect(f.content.style.max_height() >= 100);
-    // cap 没咬住 -> 不额外裁切（保持 caller 意愿 false）
+    // cap doesn't bite -> no extra clipping (preserve caller's false)
     try std.testing.expect(!f.content.style.overflow_hidden);
 }
 
 test "Popover autosize: 可用高度变大的那一帧仍保持裁切（ph 还贴着旧 cap）" {
-    // 复现：打开 tall popover 后滚动页面，trigger 下移 -> 上方可用高度逐帧变大。
-    // ph 是上一帧按旧 cap 排出的高度，若只和新 cap 比会判定"没咬住"而关掉
-    // overflow_hidden，本帧内容（比旧 cap 还高）整块溢出面板；连续滚动 = 连续漏出。
+    // Reproduction: open tall popover then scroll page, trigger moves down -> upward available
+    // height grows per frame. ph is height laid out with previous cap; comparing only to new cap
+    // judges "doesn't bite" and disables overflow_hidden, this frame content (taller than old cap)
+    // fully overflows panel; continuous scroll = continuous leak.
     var f = try AutosizeFixture.init(300);
     defer f.deinit();
     var position_ctx = f.positionCtx(null);
@@ -1359,7 +1339,8 @@ test "Popover autosize: 可用高度变大的那一帧仍保持裁切（ph 还�
     try std.testing.expectApproxEqAbs(@as(f32, 284), f.content.style.max_height(), 0.5);
     try std.testing.expect(f.content.style.overflow_hidden);
 
-    // 下一帧：layout 已按 cap 把面板钳到 284；页面滚动让 trigger 下移 20 -> 可用 304
+    // Next frame: layout clamped panel to 284 by cap; page scroll moves trigger down 20 ->
+    // available 304
     f.content.setLayoutRect(.{ .x = 0, .y = 0, .w = 160, .h = 284 });
     f.trigger.setLayoutRect(.{ .x = 40, .y = 320, .w = 120, .h = 32 });
     popoverBeforeRender(f.content);
@@ -1371,7 +1352,7 @@ test "Popover autosize: 可用高度变大的那一帧仍保持裁切（ph 还�
 test "Popover autosize: viewport 极挤时保底 AUTOSIZE_MIN_HEIGHT 而非折到 0" {
     var f = try AutosizeFixture.init(300);
     defer f.deinit();
-    // trigger 几乎贴顶且占满高度：上方 8、下方 8
+    // trigger almost at top filling height: top 8, bottom 8
     f.trigger.setLayoutRect(.{ .x = 40, .y = 16, .w = 120, .h = 448 });
     var position_ctx = f.positionCtx(null);
     f.content.meta.per_frame.hooks.slots.anim_state = @ptrCast(&position_ctx);
@@ -1382,10 +1363,11 @@ test "Popover autosize: viewport 极挤时保底 AUTOSIZE_MIN_HEIGHT 而非折�
 }
 
 test "Popover: portal content has no clip and wins hit over clipped trigger container" {
-    // 方案 §9.3：C2 删除 z>0 的隐式裁剪逃逸后，"画到容器外"只剩结构性 portal 一条路。
-    // trigger 放在一个 overflow_hidden 的小容器里，content 延伸到容器外：content 的
-    // retained clip_id 必须为空、它的背景 fill 不在任何 scissor 内、容器外的点命中 content。
-    var ctx = try Cx.init(std.testing.allocator);
+    // Plan section 9.3: After C2 deleted implicit clipping escape for z>0, "draw outside container"
+    // has only structural portal path. trigger in overflow_hidden small container, content extends
+    // outside: content's retained clip_id must be empty, its background fill not in any scissor,
+    // outside-container points hit content.
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     ctx.setViewport(400, 300);
 
@@ -1425,7 +1407,7 @@ test "Popover: portal content has no clip and wins hit over clipped trigger cont
     ctx.layout();
     _ = ctx.render();
 
-    result.is_open.set(true);
+    result.open.?.set(true);
     var iter: usize = 0;
     while (iter < 12) : (iter += 1) {
         ctx.frame_time_ms += 16;
@@ -1433,12 +1415,13 @@ test "Popover: portal content has no clip and wins hit over clipped trigger cont
         _ = ctx.render();
     }
 
-    // content 挂在 portal 下，portal 祖先链上没有裁剪。
+    // content under portal, portal ancestor chain has no clipping.
     try std.testing.expect(result.chrome.parent == ctx.popover_portal_root.?);
     const chrome_rt = ctx.scene_runtime.get(result.chrome.id) orelse return error.ChromeNotRendered;
     try std.testing.expectEqual(core.SceneRuntimeInvalidId, chrome_rt.clip_id);
 
-    // panel 背景 fill 不处于任何 scissor 之内（对照：它的 trigger 所在容器是 40px 高的裁剪框）。
+    // panel background fill not in any scissor (contrast: trigger's container is 40px tall clipping
+    // box).
     var depth: usize = 0;
     var found = false;
     for (ctx.lowerForEncoderPaintTable()) |it| {
@@ -1458,7 +1441,7 @@ test "Popover: portal content has no clip and wins hit over clipped trigger cont
     }
     try std.testing.expect(found);
 
-    // 容器外（y > 40）、panel 内的点命中 panel。
+    // points outside container (y > 40), inside panel, hit panel.
     const panel_rect = panel.globalRect();
     try std.testing.expect(panel_rect.y + panel_rect.h > 60);
     const hit = ctx.hitTest(panel_rect.x + 20, panel_rect.y + panel_rect.h - 10) orelse return error.NoHit;
@@ -1466,7 +1449,7 @@ test "Popover: portal content has no clip and wins hit over clipped trigger cont
 }
 
 test "Popover: dropdown transition slides 6px toward the anchor with opacity and settles at rest" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     ctx.setViewport(640, 480);
 
@@ -1489,7 +1472,7 @@ test "Popover: dropdown transition slides 6px toward the anchor with opacity and
 
     ctx.layout();
     _ = ctx.render();
-    result.is_open.set(true);
+    result.open.?.set(true);
 
     var now_ms: f64 = 0;
     var saw_mid = false;
@@ -1503,7 +1486,8 @@ test "Popover: dropdown transition slides 6px toward the anchor with opacity and
         const op = result.content.getOpacity();
         if (op > 0.05 and op < 0.95) {
             saw_mid = true;
-            // 离开静止位的量 = (1 - opacity) × 6，方向朝上（远离下方落位，靠向锚点一侧）。
+            // offset from rest position = (1 - opacity) x 6, direction upward (away from bottom
+            // landing, toward anchor).
             const pctx: *PopoverPositionCtx = @ptrCast(@alignCast(result.content.meta.per_frame.hooks.slots.anim_state.?));
             const dy = result.content.style.translate_y - pctx.rest_translate_y;
             try std.testing.expect(dy < -0.1);
@@ -1516,9 +1500,9 @@ test "Popover: dropdown transition slides 6px toward the anchor with opacity and
     try std.testing.expectApproxEqAbs(pctx.rest_translate_y, result.content.style.translate_y, 0.01);
     try std.testing.expectApproxEqAbs(@as(f32, 0.98), overlay_stack_mod.TransitionController.hiddenScaleForTransition(.dropdown), 0.0001);
 
-    // 退场：定位器不再跑，滑出偏移仍跟着 opacity 推进。
+    // Exit: positioner stops, slide-out offset still follows opacity.
     const rest_y = pctx.rest_translate_y;
-    result.is_open.set(false);
+    result.open.?.set(false);
     var saw_exit_mid = false;
     for (0..20) |_| {
         now_ms += 16.0;
@@ -1545,7 +1529,7 @@ test "Popover: dropdownSlideOffset follows the resolved side" {
 }
 
 fn openPopoverForConsumeTest(ctx: *Cx, result: anytype, now_ms: *f64) void {
-    result.is_open.set(true);
+    result.open.?.set(true);
     for (0..20) |_| {
         now_ms.* += 16.0;
         render_engine.current_frame_time_ms = now_ms.*;
@@ -1557,7 +1541,7 @@ fn openPopoverForConsumeTest(ctx: *Cx, result: anytype, now_ms: *f64) void {
 }
 
 fn consumeCase(consume: bool) !usize {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     ctx.setViewport(640, 480);
     const root = try box(ctx, .{ .width = .{ .px = 640 }, .height = .{ .px = 480 }, .direction = .column }, .{});
@@ -1588,9 +1572,9 @@ fn consumeCase(consume: bool) !usize {
     _ = ctx.render();
     var now_ms: f64 = 0;
     openPopoverForConsumeTest(ctx, result, &now_ms);
-    try std.testing.expect(result.is_open.peek());
+    try std.testing.expect(result.open.?.peek());
 
-    // 第一下点在面板外的按钮上。
+    // First click on button outside panel.
     ctx.handleClick(50, 20);
     for (0..20) |_| {
         now_ms += 16;
@@ -1599,9 +1583,9 @@ fn consumeCase(consume: bool) !usize {
         ctx.layout();
         _ = ctx.render();
     }
-    try std.testing.expect(!result.is_open.peek());
+    try std.testing.expect(!result.open.?.peek());
     const first = clicks;
-    // 关闭后第二下照常触发。
+    // Second click after close triggers normally.
     ctx.handleClick(50, 20);
     try std.testing.expectEqual(first + 1, clicks);
     return first;
@@ -1609,16 +1593,17 @@ fn consumeCase(consume: bool) !usize {
 
 test "Popover: consume_outside_click closes without activating what was clicked" {
     try std.testing.expectEqual(@as(usize, 0), try consumeCase(true));
-    // 对照：默认行为关闭的同时点击照常落到下面。
+    // Contrast: default behavior, close and click still reach below.
     try std.testing.expectEqual(@as(usize, 1), try consumeCase(false));
 }
 
 const LostUp = enum { cancel_pointer, new_press };
 
-/// 被 consume 吞掉的按下若收不到抬起（窗口失焦 / 指针交互被取消 / 抬起丢失），
-/// 吞抬起的标记不能活过这次按下，否则下一次正常点击的抬起被吞、click 不合成。
+/// If consumed press doesn't receive matching release (window loses focus / pointer interaction
+/// cancelled / release lost), swallow-release flag can't outlive this press, else next normal
+/// click's release swallowed, click doesn't synthesize.
 fn lostUpCase(mode: LostUp) !usize {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     ctx.setViewport(640, 480);
     const root = try box(ctx, .{ .width = .{ .px = 640 }, .height = .{ .px = 480 }, .direction = .column }, .{});
@@ -1644,13 +1629,14 @@ fn lostUpCase(mode: LostUp) !usize {
     _ = ctx.render();
     var now_ms: f64 = 0;
     openPopoverForConsumeTest(ctx, result, &now_ms);
-    try std.testing.expect(result.is_open.peek());
+    try std.testing.expect(result.open.?.peek());
 
-    // 面板外按下被吞；对应的抬起丢失。
+    // press outside panel swallowed; corresponding release lost.
     ctx.handleMouseDown(50, 20, .{});
     try std.testing.expect(ctx.swallowed_press_button != null);
     switch (mode) {
-        // 交互取消即结束这次按下：标记当场作废，不指望后续按下兜底。
+        // pointer interaction cancelled ends this press: flag immediately invalidated, don't expect
+        // later press to cover.
         .cancel_pointer => {
             ctx.cancelPointerInteractions(.window_blur);
             try std.testing.expect(ctx.swallowed_press_button == null);
@@ -1664,8 +1650,8 @@ fn lostUpCase(mode: LostUp) !usize {
         ctx.layout();
         _ = ctx.render();
     }
-    try std.testing.expect(!result.is_open.peek());
-    // 下一次正常点击必须照常触发。
+    try std.testing.expect(!result.open.?.peek());
+    // next normal click must trigger normally.
     ctx.handleClick(50, 20);
     return clicks;
 }
@@ -1676,7 +1662,7 @@ test "Popover: consumed press whose mouse-up is lost does not swallow the next c
 }
 
 test "Popover: an item that closes a nested popover from its click handler keeps the parent open" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     ctx.setViewport(640, 480);
     const root = try box(ctx, .{ .width = .{ .px = 640 }, .height = .{ .px = 480 }, .direction = .column }, .{});
@@ -1689,9 +1675,9 @@ test "Popover: an item that closes a nested popover from its click handler keeps
     try outer.trigger.appendChild(std.testing.allocator, try box(ctx, .{ .width = .{ .px = 40 }, .height = .{ .px = 20 } }, .{}));
     try outer.content.appendChild(std.testing.allocator, try box(ctx, .{ .width = .{ .px = 200 }, .height = .{ .px = 200 } }, .{}));
 
-    // 内层菜单：manual + 自己的 visible，点菜单项时在 click 回调里关掉它。
+    // inner menu: manual + own visible, on menu item click close it in click callback.
     const inner_visible = try core.Signal(bool).createInScope(scope, false);
-    const inner = try Popover(.{ .position = .bottom_start, .trigger = .manual, .visible = inner_visible, .consume_outside_click = true }).mount(scope, ctx);
+    const inner = try Popover(.{ .position = .bottom_start, .trigger = .manual, .open = inner_visible, .consume_outside_click = true }).mount(scope, ctx);
     try root.appendChild(std.testing.allocator, inner.wrapper);
     const item = try box(ctx, .{ .width = .{ .px = 120 }, .height = .{ .px = 30 } }, .{});
     item.behavior.events.on_click = Cx.simpleHandler(struct {
@@ -1714,7 +1700,7 @@ test "Popover: an item that closes a nested popover from its click handler keeps
         ctx.layout();
         _ = ctx.render();
     }
-    try std.testing.expect(outer.is_open.peek());
+    try std.testing.expect(outer.open.?.peek());
     try std.testing.expect(inner_visible.peek());
 
     const r = item.globalRect();
@@ -1728,7 +1714,7 @@ test "Popover: an item that closes a nested popover from its click handler keeps
         _ = ctx.render();
     }
     try std.testing.expect(!inner_visible.peek());
-    try std.testing.expect(outer.is_open.peek());
+    try std.testing.expect(outer.open.?.peek());
 }
 
 const HookTextCtx = struct {
@@ -1750,7 +1736,7 @@ const HookTextCtx = struct {
 };
 
 test "Popover: wrapped text updated from a before_render hook re-wraps and repaints in full" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     ctx.setViewport(640, 480);
     const root = try box(ctx, .{ .width = .{ .px = 640 }, .height = .{ .px = 480 }, .direction = .column }, .{});
@@ -1766,7 +1752,8 @@ test "Popover: wrapped text updated from a before_render hook re-wraps and repai
     try pop.trigger.appendChild(std.testing.allocator, try box(ctx, .{ .width = .{ .px = 40 }, .height = .{ .px = 20 } }, .{}));
     pop.chrome.style.direction = .column;
     try pop.content.appendChild(std.testing.allocator, try box(ctx, .{ .width = .fill(), .height = .{ .px = 40 } }, .{}));
-    // 先折叠（高 0 + 裁切 + 透明），钩子里与改文本同帧展开，面板横幅的真实时序。
+    // first collapse (height 0 + clipped + transparent), hook expands same frame as text change,
+    // panel banner real timing.
     const collapsed = try box(ctx, .{ .width = .fill(), .direction = .column, .padding = .{ .top = 0, .right = 10, .bottom = 10, .left = 10 } }, .{});
     try pop.content.appendChild(std.testing.allocator, collapsed);
     collapsed.style.height = .{ .px = 0 };
@@ -1780,7 +1767,7 @@ test "Popover: wrapped text updated from a before_render hook re-wraps and repai
     try col.appendChild(std.testing.allocator, t);
     t.style.width = .fill();
 
-    // 钩子挂在主树上的一个节点：模拟宿主在 before_render 里刷新面板文本。
+    // hook on node in main tree: simulate host refreshing panel text in before_render.
     var hctx: HookTextCtx = .{ .node = t, .reveal = collapsed };
     const driver = try box(ctx, .{ .width = .{ .px = 1 }, .height = .{ .px = 1 } }, .{});
     try root.appendChild(std.testing.allocator, driver);
@@ -1796,7 +1783,7 @@ test "Popover: wrapped text updated from a before_render hook re-wraps and repai
     hctx.armed = true;
     driver.markRenderDirty();
     var painted: usize = 0;
-    // 真实应用只调 render()（layout 在 render 内部）；额外的 ctx.layout() 会掩盖问题。
+    // real apps only call render() (layout inside render); extra ctx.layout() masks issue.
     for (0..3) |_| {
         now_ms += 16;
         render_engine.current_frame_time_ms = now_ms;
@@ -1833,7 +1820,7 @@ fn stepFrames(ctx: *Cx, now_ms: *f64, n: usize) void {
 }
 
 test "Popover fit_content: a shrinkable scroll list grows back when its rows grow again" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     ctx.setViewport(640, 480);
     const root = try box(ctx, .{ .width = .{ .px = 640 }, .height = .{ .px = 480 }, .direction = .column }, .{});
@@ -1851,7 +1838,7 @@ test "Popover fit_content: a shrinkable scroll list grows back when its rows gro
     const header = try box(ctx, .{ .width = .fill(), .height = .{ .px = 50 } }, .{});
     header.style.flex_shrink = 0;
     try pop.content.appendChild(std.testing.allocator, header);
-    const sa = try @import("../scroll_area/mod.zig").mountScrollArea(.{ .direction = .vertical }, scope, ctx);
+    const sa = try @import("../scroll_area/mod.zig").ScrollArea(.{ .direction = .vertical }).mount(scope, ctx);
     try pop.content.appendChild(std.testing.allocator, sa.container);
     sa.container.style.height = .{ .fit = .{ .max = 300 } };
     sa.container.style.flex_shrink = 1;
@@ -1872,4 +1859,35 @@ test "Popover fit_content: a shrinkable scroll list grows back when its rows gro
     stepFrames(ctx, &now_ms, 3);
     try std.testing.expectApproxEqAbs(@as(f32, 240), sa.container.rectFromWorldOrFallback().h, 1);
     try std.testing.expectApproxEqAbs(@as(f32, 290), pop.chrome.rectFromWorldOrFallback().h, 1);
+}
+
+test "Popover: split open — trigger click and Esc are proposals the parent can reject" {
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
+    const root = try box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
+    ctx.root = root;
+    const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
+    defer scope.dispose();
+
+    const open = try scope.createSignal(bool, false);
+    const Gate = struct {
+        open: *Signal(bool),
+        allow_close: bool = false,
+        fn propose(self: *@This(), v: bool) void {
+            if (v or self.allow_close) self.open.set(v); // allow open, refuse close on demand
+        }
+    };
+    var gate = Gate{ .open = open };
+    const result = try Popover(.{ .open = @import("../../reactive.zig").split(open, ctx.on(Gate, &gate, Gate.propose)) }).mount(scope, ctx);
+    try root.appendChild(std.testing.allocator, result.wrapper);
+
+    result.trigger.behavior.events.on_click.?.invoke(); // open: parent accepts
+    try std.testing.expect(open.peek());
+    result.trigger.behavior.events.on_click.?.invoke(); // close: parent refuses
+    ctx.handleKeyDown(.escape, .{}); // Esc: also refused
+    try std.testing.expect(open.peek());
+    try std.testing.expect(!ctx.overlay_stack.anyExiting());
+    gate.allow_close = true;
+    ctx.handleKeyDown(.escape, .{});
+    try std.testing.expect(!open.peek());
 }

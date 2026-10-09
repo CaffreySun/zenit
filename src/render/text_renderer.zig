@@ -1,8 +1,9 @@
-/// Metal Text Renderer - GPU 实例化文本渲染
+/// Metal Text Renderer - GPU-instanced text rendering
 ///
-/// 使用 HarfBuzz 进行文本塑形，FreeType 光栅化字形
-/// GPU 实例化渲染实现高性能文本绘制
+/// HarfBuzz text shaping, FreeType glyph rasterization
+/// GPU-instanced render for high-perf text drawing.
 const std = @import("std");
+const builtin = @import("builtin");
 const gpu = @import("gpu");
 const text_module = @import("text");
 const Font = text_module.Font;
@@ -13,14 +14,14 @@ const font_stack_mod = @import("font_fallback_stack.zig");
 const FontFallbackStack = font_stack_mod.FontFallbackStack;
 const text_trace = @import("trace").text_flicker;
 
-/// Text Shader 源码（单一事实源）
-const text_shader_source: []const u8 = @embedFile("shaders/text.metal");
+/// Text shader source (single source of truth).
+const text_shader_source: []const u8 = @import("shader_sources.zig").text;
 const MAX_CLIP_POLYGON_POINTS = 32;
 const MAX_CLIP_POLYGON_CONTOURS = 8;
 
-/// Uniforms 结构（必须与 shader 匹配）
+/// Uniforms struct (must match shader).
 const Uniforms = extern struct {
-    viewport_size: [2]f32, // 物理像素
+    viewport_size: [2]f32, // Physical pixels.
     scale_factor: f32,
     clip_shape_kind: u32 = 0,
     clip_rect: [4]f32 = .{ 0, 0, 0, 0 },
@@ -28,40 +29,49 @@ const Uniforms = extern struct {
     clip_fill_rule: u32 = 0,
     clip_point_count: u32 = 0,
     clip_contour_count: u32 = 0,
-    clip_polygon_end_points: [MAX_CLIP_POLYGON_CONTOURS]u32 = [_]u32{0} ** MAX_CLIP_POLYGON_CONTOURS,
-    clip_polygon_points: [MAX_CLIP_POLYGON_POINTS][2]f32 = [_][2]f32{.{ 0, 0 }} ** MAX_CLIP_POLYGON_POINTS,
+    clip_polygon_end_points: [MAX_CLIP_POLYGON_CONTOURS]u32 = @as([MAX_CLIP_POLYGON_CONTOURS]u32, @splat(0)),
+    clip_polygon_points: [MAX_CLIP_POLYGON_POINTS][2]f32 = @as([MAX_CLIP_POLYGON_POINTS][2]f32, @splat(.{ 0, 0 })),
 };
 
-/// 字形实例数据（必须与 shader 匹配）
+/// Glyph instance data (must match shader).
 const GlyphInstance = extern struct {
-    position: [2]f32, // 字形左下角位置
-    size: [2]f32, // 字形尺寸
-    uv_rect: [4]f32, // UV 矩形 (u_min, v_min, u_max, v_max)
-    color: [4]f32, // 颜色 RGBA
-    rect_clip: [4]f32 = .{ 0, 0, -1, -1 }, // x, y, w, h (逻辑像素); negative size = disabled
-    skew_x: f32 = 0, // 合成斜体 x 偏移（逻辑像素）
-    page_index: f32 = 0, // Atlas 页号（CPU 分桶用，shader 不读）
-    /// >0.5 = 该字形在 BGRA 彩色页；shader 据此选采样路径（彩色直接输出
-    /// 采样值，不乘文字颜色）。
+    position: [2]f32, // Glyph bottom-left position.
+    size: [2]f32, // Glyph size.
+    uv_rect: [4]f32, // UV rect (u_min, v_min, u_max, v_max).
+    color: [4]f32, // Color RGBA.
+    rect_clip: [4]f32 = .{ 0, 0, -1, -1 }, // x, y, w, h (logical pixels); negative size = disabled.
+    skew_x: f32 = 0, // Synthetic italic x offset (logical pixels).
+    page_index: f32 = 0, // Atlas page number (CPU bucketing, shader doesn't read).
+    /// >0.5 = this glyph in BGRA color page; shader picks sample path per it (color direct output
+    /// sample,
+    /// not multiply text color).
     is_color: f32 = 0,
-    /// >0.5 = vertex shader 把 position 吸附到物理像素（round）。
-    /// direct_animated 文本必须置 0：各 glyph 的小数部分不同，逐 glyph round
-    /// 会让相邻字形在不同帧跨越取整阈值，产生字距/基线跳动。
-    /// per-instance 而非 per-draw：nearest/linear 两个列表内混装多种策略
-    /// （静态合成斜体、静态缩放文本也走 linear 列表）。
+    /// >0.5 = vertex shader snap position to physical pixel (round). direct_animated text must set
+    /// 0: each glyph
+    /// fractional part differs, per-glyph round causes adjacent glyphs cross rounding threshold
+    /// different frames,
+    /// produce letter spacing / baseline jitter. per-instance not per-draw: nearest/linear lists
+    /// mix multi-strategy
+    /// (static composite italic, static scale text also linear list).
     shader_snap: f32 = 1,
 };
 
-/// 单帧实例 buffer 容量（一帧内所有 flush 共享同一个 buffer）
-/// 编辑器 ~1000 + minimap text 模式 ~12000 + UI ~100 = ~13100 glyphs/帧
-/// Metal command buffer 是延迟执行，回绕覆写会破坏先前 draw call 引用的数据
+/// Single-frame instance buffer capacity (all frame flushes share one buffer). Editor ~1000 +
+/// minimap text mode
+/// ~12000 + UI ~100 = ~13100 glyphs/frame. Metal command buffer deferred-exec, wraparound overwrite
+/// breaks
+/// prior draw call data refs.
 const MAX_INSTANCES = 32768;
 const MAX_UNIFORM_UPDATES = 512;
+// D3D12 CBV addresses require 256-byte alignment. Append aligned slots so
+// normal shared draws can bind the retained frame buffer without snapshots.
+// D3D12 CBV addresses need 256-byte alignment; Metal buffer offsets need 16.
+const UNIFORM_STRIDE = std.mem.alignForward(usize, @sizeOf(Uniforms), if (gpu.backend_kind == .d3d12) 256 else 16);
 
-/// Triple buffering 常量
+/// Triple-buffering constant.
 const BUFFER_COUNT = 3;
 
-/// 颜色常量
+/// Color constant.
 pub const Color = struct {
     r: f32,
     g: f32,
@@ -79,38 +89,36 @@ pub const Color = struct {
     }
 };
 
-// ── 段级 Shaping Cache ──────────────────────────────────────────────
-// 借鉴 Chrome/Blink 词级缓存：将文本按 shaping 等价性切分为最小段，
-// CJK 单字独立缓存（无 ligature），ASCII 词+尾部空白为一段。
-// 内联存储消灭所有 alloc/free，确定性内存 ~5.5MB。
+// -- Segment-level Shaping Cache ------
+// Inspired by Chrome/Blink word-level cache: split text by shaping equivalence to min segment,
+// CJK single char standalone cache (no ligature), ASCII word + tail space one segment.
+// Inline storage kill all alloc/free, deterministic memory ~5.5MB.
 
-/// 段分割结果
+/// Segment split result.
 const Segment = struct {
     start: u32,
     end: u32,
 };
 
-/// 栈上最大段数（超过则 fallback 到整行缓存）
+/// Max segments on stack (over -> fallback whole-line cache).
 const MAX_SEGMENTS = 256;
 
-/// 段级缓存，每个段最多内联存储的 glyph 数。
+/// Segment-level cache: max inline glyphs per segment.
 ///
-/// 这个上限决定了哪些段能进缓存：超过的段每帧现场 shape。代码文本里
-/// 最长的段（`compute(alpha_00042,` 这类标识符/调用表达式，一段就是
-/// 一行的大半字节）普遍在 12～32 之间，取 12 时它们全部逐帧重 shape，
-/// git diff 滚动实测 encode 的 ~85% 都烧在 CTLineCreateWithAttributedString
-/// 上。32 覆盖绝大多数代码 token；更长的段默认走 owned 路径，
-/// 显式开启 cache_long_segments 时可进入有界 spill cache。
+/// Segments over this cap are re-shaped every frame. Code identifiers/call expressions are
+/// usually 12-32 glyphs; a cap of 12 re-shapes them all per frame and burns encode time in
+/// CTLineCreateWithAttributedString. 32 covers most code tokens; longer segments take the
+/// owned path, and explicit cache_long_segments enters the bounded spill cache.
 const MAX_SEGMENT_GLYPHS = 32;
 
-/// 段级缓存键
+/// Segment-level cache key.
 const SegmentCacheKey = struct {
-    content_hash: u64, // Wyhash(段文本)
-    font_ptr: usize, // 字体指针
+    content_hash: u64, // Wyhash(segment text).
+    font_ptr: usize, // Font pointer.
     flags: u8, // bit0: use_italic
 };
 
-/// 段级缓存条目（全内联，无 alloc）
+/// Segment-level cache entry (all inline, no alloc).
 const SegmentCacheEntry = struct {
     glyphs_buf: [MAX_SEGMENT_GLYPHS]text_module.ShapedGlyph = undefined,
     glyph_count: u8 = 0,
@@ -174,13 +182,14 @@ const LongSegmentCache = struct {
     }
 };
 
-/// 段级缓存最大条目数。条目是内联数组：32 glyph × 40B + 头 ≈ 1.3KB，
-/// 8K 条 ≈ 10.6MB 确定性内存（约 16 屏代码的工作集）。
-/// MAX_SEGMENT_GLYPHS 提到 32 时同步从 16K 降下来，总内存与旧配置持平。
+/// Max entry count. Entry inline array: 32 glyph x 40B + head ~ 1.3KB, 8K entry ~ 10.6MB
+/// deterministic memory (~ 16 screen code working set). MAX_SEGMENT_GLYPHS up to 32 sync drop from
+/// 16K,
+/// total memory same old config.
 const SEGMENT_CACHE_MAX = 8192;
 
-/// CoreText fallback font wrapper 缓存上限。
-/// run 级 CTFontRef 可能不是稳定指针，必须限制增长。
+/// CoreText fallback font wrapper cache limit.
+/// run-level CTFontRef may not stable pointer, must cap growth.
 const FALLBACK_FONT_CACHE_MAX = 256;
 var font_debug_budget: u32 = 12;
 
@@ -189,10 +198,11 @@ const FallbackFontCacheEntry = struct {
     frame_last_used: u64,
 };
 
-/// 主字体覆盖判定缓存的键：cmap 覆盖是 (字体, 码点) 的纯函数。
-/// 只有长命字体（selector 档位 / derived cache）会当 primary 进来，
-/// 指针作键安全，与 fallback wrapper 那个「run 级 CTFontRef 指针不稳定」
-/// 的教训不冲突：那是 CoreText 现场造的临时实例，这里是我们持有的。
+/// Primary font coverage check cache key: cmap coverage is (font, codepoint) pure function.
+/// Only long-lived fonts (selector slot / derived cache) come as primary. Using the pointer as
+/// key is safe here and does not conflict with the lesson that a run-level CTFontRef pointer is
+/// unstable for fallback wrappers: those are temporary instances CoreText creates on the fly,
+/// whereas these fonts are owned by us.
 const PrimaryCovKey = struct { font_ptr: usize, cp: u21 };
 const PRIMARY_COVERAGE_CACHE_MAX = 16384;
 
@@ -214,7 +224,7 @@ fn containsEnclosedDigit(text: []const u8) bool {
     return false;
 }
 
-/// 判断 codepoint 是否为 CJK 表意文字（无 ligature，可独立 shape）
+/// Judge codepoint is CJK ideograph (no ligature, can shape solo).
 fn isCJK(cp: u21) bool {
     return (cp >= 0x2E80 and cp <= 0x2EFF) or // CJK Radicals Supplement
         (cp >= 0x2F00 and cp <= 0x2FDF) or // Kangxi Radicals
@@ -243,40 +253,52 @@ fn isCJK(cp: u21) bool {
         (cp >= 0x2F800 and cp <= 0x2FA1F); // CJK Compatibility Supplement
 }
 
-/// BMP 内可带 emoji 表现的码点（U+1F000 以下）。这些字符本身是普通符号，
-/// 跟上 VS16(U+FE0F) 才转成彩色 emoji（如 ❤ U+2764 -> ❤️）。
-///
-/// 必须和 `cp >= 0x1F000` 一起进 emoji 分支：否则它们落到"其他 Unicode
-/// 逐码点独立"分支，基字与 VS16 被切成两段分别 shape，CoreText 看不到
-/// 这个组合 -> 退回单色文本形态，且宽度按窄字形算（12.742 vs 19.0），
-/// 光标随之偏移。
+/// BMP codepoints (below U+1F000) can have emoji presentation: followed by VS16 (U+FE0F) they
+/// become color emoji (e.g. heart U+2764). They must also enter the emoji branch; otherwise
+/// they drop to the "other Unicode per-codepoint solo" branch, base and VS16 are shaped
+/// separately, CoreText can't see the combination and falls back to the single-color form with
+/// the narrow width (12.742 vs 19.0), offsetting the cursor.
 fn isEmojiCapable(cp: u21) bool {
-    return (cp >= 0x2190 and cp <= 0x21FF) or // 箭头
-        (cp >= 0x2300 and cp <= 0x23FF) or // 技术符号（⌚⏰⏳…）
-        (cp >= 0x2460 and cp <= 0x24FF) or // 带圈字母数字
-        (cp >= 0x25A0 and cp <= 0x25FF) or // 几何图形
-        (cp >= 0x2600 and cp <= 0x27BF) or // 杂项符号 + Dingbats（☀★❤✅✨…）
-        (cp >= 0x2B00 and cp <= 0x2BFF) or // 杂项符号与箭头
-        (cp >= 0x1F000 and cp <= 0x1FAFF) or // 主 emoji 区（保险，实际由调用处 >= 0x1F000 覆盖）
+    return (cp >= 0x2190 and cp <= 0x21FF) or // Arrows.
+        (cp >= 0x2300 and cp <= 0x23FF) or // Technical symbols (stopwatch / timer / hourglass...).
+        (cp >= 0x2460 and cp <= 0x24FF) or // Circled letters & digits.
+        (cp >= 0x25A0 and cp <= 0x25FF) or // Geometric shapes.
+        (cp >= 0x2600 and cp <= 0x27BF) or // Misc symbols + Dingbats (sun / star / heart / checkmark / sparkles...).
+        (cp >= 0x2B00 and cp <= 0x2BFF) or // Misc symbols & arrows.
+        (cp >= 0x1F000 and cp <= 0x1FAFF) or // Main emoji region (safety, actually covered by caller >= 0x1F000).
         cp == 0x203C or cp == 0x2049 or // ‼ ⁉
         cp == 0x2122 or cp == 0x2139 or // ™ ℹ
         cp == 0x3030 or cp == 0x303D or
         cp == 0x3297 or cp == 0x3299;
 }
 
-/// 判断 codepoint 是否为 ZWJ/Variation Selector（Emoji 序列连接符）
+/// Keycap emoji sequence at `i`: `[0-9#*]` + optional VS16 (U+FE0F) + COMBINING ENCLOSING KEYCAP
+/// (U+20E3), e.g. 3️⃣. Returns its byte length, 0 when `i` does not start one. The base is ASCII,
+/// so without this the ASCII run swallows it and the keycap mark lands in a segment of its own:
+/// CoreText then draws a text "3" and the bare enclosing mark (an empty frame) instead of the
+/// emoji.
+fn keycapLen(text: []const u8, i: u32) u32 {
+    const b = text[i];
+    if (!((b >= '0' and b <= '9') or b == '#' or b == '*')) return 0;
+    var j = i + 1;
+    if (j + 3 <= text.len and std.mem.eql(u8, text[j .. j + 3], "\u{FE0F}")) j += 3;
+    if (j + 3 <= text.len and std.mem.eql(u8, text[j .. j + 3], "\u{20E3}")) return j + 3 - i;
+    return 0;
+}
+
+/// Judge codepoint is ZWJ / Variation Selector (emoji sequence joiner).
 fn isJoiner(cp: u21) bool {
     return cp == 0x200D or // ZWJ
         (cp >= 0xFE00 and cp <= 0xFE0F) or // Variation Selectors
         (cp >= 0xE0100 and cp <= 0xE01EF); // Variation Selectors Supplement
 }
 
-/// RTL 脚本码点（阿拉伯/希伯来及其扩展区），含这些脚本内部会用到的
-/// 结合符号。RTL **必须整段交给 CoreText**：
-///   1. bidi（UAX #9）重排是 CTLine 级别的行为，逐码点 shape 拿不到；
-///   2. 阿拉伯字母的连写形态（isolated/initial/medial/final）取决于左右
-///      邻居，切碎后每个字母都会退化成孤立形；
-///   3. 变音符号（harakat / niqqud）要挂到基字上，切开就变成独立字形。
+/// RTL script codepoint (Arabic / Hebrew & extension), include combiners used in these scripts.
+/// RTL **must hand whole segment to CoreText**: 1. bidi (UAX#9) re-order is CTLine-level,
+/// per-codepoint shape can't get;
+/// 2. Arabic letter connect form (isolated/initial/medial/final) depend left/right neighbor, cut
+///    breaks each letter
+/// degrade isolated; 3. diacritic (harakat / niqqud) hang on base, cut become solo glyph.
 fn isRtlScript(cp: u21) bool {
     return (cp >= 0x0590 and cp <= 0x05FF) or // Hebrew
         (cp >= 0x0600 and cp <= 0x06FF) or // Arabic
@@ -289,8 +311,8 @@ fn isRtlScript(cp: u21) bool {
         (cp >= 0xFE70 and cp <= 0xFEFF); // Arabic Presentation Forms-B
 }
 
-/// 将文本按 shaping 等价性切分为最小缓存单元
-/// 返回段数（0 = 空文本），超过 MAX_SEGMENTS 时返回 MAX_SEGMENTS + 1 表示溢出
+/// Split text by shaping equivalence to min cache unit.
+/// Return segment count (0 = empty text), over MAX_SEGMENTS return MAX_SEGMENTS + 1 overflow.
 fn segmentText(text: []const u8, out: *[MAX_SEGMENTS]Segment) u32 {
     if (text.len == 0) return 0;
     var seg_count: u32 = 0;
@@ -298,10 +320,10 @@ fn segmentText(text: []const u8, out: *[MAX_SEGMENTS]Segment) u32 {
     const len: u32 = @intCast(text.len);
 
     while (i < len) {
-        if (seg_count >= MAX_SEGMENTS) return MAX_SEGMENTS + 1; // 溢出
+        if (seg_count >= MAX_SEGMENTS) return MAX_SEGMENTS + 1; // Overflow.
 
         const byte = text[i];
-        // 判断首字节得到 codepoint 长度
+        // Judge first byte get codepoint length.
         const cp_len: u32 = if (byte < 0x80)
             1
         else if (byte < 0xE0)
@@ -311,9 +333,9 @@ fn segmentText(text: []const u8, out: *[MAX_SEGMENTS]Segment) u32 {
         else
             4;
 
-        if (i + cp_len > len) break; // 截断的 UTF-8，跳过
+        if (i + cp_len > len) break; // Truncated UTF-8, skip.
 
-        // 解码 codepoint
+        // Decode codepoint.
         const cp: u21 = switch (cp_len) {
             1 => @intCast(byte),
             2 => (@as(u21, byte & 0x1F) << 6) | @as(u21, text[i + 1] & 0x3F),
@@ -323,33 +345,43 @@ fn segmentText(text: []const u8, out: *[MAX_SEGMENTS]Segment) u32 {
         };
 
         if (isCJK(cp)) {
-            // CJK: 每个码点独立一段
+            // CJK: each codepoint solo segment.
             out[seg_count] = .{ .start = i, .end = i + cp_len };
             seg_count += 1;
             i += cp_len;
+        } else if (keycapLen(text, i) > 0) {
+            // Keycap emoji: the whole sequence is one segment (see keycapLen).
+            const kl = keycapLen(text, i);
+            out[seg_count] = .{ .start = i, .end = i + kl };
+            seg_count += 1;
+            i += kl;
+            while (i < len and text[i] == 0x20) i += 1;
+            out[seg_count - 1].end = i;
         } else if (byte < 0x80 and byte > 0x20) {
-            // ASCII 可见字符：连续扫描直到非 ASCII 可见或结束，包含尾部空白
+            // ASCII visible char: scan continuous to non-ASCII visible or end, include tail space;
+            // a keycap sequence ends the run (it is shaped as emoji, see keycapLen).
             const seg_start = i;
             i += 1;
-            while (i < len and text[i] > 0x20 and text[i] < 0x80) {
+            while (i < len and text[i] > 0x20 and text[i] < 0x80 and keycapLen(text, i) == 0) {
                 i += 1;
             }
-            // 吞掉尾部 ASCII 空白（与下一个词的间距属于当前段）
+            // Consume ASCII space tail (interval to next word own this segment).
             while (i < len and text[i] == 0x20) {
                 i += 1;
             }
             out[seg_count] = .{ .start = seg_start, .end = i };
             seg_count += 1;
         } else if (cp == 0x200D or (cp >= 0xFE00 and cp <= 0xFE0F)) {
-            // ZWJ/VS 出现在段首 = 前一个基字没把它吞进去。**必须仍然成段**：
-            // 直接 `i += cp_len` 会让这几个字节从所有段里消失，后续段的
-            // start/end 与原文错位（实测 "abc❤️def" 会漏掉一整段）。
-            // 交给 shaper 时它的 advance 是 0，不影响排版。
+            // ZWJ / VS at segment start = prior base didn't consume. **Must still segment**: direct
+            // i += cp_len drop bytes from
+            // all segment, later start/end mismatch original (test "abc heart-filled def" skip
+            // whole segment).
+            // Pass to shaper, its advance 0, layout unaffect.
             out[seg_count] = .{ .start = i, .end = i + cp_len };
             seg_count += 1;
             i += cp_len;
         } else if (cp >= 0x1F000 or isEmojiCapable(cp)) {
-            // Emoji 范围：连续扫描 ZWJ 连接的序列
+            // Emoji range: scan ZWJ-joined sequence continuous.
             const seg_start = i;
             i += cp_len;
             while (i < len) {
@@ -363,9 +395,10 @@ fn segmentText(text: []const u8, out: *[MAX_SEGMENTS]Segment) u32 {
                     4 => (@as(u21, nb & 0x07) << 18) | (@as(u21, text[i + 1] & 0x3F) << 12) | (@as(u21, text[i + 2] & 0x3F) << 6) | @as(u21, text[i + 3] & 0x3F),
                     else => unreachable,
                 };
-                // 只在**前一个码点是 ZWJ** 时才接受 BMP emoji 基字
-                // （如 ❤‍🔥 = U+1F525 ZWJ U+2764）。无条件接受 isEmojiCapable
-                // 会把紧跟 emoji 的普通符号（-> ■ 等）误吞进同一段。
+                // Only **prior codepoint is ZWJ** accept BMP emoji base (like heart ZWJ flame =
+                // U+1F525 ZWJ U+2764).
+                // Unconditional isEmojiCapable swallow normal symbol (-> / box etc) right after
+                // emoji into same segment.
                 const prev_was_zwj = i >= 3 and text[i - 3] == 0xE2 and text[i - 2] == 0x80 and text[i - 1] == 0x8D;
                 if (isJoiner(ncp) or ncp >= 0x1F000 or (prev_was_zwj and isEmojiCapable(ncp))) {
                     i += ncl;
@@ -374,7 +407,8 @@ fn segmentText(text: []const u8, out: *[MAX_SEGMENTS]Segment) u32 {
             out[seg_count] = .{ .start = seg_start, .end = i };
             seg_count += 1;
         } else if (byte == 0x20) {
-            // 前导/孤立空格：生成段（shaper 会给空格正确的 advance，确保 cursor_x 推进）
+            // Leading/isolated spaces: generate segment (shaper gives spaces correct advance,
+            // cursor_x advances)
             const seg_start = i;
             while (i < len and text[i] == 0x20) {
                 i += 1;
@@ -382,14 +416,16 @@ fn segmentText(text: []const u8, out: *[MAX_SEGMENTS]Segment) u32 {
             out[seg_count] = .{ .start = seg_start, .end = i };
             seg_count += 1;
         } else if (byte == 0x09 or byte == 0x0A or byte == 0x0D) {
-            // tab/换行：跳过（tab 应在上游被展开为空格）
+            // Tab/newline: skip (tabs should be expanded to spaces upstream)
             i += 1;
         } else if (isRtlScript(cp)) {
-            // RTL：连续的 RTL 码点**整段**扫下来交给 CoreText。
-            // 不能像下面 else 那样逐码点切，那会同时毁掉 bidi 重排、
-            // 阿拉伯连写形态和变音符号挂载（见 isRtlScript 注释）。
-            // 段内允许夹空格：RTL 词间空格属于同一个 bidi run，单独成段
-            // 会把一句话切成多个 run 并按 LTR 累加 cursor 拼回去。
+            // RTL: contiguous RTL codepoints go to CoreText **as a whole segment**.
+            // Don't segment per codepoint like the branch below: that would destroy bidi
+            // reordering,
+            // Arabic connective forms and diacritic attachment (see isRtlScript comment).
+            // Spaces within the segment are allowed: a space between RTL words belongs to the same
+            // bidi
+            // run; splitting would cut the sentence into several runs and sum the cursor as LTR.
             const seg_start = i;
             i += cp_len;
             while (i < len) {
@@ -403,12 +439,12 @@ fn segmentText(text: []const u8, out: *[MAX_SEGMENTS]Segment) u32 {
                     4 => (@as(u21, nb & 0x07) << 18) | (@as(u21, text[i + 1] & 0x3F) << 12) | (@as(u21, text[i + 2] & 0x3F) << 6) | @as(u21, text[i + 3] & 0x3F),
                     else => unreachable,
                 };
-                // 尾随空格不吞：留给后面的空格分支，避免把 RTL 段末尾
-                // 的空格算进 RTL run（那会让 LTR 续接位置偏移）。
+                // Trailing spaces not consumed: left for space branch below, avoid counting
+                // RTL segment trailing spaces into RTL run (would offset LTR continuation).
                 if (isRtlScript(ncp) or isJoiner(ncp)) {
                     i += ncl;
                 } else if (ncp == 0x20) {
-                    // 只有当空格后面仍是 RTL 时才并入本段。
+                    // Only merge space into current segment if next char is still RTL.
                     var j = i + 1;
                     while (j < len and text[j] == 0x20) j += 1;
                     if (j >= len) break;
@@ -428,7 +464,7 @@ fn segmentText(text: []const u8, out: *[MAX_SEGMENTS]Segment) u32 {
             out[seg_count] = .{ .start = seg_start, .end = i };
             seg_count += 1;
         } else {
-            // 其他 Unicode：每个码点独立
+            // Other Unicode: each codepoint independent
             out[seg_count] = .{ .start = i, .end = i + cp_len };
             seg_count += 1;
             i += cp_len;
@@ -437,113 +473,126 @@ fn segmentText(text: []const u8, out: *[MAX_SEGMENTS]Segment) u32 {
     return seg_count;
 }
 
-/// Metal Text Renderer
-/// text 管线模块级累计 GPU draw 数（FrameStats 取每帧增量用）
+/// Metal Text Renderer - text pipeline module-level cumulative GPU draw count
+/// (FrameStats takes per-frame delta)
 pub var text_draw_calls: u64 = 0;
 
-/// 模块级累计：uniform 槽位溢出到备用 buffer 的次数。
-///
-/// 溢出本身**不再丢字**（见 TextRenderer.flush 的注释），但它是「一帧内 clip
-/// 切换次数超出预期」的直接信号，那正是 2026-08 那轮 clip flush 风暴的
-/// 特征。恒为 0 是健康态；持续增长说明该去查 clip 链是否又在逐行重发。
-/// 导出到这里是为了让 e2e / /perf 能断言它，而不是只能靠翻日志。
+/// Module-level cumulative count of uniform slot overflows that spill to the backup buffer.
+/// Overflow itself **doesn't drop glyphs** (see TextRenderer.flush comment), but signals
+/// "clip switches per frame exceed expectation", the hallmark of a clip flush storm.
+/// Constant zero is healthy; steady growth means the clip chain may re-emit per row.
+/// Exported so e2e / /perf can assert it, not just scan logs.
 pub var text_uniform_overflow_total: u64 = 0;
-/// 模块级累计：fallback wrapper Font 的创建次数。
-/// 健康态下它应当与「不同 (字体,字号,traits) 组合数」同量级（几十以内）。
-/// 持续增长 = fallback 身份键失效回退成指针键，上面描述的丢字灾难会复发。
+/// Module-level cumulative: creation count of fallback wrapper Font.
+/// Healthy state on order of 'distinct (font,size,traits) combinations' (dozens or less).
+/// Steady growth = fallback identity key regression to pointer-based, character loss recurs.
 pub var fallback_wrappers_created_total: u64 = 0;
 
 pub const TextRenderer = struct {
+    pub const FontRangeRequest = struct {
+        text: []const u8,
+        font_size: f32,
+        font_weight: u16,
+        font_family: u16,
+        use_italic: bool,
+        use_monospace: bool,
+        use_symbols: bool,
+    };
+    pub const FontRangesProvider = *const fn (*anyopaque, FontRangeRequest, *Font, std.mem.Allocator) anyerror!?*text_module.FontRanges;
+    /// Shared shaping-equivalence segmentation for platform layout adapters.
+    pub const SegmentSpan = Segment;
+    pub const segment_capacity = MAX_SEGMENTS;
+    pub fn splitSegments(content: []const u8, out: *[segment_capacity]SegmentSpan) u32 {
+        return segmentText(content, out);
+    }
+
     allocator: std.mem.Allocator,
     device: *gpu.Backend.Device,
     pipeline: gpu.Backend.RenderPipeline,
-    /// Triple-buffered uniform buffers，必须与 instance buffers 一样按帧轮转。
-    /// 曾经是**单个** buffer 而每帧把 uniform_write_offset 归零：三帧在飞时第 N+1
-    /// 帧会覆写 GPU 尚未消费的第 N 帧 viewport/clip/scale，表现为偶发闪烁/错误裁剪。
+    /// Triple-buffered uniform buffers, must rotate per-frame like instance buffers.
+    /// Previously single buffer with uniform_write_offset reset each frame: with three in flight,
+    /// frame N+1 would overwrite N-frame viewport/clip/scale not yet consumed, manifesting
+    /// as flicker/wrong clipping.
     uniform_buffers: [BUFFER_COUNT]gpu.Backend.Buffer,
     uniform_write_offset: usize = 0,
-    /// 单帧 uniform 槽位溢出次数（诊断用）
+    /// Per-frame uniform slot overflow count (diagnostic)
     uniform_overflow_count: u64 = 0,
 
-    /// 溢出 uniform 缓冲（每帧槽位各一个，随需增长后**保留**）。
-    ///
-    /// 曾经：槽位用尽直接 `return error.UniformSlotsExhausted` 丢掉整批字。
-    /// 因为 flush 失败时 instances **不清空**，下一批带着旧实例再来一次、
-    /// 再次溢出，从耗尽那一刻起该帧剩余文本**全部不画**。用户可见症状是
-    /// 「大段文字消失但位置留白、逐帧闪烁」，而节点树/布局 rect 全对，
-    /// 只看 app_state 永远查不出来。
-    ///
-    /// 现在与 overflow_buffers（实例侧）同款：槽位不够就用一块按需增长、
-    /// 跨帧保留的溢出 buffer 继续画。容量够直接复用，不够才重建一次。
-    /// 槽位随 current_buffer 轮转，不会覆写 GPU 尚在消费的在飞帧数据。
-    uniform_overflow_buffers: [BUFFER_COUNT]?gpu.Backend.Buffer = [_]?gpu.Backend.Buffer{null} ** BUFFER_COUNT,
-    uniform_overflow_capacities: [BUFFER_COUNT]usize = [_]usize{0} ** BUFFER_COUNT,
-    /// 本帧内已用掉的溢出 uniform 槽数
+    /// Overflow uniform buffer (one per frame per slot, grows and is retained).
+    /// Slot exhaustion must not fail the batch: a flush failure doesn't clear instances, the next
+    /// batch overflows again, and the frame renders nothing from then on (symptom: large text
+    /// vanishes with gaps and flickers while node tree/layout rects stay correct).
+    /// Mirrors overflow_buffers (instance side): out of slots -> grow on demand in a cross-frame
+    /// retained overflow buffer. Enough capacity -> reuse, short -> rebuild once. Slots rotate
+    /// with current_buffer, so in-flight data is not overwritten.
+    uniform_overflow_buffers: [BUFFER_COUNT]?gpu.Backend.Buffer = @as([BUFFER_COUNT]?gpu.Backend.Buffer, @splat(null)),
+    uniform_overflow_capacities: [BUFFER_COUNT]usize = @as([BUFFER_COUNT]usize, @splat(0)),
+    /// Overflow uniform slots consumed in this frame
     uniform_overflow_used: usize = 0,
-    /// 本帧 flush 次数峰值（诊断用，导出到 /perf）
+    /// Peak flush count this frame (diagnostic, exported to /perf)
     uniform_peak_slots: usize = 0,
     /// Triple-buffered instance buffers
     instance_buffers: [BUFFER_COUNT]gpu.Backend.Buffer,
     current_buffer: usize = 0,
 
-    /// 溢出实例缓冲（每帧槽位各一个，随需增长后**保留**）。
-    ///
-    /// 旧实现在 MAX_INSTANCES 用尽后对**每一批**都 createBuffer + destroy,
-    /// 重文本帧每帧多次 driver 分配（走驱动，非 malloc）。改为按帧槽位持有
-    /// 一个可增长的 buffer：容量够就直接复用，不够才重建一次。槽位随
-    /// current_buffer 轮转，因此不会覆写 GPU 尚在消费的在飞帧数据。
-    /// 与 sdf_renderer 的保留池同款。
-    overflow_buffers: [BUFFER_COUNT]?gpu.Backend.Buffer = [_]?gpu.Backend.Buffer{null} ** BUFFER_COUNT,
-    overflow_capacities: [BUFFER_COUNT]usize = [_]usize{0} ** BUFFER_COUNT,
-    /// 本帧槽位内溢出缓冲的写入游标（字节），保证同帧多批次不互相覆写。
+    /// Overflow instance buffer (one per frame per slot, grows and is retained).
+    /// Destroying the buffer after every batch once MAX_INSTANCES is exhausted makes heavy-text
+    /// frames trigger multiple driver allocations (via driver, not malloc), so the buffer is a
+    /// per-frame-slot growable one: capacity enough -> reuse, short -> rebuild once.
+    /// Slots rotate with current_buffer, so GPU in-flight data is not overwritten.
+    /// Same pattern as the sdf_renderer retention pool.
+    overflow_buffers: [BUFFER_COUNT]?gpu.Backend.Buffer = @as([BUFFER_COUNT]?gpu.Backend.Buffer, @splat(null)),
+    overflow_capacities: [BUFFER_COUNT]usize = @as([BUFFER_COUNT]usize, @splat(0)),
+    /// This frame's overflow buffer write cursor (bytes) within slot,
+    /// ensures multiple batches don't overwrite each other.
     overflow_write_offset: usize = 0,
 
-    // 字体和图集
+    // Fonts and atlases
     atlas: GlyphAtlas,
 
-    /// 显式字体回退栈（应用注入；null = 维持纯 CoreText 级联行为）。
-    /// 见 font_fallback_stack.zig 的文件头注释。
+    /// Explicit font fallback stack (app-injected; null = maintain pure CoreText cascade).
+    /// See font_fallback_stack.zig header comment.
     fallback_stack: ?*FontFallbackStack = null,
-    /// (primary 字体, 码点) -> 是否覆盖。selectSegmentFont 的热路径缓存：
-    /// 命中后每个非 ASCII 段只付一次 hash 查找，不再走 CoreText FFI。
+    font_ranges_provider: ?FontRangesProvider = null,
+    font_ranges_context: ?*anyopaque = null,
+    /// Borrowed only during a single encoder draw; never enters segment caches.
+    active_font_ranges: ?*const text_module.FontRanges = null,
+
+    /// (primary font, codepoint) -> is covered. selectSegmentFont hot-path cache:
+    /// hit -> each non-ASCII segment pays hash lookup once, no CoreText FFI again.
     primary_coverage_cache: std.AutoHashMap(PrimaryCovKey, bool),
 
-    /// Prewarm 模式：只做 shaping + glyph 光栅化入 atlas，**不产出实例**。
-    ///
-    /// 帧初的 prewarm pass 目的是把缺失字形提前上传到 atlas（避开 GPU 关键路径），
-    /// 但此前它调用完整的 encodeText，把实例全部生成出来再整体丢弃
-    /// （shrinkRetainingCapacity），于是长文本/复杂 spans 的实例构造与 append
-    /// 被**白做一遍**（审查报告 P1：文本几乎编码两遍）。
-    /// 打开此开关后，emitGlyphInstance 在完成 atlas 插入后立即返回 advance，
-    /// 跳过所有实例构造与 append。
+    /// Prewarm mode: shape + rasterize glyphs into the atlas only, **no instance output**.
+    /// Early-frame prewarm uploads missing glyphs to the atlas before the GPU critical path;
+    /// running full encodeText would build all instances only to discard them
+    /// (shrinkRetainingCapacity), encoding text almost twice. With this flag emitGlyphInstance
+    /// returns the advance after atlas insertion, skipping all instance construction and append.
     glyph_only: bool = false,
 
-    /// 上一次真正跑完 prewarm 的命令流文本签名 + 当时的 atlas GC 代号。
-    ///
-    /// prewarm 唯一的产物是「缺失字形进 atlas」。若本帧的文本负载与上一帧
-    /// 逐字节相同、且期间没有发生 atlas 页驱逐，那么所需字形**必然**已经
-    /// 全部驻留，整趟 prewarm 是纯粹的空转（实测滚动 448 帧里 434 帧
-    /// inserts=0，白烧 8ms/帧，比 encode 本身还贵）。
-    /// 签名一致 + gc_generation 一致 -> 直接跳过。
-    /// 任一不符（文本变了 / 页被驱逐）都退回完整 prewarm，方向是安全的。
+    /// Text signature of the last fully-run prewarm command stream + atlas GC generation.
+    /// Prewarm's only output is "missing glyphs enter the atlas". If this frame's text matches the
+    /// previous one byte-for-byte and no atlas page was evicted in between, the required glyphs
+    /// **must** already be resident and the whole prewarm is pure spinning (often inserts=0 while
+    /// costing more than encode). Signature match + gc_gen match -> skip. Either differs (text
+    /// changed / page evicted) -> full prewarm.
     prewarm_signature: u64 = 0,
     prewarm_signature_valid: bool = false,
     prewarm_gc_generation: u32 = 0,
     shaper: TextShaper,
 
-    // 段级塑形缓存，词/CJK 单字粒度，内联存储无 alloc
+    // Segment-level shaping cache, word/CJK-single-char granularity, inline-stored no-alloc
     segment_cache: std.AutoHashMap(SegmentCacheKey, SegmentCacheEntry),
     cache_long_segments: bool = false,
     long_segment_cache: LongSegmentCache = .{},
-    // 整行 fallback 缓存，段溢出时使用
-    // CoreText 实际 fallback CTFontRef -> borrowed Font wrapper。
-    // run 级 CTFontRef 可能每次 shape 都重新 materialize，故必须做容量控制。
+    // Full-line fallback cache, used when segment overflows.
+    // CoreText actual fallback CTFontRef -> borrowed Font wrapper.
+    // Per-run CTFontRef may materialize fresh each shape, capacity control required.
     fallback_font_cache: std.AutoHashMap(u64, FallbackFontCacheEntry),
     current_frame: u64 = 0,
-    /// GC 本帧回收了 atlas 页面 -> 上层需要清除渲染命令缓存
+    /// GC collected atlas pages this frame -> upper layers must invalidate render cache
     atlas_gc_happened: bool = false,
 
-    // 当前帧的实例数据
+    // Current frame's instance data
     instances_nearest: std.ArrayList(GlyphInstance),
     instances_linear: std.ArrayList(GlyphInstance),
     viewport_width: f32,
@@ -555,46 +604,49 @@ pub const TextRenderer = struct {
     clip_fill_rule: u32 = 0,
     clip_point_count: u32 = 0,
     clip_contour_count: u32 = 0,
-    clip_polygon_end_points: [MAX_CLIP_POLYGON_CONTOURS]u32 = [_]u32{0} ** MAX_CLIP_POLYGON_CONTOURS,
-    clip_polygon_points: [MAX_CLIP_POLYGON_POINTS][2]f32 = [_][2]f32{.{ 0, 0 }} ** MAX_CLIP_POLYGON_POINTS,
+    clip_polygon_end_points: [MAX_CLIP_POLYGON_CONTOURS]u32 = @as([MAX_CLIP_POLYGON_CONTOURS]u32, @splat(0)),
+    clip_polygon_points: [MAX_CLIP_POLYGON_POINTS][2]f32 = @as([MAX_CLIP_POLYGON_POINTS][2]f32, @splat(.{ 0, 0 })),
     current_rect_clip: [4]f32 = .{ 0, 0, -1, -1 },
-    /// 当前 clip 区域的水平范围（逻辑像素），用于跳过视口外的 glyph
+    /// Current clip region's horizontal range (logical pixels), skip off-viewport glyphs
     clip_x_min: f32 = 0,
     clip_x_max: f32 = std.math.inf(f32),
-    /// 当前 pass 目标的**逻辑像素**宽（beginFrame/setViewport 的 width 参数）。
-    /// setRectClip(null) 要把 clip_x_min/max 恢复成整个目标宽度，
-    /// 不能用 viewport_width，那是乘过 scale 的物理像素。
+    /// Current pass target's **logical-pixel** width (beginFrame/setViewport width param).
+    /// setRectClip(null) must restore clip_x_min/max to whole target width, cannot use
+    /// viewport_width which is physical pixels post-scale.
     viewport_logical_width: f32 = 0,
-    /// 右端淡出遮罩窗口（逻辑像素，与 draw x 同空间；类 CSS mask-image 的
-    /// 文本专用最小实现）：glyph 左缘落在 [fade_x0, fade_x1] 内时 alpha 按
-    /// 位置线性降到 0，越过 fade_x1 全透明。inf/inf = 关闭。
-    /// 由 command_encoder 按 text 命令逐条设置并复位（同 clip_x_* 模式）。
+    /// Right-fade mask window (logical pixels, same space as draw x; CSS mask-image minimal
+    /// text-only): glyph left edge in [fade_x0, fade_x1] -> alpha linearly drops to 0, past
+    /// fade_x1 fully transparent. inf/inf = off. Set per text command and reset by
+    /// command_encoder (same mode as clip_x_*)
+    /// Font smoothing for the glyphs being emitted (set per text command by the encoder from
+    /// TextFontFlag.no_smoothing, reset after it)
+    smooth_fonts: bool = true,
     fade_x0: f32 = std.math.inf(f32),
     fade_x1: f32 = std.math.inf(f32),
     instance_high_water_mark: usize = 0,
-    /// flush 偏移：中间 flush 后追加写入，避免 GPU 异步执行时数据被覆盖
+    /// Flush offset: after mid-flush, append writes avoid GPU async overwrite
     buffer_write_offset: usize = 0,
 
-    /// 初始化 Text Renderer
+    /// Initialize Text Renderer
     pub fn init(allocator: std.mem.Allocator, device: *gpu.Backend.Device) !TextRenderer {
-        // 编译 shader
+        // Compile shader
         var shader = try gpu.Backend.ShaderModule.initFromSource(device, text_shader_source);
         defer shader.deinit();
 
-        // 获取函数
+        // Get function
         var vertex_func = try shader.getFunction("text_vertex_main");
         defer vertex_func.deinit();
         var fragment_func = try shader.getFunction("text_fragment_main");
         defer fragment_func.deinit();
 
-        // 创建 pipeline。此行之后每个可失败步骤都必须有 errdefer 覆盖已建
-        // 资源，GPU 对象 GPA 检测不到，泄漏的是 MTLBuffer/PSO/CoreText 资源。
-        // 注意：errdefer 声明在 for 循环体内会随迭代作用域失效（等于死代码，
-        // 这里曾经就是这么写的），计数必须放在循环外。
+        // Create pipeline. After this line, every fallible step must have errdefer covering
+        // created resources; GPU objects GPA won't detect, leaks are MTLBuffer/PSO/CoreText.
+        // Note: errdefer in for loop body loses scope with iteration (dead code, used to be
+        // that way); counter must go outside loop.
         var pipeline = try gpu.Backend.createRenderPipeline(device, .{
             .vertex_function = &vertex_func,
             .fragment_function = &fragment_func,
-            .color_attachment_formats = &[_]gpu.TextureFormat{.bgra8_unorm_srgb},
+            .color_attachment_formats = &[_]gpu.TextureFormat{gpu.color_format},
             .blend_state = .{
                 .source_rgb = .one,
                 .destination_rgb = .one_minus_src_alpha,
@@ -606,20 +658,20 @@ pub const TextRenderer = struct {
         });
         errdefer pipeline.deinit();
 
-        // 创建 uniform buffer
+        // Create uniform buffer
         var uniform_buffers: [BUFFER_COUNT]gpu.Backend.Buffer = undefined;
         var uniform_created: usize = 0;
         errdefer for (uniform_buffers[0..uniform_created]) |*ub| ub.destroy();
         for (&uniform_buffers) |*ubuf| {
             ubuf.* = try device.createBuffer(allocator, .{
                 .label = "Zenit.Text.Uniforms",
-                .size = @sizeOf(Uniforms) * MAX_UNIFORM_UPDATES,
+                .size = UNIFORM_STRIDE * MAX_UNIFORM_UPDATES,
                 .usage = .{ .vertex = true, .map_write = true },
             });
             uniform_created += 1;
         }
 
-        // 创建 triple-buffered instance buffers
+        // Create triple-buffered instance buffers
         var instance_buffers: [BUFFER_COUNT]gpu.Backend.Buffer = undefined;
         var instance_created: usize = 0;
         errdefer for (instance_buffers[0..instance_created]) |*ib| ib.destroy();
@@ -634,11 +686,11 @@ pub const TextRenderer = struct {
             instance_created += 1;
         }
 
-        // 创建字形图集
+        // Create glyph atlas
         var atlas = try GlyphAtlas.init(allocator, device);
         errdefer atlas.deinit();
 
-        // 创建文本塑形器
+        // Create text shaper
         const shaper = try TextShaper.init(allocator);
 
         std.log.info("[TextRenderer] Initialized", .{});
@@ -654,15 +706,15 @@ pub const TextRenderer = struct {
             .segment_cache = std.AutoHashMap(SegmentCacheKey, SegmentCacheEntry).init(allocator),
             .fallback_font_cache = std.AutoHashMap(u64, FallbackFontCacheEntry).init(allocator),
             .primary_coverage_cache = std.AutoHashMap(PrimaryCovKey, bool).init(allocator),
-            .instances_nearest = .{},
-            .instances_linear = .{},
+            .instances_nearest = .empty,
+            .instances_linear = .empty,
             .viewport_width = 800,
             .viewport_height = 600,
             .scale_factor = 1.0,
         };
     }
 
-    /// 销毁
+    /// Destroy
     pub fn deinit(self: *TextRenderer) void {
         var seg_iter = self.segment_cache.iterator();
         while (seg_iter.next()) |entry| {
@@ -692,23 +744,23 @@ pub const TextRenderer = struct {
         std.log.info("[TextRenderer] Destroyed", .{});
     }
 
-    /// 开始新帧
-    /// width/height: 逻辑像素; scale: DPI 缩放因子 (Retina=2.0)
+    /// Start new frame. width/height: logical pixels; scale: DPI scale factor (Retina=2.0)
     pub fn beginFrame(self: *TextRenderer, width: f32, height: f32, scale: f32) void {
         self.instances_nearest.clearRetainingCapacity();
         self.instances_linear.clearRetainingCapacity();
         self.buffer_write_offset = 0;
         self.current_buffer = (self.current_buffer + 1) % BUFFER_COUNT;
         self.uniform_write_offset = 0;
-        // 新槽位的溢出缓冲从头写起（该槽位上一次使用已隔了 BUFFER_COUNT 帧）
+        // Overflow buffer of new slot starts writing from beginning
+        // (this slot's last use was BUFFER_COUNT frames ago)
         self.overflow_write_offset = 0;
         self.uniform_overflow_used = 0;
         self.uniform_peak_slots = 0;
         self.current_frame += 1;
-        // DPI 变了（跨屏拖窗）会改字形光栅尺寸与 subpixel 分箱键，
-        // prewarm 的跳过基线随之失效。
+        // DPI changed (drag window across screens) -> glyph raster size and subpixel
+        // bin key change; prewarm skip baseline invalidated.
         if (self.scale_factor != scale) self.prewarm_signature_valid = false;
-        // viewport_size 传物理像素给 shader
+        // viewport_size passes physical pixels to shader
         self.viewport_width = width * scale;
         self.viewport_height = height * scale;
         self.scale_factor = scale;
@@ -718,38 +770,39 @@ pub const TextRenderer = struct {
         self.clip_fill_rule = 0;
         self.clip_point_count = 0;
         self.clip_contour_count = 0;
-        self.clip_polygon_end_points = [_]u32{0} ** MAX_CLIP_POLYGON_CONTOURS;
-        self.clip_polygon_points = [_][2]f32{.{ 0, 0 }} ** MAX_CLIP_POLYGON_POINTS;
+        self.clip_polygon_end_points = @as([MAX_CLIP_POLYGON_CONTOURS]u32, @splat(0));
+        self.clip_polygon_points = @as([MAX_CLIP_POLYGON_POINTS][2]f32, @splat(.{ 0, 0 }));
         self.current_rect_clip = .{ 0, 0, -1, -1 };
-        // 重置 clip 为全视口（逻辑像素）
+        // Reset clip to full viewport (logical pixels)
         self.viewport_logical_width = width;
         self.clip_x_min = 0;
         self.clip_x_max = width;
 
-        // 同步帧号到 atlas（用于页级 GC 的 last_used_frame 判断）
+        // Sync frame number to atlas (used for page-level last_used_frame GC judgment)
         self.atlas.current_frame = self.current_frame;
         self.atlas.frame_insert_count = 0;
-        // 周期性 age-based GC（内部自带间隔 + 预算门控，非每帧扫描）。
-        // 此前 atlas 只在页数撞到 MAX_PAGES(=512 MiB) 时才驱逐，
-        // EVICT_THRESHOLD 形同虚设（审查报告 P1）。
+        // Periodic age-based GC (self-throttled internally + budget gate, not every-frame scan).
+        // Previously atlas only evicted when page count hit MAX_PAGES (=512 MiB);
+        // EVICT_THRESHOLD was dead code (review report P1).
         self.atlas.maybeCollect();
 
-        // Atlas 页级 GC 已移至 window_render.zig 的 render() 之前执行
-        // 确保 GC 回收页面后能在同帧 invalidate 渲染缓存，避免引用已释放的纹理
+        // Atlas page-level GC moved to window_render.zig render() before execution,
+        // ensuring GC-collected pages can invalidate render cache same frame, avoiding
+        // stale texture references
         self.atlas_gc_happened = false;
 
-        // 段级缓存清理：降频 + 更长保留窗口，减少滚动抖动
+        // Segment cache cleanup: lower frequency + longer retention window, reduce jitter
         if (self.current_frame % 900 == 0) {
             self.evictStaleSegments();
             self.evictStaleFallbackFonts();
-            // fallback font 被释放后，atlas 的 GlyphKey.font_ptr 可能被新 Font
-            // 复用同一地址。prewarm 的跳过基线不能跨过这个点，强制下一帧重跑。
+            // After fallback font release, atlas GlyphKey.font_ptr may be reused by next Font at
+            // same address. prewarm skip baseline cannot cross this point; force next frame rerun.
             self.prewarm_signature_valid = false;
         }
     }
 
-    /// 仅更新 viewport 尺寸（离屏合成 render pass 切换时使用）
-    /// 不重置 buffer/instances/轮转，帧内状态保持连续
+    /// Update viewport size only (used when offscreen composite render pass switches).
+    /// Don't reset buffer/instances/rotation, frame-internal state stays continuous
     pub fn setViewport(self: *TextRenderer, width: f32, height: f32, scale: f32) void {
         self.viewport_width = width * scale;
         self.viewport_height = height * scale;
@@ -776,22 +829,20 @@ pub const TextRenderer = struct {
             self.clip_fill_rule = 0;
             self.clip_point_count = 0;
             self.clip_contour_count = 0;
-            self.clip_polygon_end_points = [_]u32{0} ** MAX_CLIP_POLYGON_CONTOURS;
-            self.clip_polygon_points = [_][2]f32{.{ 0, 0 }} ** MAX_CLIP_POLYGON_POINTS;
+            self.clip_polygon_end_points = @as([MAX_CLIP_POLYGON_CONTOURS]u32, @splat(0));
+            self.clip_polygon_points = @as([MAX_CLIP_POLYGON_POINTS][2]f32, @splat(.{ 0, 0 }));
         }
     }
 
-    /// 除了记录 per-instance 的 rect_clip，还把它的 x 范围并进
-    /// clip_x_min/x_max, draw 路径的 emit 循环按这对边界做左跳过/右截断。
-    /// 此前这对边界只在 beginFrame 设为整窗宽：rect clip 内的长行（split
-    /// 视图的半宽代码列、横滚窗口）会一路 emit 到窗口右缘，每个不可见
-    /// glyph 白付一次 atlas 查找 + instance append，最后由 GPU 按
-    /// per-instance rect_clip 丢弃。CPU 侧提前截断不改变可见结果：shader
-    /// 本来就画不出 rect 外的东西（负 bearing 探出的一丝与既有窗口右缘
-    /// 截断同类，已被容忍）。
-    ///
-    /// rect 与 cursor_x 同为目标坐标系的逻辑像素（离屏 pass 下同为
-    /// layer-local；encoder 的 syncRectClipState 在 pass 切换后会重推）。
+    /// Besides recording the per-instance rect_clip, also merge its x range into
+    /// clip_x_min/x_max; the draw path emit loop uses this pair to skip left / truncate right.
+    /// If it were only set to full window width at beginFrame, long lines within a rect clip
+    /// (split-view code column, h-scroll window) would emit to the window right edge, each
+    /// invisible glyph paying one atlas lookup + instance append before the GPU discards it by
+    /// per-instance rect_clip. Early CPU truncation doesn't change the visible result: the shader
+    /// can't draw outside the rect anyway (negative bearing fray is tolerated, same as the
+    /// window-right truncate). Rect and cursor_x are logical pixels in target coords (offscreen
+    /// pass also layer-local; encoder's syncRectClipState re-pushes after a pass switch).
     pub fn setRectClip(self: *TextRenderer, rect: ?[4]f32) void {
         self.current_rect_clip = rect orelse .{ 0, 0, -1, -1 };
         if (rect) |r| {
@@ -803,7 +854,7 @@ pub const TextRenderer = struct {
         }
     }
 
-    /// 清理超过 1800 帧未使用的段级缓存条目（约 30 秒 @60fps）
+    /// Clean up segment-cache entries unused over 1800 frames (approx 30 sec @60fps)
     fn evictStaleSegments(self: *TextRenderer) void {
         const evict_threshold = 1800;
         var keys_buf: [128]SegmentCacheKey = undefined;
@@ -826,8 +877,8 @@ pub const TextRenderer = struct {
     }
 
     fn destroyFallbackFontEntry(self: *TextRenderer, entry: FallbackFontCacheEntry) void {
-        // atlas 以 Font 堆地址为键；wrapper 释放后地址会被下一个 wrapper 复用，
-        // 不先摘条目就会让新字体命中旧字体的位图（画错字形）。
+        // Atlas keyed by Font heap address; after wrapper release address gets reused by next
+        // wrapper, must remove entry first or new font hits old font's bitmap (wrong glyph).
         self.atlas.forgetFont(@intFromPtr(entry.font));
         entry.font.deinit();
     }
@@ -854,9 +905,9 @@ pub const TextRenderer = struct {
         }
     }
 
-    /// 段级缓存满时驱逐：先删 >300 帧未用的；若仍满，清除一半
+    /// When segment cache full: evict first delete >300-frame-unused; if still full, clear half
     fn evictSegmentCacheOnFull(self: *TextRenderer) void {
-        // 第一轮：删除 >300 帧未使用的条目
+        // Pass 1: delete entries unused >300 frames
         const threshold = 300;
         var keys_buf: [256]SegmentCacheKey = undefined;
         var remove_count: usize = 0;
@@ -876,7 +927,7 @@ pub const TextRenderer = struct {
             }
         }
 
-        // 若仍满，暴力清除一半
+        // If still full, brutally clear half
         if (self.segment_cache.count() >= SEGMENT_CACHE_MAX) {
             var iter2 = self.segment_cache.iterator();
             var half = self.segment_cache.count() / 2;
@@ -958,61 +1009,76 @@ pub const TextRenderer = struct {
         }
     }
 
-    /// 绘制文本
+    /// Draw text
     fn getOrCreateGlyphFallbackFont(self: *TextRenderer, fallback_font_ref: *anyopaque, prototype: *Font) !*Font {
-        // 键必须是字体**身份**（PS 名+size+traits），不能是 CTFontRef 指针：
-        // CoreText 每次 shape 给的 run 级 fallback ref 不是稳定实例。指针作键
-        // 的实测后果（2026-08-22 定案，用户可见 bug）：
-        //   1. wrapper 每帧全量 miss，滚动 CJK 文档 240 帧创建 36.8 万个
-        //      wrapper Font（缓存 256 上限被打成 130↔194 的驱逐抖动）；
-        //   2. wrapper 堆地址进 GlyphKey.font_ptr -> 同一字形以无数“新字体”
-        //      重复收录进 glyph atlas -> 32 页耗尽 -> AtlasFull -> 后续 CJK 字形
-        //      被静默丢弃（中文逐字消失、位置留白、ASCII 因主字体指针稳定而
-        //      不受影响）；地址被 allocator 复用时则是键混叠，指鹿为马。
-        const key = text_module.fallbackFontRefIdentityHash(fallback_font_ref);
-        if (self.fallback_font_cache.getPtr(key)) |cached| {
-            cached.frame_last_used = self.current_frame;
-            cached.font.scale_factor = prototype.scale_factor;
-            return cached.font;
-        }
+        if (comptime builtin.target.os.tag != .macos and builtin.target.os.tag != .windows) {
+            return error.UnsupportedNativeFallbackFontRef;
+        } else {
+            // Key must be the font **identity** (PS name + size + traits), not the CTFontRef
+            // pointer:
+            // CoreText's per-run fallback ref isn't a stable instance. A pointer key causes:
+            //   1. wrapper total miss every frame (scrolling a CJK doc creates hundreds of
+            //      thousands of
+            //      wrappers, thrashing the 256-entry cache);
+            //   2. the wrapper heap addr enters GlyphKey.font_ptr -> the same glyph is recorded as
+            //      countless "new fonts" in the glyph atlas -> 32 pages exhausted -> AtlasFull ->
+            //      later CJK glyphs silently dropped (char-by-char vanishing with position gaps;
+            //      ASCII
+            //      unaffected because the primary font ptr is stable). When the allocator reuses
+            //      addresses, keys alias and point at the wrong font.
+            const key = text_module.fallbackFontRefIdentityHash(fallback_font_ref);
+            if (self.fallback_font_cache.getPtr(key)) |cached| {
+                cached.frame_last_used = self.current_frame;
+                cached.font.scale_factor = prototype.scale_factor;
+                return cached.font;
+            }
 
-        if (self.fallback_font_cache.count() >= FALLBACK_FONT_CACHE_MAX) {
-            self.evictFallbackFontsOnFull();
-        }
+            if (self.fallback_font_cache.count() >= FALLBACK_FONT_CACHE_MAX) {
+                self.evictFallbackFontsOnFull();
+            }
 
-        fallback_wrappers_created_total += 1;
-        const ct_size = text_module.fallbackFontRefSize(fallback_font_ref);
-        const requested_size = if (std.math.isFinite(ct_size) and ct_size > 0) ct_size else prototype.pixelSize();
-        const size_px: f32 = if (std.math.isFinite(requested_size)) std.math.clamp(requested_size, 1, 4096) else 1;
-        const fallback_font = try self.allocator.create(Font);
-        // Font wrapper 独立 retain CTFontRef，不依赖段级缓存的引用生命周期。
-        // 段级缓存淘汰时会 release 自己的 retain，不影响此处的引用。
-        text_module.retainFallbackFontRef(fallback_font_ref);
-        fallback_font.* = .{
-            .allocator = self.allocator,
-            .ct_font = fallback_font_ref,
-            .size = @intFromFloat(@round(size_px)),
-            .size_px = size_px,
-            .weight = prototype.weight,
-            .scale_factor = prototype.scale_factor,
-        };
-        // Font.deinit 既 release 上面那次 retain，也 destroy wrapper 堆块本身
-        // （见 font_system.zig Font.deinit）；这里再 destroy 一次就是 double free。
-        errdefer fallback_font.deinit();
-        try self.fallback_font_cache.put(key, .{
-            .font = fallback_font,
-            .frame_last_used = self.current_frame,
-        });
-        return fallback_font;
+            fallback_wrappers_created_total += 1;
+            const ct_size = text_module.fallbackFontRefSize(fallback_font_ref);
+            const requested_size = if (std.math.isFinite(ct_size) and ct_size > 0) ct_size else prototype.pixelSize();
+            const size_px: f32 = if (std.math.isFinite(requested_size)) std.math.clamp(requested_size, 1, 4096) else 1;
+            const fallback_font = if (comptime builtin.target.os.tag == .windows)
+                try Font.fromFallbackRef(self.allocator, fallback_font_ref, prototype)
+            else blk: {
+                const owned = try self.allocator.create(Font);
+                // Font wrapper independently retains CTFontRef, independent of segment cache
+                // reference lifetime. Segment cache evict releases its own retain, doesn't affect
+                // this.
+                text_module.retainFallbackFontRef(fallback_font_ref);
+                owned.* = .{
+                    .allocator = self.allocator,
+                    .ct_font = fallback_font_ref,
+                    .io = prototype.io,
+                    .size = @intFromFloat(@round(size_px)),
+                    .size_px = size_px,
+                    .weight = prototype.weight,
+                    .scale_factor = prototype.scale_factor,
+                };
+                break :blk owned;
+            };
+            // Font.deinit both releases that retain and destroys wrapper heap block itself
+            // (see font_system.zig Font.deinit); calling destroy again here is double-free.
+            errdefer fallback_font.deinit();
+            try self.fallback_font_cache.put(key, .{
+                .font = fallback_font,
+                .frame_last_used = self.current_frame,
+            });
+            return fallback_font;
+        }
     }
 
-    /// 接上应用的显式字体回退栈。传 null 断开（回到纯级联行为）。
-    /// 栈必须比本 renderer 活得久（应用层持有）。
+    /// Hook to app's explicit font fallback stack. Pass null to disconnect
+    /// (revert to pure cascade). Stack must outlive this renderer (held by app).
     pub fn setFallbackStack(self: *TextRenderer, stack: ?*FontFallbackStack) void {
         if (self.fallback_stack == stack) return;
         self.fallback_stack = stack;
         self.primary_coverage_cache.clearRetainingCapacity();
-        // 字体选择变了 -> prewarm 的「上一帧字形必然已驻留」基线失效。
+        // Font selection changed -> prewarm 'glyphs from last frame must be resident' baseline
+        // invalidated.
         self.prewarm_signature_valid = false;
     }
 
@@ -1027,18 +1093,16 @@ pub const TextRenderer = struct {
         return covered;
     }
 
-    /// shaping **前**的显式字体选择（CSS font-family 语义）：
-    /// 段首码点 -> primary 覆盖则 primary（隐式栈首），否则问回退栈拿第一个
-    /// 覆盖它的族的字体，用它直接 shape，选择确定、CTFont 由我们持有
-    /// （指针稳定）、跳过 CoreText 级联开销。都答不上才维持 primary，
-    /// 让 run 级联做最后兜底（emoji、罕见符号）。
-    ///
-    /// 判定只看段首码点：segmentText 已把 CJK 切成单码点段，混脚本段
-    /// （RTL/emoji 序列）本来就该整段一个字体。ASCII 段第一字节 < 0x80
-    /// 直接短路，ASCII 热路径零开销。
-    ///
-    /// ⚠ draw（shapeAndEmitSegment*）与 measure（measureTextWidthAsDrawn）
-    /// 必须都走这里，单边接入就是「量出来和画出来不一样宽」的老病复发。
+    /// Explicit font selection **before** shaping (CSS font-family semantics): segment-start
+    /// codepoint -> if primary covers it use primary (implicit stack head), else ask the fallback
+    /// stack for the first font covering it and shape directly; the selection is certain and the
+    /// CTFont is owned by us (pointer stable), skipping CoreText cascade overhead. If neither
+    /// answers, keep primary and let the run cascade do the final fallback (emoji, rare symbols).
+    /// Only the segment-start codepoint is checked: segmentText already splits CJK per codepoint;
+    /// mixed-script segments (RTL/emoji sequences) should use one font.
+    /// ASCII segments (first byte < 0x80) short-circuit: the ASCII hot path costs nothing.
+    /// WARNING: draw (shapeAndEmitSegment*) and measure (measureTextWidthAsDrawn) must both go
+    /// through here; if only one does, "measured and drawn width differ" recurs.
     fn selectSegmentFont(self: *TextRenderer, seg_text: []const u8, font: *Font, requested_size: f32) *Font {
         const stack = self.fallback_stack orelse return font;
         if (seg_text.len == 0 or seg_text[0] < 0x80) return font;
@@ -1047,19 +1111,19 @@ pub const TextRenderer = struct {
         const cp = std.unicode.utf8Decode(seg_text[0..seq_len]) catch return font;
         if (self.primaryCoversCodepoint(font, cp)) return font;
         if (stack.selectForCodepoint(cp, requested_size, font.weight)) |stack_font| {
-            // 与 fallback wrapper 同款的 scale 跟随：栈字体是共享实例，
-            // 光栅尺寸必须跟当前绘制上下文的 DPI 走。
+            // Same scale-following as fallback wrapper: stack fonts are shared instances;
+            // raster size must track current draw context DPI.
             stack_font.scale_factor = font.scale_factor;
             return stack_font;
         }
         return font;
     }
 
-    /// selectSegmentFont 之上的 EmitParams 适配：栈字体与主字体可能是不同
-    /// pixelSize 的实例，advance/offset 的 shaping 缩放必须按段字体重算。
-    /// use_subpixel 关闭：维持与既有级联回退一致的整像素光栅路径，避免
-    /// CJK 大字符集 × 亚像素分箱把 glyph atlas 撑爆（那是本功能要埋葬的
-    /// 事故，不能换个姿势再来一次）。
+    /// EmitParams adapted above selectSegmentFont: the stack font and primary font may be
+    /// different pixelSize instances, so shaping advance/offset scale must be recalculated per
+    /// segment font. use_subpixel is turned off: keep the whole-pixel raster path consistent with
+    /// the existing cascade fallback, to avoid a CJK large charset x subpixel bins exploding the glyph atlas
+    /// (must not be reintroduced).
     fn emitParamsForSegmentFont(p: EmitParams, seg_font: *Font) EmitParams {
         var seg_p = p;
         seg_p.font = seg_font;
@@ -1145,36 +1209,50 @@ pub const TextRenderer = struct {
         }
     }
 
-    /// Glyph emit 参数包（避免函数参数过多）
+    /// Glyph emit params pack (avoid function parameter explosion)
     const EmitParams = struct {
         requested_size: f32,
-        /// Shaping 空间缩放（用于 x_advance / x_offset / y_offset）
+        /// Shaping space scale (used for x_advance / x_offset / y_offset)
         layout_scale: f32,
         scale: f32,
         use_subpixel: bool,
         snap_to_device_pixels: bool,
-        /// vertex shader 是否对 position 做物理像素 round（写进 GlyphInstance.shader_snap）。
-        /// 与 snap_to_device_pixels 必须同源派生：CPU 吸附 + shader 吸附是幂等组合，
-        /// CPU 不吸附 + shader 吸附是 direct_animated 抖动根因（两侧合同见 text_blob.TextRasterPolicy）。
+        /// Does vertex shader snap position to physical pixels (written to
+        /// GlyphInstance.shader_snap).
+        /// Must match snap_to_device_pixels origin: CPU snap + shader snap is idempotent;
+        /// CPU no-snap + shader snap is direct_animated jitter cause (both sides contract
+        /// in text_blob.TextRasterPolicy).
         shader_snap: bool,
         synthetic_skew: f32,
         font: *Font,
         fallback_font: ?*Font,
         instance_list: *std.ArrayList(GlyphInstance),
         fixed_advance: f32 = 0,
+        explicit_range_raster: bool = false,
     };
 
-    /// 取 glyphs[i] 的 cluster_span = next_cluster - cur_cluster，最后一个 glyph 用 segment 末尾 byte 偏移。
-    /// fixed_advance 模式下用此 span 把 ligature glyph 推进 N 格，保持 byte_col -> pixel_x 恒等式。
+    /// Take glyphs[i] cluster_span = next_cluster - cur_cluster, last glyph uses
+    /// segment end byte offset. fixed_advance mode uses this span to advance ligature
+    /// glyph N cells, keep byte_col -> pixel_x identity.
     fn clusterSpanAt(glyphs: []const text_module.ShapedGlyph, idx: usize, segment_end_byte: u32) u32 {
         const cur = glyphs[idx].cluster;
         const next = if (idx + 1 < glyphs.len) glyphs[idx + 1].cluster else segment_end_byte;
         return if (next > cur) next - cur else 1;
     }
 
-    /// `cluster_span` 是该 glyph 覆盖的源 byte 数 (`next_cluster - glyph.cluster`)。
-    /// 在 fixed_advance 模式下，ligature glyph 的 cluster_span > 1，需要按 N × cell 推进
-    /// 以保持 byte_col -> pixel_x = byte_col × cell_width 的恒等式。
+    /// `cluster_span` is the source byte count this glyph covers (`next_cluster - glyph.cluster`).
+    /// In fixed_advance mode, a ligature glyph with cluster_span > 1 needs N x cell advance to
+    /// keep the byte_col -> pixel_x = byte_col x cell_width identity.
+    /// Physical-pixel left edge of a subpixel-binned glyph bitmap. The rasterizer
+    /// bakes the pen's fractional bin into the bitmap and measures bearing from the
+    /// integer origin (CoreText and DirectWrite alike), so only the pen's integer
+    /// pixel may move it. Rounding pen + bearing adds the fraction a second time:
+    /// every glyph whose pen fraction >= 0.5 lands one device pixel right,
+    /// which reads as random letter gaps at 100% scale.
+    fn subpixelGlyphLeftPx(pen_px: f32, bearing_px: f32) f32 {
+        return @floor(pen_px) + bearing_px;
+    }
+
     fn glyphAdvance(glyph: text_module.ShapedGlyph, cluster_span: u32, p: EmitParams) f32 {
         const advance = glyph.x_advance * p.layout_scale;
         if (p.fixed_advance > 0 and !glyph.is_fallback_font) {
@@ -1184,10 +1262,11 @@ pub const TextRenderer = struct {
         return advance;
     }
 
-    /// 注意：fixed_advance 模式下不能强制 clamp glyph_x >= cell_x。
-    /// JetBrains Mono 的 calt overhang（如 `less_slash.liga` xMin=-470）依赖
-    /// 字形从 cell 起点向左延伸来形成 `</` 视觉连字，强行 clamp 会让 alt 字形
-    /// 被推回 cell 内，与右侧字符重叠。让字体自己负 bearing 决定位置。
+    /// Caveat: fixed_advance mode cannot forcibly clamp glyph_x >= cell_x.
+    /// JetBrains Mono calt overhang (e.g. `less_slash.liga` xMin=-470) relies on the glyph
+    /// extending left of the cell origin to form the `</` visual ligature; a forced clamp pushes
+    /// the alt glyph back into the cell and overlaps the right neighbor. Let the font own its
+    /// bearing and decide position.
     fn clampFixedAdvanceGlyphX(x: f32, cell_x: f32, glyph: text_module.ShapedGlyph, p: EmitParams) f32 {
         _ = cell_x;
         _ = glyph;
@@ -1195,8 +1274,8 @@ pub const TextRenderer = struct {
         return x;
     }
 
-    /// 将单个 ShapedGlyph 转为 GlyphInstance 并追加到 instance list
-    /// 返回 cursor_x 增量 (glyph.x_advance * text_scale)
+    /// Convert single ShapedGlyph to GlyphInstance and append to instance list;
+    /// return cursor_x delta (glyph.x_advance * text_scale)
     fn emitGlyphInstance(
         self: *TextRenderer,
         glyph: text_module.ShapedGlyph,
@@ -1206,8 +1285,9 @@ pub const TextRenderer = struct {
         raw_glyph_color: Color,
         p: EmitParams,
     ) !f32 {
-        // 右端淡出遮罩：逐 glyph 按左缘位置调制 alpha（见 fade_x0/x1 注释）。
-        // 所有 draw 路径（含 spans 逐 glyph 着色）都汇到这里，单点生效。
+        // Right-fade mask: per-glyph modulate alpha by left edge position
+        // (see fade_x0/x1 comment). All draw paths (including spans per-glyph coloring)
+        // converge here, single-point effect.
         var glyph_color = raw_glyph_color;
         if (cursor_x >= self.fade_x0) {
             const span_w = self.fade_x1 - self.fade_x0;
@@ -1218,9 +1298,17 @@ pub const TextRenderer = struct {
             glyph_color.a *= keep;
         }
         const render_font = try self.selectRenderFontForGlyph(glyph, p);
+        // Rasterize at the current target's scale, not the window's: inside a magnified surface
+        // (an upscaled layer draws at parent scale x its magnification) a glyph rasterized for
+        // the window would be stretched (blurry). scale_factor only drives rasterization; the
+        // atlas keys glyphs by it.
+        if (p.scale > 0 and render_font.scale_factor != p.scale) render_font.setScaleFactor(p.scale);
+        // and with the command's font smoothing (TextProps.font_smoothing; atlas-keyed)
+        render_font.smooth_fonts = self.smooth_fonts;
         const layout_scale = p.layout_scale;
         const render_font_px = render_font.pixelSize();
-        // bitmap_scale 只作用于 bearing/bitmap 尺寸；layout_scale 继续作用于 shaping 偏移与 advance。
+        // bitmap_scale applies to bearing/bitmap size; layout_scale continues for
+        // shaping offset and advance.
         const bitmap_scale: f32 = if (p.requested_size > 0 and render_font_px > 0)
             p.requested_size / render_font_px
         else
@@ -1231,7 +1319,7 @@ pub const TextRenderer = struct {
         else
             p.instance_list;
 
-        if (p.use_subpixel and !glyph.is_synthetic_italic and !glyph.is_fallback_font) {
+        if (p.use_subpixel and !glyph.is_synthetic_italic and (!glyph.is_fallback_font or p.explicit_range_raster)) {
             const phys_x = (cursor_x + glyph.x_offset * layout_scale) * p.scale;
             const fract_x = phys_x - @floor(phys_x);
             const x_bin = atlas_mod.subpixelBin(fract_x);
@@ -1243,12 +1331,14 @@ pub const TextRenderer = struct {
             if (region.width == 0 or region.height == 0) {
                 return glyphAdvance(glyph, cluster_span, p);
             }
-            // prewarm：字形已进 atlas，实例不用产（见 glyph_only 注释）。
+            // prewarm: glyph already in atlas, no instance needed (see glyph_only comment).
             if (self.glyph_only) return glyphAdvance(glyph, cluster_span, p);
 
-            const sp_bearing_x: f32 = @as(f32, @floatFromInt(region.bearing_x)) / render_font.scale_factor;
             const sp_bearing_y: f32 = @as(f32, @floatFromInt(region.bearing_y)) / render_font.scale_factor;
-            const raw_final_x = cursor_x + glyph.x_offset * layout_scale + sp_bearing_x * bitmap_scale;
+            // The bitmap already carries the pen's fractional bin; place it from
+            // the pen's integer pixel only (see subpixelGlyphLeftPx).
+            const bearing_px = @as(f32, @floatFromInt(region.bearing_x)) * (p.scale / render_font.scale_factor) * bitmap_scale;
+            const raw_final_x = subpixelGlyphLeftPx(phys_x, bearing_px) / p.scale;
             const final_x = clampFixedAdvanceGlyphX(raw_final_x, cursor_x, glyph, p);
             const final_y = cursor_y + glyph.y_offset * layout_scale - sp_bearing_y * bitmap_scale;
             const snap_x = if (p.snap_to_device_pixels) @round(final_x * p.scale) / p.scale else final_x;
@@ -1279,7 +1369,7 @@ pub const TextRenderer = struct {
             if (region.width == 0 or region.height == 0) {
                 return glyphAdvance(glyph, cluster_span, p);
             }
-            // prewarm：同上，只要字形进了 atlas 就够了。
+            // prewarm: same; just glyph in atlas is enough.
             if (self.glyph_only) return glyphAdvance(glyph, cluster_span, p);
 
             const bearing_x: f32 = @as(f32, @floatFromInt(region.bearing_x)) / render_font.scale_factor;
@@ -1316,23 +1406,22 @@ pub const TextRenderer = struct {
         return glyphAdvance(glyph, cluster_span, p);
     }
 
-    /// lookupOrShapeSegment 的返回值：glyphs 要么借自缓存、要么归调用方所有。
-    ///
-    /// owned=true 时调用方必须 `releaseGlyphFallbackFontRefs` + `free`；
-    /// owned=false 时内存与其中 fallback_font_ref 的 retain 都归缓存，
-    /// 由 evict/deinit 统一释放，调用方只在本次 draw 内借用。
+    /// lookupOrShapeSegment return: glyphs either borrowed from cache or caller-owned.
+    /// owned=true caller must `releaseGlyphFallbackFontRefs` + `free`;
+    /// owned=false memory and its fallback_font_ref retains belong to cache,
+    /// released by evict/deinit, caller only borrows for this draw.
     const SegmentGlyphs = struct {
         glyphs: []const text_module.ShapedGlyph,
         owned: bool,
     };
 
-    /// 段级缓存查找/插入。miss 时 shape 一次：能进缓存就进缓存（借出），
-    /// 进不了（超长 / put 失败）就把这次 shape 的结果**连所有权一起交给
-    /// 调用方**，绝不丢弃重来，旧实现对超长段先 shape、发现超限后 free
-    /// 掉返回 null，调用方拿到 null 再 shape 一遍：代码行里最长的那几个段
-    /// （标识符/调用表达式）每帧每行付两次 CTLine 创建，git diff 滚动实测
-    /// encode 的大头就是它。丢弃路径还只 free 不 release fallback_font_ref，
-    /// 含 fallback 字形的长段会泄漏 CTFontRef 的 retain。
+    /// Segment cache lookup/insert. Miss -> shape once: if it fits the cache, cache it (borrow),
+    /// else (too long / put failed) **hand the caller ownership including glyphs**; never
+    /// discard and retry. Shaping an oversized segment, discovering the over-limit, freeing it and
+    /// returning null makes the caller shape again, so the longest code segments
+    /// (identifiers/call expressions) pay CTLine creation twice per frame per line. The discard
+    /// path must also release fallback_font_ref, else long segments with fallback glyphs leak a
+    /// CTFontRef.
     fn lookupOrShapeSegment(
         self: *TextRenderer,
         seg_text: []const u8,
@@ -1356,16 +1445,17 @@ pub const TextRenderer = struct {
                 return .{ .glyphs = glyphs, .owned = false };
         }
 
-        // cache miss, shape 这个段
+        // cache miss, shape this segment
         const shaped = try self.shaper.shapeWithOptions(seg_text, font, use_italic);
 
-        // 超过内联容量时尝试有界长段缓存；失败仍把所有权交给调用方。
+        // When inline capacity exceeded, try bounded long-segment cache; failure still hands
+        // caller ownership.
         if (shaped.len > MAX_SEGMENT_GLYPHS) {
             const cached = self.cache_long_segments and self.long_segment_cache.adopt(self.allocator, cache_key, seg_text, shaped, self.current_frame);
             return .{ .glyphs = shaped, .owned = !cached };
         }
 
-        // 缓存满时驱逐
+        // Evict when full
         if (self.segment_cache.count() >= SEGMENT_CACHE_MAX) {
             self.evictSegmentCacheOnFull();
         }
@@ -1376,33 +1466,33 @@ pub const TextRenderer = struct {
         };
         @memcpy(entry.glyphs_buf[0..shaped.len], shaped);
         const gop = self.segment_cache.getOrPut(cache_key) catch {
-            // put 失败（极罕见）：条目没进缓存，refs 无人接管，所有权交回调用方。
-            // 旧实现在这里把栈上 entry 连同已 memcpy 进去的 fallback refs 一起
-            // 丢掉，每个 ref 泄漏一个 retain。
+            // put failed (extremely rare): entry didn't enter cache, refs unclaimed, ownership
+            // handed back to caller. Old impl threw stale stack entry plus already-memcpied
+            // fallback refs away, each ref leaked a retain.
             return .{ .glyphs = shaped, .owned = true };
         };
         gop.value_ptr.* = entry;
-        // fallback_font_ref 的 retain 已随 memcpy 进缓存条目（唯一一份，
-        // 由 evict/deinit release）；heap slice 本身不再承载所有权，直接还。
+        // fallback_font_ref's retain already went into cache entry via memcpy (sole owner,
+        // released by evict/deinit); heap slice itself no longer carries ownership, return.
         self.allocator.free(shaped);
         return .{ .glyphs = gop.value_ptr.glyphs_buf[0..gop.value_ptr.glyph_count], .owned = false };
     }
 
-    /// 一段文本**实际会被画成多宽**，与 drawTextWithOptions 的 emit 循环
-    /// 同一套分段、同一个 shaper、同一份 glyphAdvance 公式，只是不 emit。
+    /// How wide a text segment ACTUALLY draws: uses the same segmentation, shaper and
+    /// glyphAdvance formula as the drawTextWithOptions emit loop, just doesn't emit.
     ///
-    /// == 为什么布局必须用这个,而不是另测一次 ==
-    /// `.fit` 宽度本质是「先测一次、再画一次」,两次答案不一致 = 容器按 A 收紧、
-    /// 字按 B 画,尾部被裁。而绘制端的宽度并不是"文本 + 字号"的纯函数,它还取决于:
-    ///   1. 用哪个 *Font shape（italic/mono/symbols/脚本回退各选各的）
-    ///   2. **分段方式**，绘制按 segmentText 逐段 shape(CJK 逐码点、ASCII 成词),
-    ///      整串一次 shape 会多出跨段 kerning/连字,与逐段累加的结果不等
-    ///   3. fixed_advance(等宽网格)对 ligature 的按格推进
-    /// 任何"重新实现一遍测量"的函数都必须同时复刻这三条才可能对得上,而它们会
-    /// 各自演进，于是分岔是必然的,不是偶然的。所以这里不提供第二套算法,
-    /// 只提供**同一套算法的不 emit 版本**。
+    /// Layout must use this instead of remeasuring: .fit width is "measure once, draw once"; two
+    /// different answers = container shrinks per A, text draws per B, tail gets clipped. Drawn
+    /// width is not a pure function of "text + font size", it depends on:
+    ///   1. Which *Font shapes it (italic/mono/symbols/script fallback each pick their own)
+    ///   2. Segmentation: draw segments per segmentText (CJK per codepoint, ASCII by word);
+    ///      whole-string shaping produces cross-segment kerning/ligatures absent from per-segment
+    ///      sums
+    ///   3. fixed_advance (monospace grid) pushes ligatures by grid
+    /// A re-implemented measure function must duplicate all three and they evolve independently,
+    /// so divergence is inevitable. Hence no second algorithm, only this same one WITHOUT emit.
     ///
-    /// 参数与 drawTextWithOptions 一一对应,调用方必须原样传它给渲染时会传的值。
+    /// Parameters mirror drawTextWithOptions one-to-one; pass the values the render-time call uses.
     pub fn measureTextWidthAsDrawn(
         self: *TextRenderer,
         text: []const u8,
@@ -1428,8 +1518,9 @@ pub const TextRenderer = struct {
             for (seg_buf[0..effective_count]) |seg| {
                 const seg_text = remaining[seg.start..seg.end];
                 const seg_end_byte: u32 = @intCast(seg_text.len);
-                // 显式字体栈：与 draw 的 emit 循环**同一个** selectSegmentFont。
-                // 单边接入 = 量的和画的不是一个字体，.fit 容器裁尾巴的老病复发。
+                // Explicit font stack: **same** selectSegmentFont as draw emit loop.
+                // Single-path buy-in = measured and drawn use different font, .fit container
+                // clips tail, old bug recurs.
                 const seg_font = self.selectSegmentFont(seg_text, font, requested_size);
                 const seg_px = seg_font.pixelSize();
                 const seg_scale: f32 = if (requested_size > 0 and seg_px > 0)
@@ -1443,8 +1534,9 @@ pub const TextRenderer = struct {
                 };
                 for (shaped.glyphs, 0..) |g, i| {
                     const span = clusterSpanAt(shaped.glyphs, i, seg_end_byte);
-                    // glyphAdvance 只用到 layout_scale / fixed_advance 两项,
-                    // 其余 emit 相关字段与宽度无关,给零值即可。
+                    // glyphAdvance only uses layout_scale / fixed_advance, other emit fields
+                    // unrelated
+                    // to width, pass zero.
                     total += glyphAdvance(g, span, .{
                         .requested_size = requested_size,
                         .layout_scale = seg_scale,
@@ -1484,7 +1576,7 @@ pub const TextRenderer = struct {
     ) !void {
         const instances_before = self.instances_nearest.items.len + self.instances_linear.items.len;
 
-        // 计算缩放因子: UI 请求大小 / 字体物理大小
+        // Calculate scale factor: UI requested size / font physical size
         const font_physical_size = font.pixelSize();
         const text_scale: f32 = if (requested_size > 0 and font_physical_size > 0)
             requested_size / font_physical_size
@@ -1510,19 +1602,21 @@ pub const TextRenderer = struct {
             .fixed_advance = fixed_advance,
         };
 
-        // 水平视口裁剪边界（逻辑像素）
+        if (try self.emitFontRanges(text, x, y, color, use_italic, emit_params, &.{})) return;
+
+        // Horizontal viewport clip boundary (logical pixels)
         const clip_left = self.clip_x_min;
         const clip_right = self.clip_x_max;
 
-        // 段分割 + 逐段渲染（统一路径，溢出时自动续分）
+        // Segment split + per-segment render (unified path, auto-continue on overflow)
         var cursor_x = x;
         var seg_buf: [MAX_SEGMENTS]Segment = undefined;
-        var text_pos: u32 = 0; // 已处理到的字节偏移
+        var text_pos: u32 = 0; // byte offset processed so far
 
         while (text_pos < text.len) {
             if (cursor_x > clip_right) break;
 
-            // 对剩余文本做段分割
+            // Segment-split remaining text
             const remaining = text[text_pos..];
             const seg_count = segmentText(remaining, &seg_buf);
             const effective_count = @min(seg_count, MAX_SEGMENTS);
@@ -1534,14 +1628,14 @@ pub const TextRenderer = struct {
                 cursor_x = try self.shapeAndEmitSegment(seg_text, cursor_x, y, color, clip_left, text_scale, font, use_italic, emit_params);
             }
 
-            // 更新已处理偏移
+            // Update processed offset
             if (effective_count > 0) {
                 text_pos += seg_buf[effective_count - 1].end;
             } else {
-                break; // 无法分段（空文本），退出
+                break; // Cannot segment (empty text), exit
             }
 
-            // 未溢出则已处理完全部文本
+            // Didn't overflow -> fully processed all text
             if (seg_count <= MAX_SEGMENTS) break;
         }
 
@@ -1564,8 +1658,36 @@ pub const TextRenderer = struct {
         }
     }
 
-    /// 辅助：shape 并 emit 单个文本段（无 span），返回更新后的 cursor_x。
-    /// 支持左边界跳过（shape 后不 emit）和段级缓存。
+    fn emitFontRanges(self: *TextRenderer, content: []const u8, x: f32, y: f32, color: Color, italic: bool, params: EmitParams, spans: []const ColorSpan) !bool {
+        if (comptime builtin.os.tag != .windows) return false;
+        const ranges = self.active_font_ranges orelse return false;
+        const glyphs = try self.shaper.shapeWithRanges(content, params.font, italic, ranges);
+        defer self.allocator.free(glyphs);
+        defer releaseGlyphFallbackFontRefs(glyphs);
+        var cursor = x;
+        for (glyphs, 0..) |glyph, index| {
+            var p = params;
+            // A provider-selected face is intentional, not an automatic fallback.
+            // Keep the same fractional-origin raster policy as direct selection.
+            p.explicit_range_raster = true;
+            // Explicit range sizes affect raster dimensions as well as advance.
+            // Preserve shaping scale; do not normalize every run to base size.
+            if (glyph.fallback_font_ref) |ref| p.requested_size = text_module.fallbackFontRefSize(ref) * params.layout_scale;
+            var glyph_color = color;
+            // Visual-order glyphs may have descending clusters (RTL).
+            for (spans) |span| {
+                if (span.start <= glyph.cluster and glyph.cluster < span.end) {
+                    glyph_color = span.color;
+                    break;
+                }
+            }
+            cursor += try self.emitGlyphInstance(glyph, clusterSpanAt(glyphs, index, @intCast(content.len)), cursor, y, glyph_color, p);
+        }
+        return true;
+    }
+
+    /// Helper: shape and emit single text segment (no spans), return updated cursor_x.
+    /// Supports left-boundary skip (shape but don't emit) and segment cache.
     fn shapeAndEmitSegment(
         self: *TextRenderer,
         seg_text: []const u8,
@@ -1581,7 +1703,8 @@ pub const TextRenderer = struct {
         var cursor_x = cursor_x_in;
 
         const seg_end_byte: u32 = @intCast(seg_text.len);
-        // 显式字体栈：shaping 前按段首码点选字体（见 selectSegmentFont）。
+        // Explicit font stack: per-segment-start codepoint font selection before shaping
+        // (see selectSegmentFont).
         const seg_font = self.selectSegmentFont(seg_text, font, p.requested_size);
         const seg_p = if (seg_font != font) emitParamsForSegmentFont(p, seg_font) else p;
         const seg = try self.lookupOrShapeSegment(seg_text, seg_font, use_italic);
@@ -1603,14 +1726,14 @@ pub const TextRenderer = struct {
         return cursor_x;
     }
 
-    /// 文本颜色 span，用于 drawTextWithSpans 逐 glyph 着色
+    /// Text color span for drawTextWithSpans per-glyph coloring
     pub const ColorSpan = struct {
-        start: u32, // content 中的字节偏移
+        start: u32, // byte offset within content
         end: u32,
         color: Color,
     };
 
-    /// 整行一次塑形 + 逐 glyph 按 span 着色（段级缓存版）
+    /// Shape full line once + per-glyph color by span (segment-cache version)
     pub fn drawTextWithSpans(
         self: *TextRenderer,
         text: []const u8,
@@ -1651,11 +1774,13 @@ pub const TextRenderer = struct {
             .fixed_advance = fixed_advance,
         };
 
-        // 水平视口裁剪边界（逻辑像素）
+        if (try self.emitFontRanges(text, x, y, base_color, use_italic, emit_params, spans)) return;
+
+        // Horizontal viewport clip boundary (logical pixels)
         const clip_left = self.clip_x_min;
         const clip_right = self.clip_x_max;
 
-        // 段分割 + 逐段渲染（统一路径，溢出时自动续分）
+        // Segment split + per-segment render (unified path, auto-continue on overflow)
         var cursor_x = x;
         var span_idx: usize = 0;
         var seg_buf: [MAX_SEGMENTS]Segment = undefined;
@@ -1672,7 +1797,7 @@ pub const TextRenderer = struct {
                 if (cursor_x > clip_right) break;
 
                 const seg_text = remaining[seg.start..seg.end];
-                // 全局字节偏移 = text_pos + seg 内偏移（用于 span 匹配）
+                // Global byte offset = text_pos + offset within segment (for span matching)
                 const global_start = text_pos + seg.start;
                 const global_end = text_pos + seg.end;
                 cursor_x = try self.shapeAndEmitSegmentWithSpans(seg_text, global_start, cursor_x, y, base_color, clip_left, text_scale, font, use_italic, emit_params, spans, &span_idx, global_end);
@@ -1688,7 +1813,7 @@ pub const TextRenderer = struct {
         }
     }
 
-    /// 辅助：shape 并 emit 单个带 spans 的文本段，返回更新后的 cursor_x。
+    /// Helper: shape and emit single span-bearing segment, return updated cursor_x.
     fn shapeAndEmitSegmentWithSpans(
         self: *TextRenderer,
         seg_text: []const u8,
@@ -1707,10 +1832,10 @@ pub const TextRenderer = struct {
     ) !f32 {
         var cursor_x = cursor_x_in;
 
-        // 显式字体栈：与 shapeAndEmitSegment 同一套 shaping 前选择。
+        // Explicit font stack: same shaping-before-selection as shapeAndEmitSegment.
         const seg_font = self.selectSegmentFont(seg_text, font, p.requested_size);
         const seg_p = if (seg_font != font) emitParamsForSegmentFont(p, seg_font) else p;
-        // Shape：缓存借出或本次独有（owned），owned 时本函数负责释放。
+        // Shape: cache-borrowed or this-time-owned, owned -> this function releases.
         const seg = try self.lookupOrShapeSegment(seg_text, seg_font, use_italic);
         defer if (seg.owned) {
             releaseGlyphFallbackFontRefs(seg.glyphs);
@@ -1720,7 +1845,7 @@ pub const TextRenderer = struct {
         self.logEnclosedDigitFontDebug(seg_text, seg_font, use_italic, seg_p.fallback_font, glyphs, if (seg.owned) "fresh-shape-spans" else "segment-cache-spans");
 
         const seg_end_byte: u32 = @intCast(seg_text.len);
-        // 左边界裁剪：整段在视口左侧则跳过 emit
+        // Left-boundary clip: entire segment left of viewport -> skip emit
         if (cursor_x < clip_left) {
             var adv: f32 = 0;
             for (glyphs, 0..) |g, i| adv += glyphAdvance(g, clusterSpanAt(glyphs, i, seg_end_byte), seg_p);
@@ -1744,35 +1869,37 @@ pub const TextRenderer = struct {
         return cursor_x;
     }
 
-    /// 中间 flush：绘制当前积累的字形实例并清空缓冲区
-    /// 用于 scissor rect 变更前确保文本按正确 clip 区域绘制
-    /// Multi-Page: 按 page_index 分桶，每桶切换纹理后 draw
+    /// Mid-flush: draw accumulated glyph instances and clear buffer.
+    /// Ensures text draws per correct clip region before scissor rect change.
+    /// Multi-Page: per page_index bucket, each bucket switches texture then draws
     pub fn flush(self: *TextRenderer, render_pass: *gpu.Backend.RenderPass) !void {
         const nearest_count = self.instances_nearest.items.len;
         const linear_count = self.instances_linear.items.len;
         if (nearest_count == 0 and linear_count == 0) return;
 
-        // 更新 uniform buffer
+        // Update uniform buffer.
         //
-        // 溢出**不能** clamp 到最后一槽，那会让本批及后续 draw 别名同一块随后
-        // 被覆写的内存，静默画错。也**不能**丢掉这一批：flush 失败时下面的
-        // clearRetainingCapacity 到不了，实例留在原地，下一批带着它再溢出一次，
-        // 于是该帧从此刻起一个字都画不出来（症状：整段中文消失、位置留白、闪烁）。
+        // Overflow **cannot** clamp to the last slot: that aliases the batch and subsequent draws
+        // to
+        // soon-overwritten memory (silent wrong draw). It also **cannot** drop the batch: a flush
+        // failure doesn't reach clearRetainingCapacity below, instances stay, the next batch
+        // overflows
+        // again with stale instances, and the frame renders **nothing** from that point.
         //
-        // 正确做法是继续画：槽位不够就切到按需增长、跨帧保留的溢出 buffer，
-        // 与实例侧的 overflow_buffers 同款。
+        // Correct: keep drawing. Out of slots -> switch to a grow-on-demand cross-frame retained
+        // overflow buffer, same as the instance-side overflow_buffers.
         const uniform_buffer, const uniform_byte_offset = blk: {
             if (self.uniform_write_offset < MAX_UNIFORM_UPDATES) {
                 const slot = self.uniform_write_offset;
                 self.uniform_write_offset += 1;
-                break :blk .{ &self.uniform_buffers[self.current_buffer], slot * @sizeOf(Uniforms) };
+                break :blk .{ &self.uniform_buffers[self.current_buffer], slot * UNIFORM_STRIDE };
             }
             self.uniform_overflow_count += 1;
             text_uniform_overflow_total += 1;
             const slot = self.uniform_overflow_used;
             self.uniform_overflow_used += 1;
             const buf = try self.ensureUniformOverflowCapacity(slot + 1);
-            break :blk .{ buf, slot * @sizeOf(Uniforms) };
+            break :blk .{ buf, slot * UNIFORM_STRIDE };
         };
         const peak = self.uniform_write_offset + self.uniform_overflow_used;
         if (peak > self.uniform_peak_slots) self.uniform_peak_slots = peak;
@@ -1791,16 +1918,16 @@ pub const TextRenderer = struct {
         const uniform_data = try uniform_buffer.getMappedRange(uniform_byte_offset, @sizeOf(Uniforms));
         @memcpy(uniform_data, std.mem.asBytes(&uniforms));
 
-        // 设置管线
+        // Set pipeline
         render_pass.setPipeline(&self.pipeline);
 
-        // Text fragment shader 也会读取 buffer(0) 里的 clip/uniform。
-        // 这里只绑 vertex buffer 会让 fragment stage 读到陈旧或未定义的状态，
-        // 在离屏/clip 切换场景下会表现成文字首帧被错误裁掉。
+        // Text fragment shader also reads buffer(0) clip/uniform. Binding only vertex buffer
+        // leaves fragment stage with stale or undefined state; offscreen/clip switch scenes
+        // show first-frame text clipped wrong.
         render_pass.setVertexBuffer(0, uniform_buffer, @intCast(uniform_byte_offset));
         render_pass.setFragmentBuffer(0, uniform_buffer, @intCast(uniform_byte_offset));
 
-        // Nearest pass (1:1 缩放)，按 page_index 分桶
+        // Nearest pass (1:1 scale), per page_index bucket
         if (nearest_count > 0) {
             if (self.atlas.getSamplerNearest()) |sampler| {
                 render_pass.setFragmentSampler(0, sampler);
@@ -1808,7 +1935,7 @@ pub const TextRenderer = struct {
             try self.flushInstanceList(&self.instances_nearest, render_pass);
         }
 
-        // Linear pass (非 1:1 缩放)，按 page_index 分桶
+        // Linear pass (non-1:1 scale), per page_index bucket
         if (linear_count > 0) {
             if (self.atlas.getSamplerLinear()) |sampler| {
                 render_pass.setFragmentSampler(0, sampler);
@@ -1816,19 +1943,20 @@ pub const TextRenderer = struct {
             try self.flushInstanceList(&self.instances_linear, render_pass);
         }
 
-        // 清空实例缓冲区继续收集后续文本
+        // Clear instance buffer, continue collecting subsequent text
         self.instances_nearest.clearRetainingCapacity();
         self.instances_linear.clearRetainingCapacity();
     }
 
-    /// 保证本帧槽位的溢出 uniform buffer 至少能放下 `slots` 个 Uniforms。
-    /// 与实例侧 overflow_buffers 同款：几何增长、跨帧保留、容量够就复用。
+    /// Ensure this frame's slot overflow uniform buffer can hold at least `slots` Uniforms.
+    /// Same as instance-side overflow_buffers: geometric grow, cross-frame retain, capacity
+    /// enough -> reuse.
     fn ensureUniformOverflowCapacity(self: *TextRenderer, slots: usize) !*gpu.Backend.Buffer {
-        const needed = slots * @sizeOf(Uniforms);
+        const needed = slots * UNIFORM_STRIDE;
         if (self.uniform_overflow_capacities[self.current_buffer] < needed) {
             var new_capacity = @max(
                 self.uniform_overflow_capacities[self.current_buffer],
-                @sizeOf(Uniforms) * 64,
+                UNIFORM_STRIDE * 64,
             );
             while (new_capacity < needed) new_capacity *= 2;
             if (self.uniform_overflow_buffers[self.current_buffer]) |*old| old.destroy();
@@ -1842,8 +1970,8 @@ pub const TextRenderer = struct {
         return &self.uniform_overflow_buffers[self.current_buffer].?;
     }
 
-    /// 按 page_index 分桶 flush 一个 instance list
-    /// 遍历 instances，找连续相同 page_index 的段，每段切换纹理后 draw
+    /// Per page_index bucket flush one instance list. Iterate instances, find contiguous
+    /// same page_index spans, each span switches texture then draws
     fn flushInstanceList(self: *TextRenderer, list: *std.ArrayList(GlyphInstance), render_pass: *gpu.Backend.RenderPass) !void {
         const items = list.items;
         const total = items.len;
@@ -1858,24 +1986,28 @@ pub const TextRenderer = struct {
                 batch_end += 1;
             }
 
-            // 绑定该页的纹理。
-            // 批次已按 page_index 分好，而一个 page_index 唯一确定一页的格式，
-            // 所以一个批次内格式必然一致：灰度页绑 texture(0)、彩色页绑
-            // texture(1)，与 shader 的两个绑定点对应。
-            //
-            // 两个槽都必须始终绑着**有效**纹理：Metal 下未绑定的 texture 槽被
-            // 采样是未定义行为，而 fragment shader 里两条分支虽然只有一条会
-            // 产出结果，编译器仍可能对另一条做投机采样。所以另一个槽用 page 0
-            // （init 保证存在的灰度页）兜底，纯占位、不影响输出。
+            // Bind this page's texture.
+            // Batches are bucketed by page_index and one page_index determines one page's format,
+            // so
+            // format within a batch is consistent: grayscale page binds texture(0), color page
+            // binds
+            // texture(1), mapping to the shader's two binding points.
+            // Both slots must always bind a **valid** texture: sampling an unbound texture is
+            // undefined
+            // behavior in Metal, and although only one fragment shader branch produces output, the
+            // compiler may speculatively sample the other. So the other slot uses page 0
+            // (guaranteed by
+            // init, grayscale page) as a pure placeholder that doesn't affect output.
             const texture = self.atlas.getPageTexture(cur_page) orelse {
-                // A stale page index must never draw with the previous batch's
-                // binding. The atlas normally pins pages used in this frame;
-                // skipping is the fail-closed fallback if that invariant ever
-                // regresses.
+                // A stale page index must never draw with the previous batch's binding. The atlas
+                // normally pins pages used in this frame; skipping is the fail-closed fallback if
+                // that invariant ever regresses.
                 //
-                // ⚠️ 跳过 = 这一页桶里的字形**全部不画**（用户可见：整页范围内
-                // 同一批字消失、位置留白）。这条路径按设计永远不该走到,
-                // 走到了必须大声报出来，否则又是一个只能靠截图猜的静默丢字点。
+                // Warning: skip = glyphs **in this page bucket don't draw at all** (same-batch
+                // characters
+                // vanish, with position gaps). By design this path never hits; if it does it must
+                // shout,
+                // else it is another silent character-loss point visible only in screenshots.
                 std.log.warn("[TextRenderer] stale atlas page index {d} (pages: {d}); dropping batch segment of {d} glyphs", .{ cur_page, self.atlas.getPageCount(), batch_end - batch_start });
                 batch_start = batch_end;
                 continue;
@@ -1890,9 +2022,9 @@ pub const TextRenderer = struct {
                 render_pass.setFragmentTextureBinding(1, fallback);
             }
 
-            // 写入 instance buffer 并 draw
-            // 注意：Metal command buffer 延迟执行，同一帧内不能回绕覆写,
-            // 否则 commit 时先前 draw call 引用的 offset 处数据已被覆盖
+            // Write instance buffer and draw. Note: Metal command buffer deferred execution,
+            // can't wrap-overwrite in same frame, else prior draw call's referenced offset
+            // already overwritten at commit
             var seg_offset = batch_start;
             while (seg_offset < batch_end) {
                 const remaining_total = batch_end - seg_offset;
@@ -1903,7 +2035,8 @@ pub const TextRenderer = struct {
                     @min(remaining_total, remaining);
                 const instance_size = @sizeOf(GlyphInstance) * batch;
                 if (remaining == 0) {
-                    // 复用本帧槽位的溢出缓冲；容量不足才重建（几何增长，避免抖动）。
+                    // Reuse this frame slot's overflow buffer; capacity short -> rebuild
+                    // (geometric grow, avoid thrash).
                     const needed = self.overflow_write_offset + instance_size;
                     if (self.overflow_capacities[self.current_buffer] < needed) {
                         var new_capacity = @max(self.overflow_capacities[self.current_buffer], instance_size);
@@ -1939,7 +2072,7 @@ pub const TextRenderer = struct {
         }
     }
 
-    /// 结束帧并渲染
+    /// End frame and render
     pub fn endFrame(self: *TextRenderer, render_pass: *gpu.Backend.RenderPass) !void {
         try self.flush(render_pass);
         if (self.atlas.frame_insert_count > 0 or self.atlas_gc_happened) {
@@ -1958,7 +2091,7 @@ pub const TextRenderer = struct {
         }
     }
 
-    /// 获取图集缓存大小
+    /// Get atlas cache size
     pub fn getAtlasCacheSize(self: *TextRenderer) usize {
         return self.atlas.getCacheSize();
     }
@@ -1968,10 +2101,11 @@ pub const TextRenderer = struct {
     }
 };
 
-// ── segmentText: RTL 整段化单测 ──
+// -- segmentText: RTL whole-segment unit test --
 //
-// RTL 必须整段交给 CoreText，否则 bidi 重排 / 阿拉伯连写 / 变音符号挂载
-// 三样全毁。这里钉死分段边界，防止有人为了缓存粒度把 RTL 切碎。
+// RTL must go to CoreText as a whole segment, else bidi reorder / Arabic connect forms /
+// diacritic attachment break. Pins segment boundaries here to prevent chunking RTL for
+// cache granularity.
 const seg_testing = std.testing;
 
 fn segCountOf(text: []const u8, out: *[MAX_SEGMENTS]Segment) u32 {
@@ -2008,7 +2142,7 @@ test "segmentText: RTL 尾随空格不并入 RTL 段" {
     const s = "\u{5E9}\u{5DC}  ";
     const n = segCountOf(s, &buf);
     try seg_testing.expectEqual(@as(u32, 2), n);
-    // 第一段只含 RTL 字母（2 字符 × 2 字节）。
+    // First segment only RTL letters (2 chars x 2 bytes)
     try seg_testing.expectEqual(@as(u32, 4), buf[0].end);
 }
 
@@ -2020,7 +2154,7 @@ test "segmentText: 混排 latin+arabic+latin 切成三段且 RTL 段完整" {
     try seg_testing.expectEqual(@as(u32, 0), buf[0].start);
     try seg_testing.expectEqual(@as(u32, 2), buf[0].end); // "ab"
     try seg_testing.expectEqual(@as(u32, 2), buf[1].start);
-    try seg_testing.expectEqual(@as(u32, 8), buf[1].end); // 3 个阿拉伯字母 × 2 字节
+    try seg_testing.expectEqual(@as(u32, 8), buf[1].end); // 3 Arabic letters x 2 bytes
     try seg_testing.expectEqual(@as(u32, 8), buf[2].start);
     try seg_testing.expectEqual(@as(u32, 10), buf[2].end); // "cd"
 }
@@ -2029,7 +2163,7 @@ test "segmentText: LTR 未退化 —— ASCII 仍按词分段" {
     var buf: [MAX_SEGMENTS]Segment = undefined;
     const n = segCountOf("hello world", &buf);
     try seg_testing.expectEqual(@as(u32, 2), n);
-    try seg_testing.expectEqual(@as(u32, 6), buf[0].end); // "hello " 含尾空格
+    try seg_testing.expectEqual(@as(u32, 6), buf[0].end); // 'hello ' with trailing space
 }
 
 test "segmentText: CJK 未退化 —— 仍每码点独立" {
@@ -2038,13 +2172,14 @@ test "segmentText: CJK 未退化 —— 仍每码点独立" {
     try seg_testing.expectEqual(@as(u32, 2), n);
 }
 
-// ── segmentText: 字节覆盖完整性 + VS16 emoji presentation ──
+// -- segmentText: byte coverage completeness + VS16 emoji presentation --
 //
-// 这两类 bug 都是"静默"的：分段丢字节不会报错，只会让后续段的
-// start/end 与原文错位；VS16 被切走也不会报错，只会让 ❤️ 退回单色 ❤
-// 且宽度按窄字形算（12.742 vs 19.0），表现为光标偏移。
+// Both bug classes are silent: dropped bytes don't error, later segment start/end just
+// misalign from the original; a stripped VS16 doesn't error, the heart just reverts to
+// single-color with the narrow glyph width (12.742 vs 19.0), showing as caret offset.
 
-/// 所有段必须**恰好**拼回原文：无空洞、无重叠、总长相等。
+/// All segments must **exactly** stitch back to original: no holes, no overlap,
+/// total length equal.
 fn expectFullCoverage(text: []const u8) !void {
     var buf: [MAX_SEGMENTS]Segment = undefined;
     const n = segCountOf(text, &buf);
@@ -2052,12 +2187,26 @@ fn expectFullCoverage(text: []const u8) !void {
     var covered: usize = 0;
     var k: u32 = 0;
     while (k < n) : (k += 1) {
-        try seg_testing.expectEqual(prev_end, buf[k].start); // 无空洞/重叠
+        try seg_testing.expectEqual(prev_end, buf[k].start); // No holes/overlap
         covered += buf[k].end - buf[k].start;
         prev_end = buf[k].end;
     }
     try seg_testing.expectEqual(text.len, covered);
     if (n > 0) try seg_testing.expectEqual(@as(u32, @intCast(text.len)), prev_end);
+}
+
+test "segmentText: keycap sequence is one segment, split from the ASCII run around it" {
+    var segs: [MAX_SEGMENTS]Segment = undefined;
+    const s = "ab3\u{FE0F}\u{20E3} #\u{20E3}x";
+    const n = segmentText(s, &segs);
+    try std.testing.expectEqual(@as(u32, 4), n);
+    try std.testing.expectEqualStrings("ab", s[segs[0].start..segs[0].end]);
+    try std.testing.expectEqualStrings("3\u{FE0F}\u{20E3} ", s[segs[1].start..segs[1].end]);
+    try std.testing.expectEqualStrings("#\u{20E3}", s[segs[2].start..segs[2].end]);
+    try std.testing.expectEqualStrings("x", s[segs[3].start..segs[3].end]);
+    // a plain digit is not a keycap
+    try std.testing.expectEqual(@as(u32, 1), segmentText("a3b", &segs));
+    try expectFullCoverage("ab3\u{FE0F}\u{20E3} #\u{20E3}x");
 }
 
 test "segmentText: VS16 与基字同段（❤+FE0F 不可拆，否则退回单色窄字形）" {
@@ -2072,12 +2221,13 @@ test "segmentText: VS16 与基字同段（❤+FE0F 不可拆，否则退回单�
 test "segmentText: 字节覆盖完整 —— VS16 序列不得吞字节" {
     try expectFullCoverage("\u{2764}\u{FE0F}");
     try expectFullCoverage("abc\u{2764}\u{FE0F}def");
-    try expectFullCoverage("a\u{FE0F}b"); // 孤立 VS16 也要成段
+    try expectFullCoverage("a\u{FE0F}b"); // Isolated VS16 must segment too
     try expectFullCoverage("abc\u{1F62D}def\u{9876}\u{8D77}\u{2764}\u{FE0F}\u{2705}\u{2728}");
 }
 
 test "segmentText: 字节覆盖完整 —— 实测丢字文档的原文行（下游编辑器滚动丢字回归）" {
-    // 这些行在下游编辑器渲染一份画布引擎调研文档时实测丢中段/丢行尾
+    // These lines were observed to lose their middle or tail when a downstream editor rendered a
+    // canvas-engine research document.
     try expectFullCoverage("Figma 说自己是 tile-based，但没说怎么做。我们要不要跟？");
     try expectFullCoverage("代价是：一套持久 tile 池 + 失效逻辑 + 额外显存。");
     try expectFullCoverage("**但 300 draw call 在 Apple Silicon 上依然是很小的负载**（量级参考：");
@@ -2087,7 +2237,8 @@ test "segmentText: 字节覆盖完整 —— 实测丢字文档的原文行（�
 
 test "segmentText: emoji 后的普通符号不被吞进 emoji 段" {
     var buf: [MAX_SEGMENTS]Segment = undefined;
-    // 🔥 后跟箭头 ->（U+2192，在 isEmojiCapable 范围内但非 ZWJ 连接）
+    // Fire emoji followed by arrow -> (U+2192, in isEmojiCapable range but not
+    // ZWJ-connected)
     const n = segCountOf("\u{1F525}\u{2192}", &buf);
     try seg_testing.expectEqual(@as(u32, 2), n);
 }
@@ -2138,10 +2289,10 @@ test "long segment cache allocation failures leave glyph ownership with caller" 
 }
 
 test "long segment cache preserves real shaped glyphs including fallback fonts" {
-    // SKIP-REASON: 需要真实 CoreText 字体系统（findFont/shape），非 macOS 上没有
+    // SKIP-REASON: needs real CoreText font system (findFont/shape), absent non-macOS
     if (@import("builtin").os.tag != .macos) return error.SkipZigTest;
     const allocator = std.testing.allocator;
-    var fs = try text_module.FontSystem.init(allocator);
+    var fs = try text_module.FontSystem.init(allocator, @import("std").testing.io);
     defer fs.deinit();
     const font = try fs.findFont(.{ .family = "Menlo", .size = 14 });
     defer font.deinit();
@@ -2149,7 +2300,7 @@ test "long segment cache preserves real shaped glyphs including fallback fonts" 
     defer shaper.deinit();
     var cache: LongSegmentCache = .{};
     defer cache.deinit(allocator);
-    const sample = "A" ** 80 ++ "中文🙂";
+    const sample = (@as([("A").len * (80)]u8, @bitCast(@as([80][("A").len]u8, @splat(("A").*)))) ++ "") ++ "中文🙂";
     const shaped = try shaper.shapeWithOptions(sample, font, false);
     var caller_owned = true;
     defer if (caller_owned) {
@@ -2177,8 +2328,9 @@ test "long segment cache preserves real shaped glyphs including fallback fonts" 
     try std.testing.expect(fallback_refs > 0);
 }
 
-/// 只装配 fallback wrapper 路径用到的字段（allocator / fallback_font_cache /
-/// current_frame / atlas.cache），其余 GPU 资源保持 undefined，被测函数不碰它们。
+/// Assemble fallback wrapper path-only fields (allocator / fallback_font_cache /
+/// current_frame / atlas.cache), rest GPU resources stay undefined, tested function
+/// untouches them.
 fn fallbackOnlyRendererForTest(allocator: std.mem.Allocator) TextRenderer {
     var tr: TextRenderer = undefined;
     tr.allocator = allocator;
@@ -2189,29 +2341,30 @@ fn fallbackOnlyRendererForTest(allocator: std.mem.Allocator) TextRenderer {
 }
 
 test "fallback wrapper: cache put OOM 时 errdefer 不 double free" {
-    // SKIP-REASON: 需要真实 CTFontRef 作为 fallback ref
+    // SKIP-REASON: needs real CTFontRef as fallback ref
     if (@import("builtin").os.tag != .macos) return error.SkipZigTest;
     const allocator = std.testing.allocator;
-    var fs = try text_module.FontSystem.init(allocator);
+    var fs = try text_module.FontSystem.init(allocator, @import("std").testing.io);
     defer fs.deinit();
     const proto = try fs.findFont(.{ .family = "Helvetica", .size = 14 });
     defer proto.deinit();
 
-    // fail_index 0 = create(Font) 成功，1 = fallback_font_cache.put 扩容失败。
+    // fail_index 0 = create(Font) succeeds, 1 = fallback_font_cache.put resizes fails.
     var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 1 });
     var tr = fallbackOnlyRendererForTest(failing.allocator());
     defer tr.atlas.cache.deinit();
     defer tr.fallback_font_cache.deinit();
     try std.testing.expectError(error.OutOfMemory, tr.getOrCreateGlyphFallbackFont(proto.ct_font, proto));
-    // create 过的 wrapper 恰好释放一次（testing allocator 会对 double free / 泄漏报错）。
+    // Created wrapper destroyed exactly once (testing allocator errors on
+    // double-free / leak).
     try std.testing.expectEqual(failing.allocations, failing.deallocations);
 }
 
 test "fallback wrapper 驱逐时摘除其 atlas 条目（地址复用不命中旧位图）" {
-    // SKIP-REASON: 需要真实 CTFontRef 作为 fallback ref
+    // SKIP-REASON: needs real CTFontRef as fallback ref
     if (@import("builtin").os.tag != .macos) return error.SkipZigTest;
     const allocator = std.testing.allocator;
-    var fs = try text_module.FontSystem.init(allocator);
+    var fs = try text_module.FontSystem.init(allocator, @import("std").testing.io);
     defer fs.deinit();
     const proto = try fs.findFont(.{ .family = "Helvetica", .size = 14 });
     defer proto.deinit();
@@ -2240,7 +2393,7 @@ test "fallback wrapper 驱逐时摘除其 atlas 条目（地址复用不命中�
     try tr.atlas.cache.put(wrapper_key, region);
     try tr.atlas.cache.put(other_key, region);
 
-    // 走真实驱逐路径：老化超过阈值后 evictStaleFallbackFonts 销毁 wrapper。
+    // Take real eviction path: evictStaleFallbackFonts destroys wrapper once over-aged.
     tr.current_frame = 100_000;
     tr.evictStaleFallbackFonts();
     try std.testing.expectEqual(@as(u32, 0), tr.fallback_font_cache.count());
@@ -2249,10 +2402,10 @@ test "fallback wrapper 驱逐时摘除其 atlas 条目（地址复用不命中�
 }
 
 test "CoreText 桥：开头 UTF-8 BOM 不打乱 cluster 映射与 caret stops" {
-    // SKIP-REASON: 走真实 CoreText 桥（initWithBytes 吃 BOM 是 Foundation 行为）
+    // SKIP-REASON: real CoreText bridge (initWithBytes eats BOM is Foundation)
     if (@import("builtin").os.tag != .macos) return error.SkipZigTest;
     const allocator = std.testing.allocator;
-    var fs = try text_module.FontSystem.init(allocator);
+    var fs = try text_module.FontSystem.init(allocator, @import("std").testing.io);
     defer fs.deinit();
     const font = try fs.findFont(.{ .family = "Helvetica", .size = 14 });
     defer font.deinit();
@@ -2265,7 +2418,7 @@ test "CoreText 桥：开头 UTF-8 BOM 不打乱 cluster 映射与 caret stops" {
         TextRenderer.releaseGlyphFallbackFontRefs(shaped);
         allocator.free(shaped);
     }
-    // 'a' 在字节 3、'b' 在字节 4（BOM 自身可能有也可能没有 glyph）。
+    // 'a' at byte 3, 'b' at byte 4 (BOM itself may or may not have glyph).
     try std.testing.expect(shaped.len >= 2);
     try std.testing.expectEqual(@as(u32, 3), shaped[shaped.len - 2].cluster);
     try std.testing.expectEqual(@as(u32, 4), shaped[shaped.len - 1].cluster);
@@ -2275,7 +2428,22 @@ test "CoreText 桥：开头 UTF-8 BOM 不打乱 cluster 映射与 caret stops" {
     var stops: [boundaries.len]text_module.LineCaretStop = undefined;
     _ = try font.lineCaretStops(sample, &boundaries, &stops);
     try std.testing.expectEqual(@as(u32, 3), stops[1].byte_offset);
-    // 'a' 和 'b' 各有正宽度：caret 单调前进。
+    // 'a' and 'b' each have positive width: caret advances monotonic.
     try std.testing.expect(stops[2].primary_x > stops[1].primary_x);
     try std.testing.expect(stops[3].primary_x > stops[2].primary_x);
+}
+
+test "subpixel glyph placement counts the pen fraction once" {
+    // A glyph rasterized into bin b has its origin at subpixelOffset(b) inside the
+    // bitmap, whose left edge sits at bearing from the integer origin.
+    const bearing_px: f32 = -1;
+    var i: u32 = 0;
+    while (i < 64) : (i += 1) {
+        const pen_px = 100.0 + @as(f32, @floatFromInt(i)) / 64.0;
+        const bin = atlas_mod.subpixelBin(pen_px - @floor(pen_px));
+        const left = TextRenderer.subpixelGlyphLeftPx(pen_px, bearing_px);
+        try std.testing.expectEqual(@floor(left), left);
+        const drawn_origin = left - bearing_px + atlas_mod.subpixelOffset(bin);
+        try std.testing.expect(@abs(drawn_origin - pen_px) <= 0.5 / @as(f32, @floatFromInt(atlas_mod.SUBPIXEL_BINS)) + 1e-4);
+    }
 }

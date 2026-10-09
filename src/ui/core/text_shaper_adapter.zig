@@ -1,12 +1,12 @@
-//! TextShaper -> GlyphRun 适配器（v0.5 §5 GlyphRun pipeline 起步）
+//! TextShaper -> GlyphRun adapter (start of the GlyphRun pipeline)
 //!
-//! src/text/types.zig.ShapedGlyph 是低级 shaping 输出（每 glyph 一条），包含
-//! cluster 字段 (utf-8 byte offset)。zenit IR `GlyphRun` (src/ui/core/glyph_run.zig)
-//! 是高级聚合：glyph 序列 + cluster_map (byte_offset -> glyph index range) +
-//! FontMetrics + total_advance。
+//! `src/text/types.zig.ShapedGlyph` is low-level per-glyph shaping output, including a cluster
+//! field (utf-8 byte offset). Zenit IR `GlyphRun` (src/ui/core/glyph_run.zig) is the high-level
+//! aggregate: glyph sequence + cluster_map (byte_offset -> glyph index range) + FontMetrics +
+//! total_advance.
 //!
-//! 这个 adapter 只做格式翻译，不调任何平台 API，因此 ui_core 不需要 native
-//! bridge link（除了 cx.shapeText 入口处真正调 TextShaper.shape() 时）。
+//! This adapter only translates format and calls no platform APIs, so ui_core needs no native
+//! bridge link (except where the cx.shapeText entry actually calls TextShaper.shape()).
 
 const std = @import("std");
 const text_module = @import("text");
@@ -19,14 +19,13 @@ const Cluster = glyph_run_mod.Cluster;
 const FontMetrics = glyph_run_mod.FontMetrics;
 const Direction = glyph_run_mod.Direction;
 
-/// 把 TextShaper.shape() 输出 + 字体度量翻译成 GlyphRun。
+/// Translate TextShaper.shape() output + font metrics into GlyphRun.
 ///
-/// 内存：glyphs/clusters slice 在 caller 提供的 allocator 里 alloc。caller
-/// 负责生命周期（典型 caller 是 ShapingCache，它把这两段 slice 存到自己的 arena
-/// 里供后续读取）。
+/// Memory: glyphs/clusters slices are allocated with the caller-provided allocator; the caller
+/// manages lifecycle (typically ShapingCache stores both slices in its arena for later reads).
 ///
-/// cluster 聚合：ShapedGlyph 序列里**相邻 glyph 共享 cluster byte_offset 的**
-/// 视为一个 cluster (复杂脚本：1 cluster = N glyphs)。
+/// Cluster aggregation: a run of ShapedGlyph where **adjacent glyphs share a cluster byte_offset**
+/// forms one cluster (complex script: 1 cluster = N glyphs).
 pub fn fromShapedGlyphs(
     allocator: std.mem.Allocator,
     shaped: []const ShapedGlyph,
@@ -43,7 +42,7 @@ pub fn fromShapedGlyphs(
         };
     }
 
-    // 1) glyphs slice：直接 1:1 翻译，累加 total_advance
+    // 1) glyphs slice: 1:1 translation direct, accumulate total_advance
     const glyphs = try allocator.alloc(GlyphPosition, shaped.len);
     errdefer allocator.free(glyphs);
     var total: f32 = 0;
@@ -58,7 +57,7 @@ pub fn fromShapedGlyphs(
         total += g.x_advance;
     }
 
-    // 2) cluster map：按 byte_offset 分段。第一遍数 cluster 数。
+    // 2) cluster map: segment by byte_offset. First pass count clusters.
     var cluster_count: usize = 1;
     var prev_cluster = shaped[0].cluster;
     for (shaped[1..]) |g| {
@@ -71,7 +70,7 @@ pub fn fromShapedGlyphs(
     const clusters = try allocator.alloc(Cluster, cluster_count);
     errdefer allocator.free(clusters);
 
-    // 3) 第二遍填 cluster 范围
+    // 3) Second pass fill cluster ranges
     var ci: usize = 0;
     var run_start: u32 = 0;
     prev_cluster = shaped[0].cluster;
@@ -87,7 +86,7 @@ pub fn fromShapedGlyphs(
             prev_cluster = g.cluster;
         }
     }
-    // 收尾最后一个 cluster
+    // Finalize last cluster
     clusters[ci] = .{
         .byte_offset = prev_cluster,
         .glyph_start = run_start,
@@ -140,7 +139,7 @@ test "fromShapedGlyphs: simple ASCII (1 cluster per glyph)" {
     try testing.expectEqual(@as(usize, 3), run.clusters.len);
     try testing.expectEqual(@as(f32, 33), run.total_advance);
 
-    // 每 cluster 一个 glyph
+    // One glyph per cluster
     try testing.expectEqual(@as(u32, 0), run.clusters[0].byte_offset);
     try testing.expectEqual(@as(u32, 0), run.clusters[0].glyph_start);
     try testing.expectEqual(@as(u32, 1), run.clusters[0].glyph_end);
@@ -150,7 +149,7 @@ test "fromShapedGlyphs: simple ASCII (1 cluster per glyph)" {
 }
 
 test "fromShapedGlyphs: complex cluster (1 cluster = 2 glyphs)" {
-    // 模拟 emoji ZWJ sequence: 2 glyph 共享 cluster=0
+    // Simulate emoji ZWJ sequence: 2 glyphs share cluster=0
     const shaped = [_]ShapedGlyph{
         .{ .glyph_index = 100, .cluster = 0, .x_advance = 16, .y_advance = 0, .x_offset = 0, .y_offset = 0 },
         .{ .glyph_index = 200, .cluster = 0, .x_advance = 0, .y_advance = 0, .x_offset = 0, .y_offset = 0 },

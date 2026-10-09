@@ -1,15 +1,15 @@
 const std = @import("std");
 
-/// Bundle 资源路径解析
+/// Bundle resource path resolution
 ///
-/// 运行时检测可执行文件是否位于 .app/Contents/MacOS/ 内：
-/// - Bundle 模式: 资源在 .app/Contents/Resources/ 下
-/// - 开发模式: 资源在 CWD 下的 assets/ 目录
+/// Detects at runtime whether the executable is in .app/Contents/MacOS/:
+/// - Bundle mode: resources in .app/Contents/Resources/
+/// - Dev mode: resources in CWD's assets/ directory
 pub const ResourcePath = struct {
-    /// 资源根目录（以 '/' 结尾）
-    /// Bundle 模式: "/path/to/MyApp.app/Contents/Resources/"
-    /// 开发模式: 优先解析为可执行文件上层目录中的 ".../assets/"
-    /// null 表示回退到相对路径 "assets/"
+    /// Resource root directory (ends with '/')
+    /// Bundle mode: "/path/to/MyApp.app/Contents/Resources/"
+    /// Dev mode: prefer resolve to .../assets/ in executable's parent directory
+    /// null means fallback to relative path "assets/"
     base_path: ?[]const u8,
 
     var static_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -44,11 +44,11 @@ pub const ResourcePath = struct {
         return .{ .base_path = null };
     }
 
-    /// 将资源相对路径写入 caller 提供的 buffer，返回 sentinel-terminated 切片
+    /// Write resource relative path into caller-provided buffer, return sentinel-terminated slice
     ///
-    /// 输入: "fonts/Roboto.ttf"
-    /// Bundle 模式: "/path/to/MyApp.app/Contents/Resources/fonts/Roboto.ttf"
-    /// 开发模式: "/abs/path/to/assets/fonts/Roboto.ttf" 或回退到 "assets/fonts/..."
+    /// Input: "fonts/Roboto.ttf"
+    /// Bundle mode: "/path/to/MyApp.app/Contents/Resources/fonts/Roboto.ttf"
+    /// Dev mode: "/abs/path/to/assets/fonts/Roboto.ttf" or fallback to "assets/fonts/..."
     pub fn resolve(self: *const ResourcePath, buf: []u8, rel_path: []const u8) [:0]const u8 {
         if (self.base_path) |base| {
             const total = base.len + rel_path.len;

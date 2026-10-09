@@ -1,77 +1,77 @@
-/// Metal C API 绑定
+/// Metal C API bindings
 ///
-/// 这个文件提供对 native/metal_bridge.m 中定义的 C API 的 Zig 绑定
-/// 所有 Metal API 调用都通过这些 C 桥接函数进行
+/// Provides Zig bindings to C API defined in native/metal_bridge.m.
+/// All Metal API calls go through these C bridge functions.
 
 // ============================================================================
-// Opaque Types - Metal 对象句柄
+// Opaque Types - Metal object handles
 // ============================================================================
 
-/// MTLDevice - Metal 设备
+/// MTLDevice - Metal device
 pub const MTLDevice = opaque {};
 
-/// MTLCommandQueue - 命令队列
+/// MTLCommandQueue - command queue
 pub const MTLCommandQueue = opaque {};
 
-/// MTLCommandBuffer - 命令缓冲区
+/// MTLCommandBuffer - command buffer
 pub const MTLCommandBuffer = opaque {};
 
-/// MTLBuffer - GPU 缓冲区
+/// MTLBuffer - GPU buffer
 pub const MTLBuffer = opaque {};
 
-/// MTLTexture - GPU 纹理
+/// MTLTexture - GPU texture
 pub const MTLTexture = opaque {};
 
-/// MTLTextureDescriptor - 纹理描述符
+/// MTLTextureDescriptor - texture descriptor
 pub const MTLTextureDescriptor = opaque {};
 
-/// MTLSamplerState - 采样器状态
+/// MTLSamplerState - sampler state
 pub const MTLSamplerState = opaque {};
 
-/// MTLSamplerDescriptor - 采样器描述符
+/// MTLSamplerDescriptor - sampler descriptor
 pub const MTLSamplerDescriptor = opaque {};
 
-/// MTLLibrary - 着色器库
+/// MTLLibrary - shader library
 pub const MTLLibrary = opaque {};
 
-/// MTLFunction - 着色器函数
+/// MTLFunction - shader function
 pub const MTLFunction = opaque {};
 
-/// MTLRenderPipelineState - 渲染管线状态
+/// MTLRenderPipelineState - render pipeline state
 pub const MTLRenderPipelineState = opaque {};
 
-/// MTLRenderPipelineDescriptor - 渲染管线描述符
+/// MTLRenderPipelineDescriptor - render pipeline descriptor
 pub const MTLRenderPipelineDescriptor = opaque {};
 
-/// MTLDepthStencilState - 深度模板状态
+/// MTLDepthStencilState - depth stencil state
 pub const MTLDepthStencilState = opaque {};
 
-/// MTLComputePipelineState - 计算管线状态
+/// MTLComputePipelineState - compute pipeline state
 pub const MTLComputePipelineState = opaque {};
 
-/// MTLRenderCommandEncoder - 渲染命令编码器
+/// MTLRenderCommandEncoder - render command encoder
 pub const MTLRenderCommandEncoder = opaque {};
 
-/// MTLComputeCommandEncoder - 计算命令编码器
+/// MTLComputeCommandEncoder - compute command encoder
 pub const MTLComputeCommandEncoder = opaque {};
 
-/// MTLBlitCommandEncoder - Blit 命令编码器
+/// MTLBlitCommandEncoder - blit command encoder
 pub const MTLBlitCommandEncoder = opaque {};
 
-/// MTLRenderPassDescriptor - 渲染通道描述符
+/// MTLRenderPassDescriptor - render pass descriptor
 pub const MTLRenderPassDescriptor = opaque {};
 
-/// CAMetalLayer - Metal 层
+/// CAMetalLayer - Metal layer
 pub const CAMetalLayer = opaque {};
 
-/// CAMetalDrawable - Metal 可绘制对象
+/// CAMetalDrawable - Metal drawable
 pub const CAMetalDrawable = opaque {};
 
 // ============================================================================
-// Enums - Metal 枚举类型
+// Enums - Metal enum types
 // ============================================================================
 
-/// MTLStorageMode - 存储模式
+/// MTLStorageMode - storage mode
 pub const MTLStorageMode = enum(c_uint) {
     Shared = 0,
     Managed = 1,
@@ -79,15 +79,15 @@ pub const MTLStorageMode = enum(c_uint) {
     Memoryless = 3,
 };
 
-/// MTLResourceOptions - 资源选项（简化版，只使用存储模式）
+/// MTLResourceOptions - resource options (simplified, storage mode only)
 pub const MTLResourceOptions = c_uint;
 
-/// 便捷函数：从存储模式创建 ResourceOptions
+/// Convenience function: create ResourceOptions from storage mode.
 pub fn resourceOptionsFromStorageMode(mode: MTLStorageMode) MTLResourceOptions {
-    return @as(c_uint, @intFromEnum(mode)) << 4;
+    return @as(c_uint, @backingInt(mode)) << 4;
 }
 
-/// MTLPixelFormat - 像素格式
+/// MTLPixelFormat - pixel format
 pub const MTLPixelFormat = enum(c_ulong) {
     Invalid = 0,
     // 8-bit formats
@@ -158,7 +158,7 @@ pub const MTLPixelFormat = enum(c_ulong) {
     BC7_RGBAUnorm_sRGB = 153,
 };
 
-/// MTLTextureType - 纹理类型
+/// MTLTextureType - texture type
 pub const MTLTextureType = enum(c_ulong) {
     Type1D = 0,
     Type1DArray = 1,
@@ -172,7 +172,7 @@ pub const MTLTextureType = enum(c_ulong) {
     TypeTextureBuffer = 9,
 };
 
-/// MTLTextureUsage - 纹理用途
+/// MTLTextureUsage - texture usage
 pub const MTLTextureUsage = enum(c_ulong) {
     Unknown = 0x0000,
     ShaderRead = 0x0001,
@@ -181,20 +181,20 @@ pub const MTLTextureUsage = enum(c_ulong) {
     PixelFormatView = 0x0008,
 };
 
-/// MTLSamplerMinMagFilter - 采样器过滤模式
+/// MTLSamplerMinMagFilter - sampler min/mag filter mode
 pub const MTLSamplerMinMagFilter = enum(c_ulong) {
     Nearest = 0,
     Linear = 1,
 };
 
-/// MTLSamplerMipFilter - 采样器 MIP 过滤模式
+/// MTLSamplerMipFilter - sampler MIP filter mode
 pub const MTLSamplerMipFilter = enum(c_ulong) {
     NotMipmapped = 0,
     Nearest = 1,
     Linear = 2,
 };
 
-/// MTLSamplerAddressMode - 采样器地址模式
+/// MTLSamplerAddressMode - sampler address mode
 pub const MTLSamplerAddressMode = enum(c_ulong) {
     ClampToEdge = 0,
     MirrorClampToEdge = 1,
@@ -204,14 +204,14 @@ pub const MTLSamplerAddressMode = enum(c_ulong) {
     ClampToBorderColor = 5,
 };
 
-/// MTLLoadAction - 加载操作
+/// MTLLoadAction - load action
 pub const MTLLoadAction = enum(c_ulong) {
     DontCare = 0,
     Load = 1,
     Clear = 2,
 };
 
-/// MTLStoreAction - 存储操作
+/// MTLStoreAction - store action
 pub const MTLStoreAction = enum(c_ulong) {
     DontCare = 0,
     Store = 1,
@@ -221,7 +221,7 @@ pub const MTLStoreAction = enum(c_ulong) {
     CustomSampleDepthStore = 5,
 };
 
-/// MTLPrimitiveType - 基元类型
+/// MTLPrimitiveType - primitive type
 pub const MTLPrimitiveType = enum(c_ulong) {
     Point = 0,
     Line = 1,
@@ -230,13 +230,13 @@ pub const MTLPrimitiveType = enum(c_ulong) {
     TriangleStrip = 4,
 };
 
-/// MTLIndexType - 索引类型
+/// MTLIndexType - index type
 pub const MTLIndexType = enum(c_ulong) {
     UInt16 = 0,
     UInt32 = 1,
 };
 
-/// MTLCompareFunction - 比较函数
+/// MTLCompareFunction - compare function
 pub const MTLCompareFunction = enum(c_ulong) {
     Never = 0,
     Less = 1,
@@ -248,20 +248,20 @@ pub const MTLCompareFunction = enum(c_ulong) {
     Always = 7,
 };
 
-/// MTLCullMode - 剔除模式
+/// MTLCullMode - cull mode
 pub const MTLCullMode = enum(c_ulong) {
     None = 0,
     Front = 1,
     Back = 2,
 };
 
-/// MTLWinding - 绕序
+/// MTLWinding - winding order
 pub const MTLWinding = enum(c_ulong) {
     Clockwise = 0,
     CounterClockwise = 1,
 };
 
-/// MTLVertexFormat - 顶点格式
+/// MTLVertexFormat - vertex format
 pub const MTLVertexFormat = enum(c_ulong) {
     Invalid = 0,
     UChar2 = 1,
@@ -305,7 +305,7 @@ pub const MTLVertexFormat = enum(c_ulong) {
     UInt4 = 39,
 };
 
-/// MTLVertexStepFunction - 顶点步进函数
+/// MTLVertexStepFunction - vertex step function
 pub const MTLVertexStepFunction = enum(c_ulong) {
     Constant = 0,
     PerVertex = 1,
@@ -318,7 +318,7 @@ pub const MTLVertexStepFunction = enum(c_ulong) {
 // Structures
 // ============================================================================
 
-/// MTLClearColor - 清除颜色
+/// MTLClearColor - clear color
 pub const MTLClearColor = extern struct {
     red: f64,
     green: f64,
@@ -326,37 +326,37 @@ pub const MTLClearColor = extern struct {
     alpha: f64,
 };
 
-/// MTLSize - 3D 尺寸
+/// MTLSize - 3D size
 pub const MTLSize = extern struct {
     width: c_ulong,
     height: c_ulong,
     depth: c_ulong,
 };
 
-/// MTLOrigin - 3D 原点
+/// MTLOrigin - 3D origin
 pub const MTLOrigin = extern struct {
     x: c_ulong,
     y: c_ulong,
     z: c_ulong,
 };
 
-/// MTLRegion - 3D 区域
+/// MTLRegion - 3D region
 pub const MTLRegion = extern struct {
     origin: MTLOrigin,
     size: MTLSize,
 };
 
 // ============================================================================
-// External C Functions (待实现在 native/metal_bridge.m)
+// External C Functions (to implement in native/metal_bridge.m)
 // ============================================================================
 
-// 注意: 这些函数声明将在阶段 3 实现
-// 现在先定义接口，让代码能编译通过
+// Note: implementation deferred to phase 3; defining interface now for compilation.
 
 // Device Management
 pub extern "c" fn metal_create_system_default_device() ?*MTLDevice;
-/// out_count 回传系统设备总数；返回值 = 实际写入 out_devices 的条数
-/// （min(capacity, 总数)，每条 +1 retained 归调用者）。桥保证不写超过 capacity。
+/// out_count returns total system device count; return value = count actually written
+/// to out_devices (min(capacity, total); each +1 retained to caller). Bridge guarantees
+/// no overflow beyond capacity.
 pub extern "c" fn metal_copy_all_devices(out_count: *usize, out_devices: ?[*]?*anyopaque, capacity: usize) usize;
 pub extern "c" fn metal_device_get_name(device: *MTLDevice) [*:0]const u8;
 pub extern "c" fn metal_device_new_command_queue(device: *MTLDevice) ?*MTLCommandQueue;
@@ -403,8 +403,8 @@ pub extern "c" fn metal_texture_replace_region(texture: *MTLTexture, x: c_uint, 
 pub extern "c" fn metal_texture_replace_region_level(texture: *MTLTexture, x: c_uint, y: c_uint, width: c_uint, height: c_uint, mipLevel: c_ulong, bytes: [*]const u8, bytesPerRow: c_uint) void;
 pub extern "c" fn metal_texture_read_bgra8(texture: *MTLTexture, out_bytes: [*]u8, bytes_per_row: c_uint, width: c_uint, height: c_uint) c_int;
 
-// 图像写出（image_bridge.m），把 RGBA8 像素编码成 PNG 落盘。
-// 返回 0 成功，负数失败。用于 e2e 截图验证。
+// Write image (image_bridge.m): encode RGBA8 pixels as PNG to disk. Return 0 on
+// success, negative on failure. Used for e2e screenshot verification.
 pub extern "c" fn macos_write_png_from_rgba(path_cstr: [*:0]const u8, rgba: [*]const u8, width: c_uint, height: c_uint, bytes_per_row: c_uint) c_int;
 
 // Command Queue
@@ -414,13 +414,13 @@ pub extern "c" fn metal_command_queue_command_buffer(queue: *MTLCommandQueue) ?*
 pub extern "c" fn metal_command_buffer_commit(buffer: *MTLCommandBuffer) void;
 pub extern "c" fn metal_command_buffer_wait_until_completed(buffer: *MTLCommandBuffer) void;
 
-/// GPU 实际执行起止时刻（秒，CPU 时间基准）。**仅在 command buffer 完成后有效**，
-/// 未完成时返回 0。这是真 GPU 时间，区别于 FrameStats.gpu_encode_us 那个
-/// 混入 wait/acquire 的 CPU 墙钟（审查报告 §4）。
+/// GPU actual execution start/end times (seconds, CPU time base). Valid only after
+/// command buffer completes; returns 0 if incomplete. True GPU time, differs from
+/// FrameStats.gpu_encode_us which mixes wait/acquire (see review report section 4).
 pub extern "c" fn metal_command_buffer_gpu_start_time(buffer: *MTLCommandBuffer) f64;
 pub extern "c" fn metal_command_buffer_gpu_end_time(buffer: *MTLCommandBuffer) f64;
 
-/// 非阻塞查询是否已到终态（completed / error）。
+/// Non-blocking query: has command buffer reached terminal state (completed/error)?
 pub extern "c" fn metal_command_buffer_is_completed(buffer: *MTLCommandBuffer) bool;
 
 // Reference Counting
@@ -458,17 +458,17 @@ pub extern "c" fn metal_queue_command_buffer(queue: *MTLCommandQueue) ?*MTLComma
 // Helper Functions
 // ============================================================================
 
-/// 创建系统默认 Metal 设备
+/// Create system default Metal device
 pub fn createSystemDefaultDevice() ?*MTLDevice {
     return metal_create_system_default_device();
 }
 
-/// 释放 Metal 对象
+/// Release Metal object
 pub fn release(obj: anytype) void {
     metal_release(@ptrCast(obj));
 }
 
-/// 保留 Metal 对象
+/// Retain Metal object
 pub fn retain(obj: anytype) @TypeOf(obj) {
     return @ptrCast(@alignCast(metal_retain(@ptrCast(obj))));
 }
@@ -480,7 +480,7 @@ pub fn retain(obj: anytype) @TypeOf(obj) {
 pub extern "c" fn objc_autoreleasepool_push() ?*anyopaque;
 pub extern "c" fn objc_autoreleasepool_pop(pool: *anyopaque) void;
 
-/// Autorelease Pool RAII 包装器
+/// Autorelease pool RAII wrapper
 pub const AutoreleasePool = struct {
     pool: *anyopaque,
 
@@ -495,12 +495,12 @@ pub const AutoreleasePool = struct {
     }
 };
 
-/// 在 autorelease pool 中执行函数
-/// 使用示例:
+/// Execute function in autorelease pool
+/// Usage example:
 /// ```zig
 /// const result = autoreleasepool(struct {
 ///     fn call(ctx: *Context) !Result {
-///         // ... Metal API 调用 ...
+///         // ... Metal API calls ...
 ///         return result;
 ///     }
 /// }.call, &context);
@@ -594,35 +594,35 @@ pub extern "c" fn metal_compute_encoder_dispatch_threadgroups(encoder: *MTLCompu
 // GPU Frame Synchronization (dispatch_semaphore)
 // ============================================================================
 
-/// dispatch_semaphore_t, GCD 信号量，用于 CPU/GPU 帧同步
+/// dispatch_semaphore_t, GCD semaphore for CPU/GPU frame sync
 pub const dispatch_semaphore_t = *anyopaque;
 
-/// 创建信号量（初始值 = value）
+/// Create semaphore (initial value = value)
 pub extern "c" fn dispatch_semaphore_create(value: c_long) ?dispatch_semaphore_t;
 
-/// 等待信号量（递减，timeout = DISPATCH_TIME_FOREVER）
+/// Wait semaphore (decrement, timeout = DISPATCH_TIME_FOREVER)
 pub extern "c" fn dispatch_semaphore_wait(dsema: dispatch_semaphore_t, timeout: u64) c_long;
 
-/// 发送信号量（递增）
+/// Signal semaphore (increment)
 pub extern "c" fn dispatch_semaphore_signal(dsema: dispatch_semaphore_t) c_long;
 
-/// 释放 dispatch 对象。dispatch_semaphore_t 在 Zig 侧是裸 extern 指针，
-/// 不受 ARC 管辖，create 后必须显式 release，否则每个 FrameSync 生命周期
-/// 泄漏一个信号量对象（多窗口反复开关线性累积）。
+/// Release dispatch object. dispatch_semaphore_t in Zig is bare extern pointer,
+/// not ARC-managed; after create must explicitly release, else each FrameSync lifetime
+/// leaks one semaphore (multi-window repeat open/close accumulates linearly).
 pub extern "c" fn dispatch_release(object: dispatch_semaphore_t) void;
 
 /// DISPATCH_TIME_FOREVER
 pub const DISPATCH_TIME_FOREVER: u64 = ~@as(u64, 0);
 
-/// Command Buffer 添加完成回调
+/// Add completion callback to command buffer
 pub extern "c" fn metal_command_buffer_add_completed_handler(
     buffer: *MTLCommandBuffer,
     context: ?*anyopaque,
     callback: *const fn (?*anyopaque) callconv(.c) void,
 ) void;
 
-/// Command Buffer 错误观测：完成时 status == Error 才回调（Metal completion
-/// 线程；desc 只在回调期间有效）。
+/// Command buffer error observation: calls only when status == Error at completion
+/// (Metal completion thread; desc valid only during callback).
 pub extern "c" fn metal_command_buffer_notify_error(
     buffer: *MTLCommandBuffer,
     context: ?*anyopaque,

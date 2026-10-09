@@ -1,114 +1,191 @@
-//! Accessibility Tree, Phase 6 真 a11y 投影
+//! Accessibility Tree: true a11y projection.
 //!
-//! 当前 zenit a11y 仅是单点 "notify focus/property change" 的桥；本模块建立
-//! 完整的 AccessibilityTree，从 ElementTable + InteractionTable 投影出
-//! 平台无关的 a11y node 树，供 NSAccessibility / IAccessible / AT-SPI 消费。
+//! Builds a complete AccessibilityTree, projecting ElementTable + InteractionTable into
+//! a platform-agnostic a11y node tree for NSAccessibility / IAccessible / AT-SPI.
 //!
-//! 设计参照：
-//! - macOS NSAccessibility 协议（accessibilityChildren / accessibilityHitTest:）
+//! Design reference:
+//! - macOS NSAccessibility protocol (accessibilityChildren / accessibilityHitTest:)
 //! - W3C ARIA 1.2 / WAI-ARIA Authoring Practices
 //! - Chrome AXTree / AXNode
 //! - SwiftUI AccessibilityElement
 //!
-//! 历史债避免：
-//! - **不**让 a11y 节点持 *Node（用 ElementId 跨帧安全）
-//! - **不**每帧重建（reactive：节点 a11y 属性变化只 dirty 该 a11y node）
-//! - **不**把 a11y 焦点和键盘焦点混淆（两套 focused 状态独立）
+//! Constraints:
+//! - **Do NOT** let a11y nodes hold *Node (use ElementId for frame-safety)
+//! - **Do NOT** rebuild every frame (reactive: a node's a11y property change only dirties
+//!   that a11y node)
+//! - **Do NOT** confuse a11y focus and keyboard focus (two independent focused states)
 
 const std = @import("std");
 const testing = std.testing;
 const element_id_mod = @import("../core/element_id.zig");
+pub const collection = @import("collection.zig");
 
 pub const ElementId = element_id_mod.ElementId;
 
-/// 完整 ARIA 风格角色（覆盖最常用 30+ 个；后续按需扩）
+/// AX layer element identity; the handle crossing the process boundary is its raw().
+///
+/// Node (kind = node) payload is ElementId raw, value-equal to ElementId zero-extended.
+/// Collection entries (virtual list rows/cells etc., see docs/A11Y_ARCHITECTURE.md S12) are
+/// not logical-tree nodes; identity is assigned by the a11y layer and kind distinguishes
+/// the namespace: it does not borrow ElementId reserved values, and AX callbacks do not
+/// request elements from the logical tree.
+pub const AXId = packed struct(u64) {
+    payload: u32,
+    kind: Kind = .node,
+    _reserved: u24 = 0,
+
+    pub const Kind = enum(u8) {
+        node = 0,
+        /// Collection entry row (payload = collection.ItemSlot).
+        row = 1,
+        /// Collection entry cell.
+        cell = 2,
+        /// Synthetic static text without bound entry.
+        cell_text = 3,
+        _,
+    };
+
+    /// Refers to no element. Equals NULL node form, so old u32 sentinel 0xFFFFFFFF zero-
+    /// extended still NULL.
+    pub const NULL: AXId = node(ElementId.NULL);
+
+    pub fn node(id: ElementId) AXId {
+        return .{ .payload = id.raw(), .kind = .node };
+    }
+
+    pub fn raw(self: AXId) u64 {
+        return @bitCast(self);
+    }
+
+    pub fn fromRaw(value: u64) AXId {
+        return @bitCast(value);
+    }
+
+    pub fn eql(a: AXId, b: AXId) bool {
+        return a.raw() == b.raw();
+    }
+
+    pub fn isNull(self: AXId) bool {
+        return self.eql(NULL);
+    }
+
+    /// Node identity; other kinds return null.
+    pub fn element(self: AXId) ?ElementId {
+        if (self.kind != .node) return null;
+        const id = ElementId.fromRaw(self.payload);
+        return if (id.isNull()) null else id;
+    }
+};
+
+// Native side (window_bridge.m's ZenitAXHandle / ZENIT_A11Y_INVALID_HANDLE) treats this as
+// contract: node handle equals ElementId zero-extended, kind above payload, NULL equals old
+// u32 sentinel. Field reordering silently breaks cross-language ABI, pinned here at compile
+// time.
+comptime {
+    std.debug.assert(@bitSizeOf(AXId) == 64);
+    std.debug.assert(AXId.NULL.raw() == 0x0000_0000_FFFF_FFFF);
+    std.debug.assert(AXId.node(.{ .index = 0x123456, .generation = 0x78 }).raw() == 0x7812_3456);
+    std.debug.assert(@bitOffsetOf(AXId, "kind") == 32);
+}
+
+/// Complete ARIA-style roles (covers most-used 30+; extend as needed)
 pub const Role = enum(u16) {
     none,
     application,
-    /// 按钮（普通 / submit / reset）
+    /// Button (normal / submit / reset)
     button,
-    /// 复选框
+    /// Checkbox
     checkbox,
-    /// 单选按钮
+    /// Radio button
     radio,
-    /// 单选组
+    /// Radio group
     radiogroup,
-    /// 滑块
+    /// Slider
     slider,
-    /// 数字输入
+    /// Spinbutton
     spinbutton,
-    /// 进度条
+    /// Progressbar
     progressbar,
-    /// 链接
+    /// Link
     link,
-    /// 文本框（单行 input）
+    /// Textbox (single-line input)
     textbox,
-    /// 多行文本区
+    /// Textarea (multiline)
     textarea,
-    /// 搜索框
+    /// Searchbox
     searchbox,
-    /// 下拉
+    /// Combobox
     combobox,
-    /// 列表
+    /// Listbox
     listbox,
     listitem,
-    /// 树
+    /// Tree
     tree,
     treeitem,
-    /// 表
+    /// Table
     grid,
     row,
     cell,
     columnheader,
     rowheader,
-    /// 菜单
+    /// Menu
     menu,
     menubar,
     menuitem,
     menuitemcheckbox,
     menuitemradio,
-    /// 对话
+    /// Dialog
     dialog,
     alertdialog,
-    /// 提示
+    /// Alert
     alert,
     status,
     log,
-    /// 标签页
+    /// Tablist
     tabs,
     tab,
     tabpanel,
-    /// 工具提示
+    /// Tooltip
     tooltip,
-    /// 容器/分组
+    /// Generic container/group
     group,
     region,
-    /// 文本类
+    /// Text
     heading,
     paragraph,
-    /// 图像
+    /// Img
     image,
-    /// 内容容器
+    /// Content container (article)
     article,
     section,
-    /// 导航
+    /// Navigation
     navigation,
-    /// 列表（非 listbox 的列表语义）
+    /// List (non-listbox list semantics)
     list,
-    /// 单元格层级关系
+    /// Cell hierarchy relationship
     separator,
-    /// 表单
+    /// Form
     form,
-    /// 主区
+    /// Main
     main,
-    /// 横幅
+    /// Banner
     banner,
     contentinfo,
-    /// 容器（无具体语义）
+    /// Generic container (no specific semantics)
     generic,
+    /// Unannotated text node auto-projected as static text (AXStaticText). Not a component-
+    /// declared role: projection inferred from `.text` node, value is text content. Appended at
+    /// end,
+    /// preserving existing role sequence (ObjC NS_ENUM aligns by ordinal, see macos_bridge.zig).
+    static_text,
+    /// ARIA switch. Previously projected as checkbox, VoiceOver read as "checkbox"; now
+    /// single role, macOS maps to AXCheckBox + AXSwitch subrole.
+    switch_control,
+    /// Scrollable region (AXScrollArea). See a11y_projection.inferredProps.
+    scroll_area,
 };
 
-/// 节点状态位（ARIA aria-* 属性）
+/// Node state bits (ARIA aria-* attributes)
 pub const State = packed struct(u32) {
     /// aria-disabled
     disabled: bool = false,
@@ -118,11 +195,11 @@ pub const State = packed struct(u32) {
     expanded: bool = false,
     /// aria-selected
     selected: bool = false,
-    /// aria-checked（checkbox/radio）
+    /// aria-checked (checkbox/radio)
     checked: bool = false,
-    /// aria-checked = mixed（部分选中）
+    /// aria-checked = mixed (indeterminate)
     indeterminate: bool = false,
-    /// aria-pressed（toggle button）
+    /// aria-pressed (toggle button)
     pressed: bool = false,
     /// aria-required
     required: bool = false,
@@ -130,13 +207,13 @@ pub const State = packed struct(u32) {
     invalid: bool = false,
     /// aria-readonly
     readonly: bool = false,
-    /// aria-busy（动态加载中）
+    /// aria-busy (async loading)
     busy: bool = false,
-    /// aria-modal（dialog 模态）
+    /// aria-modal (dialog modal)
     modal: bool = false,
-    /// 是否当前 a11y 焦点
+    /// Whether current a11y focus
     focused: bool = false,
-    /// 是否可获焦
+    /// Whether focusable
     focusable: bool = false,
     /// aria-haspopup
     haspopup: bool = false,
@@ -153,7 +230,7 @@ pub const State = packed struct(u32) {
     _reserved: u13 = 0,
 };
 
-/// aria-live 区域级别
+/// aria-live region level
 pub const LiveRegion = enum(u8) {
     off,
     polite,
@@ -211,46 +288,51 @@ pub const EditableText = struct {
     visible_end: u32 = std.math.maxInt(u32),
     can_set_selection: bool = false,
     can_set_value: bool = false,
+    uniform_format: bool = false,
+    can_scroll: bool = false,
 };
 
-/// 单个 a11y 节点
+/// Single a11y node
 pub const A11yNode = struct {
-    /// 投影自哪个 element
-    element: ElementId,
-    /// 父 a11y 节点（不一定与 ElementTable 父相同：a11y tree 可裁剪）
-    parent: ElementId = ElementId.NULL,
+    /// AX identity (AXId.node(ElementId) when projected)
+    element: AXId,
+    /// Parent a11y node (not necessarily same as ElementTable parent: a11y tree can prune)
+    parent: AXId = AXId.NULL,
     role: Role = .none,
     state: State = .{},
     live: LiveRegion = .off,
-    /// 标签 hash（实际字符串由 caller 通过 label_resolver 取，避免在此层持有 []const u8）
+    /// Label hash (actual string via caller's label_resolver, avoid holding []const u8)
     label_hash: u64 = 0,
-    /// 描述（aria-describedby 引用结果）hash
+    /// Description (aria-describedby reference) hash
     description_hash: u64 = 0,
     /// Placeholder and stable application identifier are independent from the
     /// accessible name; VoiceOver uses both through dedicated AX attributes.
     placeholder_hash: u64 = 0,
     identifier_hash: u64 = 0,
-    /// 数值（slider/progress/spinbutton）
+    /// Value (slider/progress/spinbutton)
     value_now: f32 = 0,
     value_min: f32 = 0,
     value_max: f32 = 0,
+    value_small_change: ?f32 = null,
+    value_large_change: ?f32 = null,
     numeric_value_present: bool = false,
     /// Whether the source node published a callable numeric setter. Native
     /// selector gating must be node-specific rather than inferred from the
     /// window-wide interaction router.
     can_set_numeric_value: bool = false,
+    can_set_expanded: bool = false,
+    can_set_item_selection: bool = false,
     /// Current AXValue text.
     text_hash: u64 = 0,
     /// Announcement payload is independent from AXValue. Alerts and status
     /// regions commonly derive this from their label or subtree text while
     /// exposing no value attribute.
     live_text_hash: u64 = 0,
-    /// 在父中的索引（用于 NSAccessibility children 顺序）
+    /// Index within parent (for NSAccessibility children ordering)
     sibling_index: u32 = 0,
-    /// aria-activedescendant，给 combobox/listbox 这种容器
-    /// 自身保持 focus，但通过 active_descendant 告诉 AT 当前哪个 child 是活动项。
-    /// ElementId.NULL = 无 active descendant (default)
-    active_descendant: ElementId = ElementId.NULL,
+    /// aria-activedescendant, for combobox/listbox containers: self keeps focus but tells AT
+    /// which child is active via active_descendant. AXId.NULL = no active descendant (default)
+    active_descendant: AXId = AXId.NULL,
     /// Current layout-space geometry and callable behavior capabilities.
     frame: Frame = .{},
     actions: Actions = .{},
@@ -266,25 +348,32 @@ pub const A11yNode = struct {
     row_span: u32 = 1,
     column_index: u32 = 0,
     column_span: u32 = 1,
+    /// aria-setsize / aria-rowcount; 0 = not declared (see types.A11yProps.set_size).
+    set_size: u32 = 0,
+    /// aria-posinset, 1-indexed; 0 = not declared.
+    pos_in_set: u32 = 0,
+    /// Projected in collection row (bound pool node subtree), that collection's table. These
+    /// nodes' frames are projection snapshots; AX callbacks translate by offset difference after
+    /// scroll submit, aligning with entry elements.
+    collection_table: AXId = AXId.NULL,
 };
 
 pub fn announcementHash(node: A11yNode) u64 {
     return if (node.live_text_hash != 0) node.live_text_hash else node.text_hash;
 }
 
-/// Tree dirty flags（reactive consumer：哪些 a11y node 本帧需重投影）
+/// Tree dirty flags (reactive consumer: which a11y nodes need re-projection this frame)
 pub const A11yDirtyFlag = packed struct(u16) {
     role_changed: bool = false,
     state_changed: bool = false,
     label_changed: bool = false,
     value_changed: bool = false,
-    /// live region 内容变 -> 需要 announce
+    /// live region content changed -> needs announce
     live_announce: bool = false,
-    /// 焦点变化 -> 需要平台通知
+    /// focus changed -> needs platform notification
     focus_changed: bool = false,
     structure_changed: bool = false,
-    /// active_descendant 变化 -> 需要 NSAccessibility
-    /// AXSelectedChildren 重投
+    /// active_descendant changed -> needs NSAccessibility AXSelectedChildren re-projection
     active_descendant_changed: bool = false,
     /// Geometry is a first-class AX attribute and must invalidate cached
     /// positions even when no semantic property changed.
@@ -292,7 +381,9 @@ pub const A11yDirtyFlag = packed struct(u16) {
     /// Text selection changes use a distinct AppKit notification from value
     /// changes. Keeping the bit separate prevents noisy full-value announces.
     selection_changed: bool = false,
-    _reserved: u6 = 0,
+    /// collection logical count (set_size) changed -> platform sends RowCountChanged.
+    row_count_changed: bool = false,
+    _reserved: u5 = 0,
 };
 
 /// Structural dirty state must survive node removal. A dirty map containing
@@ -300,12 +391,14 @@ pub const A11yDirtyFlag = packed struct(u16) {
 /// which used to make removal notifications disappear in the router.
 pub const StructureChange = struct {
     had_old: bool = false,
-    old_parent: ElementId = ElementId.NULL,
+    old_parent: AXId = AXId.NULL,
     old_hidden: bool = false,
     has_new: bool = false,
-    new_parent: ElementId = ElementId.NULL,
+    new_parent: AXId = AXId.NULL,
     new_hidden: bool = false,
 };
+
+pub const ChildSpan = struct { start: u32, len: u32 };
 
 pub const AccessibilityTree = struct {
     allocator: std.mem.Allocator,
@@ -317,19 +410,31 @@ pub const AccessibilityTree = struct {
     seen_epochs: std.ArrayListUnmanaged(u64),
     projection_epoch: u64 = 0,
     projection_active: bool = false,
-    /// 待平台通知的 dirty 队列（element id -> flags）
-    dirty: std.AutoHashMapUnmanaged(u32, A11yDirtyFlag),
+    /// Dirty queue pending platform notification (element id -> flags)
+    dirty: std.AutoHashMapUnmanaged(u64, A11yDirtyFlag),
     /// Parent snapshots for structural changes, keyed by the generational raw
     /// handle just like `dirty`.
-    structure_changes: std.AutoHashMapUnmanaged(u32, StructureChange),
-    /// 当前 a11y focused element
-    focused: ElementId = ElementId.NULL,
+    structure_changes: std.AutoHashMapUnmanaged(u64, StructureChange),
+    /// Current a11y focused element
+    focused: AXId = AXId.NULL,
+    /// Parent -> ordered visible children index list, so the native side gets the i-th child
+    /// in O(1). A per-call scan would make a single `accessibilityChildren` O(n*k^2); a large
+    /// parent (~170 direct children) takes tens of ms per AXChildren call and VoiceOver
+    /// fetches children on every step. Struct changes (add/remove/reparent/reorder sibling/
+    /// hidden toggle) mark dirty; the first fetch rebuilds once in O(n log n).
+    child_index_dirty: bool = true,
+    child_order: std.ArrayListUnmanaged(AXId) = .empty,
+    child_spans: std.AutoHashMapUnmanaged(u64, ChildSpan) = .{},
+    /// Semantic collections and item tables (see collection.zig).
+    collections: collection.Registry = .{},
+    /// Projection context: collection row table being projected (set on node during upsert).
+    projection_collection_host: AXId = AXId.NULL,
 
     pub fn init(allocator: std.mem.Allocator) AccessibilityTree {
         return .{
             .allocator = allocator,
-            .nodes = .{},
-            .seen_epochs = .{},
+            .nodes = .empty,
+            .seen_epochs = .empty,
             .dirty = .{},
             .structure_changes = .{},
         };
@@ -340,17 +445,21 @@ pub const AccessibilityTree = struct {
         self.seen_epochs.deinit(self.allocator);
         self.dirty.deinit(self.allocator);
         self.structure_changes.deinit(self.allocator);
+        self.child_order.deinit(self.allocator);
+        self.child_spans.deinit(self.allocator);
+        self.collections.deinit(self.allocator);
         self.* = undefined;
     }
 
-    /// 投影/更新一个 a11y node。
-    /// dirty flag 自动累积；caller 在帧末调 drainDirty 把变化推到平台。
+    /// Project/update an a11y node.
+    /// Dirty flags auto-accumulate; caller drainDirty at frame end to push changes to platform.
     pub fn upsert(self: *AccessibilityTree, incoming: A11yNode) !void {
         var node = incoming;
         if (node.state.hidden or node.state.disabled) {
             node.state.focused = false;
         }
-        const idx = node.element.index;
+        if (self.projection_active) node.collection_table = self.projection_collection_host;
+        const idx = denseIndex(node.element) orelse return error.UnsupportedElementKind;
         while (self.nodes.items.len <= idx) {
             try self.nodes.append(self.allocator, null);
         }
@@ -372,7 +481,7 @@ pub const AccessibilityTree = struct {
                 });
                 try self.markDirty(stale.element, .{ .structure_changed = true });
                 if (self.focused.eql(stale.element)) {
-                    self.focused = ElementId.NULL;
+                    self.focused = AXId.NULL;
                     try self.markDirty(stale.element, .{ .focus_changed = true });
                 }
             }
@@ -387,16 +496,26 @@ pub const AccessibilityTree = struct {
             const o_state: u32 = @bitCast(o.state);
             const n_state: u32 = @bitCast(node.state);
             const focused_mask: u32 = @as(u32, 1) << 12;
-            if ((o_state & ~focused_mask) != (n_state & ~focused_mask)) flag.state_changed = true;
+            // hidden toggle is struct change (structure_changed below covers it), do not also
+            // report
+            // state change: else modal open causes every previously-hidden element to send
+            // AXValueChanged (real VoiceOver axprobe observed this noise).
+            const hidden_mask: u32 = @as(u32, 1) << 1;
+            const ignored_mask = focused_mask | hidden_mask;
+            if ((o_state & ~ignored_mask) != (n_state & ~ignored_mask)) flag.state_changed = true;
             if (o.label_hash != node.label_hash or
                 o.description_hash != node.description_hash or
                 o.placeholder_hash != node.placeholder_hash) flag.label_changed = true;
             if (o.value_now != node.value_now or o.value_min != node.value_min or
                 o.value_max != node.value_max or
+                !std.meta.eql(o.value_small_change, node.value_small_change) or
+                !std.meta.eql(o.value_large_change, node.value_large_change) or
                 o.numeric_value_present != node.numeric_value_present or
                 o.text_hash != node.text_hash) flag.value_changed = true;
             if ((o.editable_text == null) != (node.editable_text == null) or
                 o.can_set_numeric_value != node.can_set_numeric_value or
+                o.can_set_expanded != node.can_set_expanded or
+                o.can_set_item_selection != node.can_set_item_selection or
                 !std.meta.eql(o.actions, node.actions)) flag.state_changed = true;
             if (o.editable_text != null and node.editable_text != null and
                 (o.editable_text.?.selection_start != node.editable_text.?.selection_start or
@@ -409,7 +528,9 @@ pub const AccessibilityTree = struct {
                 const old_editable = o.editable_text.?;
                 const new_editable = node.editable_text.?;
                 if (old_editable.can_set_selection != new_editable.can_set_selection or
-                    old_editable.can_set_value != new_editable.can_set_value) flag.state_changed = true;
+                    old_editable.can_set_value != new_editable.can_set_value or
+                    old_editable.uniform_format != new_editable.uniform_format or
+                    old_editable.can_scroll != new_editable.can_scroll) flag.state_changed = true;
                 if (old_editable.visible_start != new_editable.visible_start or
                     old_editable.visible_end != new_editable.visible_end) flag.geometry_changed = true;
             }
@@ -431,25 +552,28 @@ pub const AccessibilityTree = struct {
                     .new_hidden = node.state.hidden,
                 });
             }
+            if (o.set_size != node.set_size) flag.row_count_changed = true;
             if (o.identifier_hash != node.identifier_hash or
                 o.orientation != node.orientation or
                 o.sort_direction != node.sort_direction or
                 o.level != node.level or o.row_index != node.row_index or
                 o.row_span != node.row_span or o.column_index != node.column_index or
-                o.column_span != node.column_span)
+                o.column_span != node.column_span or
+                o.pos_in_set != node.pos_in_set)
             {
                 flag.state_changed = true;
             }
         }
         self.nodes.items[idx] = node;
+        if (flag.structure_changed) self.child_index_dirty = true;
         if (@as(u16, @bitCast(flag)) != 0) {
             try self.markDirty(node.element, flag);
         }
         if (node.state.focused) {
             if (!self.focused.isNull() and !self.focused.eql(node.element)) {
                 const previous = self.focused;
-                if (previous.index < self.nodes.items.len) {
-                    if (self.nodes.items[previous.index]) |*previous_node| {
+                if (self.slotPtr(previous)) |slot| {
+                    if (slot.*) |*previous_node| {
                         if (previous_node.element.eql(previous) and previous_node.state.focused) {
                             previous_node.state.focused = false;
                             try self.markDirty(previous, .{ .focus_changed = true });
@@ -459,7 +583,7 @@ pub const AccessibilityTree = struct {
             }
             self.focused = node.element;
         } else if (self.focused.eql(node.element)) {
-            self.focused = ElementId.NULL;
+            self.focused = AXId.NULL;
         }
     }
 
@@ -480,6 +604,7 @@ pub const AccessibilityTree = struct {
     pub fn finishProjection(self: *AccessibilityTree) !void {
         if (!self.projection_active) return;
         const epoch = self.projection_epoch;
+        try collection.finishEpoch(&self.collections, .{ .tree = self }, epoch);
         for (self.nodes.items, 0..) |maybe, idx| {
             const node = maybe orelse continue;
             const seen = idx < self.seen_epochs.items.len and self.seen_epochs.items[idx] == epoch;
@@ -488,13 +613,14 @@ pub const AccessibilityTree = struct {
         self.projection_active = false;
     }
 
-    pub fn remove(self: *AccessibilityTree, id: ElementId) !void {
-        if (id.isNull() or id.index >= self.nodes.items.len) return;
-        const existing = self.nodes.items[id.index] orelse return;
+    pub fn remove(self: *AccessibilityTree, id: AXId) !void {
+        const slot = self.slotPtr(id) orelse return;
+        const existing = slot.* orelse return;
         // A stale generation must not remove the live element which reused the
         // same dense index.
         if (!existing.element.eql(id)) return;
-        self.nodes.items[id.index] = null;
+        slot.* = null;
+        self.child_index_dirty = true;
         try self.recordStructureChange(id, .{
             .had_old = true,
             .old_parent = existing.parent,
@@ -502,16 +628,76 @@ pub const AccessibilityTree = struct {
         });
         try self.markDirty(id, .{ .structure_changed = true });
         if (self.focused.eql(id)) {
-            self.focused = ElementId.NULL;
+            self.focused = AXId.NULL;
             try self.markDirty(id, .{ .focus_changed = true });
         }
     }
 
-    pub fn get(self: *const AccessibilityTree, id: ElementId) ?A11yNode {
-        if (id.isNull() or id.index >= self.nodes.items.len) return null;
-        const node = self.nodes.items[id.index] orelse return null;
+    /// Get element. Collection entries synthesized on-demand from collection state; collection
+    /// table frames computed on-the-fly from committed offset (projection snapshot stale after AX
+    /// callback scroll submit).
+    pub fn get(self: *const AccessibilityTree, id: AXId) ?A11yNode {
+        if (id.kind != .node) return self.collections.synthesize(id);
+        const idx = denseIndex(id) orelse return null;
+        if (idx >= self.nodes.items.len) return null;
+        var node = self.nodes.items[idx] orelse return null;
         if (!node.element.eql(id)) return null;
+        if (self.collections.collectionForTable(id)) |c| node.frame = c.tableFrame();
+        if (!node.collection_table.isNull()) {
+            if (self.collections.collectionForTable(node.collection_table)) |c| node.frame.y += c.frameShift();
+        }
         return node;
+    }
+
+    // ── Semantic Collections ─────────────────────────────────────────────────────────
+
+    /// Projection: node declared collection. Return collection index for bindCollectionItem.
+    pub fn syncCollection(self: *AccessibilityTree, table: AXId, provider: collection.Provider, hidden: bool) !u32 {
+        return collection.syncCollection(&self.collections, self.allocator, .{ .tree = self }, table, provider, self.projection_epoch, hidden);
+    }
+
+    /// Projection: pool node bound to item index. Return that item's cell AXId (pool node
+    /// subtree's parent).
+    pub fn bindCollectionItem(self: *AccessibilityTree, collection_idx: u32, index: u32) !AXId {
+        return collection.bindItem(&self.collections, self.allocator, collection_idx, index, self.projection_epoch);
+    }
+
+    /// Table node release: collection and items exit immediately, no more calls to that
+    /// provider functions.
+    pub fn retireCollection(self: *AccessibilityTree, table: AXId) !void {
+        try collection.retireTable(&self.collections, .{ .tree = self }, table);
+    }
+
+    /// Child count: collection table/row/cell parsed from collection, rest use ordered children.
+    pub fn childCount(self: *AccessibilityTree, parent: AXId) usize {
+        return self.collections.childCount(self, parent) orelse self.exposedChildren(parent).len;
+    }
+
+    /// i-th child. Collection table rows materialized on-demand here.
+    pub fn childAt(self: *AccessibilityTree, parent: AXId, i: usize) ?AXId {
+        if (parent.kind != .node or self.collections.collectionForTable(parent) != null) {
+            return self.collections.childAt(self.allocator, self, parent, i);
+        }
+        const kids = self.exposedChildren(parent);
+        return if (i < kids.len) kids[i] else null;
+    }
+
+    /// Get by node identity. Framework internals and tests query by Node, avoid writing
+    /// AXId.node(...) everywhere.
+    pub fn getNode(self: *const AccessibilityTree, id: ElementId) ?A11yNode {
+        return self.get(AXId.node(id));
+    }
+
+    /// Node's index in dense storage; null if not a node identity.
+    fn denseIndex(id: AXId) ?usize {
+        const eid = id.element() orelse return null;
+        return eid.index;
+    }
+
+    fn slotPtr(self: *AccessibilityTree, id: AXId) ?*?A11yNode {
+        const idx = denseIndex(id) orelse return null;
+        if (idx >= self.nodes.items.len) return null;
+        return &self.nodes.items[idx];
     }
 
     pub fn count(self: *const AccessibilityTree) usize {
@@ -522,7 +708,7 @@ pub const AccessibilityTree = struct {
         return n;
     }
 
-    pub fn markDirty(self: *AccessibilityTree, id: ElementId, flag: A11yDirtyFlag) !void {
+    pub fn markDirty(self: *AccessibilityTree, id: AXId, flag: A11yDirtyFlag) !void {
         if (id.isNull()) return;
         const gop = try self.dirty.getOrPut(self.allocator, id.raw());
         if (!gop.found_existing) {
@@ -534,7 +720,7 @@ pub const AccessibilityTree = struct {
         }
     }
 
-    fn recordStructureChange(self: *AccessibilityTree, id: ElementId, change: StructureChange) !void {
+    pub fn recordStructureChange(self: *AccessibilityTree, id: AXId, change: StructureChange) !void {
         if (id.isNull()) return;
         const gop = try self.structure_changes.getOrPut(self.allocator, id.raw());
         if (!gop.found_existing) {
@@ -557,32 +743,73 @@ pub const AccessibilityTree = struct {
         }
     }
 
-    pub fn structureChange(self: *const AccessibilityTree, id: ElementId) ?StructureChange {
+    pub fn structureChange(self: *const AccessibilityTree, id: AXId) ?StructureChange {
         return self.structure_changes.get(id.raw());
     }
 
-    /// 平台 bridge 在帧末调用：消费 dirty 队列。
-    /// callback 可以在每个 entry 调用平台 API（NSAccessibilityPostNotification 等）。
+    /// Platform bridge calls at frame end: consume dirty queue.
+    /// Callback can invoke platform API on each entry (NSAccessibilityPostNotification etc).
     pub fn drainDirty(
         self: *AccessibilityTree,
         ctx: *anyopaque,
-        cb: *const fn (ctx: *anyopaque, id: ElementId, flag: A11yDirtyFlag) void,
+        cb: *const fn (ctx: *anyopaque, id: AXId, flag: A11yDirtyFlag) void,
     ) void {
         var iter = self.dirty.iterator();
         while (iter.next()) |entry| {
-            const id = ElementId.fromRaw(entry.key_ptr.*);
+            const id = AXId.fromRaw(entry.key_ptr.*);
             cb(ctx, id, entry.value_ptr.*);
         }
         self.dirty.clearRetainingCapacity();
         self.structure_changes.clearRetainingCapacity();
     }
 
-    /// 返回 element 的 a11y children（按 sibling_index 排序）。
-    /// 简化实现：扫描所有节点找 parent 匹配；O(n)。后续按需加索引。
+    /// Return element's a11y children (sorted by sibling_index).
+    /// `parent` visible children by (sibling_index, raw handle) stable sort; `AXId.NULL` for
+    /// top level. Slice valid until next struct change. Index rebuild OOM returns empty slice
+    /// (keeps dirty, retries next fetch): AT sees empty subtree once, better than wrong data.
+    pub fn exposedChildren(self: *AccessibilityTree, parent: AXId) []const AXId {
+        if (self.child_index_dirty) {
+            self.rebuildChildIndex() catch return &.{};
+        }
+        const span = self.child_spans.get(parent.raw()) orelse return &.{};
+        return self.child_order.items[span.start..][0..span.len];
+    }
+
+    fn rebuildChildIndex(self: *AccessibilityTree) !void {
+        self.child_order.clearRetainingCapacity();
+        self.child_spans.clearRetainingCapacity();
+        for (self.nodes.items) |maybe| {
+            const node = maybe orelse continue;
+            if (node.state.hidden) continue;
+            try self.child_order.append(self.allocator, node.element);
+        }
+        const Ctx = struct {
+            tree: *const AccessibilityTree,
+            fn lessThan(ctx: @This(), a: AXId, b: AXId) bool {
+                const na = ctx.tree.get(a).?;
+                const nb = ctx.tree.get(b).?;
+                if (na.parent.raw() != nb.parent.raw()) return na.parent.raw() < nb.parent.raw();
+                if (na.sibling_index != nb.sibling_index) return na.sibling_index < nb.sibling_index;
+                return na.element.raw() < nb.element.raw();
+            }
+        };
+        std.sort.pdq(AXId, self.child_order.items, Ctx{ .tree = self }, Ctx.lessThan);
+        var start: usize = 0;
+        while (start < self.child_order.items.len) {
+            const parent_raw = self.get(self.child_order.items[start]).?.parent.raw();
+            var end = start + 1;
+            while (end < self.child_order.items.len and
+                self.get(self.child_order.items[end]).?.parent.raw() == parent_raw) end += 1;
+            try self.child_spans.put(self.allocator, parent_raw, .{ .start = @intCast(start), .len = @intCast(end - start) });
+            start = end;
+        }
+        self.child_index_dirty = false;
+    }
+
     pub fn children(
         self: *const AccessibilityTree,
-        parent: ElementId,
-        out: *std.ArrayListUnmanaged(ElementId),
+        parent: AXId,
+        out: *std.ArrayListUnmanaged(AXId),
         allocator: std.mem.Allocator,
     ) !void {
         for (self.nodes.items) |maybe| {
@@ -604,7 +831,7 @@ pub const AccessibilityTree = struct {
                 const right_before = right.sibling_index < left.sibling_index or
                     (right.sibling_index == left.sibling_index and right.element.raw() < left.element.raw());
                 if (!right_before) break;
-                std.mem.swap(ElementId, &out.items[j - 1], &out.items[j]);
+                std.mem.swap(AXId, &out.items[j - 1], &out.items[j]);
             }
         }
     }
@@ -618,7 +845,7 @@ test "AccessibilityTree: upsert / get / count" {
     var tree = AccessibilityTree.init(testing.allocator);
     defer tree.deinit();
 
-    const id1: ElementId = .{ .index = 1, .generation = 0 };
+    const id1 = AXId.node(.{ .index = 1, .generation = 0 });
     try tree.upsert(.{
         .element = id1,
         .role = .button,
@@ -636,16 +863,16 @@ test "AccessibilityTree: upsert detects changes and marks dirty" {
     var tree = AccessibilityTree.init(testing.allocator);
     defer tree.deinit();
 
-    const id: ElementId = .{ .index = 1, .generation = 0 };
+    const id = AXId.node(.{ .index = 1, .generation = 0 });
     try tree.upsert(.{ .element = id, .role = .button });
 
-    // 第一次插入 -> structure_changed
+    // First insert -> structure_changed
     try testing.expect(tree.dirty.get(id.raw()).?.structure_changed);
 
-    // 清队列
+    // Clear queue
     tree.dirty.clearRetainingCapacity();
 
-    // 修改 role -> role_changed dirty
+    // role modified -> role_changed dirty
     try tree.upsert(.{ .element = id, .role = .checkbox });
     try testing.expect(tree.dirty.get(id.raw()).?.role_changed);
 }
@@ -654,8 +881,8 @@ test "AccessibilityTree: projection removes nodes absent from the next root" {
     var tree = AccessibilityTree.init(testing.allocator);
     defer tree.deinit();
 
-    const old_only: ElementId = .{ .index = 1, .generation = 0 };
-    const retained: ElementId = .{ .index = 2, .generation = 0 };
+    const old_only = AXId.node(.{ .index = 1, .generation = 0 });
+    const retained = AXId.node(.{ .index = 2, .generation = 0 });
     tree.beginProjection();
     try tree.upsert(.{ .element = old_only, .role = .button });
     try tree.upsert(.{ .element = retained, .role = .checkbox });
@@ -675,7 +902,7 @@ test "AccessibilityTree: state change tracked" {
     var tree = AccessibilityTree.init(testing.allocator);
     defer tree.deinit();
 
-    const id: ElementId = .{ .index = 1, .generation = 0 };
+    const id = AXId.node(.{ .index = 1, .generation = 0 });
     try tree.upsert(.{ .element = id, .role = .checkbox, .state = .{} });
     tree.dirty.clearRetainingCapacity();
 
@@ -687,7 +914,7 @@ test "AccessibilityTree: live region announce on text change" {
     var tree = AccessibilityTree.init(testing.allocator);
     defer tree.deinit();
 
-    const id: ElementId = .{ .index = 1, .generation = 0 };
+    const id = AXId.node(.{ .index = 1, .generation = 0 });
     try tree.upsert(.{ .element = id, .role = .status, .live = .polite, .text_hash = 100 });
     tree.dirty.clearRetainingCapacity();
 
@@ -699,11 +926,11 @@ test "AccessibilityTree: a populated live region announces when inserted or enab
     var tree = AccessibilityTree.init(testing.allocator);
     defer tree.deinit();
 
-    const inserted: ElementId = .{ .index = 1, .generation = 0 };
+    const inserted = AXId.node(.{ .index = 1, .generation = 0 });
     try tree.upsert(.{ .element = inserted, .role = .alert, .live = .assertive, .text_hash = 123 });
     try testing.expect(tree.dirty.get(inserted.raw()).?.live_announce);
 
-    const enabled: ElementId = .{ .index = 2, .generation = 0 };
+    const enabled = AXId.node(.{ .index = 2, .generation = 0 });
     try tree.upsert(.{ .element = enabled, .role = .status, .text_hash = 456 });
     tree.dirty.clearRetainingCapacity();
     try tree.upsert(.{ .element = enabled, .role = .status, .live = .polite, .text_hash = 456 });
@@ -714,29 +941,29 @@ test "AccessibilityTree: active_descendant diff sets flag" {
     var tree = AccessibilityTree.init(testing.allocator);
     defer tree.deinit();
 
-    const container: ElementId = .{ .index = 0, .generation = 0 };
-    const opt_a: ElementId = .{ .index = 1, .generation = 0 };
-    const opt_b: ElementId = .{ .index = 2, .generation = 0 };
+    const container = AXId.node(.{ .index = 0, .generation = 0 });
+    const opt_a = AXId.node(.{ .index = 1, .generation = 0 });
+    const opt_b = AXId.node(.{ .index = 2, .generation = 0 });
 
     try tree.upsert(.{ .element = container, .role = .combobox });
-    // 第一次进入 dirty 已 drain（这里直接清掉再做 diff）
+    // First dirty ever drained (here directly clear then diff)
     tree.dirty.clearRetainingCapacity();
 
     try tree.upsert(.{ .element = container, .role = .combobox, .active_descendant = opt_a });
     {
-        const flag = tree.dirty.get(container.index).?;
+        const flag = tree.dirty.get(container.raw()).?;
         try testing.expect(flag.active_descendant_changed);
     }
     tree.dirty.clearRetainingCapacity();
 
-    // 写入相同值 -> 不应再 dirty
+    // Write same value -> should not re-dirty
     try tree.upsert(.{ .element = container, .role = .combobox, .active_descendant = opt_a });
-    try testing.expect(tree.dirty.get(container.index) == null);
+    try testing.expect(tree.dirty.get(container.raw()) == null);
 
-    // 切到 B -> 重新 dirty
+    // Switch to B -> re-dirty
     try tree.upsert(.{ .element = container, .role = .combobox, .active_descendant = opt_b });
     {
-        const flag = tree.dirty.get(container.index).?;
+        const flag = tree.dirty.get(container.raw()).?;
         try testing.expect(flag.active_descendant_changed);
     }
 }
@@ -745,7 +972,7 @@ test "AccessibilityTree: focused tracked" {
     var tree = AccessibilityTree.init(testing.allocator);
     defer tree.deinit();
 
-    const id: ElementId = .{ .index = 1, .generation = 0 };
+    const id = AXId.node(.{ .index = 1, .generation = 0 });
     try tree.upsert(.{ .element = id, .role = .button, .state = .{ .focused = true, .focusable = true } });
     try testing.expect(tree.focused.eql(id));
     try testing.expect(tree.dirty.get(id.raw()).?.focus_changed);
@@ -755,8 +982,8 @@ test "AccessibilityTree: generation replacement cannot retain a stale focus hand
     var tree = AccessibilityTree.init(testing.allocator);
     defer tree.deinit();
 
-    const old: ElementId = .{ .index = 3, .generation = 1 };
-    const replacement: ElementId = .{ .index = 3, .generation = 2 };
+    const old = AXId.node(.{ .index = 3, .generation = 1 });
+    const replacement = AXId.node(.{ .index = 3, .generation = 2 });
     try tree.upsert(.{ .element = old, .role = .button, .state = .{ .focused = true, .focusable = true } });
     tree.dirty.clearRetainingCapacity();
     tree.structure_changes.clearRetainingCapacity();
@@ -772,8 +999,8 @@ test "AccessibilityTree: removal retains former parent until dirty drain" {
     var tree = AccessibilityTree.init(testing.allocator);
     defer tree.deinit();
 
-    const parent: ElementId = .{ .index = 1, .generation = 0 };
-    const child: ElementId = .{ .index = 2, .generation = 0 };
+    const parent = AXId.node(.{ .index = 1, .generation = 0 });
+    const child = AXId.node(.{ .index = 2, .generation = 0 });
     try tree.upsert(.{ .element = parent, .role = .group });
     try tree.upsert(.{ .element = child, .parent = parent, .role = .button });
     tree.dirty.clearRetainingCapacity();
@@ -791,12 +1018,12 @@ test "AccessibilityTree: drainDirty visits all entries" {
     var tree = AccessibilityTree.init(testing.allocator);
     defer tree.deinit();
 
-    try tree.upsert(.{ .element = .{ .index = 1, .generation = 0 }, .role = .button });
-    try tree.upsert(.{ .element = .{ .index = 2, .generation = 0 }, .role = .checkbox });
+    try tree.upsert(.{ .element = AXId.node(.{ .index = 1, .generation = 0 }), .role = .button });
+    try tree.upsert(.{ .element = AXId.node(.{ .index = 2, .generation = 0 }), .role = .checkbox });
 
     const Counter = struct {
         n: u32 = 0,
-        fn cb(ctx: *anyopaque, id: ElementId, flag: A11yDirtyFlag) void {
+        fn cb(ctx: *anyopaque, id: AXId, flag: A11yDirtyFlag) void {
             const c: *@This() = @ptrCast(@alignCast(ctx));
             c.n += 1;
             _ = id;
@@ -813,15 +1040,15 @@ test "AccessibilityTree: children lookup" {
     var tree = AccessibilityTree.init(testing.allocator);
     defer tree.deinit();
 
-    const root: ElementId = .{ .index = 0, .generation = 0 };
-    const c1: ElementId = .{ .index = 1, .generation = 0 };
-    const c2: ElementId = .{ .index = 2, .generation = 0 };
+    const root = AXId.node(.{ .index = 0, .generation = 0 });
+    const c1 = AXId.node(.{ .index = 1, .generation = 0 });
+    const c2 = AXId.node(.{ .index = 2, .generation = 0 });
 
     try tree.upsert(.{ .element = root, .role = .group });
     try tree.upsert(.{ .element = c1, .parent = root, .role = .button, .sibling_index = 9 });
     try tree.upsert(.{ .element = c2, .parent = root, .role = .button, .sibling_index = 1 });
 
-    var out: std.ArrayListUnmanaged(ElementId) = .{};
+    var out: std.ArrayListUnmanaged(AXId) = .empty;
     defer out.deinit(testing.allocator);
     try tree.children(root, &out, testing.allocator);
     try testing.expectEqual(@as(usize, 2), out.items.len);
@@ -832,4 +1059,208 @@ test "AccessibilityTree: children lookup" {
 test "State / A11yDirtyFlag are properly sized" {
     try testing.expectEqual(@as(usize, 4), @sizeOf(State));
     try testing.expectEqual(@as(usize, 2), @sizeOf(A11yDirtyFlag));
+}
+
+test "AccessibilityTree: exposedChildren 有序、跳过 hidden、结构变化后重建" {
+    var tree = AccessibilityTree.init(testing.allocator);
+    defer tree.deinit();
+
+    const root = AXId.node(.{ .index = 1, .generation = 0 });
+    const a = AXId.node(.{ .index = 9, .generation = 0 });
+    const b = AXId.node(.{ .index = 4, .generation = 0 });
+    const hidden = AXId.node(.{ .index = 5, .generation = 0 });
+    try tree.upsert(.{ .element = root, .role = .group });
+    // dense slot order (4,5,9) vs sibling order (a=0,b=1) reversed: output must follow
+    // sibling order.
+    try tree.upsert(.{ .element = a, .parent = root, .role = .button, .sibling_index = 0 });
+    try tree.upsert(.{ .element = b, .parent = root, .role = .button, .sibling_index = 1 });
+    try tree.upsert(.{ .element = hidden, .parent = root, .role = .button, .sibling_index = 2, .state = .{ .hidden = true } });
+
+    const kids = tree.exposedChildren(root);
+    try testing.expectEqual(@as(usize, 2), kids.len);
+    try testing.expect(kids[0].eql(a));
+    try testing.expect(kids[1].eql(b));
+    try testing.expectEqual(@as(usize, 1), tree.exposedChildren(AXId.NULL).len);
+
+    // Swap sibling order: index must invalidate+rebuild, not return stale order.
+    try tree.upsert(.{ .element = a, .parent = root, .role = .button, .sibling_index = 1 });
+    try tree.upsert(.{ .element = b, .parent = root, .role = .button, .sibling_index = 0 });
+    const swapped = tree.exposedChildren(root);
+    try testing.expect(swapped[0].eql(b));
+    try testing.expect(swapped[1].eql(a));
+
+    // Delete also invalidates.
+    try tree.remove(b);
+    try testing.expectEqual(@as(usize, 1), tree.exposedChildren(root).len);
+
+    // Pure property change (label) should not invalidate index.
+    _ = tree.exposedChildren(root);
+    try tree.upsert(.{ .element = a, .parent = root, .role = .button, .sibling_index = 1, .label_hash = 42 });
+    try testing.expect(!tree.child_index_dirty);
+}
+
+test "AccessibilityTree: hidden 翻转只算结构变化，不再报 state_changed（模态打开时的 ValueChanged 噪声）" {
+    var tree = AccessibilityTree.init(testing.allocator);
+    defer tree.deinit();
+    const id = AXId.node(.{ .index = 1, .generation = 0 });
+    try tree.upsert(.{ .element = id, .role = .button, .state = .{ .hidden = true } });
+    tree.dirty.clearRetainingCapacity();
+    tree.structure_changes.clearRetainingCapacity();
+    try tree.upsert(.{ .element = id, .role = .button });
+    const flag = tree.dirty.get(id.raw()).?;
+    try testing.expect(flag.structure_changed);
+    try testing.expect(!flag.state_changed);
+}
+
+test {
+    // collection.zig only imported via tree.zig; without explicit reference, its tests
+    // won't compile (orphan test).
+    _ = collection;
+}
+
+/// Owned UTF-8 byte boundaries for UI Automation Character units. Uses the
+/// same Unicode grapheme engine as editing, and scans long RI/ZWJ runs linearly.
+pub fn characterBoundaries(allocator: std.mem.Allocator, value: []const u8) ![]u32 {
+    if (value.len > std.math.maxInt(u32) or !std.unicode.utf8ValidateSlice(value)) return error.InvalidAccessibilityText;
+    var boundaries: std.ArrayList(u32) = .empty;
+    defer boundaries.deinit(allocator);
+    try boundaries.append(allocator, 0);
+    var cursor = @import("text_core").grapheme.BoundaryCursor.init(value);
+    var position: usize = 0;
+    while (position < value.len) {
+        position = cursor.next(position);
+        try boundaries.append(allocator, @intCast(position));
+    }
+    return boundaries.toOwnedSlice(allocator);
+}
+
+test "characterBoundaries shares extended grapheme clusters" {
+    const value = "e\u{0301}👩‍💻🇨🇳\r\n";
+    const boundaries = try characterBoundaries(testing.allocator, value);
+    defer testing.allocator.free(boundaries);
+    try testing.expectEqualSlices(u32, &.{ 0, 3, 14, 22, 24 }, boundaries);
+    const empty = try characterBoundaries(testing.allocator, "");
+    defer testing.allocator.free(empty);
+    try testing.expectEqualSlices(u32, &.{0}, empty);
+    try testing.expectError(error.InvalidAccessibilityText, characterBoundaries(testing.allocator, "\xff"));
+}
+
+/// Editor word categories, traversed as whole graphemes. Separators following
+/// a word belong to that unit. CJK/emoji clusters each form a separate unit.
+pub fn wordBoundaries(allocator: std.mem.Allocator, value: []const u8) ![]u32 {
+    const characters = try characterBoundaries(allocator, value);
+    defer allocator.free(characters);
+    const Doc = struct {
+        pub fn getByteAt(_: *const @This(), _: usize) ?u8 {
+            return null;
+        }
+    };
+    const Cursor = @import("text_core").cursor.DocCursor(Doc);
+    var result: std.ArrayList(u32) = .empty;
+    defer result.deinit(allocator);
+    try result.append(allocator, 0);
+    var i: usize = 0;
+    while (i + 1 < characters.len) {
+        const first = value[characters[i]];
+        if (first >= 0xe0) {
+            i += 1;
+        } else if (first >= 0x80 or !Cursor.isWordSeparator(first)) {
+            while (i + 1 < characters.len) : (i += 1) {
+                const lead = value[characters[i]];
+                if (lead >= 0xe0 or (lead < 0x80 and Cursor.isWordSeparator(lead))) break;
+            }
+        }
+        while (i + 1 < characters.len and Cursor.isWordSeparator(value[characters[i]])) : (i += 1) {}
+        try result.append(allocator, characters[i]);
+    }
+    return result.toOwnedSlice(allocator);
+}
+
+/// Logical paragraphs include their terminating newline. CRLF remains atomic;
+/// visual wrapping is intentionally not a paragraph boundary.
+pub fn paragraphBoundaries(allocator: std.mem.Allocator, value: []const u8) ![]u32 {
+    const characters = try characterBoundaries(allocator, value);
+    defer allocator.free(characters);
+    var result: std.ArrayList(u32) = .empty;
+    defer result.deinit(allocator);
+    try result.append(allocator, 0);
+    var after_break = false;
+    for (characters[0 .. characters.len - 1], characters[1..]) |first, last| {
+        const cluster = value[first..last];
+        if (cluster[0] == '\r' or cluster[0] == '\n' or std.mem.eql(u8, cluster, "\u{2029}")) {
+            after_break = true;
+        } else if (after_break) {
+            // Empty rows after a paragraph belong to it; the next content
+            // cluster starts a new paragraph. Leading blank rows form a unit.
+            try result.append(allocator, first);
+            after_break = false;
+        }
+    }
+    if (result.items[result.items.len - 1] != value.len) try result.append(allocator, @intCast(value.len));
+    return result.toOwnedSlice(allocator);
+}
+
+test "textUnitBoundaries preserves graphemes and logical paragraphs" {
+    const words = try wordBoundaries(testing.allocator, "a\u{1ab0}b, 中👩‍💻 x");
+    defer testing.allocator.free(words);
+    try testing.expectEqualSlices(u32, &.{ 0, 7, 10, 22, 23 }, words);
+    const greek = try wordBoundaries(testing.allocator, "αβ γ");
+    defer testing.allocator.free(greek);
+    try testing.expectEqualSlices(u32, &.{ 0, 5, 7 }, greek);
+    const paragraphs = try paragraphBoundaries(testing.allocator, "中\r\n\nB\rC\u{2029}D");
+    defer testing.allocator.free(paragraphs);
+    try testing.expectEqualSlices(u32, &.{ 0, 6, 8, 12, 13 }, paragraphs);
+    inline for (.{ wordBoundaries, paragraphBoundaries }) |make| {
+        const empty = try make(testing.allocator, "");
+        defer testing.allocator.free(empty);
+        try testing.expectEqualSlices(u32, &.{0}, empty);
+        try testing.expectError(error.InvalidAccessibilityText, make(testing.allocator, "\xff"));
+    }
+}
+
+test "textUnitBoundaries agrees with editor word navigation" {
+    const Doc = struct {
+        bytes: []const u8,
+        pub fn totalLength(self: *const @This()) usize {
+            return self.bytes.len;
+        }
+        pub fn getByteAt(self: *const @This(), offset: usize) ?u8 {
+            return if (offset < self.bytes.len) self.bytes[offset] else null;
+        }
+    };
+    const Cursor = @import("text_core").cursor.DocCursor(Doc);
+    for ([_][]const u8{ "  alpha_beta, γδ! 中字 👩‍💻🇨🇳", "a\u{0301}b x", "\r\n\tfoo/bar", "", "😀😀😀" }) |value| {
+        const words = try wordBoundaries(testing.allocator, value);
+        defer testing.allocator.free(words);
+        const doc = Doc{ .bytes = value };
+        for (words[0 .. words.len - 1], words[1..]) |first, last| {
+            try testing.expectEqual(@as(usize, last), Cursor.nextWordBoundary(&doc, first));
+        }
+    }
+}
+
+test "textUnitBoundaries merges empty paragraph rows" {
+    for ([_]struct { value: []const u8, expected: []const u32 }{
+        .{ .value = "A\n\nB\n\n", .expected = &.{ 0, 3, 6 } },
+        .{ .value = "\n\nB", .expected = &.{ 0, 2, 3 } },
+        .{ .value = "A\r\n\r\nB", .expected = &.{ 0, 5, 6 } },
+        .{ .value = "\n\n", .expected = &.{ 0, 2 } },
+    }) |fixture| {
+        const boundaries = try paragraphBoundaries(testing.allocator, fixture.value);
+        defer testing.allocator.free(boundaries);
+        try testing.expectEqualSlices(u32, fixture.expected, boundaries);
+    }
+}
+
+test "AccessibilityTree: editable format capability changes mark state dirty" {
+    var tree = AccessibilityTree.init(testing.allocator);
+    defer tree.deinit();
+    const id = AXId.node(.{ .index = 1, .generation = 0 });
+    var node: A11yNode = .{ .element = id, .role = .textbox, .editable_text = .{} };
+    try tree.upsert(node);
+    tree.dirty.clearRetainingCapacity();
+    node.editable_text.?.uniform_format = true;
+    try tree.upsert(node);
+    try testing.expect(tree.dirty.get(id.raw()).?.state_changed);
+    try testing.expect(tree.get(id).?.editable_text.?.uniform_format);
 }

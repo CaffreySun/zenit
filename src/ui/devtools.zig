@@ -1,40 +1,35 @@
 /// DevTools surface, two complementary tools:
 ///
-///   1. `panel` (this file), a full DevTools window: elements / components /
-///      performance tabs. Mount it in a second native window with
+///   1. `panel` (this file), full DevTools window: elements / components /
+///      performance tabs. Mount in a second native window via
 ///      `devtools.mountPanel(cx, target_cx, .{ .on_close = close_handler })`.
 ///
-///   2. `overlay` (sub-module), an in-window inspector: dashed-rect hover
-///      highlight + dimension/component label. Add it with one call:
+///   2. `overlay` (sub-module), in-window inspector: dashed-rect hover
+///      highlight + dimension/component label. Add via
 ///      `try ui.devtools.overlay.attach(cx, scope, root, .{})`.
 ///
-/// 功能:
-/// P0: 完整 Style 属性面板 / 组件名显示 / Children 数量 / 文本预览
-/// P1: 搜索过滤 / Tab 切换 (Layout/Style/State/Events) / Render dirty 标记
-/// P2: Signal/Effect 查看器 / 渲染统计 / 树统计 / Events 面板
+/// Features:
+/// P0: Complete Style property panel / component name / child count / text preview
+/// P1: search filter / tab switch (Layout/Style/State/Events) / render dirty mark
+/// P2: Signal/Effect viewer / render stats / tree stats / Events panel
 ///
-/// ─────────────────────────────────────────────────────────────────────
-/// 【本文件的 OOM 策略：`catch {}` 一律是诊断路径，故意吞掉分配失败】
+/// OOM strategy of this file: `catch {}` on all diagnostic paths, intentionally swallowing alloc
+/// failure. DevTools is a **tool observing the debugged app** and holds no authoritative app
+/// state: every panel line is a fresh snapshot of target_cx each frame (rebuildFlatRows /
+/// *BeforeRender / build*Tab). Worst case an alloc failure shows one fewer line / less text / a
+/// tree one level unexpanded, self-healing next frame; layout/hit/state/render correctness of the
+/// debugged app is unaffected. Panicking or propagating would let opening the debug panel crash
+/// the debugged app, which is explicitly unwanted.
 ///
-/// DevTools 是**观察被调试 app 的工具**，它自己不持有 app 的任何权威状态：
-/// 面板里的每一行都是每帧从 target_cx 重新采集/重建的（rebuildFlatRows /
-/// *BeforeRender / build*Tab）。所以分配失败的后果上限是「这一帧面板少显示
-/// 一行 / 少一段文本 / 树少展开一层」，下一帧就自愈；它不会影响被调试 app 的
-/// 布局、命中、状态或渲染正确性。
-///
-/// 反过来，如果这里改成 panic 或往上传播，就等于「打开调试面板会让被调试的
-/// app 崩掉」，调试工具压垮它本该观察的对象，是明确不想要的行为。
-///
-/// 具体分几类，下面各处不再逐行重复：
-///   - 面板 UI 构建（appendChild / build*Tab）：少画一块面板内容。
-///   - 采集缓冲（flat_rows / scoped_state_ptrs / signal 列表 append）：
-///     少列一个条目，均为每帧重建的临时表。
-///   - 文本格式化（writer print / writeAll / writeByte）：写进定长栈缓冲或
-///     frame arena，失败即截断显示。
-///   - 展开/折叠等 UI 偏好（explicitly_expanded / collapsed put）：
-///     丢一次记录只是某行没按记忆展开，纯观感。
-///   - Scope 资源析构注册（onDestroy）：见各处说明。
-/// ─────────────────────────────────────────────────────────────────────
+/// Categories (not repeated per line below):
+///   - panel UI build (appendChild / build*Tab): less panel content.
+///   - collection buffers (flat_rows / scoped_state_ptrs / signal list append): one fewer entry;
+///     all are per-frame temp tables.
+///   - text format (writer print / writeAll / writeByte): stack buffer or frame arena, fail =
+///     truncated display.
+///   - UI pref expand/collapse (explicitly_expanded / collapsed put): a miss loses one line's
+///     remembered expand state, pure UX.
+///   - Scope resource cleanup (onDestroy): see the explanation at each place.
 const std = @import("std");
 const dv_fmt = @import("devtools/format.zig");
 const core = @import("core.zig");
@@ -46,17 +41,14 @@ const StyleField = @import("core/types.zig").StyleField;
 pub const overlay = @import("core/devtools_overlay.zig");
 pub const source_link = @import("devtools/source_link.zig");
 
-/// 渲染原因 / 事件追踪存储，DevTools 的 Render / Trace 面板数据源。
+/// Render reason / event trace storage; data source of the DevTools Render / Trace panels.
 ///
-/// 宿主应用要自建 inspector 面板时需要它：`setGlobalTraceTarget(store, frame)`
-/// 开始采集、`clearGlobalTraceTarget()` 停止，再用 `DebugTraceStore` 上的
-/// `getRenderForNode` / `getRecentEvents` 读回。
-///
-/// 曾经挂在顶层 `ui.debug_trace`。那个位置属于"引擎内部被顺手 pub 出去"，
-/// 但**能力本身是公开的**，它是 devtools 的配套，所以归到这个命名空间。
+/// A host app building a custom inspector panel needs it: `setGlobalTraceTarget(store, frame)`
+/// starts collecting, `clearGlobalTraceTarget()` stops, then `DebugTraceStore` methods
+/// `getRenderForNode` / `getRecentEvents` read back. Public capability, paired with devtools.
 pub const trace = core.debug_trace;
 const hooks = @import("hooks.zig");
-const theme_schema = @import("theme_schema.zig");
+const devtools_styles = @import("devtools/styles.zig");
 const scroll_area_mod = @import("components/scroll_area/mod.zig");
 const virtual_list_mod = @import("components/virtual_list/mod.zig");
 const widget_state = @import("widget_state.zig");
@@ -71,7 +63,7 @@ const Button = button_mod.Button;
 const Input = input_mod.Input;
 const Tabs = tabs_mod.Tabs;
 const TabItem = tabs_mod.TabItem;
-const TabsState = tabs_mod.TabsState;
+const Signal = core.Signal;
 
 const Cx = core.Cx;
 const Node = core.Node;
@@ -85,12 +77,12 @@ const HandlerRef = core.HandlerRef;
 const Event = core.Event;
 const EventResult = core.EventResult;
 
-const mountScrollArea = scroll_area_mod.mountScrollArea;
+const ScrollArea = scroll_area_mod.ScrollArea;
 const Scope = reactive.Scope;
 
-/// DevTools 次要信息色（ID/数量等），在 light 模式下比 fg_disabled 更可读
+/// DevTools secondary info color (ID/count), more readable than fg_disabled in light mode
 fn devtoolsMuted(t: *const theme.ThemeTokens) Color {
-    return theme_schema.window(t).devtools_muted;
+    return devtools_styles.palette(t).muted;
 }
 const DebugStateEntry = widget_state.DebugStateEntry;
 const ScopedStateRef = struct {
@@ -103,26 +95,27 @@ const ScopedStateEntry = struct {
 };
 const DEVTOOLS_STATE_ID: u64 = 0xD3F70000;
 
-/// Elements 树行 slot 的 test_id。hoveredTreeRow 靠它从悬停节点向上找到所属行，
-/// e2e 也用它定位行，故集中定义避免两处字符串走样。
+/// Elements tree row slot test_id. hoveredTreeRow walks up from hovered node to find row (pointer
+/// usually lands on row's text/glyph child), e2e uses it to locate row; centralize to avoid
+/// two-place string drift.
 const tree_row_test_id = "devtools.tree.row";
 const perf_chart_sample_count: usize = 64;
-/// DevTools 窗口的保活轮询周期。DevTools 观察的是另一个窗口的 Cx，没有任何
-/// 跨窗口"target 渲染了 -> DevTools 标脏"的推送链路（MultiWindowApp 各窗口
-/// 独立 wantsFrame），所以 DevTools 必须**无条件**自轮询，早期版本只在
-/// target idle 时才调度下一次 poll，一旦某帧恰逢 target 活跃就不再调度，
-/// 保活链永久断裂，面板从此只有鼠标划过时才动一下。
+/// DevTools window keepalive poll period. DevTools observes another window's Cx, no cross-window
+/// "target rendered -> DevTools redraw" push chain (MultiWindowApp each window independent
+/// wantsFrame), so DevTools **must** self-poll unconditionally; early version only when target
+/// idle, once target active some frame skips schedule, keepalive chain breaks forever, panel only
+/// moves on mouse hover.
 const devtools_keepalive_ns: u64 = 250_000_000;
-/// Performance 页的轮询周期（10Hz）：FPS/柱状图是实时监控，250ms 太迟钝；
-/// 100ms 只让 DevTools 自己以 10fps 重绘，不构成对 target 的观测扰动。
+/// Performance page poll period (10Hz): FPS/histograms real-time monitor, 250ms too sluggish; 100ms
+/// only self-redraws at 10fps, no target observation disturbance.
 const perf_keepalive_ns: u64 = 100_000_000;
-/// Console 页的 revision 轮询周期，保证新日志在约 100ms 内可见。
+/// Console page revision poll period, new logs visible in ~100ms.
 const console_keepalive_ns: u64 = 50_000_000;
-/// 滚动监控的时间桶宽度：64 桶 × 100ms ≈ 6.4s 可视窗口。
+/// Scroll monitor time bucket width: 64 buckets * 100ms ~= 6.4s visible window.
 const perf_bucket_ns: u64 = 100_000_000;
-/// target.frame_count 超过此时长未推进 ⇒ FPS 行显示 (idle)。
-/// idle 停帧是框架的省电行为，面板必须把「没在渲染」和「稳定 60fps」
-/// 区分开，否则停帧后 FPS 文本永远冻在最后一次的值上假装健康。
+/// target.frame_count no advance over this time => FPS row shows (idle).
+/// idle frame-gating is power-save behavior, panel must distinguish "not rendering" from "steady
+/// 60fps", else frozen frame leaves FPS text at last value pretending healthy.
 const perf_idle_indicator_ns: u64 = 700_000_000;
 
 fn allocScopeResource(scope: *Scope, comptime T: type) !*T {
@@ -137,7 +130,7 @@ fn allocScopeResource(scope: *Scope, comptime T: type) !*T {
     return value;
 }
 
-// ========== 面板配置 ==========
+// ========== Panel config ==========
 
 pub const PanelOptions = struct {
     on_close: ?HandlerRef = null,
@@ -145,13 +138,13 @@ pub const PanelOptions = struct {
     /// applications that want their product name (e.g. "Zenit DevTools",
     /// "MyApp Inspector") should pass it here.
     title: []const u8 = "DevTools",
-    /// Header 上的明暗切换开关在两套主题间切换。DevTools 窗口自己的主题，
-    /// 与被观察的 target 无关；初始主题取 mountPanel 时 cx.tokens 的 scheme。
+    /// Header theme toggle switches between two themes. DevTools window's own theme, independent of
+    /// target; initial theme takes cx.tokens scheme at mountPanel.
     light_theme: *const theme.ThemeTokens = &theme.light,
     dark_theme: *const theme.ThemeTokens = &theme.dark,
 };
 
-// ========== 视图模式 ==========
+// ========== View mode ==========
 
 const ViewMode = enum {
     elements,
@@ -169,7 +162,7 @@ const ViewMode = enum {
     }
 };
 
-// ========== Tab 枚举 ==========
+// ========== Tab enum ==========
 
 const DetailsTab = enum(u8) {
     layout = 0,
@@ -202,7 +195,7 @@ const DetailsTab = enum(u8) {
     }
 };
 
-// ========== Style 实时编辑 ==========
+// ========== Style real-time edit ==========
 
 const EditableField = enum(u8) {
     gap,
@@ -227,7 +220,7 @@ const EditableField = enum(u8) {
         };
     }
 
-    /// 从目标节点读取当前值
+    /// Read current value from target node
     fn readValue(self: EditableField, node: *Node) f32 {
         return switch (self) {
             .gap => node.style.gap,
@@ -249,12 +242,12 @@ const EditableField = enum(u8) {
             .opacity => .opacity,
             .translate_x => .translate_x,
             .translate_y => .translate_y,
-            // DevTool 当前把 border.width/radius 作为 Border 聚合值编辑。
+            // DevTool currently treats border.width/radius as Border aggregate edit.
             .border_width, .border_radius => .border,
         };
     }
 
-    /// 将值写入目标节点并触发布局/渲染脏标记
+    /// Write value to target node and trigger layout/render dirty
     fn writeValue(self: EditableField, node: *Node, val: f32) void {
         switch (self) {
             .gap => node.style.gap = val,
@@ -262,7 +255,7 @@ const EditableField = enum(u8) {
             .flex_shrink => node.style.flex_shrink = val,
             .opacity => {
                 node.setOpacity(val);
-                return; // setOpacity 已处理脏标记
+                return; // setOpacity already marked dirty
             },
             .translate_x => node.style.translate_x = val,
             .translate_y => node.style.translate_y = val,
@@ -274,14 +267,14 @@ const EditableField = enum(u8) {
     }
 };
 
-/// 可编辑属性值行的点击上下文
+/// Editable property value row click context
 const EditFieldCtx = struct {
     state: *DevToolsState,
     node_id: u32,
     field: EditableField,
 };
 
-/// 编辑提交上下文
+/// Edit commit context
 const EditCommitCtx = struct {
     state: *DevToolsState,
     node_id: u32,
@@ -300,10 +293,10 @@ fn styleSourceEvent(event: Event, context: ?*anyopaque) EventResult {
         else => return .ignored,
     }
     const is_return_address = ctx.origin.kind != .styled;
-    const loc = source_link.resolveAddress(ctx.cx.allocator, ctx.origin.address, is_return_address) catch return .stop;
+    const loc = source_link.resolveAddress(ctx.cx.allocator, ctx.cx.io, ctx.origin.address, is_return_address) catch return .stop;
     if (loc) |resolved| {
         defer ctx.cx.allocator.free(resolved.file);
-        source_link.open(ctx.cx.allocator, resolved) catch {};
+        source_link.open(ctx.cx.allocator, ctx.cx.io, resolved) catch {};
     }
     return .stop;
 }
@@ -323,13 +316,13 @@ fn appendStyleSourceLink(cx: *Cx, state: *DevToolsState, inspected: *Node, field
         .justify = .center,
     });
     btn.meta.ownership.meta.test_id = "devtools.style.goto_source";
-    try btn.appendChild(cx.allocator, try inlineText(cx, "↗", cx.tokens.color.accent, 10));
+    try btn.appendChild(cx.allocator, try inlineText(cx, "↗", cx.tokens.tokens.color.accent, 10));
     btn.behavior.events.event_context = ctx;
     btn.behavior.events.on_event = styleSourceEvent;
     try row.appendChild(cx.allocator, btn);
 }
 
-/// 构建可编辑 kvRow，显示值+点击进入编辑模式
+/// Build editable kvRow, show value + click to edit
 fn editableKvRow(cx: *Cx, state: *DevToolsState, node: *Node, field: EditableField, parent: *Node) !void {
     const t = cx.tokens;
     const details_scope = state.details_scope orelse state.scope.?;
@@ -340,7 +333,7 @@ fn editableKvRow(cx: *Cx, state: *DevToolsState, node: *Node, field: EditableFie
         state.editing_node_id.? == node.id;
 
     if (is_editing) {
-        // 编辑模式：显示 Input
+        // Edit mode: show Input
         const row = try cx.createNode(.box, .{
             .direction = .row,
             .gap = 8,
@@ -350,14 +343,14 @@ fn editableKvRow(cx: *Cx, state: *DevToolsState, node: *Node, field: EditableFie
         });
         try row.appendChild(cx.allocator, try core.text(cx, field.label(), .{
             .font_size = 10,
-            .color = t.color.fg_secondary,
+            .color = t.tokens.color.fg_secondary,
         }));
 
-        // 准备初始值文本
+        // Prep initial value text
         var val_buf: [12]u8 = undefined;
         const val_str = dv_fmt.fmtFloat(&val_buf, val);
 
-        // 分配 commit context（绑定到 details_scope 生命周期）
+        // Allocate commit context (bind to details_scope lifetime)
         const commit_ctx = details_scope.allocator.create(EditCommitCtx) catch return;
         commit_ctx.* = .{
             .state = state,
@@ -369,17 +362,17 @@ fn editableKvRow(cx: *Cx, state: *DevToolsState, node: *Node, field: EditableFie
                 const c: *EditCommitCtx = @ptrCast(@alignCast(ptr));
                 alloc.destroy(c);
             }
-            // 诊断路径：注册失败只会漏掉这一个 ctx 的析构（scope 销毁时少 free
-            // 一个小结构体），不影响面板行为。注意这是**泄漏而非悬垂**：ctx 本身
-            // 仍然有效，事件回调照常能用。devtools 面板生命周期内数量有界，
-            // 不为它把调试工具变成会 panic 的东西。
+            // Diagnostic: register fail leaks this ctx's cleanup (scope teardown misses one small
+            // struct), doesn't affect panel.
+            // This is **leak not dangling**: ctx valid, event callbacks work. devtools panel
+            // lifetime bounded count, not worth panic.
         }.destroy) catch {};
 
         const mounted_input = try Input(.{
-            .initial_value = val_str,
+            .value = val_str,
             .size = .sm,
             .width = 80,
-            .on_change = core.Cx.strHandlerFrom(EditCommitCtx, commit_ctx, editFieldChanged),
+            .on_change = cx.on(EditCommitCtx, commit_ctx, editFieldChanged),
         }).mountResult(details_scope, cx);
         mounted_input.input_container.meta.ownership.meta.test_id = switch (field) {
             .gap => "devtools.style.gap.input",
@@ -394,12 +387,12 @@ fn editableKvRow(cx: *Cx, state: *DevToolsState, node: *Node, field: EditableFie
         try row.appendChild(cx.allocator, mounted_input.node);
         try appendStyleSourceLink(cx, state, node, field.sourceField(), row);
 
-        // 自动聚焦真实 input_container，确保后续 text_input 命中输入框本身。
+        // Auto-focus real input_container, ensure following text_input hits input box itself.
         cx.setFocus(mounted_input.input_container);
 
         try parent.appendChild(cx.allocator, row);
     } else {
-        // 显示模式：值可点击
+        // Display mode: value clickable
         const row = try cx.createNode(.box, .{
             .direction = .row,
             .gap = 8,
@@ -408,12 +401,12 @@ fn editableKvRow(cx: *Cx, state: *DevToolsState, node: *Node, field: EditableFie
         });
         try row.appendChild(cx.allocator, try core.text(cx, field.label(), .{
             .font_size = 10,
-            .color = t.color.fg_secondary,
+            .color = t.tokens.color.fg_secondary,
         }));
 
-        // 可点击的值
+        // Clickable value
         var val_buf2: [12]u8 = undefined;
-        const val_text = try inlineText(cx, dv_fmt.fmtFloat(&val_buf2, val), t.color.accent, 10);
+        const val_text = try inlineText(cx, dv_fmt.fmtFloat(&val_buf2, val), t.tokens.color.accent, 10);
         val_text.style.cursor = .pointer;
         val_text.meta.ownership.meta.test_id = switch (field) {
             .gap => "devtools.style.gap.value",
@@ -426,7 +419,7 @@ fn editableKvRow(cx: *Cx, state: *DevToolsState, node: *Node, field: EditableFie
             .border_radius => "devtools.style.border_radius.value",
         };
 
-        // 点击事件
+        // Click event
         const edit_ctx = try details_scope.allocator.create(EditFieldCtx);
         edit_ctx.* = .{ .state = state, .node_id = node.id, .field = field };
         details_scope.adoptResource(@ptrCast(edit_ctx), struct {
@@ -434,10 +427,10 @@ fn editableKvRow(cx: *Cx, state: *DevToolsState, node: *Node, field: EditableFie
                 const c: *EditFieldCtx = @ptrCast(@alignCast(ptr));
                 alloc.destroy(c);
             }
-            // 诊断路径：注册失败只会漏掉这一个 ctx 的析构（scope 销毁时少 free
-            // 一个小结构体），不影响面板行为。注意这是**泄漏而非悬垂**：ctx 本身
-            // 仍然有效，事件回调照常能用。devtools 面板生命周期内数量有界，
-            // 不为它把调试工具变成会 panic 的东西。
+            // Diagnostic: register fail leaks this ctx's cleanup (scope teardown misses one small
+            // struct), doesn't affect panel.
+            // This is **leak not dangling**: ctx valid, event callbacks work. devtools panel
+            // lifetime bounded count, not worth panic.
         }.destroy) catch {};
         val_text.behavior.events.on_event = editFieldClickEvent;
         val_text.behavior.events.event_context = edit_ctx;
@@ -472,24 +465,24 @@ fn editFieldChanged(ctx: *EditCommitCtx, new_value: []const u8) void {
     const root = target.root orelse return;
     const node = findNodeById(root, ctx.node_id) orelse return;
 
-    // 解析数值（中间态如 "-"/"1." 解析失败，静默等下一个键）
+    // Parse number (intermediate states like "-"/"1." parse fail, silent wait next key)
     const val = std.fmt.parseFloat(f32, new_value) catch return;
     ctx.field.writeValue(node, val);
 
-    // 实时生效但**不**退出编辑：on_change 每个键击都触发，若在这里
-    // clearEditingState + details_dirty，第一个键就会拆掉 Input，
-    // 多位数值（如 "12"）永远输不进去。退出编辑走选中节点变化
-    // （syncTreeSelection）或切换 tab（onDetailsTabChange）。
+    // Real-time effect but **don't** exit edit: on_change fires every keystroke; doing
+    // clearEditingState + details_dirty here = first key destroys Input, multi-digit (like "12")
+    // never enters.
+    // Exit via selected node change (syncTreeSelection) or tab switch (onDetailsTabChange).
     target.needs_redraw = true;
 }
 
-// ========== 保留模式入口 ==========
+// ========== Retain mode entry ==========
 
-/// 保留模式 mount（首帧调用一次）
+/// Retain mode mount (call once first frame)
 pub fn mountPanel(cx: *Cx, target: *Cx, opts: PanelOptions) !*Node {
     const t = cx.tokens;
     const state = try getState(cx);
-    // 任一步失败：root 由下面的 errdefer 整棵回收，state 里指向它的指针全部清零（不留悬垂）
+    // Any step fail: root freed below via errdefer, state pointers all zero (no dangling)
     errdefer state.clearMountedNodeRefs();
     state.setTarget(target);
     state.cx = cx;
@@ -500,24 +493,24 @@ pub fn mountPanel(cx: *Cx, target: *Cx, opts: PanelOptions) !*Node {
     state.stats_dirty = true;
     state.last_seen_target_frame_count = target.frame_count;
 
-    // 初始扁平化
+    // Initial flattening
     rebuildFlatRows(state, target);
 
     const root = try core.box(cx, .{
         .direction = .column,
-        .background = t.color.bg_primary,
+        .background = t.tokens.color.bg_primary,
         .width = .{ .grow = .{} },
         .height = .{ .grow = .{} },
     }, .{});
     errdefer cx.freeNode(root);
 
-    // 内容 scope 挂在 root scope 之下：失败路径上它随 Cx.root_scope 一起回收。
+    // Content scope hangs under root scope: fail path reclaimed with Cx.root_scope.
     state.scope = try Scope.init(cx.allocator, state.root_scope.?, cx.owner);
     try buildPanelContent(cx, target, state, root);
 
     try core.bindScopeToNode(state.root_scope.?, root);
 
-    // root 节点挂 on_before_render 驱动保留模式更新
+    // Root node hooks on_before_render to drive retain mode updates
     root.meta.per_frame.hooks.slots.anim_state = @ptrCast(state);
     root.meta.per_frame.hooks.before_render.main = devtoolsBeforeRender;
     root.meta.ownership.hooks.on_cleanup = Cx.simpleHandler(struct {
@@ -530,19 +523,20 @@ pub fn mountPanel(cx: *Cx, target: *Cx, opts: PanelOptions) !*Node {
     return root;
 }
 
-/// 在 root 下构建面板全部内容（titlebar 占位 / header / inspect / console / perf），
-/// 组件与资源归属 `state.scope`。mountPanel 首次构建与主题切换重建共用。
+/// Build all panel content under root (titlebar placeholder / header / inspect / console / perf),
+/// components and resources own to `state.scope`. mountPanel first build and theme-switch rebuild
+/// share.
 fn buildPanelContent(cx: *Cx, target: *Cx, state: *DevToolsState, root: *Node) !void {
     const t = cx.tokens;
-    // 原来八个子树全部建成游离节点、最后才用 tuple 拼进 root，中间任一步失败
-    // 前面建好的全漏（sweep：889 个注入点漏 872 个）。改成每个子树建好即 adopt；
-    // root 由调用方兜底回收；state 里的节点指针全部在装配成功之后才发布。
+    // Eight subtrees all built as orphans, last tuple-spliced into root, mid-fail lost prior trees
+    // (sweep: 889 injection sites lost 872). Now build tree, adopt immediately; root freed by
+    // caller bottom-up; state node pointers publish only after assembly success.
     const a = cx.allocator;
 
     const titlebar_safe_top: f32 = 28;
     _ = try core.adoptChild(cx, a, root, try core.box(cx, .{
         .height = .{ .px = titlebar_safe_top },
-        .background = t.color.bg_primary,
+        .background = t.tokens.color.bg_primary,
     }, .{}));
 
     _ = try core.adoptChild(cx, a, root, try buildHeader(cx, target, state.panel_opts, state));
@@ -562,17 +556,17 @@ fn buildPanelContent(cx: *Cx, target: *Cx, state: *DevToolsState, root: *Node) !
     }, .{}));
     left_panel.meta.ownership.meta.test_id = "devtools.left.panel";
     const left_panel_ext = try left_panel.style.ensureExtFallible(cx.allocator);
-    // 左栏作为整块 chrome/内容壳，需要接住 search/header/tree 交界处的 seam hit。
+    // Left pane as whole chrome/content shell needs catch seam hit where search/header/tree meet.
     left_panel_ext.hit_roles = .{ .pointer = true, .scroll = true, .inspect = false };
     left_panel_ext.hit_behavior = .@"opaque";
     _ = try core.adoptChild(cx, a, left_panel, try buildSearchBar(cx, state));
     _ = try core.adoptChild(cx, a, left_panel, try mountTreeArea(cx, target, state));
     _ = try core.adoptChild(cx, a, left_panel, try mountStatsBar(cx, state, target));
 
-    // Splitter: 垂直分割线
+    // Splitter: vertical divider
     _ = try core.adoptChild(cx, a, inspect_shell, try mountDevtoolsSplitter(cx, state));
 
-    // 右面板: tab_bar + details content
+    // Right panel: tab_bar + details content
     _ = try core.adoptChild(cx, a, inspect_shell, try mountDetails(cx, target, state));
 
     const console_shell = try core.adoptChild(cx, a, root, try mountConsoleShell(cx, target, state));
@@ -580,7 +574,8 @@ fn buildPanelContent(cx: *Cx, target: *Cx, state: *DevToolsState, root: *Node) !
     const perf_shell = try core.adoptChild(cx, a, root, try mountPerformanceShell(cx, state));
     perf_shell.meta.ownership.meta.test_id = "devtools.performance.shell";
 
-    // 装配成功之后才发布节点指针（失败时 root 整棵回收，state 里不能留悬垂指针）
+    // Publish node pointers only after assembly success (fail: root freed, no dangling state
+    // pointers)
     state.left_panel_node = left_panel;
     state.inspect_shell_node = inspect_shell;
     state.perf_shell_node = perf_shell;
@@ -588,7 +583,7 @@ fn buildPanelContent(cx: *Cx, target: *Cx, state: *DevToolsState, root: *Node) !
     syncShellVisibility(state);
 }
 
-/// Header 明暗开关的点击：只置位，真正的切换在下一帧 root hook 里做。
+/// Header theme toggle click: just set flag, actual switch next frame in root hook.
 fn themeToggleEvent(event: Event, context: ?*anyopaque) EventResult {
     const state: *DevToolsState = @ptrCast(@alignCast(context orelse return .ignored));
     switch (event) {
@@ -600,13 +595,12 @@ fn themeToggleEvent(event: Event, context: ?*anyopaque) EventResult {
     return .handled;
 }
 
-/// 切换 DevTools 窗口的明暗主题并整棵重建面板内容。
+/// Switch DevTools window theme and rebuild panel content.
 ///
-/// 面板的大部分颜色在构建时从 cx.tokens 写死（raw box/text 没有主题 hook），
-/// 单靠 Cx.setTheme 只能刷新组件，所以直接重建：套路同 detailsBeforeRender
-/// 先断交互引用、摘 hook/scope 指针，再 dispose 内容 scope，最后逐个 pop
-/// 释放旧子树。必须在 root 的 before_render 里调用（tick 在递归子节点之前
-/// 执行 root hook，替换 children 是安全的）。
+/// Panel most colors baked at build from cx.tokens (raw box/text no theme hook), cx.setTheme alone
+/// refreshes components, so full rebuild: routine like detailsBeforeRender, break interaction refs,
+/// unwire hook/scope pointers, dispose content scope, then pop children sequentially. Must call
+/// from root before_render (tick runs root hook pre-recursion, child replace safe).
 fn applyThemeToggle(state: *DevToolsState, cx: *Cx, target: *Cx, root: *Node) void {
     const opts = state.panel_opts;
     const next = if (cx.tokens.scheme == .dark) opts.light_theme else opts.dark_theme;
@@ -616,7 +610,7 @@ fn applyThemeToggle(state: *DevToolsState, cx: *Cx, target: *Cx, root: *Node) vo
         hooks.invalidateSubtreeHookState(child);
         core.clearNodeScopes(child);
     }
-    // details_scope 是内容 scope 的子 scope，随之一起 dispose。
+    // details_scope is content scope's child, disposed together.
     state.details_scope = null;
     if (state.scope) |s| s.dispose();
     state.scope = null;
@@ -626,14 +620,14 @@ fn applyThemeToggle(state: *DevToolsState, cx: *Cx, target: *Cx, root: *Node) vo
         cx.freeNode(child);
     }
     _ = state.arena.reset(.retain_capacity);
-    // 编辑态的 Input 已随旧 details 释放，退出编辑，避免重建后抢焦点。
+    // Edit-state Input already freed with old details, exit edit, avoid post-rebuild focus steal.
     clearEditingState(state);
 
     cx.setTheme(next);
-    root.setBackground(next.color.bg_primary);
+    root.setBackground(next.tokens.color.bg_primary);
 
-    // 诊断路径：重建失败上限是「面板这一帧是空的」；root 仍在、hook 仍在，
-    // 用户再点一次开关（或关掉重开 DevTools 窗口）即可恢复。
+    // Diagnostic: rebuild fail worst case: "this frame panel empty"; root, hook still there, user
+    // re-toggle or close/reopen DevTools recovers.
     state.scope = Scope.init(cx.allocator, state.root_scope.?, cx.owner) catch return;
     buildPanelContent(cx, target, state, root) catch {
         state.clearMountedNodeRefs();
@@ -652,7 +646,7 @@ fn applyThemeToggle(state: *DevToolsState, cx: *Cx, target: *Cx, root: *Node) vo
     root.markInteractionDirty();
 }
 
-/// 保留模式主更新钩子（每帧在布局前调用）
+/// Retain mode main update hook (runs pre-layout each frame)
 fn devtoolsBeforeRender(root_node: *Node) void {
     const state: *DevToolsState = @ptrCast(@alignCast(root_node.meta.per_frame.hooks.slots.anim_state orelse return));
     const target = state.liveTarget() orelse return;
@@ -663,10 +657,10 @@ fn devtoolsBeforeRender(root_node: *Node) void {
     syncShellVisibility(state);
     const cx = state.cx;
 
-    // 无条件保活：DevTools 是被动观察者，target 的渲染不会推送唤醒它
-    // （见 devtools_keepalive_ns 的说明）。scheduleRedrawAfterNs 内部按
-    // 最近截止时间合并，重复调度无害；Performance 页由 perfBeforeRender
-    // 以更高频率覆盖。
+    // Unconditional keepalive: DevTools passive observer, target render doesn't push wake (see
+    // devtools_keepalive_ns note).
+    // scheduleRedrawAfterNs internally merges by soonest deadline, re-schedule harmless;
+    // Performance page overrides via perfBeforeRender higher frequency.
     if (cx) |dev_cx| {
         const poll_ns = switch (state.view_mode) {
             .console => console_keepalive_ns,
@@ -678,26 +672,26 @@ fn devtoolsBeforeRender(root_node: *Node) void {
 
     if (state.view_mode == .console) syncConsole(state, target);
 
-    // 检测 target 窗口变化
+    // Detect target window change
     if (target.frame_count != state.last_seen_target_frame_count) {
         state.last_seen_target_frame_count = target.frame_count;
         state.stats_dirty = true;
         if (state.view_mode == .elements or state.view_mode == .components) {
             state.tree_dirty = true;
         }
-        // details 只在 Render/Trace tab 时每帧更新（实时数据），
-        // Layout/Style/State/Events tab 只在选中节点变化时更新（见 syncTreeSelection）
+        // details updates only on Render/Trace tabs each frame (real-time),
+        // Layout/Style/State/Events only on selected node change (see syncTreeSelection)
         if (state.active_tab == .render or state.active_tab == .trace) {
             state.details_dirty = true;
         }
     }
 
-    // 选中节点变化时：展开祖先 + 标记需要滚动
+    // Selected node change: expand ancestors + mark scroll needed
     if (state.view_mode == .elements or state.view_mode == .components) syncTreeSelection(state, target);
 
-    // 悬停行变化时补标脏：行 slot 的内容只在 tree_dirty 时重建，而 hover 会改变
-    // 行的渲染结果（行尾的 goto 按钮）。不标脏的话按钮要等下一次因别的原因重建
-    // 树时才出现，表现为「点一下才出来」。
+    // Hovered row change marks dirty: row slot content rebuilds on tree_dirty, hover changes render
+    // result (goto button at row tail). No dirty = button appears only on next rebuild from other
+    // cause, seems "click shows up".
     if (state.view_mode != .performance) {
         if (cx) |dev_cx| {
             const hovered_row = hoveredTreeRow(dev_cx);
@@ -708,19 +702,20 @@ fn devtoolsBeforeRender(root_node: *Node) void {
         }
     }
 
-    // 只有树区域将要重建/滚动时才强制刷新 interaction index。
-    // Performance 视图不显示树，继续每帧标脏会让 DevTools 自己产生无意义的 hit rebuild。
+    // force refresh interaction index only when tree area about to rebuild/scroll.
+    // Performance view doesn't show tree, marking dirty each frame makes DevTools itself produce
+    // meaningless hit rebuild.
     if ((state.view_mode == .elements or state.view_mode == .components) and (state.tree_dirty or state.tree_auto_scroll_pending)) {
         root_node.markInteractionDirty();
     }
 
-    // 更新树数据 + VirtualList
+    // update tree data + VirtualList
     if (state.tree_dirty) {
         rebuildFlatRows(state, target);
         if (state.vl_state) |vl| {
             virtual_list_mod.updateItemCount(vl, state.flat_rows.items.len);
         }
-        // 自动滚动到选中节点（在 rebuildFlatRows 之后执行）
+        // auto-scroll to selected node (execute after rebuildFlatRows)
         applyTreeAutoScroll(state);
         syncViewModeTabs(state);
 
@@ -728,33 +723,33 @@ fn devtoolsBeforeRender(root_node: *Node) void {
         root_node.markRenderDirty();
     }
 
-    // 同步 pick 按钮激活态（icon tint + background）
+    // sync pick button active state (icon tint + background)
     if (state.pick_btn_node) |btn| {
         const is_active = target.inspector.pick_mode;
         const tokens = (state.cx orelse return).tokens;
-        const pick_bg = if (is_active) tokens.color.accent else Color.TRANSPARENT;
+        const pick_bg = if (is_active) tokens.tokens.color.accent else Color.TRANSPARENT;
         btn.setBackground(pick_bg);
         for (btn.children.items) |child| {
-            const icon_tint = if (is_active) tokens.color.button_primary_fg else tokens.color.fg_secondary;
+            const icon_tint = if (is_active) tokens.tokens.color.button_primary_fg else tokens.tokens.color.fg_secondary;
             _ = child.setTint(icon_tint);
             for (child.children.items) |grandchild| _ = grandchild.setTint(icon_tint);
         }
     }
 
-    // 更新统计栏
+    // update stats bar
     if (state.stats_dirty) {
         updateStatsBarContent(state, target);
-        // Performance 模式下 stats_dirty 由 perfBeforeRender 清除
-        // 非 Performance 模式下在此清除
+        // in performance mode stats_dirty cleared by perfBeforeRender
+        // in non-performance mode clear here
         if (state.view_mode != .performance) {
             state.stats_dirty = false;
         }
     }
 
-    // 详情内容在 detailsBeforeRender 中更新
+    // detail content updated in detailsBeforeRender
 }
 
-/// 重建扁平化树行数据（持久化分配器上）
+/// rebuild flattened tree row data (on persistent allocator)
 fn rebuildFlatRows(state: *DevToolsState, target: *Cx) void {
     state.flat_rows.clearRetainingCapacity();
     const root = target.root orelse return;
@@ -763,11 +758,11 @@ fn rebuildFlatRows(state: *DevToolsState, target: *Cx) void {
         .elements => flattenTreeElements(state, root, 0, filter),
         .components => flattenTreeComponents(state, root, 0, filter),
         .console => {},
-        .performance => {}, // performance 模式不需要树行
+        .performance => {}, // performance mode doesn't need tree rows
     }
 }
 
-/// 更新统计栏文本内容
+/// update stats bar text content
 fn updateStatsBarContent(state: *DevToolsState, target: *Cx) void {
     var stats = TreeStats{};
     if (target.root) |r| collectTreeStats(r, 0, &stats);
@@ -809,27 +804,27 @@ fn replaceTextContent(allocator: std.mem.Allocator, t: *core.TextProps, src: []c
     try setTextContent(allocator, t, src);
 }
 
-/// 保留模式：mount inspect 树区域（VirtualList）
+/// Retain mode: mount inspect tree region (VirtualList)
 fn mountTreeArea(cx: *Cx, target: *Cx, state: *DevToolsState) !*Node {
     const t = cx.tokens;
     _ = target;
 
-    // 外层容器（overflow_hidden 防止 VirtualList 内容溢出到 header/search bar 区域）
+    // Outer shell (overflow_hidden prevents VirtualList content spilling into header/search bar)
     const wrapper = try core.box(cx, .{
         .direction = .column,
         .width = .{ .grow = .{} },
         .height = .{ .grow = .{} },
         .overflow_hidden = true,
     }, .{});
-    errdefer cx.freeNode(wrapper); // VL 挂上之前 wrapper 游离
+    errdefer cx.freeNode(wrapper); // wrapper orphan before VL adoption
 
-    // VirtualList（Elements/Components 树）
+    // VirtualList (Elements/Components tree)
     const vl = try virtual_list_mod.VirtualList(.{
         .item_count = state.flat_rows.items.len,
         .item_height = tree_row_height,
         .overscan = 8,
         .padding = Padding.symmetric(4, 4),
-        .background = t.color.bg_primary,
+        .background = t.tokens.color.bg_primary,
     }).mountWithContext(state.scope.?, cx, @ptrCast(state), null, renderTreeRowRetained);
 
     vl.container.style.height = .{ .grow = .{} };
@@ -842,18 +837,19 @@ fn mountTreeArea(cx: *Cx, target: *Cx, state: *DevToolsState) !*Node {
 
 fn mountPerformanceShell(cx: *Cx, state: *DevToolsState) !*Node {
     const t = cx.tokens;
-    // shell 先建、ScrollArea 建好即 adopt，面板内容再往 content 里填（失败时 shell 整棵回收）
+    // shell first, ScrollArea adopted after build, panel content fills shell.content (fail: shell
+    // freed whole)
     const shell = try core.box(cx, .{
         .direction = .column,
         .width = .{ .grow = .{} },
         .height = .{ .px = 0 },
-        .background = t.color.bg_primary,
+        .background = t.tokens.color.bg_primary,
     }, .{});
     errdefer cx.freeNode(shell);
-    var perf_scroll = try mountScrollArea(.{
+    var perf_scroll = try ScrollArea(.{
         .padding = Padding.symmetric(8, 10),
-        .background = t.color.bg_primary,
-    }, state.scope.?, cx);
+        .background = t.tokens.color.bg_primary,
+    }).mount(state.scope.?, cx);
     _ = try core.adoptChild(cx, cx.allocator, shell, perf_scroll.container);
     perf_scroll.container.style.width = .{ .grow = .{} };
     perf_scroll.container.style.height = .{ .grow = .{} };
@@ -877,7 +873,7 @@ fn consoleSourceEvent(event: Event, context: ?*anyopaque) EventResult {
         else => return .ignored,
     }
     const source = source_ctx.source orelse return .ignored;
-    source_link.open(source_ctx.cx.allocator, .{
+    source_link.open(source_ctx.cx.allocator, source_ctx.cx.io, .{
         .file = source.file,
         .line = source.line,
         .col = source.column,
@@ -890,12 +886,13 @@ fn mountConsoleShell(cx: *Cx, target: *Cx, state: *DevToolsState) !*Node {
     const t = cx.tokens;
     const scope = state.scope.?;
     const a = cx.allocator;
-    // shell -> toolbar 先建（errdefer 兜底整棵），子节点建好即 adopt，state 指针挂稳后发布。
+    // shell -> toolbar first (errdefer catches all), children adopted post-build, state pointer
+    // stable then publish.
     const shell = try core.box(cx, .{
         .direction = .column,
         .width = .{ .grow = .{} },
         .height = .{ .px = 0 },
-        .background = t.color.bg_primary,
+        .background = t.tokens.color.bg_primary,
     }, .{});
     errdefer cx.freeNode(shell);
     const toolbar = try core.adoptChild(cx, a, shell, try core.box(cx, .{
@@ -906,10 +903,10 @@ fn mountConsoleShell(cx: *Cx, target: *Cx, state: *DevToolsState) !*Node {
         .height = .{ .px = 44 },
         .flex_shrink = 0,
         .padding = Padding.symmetric(6, 10),
-        .background = t.color.bg_secondary,
+        .background = t.tokens.color.bg_secondary,
         .border = .{
             .width = 0,
-            .color = t.color.border,
+            .color = t.tokens.color.border,
             .side_widths = .{ 0, 0, 1, 0 },
         },
     }, .{}));
@@ -920,18 +917,18 @@ fn mountConsoleShell(cx: *Cx, target: *Cx, state: *DevToolsState) !*Node {
         .variant = .ghost,
         .size = .xs,
         .on_click = Cx.handlerFrom(DevToolsState, state, clearConsolePanel),
-        .style = .{
+        .base_style = .{
             .height = .{ .px = 28 },
             .padding = Padding.symmetric(0, 10),
-            .background = t.color.bg_primary,
-            .border = .{ .width = 1, .color = t.color.border, .radius = 5 },
-            .text_color = t.color.fg_secondary,
+            .background = t.tokens.color.bg_primary,
+            .border = .{ .width = 1, .color = t.tokens.color.border, .radius = 5 },
+            .text_color = t.tokens.color.fg_secondary,
             .font_weight = 600,
         },
         .hover_style = .{
-            .background = t.color.accent.withAlpha(18),
-            .border_color = t.color.accent.withAlpha(110),
-            .text_color = t.color.fg_primary,
+            .background = t.tokens.color.accent.withAlpha(18),
+            .border_color = t.tokens.color.accent.withAlpha(110),
+            .text_color = t.tokens.color.fg_primary,
         },
     }).mount(scope, cx));
     clear_btn.meta.ownership.meta.test_id = "devtools.console.clear";
@@ -940,10 +937,10 @@ fn mountConsoleShell(cx: *Cx, target: *Cx, state: *DevToolsState) !*Node {
     filter_ctx.* = .{ .state = state };
     const filter = try core.adoptChild(cx, a, toolbar, try Input(.{
         .placeholder = "Filter console output",
-        .initial_value = state.console_filter_buf[0..state.console_filter_len],
+        .value = state.console_filter_buf[0..state.console_filter_len],
         .size = .sm,
         .width = 320,
-        .on_change = Cx.strHandlerFrom(ConsoleFilterCtx, filter_ctx, consoleFilterChanged),
+        .on_change = cx.on(ConsoleFilterCtx, filter_ctx, consoleFilterChanged),
     }).mount(scope, cx));
     filter.meta.ownership.meta.test_id = "devtools.console.filter";
     // The filter is the flexible part of the toolbar. Its configured width is
@@ -955,7 +952,7 @@ fn mountConsoleShell(cx: *Cx, target: *Cx, state: *DevToolsState) !*Node {
     _ = try core.adoptChild(cx, a, toolbar, try core.box(cx, .{
         .width = .{ .px = 1 },
         .height = .{ .px = 20 },
-        .background = t.color.border.withAlpha(170),
+        .background = t.tokens.color.border.withAlpha(170),
         .margin = Padding.symmetric(0, 2),
     }, .{}));
 
@@ -970,8 +967,8 @@ fn mountConsoleShell(cx: *Cx, target: *Cx, state: *DevToolsState) !*Node {
         .align_items = .center,
         .gap = 1,
         .padding = Padding.all(2),
-        .background = t.color.bg_primary,
-        .border = .{ .width = 1, .color = t.color.border, .radius = 6 },
+        .background = t.tokens.color.bg_primary,
+        .border = .{ .width = 1, .color = t.tokens.color.border, .radius = 6 },
     }, .{}));
 
     const levels = [_]struct { level: console_mod.Level, label: []const u8 }{
@@ -981,29 +978,41 @@ fn mountConsoleShell(cx: *Cx, target: *Cx, state: *DevToolsState) !*Node {
         .{ .level = .warn, .label = "Warn" },
         .{ .level = .err, .label = "Error" },
     };
-    var level_buttons: [state.console_level_buttons.len]?*Node = .{null} ** state.console_level_buttons.len;
+    var level_enabled: [state.console_level_enabled.len]?*Signal(bool) = @splat(null);
     inline for (levels) |item| {
         const ctx = try allocScopeResource(scope, ConsoleLevelCtx);
         ctx.* = .{ .state = state, .level = item.level };
+        // Toggle state is data: button look (background, opacity) derived, toggle only writes
+        // signal
+        const bit: u8 = @as(u8, 1) << @intCast(@backingInt(item.level));
+        const enabled = try scope.createSignal(bool, (state.console_level_mask & bit) != 0);
+        const look = try scope.createMemo(core.StyleOverride, .{ .enabled = enabled, .color = consoleLevelColor(t, item.level), .t = t }, struct {
+            fn compute(c: anytype) core.StyleOverride {
+                const on = c.enabled.get();
+                return .{
+                    .height = .{ .px = 24 },
+                    .padding = Padding.symmetric(0, 7),
+                    .border = .{ .radius = 4 },
+                    .background = if (on) c.t.tokens.color.accent.withAlpha(22) else Color.TRANSPARENT,
+                    .opacity = if (on) 1 else 0.46,
+                    .text_color = c.color,
+                    .font_size = 10,
+                    .font_weight = 600,
+                };
+            }
+        }.compute);
         const button = try core.adoptChild(cx, a, level_group, try Button(.{
             .label = item.label,
             .variant = .ghost,
             .size = .xs,
             .on_click = Cx.handlerFrom(ConsoleLevelCtx, ctx, toggleConsoleLevel),
-            .style = .{
-                .height = .{ .px = 24 },
-                .padding = Padding.symmetric(0, 7),
-                .border = .{ .radius = 4 },
-                .text_color = consoleLevelColor(t, item.level),
-                .font_size = 10,
-                .font_weight = 600,
-            },
+            .base_style = look,
             .hover_style = .{
-                .background = t.color.fg_primary.withAlpha(12),
+                .background = t.tokens.color.fg_primary.withAlpha(12),
             },
         }).mount(scope, cx));
         button.meta.ownership.meta.test_id = "devtools.console.level";
-        level_buttons[@intFromEnum(item.level)] = button;
+        level_enabled[@backingInt(item.level)] = enabled;
     }
 
     const vl = try virtual_list_mod.VirtualList(.{
@@ -1011,7 +1020,7 @@ fn mountConsoleShell(cx: *Cx, target: *Cx, state: *DevToolsState) !*Node {
         .item_height = 30,
         .overscan = 12,
         .padding = Padding.ZERO,
-        .background = t.color.bg_primary,
+        .background = t.tokens.color.bg_primary,
     }).mountWithContext(scope, cx, @ptrCast(state), null, renderConsoleRow);
     _ = try core.adoptChild(cx, a, shell, vl.container);
     vl.container.style.width = .{ .grow = .{} };
@@ -1024,21 +1033,20 @@ fn mountConsoleShell(cx: *Cx, target: *Cx, state: *DevToolsState) !*Node {
         .width = .{ .grow = .{} },
         .height = .{ .px = 22 },
         .padding = Padding.symmetric(2, 8),
-        .background = t.color.bg_secondary,
+        .background = t.tokens.color.bg_secondary,
         .border = .{
             .width = 0,
-            .color = t.color.border,
+            .color = t.tokens.color.border,
             .side_widths = .{ 1, 0, 0, 0 },
         },
     }, .{}));
-    const status_text = try core.adoptChild(cx, a, status, try core.text(cx, "0 messages", .{ .font_size = 10, .color = t.color.fg_secondary }));
+    const status_text = try core.adoptChild(cx, a, status, try core.text(cx, "0 messages", .{ .font_size = 10, .color = t.tokens.color.fg_secondary }));
     status_text.meta.ownership.meta.test_id = "devtools.console.status";
 
-    // 整棵装配成功之后才发布 state 指针
+    // Publish state pointer only after assembly success
     state.console_filter_node = filter;
     state.console_toolbar_node = toolbar;
-    for (level_buttons, 0..) |btn, i| state.console_level_buttons[i] = btn;
-    syncConsoleLevelButtons(state);
+    for (level_enabled, 0..) |sig, i| state.console_level_enabled[i] = sig;
     state.console_vl_state = vl.state;
     state.console_status_text = status_text;
     _ = target;
@@ -1064,7 +1072,7 @@ fn consoleFilterChanged(ctx: *ConsoleFilterCtx, value: []const u8) void {
 }
 
 fn toggleConsoleLevel(ctx: *ConsoleLevelCtx) void {
-    const bit: u8 = @as(u8, 1) << @intCast(@intFromEnum(ctx.level));
+    const bit: u8 = @as(u8, 1) << @intCast(@backingInt(ctx.level));
     ctx.state.console_level_mask ^= bit;
     syncConsoleLevelButtons(ctx.state);
     rebuildConsoleFilter(ctx.state);
@@ -1074,21 +1082,18 @@ fn toggleConsoleLevel(ctx: *ConsoleLevelCtx) void {
 fn consoleLevelColor(t: *const theme.ThemeTokens, level: console_mod.Level) Color {
     return switch (level) {
         .debug => devtoolsMuted(t),
-        .log => t.color.fg_primary,
-        .info => t.color.accent,
-        .warn => t.color.warning,
-        .err => t.color.danger,
+        .log => t.tokens.color.fg_primary,
+        .info => t.tokens.color.accent,
+        .warn => t.tokens.color.warning,
+        .err => t.tokens.color.danger,
     };
 }
 
 fn syncConsoleLevelButtons(state: *DevToolsState) void {
-    const cx = state.cx orelse return;
-    for (&state.console_level_buttons, 0..) |*maybe_button, index| {
-        const button = maybe_button.* orelse continue;
+    for (state.console_level_enabled, 0..) |maybe, index| {
+        const enabled = maybe orelse continue;
         const bit: u8 = @as(u8, 1) << @intCast(index);
-        const enabled = (state.console_level_mask & bit) != 0;
-        button_mod.setBackgroundOverride(button, if (enabled) cx.tokens.color.accent.withAlpha(22) else Color.TRANSPARENT);
-        button.setOpacity(if (enabled) 1 else 0.46);
+        enabled.set((state.console_level_mask & bit) != 0);
     }
 }
 
@@ -1150,15 +1155,15 @@ fn rebuildConsoleFilter(state: *DevToolsState) void {
     state.console_filtered_indices.clearRetainingCapacity();
     const filter = state.console_filter_buf[0..state.console_filter_len];
     for (state.console_events.items, 0..) |event, index| {
-        const bit: u8 = @as(u8, 1) << @intCast(@intFromEnum(event.level));
+        const bit: u8 = @as(u8, 1) << @intCast(@backingInt(event.level));
         if ((state.console_level_mask & bit) == 0) continue;
         if (filter.len != 0 and !consoleContainsIgnoreCase(event.message, filter) and !consoleContainsIgnoreCase(event.scope, filter)) continue;
         state.console_filtered_indices.append(state.allocator, index) catch break;
     }
     if (state.console_vl_state) |vl| {
-        const old_total = @as(f32, @floatFromInt(vl.props.item_count)) * vl.props.item_height;
+        const old_total = @as(f32, @floatFromInt(vl.item_count)) * vl.props.item_height;
         const old_max_scroll = @max(@as(f32, 0), old_total - vl.scroll_state.viewport_height);
-        const was_following_tail = vl.props.item_count == 0 or
+        const was_following_tail = vl.item_count == 0 or
             vl.scroll_state.scroll_y >= old_max_scroll - vl.props.item_height * 1.5;
         virtual_list_mod.updateItemCount(vl, state.console_filtered_indices.items.len);
         // Match browser consoles: follow new output only while the user is at
@@ -1231,12 +1236,12 @@ fn renderConsoleRow(slot: *Node, filtered_index: usize, cx: *Cx, user_context: ?
     };
     slot.style.border = .{
         .width = 0,
-        .color = t.color.border.withAlpha(90),
+        .color = t.tokens.color.border.withAlpha(90),
         .side_widths = .{ 0, 0, 1, 0 },
     };
     slot.setBackground(switch (event.level) {
-        .warn => t.color.warning.withAlpha(12),
-        .err => t.color.danger.withAlpha(14),
+        .warn => t.tokens.color.warning.withAlpha(12),
+        .err => t.tokens.color.danger.withAlpha(14),
         else => Color.TRANSPARENT,
     });
     const level_color = consoleLevelColor(t, event.level);
@@ -1261,19 +1266,19 @@ fn renderConsoleRow(slot: *Node, filtered_index: usize, cx: *Cx, user_context: ?
         const scope_text = core.text(cx, event.scope, .{
             .font_size = 9,
             .font_weight = 600,
-            .color = t.color.fg_secondary,
+            .color = t.tokens.color.fg_secondary,
         }) catch return;
         const scope_badge = core.box(cx, .{
             .direction = .row,
             .align_items = .center,
             .height = .{ .px = 18 },
             .padding = Padding.symmetric(1, 5),
-            .background = t.color.bg_secondary,
-            .border = .{ .width = 1, .color = t.color.border.withAlpha(150), .radius = 4 },
+            .background = t.tokens.color.bg_secondary,
+            .border = .{ .width = 1, .color = t.tokens.color.border.withAlpha(150), .radius = 4 },
         }, .{scope_text}) catch return;
         slot.appendChild(cx.allocator, scope_badge) catch return;
     }
-    const message = core.text(cx, event.message, .{ .font_size = 12, .color = t.color.fg_primary }) catch return;
+    const message = core.text(cx, event.message, .{ .font_size = 12, .color = t.tokens.color.fg_primary }) catch return;
     message.meta.ownership.meta.test_id = "devtools.console.message";
     message.style.width = .{ .grow = .{} };
     message.style.overflow_hidden = true;
@@ -1283,7 +1288,7 @@ fn renderConsoleRow(slot: *Node, filtered_index: usize, cx: *Cx, user_context: ?
         const basename = std.fs.path.basename(source.file);
         var buf: [160]u8 = undefined;
         const label = std.fmt.bufPrint(&buf, "{s}:{d}", .{ basename, source.line }) catch basename;
-        const source_node = core.text(cx, label, .{ .font_size = 9, .font_weight = 500, .color = t.color.accent }) catch return;
+        const source_node = core.text(cx, label, .{ .font_size = 9, .font_weight = 500, .color = t.tokens.color.accent }) catch return;
         slot.appendChild(cx.allocator, source_node) catch return;
     }
 }
@@ -1292,7 +1297,7 @@ fn syncShellVisibility(state: *DevToolsState) void {
     const show_perf = state.view_mode == .performance;
     const show_console = state.view_mode == .console;
     const show_inspect = !show_perf and !show_console;
-    // per-hook 计时只在 performance 面板打开时启用，普通帧免掉每 hook 两次时钟读取
+    // Per-hook timing only on performance panel open, normal frames skip double clock read per hook
     @import("core/render_engine/tick.zig").g_profile_hooks = show_perf;
     if (state.inspect_shell_node) |node| {
         if (!show_inspect) {
@@ -1351,63 +1356,63 @@ fn isZeroHeight(node: *Node) bool {
     };
 }
 
-/// 预创建 Performance 面板所有节点（mount 时调用一次）
-/// 每个节点建好即 adopt 进 container（append 失败它自己收尸），state 指针挂稳后再发布。
+/// Pre-create all Performance panel nodes (call once mount), each adopted post-build (append fail
+/// it self-frees), state pointers stable then publish.
 fn mountPerformancePanel(cx: *Cx, container: *Node, t: *const theme.ThemeTokens, state: *DevToolsState) !void {
     const allocator = cx.allocator;
 
-    // 标题
+    // Title
     _ = try core.adoptChild(cx, allocator, container, try core.text(cx, "Frame Performance", .{
         .font_size = 12,
-        .color = t.color.fg_primary,
+        .color = t.tokens.color.fg_primary,
         .font_weight = 600,
     }));
 
-    // FPS 文本
+    // FPS text
     const fps_node = try core.adoptChild(cx, allocator, container, try core.text(cx, "FPS: 0", .{
         .font_size = 11,
-        .color = t.color.success,
+        .color = t.tokens.color.success,
     }));
     fps_node.meta.ownership.meta.test_id = "devtools.perf.fps";
     state.perf_fps_text = fps_node;
 
-    // 柱状图容器
+    // Histogram container
     const bar_container = try core.adoptChild(cx, allocator, container, try core.box(cx, .{
         .width = .{ .grow = .{} },
         .height = .{ .px = 80 },
         .direction = .row,
         .align_items = .end,
         .gap = 1,
-        .background = t.color.bg_secondary,
+        .background = t.tokens.color.bg_secondary,
         .padding = Padding.all(4),
         .border = .{ .radius = 4 },
     }, .{}));
     bar_container.setMarginTop(8);
     state.perf_bar_container = bar_container;
 
-    // 预创建 bar 节点
+    // Pre-create bar nodes
     var i: u32 = 0;
     while (i < perf_chart_sample_count) : (i += 1) {
         const bar = try core.adoptChild(cx, allocator, bar_container, try core.box(cx, .{
             .width = .{ .px = 3 },
             .height = .{ .px = 2 },
-            .background = t.color.border,
+            .background = t.tokens.color.border,
             .border = .{ .radius = 1 },
         }, .{}));
         state.perf_bars[i] = bar;
     }
 
-    // 16ms 目标线标注
+    // 16ms target line label
     const target_line = try core.adoptChild(cx, allocator, container, try core.text(cx, "  16.7ms target (60 FPS)", .{
         .font_size = 9,
         .color = devtoolsMuted(t),
     }));
     state.perf_target_text = target_line;
 
-    // 4 行 timing 文本
+    // 4 timing text rows
     const timing_node = try core.adoptChild(cx, allocator, container, try core.text(cx, "Timing(us): --", .{
         .font_size = 10,
-        .color = t.color.fg_secondary,
+        .color = t.tokens.color.fg_secondary,
     }));
     timing_node.meta.ownership.meta.test_id = "devtools.perf.timing";
     timing_node.setMarginTop(8);
@@ -1437,7 +1442,7 @@ fn mountPerformancePanel(cx: *Cx, container: *Node, t: *const theme.ThemeTokens,
     state.perf_mounted = true;
 }
 
-/// Performance 面板的 on_before_render，增量更新（不销毁/重建节点）
+/// Performance panel on_before_render, incremental update (don't destroy/rebuild nodes)
 fn perfBeforeRender(content_node: *Node) void {
     const state: *DevToolsState = @ptrCast(@alignCast(content_node.meta.per_frame.hooks.slots.anim_state orelse return));
     if (state.view_mode != .performance) return;
@@ -1445,12 +1450,13 @@ fn perfBeforeRender(content_node: *Node) void {
     const target = state.liveTarget() orelse return;
     const cx = state.cx orelse return;
     const t = cx.tokens;
-    // 无条件保活（10Hz）：性能监控必须持续走，不依赖 target 是否在渲染。
-    // 不能只在 target idle 时调度，那样某帧恰逢 target 活跃就断链（历史 bug）。
+    // Unconditional keepalive (10Hz): perf monitoring must continue, don't depend on target
+    // rendering.
+    // Can't schedule only on target idle, some frame target active breaks chain (history bug).
     cx.scheduleRedrawAfterNs(perf_keepalive_ns);
 
-    // target 停帧检测：frame_count 长时间未推进 ⇒ 面板进入 idle 显示。
-    const now_inst: ?std.time.Instant = std.time.Instant.now() catch null;
+    // Target idle detect: frame_count no advance => panel shows (idle).
+    const now_inst: ?@import("zenit_time").Instant = @import("zenit_time").Instant.now(cx.io) catch null;
     if (target.frame_count != state.perf_seen_frame_count or state.perf_last_frame_change == null) {
         state.perf_seen_frame_count = target.frame_count;
         state.perf_last_frame_change = now_inst;
@@ -1461,9 +1467,9 @@ fn perfBeforeRender(content_node: *Node) void {
         break :blk now.since(last) > perf_idle_indicator_ns;
     };
 
-    // 滚动时间桶推进（墙钟驱动，与 target 是否出帧无关）：
-    // 每满 100ms 记一桶「桶内平均 FPS」，无帧 = 0。监控因此持续向前滚，
-    // 而不是停帧后把最后 64 个渲染帧的快照冻在屏上。
+    // Scroll time bucket advance (wall clock, independent of target output): every 100ms record one
+    // bucket "avg FPS in that bucket", no frames = 0. Monitor keeps rolling, doesn't freeze last
+    // 64-frame snapshot after idle.
     if (now_inst) |now| {
         if (state.perf_bucket_start) |bucket_start| {
             const dt_ns = now.since(bucket_start);
@@ -1484,21 +1490,7 @@ fn perfBeforeRender(content_node: *Node) void {
         }
     }
 
-    // 当前 FPS：最近 ~1s（10 桶）已填充桶的平均。target idle 时自然掉到 0。
-    const current_fps: u32 = blk: {
-        var sum: f32 = 0;
-        var n_buckets: usize = 0;
-        var back: usize = 0;
-        while (back < 10) : (back += 1) {
-            const idx = (state.perf_live_head + perf_chart_sample_count - 1 - back) % perf_chart_sample_count;
-            const val = state.perf_live_fps[idx];
-            if (val < 0) continue;
-            sum += val;
-            n_buckets += 1;
-        }
-        if (n_buckets == 0) break :blk 0;
-        break :blk @intFromFloat(@min(@as(f32, 999), @round(sum / @as(f32, @floatFromInt(n_buckets)))));
-    };
+    const current_fps = liveCurrentFps(state);
 
     if (state.perf_fps_text) |n| {
         if (target_idle) {
@@ -1517,11 +1509,11 @@ fn perfBeforeRender(content_node: *Node) void {
             const next_color = if (target_idle)
                 devtoolsMuted(t)
             else if (fps_f >= refresh_hz * 0.9)
-                t.color.success
+                t.tokens.color.success
             else if (fps_f >= refresh_hz * 0.5)
-                t.color.warning
+                t.tokens.color.warning
             else
-                t.color.danger;
+                t.tokens.color.danger;
             if (!Color.eql(old.color, next_color)) {
                 var tp = old;
                 tp.color = next_color;
@@ -1540,26 +1532,27 @@ fn perfBeforeRender(content_node: *Node) void {
         });
     }
 
-    // 更新 bar 的 height + color，时间桶滚动图：head 起往后读 = 最旧->最新。
-    // 空桶（idle/未填充）画 2px 中性底线；有帧的桶画「桶平均帧时间」。
-    // 桶平均会抹平单帧尖刺，阈值放宽到 1.1×/1.5× 目标周期，避免 60Hz 满帧
-    // 时 16.7ms≈周期本身的抖动被误画成红柱。
+    // Update bar height + color, time-bucket scroll graph: head forward = oldest->newest.
+    // Empty bucket (idle/unfilled) draws 2px neutral baseline; with frames draws "bucket avg frame
+    // time".
+    // Bucket average smooths single-frame spikes, threshold relax to 1.1x/1.5x period, avoid 60Hz
+    // full-frame 16.7ms~=period jitter mis-paint red.
     const target_ms: f32 = @floatCast(1000.0 / @as(f64, @floatCast(@max(1.0, target.display_refresh_hz))));
     var i: u32 = 0;
     while (i < perf_chart_sample_count) : (i += 1) {
         if (state.perf_bars[i]) |bar| {
             const val = state.perf_live_fps[(state.perf_live_head + @as(usize, i)) % perf_chart_sample_count];
             var bar_h: f32 = 2.0;
-            var bar_color = t.color.border;
+            var bar_color = t.tokens.color.border;
             if (val > 0) {
                 const frame_ms = 1000.0 / val;
                 bar_h = @max(2.0, @min(72.0, (frame_ms / target_ms) * 40.0));
                 bar_color = if (frame_ms > target_ms * 1.5)
-                    t.color.danger
+                    t.tokens.color.danger
                 else if (frame_ms > target_ms * 1.1)
-                    t.color.warning
+                    t.tokens.color.warning
                 else
-                    t.color.success;
+                    t.tokens.color.success;
             }
             const old_h = switch (bar.style.height) {
                 .px => |v| v,
@@ -1573,10 +1566,10 @@ fn perfBeforeRender(content_node: *Node) void {
         }
     }
 
-    // 更新 timing 文本
+    // Update timing text
     const perf = target.perf;
     if (state.perf_timing_text) |n| {
-        // (encode_us/flush_us/wait_us/acquire_us/cpu_us/total_us 字段已删，0 write)
+        // (encode_us/flush_us/wait_us/acquire_us/cpu_us/total_us fields deleted, 0 write)
         _ = updateTextNodeIfChanged(cx.allocator, n, "Timing(us): layout {d} | render {d}", .{
             perf.layout_us, perf.render_us,
         });
@@ -1610,9 +1603,9 @@ fn perfBeforeRender(content_node: *Node) void {
     state.stats_dirty = false;
 }
 
-/// VirtualList 渲染回调（保留模式，VirtualList 管理 slot 生命周期）
-/// The tree-row slot the mouse is currently over, or null. Walks up from the
-/// hovered node because the pointer usually lands on a row's text/glyph child.
+/// VirtualList render callback (retain mode, VirtualList manages slot lifetime)
+/// The tree-row slot mouse is over, or null. Walks up from hovered node (pointer usually lands on
+/// row text/glyph child).
 fn hoveredTreeRow(cx: *Cx) ?*Node {
     var cur: ?*Node = cx.hovered_node;
     var guard: usize = 0;
@@ -1620,7 +1613,7 @@ fn hoveredTreeRow(cx: *Cx) ?*Node {
         if (n.meta.ownership.meta.test_id) |tid| {
             if (std.mem.eql(u8, tid, tree_row_test_id)) return n;
         }
-        if (guard >= 64) return null; // 防御异常深/成环的父链
+        if (guard >= 64) return null; // Guard vs abnormal deep/cycle parent chain
         guard += 1;
         cur = n.parent;
     }
@@ -1634,15 +1627,15 @@ fn isSelfOrAncestor(root: *Node, candidate: *Node) bool {
     var guard: usize = 0;
     while (cur) |n| {
         if (n == root) return true;
-        if (guard >= 64) return false; // 防御异常深/成环的父链
+        if (guard >= 64) return false; // Guard vs abnormal deep/cycle parent chain
         guard += 1;
         cur = n.parent;
     }
     return false;
 }
 
-/// 行内每个子节点原来都是「create 再 append」两步、append 失败 child 漏（mountPanel sweep 抓到）；
-/// 全部改 adoptChild（append 失败它自己收尸）。
+/// Each slot child was create then append, append fail orphaned child; changed all to adoptChild
+/// (append fail it self-frees).
 fn renderTreeRowRetained(node: *Node, index: usize, cx: *Cx, user_context: ?*anyopaque) void {
     const state: *DevToolsState = @ptrCast(@alignCast(user_context orelse return));
     if (index >= state.flat_rows.items.len) return;
@@ -1650,13 +1643,13 @@ fn renderTreeRowRetained(node: *Node, index: usize, cx: *Cx, user_context: ?*any
     const target = state.liveTarget() orelse return;
 
     const t = cx.tokens;
-    const s = theme_schema.window(t);
+    const s = devtools_styles.palette(t);
     const tree_node = entry.node;
 
     const is_selected = target.inspector.selected_node_id != null and target.inspector.selected_node_id.? == tree_node.id;
     const is_hovered = target.inspector.hover_node_id != null and target.inspector.hover_node_id.? == tree_node.id;
 
-    const row_bg = if (is_selected) s.devtools_row_selected_bg else if (is_hovered) s.devtools_row_hover_bg else Color.TRANSPARENT;
+    const row_bg = if (is_selected) s.row_selected_bg else if (is_hovered) s.row_hover_bg else Color.TRANSPARENT;
 
     node.style.direction = .row;
     node.style.align_items = .center;
@@ -1671,7 +1664,7 @@ fn renderTreeRowRetained(node: *Node, index: usize, cx: *Cx, user_context: ?*any
     // Expander
     if (entry.has_children) {
         const symbol = if (entry.collapsed) ">" else "v";
-        _ = core.adoptChild(cx, cx.allocator, node, core.text(cx, symbol, .{ .font_size = 9, .color = t.color.fg_secondary }) catch return) catch return;
+        _ = core.adoptChild(cx, cx.allocator, node, core.text(cx, symbol, .{ .font_size = 9, .color = t.tokens.color.fg_secondary }) catch return) catch return;
     } else {
         _ = core.adoptChild(cx, cx.allocator, node, cx.createNode(.spacer, .{
             .width = .{ .px = 8 },
@@ -1679,16 +1672,16 @@ fn renderTreeRowRetained(node: *Node, index: usize, cx: *Cx, user_context: ?*any
         }) catch return) catch return;
     }
 
-    // Tag / Component 名
+    // Tag / Component name
     if (state.view_mode == .components) {
         if (tree_node.meta.ownership.meta.component_name) |comp_name| {
-            _ = core.adoptChild(cx, cx.allocator, node, core.text(cx, comp_name, .{ .font_size = 11, .color = s.devtools_component_label, .font_weight = 600 }) catch return) catch return;
+            _ = core.adoptChild(cx, cx.allocator, node, core.text(cx, comp_name, .{ .font_size = 11, .color = s.component_label, .font_weight = 600 }) catch return) catch return;
         }
     } else {
         const tag_name = @tagName(tree_node.tag);
         _ = core.adoptChild(cx, cx.allocator, node, core.text(cx, tag_name, .{ .font_size = 11, .color = tagColor(tree_node.tag, t) }) catch return) catch return;
         if (tree_node.meta.ownership.meta.component_name) |comp_name| {
-            _ = core.adoptChild(cx, cx.allocator, node, core.text(cx, comp_name, .{ .font_size = 10, .color = s.devtools_component_label, .font_weight = 600 }) catch return) catch return;
+            _ = core.adoptChild(cx, cx.allocator, node, core.text(cx, comp_name, .{ .font_size = 10, .color = s.component_label, .font_weight = 600 }) catch return) catch return;
         }
     }
 
@@ -1698,37 +1691,37 @@ fn renderTreeRowRetained(node: *Node, index: usize, cx: *Cx, user_context: ?*any
     _ = core.adoptChild(cx, cx.allocator, node, inlineText(cx, id_str, devtoolsMuted(t), 10) catch return) catch return;
 
     if (tree_node.frame_state.state_bits.flags.inspect_pick_disabled) {
-        _ = core.adoptChild(cx, cx.allocator, node, inlineText(cx, "pick-off", t.color.warning, 9) catch return) catch return;
+        _ = core.adoptChild(cx, cx.allocator, node, inlineText(cx, "pick-off", t.tokens.color.warning, 9) catch return) catch return;
     }
 
-    // Children 数量
+    // Child count
     if (entry.has_children) {
         var count_buf: [12]u8 = undefined;
         const count_str = std.fmt.bufPrint(&count_buf, "({d})", .{tree_node.children.items.len}) catch "";
         _ = core.adoptChild(cx, cx.allocator, node, inlineText(cx, count_str, devtoolsMuted(t), 9) catch return) catch return;
     }
 
-    // 文本预览
+    // Text preview
     if (tree_node.getText()) |tp| {
         if (tp.content.len > 0) {
             const preview = tp.content[0..@min(tp.content.len, 30)];
             var preview_buf: [36]u8 = undefined;
             const preview_str = std.fmt.bufPrint(&preview_buf, "\"{s}\"", .{preview}) catch "";
-            _ = core.adoptChild(cx, cx.allocator, node, inlineText(cx, preview_str, s.devtools_text_preview, 10) catch return) catch return;
+            _ = core.adoptChild(cx, cx.allocator, node, inlineText(cx, preview_str, s.text_preview, 10) catch return) catch return;
         }
     }
 
     // Render dirty
     if (tree_node.frame_state.state_bits.dirty.core.render) {
-        _ = core.adoptChild(cx, cx.allocator, node, core.text(cx, "*", .{ .font_size = 10, .color = t.color.warning }) catch return) catch return;
+        _ = core.adoptChild(cx, cx.allocator, node, core.text(cx, "*", .{ .font_size = 10, .color = t.tokens.color.warning }) catch return) catch return;
     }
 
-    // Goto-source：hover 时在行尾显示，点击用外部编辑器打开该组件的定义处。
-    // 只有能解析出源码位置的行才显示，匿名节点和运行期拼名字的组件不在索引里，
-    // 与其显示一个点了没反应的按钮，不如不显示。
-    // 注意用 cx.hovered_node（DevTools 自己这个窗口的鼠标悬停），而不是上面的
-    // is_hovered，后者读的是 target.inspector.hover_node_id，那是 pick 模式下
-    // 鼠标悬停在**被检查的 app 窗口**上时才会被设置的，跟"鼠标停在这一行"无关。
+    // Goto-source: show at row tail on hover, click opens external editor at component definition.
+    // Only rows with parseable source location show, anon nodes and runtime-named components not
+    // indexed; showing unresponsive button worse than hiding.
+    // Note use cx.hovered_node (DevTools own window mouse hover), not is_hovered above (reads
+    // target.inspector.hover_node_id, set only when mouse hovers **debugged app window** in pick
+    // mode, unrelated to "line hover").
     const row_hovered = if (cx.hovered_node) |h| isSelfOrAncestor(node, h) else false;
     const goto_name: ?[]const u8 = if (row_hovered and source_link.isConfigured())
         tree_node.meta.ownership.meta.component_name
@@ -1743,11 +1736,12 @@ fn renderTreeRowRetained(node: *Node, index: usize, cx: *Cx, user_context: ?*any
             .padding = .{ .left = 4, .right = 4, .top = 0, .bottom = 0 },
             .cursor = .pointer,
         }) catch break :resolve_goto;
-        // btn 挂到 node 之前 glyph 还可能失败，门控 defer 守窗口（break 走的是正常退出，errdefer 不触发）
+        // glyph may fail before btn hangs on node, gate defer guards window (break normal exit,
+        // errdefer skips)
         var btn_owned = true;
         defer if (btn_owned) cx.freeNode(btn);
         btn.meta.ownership.meta.test_id = "devtools.tree.goto_source";
-        _ = core.adoptChild(cx, cx.allocator, btn, inlineText(cx, "↗", s.devtools_component_label, 11) catch break :resolve_goto) catch break :resolve_goto;
+        _ = core.adoptChild(cx, cx.allocator, btn, inlineText(cx, "↗", s.component_label, 11) catch break :resolve_goto) catch break :resolve_goto;
 
         state.goto_ctx = .{
             .state = state,
@@ -1761,7 +1755,7 @@ fn renderTreeRowRetained(node: *Node, index: usize, cx: *Cx, user_context: ?*any
         _ = core.adoptChild(cx, cx.allocator, node, btn) catch break :resolve_goto;
     }
 
-    // 点击事件，复用 slot 节点已有的 event_context，避免每次重新分配泄漏
+    // Click event, reuse slot node's existing event_context, avoid per-rebuild alloc leak
     if (node.behavior.events.event_context) |old_ptr| {
         const old: *RowCtx = @ptrCast(@alignCast(old_ptr));
         old.* = .{ .state = state, .node_id = tree_node.id, .action = .select };
@@ -1775,7 +1769,8 @@ fn renderTreeRowRetained(node: *Node, index: usize, cx: *Cx, user_context: ?*any
 
     if (entry.has_children and node.children.items.len > 0) {
         const expander_node = node.children.items[0];
-        // toggle RowCtx 存到 slot 节点的 focus_ring_anim 上（slot 不被销毁，避免子节点重建时泄漏）
+        // toggle RowCtx store into slot node's focus_ring_anim (slot not destroyed, avoid child
+        // rebuild leak)
         if (node.meta.per_frame.hooks.slots.focus_ring_anim) |old_ptr| {
             const old: *RowCtx = @ptrCast(@alignCast(old_ptr));
             old.* = .{ .state = state, .node_id = tree_node.id, .action = .toggle, .is_currently_collapsed = entry.collapsed };
@@ -1791,7 +1786,7 @@ fn renderTreeRowRetained(node: *Node, index: usize, cx: *Cx, user_context: ?*any
     }
 }
 
-/// 保留模式：mount 统计栏
+/// Retain mode: mount stats row
 fn mountStatsBar(cx: *Cx, state: *DevToolsState, target: *Cx) !*Node {
     const t = cx.tokens;
     const bar = try core.box(cx, .{
@@ -1801,17 +1796,18 @@ fn mountStatsBar(cx: *Cx, state: *DevToolsState, target: *Cx) !*Node {
         .width = .{ .grow = .{} },
         .height = .{ .px = 22 },
         .padding = Padding.symmetric(2, 8),
-        .background = t.color.bg_tertiary,
-        .border = .{ .width = 1, .color = t.color.border },
+        .background = t.tokens.color.bg_tertiary,
+        .border = .{ .width = 1, .color = t.tokens.color.border },
     }, .{});
 
-    // 五个文字节点建好即 adopt，挂稳后才发布进 state（失败时 bar 整棵回收，state 不留悬垂）
+    // Five text nodes adopted post-build, stable then publish into state (fail: bar freed, no
+    // dangling state)
     errdefer cx.freeNode(bar);
     const a = cx.allocator;
-    const nodes_text = try core.adoptChild(cx, a, bar, try core.text(cx, "Nodes: 0", .{ .font_size = 10, .color = t.color.fg_secondary }));
-    const depth_text = try core.adoptChild(cx, a, bar, try core.text(cx, "Depth: 0", .{ .font_size = 10, .color = t.color.fg_secondary }));
-    const cmds_text = try core.adoptChild(cx, a, bar, try core.text(cx, "Cmds: 0", .{ .font_size = 10, .color = t.color.fg_secondary }));
-    const se_text = try core.adoptChild(cx, a, bar, try core.text(cx, "S:0 E:0", .{ .font_size = 10, .color = t.color.fg_secondary }));
+    const nodes_text = try core.adoptChild(cx, a, bar, try core.text(cx, "Nodes: 0", .{ .font_size = 10, .color = t.tokens.color.fg_secondary }));
+    const depth_text = try core.adoptChild(cx, a, bar, try core.text(cx, "Depth: 0", .{ .font_size = 10, .color = t.tokens.color.fg_secondary }));
+    const cmds_text = try core.adoptChild(cx, a, bar, try core.text(cx, "Cmds: 0", .{ .font_size = 10, .color = t.tokens.color.fg_secondary }));
+    const se_text = try core.adoptChild(cx, a, bar, try core.text(cx, "S:0 E:0", .{ .font_size = 10, .color = t.tokens.color.fg_secondary }));
     const frame_text = try core.adoptChild(cx, a, bar, try core.text(cx, "F:0", .{ .font_size = 10, .color = devtoolsMuted(t) }));
     state.stats_nodes_text = nodes_text;
     state.stats_depth_text = depth_text;
@@ -1819,43 +1815,43 @@ fn mountStatsBar(cx: *Cx, state: *DevToolsState, target: *Cx) !*Node {
     state.stats_se_text = se_text;
     state.stats_frame_text = frame_text;
 
-    // 初始更新
+    // Initial update
     updateStatsBarContent(state, target);
 
     return bar;
 }
 
-/// 保留模式：mount 详情面板（右侧面板）
+/// Retain mode: mount details panel (right panel)
 fn mountDetails(cx: *Cx, target: *Cx, state: *DevToolsState) !*Node {
     const t = cx.tokens;
     _ = target;
 
-    // wrapper 先建，tab_bar / ScrollArea 建好即 adopt；content 指针挂稳后再发布
+    // wrapper first, tab_bar / ScrollArea adopted post-build; content pointer stable then publish
     const wrapper = try core.box(cx, .{
         .direction = .column,
         .width = .{ .grow = .{} },
         .height = .{ .grow = .{} },
-        .border = .{ .width = 1, .color = t.color.border },
+        .border = .{ .width = 1, .color = t.tokens.color.border },
     }, .{});
     errdefer cx.freeNode(wrapper);
     wrapper.meta.ownership.meta.test_id = "devtools.details.panel";
     _ = try core.adoptChild(cx, cx.allocator, wrapper, try buildTabBar(cx, state));
-    var content_scroll = try mountScrollArea(.{
+    var content_scroll = try ScrollArea(.{
         .padding = Padding.symmetric(4, 8),
-        .background = t.color.bg_secondary,
-    }, state.scope.?, cx);
+        .background = t.tokens.color.bg_secondary,
+    }).mount(state.scope.?, cx);
     _ = try core.adoptChild(cx, cx.allocator, wrapper, content_scroll.container);
     content_scroll.container.style.height = .{ .grow = .{} };
     content_scroll.container.style.width = .{ .grow = .{} };
 
-    // 保存 content 引用，用于 on_before_render 局部重建
+    // Save content reference for on_before_render local rebuild
     state.details_content = content_scroll.content;
     content_scroll.content.meta.per_frame.hooks.slots.anim_state = @ptrCast(state);
     content_scroll.content.meta.per_frame.hooks.before_render.main = detailsBeforeRender;
     return wrapper;
 }
 
-/// 详情面板 on_before_render：检测脏标记后局部重建内容
+/// Details panel on_before_render: detect dirty then local rebuild content
 fn detailsBeforeRender(content_node: *Node) void {
     const state: *DevToolsState = @ptrCast(@alignCast(content_node.meta.per_frame.hooks.slots.anim_state orelse return));
     if (state.view_mode == .performance) return;
@@ -1866,13 +1862,13 @@ fn detailsBeforeRender(content_node: *Node) void {
     const target = state.liveTarget() orelse return;
     const t = cx.tokens;
 
-    // 先清理交互引用，确保 subtree 内的 blur/focus 回调在 scope 资源仍有效时完成。
+    // First clear interaction refs, ensure subtree blur/focus callbacks finish while scope live.
     for (content_node.children.items) |child| {
         cx.invalidateReferencesTo(child);
     }
 
-    // 断开旧 subtree 上的 scope 指针，再 dispose scope。
-    // 这样后续 freeNode(child) 不会再次触碰已释放的 scope。
+    // Unwire old subtree's scope pointers, then dispose scope.
+    // Subsequent freeNode(child) won't retrace freed scope.
     for (content_node.children.items) |child| {
         hooks.invalidateSubtreeHookState(child);
         core.clearNodeScopes(child);
@@ -1880,35 +1876,35 @@ fn detailsBeforeRender(content_node: *Node) void {
     if (state.details_scope) |ds| ds.dispose();
     state.details_scope = null;
 
-    // 最后释放旧子节点。
+    // Finally free old children.
     //
-    // 逐个 pop 而不是 `for (children.items) |child| freeNode(child)`：tick 期间
-    // 的 freeNode 会走 removeChildIncremental -> children.orderedRemove(i)，即
-    // 边遍历边改动正在遍历的数组，后续迭代会跳过元素并最终读到已失效的槽位
-    // （表现为 invalidateHandlesInSubtree 递归时解引用 0xaaaa… 毒值 segfault）。
-    // 先摘链再交给 freeNode，父子链已断，removeChildIncremental 便是 no-op。
+    // pop not `for (children.items) |child| freeNode(child)`: tick freeNode calls
+    // removeChildIncremental -> children.orderedRemove(i), modifies array mid-iterate, later
+    // iterations skip elements and eventually dereference stale slot (shows
+    // invalidateHandlesInSubtree recursion dereferencing 0xaaaa... poison segfault).
+    // Unlink first, then freeNode, parent-child link severed, removeChildIncremental no-op.
     while (content_node.children.pop()) |child| {
         child.parent = null;
         cx.freeNode(child);
     }
 
-    // 回收 frame arena：Trace/State tab 的事件 ctx（TracePauseCtx/
-    // TraceClickCtx 等）都从这里分配、且只被刚释放的旧子树引用。
-    // 不 reset 的话 Trace tab + 60fps target 下每次重建 ~1-2KB 只增不减，
-    // 面板开一小时就是可观的泄漏。
+    // Reclaim frame arena: Trace/State tab event ctx (TracePauseCtx/TraceClickCtx etc.) allocated
+    // here, only referenced by freed old subtree.
+    // No reset: Trace tab + 60fps target ~1-2KB per rebuild grows, panel running hour = observable
+    // leak.
     _ = state.arena.reset(.retain_capacity);
 
-    // 创建新 scope
+    // Create new scope
     state.details_scope = Scope.init(cx.allocator, state.scope, cx.owner) catch null;
 
     const selected_id = target.inspector.selected_node_id orelse target.inspector.hover_node_id;
 
-    // 诊断路径：content_node 每帧从被选中节点重新构建，这里的 catch {} 失败
-    // 上限是「本帧详情页少显示一段内容」，下一帧重建即自愈；被调试 app 不受影响。
+    // Diagnostic: content_node rebuilt each frame from selected node, catch {} fail worst: "this
+    // frame details page misses section", next frame self-heals; debugged app unaffected.
     if (state.active_tab == .trace) {
         buildTraceTab(cx, target, state, content_node) catch {};
     } else if (selected_id == null or target.root == null) {
-        const no_sel = core.text(cx, "No selection", .{ .font_size = 11, .color = t.color.fg_secondary }) catch return;
+        const no_sel = core.text(cx, "No selection", .{ .font_size = 11, .color = t.tokens.color.fg_secondary }) catch return;
         content_node.appendChild(cx.allocator, no_sel) catch {};
     } else {
         const root = target.root.?;
@@ -1923,20 +1919,20 @@ fn detailsBeforeRender(content_node: *Node) void {
                 .trace => unreachable,
             }
         } else {
-            const not_found = core.text(cx, "Node not found", .{ .font_size = 11, .color = t.color.fg_secondary }) catch return;
+            const not_found = core.text(cx, "Node not found", .{ .font_size = 11, .color = t.tokens.color.fg_secondary }) catch return;
             content_node.appendChild(cx.allocator, not_found) catch {};
         }
     }
     content_node.markLayoutDirty();
 }
 
-// ========== 面板头部 ==========
+// ========== Panel header ==========
 
 fn buildHeader(cx: *Cx, target: *Cx, opts: PanelOptions, state: *DevToolsState) !*Node {
     const t = cx.tokens;
     const a = cx.allocator;
     const scope = state.scope.?;
-    // header 先建、errdefer 兜底整棵；子树建好即 adopt（append 失败它自己收尸）。
+    // header first, errdefer catches all; children adopted post-build (append fail self-frees).
     var header = try core.box(cx, .{
         .direction = .row,
         .align_items = .center,
@@ -1944,17 +1940,17 @@ fn buildHeader(cx: *Cx, target: *Cx, opts: PanelOptions, state: *DevToolsState) 
         .width = .{ .grow = .{} },
         .height = .{ .px = 32 },
         .padding = Padding.symmetric(4, 10),
-        .background = t.color.bg_secondary,
-        .border = .{ .width = 1, .color = t.color.border },
+        .background = t.tokens.color.bg_secondary,
+        .border = .{ .width = 1, .color = t.tokens.color.border },
     }, .{});
     errdefer cx.freeNode(header);
     header.meta.ownership.meta.test_id = "devtools.header.shell";
     const header_ext = try header.style.ensureExtFallible(cx.allocator);
-    // Header 是固定 chrome，不应把滚动漏给下方 tree/details ScrollArea。
+    // Header fixed chrome, shouldn't pass scroll to tree/details ScrollArea below.
     header_ext.hit_roles = .{ .pointer = true, .scroll = true, .inspect = false };
     header_ext.hit_behavior = .@"opaque";
 
-    // 左侧: 选择元素按钮 + 标题 + 视图切换
+    // Left: pick button + title + view switch
     const left = try core.adoptChild(cx, a, header, try core.box(cx, .{
         .direction = .row,
         .align_items = .center,
@@ -1962,7 +1958,7 @@ fn buildHeader(cx: *Cx, target: *Cx, opts: PanelOptions, state: *DevToolsState) 
     }, .{}));
     left.meta.ownership.meta.test_id = "devtools.header.left";
 
-    // "选择元素"按钮 -> Button 组件 + SVG icon
+    // "Pick" button -> Button component + SVG icon
     {
         const is_pick_active = target.inspector.pick_mode;
 
@@ -1972,7 +1968,7 @@ fn buildHeader(cx: *Cx, target: *Cx, opts: PanelOptions, state: *DevToolsState) 
         const pick_btn = try core.adoptChild(cx, a, left, try Button(.{
             .icon_only = true,
             .icon_asset = svg_assets.common.scan,
-            .variant = if (is_pick_active) .primary else .ghost,
+            .variant = @as(button_mod.ButtonVariant, if (is_pick_active) .primary else .ghost),
             .size = .xs,
             .icon_size = 14,
             .on_event = pickModeEvent,
@@ -1983,30 +1979,33 @@ fn buildHeader(cx: *Cx, target: *Cx, opts: PanelOptions, state: *DevToolsState) 
 
     _ = try core.adoptChild(cx, a, left, try core.text(cx, state.title, .{
         .font_size = 12,
-        .color = t.color.fg_primary,
+        .color = t.tokens.color.fg_primary,
         .font_weight = 600,
     }));
 
-    // 视图切换 -> underline Tabs
+    // View switch -> underline Tabs
     const mode_items = [_]TabItem{
-        .{ .id = "elements", .label_text = "Elements" },
-        .{ .id = "components", .label_text = "Components" },
-        .{ .id = "console", .label_text = "Console" },
-        .{ .id = "performance", .label_text = "Performance" },
+        .{ .id = "elements", .label = "Elements" },
+        .{ .id = "components", .label = "Components" },
+        .{ .id = "console", .label = "Console" },
+        .{ .id = "performance", .label = "Performance" },
     };
     const mode_tabs = try core.adoptChild(cx, a, left, try Tabs(.{
         .items = &mode_items,
-        .default_active_id = viewModeId(state.view_mode),
+        // Active page by signal: programmatic switch (syncViewModeTabs) just set
+        .active = blk: {
+            const sig = try scope.createSignal(?[]const u8, viewModeId(state.view_mode));
+            state.view_mode_tab = sig;
+            break :blk sig;
+        },
         .variant = .underline,
         .size = .xs,
-        // 并轨后：strHandlerFrom 把 context 与回调捆在一起，payload 即 tab id。
-        .on_change = core.Cx.strHandlerFrom(DevToolsState, state, applyViewModeById),
+        .on_change = cx.on(DevToolsState, state, applyViewModeById),
     }).mount(scope, cx));
     mode_tabs.meta.ownership.meta.test_id = "devtools.view-mode.tabs";
     state.view_mode_tabs_node = mode_tabs;
-    state.view_mode_tabs_state = tabsStateFromNode(mode_tabs);
 
-    // 右侧: 明暗切换 + 关闭
+    // Right: theme toggle + close
     const right = try core.adoptChild(cx, a, header, try core.box(cx, .{
         .direction = .row,
         .align_items = .center,
@@ -2014,7 +2013,7 @@ fn buildHeader(cx: *Cx, target: *Cx, opts: PanelOptions, state: *DevToolsState) 
     }, .{}));
     right.meta.ownership.meta.test_id = "devtools.header.right";
 
-    // 明暗切换：显示「点了会切到」的那一侧图标（暗色下显示太阳）
+    // Theme toggle: show icon for "clicking will switch to" side (dark mode shows sun)
     {
         const theme_btn = try core.adoptChild(cx, a, right, try Button(.{
             .icon_only = true,
@@ -2028,7 +2027,7 @@ fn buildHeader(cx: *Cx, target: *Cx, opts: PanelOptions, state: *DevToolsState) 
         theme_btn.meta.ownership.meta.test_id = "devtools.theme.toggle";
     }
 
-    // 关闭按钮 -> Button 组件
+    // Close button -> Button component
     if (opts.on_close) |h| {
         const close_ctx = try allocScopeResource(scope, CloseCtx);
         close_ctx.* = .{ .handler = h };
@@ -2044,7 +2043,7 @@ fn buildHeader(cx: *Cx, target: *Cx, opts: PanelOptions, state: *DevToolsState) 
         }).mount(scope, cx));
         close_btn.meta.ownership.meta.test_id = "devtools.close";
     } else {
-        // 即使没有 on_close handler 也显示一个占位
+        // Show placeholder even without on_close handler
         const close_btn = try core.adoptChild(cx, a, right, try Button(.{
             .icon_only = true,
             .icon_asset = svg_assets.common.x_close,
@@ -2058,7 +2057,7 @@ fn buildHeader(cx: *Cx, target: *Cx, opts: PanelOptions, state: *DevToolsState) 
     return header;
 }
 
-// ========== 搜索栏 ==========
+// ========== Search bar ==========
 
 fn buildSearchBar(cx: *Cx, state: *DevToolsState) !*Node {
     const t = cx.tokens;
@@ -2073,23 +2072,23 @@ fn buildSearchBar(cx: *Cx, state: *DevToolsState) !*Node {
         }
     }.destroy) catch {};
 
-    // shell 先建、Input 建好即 adopt（失败时 shell 整棵回收）
+    // shell first, Input adopted post-build (fail: shell freed whole)
     const shell = try core.box(cx, .{
         .direction = .row,
         .align_items = .center,
         .width = .{ .grow = .{} },
         .height = .{ .fit = .{} },
         .padding = Padding.symmetric(6, 8),
-        .background = t.color.bg_secondary,
+        .background = t.tokens.color.bg_secondary,
         .overflow_hidden = true,
     }, .{});
     errdefer cx.freeNode(shell);
     const mounted_input = try Input(.{
         .placeholder = "Filter (tag, #id)...",
-        .initial_value = state.filter_buf[0..state.filter_len],
+        .value = state.filter_buf[0..state.filter_len],
         .size = .sm,
         .leading_icon_asset = svg_assets.common.search,
-        .on_change = core.Cx.strHandlerFrom(FilterChangeCtx, filter_ctx, filterInputChanged),
+        .on_change = cx.on(FilterChangeCtx, filter_ctx, filterInputChanged),
     }).mountResult(scope, cx);
     const input_node = try core.adoptChild(cx, cx.allocator, shell, mounted_input.node);
     input_node.style.width = .{ .grow = .{} };
@@ -2098,13 +2097,13 @@ fn buildSearchBar(cx: *Cx, state: *DevToolsState) !*Node {
     shell.meta.ownership.meta.test_id = "devtools.search.shell";
     shell.setInteractionDelegate(mounted_input.input_container);
     const shell_ext = try shell.style.ensureExtFallible(cx.allocator);
-    // Search 区也是固定 chrome；并且给 input 留出内边距，避免它贴在上下分界线上和 header/tree 抢命中。
+    // Search region also fixed chrome; Input padding avoids hugging header/tree boundary seam.
     shell_ext.hit_roles = .{ .pointer = true, .scroll = true, .inspect = false };
     shell_ext.hit_behavior = .@"opaque";
     return shell;
 }
 
-/// 子树节点总数的快速估算（有上限截断，避免深递归）
+/// Quick estimate subtree node count (upper-clamped, avoid deep recursion)
 fn countSubtreeNodes(node: *Node, limit: u32) u32 {
     var count: u32 = 1;
     for (node.children.items) |child| {
@@ -2114,15 +2113,15 @@ fn countSubtreeNodes(node: *Node, limit: u32) u32 {
     return count;
 }
 
-/// 子节点数量超过此阈值时，DevTools 默认折叠（除非用户手动展开）
+/// Collapse subtree by default if child count exceeds this threshold (unless user manually expand)
 const auto_collapse_threshold: usize = 500;
-/// 树区域最大渲染行数上限，防止卡死
+/// Tree max render rows limit, prevent hang
 const max_visible_rows: u32 = 2000;
 const tree_row_height: f32 = 20;
 const tree_reveal_margin_top: f32 = 8;
 const tree_reveal_margin_bottom: f32 = 12;
 
-// ========== 扁平化树条目（VirtualList 数据源） ==========
+// ========== Flat tree entries (VirtualList data source) ==========
 
 const FlatTreeEntry = struct {
     node: *Node,
@@ -2131,7 +2130,7 @@ const FlatTreeEntry = struct {
     collapsed: bool,
 };
 
-/// 将 UI 树递归扁平化为索引数组（Elements 视图）
+/// Recursively flatten UI tree to index array (Elements view)
 fn flattenTreeElements(state: *DevToolsState, node: *Node, depth: u32, filter: []const u8) void {
     if (state.flat_rows.items.len >= max_visible_rows) return;
 
@@ -2143,7 +2142,7 @@ fn flattenTreeElements(state: *DevToolsState, node: *Node, depth: u32, filter: [
         return;
     }
 
-    // 过滤检查
+    // Filter check
     if (filter.len > 0) {
         if (!nodeMatchesFilter(node, filter)) {
             var any_child_match = false;
@@ -2165,12 +2164,12 @@ fn flattenTreeElements(state: *DevToolsState, node: *Node, depth: u32, filter: [
     else
         countSubtreeNodes(node, auto_collapse_threshold + 1);
     const auto_collapsed = has_children and subtree_size >= auto_collapse_threshold and !state.isExplicitlyExpanded(node.id);
-    // 有过滤串时不做折叠：能走到这里的节点要么自己匹配、要么子树里有匹配，
-    // 折叠会把用户正在搜的那一行藏起来，搜索就等于失效了。
+    // No collapse when filter: reaching here = self match or descendant match, collapse hides
+    // searched line, search fails.
     const collapsed = if (filter.len > 0) false else (state.isCollapsed(node.id) or auto_collapsed);
 
-    // 诊断路径：flat_rows 是元素树面板的显示行缓冲，每次 rebuildFlatRows 都
-    // clear 后整体重建。append 失败 = 这一帧树里少一行，下次重建自愈。
+    // Diagnostic: flat_rows is elements tree panel display buffer, clear then full rebuild each
+    // rebuildFlatRows. append fail = tree misses line this frame, next rebuild heals.
     _ = state.flat_rows.append(state.allocator, FlatTreeEntry{
         .node = node,
         .depth = depth,
@@ -2186,7 +2185,7 @@ fn flattenTreeElements(state: *DevToolsState, node: *Node, depth: u32, filter: [
     }
 }
 
-/// 将 UI 树递归扁平化（Components 视图）
+/// Recursively flatten UI tree (Components view)
 fn flattenTreeComponents(state: *DevToolsState, node: *Node, depth: u32, filter: []const u8) void {
     if (state.flat_rows.items.len >= max_visible_rows) return;
 
@@ -2206,7 +2205,7 @@ fn flattenTreeComponents(state: *DevToolsState, node: *Node, depth: u32, filter:
         const has_component_kids = hasComponentChildren(node);
         const collapsed = state.isCollapsed(node.id);
 
-        // 诊断路径：同 flattenTreeElements，每帧重建的显示行缓冲。
+        // Diagnostic: like flattenTreeElements, per-frame rebuild display buffer.
         _ = state.flat_rows.append(state.allocator, FlatTreeEntry{
             .node = node,
             .depth = depth,
@@ -2236,7 +2235,7 @@ fn flattenComponentChildren(state: *DevToolsState, node: *Node, depth: u32, filt
     }
 }
 
-/// 检查节点子树中是否有任何组件子节点
+/// Check subtree has any component children
 fn hasComponentChildren(node: *Node) bool {
     for (node.children.items) |child| {
         if (child.meta.ownership.meta.component_name != null) return true;
@@ -2245,7 +2244,7 @@ fn hasComponentChildren(node: *Node) bool {
     return false;
 }
 
-/// 查找节点子树中第一个文本内容
+/// Find first text content in node subtree
 fn findFirstText(node: *Node) ?[]const u8 {
     if (node.getText()) |t| {
         if (t.content.len > 0) return t.content;
@@ -2256,11 +2255,11 @@ fn findFirstText(node: *Node) ?[]const u8 {
     return null;
 }
 
-/// Components 视图的过滤匹配
+/// Components view filter match
 fn componentMatchesFilter(node: *Node, filter: []const u8) bool {
     if (filter.len == 0) return true;
 
-    // #id 过滤
+    // #id filter
     if (filter[0] == '#') {
         if (filter.len > 1) {
             const id_num = std.fmt.parseInt(u32, filter[1..], 10) catch return false;
@@ -2269,12 +2268,12 @@ fn componentMatchesFilter(node: *Node, filter: []const u8) bool {
         return false;
     }
 
-    // component_name 匹配
+    // component_name match
     if (node.meta.ownership.meta.component_name) |name| {
         if (containsIgnoreCase(name, filter)) return true;
     }
 
-    // 文本内容匹配
+    // Text content match
     const txt = findFirstText(node);
     if (txt) |t| {
         if (containsIgnoreCase(t, filter)) return true;
@@ -2283,7 +2282,7 @@ fn componentMatchesFilter(node: *Node, filter: []const u8) bool {
     return false;
 }
 
-/// 子树中是否有匹配过滤条件的组件
+/// Subtree has filter-matching component
 fn subtreeHasMatchingComponent(node: *Node, filter: []const u8) bool {
     for (node.children.items) |child| {
         if (child.meta.ownership.meta.component_name != null and componentMatchesFilter(child, filter)) return true;
@@ -2295,7 +2294,7 @@ fn subtreeHasMatchingComponent(node: *Node, filter: []const u8) bool {
 fn tagColor(tag: core.ElementTag, t: *const theme.ThemeTokens) Color {
     const is_dark = t.scheme == .dark;
     return switch (tag) {
-        // dark 模式用较亮色值，light 模式用较暗色值以确保在白色背景上可读
+        // Dark mode brighter value, light mode darker for white bg readability
         .box => if (is_dark) Color.hex(0x5a9fd4) else Color.hex(0x2E6FA0),
         .text => if (is_dark) Color.hex(0x7a9a70) else Color.hex(0x4A6F40),
         .image => if (is_dark) Color.hex(0x5aa0a0) else Color.hex(0x3A7575),
@@ -2303,49 +2302,52 @@ fn tagColor(tag: core.ElementTag, t: *const theme.ThemeTokens) Color {
         .input => if (is_dark) Color.hex(0xb080c0) else Color.hex(0x7A5090),
         .scroll => if (is_dark) Color.hex(0x80b0c0) else Color.hex(0x507888),
         .list => if (is_dark) Color.hex(0xa0a0c0) else Color.hex(0x606088),
-        .spacer => if (is_dark) Color.hex(0x505050) else Color.hex(0xAAAAAA),
+        .spacer, .anchor => if (is_dark) Color.hex(0x505050) else Color.hex(0xAAAAAA),
         .custom => if (is_dark) Color.hex(0xd08050) else Color.hex(0x9A5530),
     };
 }
 
-// ========== Details 面板 ==========
+// ========== Details panel ==========
 
 fn buildTabBar(cx: *Cx, state: *DevToolsState) !*Node {
     const t = cx.tokens;
     const tab_items = [_]TabItem{
-        .{ .id = "layout", .label_text = "Layout" },
-        .{ .id = "style", .label_text = "Style" },
-        .{ .id = "state", .label_text = "State" },
-        .{ .id = "events", .label_text = "Events" },
-        .{ .id = "render", .label_text = "Render" },
-        .{ .id = "trace", .label_text = "Trace" },
+        .{ .id = "layout", .label = "Layout" },
+        .{ .id = "style", .label = "Style" },
+        .{ .id = "state", .label = "State" },
+        .{ .id = "events", .label = "Events" },
+        .{ .id = "render", .label = "Render" },
+        .{ .id = "trace", .label = "Trace" },
     };
-    // shell 先建、Tabs 建好即 adopt，原来 Tabs 先建、shell 的 box 自身分配失败时
-    // tuple 里的 tabs 无人释放（mountPanel sweep 最后 3 个注入点）。指针挂稳后才发布。
+    // shell first, Tabs adopted post-build, prev Tabs first + shell box fail orphaned tabs in tuple
+    // (sweep last 3 sites). stable then publish.
     const shell = try core.box(cx, .{
         .direction = .row,
         .align_items = .center,
         .width = .{ .grow = .{} },
-        .background = t.color.bg_secondary,
+        .background = t.tokens.color.bg_secondary,
         .overflow_hidden = true,
     }, .{});
     errdefer cx.freeNode(shell);
     const tabs = try core.adoptChild(cx, cx.allocator, shell, try Tabs(.{
         .items = &tab_items,
-        .default_active_id = state.active_tab.idStr(),
+        .active = blk: {
+            const sig = try state.scope.?.createSignal(?[]const u8, state.active_tab.idStr());
+            state.details_tab = sig;
+            break :blk sig;
+        },
         .variant = .underline,
         .size = .xs,
-        .on_change = core.Cx.strHandlerFrom(DevToolsState, state, onDetailsTabChange),
+        .on_change = cx.on(DevToolsState, state, onDetailsTabChange),
     }).mount(state.scope.?, cx));
     tabs.style.width = .{ .grow = .{} };
     tabs.style.height = .{ .fit = .{} };
-    // 程序化换 tab（setActiveTab）时要能把下划线同步回组件（见
-    // syncDetailsTabs），view-mode tabs 有同款 sync 路径，这里补齐。
+    // Programmatic tab switch (setActiveTab) needs sync underline to component (see
+    // syncDetailsTabs), view-mode tabs have matching sync, round it out here.
     state.details_tabs_node = tabs;
-    state.details_tabs_state = tabsStateFromNode(tabs);
     shell.meta.ownership.meta.test_id = "devtools.details.tabs";
     const shell_ext = try shell.style.ensureExtFallible(cx.allocator);
-    // Details tabs 顶栏不应把滚动漏给下方详情滚动区。
+    // Details tabs top-bar doesn't pass scroll to details scroll area below.
     shell_ext.hit_roles = .{ .pointer = true, .scroll = true, .inspect = false };
     shell_ext.hit_behavior = .@"opaque";
     return shell;
@@ -2356,7 +2358,7 @@ fn buildTabBar(cx: *Cx, state: *DevToolsState) !*Node {
 fn buildLayoutTab(cx: *Cx, state: *DevToolsState, node: *Node, parent: *Node) !void {
     const rect = computeRenderRect(node);
 
-    // Section: 基本信息
+    // Section: Basic info
     try parent.appendChild(cx.allocator, try sectionTitle(cx, "Element"));
     try parent.appendChild(cx.allocator, try kvRow(cx, "tag", @tagName(node.tag)));
     try parent.appendChild(cx.allocator, try kvRowInt(cx, "id", @intCast(node.id)));
@@ -2370,10 +2372,10 @@ fn buildLayoutTab(cx: *Cx, state: *DevToolsState, node: *Node, parent: *Node) !v
         }
     }
 
-    // Box Model 可视化
+    // Box Model visualization
     try box_model.build(cx, node, parent);
 
-    // Section: 位置/尺寸
+    // Section: Position / Size
     try parent.appendChild(cx.allocator, try sectionTitle(cx, "Computed Rect"));
     // Render diagnostics as floats instead of converting untrusted layout data
     // to i64. NaN/Inf and very large transforms must never trap devtools.
@@ -2389,7 +2391,7 @@ fn buildLayoutTab(cx: *Cx, state: *DevToolsState, node: *Node, parent: *Node) !v
     try parent.appendChild(cx.allocator, try styleKvRow(cx, state, node, .width, "width", dv_fmt.formatSizing(&w_buf, node.style.width)));
     try parent.appendChild(cx.allocator, try styleKvRow(cx, state, node, .height, "height", dv_fmt.formatSizing(&h_buf, node.style.height)));
 
-    // Section: Flexbox（数值属性可点击编辑）
+    // Section: Flexbox (numeric properties clickable edit)
     try parent.appendChild(cx.allocator, try sectionTitle(cx, "Flexbox"));
     try parent.appendChild(cx.allocator, try styleKvRow(cx, state, node, .direction, "direction", @tagName(node.style.direction)));
     try parent.appendChild(cx.allocator, try styleKvRow(cx, state, node, .justify, "justify", @tagName(node.style.justify)));
@@ -2418,7 +2420,7 @@ fn buildLayoutTab(cx: *Cx, state: *DevToolsState, node: *Node, parent: *Node) !v
         try parent.appendChild(cx.allocator, try styleKvRowInt(cx, state, node, .z_index, "z_index", node.style.z_index()));
     }
 
-    // Transform（可编辑）
+    // Transform (editable)
     try parent.appendChild(cx.allocator, try sectionTitle(cx, "Transform"));
     try editableKvRow(cx, state, node, .translate_x, parent);
     try editableKvRow(cx, state, node, .translate_y, parent);
@@ -2456,16 +2458,16 @@ fn appendInspectPickToggle(cx: *Cx, state: *DevToolsState, node: *Node, parent: 
     });
     try row.appendChild(cx.allocator, try core.text(cx, "mouse_pick", .{
         .font_size = 10,
-        .color = cx.tokens.color.fg_secondary,
+        .color = cx.tokens.tokens.color.fg_secondary,
     }));
 
     const btn = try Button(.{
         .label = if (node.frame_state.state_bits.flags.inspect_pick_disabled) "Allow pick" else "Exclude from pick",
-        .variant = if (node.frame_state.state_bits.flags.inspect_pick_disabled) .secondary else .ghost,
+        .variant = @as(button_mod.ButtonVariant, if (node.frame_state.state_bits.flags.inspect_pick_disabled) .secondary else .ghost),
         .size = .xs,
         .on_event = inspectPickToggleEvent,
         .event_context = ctx,
-        .style = .{ .border = .{ .width = 1, .color = cx.tokens.color.border, .radius = 3 } },
+        .base_style = .{ .border = .{ .width = 1, .color = cx.tokens.tokens.color.border, .radius = 3 } },
     }).mount(details_scope, cx);
     try row.appendChild(cx.allocator, btn);
     try parent.appendChild(cx.allocator, row);
@@ -2499,16 +2501,16 @@ fn buildStyleTab(cx: *Cx, state: *DevToolsState, node: *Node, parent: *Node) !vo
     try parent.appendChild(cx.allocator, try sectionTitle(cx, "Background"));
     try parent.appendChild(cx.allocator, try styleColorRow(cx, state, node, .background, "color", node.getBackground()));
 
-    // Opacity（可编辑）
+    // Opacity (editable)
     try editableKvRow(cx, state, node, .opacity, parent);
 
-    // Border（可编辑数值）
+    // Border (editable numbers)
     try parent.appendChild(cx.allocator, try sectionTitle(cx, "Border"));
     try editableKvRow(cx, state, node, .border_width, parent);
     try parent.appendChild(cx.allocator, try styleColorRow(cx, state, node, .border, "color", node.style.border.color));
     try editableKvRow(cx, state, node, .border_radius, parent);
 
-    // Corner Radius (高级)
+    // Corner Radius (advanced)
     if (node.style.corner_radius()) |cr| {
         switch (cr) {
             .all => |v| {
@@ -2577,8 +2579,8 @@ fn buildStateTab(cx: *Cx, target: *Cx, state: *DevToolsState, node: *Node, paren
     defer scoped_state_ptrs.deinit(state.frameAlloc());
     var source_by_ptr = std.AutoHashMap(usize, u32).init(state.frameAlloc());
     defer source_by_ptr.deinit();
-    // 诊断路径：这两个都是 frame arena 上的临时采集表，只用于本帧列出 State
-    // 面板的行。丢一条 = 少显示一个 state 条目，不影响被调试 app。
+    // Diagnostic: both are frame arena temp collection tables, only display State panel rows. lose
+    // one = show one fewer state entry, no debugged app impact.
     for (scoped_state_refs.items) |r| {
         _ = scoped_state_ptrs.append(state.frameAlloc(), r.ptr) catch {};
         _ = source_by_ptr.put(@intFromPtr(r.ptr), r.source_node_id) catch {};
@@ -2596,7 +2598,7 @@ fn buildStateTab(cx: *Cx, target: *Cx, state: *DevToolsState, node: *Node, paren
         }) catch {};
     }
 
-    // 标题 + 复制
+    // Title + copy
     const state_head = try cx.createNode(.box, .{
         .direction = .row,
         .align_items = .center,
@@ -2610,7 +2612,7 @@ fn buildStateTab(cx: *Cx, target: *Cx, state: *DevToolsState, node: *Node, paren
     const title_text = scopeOwnedText(details_scope, title);
     const title_node = try core.text(cx, title_text, .{
         .font_size = 10,
-        .color = t.color.accent,
+        .color = t.tokens.color.accent,
         .font_weight = 600,
     });
     title_node.meta.ownership.meta.test_id = "devtools.state.subject";
@@ -2620,9 +2622,9 @@ fn buildStateTab(cx: *Cx, target: *Cx, state: *DevToolsState, node: *Node, paren
     var all_writer = std.Io.Writer.fixed(&all_buf);
     const all_w = &all_writer;
 
-    // 诊断路径：all_w 是 12KB **定长栈缓冲**上的 writer，这里的 catch {} 吞的是
-    // NoSpaceLeft 而非 OOM。超长时"复制全部 state"的文本被截断显示，
-    // 这正是想要的降级（而不是让面板炸掉）。下面同组 print/writeAll 同理。
+    // Diagnostic: all_w is 12KB **fixed stack buffer** writer, catch {} swallows NoSpaceLeft not
+    // OOM. Too long "copy all state" text truncates display, exactly wanted fallback (not crash
+    // panel). Print/writeAll below same.
     _ = all_w.print("node={s}#{d}\n", .{ subject_name, node.id }) catch {};
     _ = all_w.print("owning_component={s}#{d}\n", .{ component_name, component_root.id }) catch {};
     if (scoped_signals.items.len > 0) {
@@ -2651,7 +2653,7 @@ fn buildStateTab(cx: *Cx, target: *Cx, state: *DevToolsState, node: *Node, paren
         .label = "COPY ALL",
         .variant = .ghost,
         .size = .xs,
-        .style = .{ .border = .{ .width = 1, .color = t.color.accent, .radius = 3 } },
+        .base_style = .{ .border = .{ .width = 1, .color = t.tokens.color.accent, .radius = 3 } },
     }).mount(details_scope, cx);
     copy_all_btn.behavior.events.on_click = core.Cx.simpleHandler(copyStateClick, @ptrCast(copy_all_ctx_ptr));
     try state_head.appendChild(cx.allocator, copy_all_btn);
@@ -2766,7 +2768,7 @@ fn buildEventsTab(cx: *Cx, target: *Cx, node: *Node, parent: *Node) !void {
 
 fn eventRow(cx: *Cx, name: []const u8, type_info: []const u8) !*Node {
     const t = cx.tokens;
-    const s = theme_schema.window(t);
+    const s = devtools_styles.palette(t);
     const row = try cx.createNode(.box, .{
         .direction = .row,
         .gap = 8,
@@ -2775,7 +2777,7 @@ fn eventRow(cx: *Cx, name: []const u8, type_info: []const u8) !*Node {
     });
     try row.appendChild(cx.allocator, try core.text(cx, name, .{
         .font_size = 10,
-        .color = s.devtools_event_name,
+        .color = s.event_name,
     }));
     try row.appendChild(cx.allocator, try inlineText(cx, type_info, devtoolsMuted(t), 10));
     return row;
@@ -2899,10 +2901,10 @@ fn buildRenderTab(cx: *Cx, target: *Cx, node: *Node, parent: *Node) !void {
         }) catch "";
 
         const reason_color = switch (rec.reason) {
-            .layout_triggered, .sizing_triggered => t.color.warning,
-            .explicit, .mount => t.color.accent,
+            .layout_triggered, .sizing_triggered => t.tokens.color.warning,
+            .explicit, .mount => t.tokens.color.accent,
             .transition_tick => devtoolsMuted(t),
-            else => t.color.fg_primary,
+            else => t.tokens.color.fg_primary,
         };
 
         try parent.appendChild(cx.allocator, try core.text(cx, line, .{
@@ -2974,7 +2976,7 @@ fn buildRenderTab(cx: *Cx, target: *Cx, node: *Node, parent: *Node) !void {
 fn buildTraceTab(cx: *Cx, target: *Cx, state: *DevToolsState, parent: *Node) !void {
     const t = cx.tokens;
 
-    // 顶栏: Pause/Resume + Clear 按钮
+    // Top bar: Pause/Resume + Clear buttons
     const toolbar = try core.box(cx, .{
         .direction = .row,
         .align_items = .center,
@@ -2985,7 +2987,7 @@ fn buildTraceTab(cx: *Cx, target: *Cx, state: *DevToolsState, parent: *Node) !vo
 
     const store = target.inspector.trace_store;
 
-    // Pause/Resume 按钮 -> Button 组件
+    // Pause/Resume button -> Button component
     {
         const is_paused = if (store) |s| s.paused else false;
         const pause_ctx = try state.frameAlloc().create(TracePauseCtx);
@@ -2993,7 +2995,7 @@ fn buildTraceTab(cx: *Cx, target: *Cx, state: *DevToolsState, parent: *Node) !vo
         const details_scope = state.details_scope orelse state.scope.?;
         const pause_btn = try Button(.{
             .label = if (is_paused) "Resume" else "Pause",
-            .variant = if (is_paused) .secondary else .ghost,
+            .variant = @as(button_mod.ButtonVariant, if (is_paused) .secondary else .ghost),
             .size = .xs,
             .on_event = tracePauseEvent,
             .event_context = pause_ctx,
@@ -3001,7 +3003,7 @@ fn buildTraceTab(cx: *Cx, target: *Cx, state: *DevToolsState, parent: *Node) !vo
         try toolbar.appendChild(cx.allocator, pause_btn);
     }
 
-    // Clear 按钮 -> Button 组件
+    // Clear button -> Button component
     {
         const clear_ctx = try state.frameAlloc().create(TraceClearCtx);
         clear_ctx.* = .{ .state = state };
@@ -3018,7 +3020,7 @@ fn buildTraceTab(cx: *Cx, target: *Cx, state: *DevToolsState, parent: *Node) !vo
 
     try parent.appendChild(cx.allocator, toolbar);
 
-    // 事件列表
+    // Event list
     if (store == null) {
         try parent.appendChild(cx.allocator, try core.text(cx, "No trace store active.", .{
             .font_size = 10,
@@ -3052,17 +3054,17 @@ fn buildTraceTab(cx: *Cx, target: *Cx, state: *DevToolsState, parent: *Node) !vo
             @tagName(rec.result),
         }) catch "";
 
-        // phase 颜色：capture=灰, target=蓝, bubble=绿
+        // phase color: capture=gray, target=blue, bubble=green
         const phase_color = switch (rec.phase) {
             .capture => devtoolsMuted(t),
-            .target => t.color.accent,
-            .bubble => t.color.success,
+            .target => t.tokens.color.accent,
+            .bubble => t.tokens.color.success,
         };
 
-        // result 颜色修正：stop=红
-        const line_color = if (rec.result == .stop) t.color.danger else phase_color;
+        // result color correct: stop=red
+        const line_color = if (rec.result == .stop) t.tokens.color.danger else phase_color;
 
-        // 高亮选中节点相关行
+        // Highlight selected-node related rows
         const is_related = selected_id != null and
             (rec.target_node_id == selected_id.? or rec.handler_node_id == selected_id.?);
 
@@ -3071,15 +3073,16 @@ fn buildTraceTab(cx: *Cx, target: *Cx, state: *DevToolsState, parent: *Node) !vo
             .align_items = .center,
             .height = .{ .px = 16 },
             .padding = Padding.symmetric(0, 4),
-            .background = if (is_related) t.color.bg_hover else Color.TRANSPARENT,
+            .background = if (is_related) t.tokens.color.bg_hover else Color.TRANSPARENT,
         }, .{
             try core.text(cx, line, .{ .font_size = 10, .color = line_color }),
         });
-        // row 建好之后 frameAlloc().create 还可能失败，门控 errdefer 守窗口，adopt 挂接。
+        // row post-build frameAlloc().create may still fail, gate errdefer guards window, adopt
+        // hooks.
         var row_owned = true;
         errdefer if (row_owned) cx.freeNode(row);
 
-        // 点击跳转到 handler 节点
+        // Click jump to handler node
         const trace_click_ctx = try state.frameAlloc().create(TraceClickCtx);
         trace_click_ctx.* = .{ .state = state, .node_id = rec.handler_node_id };
         row.behavior.events.on_event = traceClickEvent;
@@ -3094,9 +3097,9 @@ const TracePauseCtx = struct {
     state: *DevToolsState,
 };
 
-/// Trace 工具栏按钮点击发生在 DevTools 窗口，不推进 target 的 frame_count，
-/// 而 Trace 内容默认只在 target 出帧时重建，不在这里显式标脏的话，
-/// Pause 按钮文字不翻转、Clear 后列表残留，要等 target 恰好渲染才更新。
+/// Trace toolbar button click in DevTools window, doesn't advance target frame_count, but Trace
+/// content rebuilds only on target frame (not here explicit dirty), Pause text won't flip, Clear
+/// leaves list residue, waits target chance frame.
 fn markTraceDetailsDirty(state: *DevToolsState) void {
     state.details_dirty = true;
     if (state.cx) |c| c.needs_redraw = true;
@@ -3153,7 +3156,7 @@ fn traceClickEvent(event: Event, context: ?*anyopaque) EventResult {
     return .handled;
 }
 
-// ========== UI 辅助函数 ==========
+// ========== UI helper functions ==========
 
 fn sectionTitle(cx: *Cx, title: []const u8) !*Node {
     const t = cx.tokens;
@@ -3165,7 +3168,7 @@ fn sectionTitle(cx: *Cx, title: []const u8) !*Node {
     }, .{
         try core.text(cx, title, .{
             .font_size = 10,
-            .color = t.color.accent,
+            .color = t.tokens.color.accent,
             .font_weight = 600,
         }),
     });
@@ -3173,7 +3176,7 @@ fn sectionTitle(cx: *Cx, title: []const u8) !*Node {
 
 fn stateRow(cx: *Cx, state: *DevToolsState, scoped: ScopedStateEntry) !*Node {
     const t = cx.tokens;
-    const s = theme_schema.window(t);
+    const s = devtools_styles.palette(t);
     const details_scope = state.details_scope orelse state.scope.?;
     var row = try cx.createNode(.box, .{
         .direction = .column,
@@ -3181,12 +3184,12 @@ fn stateRow(cx: *Cx, state: *DevToolsState, scoped: ScopedStateEntry) !*Node {
         .height = .{ .fit = .{} },
         .padding = Padding{ .top = 4, .bottom = 4, .left = 6, .right = 6 },
         .width = .{ .grow = .{} },
-        .border = .{ .radius = 4, .width = 1, .color = t.color.border },
+        .border = .{ .radius = 4, .width = 1, .color = t.tokens.color.border },
     });
     cx.linkNodeToWorld(row);
-    row.setBackgroundRaw(s.devtools_state_card_bg);
+    row.setBackgroundRaw(s.state_card_bg);
 
-    // ID + 类型名在同一行
+    // ID + type name same line
     var id_buf: [20]u8 = undefined;
     const id_str = std.fmt.bufPrint(&id_buf, "0x{x}", .{scoped.entry.id}) catch "0x0";
     const owned_id_str = scopeOwnedText(details_scope, id_str);
@@ -3207,7 +3210,7 @@ fn stateRow(cx: *Cx, state: *DevToolsState, scoped: ScopedStateEntry) !*Node {
     });
     try head_row.appendChild(cx.allocator, try core.text(cx, scoped.entry.type_name, .{
         .font_size = 10,
-        .color = t.color.fg_primary,
+        .color = t.tokens.color.fg_primary,
     }));
     try head_row.appendChild(cx.allocator, try inlineText(cx, owned_id_str, devtoolsMuted(t), 9));
     try head_row.appendChild(cx.allocator, try inlineText(cx, owned_inst_str, devtoolsMuted(t), 9));
@@ -3231,7 +3234,7 @@ fn stateRow(cx: *Cx, state: *DevToolsState, scoped: ScopedStateEntry) !*Node {
         .label = "COPY",
         .variant = .ghost,
         .size = .xs,
-        .style = .{ .border = .{ .width = 1, .color = t.color.accent, .radius = 3 } },
+        .base_style = .{ .border = .{ .width = 1, .color = t.tokens.color.accent, .radius = 3 } },
     }).mount(details_scope, cx);
     copy_btn.behavior.events.on_click = core.Cx.simpleHandler(copyStateClick, @ptrCast(copy_ctx_ptr));
     try head_row.appendChild(cx.allocator, copy_btn);
@@ -3241,7 +3244,7 @@ fn stateRow(cx: *Cx, state: *DevToolsState, scoped: ScopedStateEntry) !*Node {
     const wrap_cols: usize = 82;
     var it = std.mem.splitScalar(u8, pretty, '\n');
     while (it.next()) |line| {
-        const trimmed = std.mem.trimRight(u8, line, " \t\r");
+        const trimmed = std.mem.trimEnd(u8, line, " \t\r");
         if (trimmed.len == 0) continue;
         var start: usize = 0;
         while (start < trimmed.len) {
@@ -3249,7 +3252,7 @@ fn stateRow(cx: *Cx, state: *DevToolsState, scoped: ScopedStateEntry) !*Node {
             const seg = trimmed[start..end];
             try row.appendChild(cx.allocator, try core.text(cx, scopeOwnedText(details_scope, seg), .{
                 .font_size = 10,
-                .color = t.color.fg_secondary,
+                .color = t.tokens.color.fg_secondary,
             }));
             start = end;
         }
@@ -3275,8 +3278,8 @@ fn collectNodeDebugRefs(node: *Node, state_refs: *std.ArrayList(ScopedStateRef),
     }
 }
 
-/// 诊断路径：本函数与 appendUniqueSignal 都往 frame arena 的去重采集表里加一条，
-/// 供 State 面板列出。append 失败 = 少列一个 state/signal，不影响被调试 app。
+/// Diagnostic: this function + appendUniqueSignal both append frame arena dedup collection for
+/// State panel list. fail = show one fewer state/signal, no debugged app impact.
 fn appendUniqueStateRef(list: *std.ArrayList(ScopedStateRef), alloc: std.mem.Allocator, ptr: *anyopaque, source_node_id: u32) void {
     for (list.items) |e| {
         if (e.ptr == ptr) return;
@@ -3302,9 +3305,10 @@ fn signalValueText(sig: core.DebugSignalRef) []const u8 {
     return "<opaque>";
 }
 
-/// 诊断路径：把 state 的原始值排版成带缩进的多行文本，写进调用方给的**定长**
-/// 缓冲 `out`。函数内所有 `catch {}` 吞的都是 NoSpaceLeft：缓冲写满即停止，
-/// 返回已写部分，面板显示一段被截断的值，正是期望的降级行为。
+/// Diagnostic: pretty-print state raw value into multi-line indented text, write into caller
+/// **fixed** buffer `out`.
+/// All catch {} inside swallow NoSpaceLeft: buffer full stop, return written part, panel shows
+/// truncated value, exactly wanted fallback.
 fn prettyStateValueInto(out: []u8, raw: []const u8) []const u8 {
     if (raw.len == 0) return raw;
     if (out.len == 0) return out[0..0];
@@ -3362,8 +3366,8 @@ fn prettyStateValueInto(out: []u8, raw: []const u8) []const u8 {
     return writer.buffered();
 }
 
-/// 诊断路径：只给 prettyStateValueInto 写缩进空格，写的是定长缓冲，
-/// 吞的是 NoSpaceLeft，缓冲满了就不再缩进，显示截断即可。
+/// Diagnostic: only write indent spaces for prettyStateValueInto, fixed buffer writer, swallow
+/// NoSpaceLeft, buffer full skip indent, show truncated OK.
 fn writeIndent(writer: anytype, depth: usize) void {
     var i: usize = 0;
     while (i < depth) : (i += 1) {
@@ -3435,29 +3439,29 @@ fn colorRow(cx: *Cx, label: []const u8, color: Color) !*Node {
         .height = .{ .px = 18 },
     });
 
-    // 标签
+    // Label
     try row.appendChild(cx.allocator, try core.text(cx, label, .{
         .font_size = 10,
-        .color = t.color.fg_secondary,
+        .color = t.tokens.color.fg_secondary,
     }));
 
-    // 色块预览
+    // Color swatch preview
     const swatch = try cx.createNode(.box, .{
         .width = .{ .px = 12 },
         .height = .{ .px = 12 },
-        .border = .{ .radius = 2, .width = 1, .color = t.color.border },
+        .border = .{ .radius = 2, .width = 1, .color = t.tokens.color.border },
     });
     cx.linkNodeToWorld(swatch);
     swatch.setBackgroundRaw(color);
     try row.appendChild(cx.allocator, swatch);
 
-    // RGBA 值
+    // RGBA value
     var color_buf: [32]u8 = undefined;
     const color_str = if (color.a == 255)
         std.fmt.bufPrint(&color_buf, "#{x:0>2}{x:0>2}{x:0>2}", .{ color.r, color.g, color.b }) catch ""
     else
         std.fmt.bufPrint(&color_buf, "rgba({d},{d},{d},{d})", .{ color.r, color.g, color.b, color.a }) catch "";
-    try row.appendChild(cx.allocator, try inlineText(cx, color_str, t.color.fg_primary, 10));
+    try row.appendChild(cx.allocator, try inlineText(cx, color_str, t.tokens.color.fg_primary, 10));
 
     return row;
 }
@@ -3478,9 +3482,9 @@ fn kvRow(cx: *Cx, label: []const u8, value: []const u8) !*Node {
     });
     try row.appendChild(cx.allocator, try core.text(cx, label, .{
         .font_size = 10,
-        .color = t.color.fg_secondary,
+        .color = t.tokens.color.fg_secondary,
     }));
-    try row.appendChild(cx.allocator, try inlineText(cx, value, t.color.fg_primary, 10));
+    try row.appendChild(cx.allocator, try inlineText(cx, value, t.tokens.color.fg_primary, 10));
     return row;
 }
 
@@ -3519,12 +3523,12 @@ fn setTextContent(allocator: std.mem.Allocator, t: *core.TextProps, src: []const
     try t.setContent(allocator, src);
 }
 
-// ========== 搜索/过滤 ==========
+// ========== Search / filter ==========
 
 fn nodeMatchesFilter(node: *Node, filter: []const u8) bool {
     if (filter.len == 0) return true;
 
-    // #id 过滤
+    // #id filter
     if (filter[0] == '#') {
         if (filter.len > 1) {
             const id_num = std.fmt.parseInt(u32, filter[1..], 10) catch return false;
@@ -3533,16 +3537,16 @@ fn nodeMatchesFilter(node: *Node, filter: []const u8) bool {
         return false;
     }
 
-    // tag 名匹配
+    // tag name match
     const tag_name = @tagName(node.tag);
     if (containsIgnoreCase(tag_name, filter)) return true;
 
-    // component_name 匹配
+    // component_name match
     if (node.meta.ownership.meta.component_name) |name| {
         if (containsIgnoreCase(name, filter)) return true;
     }
 
-    // 文本内容匹配
+    // text content match
     if (node.getText()) |t| {
         if (t.content.len > 0 and containsIgnoreCase(t.content, filter)) return true;
     }
@@ -3551,7 +3555,7 @@ fn nodeMatchesFilter(node: *Node, filter: []const u8) bool {
 }
 
 fn subtreeMatchesFilter(node: *Node, filter: []const u8, depth: u32) bool {
-    // 限制搜索深度，避免在大子树中深递归
+    // Limit search depth, avoid deep recursion in large subtree
     const max_filter_depth = 512;
     if (depth >= max_filter_depth) return false;
     if (nodeMatchesFilter(node, filter)) return true;
@@ -3582,7 +3586,7 @@ fn toLower(c: u8) u8 {
     return if (c >= 'A' and c <= 'Z') c + 32 else c;
 }
 
-// ========== 树统计 ==========
+// ========== Tree stats ==========
 
 const TreeStats = struct {
     total_nodes: u32 = 0,
@@ -3609,9 +3613,9 @@ fn collectTreeStats(node: *Node, depth: u32, stats: *TreeStats) void {
     }
 }
 
-// ========== 节点选中同步（保留模式） ==========
+// ========== Node selection sync (retain mode) ==========
 
-/// 保留模式：检测 selected_node_id 变化，展开祖先并标记 tree_dirty + 待滚动
+/// Retain mode: detect selected_node_id change, expand ancestors mark tree_dirty + scroll pending
 fn syncTreeSelection(state: *DevToolsState, target: *Cx) void {
     const selected = target.inspector.selected_node_id;
     if (state.last_target_selected_id == selected) return;
@@ -3625,7 +3629,7 @@ fn syncTreeSelection(state: *DevToolsState, target: *Cx) void {
 
     const selected_id = selected orelse return;
 
-    // 展开祖先链（确保选中节点在 flat_rows 中可见）
+    // Expand ancestor chain (ensure selected visible in flat_rows)
     if (target.root) |root| {
         if (findNodeById(root, selected_id)) |node| {
             revealInspectableAncestors(state, node);
@@ -3638,7 +3642,7 @@ fn syncTreeSelection(state: *DevToolsState, target: *Cx) void {
     state.details_dirty = true;
 }
 
-/// 保留模式：在 rebuildFlatRows 之后，查找目标行并滚动 VirtualList
+/// Retain mode: after rebuildFlatRows, find target row scroll VirtualList
 fn applyTreeAutoScroll(state: *DevToolsState) void {
     if (!state.tree_auto_scroll_pending) return;
     const target_id = state.tree_auto_scroll_id orelse {
@@ -3646,7 +3650,7 @@ fn applyTreeAutoScroll(state: *DevToolsState) void {
         return;
     };
 
-    // 在 flat_rows 中查找目标节点的行索引
+    // Find target node row index in flat_rows
     for (state.flat_rows.items, 0..) |entry, idx| {
         if (entry.node.id == target_id) {
             if (state.vl_state) |vl| {
@@ -3660,8 +3664,8 @@ fn applyTreeAutoScroll(state: *DevToolsState) void {
     state.tree_auto_scroll_id = null;
 }
 
-/// 诊断路径：把被选中节点的祖先链标成"展开"，好让它在树里可见。
-/// put 失败 = 某一层没自动展开，用户手点一下即可，纯 UI 观感。
+/// Diagnostic: mark selected node ancestors "expand" so visible in tree.
+/// put fail = one level didn't auto-expand, user manual click works, pure UX.
 fn revealInspectableAncestors(state: *DevToolsState, node: *Node) void {
     var cur = node.parent;
     while (cur) |n| : (cur = n.parent) {
@@ -3683,9 +3687,9 @@ fn findNodeById(node: *Node, id: u32) ?*Node {
     return null;
 }
 
-// ========== 行为/状态 ==========
+// ========== Behavior / state ==========
 
-// ========== Splitter 垂直分割线 ==========
+// ========== Splitter vertical divider ==========
 
 const SPLITTER_HIT_WIDTH: f32 = 6;
 const SPLITTER_GUIDE_THICKNESS: f32 = 2;
@@ -3696,10 +3700,10 @@ const MAX_LEFT_PANEL: f32 = 600;
 fn mountDevtoolsSplitter(cx: *Cx, state: *DevToolsState) !*Node {
     const allocator = cx.allocator;
     const t = cx.tokens;
-    const guide_color = t.color.accent;
+    const guide_color = t.tokens.color.accent;
     const guide_transparent = Color.rgba(guide_color.r, guide_color.g, guide_color.b, 0);
 
-    // 热区
+    // Hotzone
     const splitter = try core.box(cx, .{
         .width = .{ .px = SPLITTER_HIT_WIDTH },
         .height = .{ .grow = .{} },
@@ -3708,13 +3712,13 @@ fn mountDevtoolsSplitter(cx: *Cx, state: *DevToolsState) !*Node {
         .cursor = .ew_resize,
     }, .{});
     splitter.style.cursor = .ew_resize;
-    // line 及其子节点还没建好，splitter 自身也要守；state 指针在整棵装配成功后才发布
+    // Until child nodes are built, splitter must be guarded; state pointer published only after
+    // assembly completes
     errdefer cx.freeNode(splitter);
 
-    // 视觉线 (上渐变 + 实线 + 下渐变)
-    // 原来四个节点全部建完、`state.splitter_line_node = line` 先发布，最后才逐个 append,
-    // 中间任一步失败四个节点全漏，state 里还留着指向游离节点的指针。改成每个子节点建好即 adopt
-    // 进 line、line 挂稳 splitter 之后才发布；line 自身用门控 errdefer 守到 adopt 前。
+    // Visual line (top gradient + solid line + bottom gradient) with guarded adoption:
+    // each child adopted into line immediately after creation; line mounted to splitter before
+    // state is published.
     const line = try core.box(cx, .{
         .width = .{ .px = SPLITTER_GUIDE_THICKNESS },
         .height = .{ .grow = .{} },
@@ -3751,7 +3755,7 @@ fn mountDevtoolsSplitter(cx: *Cx, state: *DevToolsState) !*Node {
     state.splitter_node = splitter;
     state.splitter_line_node = line;
 
-    // 绑定事件
+    // Bind event handlers
     splitter.behavior.events.on_event = devtoolsSplitterEvent;
     splitter.behavior.events.event_context = @ptrCast(state);
 
@@ -3776,9 +3780,9 @@ fn devtoolsSplitterEvent(event: Event, context: ?*anyopaque) EventResult {
                     }
                 }.lost;
                 cx.setPointerCapture(sn);
-                // 本文件头部的策略：DevTools 不该杀掉被调试的 app。
-                // 拖 splitter 拿不到 ew_resize 光标是纯观感降级，
-                // splitter_dragging 状态不受影响。
+                // Policy: DevTools must not kill the debugged app.
+                // Dragging splitter without ew_resize cursor is visual regression only.
+                // splitter_dragging state unaffected.
                 _ = cx.acquireCursor(sn, .ew_resize) catch {};
             }
             updateSplitterVisual(state, true);
@@ -3871,7 +3875,7 @@ fn rowEvent(event: Event, context: ?*anyopaque) EventResult {
                 defer alloc.free(l.file);
                 // A failed launch (no editor on PATH) is not worth disrupting
                 // the inspector over, the button simply appears to do nothing.
-                source_link.open(alloc, l) catch {};
+                source_link.open(alloc, cx.io, l) catch {};
             }
             return .stop;
         },
@@ -3879,12 +3883,12 @@ fn rowEvent(event: Event, context: ?*anyopaque) EventResult {
 }
 
 fn onDetailsTabChange(state: *DevToolsState, tab_id: []const u8) void {
-    const tab: ?DetailsTab = inline for (std.meta.fields(DetailsTab)) |f| {
-        if (std.mem.eql(u8, tab_id, f.name)) break @enumFromInt(f.value);
+    const tab: ?DetailsTab = inline for (@import("zenit_reflection").fields(DetailsTab)) |f| {
+        if (std.mem.eql(u8, tab_id, f.name)) break @fromBackingInt(@intCast(f.value));
     } else null;
     if (tab) |t| {
         state.active_tab = t;
-        // 离开 Style tab 的编辑态：编辑退出点之一（另一个是选中节点变化）。
+        // Exit Style tab edit mode: one of two edit exit points (other is selection change).
         clearEditingState(state);
         state.details_dirty = true;
         syncDetailsTabs(state);
@@ -3892,22 +3896,10 @@ fn onDetailsTabChange(state: *DevToolsState, tab_id: []const u8) void {
     }
 }
 
-/// 把 state.active_tab 同步回 details Tabs 组件（下划线位置）。
-/// 用户点击 tab 时组件自身已更新（no-op）；程序化 setActiveTab 时靠这里。
+/// Sync state.active_tab back to details Tabs component (underline position).
+/// User clicks update component (no-op); programmatic setActiveTab depends on this.
 fn syncDetailsTabs(state: *DevToolsState) void {
-    const tabs_state = state.details_tabs_state orelse return;
-    const target_index: usize = @intFromEnum(state.active_tab);
-    if (tabs_state.active_index == target_index) return;
-    tabs_state.active_index = target_index;
-    if (state.details_tabs_node) |tabs_node| {
-        if (tabs_node.children.items.len > 0) {
-            const tab_row = tabs_node.children.items[0];
-            if (tab_row.meta.per_frame.hooks.before_render.main) |before_render| {
-                before_render(tab_row);
-            }
-        }
-        tabs_node.markRenderDirty();
-    }
+    if (state.details_tab) |sig| sig.set(state.active_tab.idStr());
 }
 
 const PickModeCtx = struct {
@@ -3925,20 +3917,20 @@ fn pickModeEvent(event: Event, context: ?*anyopaque) EventResult {
     // toggle pick mode
     target.inspector.pick_mode = !target.inspector.pick_mode;
     if (target.inspector.pick_mode) {
-        // pick 模式需要 enabled 才能渲染 overlay 和处理 hover/click
+        // Pick mode requires enabled to render overlay and handle hover/click
         target.inspector.enabled = true;
     } else {
         target.inspector.hover_node_id = null;
-        // 高亮画在 target 窗口里，必须让 target 重绘一帧来消掉,
-        // 否则退出 pick 后最后的 hover 高亮冻结在 target 上。
+        // Highlight drawn in target window; force target redraw to clear last hover highlight on
+        // pick exit.
         target.needs_redraw = true;
     }
     return .handled;
 }
 
 fn applyViewModeById(state: *DevToolsState, mode_id: []const u8) void {
-    const mode: ?ViewMode = inline for (std.meta.fields(ViewMode)) |f| {
-        if (std.mem.eql(u8, mode_id, f.name)) break @enumFromInt(f.value);
+    const mode: ?ViewMode = inline for (@import("zenit_reflection").fields(ViewMode)) |f| {
+        if (std.mem.eql(u8, mode_id, f.name)) break @fromBackingInt(@intCast(f.value));
     } else null;
     if (mode) |m| {
         applyViewMode(state, m);
@@ -3963,38 +3955,8 @@ fn viewModeId(mode: ViewMode) []const u8 {
     };
 }
 
-fn tabsStateFromNode(node: *Node) ?*TabsState {
-    for (node.meta.ownership.debug_slots.state_ptrs[0..node.meta.ownership.debug_slots.state_count]) |slot| {
-        if (slot) |ptr| {
-            return @ptrCast(@alignCast(ptr));
-        }
-    }
-    return null;
-}
-
-fn viewModeIndex(mode: ViewMode) usize {
-    return switch (mode) {
-        .elements => 0,
-        .components => 1,
-        .console => 2,
-        .performance => 3,
-    };
-}
-
 fn syncViewModeTabs(state: *DevToolsState) void {
-    const tabs_state = state.view_mode_tabs_state orelse return;
-    const target_index = viewModeIndex(state.view_mode);
-    if (tabs_state.active_index == target_index) return;
-    tabs_state.active_index = target_index;
-    if (state.view_mode_tabs_node) |tabs_node| {
-        if (tabs_node.children.items.len > 0) {
-            const tab_row = tabs_node.children.items[0];
-            if (tab_row.meta.per_frame.hooks.before_render.main) |before_render| {
-                before_render(tab_row);
-            }
-        }
-        tabs_node.markRenderDirty();
-    }
+    if (state.view_mode_tab) |sig| sig.set(viewModeId(state.view_mode));
 }
 
 const FilterChangeCtx = struct {
@@ -4024,27 +3986,26 @@ fn closeEvent(event: Event, context: ?*anyopaque) EventResult {
     return .stop;
 }
 
-// ========== DevTools 持久状态 ==========
+// ========== DevTools persistent state ==========
 
 const DevToolsState = struct {
     initialized: bool = false,
     allocator: std.mem.Allocator = undefined,
     arena: std.heap.ArenaAllocator = undefined,
     collapsed: std.AutoHashMap(u32, bool) = undefined,
-    /// 用户手动展开的节点（大子树默认折叠，展开后记录在此）
+    /// User-expanded nodes (large subtrees collapsed by default, recorded here when expanded)
     explicitly_expanded: std.AutoHashMap(u32, bool) = undefined,
-    /// 面板内容 scope：root 下所有组件/资源的归属。它是 `root_scope` 的子
-    /// scope，切换明暗主题时整棵内容重建，dispose 这一个就能回收旧内容的全部
-    /// 组件状态，而 root 节点本身（host 持有的 cx.root）与其 hook 保持不动。
+    /// Panel content scope: owns all components/resources under root.
+    /// Disposed when theme toggles for full rebuild; root node (Cx.root) and hooks unchanged.
     scope: ?*Scope = null,
-    /// Cx.root_scope（见 ensureInit）。root 节点绑定在它上面。
+    /// Cx.root_scope (see ensureInit). Root node bound to it.
     root_scope: ?*Scope = null,
     /// Title shown in panel header, supplied by PanelOptions. Borrowed.
     title: []const u8 = "DevTools",
-    /// mountPanel 的原始选项，主题切换重建 header 时复用（on_close 等）。
+    /// Original mountPanel options; reused when header rebuilt on theme change.
     panel_opts: PanelOptions = .{},
-    /// Header 明暗开关点击后置位；下一帧 devtoolsBeforeRender 在安全点
-    /// 切主题并重建面板内容（不能在事件回调里拆掉正在分发事件的按钮）。
+    /// Header theme toggle clicked; devtoolsBeforeRender switches theme and rebuilds panel at safe
+    /// point.
     theme_toggle_pending: bool = false,
 
     // View mode
@@ -4053,11 +4014,11 @@ const DevToolsState = struct {
     // Tab
     active_tab: DetailsTab = .layout,
 
-    // Style 实时编辑状态
+    // Style real-time edit state
     editing_field: ?EditableField = null,
     editing_node_id: ?u32 = null,
 
-    // 左右分割: 左面板宽度 + splitter 拖拽状态
+    // Left/right split: left panel width + splitter drag state
     left_panel_width: f32 = 350,
     splitter_dragging: bool = false,
     splitter_drag_start_x: f32 = 0,
@@ -4073,21 +4034,20 @@ const DevToolsState = struct {
     tree_auto_scroll_pending: bool = false,
     tree_auto_scroll_id: ?u32 = null,
 
-    /// goto-source 按钮的点击上下文。只有一行能处于 hover 态，故整个面板复用
-    /// 这一个实例，每帧新分配会在面板生命周期内累积（scope 资源直到 unmount
-    /// 才释放）。
+    /// Goto-source button click context. Single hover row per panel; reused instance to avoid
+    /// accumulation.
     goto_ctx: RowCtx = undefined,
 
-    // VirtualList 数据源：扁平化的树行（持久化分配器上）
+    // VirtualList data source: flattened tree rows (persistent allocator)
     flat_rows: std.ArrayList(FlatTreeEntry) = .empty,
 
-    // === 保留模式字段 ===
+    // === Retained-mode fields ===
     target_cx: ?*Cx = null,
     target_lifetime: ?*Cx.LifetimeToken = null,
     cx: ?*Cx = null,
     last_seen_target_frame_count: u64 = 0,
-    /// 上一帧鼠标悬停所在的树行 slot。行内容只在 tree_dirty 时重建，而 hover
-    /// 会改变行的渲染结果（goto 按钮），故需要在悬停行变化时补标脏。
+    /// Previous frame mouse hover tree row slot. Row content rebuilt only when tree_dirty; hover
+    /// changes render (goto button).
     last_hovered_row: ?*Node = null,
     tree_dirty: bool = true,
     details_dirty: bool = true,
@@ -4116,39 +4076,39 @@ const DevToolsState = struct {
     console_status_text: ?*Node = null,
     console_toolbar_node: ?*Node = null,
     console_filter_node: ?*Node = null,
-    console_level_buttons: [5]?*Node = .{null} ** 5,
-    // Performance 面板保留节点引用
+    /// Per-log-level toggle states of the Console filter buttons (button appearance is derived from
+    /// them); released with the scope on panel rebuild.
+    console_level_enabled: [5]?*Signal(bool) = @splat(null),
+    // Performance panel retained node reference
     perf_fps_text: ?*Node = null,
     perf_bar_container: ?*Node = null,
-    perf_bars: [perf_chart_sample_count]?*Node = .{null} ** perf_chart_sample_count,
+    perf_bars: [perf_chart_sample_count]?*Node = @splat(null),
     perf_target_text: ?*Node = null,
     perf_timing_text: ?*Node = null,
     perf_summary_text: ?*Node = null,
     perf_interaction_text: ?*Node = null,
     perf_cache_text: ?*Node = null,
     perf_mounted: bool = false,
-    /// perfBeforeRender 上次看到的 target.frame_count（idle 检测专用，与
-    /// last_seen_target_frame_count 分开，后者在 devtoolsBeforeRender 里
-    /// 每帧被消费，无法用来测"多久没变"）。
+    /// Frame count seen in perfBeforeRender (idle detection only; distinct from
+    /// last_seen_target_frame_count for time-since-change detection).
     perf_seen_frame_count: u64 = 0,
-    perf_last_frame_change: ?std.time.Instant = null,
-    /// 滚动时间桶（每桶 100ms，共 64 桶 ≈ 6.4s 窗口）。监控按墙钟持续
-    /// 向前滚，target 停帧时滚出 idle 空档，而不是把"最近 64 个渲染帧"
-    /// 的快照冻在屏上（Chrome FPS meter 语义）。
-    /// 值：<0 = 桶未填充；0 = 桶内无渲染帧（idle）；>0 = 桶内平均 FPS。
+    perf_last_frame_change: ?@import("zenit_time").Instant = null,
+    /// Time buckets for scroll monitoring (100ms/bucket, 64 buckets ~= 6.4s window).
+    /// Advances by wall clock while target idles; values: <0 = unfilled, 0 = idle, >0 = avg FPS.
     perf_live_fps: [perf_chart_sample_count]f32 = @splat(-1.0),
-    /// 下一个要写入的桶（环形游标；渲染时从这里往后读 = 最旧->最新）。
+    /// Next bucket to write (ring cursor; render reads forward = oldest->newest)
     perf_live_head: usize = 0,
-    perf_bucket_start: ?std.time.Instant = null,
+    perf_bucket_start: ?@import("zenit_time").Instant = null,
     perf_bucket_frames: u64 = 0,
-    // 组件化 Header 引用
+    // Componentized Header reference
     pick_btn_node: ?*Node = null,
     view_mode_tabs_node: ?*Node = null,
-    view_mode_tabs_state: ?*TabsState = null,
-    // Details tab bar 引用（程序化 setActiveTab 时同步下划线）
+    /// View-mode Tabs active page signal (set for programmatic switch)
+    view_mode_tab: ?*Signal(?[]const u8) = null,
+    // Details tab bar reference (programmatic setActiveTab syncs underline)
     details_tabs_node: ?*Node = null,
-    details_tabs_state: ?*TabsState = null,
-    // 详情区域组件 Scope（每次重建时 dispose + 重建）
+    details_tab: ?*Signal(?[]const u8) = null,
+    // Details area component scope (dispose + rebuild each time)
     details_scope: ?*Scope = null,
 
     fn ensureInit(self: *DevToolsState, cx: *Cx) !void {
@@ -4175,10 +4135,12 @@ const DevToolsState = struct {
         self.initialized = true;
     }
 
-    /// mountPanel 失败时 root 整棵回收，而子 mount 中途写进来的节点 / 子状态指针
-    ///（vl_state / details_content / perf_* / console_* / stats_* / splitter_*）会悬垂,
-    /// 同一 Cx 再次 mountPanel、或事件 handler（event_context = state）读到它们就是 UAF。
-    /// 失败路径统一清零（交叉审查 P1/P2）。scope / target / cx 不属于这批，保留。
+    /// when mountPanel fails entire root tree recycled, but nodes/child states pointers written
+    /// during child mount
+    /// (vl_state / details_content / perf_* / console_* / stats_* / splitter_*) dangle,
+    /// same Cx re-mountPanel or event handler (event_context = state) reading them is UAF.
+    /// clear all failure paths (cross-review P1/P2). scope / target / cx don't belong to this
+    /// batch, preserve.
     pub fn clearMountedNodeRefs(self: *DevToolsState) void {
         self.left_panel_node = null;
         self.splitter_node = null;
@@ -4198,10 +4160,10 @@ const DevToolsState = struct {
         self.console_status_text = null;
         self.console_toolbar_node = null;
         self.console_filter_node = null;
-        self.console_level_buttons = .{null} ** self.console_level_buttons.len;
+        self.console_level_enabled = @splat(null);
         self.perf_fps_text = null;
         self.perf_bar_container = null;
-        self.perf_bars = .{null} ** perf_chart_sample_count;
+        self.perf_bars = @splat(null);
         self.perf_target_text = null;
         self.perf_timing_text = null;
         self.perf_summary_text = null;
@@ -4210,18 +4172,17 @@ const DevToolsState = struct {
         self.perf_mounted = false;
         self.pick_btn_node = null;
         self.view_mode_tabs_node = null;
-        self.view_mode_tabs_state = null;
+        self.view_mode_tab = null;
         self.details_tabs_node = null;
-        self.details_tabs_state = null;
+        self.details_tab = null;
     }
 
     pub fn deinit(self: *DevToolsState) void {
         if (!self.initialized) return;
-        // 注意: 不要在这里 dispose scope/details_scope。
-        // DevTools scope 已登记为 Cx.root_scope，Cx.deinit/unmount 会在释放
-        // 节点树之前 dispose 整棵 scope。deinit 也可能在 Cx.freeNode
-        // 递归中通过 on_cleanup -> StateStore.remove 调用，所以这里只清理
-        // DevToolsState 自身所有的容器，不重复触碰 scope。
+        // Note: do not dispose scope/details_scope here.
+        // DevTools scope registered as Cx.root_scope; Cx.deinit unmounts and disposes before
+        // freeing nodes.
+        // This clears only DevToolsState containers, not scopes.
         self.details_scope = null;
         self.arena.deinit();
         self.collapsed.deinit();
@@ -4263,22 +4224,21 @@ const DevToolsState = struct {
         return self.collapsed.get(id) != null;
     }
 
-    /// 是否被用户手动展开过
+    /// Whether user manually expanded
     fn isExplicitlyExpanded(self: *DevToolsState, id: u32) bool {
         return self.explicitly_expanded.get(id) != null;
     }
 
-    /// is_currently_collapsed: 当前节点是否在 UI 上显示为折叠状态（含自动折叠）
-    ///
-    /// 诊断路径：展开/折叠只是树面板的显示偏好。put 失败 = 这次点击没记住状态
-    /// （下一帧仍按默认折叠规则显示），用户再点一次即可，无正确性影响。
+    /// is_currently_collapsed: whether node displays as collapsed in UI (includes auto-collapse).
+    /// Collapse/expand are display preference only. Put failure = this click not recorded; next
+    /// frame follows default; no correctness impact.
     fn toggle(self: *DevToolsState, id: u32, is_currently_collapsed: bool) void {
         if (is_currently_collapsed) {
-            // 当前折叠 -> 展开
+            // Current collapsed -> expand
             _ = self.collapsed.remove(id);
             _ = self.explicitly_expanded.put(id, true) catch {};
         } else {
-            // 当前展开 -> 折叠
+            // Current expanded -> collapse
             _ = self.explicitly_expanded.remove(id);
             _ = self.collapsed.put(id, true) catch {};
         }
@@ -4292,7 +4252,7 @@ fn getState(cx: *Cx) !*DevToolsState {
 }
 
 test "DevTools root scope is owned by its Cx" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
 
     const state = try getState(cx);
@@ -4302,10 +4262,10 @@ test "DevTools root scope is owned by its Cx" {
 }
 
 test "DevTools stops observing a target Cx that has been destroyed" {
-    var target = try Cx.init(std.testing.allocator);
+    var target = try Cx.init(std.testing.allocator, std.testing.io);
     target.root = try core.box(target, .{}, .{});
 
-    var dev = try Cx.init(std.testing.allocator);
+    var dev = try Cx.init(std.testing.allocator, std.testing.io);
     defer dev.deinit();
     const panel = try mountPanel(dev, target, .{});
     dev.root = panel;
@@ -4321,11 +4281,11 @@ test "DevTools stops observing a target Cx that has been destroyed" {
 }
 
 test "DevTools header theme toggle flips scheme and rebuilds panel content" {
-    var target = try Cx.init(std.testing.allocator);
+    var target = try Cx.init(std.testing.allocator, std.testing.io);
     defer target.deinit();
     target.root = try core.box(target, .{}, .{});
 
-    var dev = try Cx.init(std.testing.allocator);
+    var dev = try Cx.init(std.testing.allocator, std.testing.io);
     defer dev.deinit();
     dev.setTheme(&theme.light);
     const panel = try mountPanel(dev, target, .{});
@@ -4336,7 +4296,7 @@ test "DevTools header theme toggle flips scheme and rebuilds panel content" {
     const child_count = panel.children.items.len;
     try std.testing.expect(state.scope.? != state.root_scope.?);
 
-    // 点击开关只置位，不在事件回调里拆树。
+    // Toggle only sets flag; do not mutate tree in event callback.
     try std.testing.expectEqual(EventResult.handled, themeToggleEvent(.{ .mouse_down = .{ .x = 0, .y = 0, .button = .left } }, state));
     try std.testing.expect(dev.tokens == &theme.light);
 
@@ -4345,7 +4305,7 @@ test "DevTools header theme toggle flips scheme and rebuilds panel content" {
     try std.testing.expect(!state.theme_toggle_pending);
     try std.testing.expectEqual(child_count, panel.children.items.len);
     try std.testing.expect(state.pick_btn_node != null and state.pick_btn_node.? != old_header);
-    try std.testing.expectEqual(theme.dark.color.bg_primary, panel.getBackground());
+    try std.testing.expectEqual(theme.dark.tokens.color.bg_primary, panel.getBackground());
 
     state.theme_toggle_pending = true;
     devtoolsBeforeRender(panel);
@@ -4393,12 +4353,12 @@ fn testFindByTestId(node: *Node, test_id: []const u8) ?*Node {
 }
 
 test "Style tab adds goto-source only for properties with tracked origins" {
-    var target = try Cx.init(std.testing.allocator);
+    var target = try Cx.init(std.testing.allocator, std.testing.io);
     defer target.deinit();
     const inspected = try core.box(target, .{ .background = Color.BLACK }, .{});
     target.root = inspected;
 
-    var dev = try Cx.init(std.testing.allocator);
+    var dev = try Cx.init(std.testing.allocator, std.testing.io);
     defer dev.deinit();
     const state = try getState(dev);
     state.setTarget(target);
@@ -4411,7 +4371,7 @@ test "Style tab adds goto-source only for properties with tracked origins" {
     try std.testing.expect(source_btn.behavior.events.on_event != null);
     try std.testing.expect(source_btn.behavior.events.event_context != null);
 
-    // gap 没在这个 BoxStyle 中声明，不能用 background 的 base 来源冒充。
+    // Gap not declared in this BoxStyle; cannot use background base.
     try std.testing.expect(inspected.styleOrigin(.gap) == null);
 }
 
@@ -4427,7 +4387,7 @@ test "replaceTextContent upgrades long text to owned storage" {
 }
 
 test "DevTools Console mirrors pre-mount history, pagination, filtering and clear" {
-    var target = try Cx.init(std.testing.allocator);
+    var target = try Cx.init(std.testing.allocator, std.testing.io);
     defer target.deinit();
     target.console().configure(.{ .terminal_level = null, .max_entries = 2_000 });
     target.root = try core.box(target, .{ .width = .{ .px = 320 }, .height = .{ .px = 200 } }, .{});
@@ -4437,7 +4397,7 @@ test "DevTools Console mirrors pre-mount history, pagination, filtering and clea
     for (0..1_500) |i| target.console().debug("history-{d}", .{i});
     target.console().writeAt(.err, @src(), "needle-error", .{});
 
-    var dev = try Cx.init(std.testing.allocator);
+    var dev = try Cx.init(std.testing.allocator, std.testing.io);
     defer dev.deinit();
     const panel = try mountPanel(dev, target, .{});
     dev.root = panel;
@@ -4503,6 +4463,30 @@ pub fn setActiveTab(cx: *Cx, tab_id: []const u8) bool {
     return std.mem.eql(u8, state.active_tab.idStr(), tab_id);
 }
 
+/// Current FPS: average of last ~1s (10 buckets) filled buckets. Buckets advance by wall clock;
+/// target idle drops to 0.
+fn liveCurrentFps(state: *const DevToolsState) u32 {
+    var sum: f32 = 0;
+    var n_buckets: usize = 0;
+    var back: usize = 0;
+    while (back < 10) : (back += 1) {
+        const idx = (state.perf_live_head + perf_chart_sample_count - 1 - back) % perf_chart_sample_count;
+        const val = state.perf_live_fps[idx];
+        if (val < 0) continue;
+        sum += val;
+        n_buckets += 1;
+    }
+    if (n_buckets == 0) return 0;
+    return @intFromFloat(@min(@as(f32, 999), @round(sum / @as(f32, @floatFromInt(n_buckets)))));
+}
+
+/// Performance panel scroll monitor current FPS (same source as panel FPS row). Real window probe
+/// asserts "scroll advances after frame pause; FPS drops to 0".
+pub fn perfCurrentFps(cx: *Cx) ?u32 {
+    const state = getState(cx) catch return null;
+    return liveCurrentFps(state);
+}
+
 pub fn setViewMode(cx: *Cx, mode_id: []const u8) bool {
     const state = getState(cx) catch return false;
     applyViewModeById(state, mode_id);
@@ -4553,19 +4537,19 @@ pub fn setConsoleFilter(cx: *Cx, filter: []const u8) bool {
     return true;
 }
 
-// DevTools 面板整条 mount 的逐分配点 OOM sweep（与 components/oom_sweep 同口径：
-// per-case GPA 判 leak、induced>0 防空转）。mountPanel 需要一个 target Cx，helper 的
-// MountFn(scope, cx) 形态放不下，这里手写一份。
+// Full DevTools panel mount allocation-point OOM sweep (per-case GPA check leak; induced > 0
+// prevents empty-spin).
+// mountPanel needs target Cx; MountFn(scope, cx) form insufficient; custom here.
 test "mountPanel 在任意分配点失败时不泄漏" {
     const t = std.testing;
     const total_allocs = blk: {
         var arena = std.heap.ArenaAllocator.init(t.allocator);
         defer arena.deinit();
         var counting = t.FailingAllocator.init(arena.allocator(), .{});
-        const target = try Cx.init(t.allocator);
+        const target = try Cx.init(t.allocator, std.testing.io);
         defer target.deinit();
         target.root = try core.box(target, .{}, .{});
-        const dev = try Cx.init(counting.allocator());
+        const dev = try Cx.init(counting.allocator(), std.testing.io);
         defer dev.deinit();
         const before = counting.alloc_index;
         dev.root = try mountPanel(dev, target, .{});
@@ -4577,13 +4561,13 @@ test "mountPanel 在任意分配点失败时不泄漏" {
     var leaked: usize = 0;
     var first_leak: ?usize = null;
     for (0..total_allocs) |failure_index| {
-        var gpa = std.heap.GeneralPurposeAllocator(.{ .safety = true }){};
+        var gpa = std.heap.DebugAllocator(.{ .safety = true }){};
         {
             var failing = t.FailingAllocator.init(gpa.allocator(), .{});
-            const target = try Cx.init(t.allocator);
+            const target = try Cx.init(t.allocator, std.testing.io);
             defer target.deinit();
             target.root = try core.box(target, .{}, .{});
-            const dev = Cx.init(failing.allocator()) catch {
+            const dev = Cx.init(failing.allocator(), std.testing.io) catch {
                 _ = gpa.deinit();
                 continue;
             };
@@ -4596,7 +4580,7 @@ test "mountPanel 在任意分配点失败时不泄漏" {
                 dev.root = panel;
             } else |_| {
                 induced += 1;
-                // 失败后 state 里不能留指向已回收节点的指针（交叉审查 P1/P2）
+                // State cannot hold dangling pointers to freed nodes after failure.
                 const st = getState(dev) catch unreachable;
                 try t.expect(st.splitter_node == null);
                 try t.expect(st.splitter_line_node == null);
@@ -4615,8 +4599,9 @@ test "mountPanel 在任意分配点失败时不泄漏" {
             if (first_leak == null) first_leak = failure_index;
         }
     }
-    // 空转防护按比例而非绝对下限（口径同 oom_sweep.zig）：induced > 0 的门槛
-    // 比实测值低三个数量级，挡不住「mount 提前 return 导致分配点坍塌」。
+    // Empty-spin guard by ratio not absolute minimum (same meter as oom_sweep.zig): induced > 0
+    // threshold lower than measured by three orders of magnitude; cannot block mount early-return
+    // collapse.
     const min_induced = total_allocs / 2;
     if (induced < min_induced) {
         std.debug.print(

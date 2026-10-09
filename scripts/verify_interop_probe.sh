@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
-# 富剪贴板 + 文件拖出的真机验证（真系统路径，e2e 注入覆盖不到）。
+# Rich clipboard + drag-out real-machine verification (true system paths that e2e injection cannot
+# reach).
 #
-# 覆盖三条链路：
-#   A. 剪贴板 get：外部（swift/NSPasteboard）预置 HTML → probe 启动时读到
-#   B. 剪贴板 set：probe 写 text+HTML 双 representation → 外部读回两种类型
-#   C. 拖出：probe 窗口 mousedown 起 beginDrag(file_url) → CGEvent 拖到
-#      Finder 目标目录 → 判据 = 目标目录出现 payload.txt（Finder 执行拷贝）
+# Covers three paths:
+#   A. Clipboard get: external (swift/NSPasteboard) pre-stages HTML -> probe reads it at startup
+#   B. Clipboard set: probe writes text+HTML -> external process reads both types
+#   C. Drag-out: mousedown in probe window starts beginDrag(file_url) -> CGEvent drags to a Finder
+#   target dir -> pass if the dir has payload.txt (Finder copied it)
 #
-# 前置条件：GUI 会话；跑 C 需要终端有「辅助功能」权限（同 verify_real_drag.sh）。
-# 用法：bash scripts/verify_interop_probe.sh [--skip-drag]
+# Preconditions: GUI session; C needs terminal accessibility permission (same as
+# verify_real_drag.sh). Usage: bash scripts/verify_interop_probe.sh [--skip-drag]
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
@@ -66,7 +67,7 @@ else
   rm -rf "$SRC" "$DST"; mkdir -p "$SRC" "$DST"
   printf 'zenit drag-out payload\n' > "$SRC/payload.txt"
 
-  # 摆放 probe 窗口与 Finder 目标窗口（固定坐标，CGEvent 用全局屏幕坐标）
+  # Arrange probe window and Finder target window (fixed coords, CGEvent uses global screen coords).
   osascript >/dev/null <<EOF
 tell application "System Events"
   tell process "interop_probe"
@@ -89,9 +90,9 @@ tell application "System Events"
 end tell
 EOF
   sleep 1
-  # probe 窗口左半边拖拽源区 (180, 270)（右半边是普通点击区，不起拖）
-  # → Finder 窗口列表区 (850, 320)（实测 830 差 20px 撞在 sidebar 上）
-  # draghold：按住起拖后分步移动（memory: 需分步拖动 + mousedown 立刻起拖）
+  # Probe window left half drag source (180, 270) (right half normal click, no drag) -> Finder
+  # window list (850, 320) (measured 830 off by 20px hitting sidebar). draghold: hold then step move
+  # (memory: step drag + mousedown immediate start).
   swift scripts/cgevent.swift draghold 180 270 850 320 1.0 || \
     swift scripts/cgevent.swift drag 180 270 850 320
 

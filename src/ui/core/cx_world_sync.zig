@@ -1,5 +1,5 @@
-//! Cx -> World 表同步：节点挂接 World（ElementTag 映射）、layerize、
-//! layout / paint / interaction 三张表的逐帧同步，以及 layout shadow-sync 完整性校验。
+//! Cx -> World table sync: node hook into World (ElementTag mapping), layerize,
+//! layout / paint / interaction 3-table per-frame sync, layout shadow-sync completeness audit.
 
 const std = @import("std");
 const core = @import("../core.zig");
@@ -13,12 +13,12 @@ const paint_table = core.paint_table;
 const render_engine = core.render_engine;
 const world = core.world;
 
-/// Node.tag (UI 端) -> ElementTable.ElementTag (SoA 端) 映射。
-/// 两套 enum 不耦合：UI 端是组件级别（box/button/scroll/list/...），
-/// SoA 端是渲染端类别（container/text/image/input/component/...）。
+/// Node.tag (UI side) -> ElementTable.ElementTag (SoA side) mapping.
+/// Two enums uncoupled: UI side component-level (box/button/scroll/list/...),
+/// SoA side render categories (container/text/image/input/component/...).
 pub fn nodeTagToWorldTag(t: ElementTag) world.ElementTag {
     return switch (t) {
-        .box, .scroll, .list, .spacer => .container,
+        .box, .scroll, .list, .spacer, .anchor => .container,
         .text => .text,
         .image => .image,
         .input, .button => .input,
@@ -27,7 +27,7 @@ pub fn nodeTagToWorldTag(t: ElementTag) world.ElementTag {
 }
 
 pub fn linkNodeToWorld(self: *Cx, node: *Node) void {
-    if (node.element_id_raw != 0xFFFFFFFF) return; // 已注册，幂等
+    if (node.element_id_raw != 0xFFFFFFFF) return; // Already registered, idempotent
     const eid = self.world.createElement(.{
         .tag = nodeTagToWorldTag(node.tag),
         .key = node.id,
@@ -35,12 +35,12 @@ pub fn linkNodeToWorld(self: *Cx, node: *Node) void {
     node.element_id_raw = eid.raw();
 }
 
-/// 帧开始 layerize，把 World.elements 分组到 LayerTree。
-/// 返回 layer 数量（含 root）。
+/// Frame start: layerize, group World.elements into LayerTree.
+/// Returns layer count (includes root).
 ///
-/// 从 World.interaction 自动收集 PromotionHint, scroll containers
-/// 自动提为独立 layer。无需 caller 传 hints。
-/// PaintTable.bounds 为主 + LayoutTable.rect fallback。
+/// Auto-collects PromotionHint from World.interaction; scroll containers
+/// are auto-promoted to their own layer. No caller hints needed.
+/// PaintTable.bounds primary + LayoutTable.rect fallback.
 fn paintChunkBoundsOrLayoutFallback(w: *world.World, eid: world.ElementId) paint_table.Bounds {
     if (w.paint.get(eid)) |chunk| {
         if (!chunk.bounds.isEmpty()) return chunk.bounds;
@@ -57,20 +57,20 @@ fn paintChunkBoundsOrLayoutFallback(w: *world.World, eid: world.ElementId) paint
 }
 
 pub fn layerizeFrame(self: *Cx, extra_hints: []const layerize_mod.LayerizeInput) u32 {
-    // 帧开始：清 layer damage 状态
+    // Frame start: clear layer damage state
     self.layer_tree.beginFrame();
 
-    // 自动从 InteractionTable 收集 promotion hints（scroll containers 等）
-    var collected = std.ArrayList(layerize_mod.LayerizeInput){};
+    // Auto-collect promotion hints from InteractionTable (scroll containers etc)
+    var collected = @as(std.ArrayList(layerize_mod.LayerizeInput), .empty);
     defer collected.deinit(self.allocator);
 
     var iter = self.world.interaction.data.iterator();
     while (iter.next()) |entry| {
         const eid = world.ElementId.fromRaw(entry.key_ptr.*);
         const data = entry.value_ptr.*;
-        // scroll_id 有效 -> promotion hint = scroll container
+        // scroll_id valid -> promotion hint = scroll container
         if (data.scroll_id != std.math.maxInt(u32)) {
-            // 从 PaintTable 取 chunk bounds（shadow-sync 已就绪）。
+            // Take chunk bounds from PaintTable (shadow-sync ready).
             const bounds = paintChunkBoundsOrLayoutFallback(&self.world, eid);
             collected.append(self.allocator, .{
                 .element = eid,
@@ -80,16 +80,17 @@ pub fn layerizeFrame(self: *Cx, extra_hints: []const layerize_mod.LayerizeInput)
         }
     }
 
-    // v0.5-P3 Stage 3-3 Phase 4 (session 38): 也根据 PaintChunk.property_state.effect_id
-    // 提升带有非 root effect 的元素（opacity layer / backdrop_blur 等）。
-    // 这是 Stage 5 删 deferred 文件的关键依赖：layerize 不再只听 InteractionTable，
-    // 而是真消费 PaintTable 4 表 SoT。
+    // v0.5-P3 Stage 3-3 Phase 4 (session 38): also promote elements with non-root effect via
+    // PaintChunk.property_state.effect_id (opacity layer / backdrop_blur etc).
+    // Stage 5 deletes deferred file key dependency: layerize no longer listens to InteractionTable
+    // alone,
+    // truly consumes PaintTable 4-table SoT.
     for (self.world.paint.chunks.items, 0..) |chunk, idx| {
         const effect_id = chunk.property_state.effect_id;
         if (effect_id == std.math.maxInt(u32)) continue;
         if (effect_id >= self.property_tree.effects.items.len) continue;
         const effect = self.property_tree.effects.items[effect_id];
-        // 只提升真需要离屏的 effect（opacity layer / backdrop blur）
+        // Only promote effects truly needing offscreen (opacity layer / backdrop blur)
         if (!effect.requires_offscreen) continue;
 
         const eid_idx: u24 = @intCast(idx);
@@ -97,7 +98,7 @@ pub fn layerizeFrame(self: *Cx, extra_hints: []const layerize_mod.LayerizeInput)
             .index = eid_idx,
             .generation = self.world.elements.generations.items[eid_idx],
         };
-        // 跳过已经因 scroll_id 添加的元素，避免重复
+        // Skip already added by scroll_id, prevent duplicate
         var already_collected = false;
         for (collected.items) |c| {
             if (c.element.eql(eid)) {
@@ -120,7 +121,7 @@ pub fn layerizeFrame(self: *Cx, extra_hints: []const layerize_mod.LayerizeInput)
             .world_bounds = paintChunkBoundsOrLayoutFallback(&self.world, eid),
         }) catch break;
     }
-    // 追加 caller 显式传的 hints
+    // Append caller's explicit hints
     for (extra_hints) |h| collected.append(self.allocator, h) catch break;
 
     layerize_mod.layerize(&self.layer_tree, collected.items) catch return 0;
@@ -154,8 +155,8 @@ fn syncPaintNodeRecursive(self: *Cx, node: *Node) void {
     self.perf.synced_node_count +|= 1;
     if (node.element_id_raw != 0xFFFFFFFF) {
         const eid = world.ElementId.fromRaw(node.element_id_raw);
-        // rect 读一次复用：这是每帧每节点路径，rectFromWorldOrFallback
-        // 一次 ≈ 6-8 层调用（Debug 不 CSE，写四遍就是四次全链）。
+        // rect read once-reused: per-frame per-node path, rectFromWorldOrFallback
+        // once ≈ 6-8 layer calls (Debug without CSE, write 4 times = 4 full chains).
         const rect = node.rectFromWorldOrFallback();
         const hash = paintContentHash(node, rect);
         const bounds: paint_table.Bounds = .{
@@ -164,10 +165,12 @@ fn syncPaintNodeRecursive(self: *Cx, node: *Node) void {
             .max_x = rect.x + rect.w,
             .max_y = rect.y + rect.h,
         };
-        // beginRecord 返回 true = 需要重录（hash mismatch / 首次）；false = cache hit。
+        // beginRecord returns true = need re-record (hash mismatch / first time); false = cache
+        // hit.
         const need_record = self.world.paint.beginRecord(eid, hash) catch return;
-        // v0.5-P3 Stage 3-3 Phase 3 (session 37): 从 SceneRuntime 取 property tree refs
-        // (transform_id / clip_id / effect_id)，从 InteractionTable 取 scroll_id，写到 chunk.property_state。
+        // v0.5-P3 Stage 3-3 Phase 3 (session 37): take property tree refs from SceneRuntime
+        // (transform_id / clip_id / effect_id), take scroll_id from InteractionTable, write to
+        // chunk.property_state.
         const runtime = self.scene_runtime.get(node.id);
         const interaction_data = self.world.interaction.get(eid);
         const property_state = paint_table.PropertyStateRef{
@@ -177,7 +180,7 @@ fn syncPaintNodeRecursive(self: *Cx, node: *Node) void {
             .scroll_id = if (interaction_data) |d| d.scroll_id else std.math.maxInt(u32),
         };
         if (need_record) {
-            // 真 mirror 该节点的 own DisplayItem 范围。
+            // Truly mirror node's own DisplayItem range.
             if (runtime) |rt| {
                 const start: usize = rt.display_item_start;
                 const count: usize = rt.display_item_count;
@@ -186,13 +189,13 @@ fn syncPaintNodeRecursive(self: *Cx, node: *Node) void {
                     var i: usize = 0;
                     while (i < count) : (i += 1) {
                         const di = self.display_list.items.items[start + i];
-                        // 唯一的 display_list -> paint_table
-                        // 映射点 (从 cx 内 mapDisplayItem 合并到 shadow 路径的
-                        // lowerDisplayItem)。两个路径产 identical paint_table.DisplayItem。
+                        // Unique display_list -> paint_table
+                        // mapping point (merged mapDisplayItem from cx internal to shadow path's
+                        // lowerDisplayItem). Both paths produce identical paint_table.DisplayItem.
                         const mapped = gpu_draw_shadow.lowerDisplayItem(di);
-                        // 失败会让本节点的 paint chunk **少掉若干 item** ->
-                        // 画面局部缺失且无任何信号。计数以便诊断
-                        // （审查报告 §3 的静默吞错家族）。
+                        // Failure causes node's paint chunk **lose some items** ->
+                        // local screen gap, no signal. Count for diagnostics
+                        // (review report §3's silent-error family).
                         self.world.paint.pushItem(eid, mapped) catch {
                             core.paint_push_failures += 1;
                         };
@@ -201,11 +204,11 @@ fn syncPaintNodeRecursive(self: *Cx, node: *Node) void {
             }
             self.world.paint.endRecord(eid, property_state);
         }
-        // 单次 get 合并两笔写：cache hit 也要更新 property_state
-        // （transform_id / scroll_id 会变）；chunk.bounds 是 world-space
-        // element rect, pushItem 内部 unionWith 累积的 local_bounds
-        // （item-local 坐标）与 world bounds 语义不符，这里覆盖。下游
-        // （LayerTree.layerizeFrame）要的是 world bounds。
+        // Single get merges two writes: a cache hit must also update property_state
+        // (transform_id / scroll_id can change); chunk.bounds is the world-space
+        // element rect. pushItem's internal unionWith accumulates local_bounds
+        // (item-local coords), a semantic mismatch with world bounds, so override here.
+        // Downstream (LayerTree.layerizeFrame) needs world bounds.
         if (self.world.paint.get(eid)) |chunk| {
             if (!need_record) chunk.property_state = property_state;
             chunk.bounds = bounds;
@@ -214,10 +217,10 @@ fn syncPaintNodeRecursive(self: *Cx, node: *Node) void {
     for (node.children.items) |child| syncPaintNodeRecursive(self, child);
 }
 
-/// 轻量 content hash, Stage 3-3 Phase 1+ 用于 cache invalidation。
-/// 取 background + border + opacity + width/height + text + image/icon refs。
-/// session 43: 扩展从 background-only 到 8 个常见可视属性，让 PaintTable cache
-/// invalidation 覆盖更多真实修改场景。
+/// Lightweight content hash for Stage 3-3 Phase 1+ cache invalidation.
+/// Takes background + border + opacity + width/height + text + image/icon refs.
+/// Session 43: expanded from background-only to 8 common visual properties,
+/// letting PaintTable cache invalidation cover more real-world change scenarios.
 fn paintContentHash(node: *const Node, rect: ComputedRect) u64 {
     var h = std.hash.Wyhash.init(0);
     const bg = node.getBackground();
@@ -254,8 +257,9 @@ fn syncInteractionNodeRecursive(self: *Cx, node: *Node) void {
         const eid = world.ElementId.fromRaw(node.element_id_raw);
         const has_a11y = node.behavior.interaction.a11y != null;
         const has_event = nodeHasAnyEvent(node);
-        // v0.5-P3 Stage 3-4 fix (session 34): 保留已有 scroll_id（ScrollArea.mount 注入），
-        // 不被每帧 render 后的 syncInteractionToTable 擦回 sentinel。
+        // v0.5-P3 Stage 3-4 fix (session 34): preserve existing scroll_id
+        // (ScrollArea.mount injection), not erased by syncInteractionToTable after each frame
+        // render.
         const existing_scroll_id: u32 = if (self.world.interaction.get(eid)) |existing|
             existing.scroll_id
         else
@@ -267,7 +271,7 @@ fn syncInteractionNodeRecursive(self: *Cx, node: *Node) void {
                 @as(i16, @intCast(@max(@min(t, std.math.maxInt(i16)), std.math.minInt(i16))))
             else
                 0;
-            const role: u16 = if (node.behavior.interaction.a11y) |a| @intFromEnum(a.role) else 0;
+            const role: u16 = if (node.behavior.interaction.a11y) |a| @backingInt(a.role) else 0;
             const data: interaction_table.InteractionData = .{
                 .focus = .{
                     .focusable = node.behavior.interaction.focusable,
@@ -279,8 +283,8 @@ fn syncInteractionNodeRecursive(self: *Cx, node: *Node) void {
                 .a11y_role = role,
                 .scroll_id = existing_scroll_id,
             };
-            // 失败 -> 该节点这一帧**不可命中**（点击/hover 全失效），
-            // 且完全无信号。与 core.paint_push_failures 同属"静默劣化"家族。
+            // failure -> that node this frame **cannot be hit** (click/hover fail silent),
+            // completely silent. Same 'silent degradation' family as core.paint_push_failures.
             self.world.interaction.put(eid, data) catch {
                 core.interaction_put_failures += 1;
             };
@@ -308,12 +312,9 @@ fn assertLayoutSyncIntegrityRecursive(self: *Cx, node: *Node) bool {
         const eid = world.ElementId.fromRaw(node.element_id_raw);
         const lr = self.rectOf(eid) orelse return false;
         const eps: f32 = 0.001;
-        // v0.5-P3 N-2 (2026-05-03 字段已删): frame_state.rect 已删，
-        // World.LayoutTable 是唯一 source-of-truth。原 frame_state vs
-        // LayoutTable 的 divergence 检测自动失效（divergence 不可能发生）。
-        // PaintTable.bounds vs LayoutTable.rect 的 invariant 仍在下面 enforce。
-        // v0.5-P3 Stage 3-3 Phase 5 (session 40): PaintTable.bounds 应等于 LayoutTable.rect
-        // （shadow-sync 由 syncPaintToTable 保证）。任何 PaintTable shadow 漏写都被此处 catch。
+        // World.LayoutTable is the sole source of truth for rect (no frame_state.rect).
+        // Invariant enforced below: PaintTable.bounds must equal LayoutTable.rect
+        // (shadow-sync guaranteed by syncPaintToTable). Any PaintTable shadow miss is caught here.
         if (self.world.paint.get(eid)) |chunk| {
             if (!chunk.bounds.isEmpty()) {
                 if (@abs(chunk.bounds.min_x - lr.x) > eps) return false;
@@ -323,10 +324,11 @@ fn assertLayoutSyncIntegrityRecursive(self: *Cx, node: *Node) bool {
             }
         }
         // v0.5-P3 Stage 3-2 Phase 2 attempt (session 41, REVERTED):
-        // 试图加 ElementTable 父子链结构一致性 invariant，但 Input/某些组件路径下
-        // Node.parent 与 World.elements parent 在 layout pass 中间会有 stale 状态
-        // （Input 组件内部 reparent 时序复杂）。撞墙 panic，已 revert。
-        // 真正的 ElementTable invariant gate 需要先精细化"何时同步" hook。
+        // tried adding ElementTable parent-child chain consistency invariant, but Node.parent vs
+        // World.elements parent are stale mid-layout pass (Input component reparent timing
+        // complex).
+        // Crashed panic, reverted. True ElementTable invariant gate needs prior hook 'sync when'
+        // granularity.
     }
     for (node.children.items) |child| {
         if (!assertLayoutSyncIntegrityRecursive(self, child)) return false;

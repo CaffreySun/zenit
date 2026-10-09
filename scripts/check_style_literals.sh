@@ -1,32 +1,46 @@
 #!/usr/bin/env bash
-# 样式字面量 ratchet —— examples/ 里**裸的**颜色/字号字面量只降不升。
-# 约定见 docs/STYLING.md：view 代码消费 token（styles.zig 具名样式函数），
-# 不写裸 `Color.hex(...)` / `.font_size = <数字>` 字面量。
+# Style literal ratchet: **bare** color/font-size literals in examples/ may only decrease.
+# Convention (docs/STYLING.md): view code consumes tokens (styles.zig named style functions) and
+# doesn't write bare `Color.hex(...)` / `.font_size = <number>` literals.
 #
-# 有意的 off-token 值走 `ui.arb.px(...)` / `ui.arb.hex(...)` 逃生舱
-# （对标 Panda arbitrary values）——不匹配下面的正则，天然放行。
+# Intentional off-token values use the `ui.arb.px(...)` / `ui.arb.hex(...)` escape hatch (parallel
+# to Panda arbitrary values); these don't match the regex below and pass.
 #
-# storybook 除外：它是组件展示画廊，包含刻意的样式演示。
+# Storybook is excepted: it is a component gallery with deliberate style demos.
 #
-# 基线降到 0 之前只 ratchet；降了请同步收紧 BASELINE。
+# .yix view files also count (style blocks can hold file-level Zig); .yss style recipes count per
+# their syntax (`#rrggbb` / `font-size: <number>`). Ratchet only until baseline reaches 0; tighten
+# BASELINE whenever the count drops.
 #
-# 退出码：0 通过；1 字面量数量超过基线；2 脚本错误
+# Exit codes: 0 pass; 1 literal count exceeds baseline; 2 script error
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-# 2026-08-09 基线：text_input(2) + multi_window(2) + virtual_list_perf(3)
-BASELINE=7
+# 2026-10-03: all non-storybook examples dropped to zero.
+BASELINE=0
 
-count=$(grep -rEn 'Color\.hex\(|\.font_size = [0-9]' examples --include='*.zig' \
-    | grep -v '^examples/storybook/' | wc -l | tr -d ' ')
+scan() {
+    rg -n "$@" -g '!examples/storybook/**' examples || {
+        status=$?
+        # rg 1 means no match; zero literals pass, tool error means script failure.
+        if (( status != 1 )); then exit 2; fi
+    }
+}
+zig_hits=$(scan -g '*.zig' -g '*.yix' 'Color\.hex\(|\.font_size = [0-9]')
+yss_hits=$(scan -g '*.yss' '#[0-9a-fA-F]{6}\b|font-size: *[0-9]')
+matches=$(printf '%s\n%s' "$zig_hits" "$yss_hits" | sed '/^$/d')
+count=0
+if [[ -n "$matches" ]]; then
+    count=$(printf '%s\n' "$matches" | wc -l | tr -d ' ')
+fi
 
 if (( count > BASELINE )); then
     echo "[FAIL] examples/ 样式字面量 ${count} 处 > 基线 ${BASELINE}"
     echo "       新增的字面量请改走 token（styles.zig 具名样式函数，见 docs/STYLING.md）："
-    grep -rEn 'Color\.hex\(|\.font_size = [0-9]' examples --include='*.zig' | grep -v '^examples/storybook/'
+    printf '%s\n' "$matches"
     exit 1
 fi
 

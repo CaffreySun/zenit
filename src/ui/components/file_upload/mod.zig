@@ -1,93 +1,100 @@
-/// FileUpload，文件选择区（B5）
+/// FileUpload: file select area.
 ///
-/// 文件对话框：
-///   - `on_browse` 未提供时，"Browse…" 默认走原生 NSOpenPanel
-///     （`cx.openFilePanel`，system_sdk `file_dialog` capability；headless/无
-///     SDK 环境下静默 no-op）。注意 runModal 同步阻塞帧循环。
-///   - `on_browse` 提供时优先（宿主自行调起对话框/自定义来源，用
-///     `state.addFile(path)` 程序化回填），e2e/storybook 走此路径。
-///   - 文件列表行 + × 移除
-/// 拖放：提示区即 drop target，从 Finder 拖文件进来会逐条 addFile，
-/// 悬停期间换边框/底色高亮。窗口内元素互拖（reorder）仍不支持。
+/// Data: `files: Model([]const []const u8)` (full paths). `*Signal` must be created via
+/// `scope.createList([]const u8, ...)` (path bytes copied by signal).
+/// File rows rebuild with `files`; Browse / drag / delete only propose a new path list.
+///
+/// File dialog:
+///   - without `on_browse`, 'Browse...' uses native NSOpenPanel
+///     (`cx.openFilePanel`, system_sdk `file_dialog` capability; no-op when headless/no SDK).
+///     runModal blocks the frame loop synchronously.
+///   - `on_browse` takes priority (host invokes dialog/custom source); host fills via
+///     `result.add(path)` (same proposal pipeline), or writes its own files signal.
+/// Drag-drop: hint zone is the drop target; files dragged from Finder are added one by one;
+/// hover highlights border/background. Intra-window drag (reorder) not supported.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const core = @import("../../core.zig");
+const view = @import("../../view.zig");
 const Cx = core.Cx;
 const Node = core.Node;
 const box = core.box;
-const Padding = core.Padding;
-const Color = core.Color;
-const theme = core.theme;
-const Scope = @import("../../reactive.zig").Scope;
+const reactive = @import("../../reactive.zig");
+const Scope = reactive.Scope;
+const Signal = reactive.Signal;
+const Source = reactive.Source;
+const Model = reactive.Model;
+const Handler = core.Handler;
+const bind_mod = @import("../../bind.zig");
 const button_mod = @import("../button/mod.zig");
 const styles = @import("styles.zig");
-const DeferredEntry = @import("../../reactive/deferred_disposal.zig").Entry;
 
 pub const FileUploadProps = struct {
     width: f32 = 360,
+    /// Max files to retain (exceeding adds discarded)
     max_files: usize = 8,
-    hint: []const u8 = "Click Browse to add files",
-    /// Browse 按钮回调（宿主调起对话框后用 state.addFile 回填）。
-    /// null = 默认原生 NSOpenPanel（cx.openFilePanel）。
-    on_browse: ?core.HandlerRef = null,
-    /// 文件列表变化回调
-    on_change: ?core.HandlerRef = null,
+    /// Hint text (also a11y description for entire group)
+    hint: Source([]const u8) = .{ .value = "Click Browse to add files" },
+    /// Selected file full paths
+    files: Model([]const []const u8) = .{ .local = &.{} },
+    /// Called after user adds / removes and lands (landed value). Same list as split parent sees,
+    /// valid only during this sync call (elements may point to event buffer); to keep, write to
+    /// owned signal or copy on-site
+    on_change: ?Handler([]const []const u8) = null,
+    /// Custom Browse (host fills via `result.add(path)`); null = native NSOpenPanel
+    on_browse: ?Handler(void) = null,
 };
 
-const FileEntry = struct {
-    path: []u8,
-    row_node: *Node,
-    /// false = 已移除但 path 仍归 state（仅延迟释放分配失败时的降级路径：槽不复用，
-    /// path 在 scope cleanup 释放）。正常移除把槽置 null 供复用。
-    active: bool = true,
-};
+/// Create FileUpload: `W.FileUpload(.{ .files = picked, .max_files = 4 }).mount(scope, cx)`
+pub fn FileUpload(props: anytype) FileUploadBuilder {
+    return .{ .props = reactive.props.coerce(FileUploadProps, props) };
+}
 
-const RemoveCtx = struct {
-    state: *FileUploadState,
-    slot: usize,
-};
+pub const FileUploadBuilder = struct {
+    props: FileUploadProps,
 
-/// 移除后释放 path：行节点的 TextProps / a11y label 仍借用这段字节，而 freeNode 在
-/// reactive / tick 深度里只是排队，必须排进与 freeNode 同一条延迟队列，节点在前、path 在后。
-const DeferredBytes = struct {
-    entry: DeferredEntry = .{},
-    alloc: Allocator,
-    bytes: []u8,
-
-    fn dispose(ptr: *anyopaque) void {
-        const d: *DeferredBytes = @ptrCast(@alignCast(ptr));
-        d.alloc.free(d.bytes);
-        d.alloc.destroy(d);
-    }
-
-    /// 紧跟在对应的 freeNode 之后调用。分配失败返回 false（调用方保留所有权）。
-    fn freeAfterNode(cx: *Cx, alloc: Allocator, bytes: []u8) bool {
-        const d = alloc.create(DeferredBytes) catch return false;
-        d.* = .{ .alloc = alloc, .bytes = bytes };
-        cx.deferDisposalLikeFreeNode(&d.entry, @ptrCast(d), dispose);
-        return true;
+    pub fn mount(self: FileUploadBuilder, scope: *Scope, cx: *Cx) !FileUploadResult {
+        cx.owner.enterMount();
+        defer cx.owner.exitMount();
+        return mountImpl(self.props, scope, cx);
     }
 };
 
-pub const FileUploadState = struct {
-    alloc: Allocator,
+pub const FileUploadResult = struct {
+    wrapper: *Node,
+    /// Files list signal (`ui.split` when null)
+    files: ?*Signal([]const []const u8),
+    /// Hint zone (drop target)
+    drop_zone: *Node,
+    rt: *FileUploadRuntime,
+
+    /// Programmatically add one file (custom Browse fill): same proposal pipeline as drag
+    pub fn add(self: FileUploadResult, path: []const u8) void {
+        self.rt.addPaths(&.{path});
+    }
+    /// `ui.view` entry (see src/ui/view_parts.zig).
+    pub fn viewParts(self: FileUploadResult) core.ViewParts {
+        return .{ .root = self.wrapper };
+    }
+};
+
+/// Runtime (scope-owned). View = f(files): rows rebuild via `ui.rebuildOn` when files changes.
+pub const FileUploadRuntime = struct {
     cx: *Cx,
-    files: [32]?FileEntry = [_]?FileEntry{null} ** 32,
-    remove_ctxs: [32]RemoveCtx = undefined,
-    count: usize = 0,
+    files: reactive.Bound([]const []const u8),
+    on_change: ?Handler([]const []const u8),
     max_files: usize,
     list: *Node,
-    /// 提示区 = drop target，悬停时改边框/底色
+    /// Hint zone = drop target, hover changes border/background
     drop_zone: *Node,
     drop_hover: bool = false,
-    on_change: ?core.HandlerRef = null,
 
-    pub fn fileCount(self: *const FileUploadState) usize {
-        return self.count;
+    pub fn fileCount(self: *const FileUploadRuntime) usize {
+        return self.files.peek().len;
     }
 
-    /// 拖放悬停高亮：换 drop_zone 的边框/底色。
-    pub fn setDropHover(self: *FileUploadState, active: bool) void {
+    /// Drag-drop hover highlight: swap drop_zone border/background.
+    pub fn setDropHover(self: *FileUploadRuntime, active: bool) void {
         if (self.drop_hover == active) return;
         self.drop_hover = active;
         const colors = styles.dropZoneColors(active, self.cx.tokens);
@@ -95,270 +102,375 @@ pub const FileUploadState = struct {
         self.drop_zone.setBorderColor(colors.border);
     }
 
-    /// 程序化添加文件（拷贝 path）。超上限 no-op。
-    pub fn addFile(self: *FileUploadState, path: []const u8) !void {
-        if (path.len == 0 or self.count >= self.max_files) return;
-        const slot = blk: {
-            for (&self.files, 0..) |*s, i| {
-                if (s.* == null) break :blk i;
-            }
+    /// Propose current list + paths (skip empty paths, discard over max_files)
+    pub fn addPaths(self: *FileUploadRuntime, paths: []const []const u8) void {
+        const cur = self.files.peek();
+        var n_new: usize = 0;
+        for (paths) |p| {
+            if (p.len > 0) n_new += 1;
+        }
+        if (n_new == 0 or cur.len >= self.max_files) return;
+        const total = @min(cur.len + n_new, self.max_files);
+        const buf = self.cx.allocator.alloc([]const u8, total) catch |err| {
+            std.log.err("[FileUpload] add failed: {}", .{err});
             return;
         };
-        const t = self.cx.tokens;
-        const copy = try self.alloc.dupe(u8, path);
-        errdefer self.alloc.free(copy);
-
-        // 文件名（basename）展示，完整路径悬浮可加 tooltip（后续）
-        const base = std.fs.path.basename(copy);
-
-        const row = try box(self.cx, styles.fileRowStyle(t), .{});
-        row.behavior.interaction.a11y = .{ .role = .listitem, .label = base };
-        const name_node = try box(self.cx, .{ .width = .{ .grow = .{} }, .height = .{ .fit = .{} } }, .{});
-        var name_txt = styles.fileNameTextStyle(t);
-        name_txt.content = base;
-        name_node.setText(name_txt);
-        try row.appendChild(self.alloc, name_node);
-
-        const close = try box(self.cx, styles.removeBtnStyle(t), .{});
-        close.style.cursor = .pointer;
-        // 子树文本是字面量 "x"，靠 fallback 会被读成字母 x。给出文件名让
-        // AT 用户知道自己要移除的是哪一个。
-        close.behavior.interaction.a11y = .{ .role = .button, .label = "Remove file" };
-        const x_node = try box(self.cx, .{ .width = .{ .fit = .{} }, .height = .{ .fit = .{} } }, .{});
-        var x_txt = styles.removeGlyphTextStyle(t);
-        x_txt.content = "x";
-        x_node.setText(x_txt);
-        try close.appendChild(self.alloc, x_node);
-        self.remove_ctxs[slot] = .{ .state = self, .slot = slot };
-        close.behavior.events.on_click = .{ .callback = onRemoveClick, .context = @ptrCast(&self.remove_ctxs[slot]) };
-        try row.appendChild(self.alloc, close);
-
-        try self.list.appendChild(self.alloc, row);
-        self.files[slot] = .{ .path = copy, .row_node = row };
-        self.count += 1;
-        self.list.markLayoutDirty();
-        if (self.on_change) |h| h.invoke();
-    }
-
-    pub fn removeSlot(self: *FileUploadState, slot: usize) void {
-        if (self.files[slot]) |*e| {
-            if (!e.active) return;
-            self.list.removeChild(e.row_node);
-            self.cx.freeNode(e.row_node);
-            if (DeferredBytes.freeAfterNode(self.cx, self.alloc, e.path)) {
-                self.files[slot] = null; // 槽可复用（此前永不复用，32 次 add 后静默丢文件）
-            } else {
-                e.active = false;
-            }
-            if (self.count > 0) self.count -= 1;
-            self.list.markLayoutDirty();
-            if (self.on_change) |h| h.invoke();
+        defer self.cx.allocator.free(buf);
+        @memcpy(buf[0..cur.len], cur);
+        var n = cur.len;
+        for (paths) |p| {
+            if (p.len == 0) continue;
+            if (n >= total) break;
+            buf[n] = p;
+            n += 1;
         }
+        self.propose(buf[0..n]);
     }
-};
 
-fn onRemoveClick(ctx: *anyopaque) void {
-    const c: *RemoveCtx = @ptrCast(@alignCast(ctx));
-    c.state.removeSlot(c.slot);
-}
-
-/// 默认 Browse：原生打开文件面板 -> addFile 回填。
-/// 无 SDK / 不支持 / 取消 / 出错时 no-op。
-fn onNativeBrowse(ctx: *anyopaque) void {
-    const state: *FileUploadState = @ptrCast(@alignCast(ctx));
-    var path_buf: [1024]u8 = undefined;
-    const path = core.platform_services.openFilePanel(state.cx.system_sdk, &path_buf) orelse return;
-    // 用户已经在原生面板里明确选了文件：失败静默 no-op 会让文件凭空不出现，
-    // 与「取消选择」无法区分（取消走上面的 orelse return）。回调无法传播 -> panic。
-    state.addFile(path) catch @panic("OOM: FileUpload 无法添加原生面板选中的文件");
-}
-
-/// 从 Finder 拖入：paths 是换行分隔的路径列表，逐条 addFile。
-/// 超 max_files 的部分由 addFile 自身 no-op 吃掉。
-fn onDropFiles(self: *FileUploadState, paths: []const u8) void {
-    self.setDropHover(false);
-    if (paths.len == 0) return;
-    var it = std.mem.splitScalar(u8, paths, '\n');
-    while (it.next()) |p| {
-        const trimmed = std.mem.trim(u8, p, " \t\r");
-        if (trimmed.len == 0) continue;
-        // 超 max_files 是 addFile 内部的 `return`（非 error），不受这里影响；
-        // 能到这里的只有分配失败，吞掉会让拖入的文件静默消失。
-        self.addFile(trimmed) catch @panic("OOM: FileUpload 无法添加拖入的文件");
+    /// Propose removing file at index
+    pub fn removeAt(self: *FileUploadRuntime, index: usize) void {
+        const cur = self.files.peek();
+        if (index >= cur.len) return;
+        const buf = self.cx.allocator.alloc([]const u8, cur.len - 1) catch |err| {
+            std.log.err("[FileUpload] remove failed: {}", .{err});
+            return;
+        };
+        defer self.cx.allocator.free(buf);
+        @memcpy(buf[0..index], cur[0..index]);
+        @memcpy(buf[index..], cur[index + 1 ..]);
+        self.propose(buf);
     }
-}
 
-fn onDropEnter(self: *FileUploadState) void {
-    self.setDropHover(true);
-}
+    fn propose(self: *FileUploadRuntime, v: []const []const u8) void {
+        const on_change = self.on_change;
+        const landed = self.files.commit(v) orelse return;
+        if (on_change) |h| h.call(landed);
+    }
 
-fn onDropLeave(self: *FileUploadState) void {
-    self.setDropHover(false);
-}
+    // ---- File rows (ui.rebuildOn) ----
 
-pub const FileUploadMount = struct {
-    wrapper: *Node,
-    state: *FileUploadState,
-};
-
-pub fn mountFileUpload(props: FileUploadProps, scope: *Scope, cx: *Cx) !FileUploadMount {
-    const my_scope = try scope.childScope();
-    const allocator = cx.allocator;
-    const t = cx.tokens;
-
-    const state = try my_scope.allocator.create(FileUploadState);
-    // sweep：adoptResource 失败当场跑 cleanup、之后任何一步失败也会经 scope 级联跑到它，
-    // 而 cleanup 会遍历 files 释放 path, state 此刻还没初始化（0xaa），必须先把 files 清空。
-    state.files = [_]?FileEntry{null} ** 32;
-    try my_scope.adoptResource(@ptrCast(state), struct {
-        fn cleanup(ptr: *anyopaque, alloc: Allocator) void {
-            const s: *FileUploadState = @ptrCast(@alignCast(ptr));
-            for (&s.files) |*maybe| {
-                if (maybe.*) |e| {
-                    alloc.free(e.path);
-                    maybe.* = null;
-                }
-            }
-            alloc.destroy(s);
+    fn filesKey(files: []const []const u8) u64 {
+        var h = std.hash.Wyhash.init(0);
+        h.update(std.mem.asBytes(&files.len));
+        for (files) |f| {
+            h.update(std.mem.asBytes(&f.len));
+            h.update(f);
         }
-    }.cleanup);
+        return h.final();
+    }
 
-    const wrapper = try box(cx, styles.wrapperStyle(props.width), .{});
-    wrapper.meta.ownership.meta.component_name = "FileUpload";
-    // sweep：wrapper 守到 return（连带 dispose 绑上的 my_scope）；子节点建好即 adopt
-    errdefer cx.freeNode(wrapper);
-    try core.bindScopeToNode(my_scope, wrapper);
-    // role=group + label：把"提示文字 + Browse 按钮 + 已选文件列表"绑成一个
-    // 有名字的整体。否则 AT 用户 tab 到 Browse 按钮时，完全不知道它属于
-    // 哪个上传控件，也听不到 hint 里写的格式/大小限制。
-    wrapper.behavior.interaction.a11y = .{
-        .role = .group,
-        .label = "File upload",
-        .description = props.hint,
+    const RemoveCtx = struct {
+        rt: *FileUploadRuntime,
+        index: usize,
+
+        fn fire(ptr: *anyopaque) void {
+            const c: *RemoveCtx = @ptrCast(@alignCast(ptr));
+            c.rt.removeAt(c.index);
+        }
     };
 
-    // 提示区 + Browse 按钮
-    const drop_zone = try core.adoptChild(cx, allocator, wrapper, try box(cx, styles.dropZoneStyle(t), .{}));
-    const hint_node = try core.adoptChild(cx, allocator, drop_zone, try box(cx, .{ .width = .{ .fit = .{} }, .height = .{ .fit = .{} } }, .{}));
-    var hint_txt = styles.hintTextStyle(t);
-    hint_txt.content = props.hint;
-    hint_node.setText(hint_txt);
+    const Ctxs = struct {
+        items: []RemoveCtx = &.{},
 
-    const browse_btn = try button_mod.Button(.{
-        .label = "Browse…",
-        .variant = .secondary,
-        .size = .sm,
-        .on_click = props.on_browse orelse core.HandlerRef{ .callback = onNativeBrowse, .context = @ptrCast(state) },
-    }).mount(my_scope, cx);
-    _ = try core.adoptChild(cx, allocator, drop_zone, browse_btn);
+        fn destroy(ptr: *anyopaque, alloc: Allocator) void {
+            const c: *Ctxs = @ptrCast(@alignCast(ptr));
+            alloc.free(c.items);
+            alloc.destroy(c);
+        }
+    };
 
-    // 文件列表
-    const list = try core.adoptChild(cx, allocator, wrapper, try box(cx, styles.listStyle(t), .{}));
-    // 已选文件是一份列表，role=list 让 AT 播报"共 N 项"。
-    list.behavior.interaction.a11y = .{ .role = .list, .label = "Selected files" };
+    fn buildRows(self: *FileUploadRuntime, child: *Scope, list: *Node, files: []const []const u8) !void {
+        const cx = self.cx;
+        const ctxs = try child.allocator.create(Ctxs);
+        ctxs.* = .{};
+        try child.adoptResource(@ptrCast(ctxs), Ctxs.destroy);
+        ctxs.items = try child.allocator.alloc(RemoveCtx, files.len);
+        for (ctxs.items, 0..) |*c, i| c.* = .{ .rt = self, .index = i };
+        try view.mount(child, cx, list, view.items(ctxs.items, files, rowElement));
+    }
 
-    state.* = .{
-        .alloc = my_scope.allocator,
+    fn rowElement(ctxs: []RemoveCtx, path: []const u8, i: usize) view.ComponentOf(buildRow) {
+        return view.component(buildRow, RowArgs{ .path = path, .remove = &ctxs[i] });
+    }
+
+    const RowArgs = struct { path: []const u8, remove: *RemoveCtx };
+
+    fn buildRow(args: RowArgs, scope: *Scope, cx: *Cx) !*Node {
+        const t = cx.tokens;
+        var name_node: *Node = undefined;
+        const row = try view.render(scope, cx, view.box(.{ .style = styles.fileRowStyle(t) }, .{
+            // Filename (basename) fills line remainder (pushes x to line end); text copied into
+            // node itself (not borrowed from signal double-buffer)
+            view.capture(&name_node, view.attrs(.{ .style = core.BoxStyle{ .width = .{ .grow = .{} } } }, view.text(.{ .style = styles.fileNameTextStyle(t) }, std.fs.path.basename(args.path)))),
+            view.box(.{
+                .style = .{ styles.removeBtnStyle(t), core.BoxStyle{ .cursor = .pointer } },
+                // Subtree text is literal 'x', fallback reads as letter x.
+                .a11y = core.A11yProps{ .role = .button, .label = "Remove file" },
+                .on_click = core.Cx.simpleHandler(RemoveCtx.fire, args.remove),
+            }, view.text(.{ .style = styles.removeGlyphTextStyle(t) }, "x")),
+        }));
+        // Row a11y name points to node's own text copy
+        row.behavior.interaction.a11y = .{ .role = .listitem, .label = name_node.getText().?.content };
+        return row;
+    }
+};
+
+/// Default Browse: native open file panel -> propose add.
+/// No SDK / unsupported / cancel: no-op.
+fn onNativeBrowse(ptr: *anyopaque) void {
+    const rt: *FileUploadRuntime = @ptrCast(@alignCast(ptr));
+    var path_buf: [1024]u8 = undefined;
+    const path = core.platform_services.openFilePanel(rt.cx.system_sdk, &path_buf) orelse return;
+    rt.addPaths(&.{path});
+}
+
+/// Drag from Finder: paths are newline-delimited list, propose all at once (empty lines skipped in
+/// addPaths)
+fn onDropFiles(rt: *FileUploadRuntime, paths: []const u8) void {
+    rt.setDropHover(false);
+    const a = rt.cx.allocator;
+    const list = a.alloc([]const u8, std.mem.count(u8, paths, "\n") + 1) catch |err| {
+        std.log.err("[FileUpload] drop failed: {}", .{err});
+        return;
+    };
+    defer a.free(list);
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, paths, '\n');
+    while (it.next()) |p| : (n += 1) list[n] = std.mem.trim(u8, p, " \t\r");
+    rt.addPaths(list[0..n]);
+}
+
+fn onDropEnter(rt: *FileUploadRuntime) void {
+    rt.setDropHover(true);
+}
+
+fn onDropLeave(rt: *FileUploadRuntime) void {
+    rt.setDropHover(false);
+}
+
+fn mountImpl(props: FileUploadProps, scope: *Scope, cx: *Cx) !FileUploadResult {
+    const my_scope = try scope.childScope();
+    var scope_bound = false;
+    errdefer if (!scope_bound) my_scope.dispose();
+    const t = cx.tokens;
+    reactive.checkBorrow(my_scope, props.hint);
+
+    // Structure: hint zone (hint text + Browse button) + selected files list
+    const Parts = struct { drop_zone: *Node = undefined, hint: *Node = undefined, list: *Node = undefined };
+    var parts: Parts = .{};
+    const wrapper = try view.render(my_scope, cx, view.box(.{
+        .style = styles.wrapperStyle(props.width),
+        // role=group + label: binds 'hint text + Browse button + file list' as single named unit,
+        // so AT users tabbing to Browse know which upload control, hear hint.
+        .a11y = .{ .role = .group, .label = "File upload" },
+    }, .{
+        view.capture(&parts.drop_zone, view.box(.{ .style = styles.dropZoneStyle(t) }, view.capture(&parts.hint, view.text(.{ .style = styles.hintTextStyle(t) }, props.hint.peek())))),
+        // Selected files are a list, role=list tells AT 'N items total'.
+        view.capture(&parts.list, view.box(.{ .style = styles.listStyle(t), .a11y = .{ .role = .list, .label = "Selected files" } }, {})),
+    }));
+    wrapper.meta.ownership.meta.component_name = "FileUpload";
+    // sweep: wrapper guards to return (carries dispose of bound my_scope)
+    errdefer cx.freeNode(wrapper);
+    try core.bindScopeToNode(my_scope, wrapper);
+    scope_bound = true;
+
+    const files = try reactive.resolveListModel([]const u8, my_scope, props.files);
+    const rt = try my_scope.allocator.create(FileUploadRuntime);
+    try my_scope.adoptResource(@ptrCast(rt), struct {
+        fn destroy(ptr: *anyopaque, alloc: Allocator) void {
+            alloc.destroy(@as(*FileUploadRuntime, @ptrCast(@alignCast(ptr))));
+        }
+    }.destroy);
+
+    const drop_zone = parts.drop_zone;
+    const hint_node = parts.hint;
+    const list = parts.list;
+    // Initial value synced into view.text; changes tracked by binding.
+    // Hint text also a11y description for group (points to node's own copy)
+    try bind_mod.bindTextA11y(cx, my_scope, props.hint, hint_node, wrapper, .description);
+
+    rt.* = .{
         .cx = cx,
+        .files = files,
+        .on_change = props.on_change,
         .max_files = props.max_files,
         .list = list,
         .drop_zone = drop_zone,
-        .on_change = props.on_change,
     };
+    wrapper.addDebugState(@ptrCast(rt));
 
-    // 从 Finder 拖文件进提示区即添加（点击 Browse 之外的第二条入口）。
-    // 必须在 state.* 初始化之后挂：handler 捕获的是 state 指针。
-    drop_zone.behavior.events.on_drag_enter =
-        core.Cx.handlerFrom(FileUploadState, state, onDropEnter);
-    drop_zone.behavior.events.on_drag_leave =
-        core.Cx.handlerFrom(FileUploadState, state, onDropLeave);
-    drop_zone.behavior.events.on_drop =
-        core.Cx.strHandlerFrom(FileUploadState, state, onDropFiles);
+    const browse_btn = button_mod.Button(.{
+        .label = "Browse…",
+        .variant = .secondary,
+        .size = .sm,
+        .on_click = props.on_browse orelse core.Cx.simpleHandler(onNativeBrowse, rt),
+    });
+    try view.mount(my_scope, cx, drop_zone, browse_btn);
 
-    return .{ .wrapper = wrapper, .state = state };
+    // Drag files into hint zone to add (second entry besides Browse button)
+    drop_zone.behavior.events.on_drag_enter = core.Cx.handlerFrom(FileUploadRuntime, rt, onDropEnter);
+    drop_zone.behavior.events.on_drag_leave = core.Cx.handlerFrom(FileUploadRuntime, rt, onDropLeave);
+    drop_zone.behavior.events.on_drop = core.Cx.strHandlerFrom(FileUploadRuntime, rt, onDropFiles);
+
+    // files is Model: rebuildOn rebuilds with it (local also signal, must have effect)
+    try bind_mod.rebuildOn(cx, my_scope, files.read, list, rt, FileUploadRuntime.filesKey, FileUploadRuntime.buildRows);
+
+    return .{ .wrapper = wrapper, .files = files.asSignal(), .drop_zone = drop_zone, .rt = rt };
 }
 
 // ============================================================================
 
-test "FileUpload: addFile/removeSlot + max_files" {
-    const testing = std.testing;
-    var cx = try Cx.init(testing.allocator);
-    defer cx.deinit();
-    const root = try box(cx, .{ .width = .{ .px = 600 }, .height = .{ .px = 400 } }, .{});
-    cx.root = root;
-    const scope = try Scope.init(testing.allocator, null, cx.owner);
-    defer scope.dispose();
+const testing = std.testing;
 
-    const fu = try mountFileUpload(.{ .max_files = 2 }, scope, cx);
-    try root.appendChild(testing.allocator, fu.wrapper);
-
-    try fu.state.addFile("/tmp/a.txt");
-    try fu.state.addFile("/tmp/b.txt");
-    try fu.state.addFile("/tmp/c.txt"); // 超上限 no-op
-    try testing.expectEqual(@as(usize, 2), fu.state.fileCount());
-
-    fu.state.removeSlot(0);
-    try testing.expectEqual(@as(usize, 1), fu.state.fileCount());
-    fu.state.removeSlot(0); // 重复移除 no-op
-    try testing.expectEqual(@as(usize, 1), fu.state.fileCount());
+fn rowNames(r: FileUploadResult, out: [][]const u8) [][]const u8 {
+    for (r.rt.list.children.items, 0..) |row, i| out[i] = row.children.items[0].getText().?.content;
+    return out[0..r.rt.list.children.items.len];
 }
 
-test "FileUpload: 移除后槽位复用，增删超过 32 次仍能添加" {
-    const testing = std.testing;
-    var cx = try Cx.init(testing.allocator);
+test "FileUpload: 添加 / 移除只提议；行跟随 files；max_files 截断" {
+    var cx = try Cx.init(testing.allocator, std.testing.io);
     defer cx.deinit();
-    const root = try box(cx, .{ .width = .{ .px = 600 }, .height = .{ .px = 400 } }, .{});
-    cx.root = root;
     const scope = try Scope.init(testing.allocator, null, cx.owner);
     defer scope.dispose();
 
-    const fu = try mountFileUpload(.{}, scope, cx);
-    try root.appendChild(testing.allocator, fu.wrapper);
-    var i: usize = 0;
-    while (i < 40) : (i += 1) {
-        try fu.state.addFile("/tmp/a.txt");
-        try testing.expectEqual(@as(usize, 1), fu.state.fileCount());
-        fu.state.removeSlot(0);
-        try testing.expectEqual(@as(usize, 0), fu.state.fileCount());
+    const Spy = struct {
+        n: usize = 0,
+        fn f(self: *@This(), _: []const []const u8) void {
+            self.n += 1;
+        }
+    };
+    var spy = Spy{};
+    const fu = try FileUpload(.{ .max_files = 2, .on_change = cx.on(Spy, &spy, Spy.f) }).mount(scope, cx);
+    defer cx.freeNode(fu.wrapper);
+
+    var tmp = "/tmp/a.txt".*;
+    fu.add(&tmp);
+    tmp[5] = 'Z'; // Caller's temp buffer change has no effect
+    fu.add("/tmp/b.txt");
+    fu.add("/tmp/c.txt"); // Over limit: no-op
+    try testing.expectEqual(@as(usize, 2), fu.rt.fileCount());
+    try testing.expectEqualStrings("/tmp/a.txt", fu.files.?.peek()[0]);
+    var names: [8][]const u8 = undefined;
+    const shown = rowNames(fu, &names);
+    try testing.expectEqual(@as(usize, 2), shown.len);
+    try testing.expectEqualStrings("a.txt", shown[0]);
+    try testing.expectEqualStrings("b.txt", shown[1]);
+    try testing.expectEqual(@as(usize, 2), spy.n);
+
+    // Click × on first row
+    const close = fu.rt.list.children.items[0].children.items[1];
+    close.behavior.events.on_click.?.invoke();
+    try testing.expectEqual(@as(usize, 1), fu.rt.fileCount());
+    try testing.expectEqualStrings("b.txt", rowNames(fu, &names)[0]);
+    try testing.expectEqual(@as(usize, 3), spy.n);
+}
+
+test "FileUpload: 增删超过 32 次仍能添加（行随数据重建，不再有固定槽位）" {
+    var cx = try Cx.init(testing.allocator, std.testing.io);
+    defer cx.deinit();
+    const scope = try Scope.init(testing.allocator, null, cx.owner);
+    defer scope.dispose();
+    const fu = try FileUpload(.{}).mount(scope, cx);
+    defer cx.freeNode(fu.wrapper);
+    for (0..40) |_| {
+        fu.add("/tmp/a.txt");
+        try testing.expectEqual(@as(usize, 1), fu.rt.list.children.items.len);
+        fu.rt.removeAt(0);
+        try testing.expectEqual(@as(usize, 0), fu.rt.list.children.items.len);
     }
 }
 
-test "FileUpload: 拖入多行路径逐条添加 + 悬停高亮复位" {
-    const testing = std.testing;
-    var cx = try Cx.init(testing.allocator);
+test "FileUpload: 拖入多行路径一次添加 + 悬停高亮复位" {
+    var cx = try Cx.init(testing.allocator, std.testing.io);
     defer cx.deinit();
-    const root = try box(cx, .{ .width = .{ .px = 600 }, .height = .{ .px = 400 } }, .{});
-    cx.root = root;
+    const scope = try Scope.init(testing.allocator, null, cx.owner);
+    defer scope.dispose();
+    const fu = try FileUpload(.{ .max_files = 2 }).mount(scope, cx);
+    defer cx.freeNode(fu.wrapper);
+
+    // drop_zone really is drop target (has handler)
+    try testing.expect(fu.drop_zone.behavior.events.on_drop != null);
+    fu.rt.setDropHover(true);
+    try testing.expect(fu.rt.drop_hover);
+    // Newline separator + empty lines + over limit all verified
+    fu.drop_zone.behavior.events.on_drop.?.invokeWithStr("/tmp/a.txt\n\n/tmp/b.txt\n/tmp/c.txt");
+    try testing.expectEqual(@as(usize, 2), fu.rt.fileCount());
+    // After drop, highlight must reset, else keeps showing after drag
+    try testing.expect(!fu.rt.drop_hover);
+}
+
+test "FileUpload: 一次拖入超过 64 个路径不丢（max_files 足够时全部添加）" {
+    var cx = try Cx.init(testing.allocator, std.testing.io);
+    defer cx.deinit();
+    const scope = try Scope.init(testing.allocator, null, cx.owner);
+    defer scope.dispose();
+    const fu = try FileUpload(.{ .max_files = 100 }).mount(scope, cx);
+    defer cx.freeNode(fu.wrapper);
+    var buf: [100 * 16]u8 = undefined;
+    var w: usize = 0;
+    for (0..80) |i| {
+        const line = try std.fmt.bufPrint(buf[w..], "/tmp/f{d}.txt\n", .{i});
+        w += line.len;
+    }
+    fu.drop_zone.behavior.events.on_drop.?.invokeWithStr(buf[0..w]);
+    try testing.expectEqual(@as(usize, 80), fu.rt.fileCount());
+}
+
+test "FileUpload: 外部写入 files 刷新行；ui.split 拒绝时不动；非 createList 的 signal 被拒" {
+    var cx = try Cx.init(testing.allocator, std.testing.io);
+    defer cx.deinit();
     const scope = try Scope.init(testing.allocator, null, cx.owner);
     defer scope.dispose();
 
-    const fu = try mountFileUpload(.{ .max_files = 2 }, scope, cx);
-    try root.appendChild(testing.allocator, fu.wrapper);
+    const files = try scope.createList([]const u8, &.{"/x/one.png"});
+    const fu = try FileUpload(.{ .files = files }).mount(scope, cx);
+    defer cx.freeNode(fu.wrapper);
+    var names: [8][]const u8 = undefined;
+    try testing.expectEqualStrings("one.png", rowNames(fu, &names)[0]);
+    files.set(&.{ "/y/two.png", "/y/three.png" });
+    try testing.expectEqual(@as(usize, 2), rowNames(fu, &names).len);
+    try testing.expectEqualStrings("three.png", rowNames(fu, &names)[1]);
 
-    // drop_zone 必须真的是 drop target（挂了 handler）
-    try testing.expect(fu.state.drop_zone.behavior.events.on_drop != null);
+    const Parent = struct {
+        sig: *Signal([]const []const u8),
+        fn write(_: *@This(), _: []const []const u8) void {}
+    };
+    var parent = Parent{ .sig = try scope.createList([]const u8, &.{}) };
+    const fu2 = try FileUpload(.{ .files = reactive.split(parent.sig, cx.on(Parent, &parent, Parent.write)) }).mount(scope, cx);
+    defer cx.freeNode(fu2.wrapper);
+    try testing.expect(fu2.files == null);
+    fu2.add("/tmp/a.txt");
+    try testing.expectEqual(@as(usize, 0), fu2.rt.list.children.items.len);
 
-    fu.state.setDropHover(true);
-    try testing.expect(fu.state.drop_hover);
-
-    // 换行分隔 + 空行 + 超上限一并验证
-    fu.state.drop_zone.behavior.events.on_drop.?.invokeWithStr("/tmp/a.txt\n\n/tmp/b.txt\n/tmp/c.txt");
-    try testing.expectEqual(@as(usize, 2), fu.state.fileCount());
-    // drop 后高亮必须复位，否则拖完一直亮着
-    try testing.expect(!fu.state.drop_hover);
+    const borrowed = try scope.createSignal([]const []const u8, &.{});
+    try testing.expectError(error.ListModelNotOwned, FileUpload(.{ .files = borrowed }).mount(scope, cx));
 }
 
-// styles.zig 的测试收集，这行是必需的，见 docs/STYLING.md
+test "FileUpload: 动态提示文字同步到整组的无障碍描述" {
+    var cx = try Cx.init(testing.allocator, std.testing.io);
+    defer cx.deinit();
+    const scope = try Scope.init(testing.allocator, null, cx.owner);
+    defer scope.dispose();
+    const hint = try scope.createText("PNG only", .{});
+    const fu = try FileUpload(.{ .hint = hint }).mount(scope, cx);
+    defer cx.freeNode(fu.wrapper);
+    try testing.expectEqualStrings("PNG only", fu.wrapper.behavior.interaction.a11y.?.description.?);
+    hint.set("PNG or JPEG, up to 5 MB");
+    try testing.expectEqualStrings("PNG or JPEG, up to 5 MB", fu.wrapper.behavior.interaction.a11y.?.description.?);
+}
+
+// styles.zig test collection, this line required, see docs/STYLING.md
 test {
     _ = @import("styles.zig");
 }
 
-// 逐分配点 OOM sweep，见 src/ui/components/oom_sweep.zig
+// Per-alloc OOM sweep, see src/ui/components/oom_sweep.zig
 test "file_upload: mount 在任意分配点失败时不泄漏（sweep）" {
     const sw = @import("../oom_sweep.zig");
     try sw.sweepMount("file_upload", struct {
         fn m(scope: *sw.Scope, cx: *sw.Cx) anyerror!?*sw.Node {
-            return (try mountFileUpload(.{ .max_files = 2 }, scope, cx)).wrapper;
+            const files = try scope.createList([]const u8, &.{ "/tmp/a.txt", "/tmp/b.txt" });
+            return (try FileUpload(.{ .max_files = 2, .files = files }).mount(scope, cx)).wrapper;
         }
     }.m);
 }

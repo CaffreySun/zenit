@@ -104,6 +104,26 @@ void* coretext_find_font(const char* family, float size, int weight, int italic)
 
         NSString *familyName = [NSString stringWithUTF8String:family];
 
+        // "system-ui": the platform UI font (SF Pro). Its family is hidden from descriptor
+        // lookups; CTFontCreateUIFontForLanguage gives it with the size's optical size and
+        // tracking, and a weight trait picks the instance.
+        if ([familyName isEqualToString:@"system-ui"]) {
+            CTFontRef sys = CTFontCreateUIFontForLanguage(kCTFontUIFontSystem, size, NULL);
+            if (!sys) return NULL;
+            CTFontDescriptorRef base = CTFontCopyFontDescriptor(sys);
+            if (!base) { CFRelease(sys); return NULL; }
+            NSMutableDictionary *t = [NSMutableDictionary dictionaryWithObject:@(ctWeight) forKey:(id)kCTFontWeightTrait];
+            // the traits attribute replaces the base's: keep its symbolic bits, add italic
+            if (italic) t[(id)kCTFontSymbolicTrait] = @(CTFontGetSymbolicTraits(sys) | kCTFontItalicTrait);
+            CTFontDescriptorRef desc = CTFontDescriptorCreateCopyWithAttributes(base, (__bridge CFDictionaryRef)@{ (id)kCTFontTraitsAttribute: t });
+            CFRelease(base);
+            CFRelease(sys);
+            if (!desc) return NULL;
+            CTFontRef font = CTFontCreateWithFontDescriptor(desc, size, NULL);
+            CFRelease(desc);
+            return (void*)font;
+        }
+
         // Build font attributes
         NSMutableDictionary *attrs = [NSMutableDictionary dictionary];
         attrs[(id)kCTFontFamilyNameAttribute] = familyName;
@@ -113,7 +133,7 @@ void* coretext_find_font(const char* family, float size, int weight, int italic)
         NSMutableDictionary *traits = [NSMutableDictionary dictionary];
         traits[(id)kCTFontWeightTrait] = @(ctWeight);
         if (italic) {
-            // 使用 symbolic trait 请求 italic 变体
+            // Use symbolic trait to request italic variant
             traits[(id)kCTFontSymbolicTrait] = @(kCTFontItalicTrait);
         }
         attrs[(id)kCTFontTraitsAttribute] = traits;
@@ -127,11 +147,11 @@ void* coretext_find_font(const char* family, float size, int weight, int italic)
             return NULL;
         }
 
-        // 验证返回的字体确实包含 italic trait
+        // Verify returned font actually has italic trait
         if (italic) {
             CTFontSymbolicTraits actualTraits = CTFontGetSymbolicTraits(font);
             if (!(actualTraits & kCTFontItalicTrait)) {
-                // 字体族没有 italic 变体，CoreText 回退到了非 italic
+                // Font family has no italic variant, CoreText fell back to non-italic
                 NSLog(@"[CoreText] Font %s has no italic variant, rejecting", family);
                 CFRelease(font);
                 return NULL;
@@ -238,14 +258,13 @@ float coretext_font_get_size(void* font) {
     return (float)CTFontGetSize((CTFontRef)font);
 }
 
-/// 字体的**稳定身份** hash：PostScript 名 + size + symbolic traits 的 FNV-1a。
+/// Font **stable identity** hash: FNV-1a of PostScript name + size + symbolic traits.
 ///
-/// 动机：CoreText 每次 shape 返回的 run 级 fallback CTFontRef **不是稳定
-/// 指针**——同一个 "PingFangSC-Regular 14pt" 在两次 shape 里是两个实例。
-/// 以指针为缓存键会导致 wrapper Font 每帧重建（实测滚动 CJK 文档时
-/// 240 帧创建 36 万个 wrapper），进而让 glyph atlas 以不同 font_ptr 重复
-/// 收录同一字形，直至 32 页耗尽、后续字形被静默丢弃（用户可见：中文
-/// 逐字消失、位置留白、ASCII 不受影响）。
+/// Reason: the run-level fallback CTFontRef returned by CoreText shaping is **not a stable
+/// pointer**: the same "PingFangSC-Regular 14pt" is two instances across shapes.
+/// Using the pointer as cache key rebuilds wrapper Fonts every frame, the glyph atlas
+/// repeats the same glyph under different font_ptr and fills its 32 pages, and later glyphs
+/// are silently dropped (CJK characters disappear one by one, ASCII unaffected).
 unsigned long long coretext_font_identity_hash(void* font) {
     CTFontRef f = (CTFontRef)font;
     unsigned long long h = 1469598103934665603ULL;
@@ -321,18 +340,17 @@ static int shouldPreferSymbolFallbackForCodepoint(uint32_t codepoint) {
     return codepoint >= 0x2460 && codepoint <= 0x24FF;
 }
 
-/// SMP emoji 平面（U+1F000–U+1FAFF：enclosed ideographs 🈶、旗帜、表情、
-/// 交通、补充符号等）默认 emoji 呈现。必须给这些码点**显式**指定
-/// Apple Color Emoji：CoreText 的 cascade 是 run 上下文相关的——
-/// 同一个 🈶 孤立塑形（渲染端 per-codepoint 分段）解析到 Apple Color
-/// Emoji（advance ~1.33em），跟在 CJK run 后整串塑形（度量/caret 端
-/// CTLine）却被 PingFang 接走（advance 1em）——分段与整串两条路径的
-/// advance 不一致 = 光标/选区/宽度回写全部错位。统一强制 emoji 字体后
-/// 两条路径 run 划分一致。VS15 (U+FE0E) 显式要求文本呈现时跳过。
+/// SMP emoji plane (U+1F000-U+1FAFF) defaults to emoji presentation but must
+/// explicitly specify Apple Color Emoji: CoreText cascade is run-context-dependent.
+/// Isolated shaping resolves to Apple Color Emoji (advance ~1.33em), but a whole sequence
+/// after a CJK run gets taken by PingFang (advance 1em). Inconsistent advance between
+/// paths breaks caret/selection/width. Force the emoji font to keep run segmentation
+/// consistent. VS15 (U+FE0E) explicitly requests text presentation; skip.
 ///
-/// ⚠ 强制必须按 **ZWJ 序列**整体覆盖，不能逐码点：ZWJ (U+200D) 是 BMP
-/// 字符，若只给 SMP 成员标 emoji 字体，序列被切成多个 attribute run，
-/// CTLine 不跨 run 结扎——👨‍👩‍👧 会碎成三个独立人形（实测 21→63px）。
+/// WARNING: Force entire ZWJ sequences, not per-codepoint. ZWJ (U+200D) is BMP;
+/// if only SMP members get the emoji font, sequences split into multiple attribute runs.
+/// CTLine won't knit across runs, breaking a family emoji sequence into three separate
+/// glyphs (21->63px).
 static int shouldForceEmojiFallbackForCodepoint(uint32_t codepoint) {
     return codepoint >= 0x1F000 && codepoint <= 0x1FAFF;
 }
@@ -384,11 +402,10 @@ static NSAttributedString* createAttributedStringWithPreferredSymbolFallback(NSS
         i += charLen - 1;
     }
 
-    // 第二遍：emoji 强制，按 ZWJ 连接的整个序列（cluster）为单位。
-    // cluster = 若干成员码点（各可带 VS16/VS15），成员之间由 ZWJ 连接。
-    // 任一成员落在强制范围且未被 VS15 显式转文本呈现 → 整个 cluster
-    // （含 ZWJ、VS16 与 BMP 成员如 ❤）统一覆盖同一 emojiFont 实例，
-    // 保证度量/渲染/caret 三路 run 划分一致且序列不被拆散。
+    // Second pass: force emoji per ZWJ-connected sequence (cluster). Cluster = codepoints
+    // optionally with VS16/VS15, joined by ZWJ. If any member falls in forced range and
+    // not VS15-suppressed, cover entire cluster (including ZWJ, VS16, and BMP members
+    // like ❤) with same emoji font to ensure consistent metrics/rendering/caret.
     NSUInteger ci = 0;
     while (ci < utf16Len) {
         const NSUInteger clusterStart = ci;
@@ -408,15 +425,15 @@ static NSAttributedString* createAttributedStringWithPreferredSymbolFallback(NSS
             ci += charLen;
             if (ci < utf16Len) {
                 unichar vs = [text characterAtIndex:ci];
-                if (vs == 0xFE0E) { // VS15：该成员显式文本呈现
+                if (vs == 0xFE0E) { // VS15: explicit text presentation for this member
                     memberForced = NO;
                     ci += 1;
-                } else if (vs == 0xFE0F) { // VS16：显式 emoji 呈现
+                } else if (vs == 0xFE0F) { // VS16: explicit emoji presentation
                     ci += 1;
                 }
             }
             if (memberForced) forced = YES;
-            // 仅 ZWJ 延续 cluster；其余任何字符都结束当前 cluster
+            // Only ZWJ continues cluster; any other character ends it
             if (ci < utf16Len && [text characterAtIndex:ci] == 0x200D) {
                 ci += 1;
                 continue;
@@ -489,7 +506,7 @@ float coretext_measure_text_width_utf8(const char* text, int len, float font_siz
 float coretext_measure_text_width_weighted(const char* text, int len, float font_size, int font_weight) {
     @autoreleasepool {
         if (!text || len <= 0) return 0.0f;
-        // weight == 400 直接走原有逻辑（性能优化）
+        // weight == 400: use existing logic (perf optimization)
         if (font_weight <= 400) return coretext_measure_text_width_utf8(text, len, font_size);
 
         NSString *nsText = [[NSString alloc] initWithBytes:text
@@ -542,24 +559,19 @@ unsigned int coretext_font_get_glyph_index(void* font, unsigned int codepoint) {
 // Glyph Rasterization
 // ============================================================================
 
-/// 判断字体是否含彩色字形表。
-///
-/// 为什么按**字体**判定而不是按 codepoint 的 Extended_Pictographic 判定：
-/// 真正决定光栅化结果是否有颜色的是最终选中的那个字体 —— 同一个
-/// pictographic 码点在 text-presentation（VS15）或在只有黑白字形的字体里
-/// 落下来仍然是单通道覆盖率；反过来某些非 pictographic 码点（旗帜 tag
-/// 序列、部分符号）在 Apple Color Emoji 里是彩色的。CoreText fallback
-/// 已经把"用哪个字体画"解析好了，直接查那个字体的表是无歧义的信号。
-///
-/// sbix = Apple 位图（Apple Color Emoji）、COLR = 分层矢量（Windows/Noto）、
-/// CBDT = Google 位图。三者覆盖了实际会遇到的全部彩色字形格式。
+/// Detect whether a font has a color glyph table. Decided per font, not per codepoint
+/// (Extended_Pictographic), because rasterization depends on the selected font: a pictographic
+/// codepoint in a text-presentation or monochrome font stays single-channel, while some
+/// non-pictographic codepoints (tag sequences, symbols) are color in Apple Color Emoji.
+/// CoreText fallback has already picked the font, so checking its tables is unambiguous.
+/// sbix (Apple bitmap), COLR (layered vector) and CBDT (Google bitmap) cover all color formats.
 int coretext_font_has_color_glyphs(void* font_ptr) {
     @autoreleasepool {
         if (!font_ptr) return 0;
         CTFontRef font = (CTFontRef)font_ptr;
 
-        // CTFontGetSymbolicTraits 的 kCTFontTraitColorGlyphs 是最直接的信号，
-        // 但它对某些第三方彩色字体不置位，所以再查表兜底。
+        // CTFontGetSymbolicTraits kCTFontTraitColorGlyphs is direct but unreliable for
+        // third-party color fonts; check tables as fallback.
         if (CTFontGetSymbolicTraits(font) & kCTFontTraitColorGlyphs) {
             return 1;
         }
@@ -581,10 +593,10 @@ int coretext_font_has_color_glyphs(void* font_ptr) {
     }
 }
 
-// Forward declaration for subpixel variant
-int coretext_rasterize_glyph_subpixel(
+// Forward declaration for the full variant (subpixel offset + font smoothing)
+int coretext_rasterize_glyph_ex(
     void* font_ptr, unsigned int glyph_index, float scale_factor,
-    float subpixel_offset_x, float subpixel_offset_y,
+    float subpixel_offset_x, float subpixel_offset_y, int smooth_fonts,
     unsigned char** out_pixels, unsigned int* out_width, unsigned int* out_height,
     int* out_bearing_x, int* out_bearing_y, int* out_advance, int* out_is_color);
 
@@ -603,20 +615,34 @@ int coretext_rasterize_glyph(
     int* out_advance,
     int* out_is_color
 ) {
-    // 默认子像素偏移 = 0
-    return coretext_rasterize_glyph_subpixel(font_ptr, glyph_index, scale_factor,
-        0.0f, 0.0f, out_pixels, out_width, out_height, out_bearing_x, out_bearing_y,
+    // Default subpixel offset: 0
+    return coretext_rasterize_glyph_ex(font_ptr, glyph_index, scale_factor,
+        0.0f, 0.0f, 1, out_pixels, out_width, out_height, out_bearing_x, out_bearing_y,
         out_advance, out_is_color);
 }
 
-/// Rasterize glyph with subpixel offset (R6: 子像素变体)
-/// subpixel_offset_x/y: 物理像素内的亚像素偏移 [0.0, 1.0)
+/// Rasterize glyph with subpixel offset (R6: subpixel variants).
+/// subpixel_offset_x/y: offset within physical pixel [0.0, 1.0)
 int coretext_rasterize_glyph_subpixel(
+    void* font_ptr, unsigned int glyph_index, float scale_factor,
+    float subpixel_offset_x, float subpixel_offset_y,
+    unsigned char** out_pixels, unsigned int* out_width, unsigned int* out_height,
+    int* out_bearing_x, int* out_bearing_y, int* out_advance, int* out_is_color
+) {
+    return coretext_rasterize_glyph_ex(font_ptr, glyph_index, scale_factor,
+        subpixel_offset_x, subpixel_offset_y, 1, out_pixels, out_width, out_height,
+        out_bearing_x, out_bearing_y, out_advance, out_is_color);
+}
+
+/// Rasterize a glyph with a subpixel offset; smooth_fonts = 0 draws without platform font
+/// smoothing (macOS stem darkening; iOS draws glyphs unsmoothed).
+int coretext_rasterize_glyph_ex(
     void* font_ptr,
     unsigned int glyph_index,
     float scale_factor,
     float subpixel_offset_x,
     float subpixel_offset_y,
+    int smooth_fonts,
     unsigned char** out_pixels,
     unsigned int* out_width,
     unsigned int* out_height,
@@ -661,14 +687,14 @@ int coretext_rasterize_glyph_subpixel(
             return 0;
         }
 
-        // Calculate bitmap dimensions in physical pixels with padding
-        // R6: 加上子像素偏移，影响 origin 的 floor/ceil 计算
+        // Calculate bitmap dimensions in physical pixels with padding.
+        // R6: subpixel offset affects floor/ceil of origin calculation
         const float origin_x_px = (float)bbox.origin.x * scale + subpixel_offset_x;
         const float origin_y_px = (float)bbox.origin.y * scale + subpixel_offset_y;
         const float origin_x_px_floor = floor(origin_x_px);
         const float origin_y_px_floor = floor(origin_y_px);
 
-        // 子像素偏移可能让字形比原来宽/高 1 个像素
+        // Subpixel offset can make glyph 1 pixel wider/taller than original
         unsigned int width = (unsigned int)ceil(bbox.size.width * scale + subpixel_offset_x) + 2;
         unsigned int height = (unsigned int)ceil(bbox.size.height * scale + subpixel_offset_y) + 2;
 
@@ -679,8 +705,8 @@ int coretext_rasterize_glyph_subpixel(
         // bearing_y = height - baseline_y; baseline_y = 1 - origin_y_px_floor
         *out_bearing_y = (int)height - 1 + (int)origin_y_px_floor;
 
-        // 彩色字形（emoji）走 BGRA premultiplied 上下文：DeviceGray + AlphaNone
-        // 只能存覆盖率，颜色信息在光栅化那一刻就丢了，后面任何 shader 都救不回来。
+        // Color glyphs use BGRA premultiplied context: DeviceGray + AlphaNone only
+        // preserves coverage; color is lost at rasterization, unrecoverable by shader.
         const int is_color = coretext_font_has_color_glyphs(font_ptr);
         if (out_is_color) *out_is_color = is_color;
 
@@ -696,8 +722,8 @@ int coretext_rasterize_glyph_subpixel(
         // Create bitmap context at physical pixel size
         CGColorSpaceRef colorSpace = is_color ? CGColorSpaceCreateDeviceRGB()
                                               : CGColorSpaceCreateDeviceGray();
-        // BGRA8Unorm 纹理在小端下对应 kCGImageAlphaPremultipliedFirst |
-        // kCGBitmapByteOrder32Little（内存序 B,G,R,A）。
+        // BGRA8Unorm texture in little-endian: kCGImageAlphaPremultipliedFirst |
+        // kCGBitmapByteOrder32Little (memory order B,G,R,A).
         const CGBitmapInfo bitmap_info = is_color
             ? (CGBitmapInfo)(kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little)
             : (CGBitmapInfo)kCGImageAlphaNone;
@@ -720,24 +746,24 @@ int coretext_rasterize_glyph_subpixel(
         // Scale context so CoreText renders at physical resolution
         CGContextScaleCTM(ctx, scale, scale);
 
-        // Set up context for rendering
-        // 彩色字形自带颜色（sbix/COLR），不需要也不能被 fill color 覆盖。
+        // Set up context for rendering. Color glyphs self-color (sbix/COLR);
+        // don't need or apply fill color.
         if (!is_color) {
             CGContextSetGrayFillColor(ctx, 1.0, 1.0);
         }
         CGContextSetAllowsAntialiasing(ctx, true);
         CGContextSetShouldAntialias(ctx, true);
-        // 保持字形边缘平滑，避免小字号/CJK 观感发虚发毛。
-        CGContextSetAllowsFontSmoothing(ctx, true);
-        CGContextSetShouldSmoothFonts(ctx, true);
+        // Keep glyph edges smooth, avoid fuzziness in small sizes/CJK.
+        CGContextSetAllowsFontSmoothing(ctx, smooth_fonts != 0);
+        CGContextSetShouldSmoothFonts(ctx, smooth_fonts != 0);
         CGContextSetAllowsFontSubpixelPositioning(ctx, true);
         CGContextSetShouldSubpixelPositionFonts(ctx, true);
-        // 关闭量化，配合 atlas 子像素变体获得更稳定的细节。
+        // Disable quantization for stable detail with atlas subpixel variants.
         CGContextSetAllowsFontSubpixelQuantization(ctx, false);
         CGContextSetShouldSubpixelQuantizeFonts(ctx, false);
 
-        // Position glyph (in logical coordinates — CTM handles scaling)
-        // R6: 子像素偏移通过精确的位置传递给 CoreText
+        // Position glyph (in logical coordinates; CTM handles scaling).
+        // R6: subpixel offset passed via precise positioning to CoreText
         CGPoint position = CGPointMake(
             (-origin_x_px_floor + 1.0f) / scale,
             (-origin_y_px_floor + 1.0f) / scale
@@ -792,10 +818,10 @@ typedef struct {
     unsigned int base_rtl;
 } CoreTextLineMetrics;
 
-// Foundation 的 UTF-8 解码（initWithBytes / CFStringCreateWithBytes）会静默
-// 吃掉**开头**的 BOM（EF BB BF → U+FEFF）。调用方给的是 UTF-8 字节偏移，一旦
-// NSString 少了这个 U+FEFF，UTF-8↔UTF-16 映射整体错位 3 字节：cluster 偏移
-// 全错、caret stops 在字节 3 处查不到映射而整体失败。补回被吃掉的 U+FEFF。
+// Foundation UTF-8 decoding (initWithBytes/CFStringCreateWithBytes) silently
+// drops leading BOM (EF BB BF -> U+FEFF). Caller provides UTF-8 byte offsets;
+// if NSString lacks U+FEFF, UTF-8<->UTF-16 mapping shifts 3 bytes: all cluster
+// offsets wrong, caret stops fail at byte 3. Restore the dropped U+FEFF.
 static NSString *zenitCTStringFromUTF8(const char *bytes, NSUInteger len) {
     NSString *s = [[NSString alloc] initWithBytes:bytes length:len encoding:NSUTF8StringEncoding];
     if (!s) return nil;
@@ -996,8 +1022,8 @@ int coretext_shape_text(
             }
             int needsSyntheticItalic = 0;
             if (synthetic_italic && isFallbackFont && runFont) {
-                // 只对 fallback 字体（如 CJK 回退到 PingFang SC）检测是否需要合成斜体。
-                // 主字体（如 Inter-Italic VF）已经是 italic 字形，不需要再 skew。
+                // Check fallback fonts (e.g., CJK fallback to PingFang SC) for synthetic italic.
+                // Primary font (e.g., Inter-Italic VF) already has italic glyphs; don't skew.
                 CTFontSymbolicTraits runTraits = CTFontGetSymbolicTraits(runFont);
                 if (!(runTraits & kCTFontItalicTrait)) {
                     needsSyntheticItalic = 1;
@@ -1074,19 +1100,15 @@ void coretext_free_shaped_glyphs(CoreTextShapedGlyph* glyphs) {
     }
 }
 
-// ============================================================================
-// Font Enumeration (字体选择器)
+// Font enumeration (font selector).
 //
-// 设计约束（全部有本机实测依据，见下游应用的调研记录）：
-//   · 枚举 272 family / 990 face 实测 17.6ms，全量 trait 扫描 40.1ms
-//     —— 宿主在后台线程扫一次即可，这里不做任何缓存。
-//   · 17% 的 family 渲染不了自己的名字（阿拉伯/希伯来/天城文/CJK…），
-//     所以 can_render_name + lang 必须一起给出，让 UI 能换样例串。
-//   · 符号字体（Wingdings 等）**有** Latin 字形但画出来是图形，
-//     字形覆盖检查识别不了它 —— 唯一可靠判据是 symbolic class == 12。
-// ============================================================================
+// Design constraints: 272 families / 990 faces enumerate in 17.6ms, full trait scan 40.1ms,
+// so the host scans once in the background with no caching. 17% of families can't render
+// their own name (Arabic/Hebrew/Devanagari/CJK...), so both can_render_name and lang must be
+// provided for UI sample switching. Symbolic fonts (Wingdings) have Latin glyphs but render
+// as pictographs; glyph coverage can't detect this, only symbolic class == 12 is reliable.
 
-/// 家族数量。宿主据此分配数组。
+/// Family count; host allocates array from this.
 int coretext_family_count(void) {
     @autoreleasepool {
         NSArray *fams = (__bridge_transfer NSArray *)CTFontManagerCopyAvailableFontFamilyNames();
@@ -1094,8 +1116,8 @@ int coretext_family_count(void) {
     }
 }
 
-/// 把家族名逐条 strdup 进 out_names[0..max)，返回实际写入数。
-/// 每条都要用 coretext_free_c_string 释放。
+/// Copy family names into out_names[0..max), return count written.
+/// Each must be freed with coretext_free_c_string.
 int coretext_copy_family_names(char **out_names, int max) {
     if (!out_names || max <= 0) return 0;
     @autoreleasepool {
@@ -1116,16 +1138,16 @@ int coretext_copy_family_names(char **out_names, int max) {
 }
 
 typedef struct {
-    int  is_symbolic;      // symbolic class == 12：名字不可用自身渲染（Wingdings 等）
-    int  can_render_name;  // 字体是否含有自己名字所需的全部字形
-    int  is_variable;      // 有 variation axes
-    int  face_count;       // 该家族的 face 数
-    int  classification;   // 见下方 enum
-    int  has_latin;        // 有没有基本拉丁字形('A''a''g''1')
-    char lang[16];         // CTFontCopySupportedLanguages()[0]，用于挑样例串
+    int  is_symbolic; // symbolic class == 12: name can't be rendered by self (Wingdings, etc.)
+    int  can_render_name; // Font has all glyphs needed to render its own name
+    int  is_variable; // Has variation axes
+    int  face_count; // Face count in this family
+    int  classification; // See enum below
+    int  has_latin; // Has basic Latin glyphs ('A' 'a' 'g' '1')
+    char lang[16]; // CTFontCopySupportedLanguages()[0]; use for sample string selection
 } CoreTextFamilyInfo;
 
-// classification 取值（与 CTFontStylisticClass 对齐后收敛成 UI 需要的粒度）
+// classification values (aligned with CTFontStylisticClass, coarsened for UI)
 enum {
     CT_CLASS_UNKNOWN    = 0,
     CT_CLASS_SERIF      = 1,
@@ -1138,10 +1160,10 @@ enum {
 
 static int classifyFromTraits(CTFontSymbolicTraits traits) {
     if (traits & kCTFontTraitMonoSpace) return CT_CLASS_MONOSPACE;
-    // ⚠ kCTFontClass* 常量本身就是**已经就位**的掩码值（如 Symbolic = 0xC0000000），
-    //   不是 shift 之后的序数 12。拿右移过的值去比这些常量永远不相等 ——
-    //   第一版就是这么写的，结果 272 个家族里符号字体识别出 0 个、
-    //   Helvetica Neue 的分类也退化成 unknown。这里直接比掩码后的值。
+    // WARNING: kCTFontClass* constants are already-positioned mask values (e.g.,
+    // Symbolic = 0xC0000000), not shifted ordinals. Comparing shifted values to these
+    // constants always fails -- first version did this, 0/272 symbolic detected, wrong
+    // Helvetica Neue class. Compare against masked value.
     CTFontSymbolicTraits cls = traits & kCTFontClassMaskTrait;
     switch (cls) {
         case kCTFontClassOldStyleSerifs:
@@ -1164,9 +1186,9 @@ static int classifyFromTraits(CTFontSymbolicTraits traits) {
     }
 }
 
-/// 该家族能否用自身字形拼出自己的名字。
-/// ⚠ 这个检查**识别不了符号字体** —— Wingdings 对 'A'/'a' 返回 true，
-///   但画出来是图形。符号判据另走 is_symbolic。
+/// Family can render its own name. WARNING: glyph coverage can't detect symbolic
+/// fonts -- Wingdings returns true for 'A'/'a' but draws pictographs. Use
+/// is_symbolic separately.
 static int familyCanRenderOwnName(CTFontRef font, NSString *name) {
     NSUInteger len = name.length;
     if (len == 0) return 1;
@@ -1177,7 +1199,7 @@ static int familyCanRenderOwnName(CTFontRef font, NSString *name) {
     return CTFontGetGlyphsForCharacters(font, chars, glyphs, len) ? 1 : 0;
 }
 
-/// 该家族的 face 数。SF Pro 这类系统字体走 descriptor 查会返回 0。
+/// Face count in family. SF Pro and system fonts return 0 via descriptor query.
 static int familyFaceCount(NSString *family) {
     NSDictionary *attrs = @{ (id)kCTFontFamilyNameAttribute : family };
     CTFontDescriptorRef desc =
@@ -1190,8 +1212,8 @@ static int familyFaceCount(NSString *family) {
     return (int)matches.count;
 }
 
-/// 一次拿齐 picker 需要的全部元数据，避免逐字段跨语言往返。
-/// 返回 0 成功，-1 失败（家族名建不出字体）。
+/// Get all picker metadata at once; avoid multiple language crossings.
+/// Return 0 success, -1 failure (family not buildable).
 int coretext_family_info(const char *family, CoreTextFamilyInfo *out) {
     if (!family || !out) return -1;
     @autoreleasepool {
@@ -1203,14 +1225,14 @@ int coretext_family_info(const char *family, CoreTextFamilyInfo *out) {
         memset(out, 0, sizeof(*out));
 
         CTFontSymbolicTraits traits = CTFontGetSymbolicTraits(font);
-        // 同上：比掩码后的原值，不要右移。
+        // Compare against masked original value, don't shift.
         out->is_symbolic =
             ((traits & kCTFontClassMaskTrait) == kCTFontClassSymbolic) ? 1 : 0;
         out->classification  = classifyFromTraits(traits);
         out->can_render_name = familyCanRenderOwnName(font, fam);
         {
-            // 「选了它打英文能出字吗」—— 拉丁字母 + 数字都要有。
-            // 没有的话用户输入 ASCII 会得到空白/豆腐块，UI 给 disabled 视觉。
+            // "Can print English?" -- need Latin letters + digits. Without them,
+            // ASCII input gets blanks/tofu, UI shows disabled.
             unichar probe[4] = { 'A', 'a', 'g', '1' };
             CGGlyph pg[4];
             out->has_latin = CTFontGetGlyphsForCharacters(font, probe, pg, 4) ? 1 : 0;
@@ -1234,11 +1256,9 @@ int coretext_family_info(const char *family, CoreTextFamilyInfo *out) {
     }
 }
 
-/// CoreText weight trait(-1.0~1.0) → CSS 数值字重(100~900)。
-///
-/// 这是 createFontWithWeight 那张表的**逆映射**。取最近档,不做线性插值:
-/// CT 的刻度本身就是离散锚点(-0.8/-0.6/-0.4/0/0.23/0.3/0.4/0.56/0.62),
-/// 插值只会产出 100~900 之外的怪值。
+/// Convert CoreText weight trait (-1.0~1.0) to CSS weight (100~900).
+/// Inverse of createFontWithWeight table. Take nearest tier, no interpolation:
+/// CT scale is discrete anchors; interpolation produces out-of-range values.
 static int ctWeightToCss(CGFloat w) {
     static const struct { CGFloat ct; int css; } table[] = {
         { -0.80, 100 }, { -0.60, 200 }, { -0.40, 300 }, { 0.00, 400 },
@@ -1254,20 +1274,12 @@ static int ctWeightToCss(CGFloat w) {
     return best;
 }
 
-/// 枚举该家族**实际存在**的字重档位。
-///
-/// ⚠ 为什么必须枚举而不能挂一张固定的 100~900 列表:CoreText 对拿不到的
-/// 字重**静默降级、不报错**。实测 Zapfino 只有 1 个 face,问它要 Bold 会
-/// 安静地返回 Regular;Menlo 要 Light 也回 Regular。UI 若给出字体没有的档位,
-/// 用户选了看不到任何变化,也没有任何失败信号 —— 和"状态变了画面没变"
-/// 属同一类静默失效。
-///
-/// 输出按 CSS 字重升序、去重(同一档的 Italic 与 Regular 合并成一档 ——
-/// 斜体是独立的轴,不该挤进字重下拉)。
-/// 可变字体(实测 272 个家族里 12 个)给的是**连续轴区间**而非离散 face,
-/// 这里按轴的 min/max 铺满标准档位,让 VF 也能有可选项。
-///
-/// 返回实际写入数;out_weights 收 CSS 数值。
+/// Enumerate the weight tiers that actually exist in this family. WARNING: CoreText silently
+/// downgrades unavailable weights without error (Zapfino has 1 face, Bold returns Regular;
+/// Menlo Light returns Regular), so a UI offering non-existent tiers shows no change and
+/// no failure signal. Output is sorted ascending by CSS weight and deduplicated (italic is a
+/// separate axis). Variable fonts have a continuous axis range, not discrete faces; standard
+/// tiers are filled from the axis min/max. Returns the count written; out_weights gets CSS values.
 int coretext_family_weights(const char *family, int *out_weights, int max) {
     if (!family || !out_weights || max <= 0) return 0;
     @autoreleasepool {
@@ -1276,7 +1288,7 @@ int coretext_family_weights(const char *family, int *out_weights, int max) {
 
         int seen[16]; int n = 0;
 
-        // 可变字体:按 Weight 轴区间铺标准档位。
+        // Variable font: fill standard tiers from Weight axis range.
         CTFontRef probe = CTFontCreateWithName((__bridge CFStringRef)fam, 16, NULL);
         if (probe) {
             NSArray *axes = (__bridge_transfer NSArray *)CTFontCopyVariationAxes(probe);
@@ -1320,7 +1332,7 @@ int coretext_family_weights(const char *family, int *out_weights, int max) {
             n++;
         }
 
-        // 升序（CoreText 返回顺序是 Regular 优先，不是字重序）
+        // Ascending (CoreText returns Regular-first, not weight-ordered)
         for (int i = 1; i < n; i++) {
             int v = out_weights[i], j = i - 1;
             while (j >= 0 && out_weights[j] > v) { out_weights[j+1] = out_weights[j]; j--; }
@@ -1330,8 +1342,8 @@ int coretext_family_weights(const char *family, int *out_weights, int max) {
     }
 }
 
-/// 枚举该家族的风格名（Regular / Bold Italic / Semibold …）。
-/// 返回实际写入数；每条都要 coretext_free_c_string。
+/// Enumerate this family's style names (Regular/Bold Italic/Semibold...).
+/// Return count written; each freed with coretext_free_c_string.
 int coretext_family_styles(const char *family, char **out_styles, int max) {
     if (!family || !out_styles || max <= 0) return 0;
     @autoreleasepool {
@@ -1365,12 +1377,10 @@ int coretext_family_styles(const char *family, char **out_styles, int max) {
     }
 }
 
-/// 从字体自身的 character set 里取前 `max_cp` 个可渲染码点，写进 out_utf8。
-///
-/// 这是样例串的**最终兜底**：`lang` 为空且非符号字体时（实测 macOS 上有
-/// Noto Sans Batak / Noto Sans Tagalog 两个，它们既渲染不了自己的名字、
-/// 又拿不到语言标签），只能问字体"你到底能画什么"。
-/// 返回写入的码点数；0 = 连码点都取不到。
+/// Take first `max_cp` renderable codepoints from font's character set, write as
+/// UTF-8. Last-resort sample when lang is empty and not symbolic (real fonts like
+/// Noto Sans Batak/Tagalog can't render their name and have no tag). Ask font
+/// "what can you draw?". Return codepoint count; 0 = extraction failed.
 int coretext_family_sample_codepoints(const char *family, uint32_t *out_cps, int max_cp) {
     if (!family || !out_cps || max_cp <= 0) return 0;
     @autoreleasepool {
@@ -1382,8 +1392,8 @@ int coretext_family_sample_codepoints(const char *family, uint32_t *out_cps, int
         if (!cs) { CFRelease(font); return 0; }
 
         int n = 0;
-        // 跳过 ASCII 与常见标点：这些字体真正的"性格"在它自己的脚本区段里。
-        // 上界取 BMP 末尾就够——再往上是 emoji/补充平面，不适合当样例。
+        // Skip ASCII and common punctuation; font's character shows in its script range.
+        // Upper bound at BMP end -- above that is emoji/supplemental, not suitable samples.
         for (uint32_t cp = 0x00A1; cp <= 0xFFFF && n < max_cp; cp++) {
             if (CFCharacterSetIsLongCharacterMember(cs, cp)) out_cps[n++] = cp;
         }
@@ -1393,13 +1403,10 @@ int coretext_family_sample_codepoints(const char *family, uint32_t *out_cps, int
     }
 }
 
-/// 校验 family 是否**真的**存在。
-///
-/// ⚠ 为什么需要它：`coretext_find_font` 走 descriptor 匹配，
-///   对不存在的家族名会**静默返回一个替身字体**（只有 italic 那一路做了校验）。
-///   picker 把用户存盘的家族名解析回字体时，必须回读实际家族名比对，
-///   否则「字体丢失」会伪装成「字体正常」。
-/// 返回 1 = 名字完全匹配；0 = 不存在或被替换。
+/// Validate that the family truly exists. WARNING: coretext_find_font with a descriptor silently
+/// returns a fallback for a non-existent family (only the italic path validates). When the
+/// picker resolves a saved family name, cross-check the actual name to tell genuine from
+/// "missing" disguised as "ok". Returns 1 = exact match; 0 = doesn't exist or was substituted.
 int coretext_family_exists(const char *family) {
     if (!family) return 0;
     @autoreleasepool {

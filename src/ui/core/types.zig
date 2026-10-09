@@ -1,4 +1,6 @@
 const std = @import("std");
+const a11y_preferences = @import("../a11y/preferences.zig");
+const a11y_collection = @import("../a11y/collection.zig");
 const events_mod = @import("../events.zig");
 const actions_mod = @import("../actions.zig");
 const icon_ir = @import("icon_ir");
@@ -9,7 +11,7 @@ pub const EventResult = events_mod.EventResult;
 pub const KeyCode = events_mod.KeyCode;
 pub const Modifiers = events_mod.Modifiers;
 
-/// 二维尺寸
+/// Two-dimensional size.
 pub const Size = struct {
     width: f32,
     height: f32,
@@ -21,7 +23,7 @@ pub const Size = struct {
     }
 };
 
-/// 计算后的矩形区域
+/// Computed rectangle area.
 pub const ComputedRect = struct {
     x: f32,
     y: f32,
@@ -43,12 +45,12 @@ pub const Point = struct {
     y: f32,
 };
 
-/// 2D 仿射变换。**全部字段为 f32（含 tx/ty）**。
+/// 2D affine transform. **All fields f32 (including tx/ty)**.
 ///
-/// 无限画布类应用注意：在 1e6 量级世界坐标 + 深缩放（>1600%）下，f32 尾数
-/// 不足以区分相邻世界坐标（先转 f32 再变换会产生近 1px 量化误差，表现为
-/// 对象抖动/粘连）。应用必须在自己的 f64 里先减去视口原点、再把
-/// 视口局部坐标转 f32 交给 zenit, f64 中先做减法则误差恒为 0。
+/// Infinite-canvas apps at 1e6 world coords + deep zoom (>1600%) note: f32 mantissa can't
+/// distinguish adjacent world coords (convert f32 then transform -> ~1px quantization error,
+/// appears as jitter/sticking). Must offset by viewport origin in own f64, convert viewport-local
+/// coords to f32, subtract in f64 first -> always zero error.
 pub const Transform2D = struct {
     a: f32 = 1,
     b: f32 = 0,
@@ -319,7 +321,7 @@ pub const TransformOrigin = struct {
     }
 };
 
-/// Padding 值
+/// Padding value.
 pub const Padding = struct {
     top: f32 = 0,
     right: f32 = 0,
@@ -345,10 +347,9 @@ pub const Padding = struct {
     }
 };
 
-/// Margin 边值。
-/// 与 CSS 一样，默认是长度值；`auto` 通过 auto_mask 按边表达。
-/// 这个类型用于声明式样式输入和调试显示；Style 内部仍保持紧凑的数值 margin，
-/// auto 标记单独存到 StyleExt，避免把高频布局字段做胖。
+/// Margin value. Like CSS, default is length; `auto` via auto_mask. Type for declarative style
+/// input and debug display; Style keeps compact margin values internally, auto marks separate in
+/// StyleExt to avoid bloating hot layout fields.
 pub const Margin = struct {
     top: f32 = 0,
     right: f32 = 0,
@@ -446,15 +447,15 @@ pub const Margin = struct {
     }
 };
 
-/// 尺寸定义 - 支持 4 种模式
+/// Size definition - 4 modes supported.
 pub const Sizing = union(enum) {
-    /// 固定像素
+    /// Fixed pixels.
     px: f32,
-    /// 填充可用空间 (flex grow), 可带 min/max
+    /// Fill available space (flex grow), optional min/max.
     grow: SizingMinMax,
-    /// 适应内容大小, 可带 min/max
+    /// Fit content size, optional min/max.
     fit: SizingMinMax,
-    /// 百分比
+    /// Percentage.
     percent: f32,
 
     pub const SizingMinMax = struct {
@@ -462,35 +463,36 @@ pub const Sizing = union(enum) {
         max: f32 = std.math.inf(f32),
     };
 
-    /// 固定像素尺寸。支持 decl literal 写法：`.width = .fixed(120)`。
+    /// Fixed-pixel size. Supports decl literal: `.width = .fixed(120)`.
     pub fn fixed(v: f32) Sizing {
         return .{ .px = v };
     }
 
-    /// 填充可用空间（等价 `.{ .grow = .{} }`）。支持 decl literal 写法：`.width = .fill()`。
+    /// Fill available space (equivalent `.{ .grow = .{} }`). Supports decl literal: `.width =
+    /// .fill()`.
     pub fn fill() Sizing {
         return .{ .grow = .{} };
     }
 
-    /// 百分比尺寸。支持 decl literal 写法：`.width = .pct(50)`。
+    /// Percentage size. Supports decl literal: `.width = .pct(50)`.
     pub fn pct(v: f32) Sizing {
         return .{ .percent = v };
     }
 };
 
-/// 布局约束（Measure 阶段传递给子节点）
-/// 类似 CSS 的 available size + min/max 约束
+/// Layout constraint (passed to children in Measure phase). Like CSS available size + min/max
+/// constraints.
 pub const LayoutConstraints = struct {
     min_width: f32 = 0,
     max_width: f32 = std.math.inf(f32),
     min_height: f32 = 0,
     max_height: f32 = std.math.inf(f32),
-    /// 已知确切宽度（非 null 时子节点应使用此宽度，不做 intrinsic 计算）
+    /// Known exact width (non-null -> child uses this, no intrinsic calc).
     definite_width: ?f32 = null,
-    /// 已知确切高度
+    /// Known exact height.
     definite_height: ?f32 = null,
 
-    /// 创建有确切宽高的约束
+    /// Create constraint with known width and height.
     pub fn exact(w: f32, h: f32) LayoutConstraints {
         return .{
             .min_width = w,
@@ -503,7 +505,7 @@ pub const LayoutConstraints = struct {
     }
 };
 
-/// Flex 方向
+/// Flex direction.
 pub const Direction = enum {
     row,
     row_reverse,
@@ -519,7 +521,7 @@ pub const Direction = enum {
     }
 };
 
-/// 主轴对齐
+/// Main-axis alignment.
 pub const JustifyContent = enum {
     start,
     end,
@@ -529,7 +531,7 @@ pub const JustifyContent = enum {
     space_evenly,
 };
 
-/// 交叉轴对齐
+/// Cross-axis alignment.
 pub const AlignItems = enum {
     start,
     end,
@@ -538,7 +540,7 @@ pub const AlignItems = enum {
     baseline,
 };
 
-/// Flex 换行
+/// Flex wrapping.
 pub const FlexWrap = enum {
     no_wrap,
     wrap,
@@ -548,65 +550,21 @@ pub const FlexWrap = enum {
 pub const Justify = JustifyContent;
 pub const Alignment = AlignItems;
 
-/// 颜色（RGBA）
-pub const Color = packed struct {
-    r: u8,
-    g: u8,
-    b: u8,
-    a: u8 = 255,
-
-    pub const TRANSPARENT = Color{ .r = 0, .g = 0, .b = 0, .a = 0 };
-    pub const WHITE = Color{ .r = 255, .g = 255, .b = 255, .a = 255 };
-    pub const BLACK = Color{ .r = 0, .g = 0, .b = 0, .a = 255 };
-
-    pub fn rgb(r: u8, g: u8, b: u8) Color {
-        return .{ .r = r, .g = g, .b = b, .a = 255 };
-    }
-
-    pub fn rgba(r: u8, g: u8, b: u8, a: u8) Color {
-        return .{ .r = r, .g = g, .b = b, .a = a };
-    }
-
-    pub fn hex(value: u24) Color {
-        return .{
-            .r = @truncate(value >> 16),
-            .g = @truncate(value >> 8),
-            .b = @truncate(value),
-            .a = 255,
-        };
-    }
-
-    pub fn lerp(from: Color, to: Color, t: f32) Color {
-        const t_clamped = std.math.clamp(t, 0.0, 1.0);
-        return .{
-            .r = @intFromFloat(@as(f32, @floatFromInt(from.r)) + (@as(f32, @floatFromInt(to.r)) - @as(f32, @floatFromInt(from.r))) * t_clamped),
-            .g = @intFromFloat(@as(f32, @floatFromInt(from.g)) + (@as(f32, @floatFromInt(to.g)) - @as(f32, @floatFromInt(from.g))) * t_clamped),
-            .b = @intFromFloat(@as(f32, @floatFromInt(from.b)) + (@as(f32, @floatFromInt(to.b)) - @as(f32, @floatFromInt(from.b))) * t_clamped),
-            .a = @intFromFloat(@as(f32, @floatFromInt(from.a)) + (@as(f32, @floatFromInt(to.a)) - @as(f32, @floatFromInt(from.a))) * t_clamped),
-        };
-    }
-
-    pub fn withAlpha(self: Color, alpha: u8) Color {
-        return .{ .r = self.r, .g = self.g, .b = self.b, .a = alpha };
-    }
-
-    pub fn eql(a: Color, b: Color) bool {
-        return a.r == b.r and a.g == b.g and a.b == b.b and a.a == b.a;
-    }
-};
+/// Color (RGBA).
+pub const Color = @import("zenit_style_values").Color;
 
 pub const ThemeTokens = theme.ThemeTokens;
 pub const ColorScheme = theme.ColorScheme;
 
-/// 渐变延伸模式
-/// 控制渐变 t 值超出 [0,1] 范围时的行为（对应 CSS background-repeat / SVG spreadMethod）
+/// Gradient spread mode. Controls behavior when gradient t outside [0,1] (CSS background-repeat /
+/// SVG spreadMethod).
 pub const GradientExtendMode = enum {
-    pad, // 夹制到边界颜色（默认，CSS default）
-    repeat, // 循环重复（CSS repeat / SVG repeat）
-    reflect, // 镜像反射（CSS reflect / SVG reflect）
+    pad, // Clamp to edge color (CSS default).
+    repeat, // Repeat (CSS repeat / SVG repeat).
+    reflect, // Mirror reflection (CSS reflect / SVG reflect).
 };
 
-/// 渐变方向
+/// Gradient direction.
 pub const GradientDirection = enum {
     horizontal,
     vertical,
@@ -615,21 +573,21 @@ pub const GradientDirection = enum {
     conic,
 };
 
-/// SVG / CSS 合成混合模式（用于 Opacity Layer 的 blend_mode 参数）
-/// 对应 CSS mix-blend-mode / SVG feBlend
+/// SVG/CSS composite blend mode (Opacity Layer blend_mode param). Corresponds to CSS mix-blend-mode
+/// / SVG feBlend.
 pub const BlendMode = enum {
-    normal, // 标准 SrcOver（默认）
-    multiply, // 相乘变暗
-    screen, // 相加变亮
-    overlay, // 对比度增强（亮处更亮，暗处更暗）
-    darken, // 取较暗值
-    lighten, // 取较亮值
-    color_dodge, // 亮化（分母为 1-src）
-    color_burn, // 暗化（分母为 src）
-    hard_light, // 强光（类 Overlay 但以 src 为主导）
-    soft_light, // 柔光（低对比度 Overlay）
-    difference, // 差值（绝对差）
-    exclusion, // 排除（低对比度 Difference）
+    normal, // Standard SrcOver (default).
+    multiply, // Multiply darken.
+    screen, // Screen lighten.
+    overlay, // Overlay: contrast boost (bright brighter, dark darker).
+    darken, // Darken: take darker value.
+    lighten, // Lighten: take lighter value.
+    color_dodge, // Color dodge: brighten (denominator 1-src).
+    color_burn, // Color burn: darken (denominator src).
+    hard_light, // Hard light: strong light (like Overlay, src-dominant).
+    soft_light, // Soft light: low-contrast Overlay.
+    difference, // Difference: absolute difference.
+    exclusion, // Exclusion: low-contrast Difference.
 };
 
 pub const PathFillRule = enum {
@@ -693,11 +651,11 @@ pub const HitShapeSpec = union(enum) {
     custom,
 };
 
-/// 节点**自身绘制形状**（背景/边框走哪种 SDF）。与 `ClipShapeSpec` 不同：
-/// 那个是裁剪掩码，只裁内容、裁不动描边；这个换的是填充与描边的距离场本身。
+/// Node **self paint shape** (background/border SDF). Unlike `ClipShapeSpec`: that's clip mask,
+/// clips content not stroke; this replaces fill/stroke distance field itself.
 ///
-/// 默认 `rounded_rect` = 历史行为（圆角由 `corner_radius` 决定）。
-/// `ellipse` 内接节点盒（半轴 = w/2, h/2），此时 `corner_radius` 被忽略。
+/// Default `rounded_rect` = historical (corner_radius decides corners). `ellipse` inscribed to node
+/// box (half-axes w/2, h/2); corner_radius ignored.
 pub const ShapeSpec = enum {
     rounded_rect,
     ellipse,
@@ -721,7 +679,7 @@ pub const HitBehavior = enum {
     self_and_children,
 };
 
-/// 解析后的命中角色（三个 role 都已定值）。消费端只见这个类型。
+/// Resolved hit role (all three roles finalized). Consumer sees only this type.
 pub const HitRoles = packed struct(u3) {
     pointer: bool = false,
     scroll: bool = false,
@@ -732,18 +690,18 @@ pub const HitRoles = packed struct(u3) {
     }
 };
 
-/// `style.hit_roles` 的覆盖类型：**逐 role 三态**，null = 沿用框架推导的默认值。
+/// `style.hit_roles` override type: **three-state per role**, null = use framework default.
 ///
-/// 刻意不复用 `HitRoles`：那是个 bool 结构体，写 `.{ .pointer = true }` 会连带把
-/// 未提及的 `scroll`/`inspect` 按字段默认值归零，调用方想"加一个 role"，实际
-/// 却把另外两个也一并接管了（`inspect` 默认 true，被静默改成 false ⇒ 该节点在
-/// devtools 里选不中）。三态让"只覆盖我写的那一个"成为可表达的意图。
+/// Deliberate != `HitRoles` (bool struct): `.{ .pointer = true }` resets unmentioned
+/// `scroll`/`inspect` to field defaults, caller wants 'add one role' but actually resets the rest
+/// (inspect default true -> silent false -> can't select in devtools). Three-state makes 'override
+/// just this one' expressible.
 pub const HitRolesOverride = struct {
     pointer: ?bool = null,
     scroll: ?bool = null,
     inspect: ?bool = null,
 
-    /// 把覆盖叠加到推导出的默认值上；未指定的 role 原样保留。
+    /// Overlay override onto inferred default; unspecified roles preserved.
     pub fn apply(self: HitRolesOverride, base: HitRoles) HitRoles {
         return .{
             .pointer = self.pointer orelse base.pointer,
@@ -773,8 +731,7 @@ pub const Border = struct {
     width: f32 = 0,
     color: Color = Color.TRANSPARENT,
     radius: f32 = 0,
-    /// 按边宽度覆盖（默认 -1 = 使用 width）
-    /// 顺序: top, right, bottom, left
+    /// Override by edge width (default -1 = use width). Order: top, right, bottom, left.
     side_widths: [4]f32 = .{ -1, -1, -1, -1 },
 
     pub const SIDE_TOP: usize = 0;
@@ -782,7 +739,7 @@ pub const Border = struct {
     pub const SIDE_BOTTOM: usize = 2;
     pub const SIDE_LEFT: usize = 3;
 
-    /// 解析为四边宽度（top, right, bottom, left）
+    /// Resolve to four-edge widths (top, right, bottom, left).
     pub fn resolvedWidths(self: Border) [4]f32 {
         const base = @max(@as(f32, 0), self.width);
         return .{
@@ -827,17 +784,40 @@ pub const BorderSideColors = struct {
     }
 };
 
-pub const Shadow = struct {
-    color: Color = Color.rgba(0, 0, 0, 80),
-    blur: f32 = 8,
-    offset_x: f32 = 0,
-    offset_y: f32 = 4,
-    /// CSS box-shadow spread：正值外扩、负值先把阴影矩形收小再模糊（远投影常用）。
-    spread: f32 = 0,
+pub const Shadow = @import("zenit_style_values").Shadow;
+
+/// Max outer shadow layers (CSS multi box-shadow; first item topmost).
+pub const max_shadows = 4;
+
+/// Multi-layer inset shadow type (fixed, for BoxStyle.inset_shadows). `ui.InsetShadowList.of(&.{ a,
+/// b })`.
+pub const InsetShadowList = struct {
+    items: [3]InsetShadow = @as([3]InsetShadow, @splat(.{})),
+    len: u8 = 0,
+
+    pub fn of(list: []const InsetShadow) InsetShadowList {
+        var out = InsetShadowList{};
+        const n = @min(list.len, out.items.len);
+        for (list[0..n], 0..) |s, i| out.items[i] = s;
+        out.len = @intCast(n);
+        return out;
+    }
 };
 
-/// 外阴影层数上限（CSS 多重 box-shadow；列表第一项在最上层）。
-pub const max_shadows = 4;
+/// Multi-layer outer shadow type (fixed, value-storable, for BoxStyle.shadows).
+/// `ui.ShadowList.of(&.{ near, far })`.
+pub const ShadowList = struct {
+    items: [max_shadows]Shadow = @as([max_shadows]Shadow, @splat(.{})),
+    len: u8 = 0,
+
+    pub fn of(list: []const Shadow) ShadowList {
+        var out = ShadowList{};
+        const n = @min(list.len, max_shadows);
+        for (list[0..n], 0..) |s, i| out.items[i] = s;
+        out.len = @intCast(n);
+        return out;
+    }
+};
 
 pub const Gradient = struct {
     from: Color,
@@ -845,25 +825,26 @@ pub const Gradient = struct {
     direction: GradientDirection = .vertical,
 };
 
-/// 多色渐变色标
+/// Multi-color gradient stop.
 pub const GradientStop = struct {
     color: Color,
     position: f32, // [0.0, 1.0]
 };
 
-/// 多色渐变（最多 16 个 stop，无 banding）
-/// 用静态数组避免动态分配和生命周期管理：stops[0..stop_count] 是有效数据
+/// Multi-color gradient (max 16 stops, no banding). Static array avoids alloc and lifetime mgmt:
+/// stops[0..stop_count] is valid.
 pub const MultiGradient = struct {
-    stops: [16]GradientStop = [_]GradientStop{.{ .color = Color.rgba(0, 0, 0, 0), .position = 0 }} ** 16,
+    stops: [16]GradientStop = @as([16]GradientStop, @splat(.{ .color = Color.rgba(0, 0, 0, 0), .position = 0 })),
     stop_count: u8 = 0,
     direction: GradientDirection = .vertical,
-    /// 径向渐变圆心（占节点宽 / 高的比例，可超出 [0,1]，如 CSS `at 12% -10%`）。
+    /// Radial gradient center (proportion of node width/height, can exceed [0,1], like CSS `at 12%
+    /// -10%`).
     radial_center: [2]f32 = .{ 0.5, 0.5 },
-    /// 径向渐变椭圆半径（占节点宽 / 高的比例，CSS `radial-gradient(120% 100% …)`）。
-    /// 默认 0.5 × 0.5 = 内切椭圆（与旧行为一致）。
+    /// Radial gradient ellipse radius (proportion of node width/height, CSS `radial-gradient(120%
+    /// 100% ...)`). Default 0.5 x 0.5 = inscribed ellipse (historic behavior).
     radial_radius: [2]f32 = .{ 0.5, 0.5 },
 
-    /// 从 slice 构造（编译期 / 运行期均可，最多取 16 个）
+    /// Construct from slice (compile/runtime both, max 16).
     pub fn fromSlice(src: []const GradientStop, dir: GradientDirection) MultiGradient {
         var mg = MultiGradient{ .direction = dir };
         const n = @min(src.len, 16);
@@ -877,22 +858,22 @@ pub const MultiGradient = struct {
     }
 };
 
-/// 程序性噪声参数
+/// Procedural noise params.
 pub const NoiseParams = struct {
     mode: NoiseMode = .film_grain,
-    scale: f32 = 2.0, // 逻辑像素，Value Noise 格点间距
-    intensity: f32 = 0.04, // 混合强度 [0..1]
+    scale: f32 = 2.0, // Logical pixels, Value Noise grid spacing.
+    intensity: f32 = 0.04, // Mix intensity [0..1].
     seed: u8 = 0,
 };
 
-/// 噪声模式（对应 sdf_renderer.zig NoiseMode）
+/// Noise mode (corresponds sdf_renderer.zig NoiseMode).
 pub const NoiseMode = enum(u8) {
     none = 0,
     value = 1,
     film_grain = 2,
 };
 
-/// Inset Shadow（内阴影）
+/// Inset shadow.
 pub const InsetShadow = struct {
     color: Color = Color.rgba(0, 0, 0, 80),
     blur: f32 = 8,
@@ -900,7 +881,7 @@ pub const InsetShadow = struct {
     offset_y: f32 = 0,
 };
 
-/// Overflow fade 遮罩的边缘选择
+/// Overflow fade mask edge selection.
 pub const FadeEdges = packed struct(u4) {
     top: bool = true,
     bottom: bool = true,
@@ -908,15 +889,15 @@ pub const FadeEdges = packed struct(u4) {
     right: bool = true,
 };
 
-/// Overflow 容器溢出时在边缘显示渐变淡出遮罩
-/// 在 overflow_hidden 容器的内容之上叠加 gradient rect，
-/// 从容器背景色（实色端）到透明（淡出端），视觉效果类似 CSS mask-image
+/// Overflow container gradient-fade mask on edges when content overflows. Stacks gradient rect over
+/// overflow_hidden content, base container color (solid end) to transparent (fade end), visual like
+/// CSS mask-image.
 pub const OverflowFade = struct {
-    /// 渐变区域大小（px）
+    /// Gradient area size (px).
     size: f32 = 32,
-    /// 实色端颜色，null = 使用容器 background
+    /// Solid-end color, null = use container background.
     color: ?Color = null,
-    /// 哪些边启用渐变
+    /// Which edges enable gradient.
     edges: FadeEdges = .{},
 };
 
@@ -928,7 +909,7 @@ pub const CornerRadius = union(enum) {
         return .{ .all = r };
     }
 
-    /// 返回统一圆角值（取四角最大值）
+    /// Return unified corner radius (max of four).
     pub fn resolve(self: CornerRadius) f32 {
         return switch (self) {
             .all => |v| v,
@@ -936,7 +917,7 @@ pub const CornerRadius = union(enum) {
         };
     }
 
-    /// 返回四角独立圆角值 [TL, TR, BR, BL]
+    /// Return four-corner radii [TL, TR, BR, BL].
     pub fn resolve4(self: CornerRadius) [4]f32 {
         return switch (self) {
             .all => |v| .{ v, v, v, v },
@@ -945,9 +926,8 @@ pub const CornerRadius = union(enum) {
     }
 };
 
-/// CSS display 的子集。`.none`：节点连同子树不参与布局（不占空间、不计 gap）、
-/// 不绘制、不参与命中测试 / 焦点遍历 / 无障碍树；节点与状态保持存活，切回
-/// `.flex` 即恢复（与卸载子树不同）。
+/// CSS display subset. `.none`: node + subtree skip layout (no space, no gap), no paint, no
+/// hit/focus/a11y; node/state live; `.flex` restores (unlike unmount).
 pub const Display = enum(u1) {
     flex,
     none,
@@ -959,16 +939,16 @@ pub const Position = enum {
     sticky,
 };
 
-/// CSS inset 值（top/right/bottom/left）
+/// CSS inset value (top/right/bottom/left).
 pub const InsetValue = union(enum) {
-    /// 不约束（CSS auto）
+    /// Unconstrained (CSS auto).
     auto,
-    /// 绝对像素偏移
+    /// Absolute pixel offset.
     px: f32,
-    /// 相对 containing block 百分比
+    /// Percentage relative to containing block.
     percent: f32,
 
-    /// 解析为绝对值。auto 返回 null。
+    /// Resolve to absolute value. auto -> null.
     pub fn resolve(self: InsetValue, containing_size: f32) ?f32 {
         return switch (self) {
             .auto => null,
@@ -978,8 +958,7 @@ pub const InsetValue = union(enum) {
     }
 };
 
-/// CSS inset 配置（类似 top/right/bottom/left）
-/// 仅 position != .relative 时生效
+/// CSS inset config (top/right/bottom/left). Only apply when position != .relative.
 pub const Inset = struct {
     top: InsetValue = .auto,
     right: InsetValue = .auto,
@@ -987,30 +966,30 @@ pub const Inset = struct {
     left: InsetValue = .auto,
 };
 
-/// CSS overflow 属性
+/// CSS overflow property.
 pub const Overflow = enum {
-    /// 内容可溢出（默认）
+    /// Content can overflow (default).
     visible,
-    /// 裁剪溢出内容（无滚动条）
+    /// Clip overflow (no scrollbar).
     hidden,
-    /// 始终显示滚动条
+    /// Always show scrollbar.
     scroll,
-    /// 仅在溢出时显示滚动条
+    /// Show scrollbar only if overflow.
     auto,
 
-    /// 是否裁剪溢出（hidden/scroll/auto 都裁剪）
+    /// Clips overflow (hidden/scroll/auto all clip).
     pub fn clips(self: Overflow) bool {
         return self != .visible;
     }
 
-    /// 是否可滚动（scroll/auto）
+    /// Scrollable (scroll/auto).
     pub fn scrollable(self: Overflow) bool {
         return self == .scroll or self == .auto;
     }
 };
 
-/// Sticky 定位的 inset 配置（类似 CSS top/left/bottom/right）
-/// 只有对应方向的值不为 null 时才在该方向上粘附
+/// Sticky positioning inset config (top/left/bottom/right like CSS). Sticky on axis only if inset
+/// value non-null.
 pub const StickyInsets = struct {
     top: ?f32 = null,
     left: ?f32 = null,
@@ -1024,64 +1003,64 @@ pub const Outline = struct {
     offset: f32 = 2,
 };
 
-/// 鼠标光标形状 (类似 CSS cursor)
-/// 通过 node.style.cursor 设置，框架自动在 hover 时应用对应系统光标
+/// Mouse cursor shape (CSS cursor-like). Set via node.style.cursor; framework auto-applies on
+/// hover.
 pub const CursorShape = enum(u8) {
-    /// 继承父节点光标 (默认值，类似 CSS inherit)
+    /// Inherit parent cursor (default, CSS inherit).
     inherit,
-    /// 默认箭头光标 (CSS: default)
+    /// Default arrow cursor (CSS: default).
     default,
-    /// 手指指针，表示可点击 (CSS: pointer)
+    /// Pointing finger, indicates clickable (CSS: pointer).
     pointer,
-    /// I-beam 文本选择光标 (CSS: text)
+    /// I-beam text cursor (CSS: text).
     text,
-    /// 十字准心 (CSS: crosshair)
+    /// Crosshair (CSS: crosshair).
     crosshair,
-    /// 移动光标 (CSS: move)
+    /// Move cursor (CSS: move).
     move,
-    /// 禁止操作 (CSS: not-allowed)
+    /// No-operation cursor (CSS: not-allowed).
     not_allowed,
-    /// 抓取手势 (CSS: grab)
+    /// Grab hand (CSS: grab).
     grab,
-    /// 正在抓取 (CSS: grabbing)
+    /// Grabbing hand (CSS: grabbing).
     grabbing,
-    /// 水平调整大小 (CSS: ew-resize)
+    /// Horizontal resize (CSS: ew-resize).
     ew_resize,
-    /// 垂直调整大小 (CSS: ns-resize)
+    /// Vertical resize (CSS: ns-resize).
     ns_resize,
-    /// 左上-右下调整 (CSS: nwse-resize)
+    /// NW-SE resize (CSS: nwse-resize).
     nwse_resize,
-    /// 右上-左下调整 (CSS: nesw-resize)
+    /// NE-SW resize (CSS: nesw-resize).
     nesw_resize,
-    /// 列调整 (CSS: col-resize)
+    /// Column resize (CSS: col-resize).
     col_resize,
-    /// 行调整 (CSS: row-resize)
+    /// Row resize (CSS: row-resize).
     row_resize,
-    /// 等待 (CSS: wait)
+    /// Wait (CSS: wait).
     wait,
-    /// 后台处理中 (CSS: progress)
+    /// Progress (CSS: progress).
     progress,
-    /// 帮助 (CSS: help)
+    /// Help (CSS: help).
     help,
-    /// 隐藏光标 (CSS: none)
+    /// Hidden cursor (CSS: none).
     none,
-    /// 自定义位图光标：内容（位图 + 热点）由 `Cx.setCustomCursor` 激活，
-    /// 节点/override 上只写这个形状值；后端不支持位图光标时降级为
-    /// `Cx.custom_cursor_fallback`（默认 crosshair）。
-    /// 必须追加在枚举尾部：1..18 与 native 层 switch 一一对应。
+    /// Custom bitmap cursor: content (bitmap + hotspot) activated by `Cx.setCustomCursor`;
+    /// node/override only write this shape; fallback to `Cx.custom_cursor_fallback` (default
+    /// crosshair) if backend doesn't support bitmap. Append at enum end: 1..18 one-to-one with
+    /// native switch.
     custom,
     /// Stop framework cursor writes; a native/platform view owns presentation.
     uncontrolled,
 };
 
-/// Grid track 尺寸定义（类似 CSS grid-template-columns/rows 中的值）
+/// Grid track size definition (like CSS grid-template-columns/rows values).
 pub const GridTrackSize = union(enum) {
-    px: f32, // 固定像素
-    fr: f32, // 弹性比例（CSS fr 单位）
-    auto, // 适应内容
+    px: f32, // Fixed pixels.
+    fr: f32, // Flexible ratio (CSS fr unit).
+    auto, // Fit content.
 };
 
-/// Grid 容器配置（通过指针挂载到 Style，仅 Grid 容器使用）
+/// Grid container config (pointer-mounted on Style, Grid containers only).
 pub const GridConfig = struct {
     columns: [MAX_TRACKS]GridTrackSize = undefined,
     column_count: u8 = 0,
@@ -1093,18 +1072,31 @@ pub const GridConfig = struct {
     pub const MAX_TRACKS = 16;
 };
 
-/// Grid 子节点放置位置
+/// Grid child placement position.
 pub const GridPlacement = struct {
-    col_start: u8 = 0, // 1-based，0 = auto
+    col_start: u8 = 0, // 1-based, 0 = auto.
     col_span: u8 = 1,
-    row_start: u8 = 0, // 1-based，0 = auto
+    row_start: u8 = 0, // 1-based, 0 = auto.
     row_span: u8 = 1,
 };
 
+/// Lens warp of a composited subtree (`StyleExt.content_warp`): the composite samples the
+/// subtree's surface shifted radially from the rect centre, by `cap` px across the rounded ends
+/// and `edge` px across the long edges (positive = toward the centre, the rim magnifies),
+/// fading to zero from `fade_start` over `fade_width` px inside the contour. Native iOS tab
+/// bar: the lifted selection shows a `_UIPortalView` of the bar content through a
+/// displacement map; the portal smears far more at the caps than the backdrop does.
+pub const ContentWarp = extern struct {
+    cap: f32 = 0,
+    edge: f32 = 0,
+    fade_start: f32 = 0,
+    fade_width: f32 = 1,
+};
+
 pub const Style = struct {
-    // ── 高频内联字段 (~80 bytes) ──
-    // background / opacity 字段已删 -> World.paint_state SoA。
-    // 读写经 Node.getBackground/setBackgroundRaw（standalone fallback for mock）。
+    // -- High-freq inline fields (~80 bytes) --
+    // background / opacity removed -> World.paint_state SoA.
+    // Access via Node.getBackground/setBackgroundRaw (standalone fallback for mock).
     border: Border = .{},
     padding: Padding = Padding.ZERO,
     direction: Direction = .column,
@@ -1125,10 +1117,10 @@ pub const Style = struct {
     cursor: CursorShape = .inherit,
     layout_isolation: bool = false,
 
-    // ── 低频字段（按需分配，大多数节点为 null -> ~0 bytes） ──
+    // -- Low-freq fields (allocated on-demand, most nodes null -> ~0 bytes) --
     ext: ?*StyleExt = null,
 
-    // ── Accessor 方法（只读，返回 ext 中的值或默认值） ──
+    // -- Accessor methods (read-only, return ext value or default) --
 
     const default_ext = StyleExt{};
 
@@ -1136,13 +1128,13 @@ pub const Style = struct {
         return if (self.ext) |e| e else &default_ext;
     }
 
-    /// 返回第一层外阴影（不存在则 null）
+    /// Return first outer shadow (null if none).
     pub inline fn shadow(self: *const Style) ?Shadow {
         const e = self.getExt();
         return if (e.shadow_count > 0) e.shadows[0] else null;
     }
 
-    /// 返回全部外阴影切片（0~max_shadows 个）
+    /// Return all outer shadow slice (0~max_shadows count).
     pub inline fn shadowSlice(self: *const Style) []const Shadow {
         const e = self.getExt();
         return e.shadows[0..e.shadow_count];
@@ -1229,11 +1221,11 @@ pub const Style = struct {
     pub inline fn hit_roles(self: *const Style) HitRolesOverride {
         return self.getExt().hit_roles;
     }
-    /// 获取 glass 参数（null = 无 glass 效果）
+    /// Get glass params (null = no glass effect).
     pub inline fn glass_params(self: *const Style) ?GlassParams {
         return self.getExt().glass;
     }
-    /// 背景模糊半径（逻辑像素，0 = 无模糊），从 glass 参数解包
+    /// Backdrop blur radius (logical pixels, 0 = no blur), unpacked from glass params.
     pub inline fn backdrop_blur(self: *const Style) f32 {
         const gp = self.getExt().glass orelse return 0;
         return gp.backdrop_blur;
@@ -1247,7 +1239,7 @@ pub const Style = struct {
     pub inline fn inset_shadow(self: *const Style) ?InsetShadow {
         return self.getExt().inset_shadow;
     }
-    /// 第 2 层起的内阴影（最多 2 层）。
+    /// Inset shadows layer 2+ (max 2 layers).
     pub inline fn extraInsetShadows(self: *const Style) []const InsetShadow {
         const e = self.getExt();
         return e.extra_inset_shadows[0..e.extra_inset_count];
@@ -1269,6 +1261,9 @@ pub const Style = struct {
     }
     pub inline fn composited_group(self: *const Style) bool {
         return self.getExt().composited_group;
+    }
+    pub inline fn contentWarp(self: *const Style) ?ContentWarp {
+        return self.getExt().content_warp;
     }
     pub inline fn blendMode(self: *const Style) BlendMode {
         return self.getExt().blend_mode;
@@ -1309,6 +1304,11 @@ pub const Style = struct {
         self.margin = margin.toPadding();
         self.ensureExtPanic(allocator).margin_auto_mask = margin.auto_mask;
     }
+    /// Fallible version: OOM returns error (not abort) on constructor paths with error channel.
+    pub fn setMarginSpecFallible(self: *Style, allocator: std.mem.Allocator, margin: Margin) !void {
+        (try self.ensureExtFallible(allocator)).margin_auto_mask = margin.auto_mask;
+        self.margin = margin.toPadding();
+    }
     pub fn clearAutoMargins(self: *Style) void {
         if (self.ext) |e| e.margin_auto_mask = 0;
     }
@@ -1325,7 +1325,7 @@ pub const Style = struct {
         }
     }
 
-    // ── 可继承文本属性 accessor ──
+    // -- Inherited text property accessors --
     pub inline fn text_color(self: *const Style) ?Color {
         return self.getExt().text_color;
     }
@@ -1341,28 +1341,27 @@ pub const Style = struct {
         return self.border.radius;
     }
 
-    /// 返回四角独立圆角值 [TL, TR, BR, BL]
+    /// Return four-corner radii [TL, TR, BR, BL].
     pub fn effectiveRadii(self: *const Style) [4]f32 {
         if (self.corner_radius()) |cr| return cr.resolve4();
         const r = self.border.radius;
         return .{ r, r, r, r };
     }
 
-    // 编译期大小检查：内联高频字段应 <= 128 bytes
+    // Compile-time size check: high-freq inline fields should be <= 128 bytes.
     comptime {
         if (@sizeOf(Style) > 128) @compileError("Style too large");
     }
 
-    /// ⚠️ **已冻结，不要在新代码里用。** 分配失败时 `@panic`，对编辑器来说
-    /// abort 是最坏结局（用户数据全丢）。绝大多数调用点所在的函数本身就是 `!T`、
-    /// 本来就能传播错误。
-    ///
-    /// 新代码一律用 `ensureExtFallible` 并把错误传上去。确实"构造上不可能失败"
-    /// （容量已预留等）就写 `ensureExtFallible(a) catch unreachable` 并在注释里
-    /// 论证，要可 grep、可 review，而不是藏在库函数里。
-    ///
-    /// 存量调用点受下游项目的 OOM 债务棘轮脚本约束：只减不增。
-    /// 归零后本函数删除。改名为 `*Panic` 是为了让存量可 grep、且没人会顺手敲它。
+    /// Warning: **frozen; don't use in new code.** OOM panics (abort is worst for an editor: user
+    /// data lost).
+    /// New code uses `ensureExtFallible` and propagates errors. If it genuinely cannot fail by
+    /// construction (capacity already reserved, etc.), write `ensureExtFallible(a) catch
+    /// unreachable` and justify it in a comment, so it is greppable and reviewable instead of
+    /// hidden inside a library function.
+    /// Existing callsites are bound by the OOM debt ratchet: count may only decrease; deleted at
+    /// zero.
+    /// Named `*Panic` to be greppable and avoid accidental use.
     pub fn ensureExtPanic(self: *Style, allocator: std.mem.Allocator) *StyleExt {
         return self.ensureExtFallible(allocator) catch @panic("OOM: StyleExt");
     }
@@ -1377,116 +1376,301 @@ pub const Style = struct {
 };
 
 pub const GlassSurface = enum(u8) {
-    /// 平面，不额外塑形。适合作为玻璃底面基准。
+    /// Flat, no extra shaping. Good glass base reference.
     flat = 0,
-    /// 圆弧凸面，边缘位移更均匀，适合放大镜 / 浮凸镜片。
+    /// Arc bulge, smoother edge shift; magnifying glass / convex lens.
     convex_circle = 1,
-    /// Squircle 凸面，边缘过渡更平，适合系统控件式 liquid glass。
+    /// Squircle bulge, smooth edge transition; system-control liquid glass.
     convex_squircle = 2,
-    /// 凹面，中心更容易产生缩退 / zoom-out 的位移趋势。
+    /// Concave surface; the center tends to displace inward (shrink / zoom-out).
     concave = 3,
-    /// 外圈凸起、中心微凹，适合开关 / 胶囊按钮一类玻璃。
+    /// Outer ring convex + center slight concave; switch / capsule button glass.
     lip = 4,
+    /// Flat body + arc edge; body avoids full-face lens distortion.
+    convex_plate = 5,
 };
 
-/// 液态玻璃效果参数（用户侧，Color 类型）
-/// 类 CSS linear-gradient 的 blur 渐变：把 backdrop blur 强度当作沿某方向
-/// 变化的渐变属性（Apple scroll-edge progressive blur 是它的一个特例）。
+/// Liquid glass effect params (user-side, Color type). CSS-like linear-gradient blur: treat
+/// backdrop blur strength as gradient property varying along axis (Apple scroll-edge progressive
+/// blur is special case).
 ///   blur_gradient = .{ .direction = .to_bottom,
 ///                      .stops = ..., .stop_count = 3 }
 /// ≈ linear-gradient(to bottom, blur 0%, blur 30%, none 100%)
 pub const BlurGradient = struct {
     pub const BlurGradientDirection = enum(u8) {
-        /// 关闭（无渐变，整面均匀 blur）
+        /// Off (no gradient, uniform blur across).
         none = 0,
-        /// t=0 在顶边（CSS `to bottom`：起点在上）
+        /// t=0 at top edge (CSS `to bottom`: start at top).
         to_bottom = 1,
-        /// t=0 在底边
+        /// t=0 at bottom edge.
         to_top = 2,
-        /// t=0 在左边
+        /// t=0 at left edge.
         to_right = 3,
-        /// t=0 在右边
+        /// t=0 at right edge.
         to_left = 4,
     };
-    /// 渐变 stop（同 CSS gradient color stop）
+    /// Gradient stop (CSS gradient color stop).
     pub const Stop = struct {
-        /// 位置：占节点沿渐变轴尺寸的百分比 0~1（需升序）
+        /// Position: % of node size along gradient axis, 0~1 (must be ascending).
         pos: f32 = 0.0,
-        /// 该位置的 blur 强度 0~1
+        /// Blur strength 0~1 at this position.
         strength: f32 = 0.0,
     };
 
     direction: BlurGradientDirection = .none,
-    /// 全局强度乘子 0~1（滚动位置等运行时信号驱动整体淡入淡出）
+    /// Global strength multiplier 0~1 (scroll position etc runtime signal drives whole fade).
     strength: f32 = 1.0,
-    /// stops：段间 smoothstep 插值；首 stop 前 / 末 stop 后保持端点强度。
-    /// 最多取前 4 个；空 slice 退回默认 (0,1)->(1,0) 单段渐出。
-    /// 注意生命周期：style 是 retained 的，slice 须指向 comptime 字面量
-    /// （`&.{ ... }`）或与节点同寿命的存储，不能指向栈上临时数组。
-    stops: []const Stop = &.{},
+    /// stops: smoothstep between segments; before first/after last hold endpoint. Inline max 4
+    /// (shader match), first stop_count valid; stop_count=0 -> default (0,1)->(1,0) single
+    /// fade-out. Fixed inline not slice: styles are values, can save/compare/encode, no lifetime
+    /// constraints.
+    stops: [max_stops]Stop = @as([max_stops]Stop, @splat(.{})),
+    stop_count: u8 = 0,
+
+    pub const max_stops = 4;
+
+    /// Construct from stops (>4 takes first 4 only).
+    pub fn withStops(self: BlurGradient, list: []const Stop) BlurGradient {
+        var out = self;
+        const n = @min(list.len, max_stops);
+        out.stops = @as([max_stops]Stop, @splat(.{}));
+        for (list[0..n], 0..) |st, i| out.stops[i] = st;
+        out.stop_count = @intCast(n);
+        return out;
+    }
+};
+
+/// GlassGroup member shape (docs/LIQUID_GLASS_DESIGN.md §3 / §7.2): container surface samples
+/// background once, composites N shapes. Coords in container surface local logical px.
+pub const GlassGroupShape = struct {
+    /// Member surface node id: luminance read area key (member finds its reading by it).
+    node_id: u32 = std.math.maxInt(u32),
+    x: f32 = 0,
+    y: f32 = 0,
+    w: f32 = 0,
+    h: f32 = 0,
+    radius: f32 = 0,
+    /// Shadow (in container glass pass, drawn as union SDF, bridge-continuous): alpha 0..1, blur &
+    /// offset (logical px).
+    shadow_alpha: f32 = 0,
+    shadow_blur: f32 = 0,
+    shadow_offset_x: f32 = 0,
+    shadow_offset_y: f32 = 0,
+    /// Materialize amount (1 = fully formed): shader converges this shape's blur to clear
+    /// background.
+    level: f32 = 1,
+    /// Base coat without tint (neutral veil): {grayscale 0..1, alpha 0..1}. Container bridge + tint
+    /// fade-out use it (native: bridge always untinted base glass, tint only inside member shapes).
+    base_veil: [2]f32 = .{ 247.0 / 255.0, 0 },
+    /// Press feedback offset (see GlassParams.press_offset).
+    press_offset: f32 = 0,
+    /// glassEffectUnion: same key (!=0) merges members into one shape—their bounding box's
+    /// same-type shape (capsule recalc corners by short edge, rounded-rect keeps corners); material
+    /// from first member.
+    union_key: u32 = 0,
+    capsule: bool = false,
+    /// Member's own material: lens/coat/rim/tint per-shape; shared items (blur bank etc.) from
+    /// member 0.
+    material: ResolvedGlassParams = .{},
+};
+
+pub const glass_group_max_shapes = 8;
+
+/// Shape table owned by GlassGroup state (stable address, lifetime = container scope); container
+/// surface glass params hold pointer only; each member write self-increments version; glass
+/// fingerprint (nodeGlassParamsHash) feeds version only, not whole table.
+pub const GlassGroupShapes = struct {
+    /// Style handle (see style_decl.isStyleHandle): GlassParams.group pointer-only; identity is
+    /// address.
+    pub const style_handle = true;
+    count: u8 = 0,
+    version: u32 = 0,
+    /// Merge distance (logical px, corresponds GlassEffectContainer(spacing:)); active M3 onward.
+    spacing: f32 = 0,
+    /// Merge blend radius overall scale (0 = hard union; transitions static = 0).
+    blend: f32 = 1,
+    /// Transition-period merge radius k/S (max across transitioning members): warp 2·sqrt(1-s),
+    /// matched insert 0.75 / remove 0.5.
+    motion: f32 = 0,
+    /// This frame has member in transition (morph / matched / pulse / materialize): render disables
+    /// pixel snap, else slow segments quantize to whole physical pixels, motion steps one by one.
+    continuous: bool = false,
+    shapes: [glass_group_max_shapes]GlassGroupShape = @as([glass_group_max_shapes]GlassGroupShape, @splat(.{})),
 };
 
 pub const GlassParams = struct {
-    /// 背景模糊半径（逻辑像素，0 = 无模糊），同 CSS backdrop-filter: blur(px)：
-    /// 连续可调、DPI 无关。量程 [0, 96]，超出 clamp（Kawase 链 6 级封顶，
-    /// 96 已接近纯色平均，更大值无视觉意义）。
+    /// GlassGroup container surface: when non-null, composite N shapes by shape table (see
+    /// GlassGroupShapes).
+    group: ?*const GlassGroupShapes = null,
+    /// Backdrop blur radius (logical pixels, 0 = no blur), like CSS backdrop-filter: blur(px):
+    /// continuous adjustable, DPI-independent. Range [0, 96], exceeds -> clamp (6-tier Kawase
+    /// chain, 96 near pure-color average, larger meaningless).
     backdrop_blur: f32 = 0,
-    /// 毛玻璃色调叠加（null = 无色调，仅 blur）
+    /// Frosted glass tint (null = no tint, blur only).
     glass_tint: ?Color = null,
-    /// Liquid Glass 强度（0 = 仅 blur，1 = 默认液态玻璃，>1 = 更厚更亮）
+    /// Absorption colors transmitted light; surface blends a readable material
+    /// veil before lighting. Native regular glass needs the latter to lift a
+    /// dark backdrop in a light appearance, and to support prominent tint.
+    tint_mode: enum(u8) { absorption, surface } = .absorption,
+    /// With `.absorption`: the share of the tinted (absorption) result; the rest is the surface
+    /// veil `base_veil` (`NSGlassEffectView.tintColor` alpha: native output is exactly the untinted
+    /// glass mixed toward the fully tinted glass by alpha). 1 = fully tinted.
+    tint_amount: f32 = 1.0,
+    /// Surface veil for the untinted share of a partial tint (`tint_amount < 1`); null = none.
+    base_veil: ?Color = null,
+    /// Surface veil as a backdrop-luma transfer curve (sRGB 0-1 output at backdrop gray 16k,
+    /// i.e. luma 16k / 255, k = 0..16; the end segments extrapolate)
+    /// instead of the affine `glass_tint` blend: out = T(Y) + (e - Y) * (1 - glass_tint.a). An
+    /// affine T reproduces the blend exactly; null = the affine blend.
+    veil_curve: ?[17]f32 = null,
+    /// iOS tab-bar selection lens (single glass; see glass.metal native_glass): [0] > 0 marks
+    /// the material, whose displacement is the measured native field (tab_lens_sample_depth);
+    /// [1..8) unused.
+    tab_lens: [24]f32 = @as([24]f32, @splat(0)),
+    /// Liquid Glass intensity (0 = blur only, 1 = default liquid, >1 = thicker/brighter).
     glass_intensity: f32 = 1.0,
-    /// 高光不透明度（0.20~0.50，搜索框=0.20，开关=0.50）
+    /// Highlight opacity (0.20~0.50, searchbox=0.20, switch=0.50).
     specular_opacity: f32 = 0.35,
-    /// 高光颜色饱和度（4~9，搜索框=4，放大镜=9）
+    /// Highlight color saturation (4~9, searchbox=4, magnifier=9).
     specular_saturation: f32 = 6.0,
-    /// 折射强度（0~1，搜索框=0.70，其他=1.00）
+    /// Refraction strength (0~1, searchbox=0.70, other=1.00).
     refraction_level: f32 = 1.0,
-    /// Backdrop blur 混合（0=纯 sharp，1=纯 blur，开关=0.20，其他=1.0）
+    /// Backdrop blur blend (0=pure sharp, 1=pure blur, switch=0.20, other=1.0).
     blur_level: f32 = 1.0,
-    /// 屏幕空间折射位移感知强度（与 IOR 解耦，0-3，默认 1.0）
+    /// Screen-space refraction displacement perception intensity (uncoupled from IOR, 0-3, default
+    /// 1.0).
     warp_gain: f32 = 1.0,
-    /// 中心薄层厚度（逻辑像素，驱动折射 warp 幅度和 Beer-Lambert tint，默认 4.0）
+    /// Center thin-layer thickness (logical pixels, drives refraction warp magnitude and
+    /// Beer-Lambert tint, default 4.0).
     center_thickness: f32 = 4.0,
-    /// 玻璃上表面轮廓，直接影响镜面高光、位移向量场与中心透镜感。
+    /// Glass top-surface profile, directly affects specular highlight, displacement field,
+    /// center-lens feel.
     surface: GlassSurface = .convex_squircle,
-    /// 上表面玻璃边沿（bezel）占最小半轴的比例，决定曲面过渡宽度。
+    /// Top-surface bezel width % of minor axis, decides curvature transition width.
     bezel_width: f32 = 0.18,
-    /// 玻璃下表面轮廓，默认平面；影响厚度分布与出射折射。
+    /// Glass bottom-surface profile, default flat; affects thickness distribution and exit
+    /// refraction.
     bottom_surface: GlassSurface = .flat,
-    /// 下表面 bevel 宽度比例。默认较窄，常用于平底或浅弧底。
+    /// Bottom-surface bevel width %. Default narrow, flat/shallow-arc bottom.
     bottom_bezel_width: f32 = 0.12,
-    /// 背景饱和度（CSS backdrop-filter: saturate()，1 = 不变，2.1 = 210%）。
+    /// Background saturation (CSS backdrop-filter: saturate(), 1 = unchanged, 2.1 = 210%).
     backdrop_saturation: f32 = 1.0,
-    /// 背景亮度（CSS backdrop-filter: brightness()，1 = 不变）。
+    /// Background brightness (CSS backdrop-filter: brightness(), 1 = unchanged).
     backdrop_brightness: f32 = 1.0,
-    /// 镜面高光方向（弧度，屏幕空间，0 = 向右，-π/2 = 向上）。
+    /// Specular highlight direction (radians, screen-space, 0 = right, -pi/2 = up).
     specular_angle: f32 = -std.math.pi / 3.0,
-    /// 额外中心放大倍率（0 = 无放大，1 = 明显透镜）。
+    /// Extra center magnification (0 = none, 1 = obvious lens).
     magnification: f32 = 0.0,
-    /// 玻璃主体的光学尺度比例，控制位移场覆盖半径。
+    /// Glass body optical scale %, controls displacement field coverage radius.
     scale_ratio: f32 = 1.0,
-    /// 边缘 displacement field 强度（0.2~4.0），控制 bezel 附近的背景扭曲。
+    /// Edge displacement field intensity (0.2~4.0), controls bezel-area background warp.
     edge_field_strength: f32 = 1.0,
-    /// 中心 zoom displacement 半径（相对最小半轴，0.1~1.5）。
+    /// Center zoom displacement radius (relative minor axis, 0.1~1.5).
     center_zoom_radius: f32 = 0.58,
-    /// 中心 zoom displacement 衰减指数（越大边界越紧，0.4~6.0）。
+    /// Center zoom displacement falloff exponent (larger -> tighter boundary, 0.4~6.0).
     center_zoom_falloff: f32 = 2.2,
-    /// 玻璃与底图之间的“悬浮距离”（逻辑像素），会放大折射和模糊感。
+    /// 'Float distance' between glass and backdrop (logical px), magnifies refraction and blur
+    /// feel.
     backdrop_distance: f32 = 0.0,
-    /// blur 渐变（类 CSS linear-gradient；见 BlurGradient）。
-    /// direction=.none 时关闭。
+    /// Native Liquid Glass lens geometry (logical px, surface = .convex_plate only): superellipse
+    /// bevel width/height + flat base thickness. When bezel=0, use old surface model. Native clear
+    /// capsule measured: 19.75 / 27 / 37.5 (see docs/GLASS_NATIVE_FIDELITY.md).
+    lens_bezel_px: f32 = 0.0,
+    lens_height_px: f32 = 0.0,
+    lens_base_px: f32 = 0.0,
+    /// Native model: rim blur-mix relative to center (0..1; native clear ~= 0.7).
+    lens_edge_blur: f32 = 1.0,
+    /// Measured native gamma-space Gaussian kernel. backdrop_blur is main
+    /// sigma; signed coarse weight represents compact contrast enhancement.
+    native_fine_sigma: f32 = 0.0,
+    native_main_grid_mix: f32 = 0,
+    /// Native geometry rasterization: static SwiftUI layout snaps all four
+    /// physical edges, but an animating (morphing) shape is rasterized at its
+    /// continuous position (measured mid-morph edge coverage). GlassBox sets
+    /// this while a morph is running.
+    native_continuous_geometry: bool = false,
+    /// Press feedback: final color sRGB constant offset (system .glass button pressed: light family
+    /// -19.8/255, dark family +17.7/255).
+    press_offset: f32 = 0,
+    /// Popover arrow (single glass): {edge 0 none/1 down/2 up/3 left/4 right, offset along edge
+    /// from center, protrusion length, tip radius} (logical px). Node rect includes arrow area;
+    /// body is rect minus arrow-side protrusion.
+    arrow: [4]f32 = .{ 0, 0, 0, 0 },
+    /// Knob lens dual-color rim (see GlassUniforms.knob_rim_*); knob_rim_light[3]=0 disables.
+    knob_rim_dark: [4]f32 = .{ 0, 0, 0, 0 },
+    knob_rim_light: [4]f32 = .{ 0, 0, 0, 0 },
+    /// Accessibility material (resolve per system pref, see GlassUniforms.a11y_params).
+    a11y: [4]f32 = .{ 0, 0, 0, 0 },
+    /// Capture area no outer expand, blur clamped at edge (backgroundExtensionEffect blur layer).
+    capture_clamp: bool = false,
+    /// Not affected by accessibility material (reduce transparency / increase contrast): pure blur
+    /// layer (backgroundExtensionEffect) not glass material; replace with opaque matte -> covers
+    /// whole extension.
+    a11y_exempt: bool = false,
+    native_coarse_sigma: f32 = 0.0,
+    native_fine_weight: f32 = 0.0,
+    native_coarse_weight: f32 = 0.0,
+    native_fine_slope: f32 = 0.0,
+    native_fine_curve: f32 = 0.0,
+    native_coarse_slope: f32 = 0.0,
+    native_coarse_curve: f32 = 0.0,
+    native_rim_offset: f32 = 0.0,
+    native_rim_luma: f32 = 0.0,
+    native_rim_chroma: f32 = 0.0,
+    native_rim_ratio: f32 = 0.0,
+    native_chroma_enabled: f32 = 0.0,
+    native_chroma_fine: f32 = 0.0,
+    native_chroma_coarse: f32 = 0.0,
+    native_chroma_fine_slope: f32 = 0.0,
+    native_chroma_fine_curve: f32 = 0.0,
+    native_chroma_coarse_slope: f32 = 0.0,
+    native_chroma_coarse_curve: f32 = 0.0,
+    native_tint_mode: f32 = 0.0,
+    native_tint_dark: f32 = 0.0,
+    native_tint_chroma_base: f32 = 0.0,
+    native_tint_chroma_slope: f32 = 0.0,
+    /// Blur gradient (CSS linear-gradient-like; see BlurGradient). direction=.none disables.
     blur_gradient: BlurGradient = .{},
 
-    /// 转为 GPU 就绪格式（Color->[4]f32）
+    /// Convert to GPU-ready format (Color->[4]f32).
+    /// System pref 'reduce transparency' on: glass becomes max-frosted matte: blur maxed,
+    /// refraction/warp/
+    /// magnify/edge-field zero, highlight dimmed; color blocks and tone remain, content unseeable.
+    /// Don't swap to a solid panel: glass content color is designed over the background (white text
+    /// on
+    /// color); the node's light background would make it white-on-white (GlassBox capsules vanish).
     pub fn resolve(self: GlassParams) ResolvedGlassParams {
-        // blur gradient stops：clamp 到 [0,1] 并强制升序；空 slice -> 默认
-        // 双 stop (0,1)->(1,0)（单段渐出）
+        const ic = a11y_preferences.increaseContrast();
+        if (!self.a11y_exempt and (a11y_preferences.reduceTransparency() or ic)) {
+            // Native measured (native_tint_backdrop.swift with -reduceTransparency /
+            // -increaseContrast process params, not system settings): body becomes
+            // opaque—Glass.tint shows tint proper (background-independent), untinted is
+            // fixed-brightness matte (reduce 242; increase 234 + 14*Y), preserves 16% / 10%
+            // background saturation. Reduce keeps material highlight/shadow; increase replaces
+            // highlight with ~0.75pt dark stroke. Body color is blurred background (max blur mixes
+            // adjacent areas, dilutes saturation/brightness).
+            var frosted = self;
+            frosted.blur_level = 1.0;
+            frosted.refraction_level = 0.0;
+            frosted.warp_gain = 0.0;
+            frosted.magnification = 0.0;
+            frosted.edge_field_strength = 0.2;
+            frosted.a11y = if (ic) .{ 2, 234.0 / 255.0, 14.0 / 255.0, 0.10 } else .{ 1, 242.0 / 255.0, 0, 0.16 };
+            if (ic) frosted.specular_opacity = 0;
+            return frosted.resolveRaw();
+        }
+        return self.resolveRaw();
+    }
+
+    fn resolveRaw(self: GlassParams) ResolvedGlassParams {
+        // Blur gradient stops: clamp to [0,1], force ascending; empty slice -> default double-stop
+        // (0,1)->(1,0) (single fade-out).
         const bg = self.blur_gradient;
         var stop_pos: [4]f32 = .{ 0, 1, 1, 1 };
         var stop_str: [4]f32 = .{ 1, 0, 0, 0 };
         var stop_count: u8 = 2;
-        if (bg.stops.len > 0) {
-            stop_count = @intCast(@min(bg.stops.len, 4));
+        if (bg.stop_count > 0) {
+            stop_count = @min(bg.stop_count, BlurGradient.max_stops);
             var prev: f32 = 0.0;
             for (0..stop_count) |i| {
                 const s = bg.stops[i];
@@ -1494,7 +1678,7 @@ pub const GlassParams = struct {
                 stop_pos[i] = prev;
                 stop_str[i] = std.math.clamp(s.strength, 0.0, 1.0);
             }
-            // 尾部填充为末 stop，shader 循环越界安全
+            // Tail-fill to last stop; shader loop overflow-safe.
             for (stop_count..4) |i| {
                 stop_pos[i] = stop_pos[stop_count - 1];
                 stop_str[i] = stop_str[stop_count - 1];
@@ -1506,22 +1690,39 @@ pub const GlassParams = struct {
         const gt: [4]f32 = if (self.glass_tint) |c|
             .{ @as(f32, @floatFromInt(c.r)) / 255.0, @as(f32, @floatFromInt(c.g)) / 255.0, @as(f32, @floatFromInt(c.b)) / 255.0, @as(f32, @floatFromInt(c.a)) / 255.0 }
         else
-            .{ 1, 1, 1, 1 };
+            .{ 1, 1, 1, if (self.tint_mode == .surface) 0 else 1 };
         return .{
+            .group = self.group,
             .backdrop_blur = std.math.clamp(self.backdrop_blur, 0.0, 96.0),
             .glass_tint = gt,
+            .tint_mode = switch (self.tint_mode) {
+                .surface => 1.0,
+                .absorption => 1.0 - std.math.clamp(self.tint_amount, 0.0, 1.0),
+            },
+            .veil_curve = if (self.veil_curve) |c| curve: {
+                var out: [20]f32 = @splat(0);
+                for (c, 0..) |v, i| out[i] = std.math.clamp(v, 0.0, 1.0);
+                out[17] = 1; // enabled
+                break :curve out;
+            } else @splat(0),
+            .base_veil = if (self.base_veil) |c|
+                .{ @as(f32, @floatFromInt(c.r)) / 255.0, @as(f32, @floatFromInt(c.g)) / 255.0, @as(f32, @floatFromInt(c.b)) / 255.0, @as(f32, @floatFromInt(c.a)) / 255.0 }
+            else
+                .{ 0, 0, 0, -1 },
+            .tab_lens = self.tab_lens,
             .glass_intensity = std.math.clamp(self.glass_intensity, 0.0, 2.0),
             .specular_opacity = std.math.clamp(self.specular_opacity, 0.0, 1.0),
             .specular_saturation = std.math.clamp(self.specular_saturation, 1.0, 12.0),
-            .refraction_level = std.math.clamp(self.refraction_level, 0.0, 1.0),
+            // Negative = shrink lens (knob-hold state, native edge samples outward).
+            .refraction_level = std.math.clamp(self.refraction_level, -1.0, 1.0),
             .blur_level = std.math.clamp(self.blur_level, 0.0, 1.0),
             .warp_gain = std.math.clamp(self.warp_gain, 0.0, 3.0),
-            .center_thickness = std.math.clamp(self.center_thickness, 0.0, 20.0),
+            .center_thickness = std.math.clamp(self.center_thickness, 0.0, if (self.surface == .convex_plate) @as(f32, 40.0) else 20.0),
             .surface = self.surface,
-            .bezel_width = std.math.clamp(self.bezel_width, 0.04, 0.45),
+            .bezel_width = std.math.clamp(self.bezel_width, 0.04, if (self.surface == .convex_plate) @as(f32, 1.0) else 0.45),
             .bottom_surface = self.bottom_surface,
-            .bottom_bezel_width = std.math.clamp(self.bottom_bezel_width, 0.04, 0.45),
-            .backdrop_saturation = std.math.clamp(self.backdrop_saturation, 0.0, 4.0),
+            .bottom_bezel_width = std.math.clamp(self.bottom_bezel_width, 0.04, if (self.bottom_surface == .convex_plate) @as(f32, 1.0) else 0.45),
+            .backdrop_saturation = std.math.clamp(self.backdrop_saturation, 0.0, 8.0),
             .backdrop_brightness = std.math.clamp(self.backdrop_brightness, 0.0, 3.0),
             .specular_angle = specular_angle,
             .magnification = std.math.clamp(self.magnification, -1.0, 2.0),
@@ -1530,7 +1731,42 @@ pub const GlassParams = struct {
             .center_zoom_radius = std.math.clamp(self.center_zoom_radius, 0.1, 1.5),
             .center_zoom_falloff = std.math.clamp(self.center_zoom_falloff, 0.4, 6.0),
             .backdrop_distance = std.math.clamp(self.backdrop_distance, 0.0, 40.0),
-            .blur_gradient_direction = @intFromEnum(bg.direction),
+            .lens_bezel_px = std.math.clamp(self.lens_bezel_px, 0.0, 200.0),
+            .lens_height_px = std.math.clamp(self.lens_height_px, 0.0, 200.0),
+            .lens_base_px = std.math.clamp(self.lens_base_px, 0.0, 400.0),
+            .lens_edge_blur = std.math.clamp(self.lens_edge_blur, 0.0, 1.0),
+            .native_fine_sigma = @max(self.native_fine_sigma, 0.0),
+            .native_main_grid_mix = std.math.clamp(self.native_main_grid_mix, 0.0, 1.0),
+            .native_continuous_geometry = self.native_continuous_geometry,
+            .press_offset = self.press_offset,
+            .arrow = self.arrow,
+            .knob_rim_dark = self.knob_rim_dark,
+            .knob_rim_light = self.knob_rim_light,
+            .a11y = self.a11y,
+            .capture_clamp = self.capture_clamp,
+            .native_coarse_sigma = @max(self.native_coarse_sigma, 0.0),
+            .native_fine_weight = self.native_fine_weight,
+            .native_coarse_weight = self.native_coarse_weight,
+            .native_fine_slope = self.native_fine_slope,
+            .native_fine_curve = self.native_fine_curve,
+            .native_coarse_slope = self.native_coarse_slope,
+            .native_coarse_curve = self.native_coarse_curve,
+            .native_rim_offset = self.native_rim_offset,
+            .native_rim_luma = self.native_rim_luma,
+            .native_rim_chroma = self.native_rim_chroma,
+            .native_rim_ratio = self.native_rim_ratio,
+            .native_chroma_enabled = self.native_chroma_enabled,
+            .native_chroma_fine = self.native_chroma_fine,
+            .native_chroma_coarse = self.native_chroma_coarse,
+            .native_chroma_fine_slope = self.native_chroma_fine_slope,
+            .native_chroma_fine_curve = self.native_chroma_fine_curve,
+            .native_chroma_coarse_slope = self.native_chroma_coarse_slope,
+            .native_chroma_coarse_curve = self.native_chroma_coarse_curve,
+            .native_tint_mode = self.native_tint_mode,
+            .native_tint_dark = self.native_tint_dark,
+            .native_tint_chroma_base = self.native_tint_chroma_base,
+            .native_tint_chroma_slope = self.native_tint_chroma_slope,
+            .blur_gradient_direction = @backingInt(bg.direction),
             .blur_gradient_strength = std.math.clamp(bg.strength, 0.0, 1.0),
             .blur_gradient_stop_pos = stop_pos,
             .blur_gradient_stop_str = stop_str,
@@ -1539,10 +1775,22 @@ pub const GlassParams = struct {
     }
 };
 
-/// 液态玻璃效果参数（GPU 就绪格式，[4]f32 tint）
+/// Liquid glass effect params (GPU-ready format, [4]f32 tint).
 pub const ResolvedGlassParams = struct {
+    /// GlassGroup shape table (container surface only; null = single rect).
+    group: ?*const GlassGroupShapes = null,
     backdrop_blur: f32 = 0,
     glass_tint: [4]f32 = .{ 1, 1, 1, 1 },
+    /// Surface-veil share: 0 = absorption (Glass.tint), 1 = surface veil; in between = partial
+    /// tint (absorption result mixed toward the `base_veil` surface result).
+    tint_mode: f32 = 0,
+    /// Surface veil of a partial tint (sRGB 0-1); alpha < 0 = none (the veil branch uses
+    /// glass_tint).
+    base_veil: [4]f32 = .{ 0, 0, 0, -1 },
+    /// Veil transfer curve: [0..17) knots (sRGB 0-1), [17] = enabled flag (see GlassParams).
+    veil_curve: [20]f32 = @splat(0),
+    /// See GlassParams.tab_lens.
+    tab_lens: [24]f32 = @as([24]f32, @splat(0)),
     glass_intensity: f32 = 1.0,
     specular_opacity: f32 = 0.35,
     specular_saturation: f32 = 6.0,
@@ -1563,6 +1811,49 @@ pub const ResolvedGlassParams = struct {
     center_zoom_radius: f32 = 0.58,
     center_zoom_falloff: f32 = 2.2,
     backdrop_distance: f32 = 0.0,
+    lens_bezel_px: f32 = 0.0,
+    lens_height_px: f32 = 0.0,
+    lens_base_px: f32 = 0.0,
+    lens_edge_blur: f32 = 1.0,
+    native_fine_sigma: f32 = 0.0,
+    native_main_grid_mix: f32 = 0,
+    native_continuous_geometry: bool = false,
+    /// Press feedback: final color sRGB constant offset (system .glass button pressed: light family
+    /// -19.8/255, dark family +17.7/255).
+    press_offset: f32 = 0,
+    /// Popover arrow (single glass): {edge 0 none/1 down/2 up/3 left/4 right, offset along edge
+    /// from center, protrusion length, tip radius} (logical px). Node rect includes arrow area;
+    /// body is rect minus arrow-side protrusion.
+    arrow: [4]f32 = .{ 0, 0, 0, 0 },
+    /// Knob lens dual-color rim (see GlassUniforms.knob_rim_*); knob_rim_light[3]=0 disables.
+    knob_rim_dark: [4]f32 = .{ 0, 0, 0, 0 },
+    knob_rim_light: [4]f32 = .{ 0, 0, 0, 0 },
+    /// Accessibility material (resolve per system pref, see GlassUniforms.a11y_params).
+    a11y: [4]f32 = .{ 0, 0, 0, 0 },
+    /// Capture area no outer expand, blur clamped at edge (backgroundExtensionEffect blur layer).
+    capture_clamp: bool = false,
+    native_coarse_sigma: f32 = 0.0,
+    native_fine_weight: f32 = 0.0,
+    native_coarse_weight: f32 = 0.0,
+    native_fine_slope: f32 = 0.0,
+    native_fine_curve: f32 = 0.0,
+    native_coarse_slope: f32 = 0.0,
+    native_coarse_curve: f32 = 0.0,
+    native_rim_offset: f32 = 0.0,
+    native_rim_luma: f32 = 0.0,
+    native_rim_chroma: f32 = 0.0,
+    native_rim_ratio: f32 = 0.0,
+    native_chroma_enabled: f32 = 0.0,
+    native_chroma_fine: f32 = 0.0,
+    native_chroma_coarse: f32 = 0.0,
+    native_chroma_fine_slope: f32 = 0.0,
+    native_chroma_fine_curve: f32 = 0.0,
+    native_chroma_coarse_slope: f32 = 0.0,
+    native_chroma_coarse_curve: f32 = 0.0,
+    native_tint_mode: f32 = 0.0,
+    native_tint_dark: f32 = 0.0,
+    native_tint_chroma_base: f32 = 0.0,
+    native_tint_chroma_slope: f32 = 0.0,
     blur_gradient_direction: u8 = 0,
     blur_gradient_strength: f32 = 1.0,
     blur_gradient_stop_pos: [4]f32 = .{ 0, 1, 1, 1 },
@@ -1570,35 +1861,40 @@ pub const ResolvedGlassParams = struct {
     blur_gradient_stop_count: u8 = 2,
 };
 
-/// Style 扩展结构（低频字段，按需分配）
+/// Style extension struct (low-freq fields, allocated on-demand).
 pub const StyleExt = struct {
-    /// 外阴影列表（最多 max_shadows 层）。通过 setShadow / setShadows / setShadowList
-    /// 设置，不要直接修改字段。
-    shadows: [max_shadows]Shadow = [_]Shadow{.{}} ** max_shadows,
+    /// Outer shadow list (max max_shadows layers). Set via setShadow / setShadows / setShadowList;
+    /// don't modify field directly.
+    shadows: [max_shadows]Shadow = @as([max_shadows]Shadow, @splat(.{})),
     shadow_count: u8 = 0,
     gradient: ?Gradient = null,
     outline: ?Outline = null,
     corner_radius: ?CornerRadius = null,
+    /// >0 = this node is container shape (SwiftUI
+    /// `.containerShape(RoundedRectangle(cornerRadius:))`); descendants ConcentricRectangle /
+    /// GlassBox `.concentric` use it for concentric-corner calc (see ui/concentric.zig).
+    container_shape_radius: f32 = 0,
     scale_x: f32 = 1.0,
     scale_y: f32 = 1.0,
-    /// 旋转角度（弧度，正值顺时针），origin 由 transform_origin 控制
+    /// Rotation angle (radians, positive = clockwise), origin controlled by transform_origin.
     rotate: f32 = 0,
     transform_origin: TransformOrigin = .{},
     flex_basis: f32 = 0,
     align_self: ?AlignItems = null,
-    /// 只拒绝「继承来的」交叉轴 stretch：align_self 为 null 且父 align_items == .stretch
-    /// 时按 .start 排（保持 intrinsic 交叉尺寸）；父显式 .center/.end/.start 照常生效，
-    /// 显式 align_self（含 .stretch）仍优先。用于 fit 宽但不该被拉伸的控件（Button）。
+    /// Reject only inherited cross-axis stretch: align_self null && parent align_items == .stretch
+    /// -> .start (preserve intrinsic); parent explicit .center/.end/.start still applies; explicit
+    /// align_self (including .stretch) takes priority. For controls fit width but not stretch
+    /// (Button).
     no_cross_stretch: bool = false,
     margin_auto_mask: u8 = 0,
     inset: Inset = .{},
     sticky_insets: StickyInsets = .{},
-    /// **只影响同一父节点下兄弟节点的绘制与命中顺序。** 每个节点都是其子节点的
-    /// stacking context：z 不跨父节点比较，不影响裁剪，也不影响命中是否受裁剪
-    /// （渲染与命中都由祖先 overflow_hidden 链裁剪）。同级顺序见
-    /// core/paint_order.zig：regular -> sticky(z<=0) -> positive_z(z>0，按 z 稳定升序)；
-    /// 负值按 0 处理。要在视觉上压过表亲，就给共同祖先下相应的那个子节点设 z；
-    /// 要画到所有容器外，就挂到 portal（`cx.ensurePopoverPortalRoot()` / OverlayStack）。
+    /// **Only affects sibling paint and hit order under same parent.** Each node is its children's
+    /// stacking context: z doesn't cross-parent compare, no clipping effect, no hit clipping impact
+    /// (render and hit both clipped by ancestor overflow_hidden chain). Sibling order in
+    /// core/paint_order.zig: regular -> sticky(z<=0) -> positive_z(z>0, stable ascending by z);
+    /// negative treated 0. Visually overlay cousin -> z on common-ancestor child; paint outside all
+    /// containers -> portal (`cx.ensurePopoverPortalRoot()` / OverlayStack).
     z_index: i16 = 0,
     tab_index: ?i32 = null,
     aspect_ratio: f32 = 0,
@@ -1611,68 +1907,75 @@ pub const StyleExt = struct {
     flex_wrap: FlexWrap = .no_wrap,
     hit_shape: HitShapeSpec = .auto,
     clip_shape: ClipShapeSpec = .auto,
-    /// 节点自身的绘制形状（见 ShapeSpec）。默认圆角矩形。
+    /// Hit-testing-only override of the overflow clip (null = clip_shape). AppKit `hitTest:` is
+    /// frame-based while a layer mask clips drawing: GlassBox content paints clipped to the glass
+    /// shape but receives hits anywhere inside its rectangular bounds.
+    hit_clip_shape: ?ClipShapeSpec = null,
+    /// Node self paint shape (see ShapeSpec). Default rounded rect.
     shape: ShapeSpec = .rounded_rect,
     hit_behavior: ?HitBehavior = null,
     hit_roles: HitRolesOverride = .{},
-    /// 液态玻璃效果参数（null = 无 glass/blur 效果）
+    /// Liquid glass effect params (null = no glass/blur effect).
     glass: ?GlassParams = null,
-    /// 多色渐变（null = 用旧两色 Gradient）
+    /// Multi-color gradient (null = use old two-color Gradient).
     multi_gradient: ?MultiGradient = null,
-    /// 程序性噪声纹理（null = 无噪声）
+    /// Procedural noise texture (null = no noise).
     noise: ?NoiseParams = null,
-    /// Inset Shadow 内阴影（null = 无）。多层时这是第一层（最上层），其余在 extra_inset_shadows。
+    /// Inset shadow (null = none). When multi-layer, this is first (topmost); rest in
+    /// extra_inset_shadows.
     inset_shadow: ?InsetShadow = null,
-    /// 第 2、3 层内阴影（CSS 多重 inset box-shadow）。经 setInsetShadowList 设置。
-    extra_inset_shadows: [2]InsetShadow = [_]InsetShadow{.{}} ** 2,
+    /// Layers 2-3 inset shadow (CSS multi inset box-shadow). Set via setInsetShadowList.
+    extra_inset_shadows: [2]InsetShadow = @as([2]InsetShadow, @splat(.{})),
     extra_inset_count: u8 = 0,
-    /// Overflow fade 渐变遮罩配置
+    /// Overflow fade gradient mask config.
     overflow_fade: ?OverflowFade = null,
-    /// 四边独立 border 颜色覆盖（null = 使用 border.color）
+    /// Per-edge border color override (null = use border.color).
     border_side_colors: ?BorderSideColors = null,
-    /// 即使 opacity=0 也保留在 render/tick traversal 中，供 overlay 等场景预热首帧。
+    /// Keep in render/tick traversal even if opacity=0, for overlay first-frame warm-up.
     keep_rendering_when_transparent: bool = false,
-    /// 预提示 compositor 提前为 transform 动画准备独立 layer。
+    /// Hint compositor pre-stage layer for transform animation.
     will_change_transform: bool = false,
-    /// 预提示 compositor 提前为 opacity 动画准备独立 layer。
+    /// Hint compositor pre-stage layer for opacity animation.
     will_change_opacity: bool = false,
-    /// 显式请求将当前节点子树提升为 retained composited group surface。
+    /// Explicitly request subtree promoted to retained composited group surface.
     composited_group: bool = false,
-    /// SVG/CSS 混合模式（multiply/screen/…）。非 normal 会强制本节点子树走
-    /// offscreen surface（混合需要独立光栅化的 src），并在合成时按 W3C
-    /// Compositing L1 公式与背景混合。normal = 默认 SrcOver，无额外开销。
+    /// Lens warp of the promoted subtree surface (see ContentWarp); promotes like composited_group.
+    content_warp: ?ContentWarp = null,
+    /// SVG/CSS blend mode (multiply/screen/...). Non-normal forces subtree to offscreen surface
+    /// (blending needs src raster), composite via W3C Compositing L1 with background. normal =
+    /// default SrcOver, zero overhead.
     blend_mode: BlendMode = .normal,
 
-    // ── 可继承文本属性（类似 CSS inherited properties） ──
-    // 设置后自动被子孙 text 节点继承（除非子节点自己显式设置）
-    /// 继承文本颜色（null = 不设置，由 text node 自己决定）
+    // -- Inherited text properties (CSS-like) --
+    // After set, auto-inherited by text descendants (unless child overrides).
+    /// Inherited text color (null = unset, text node decides).
     text_color: ?Color = null,
-    /// 继承字体大小
+    /// Inherited font size.
     text_font_size: ?f32 = null,
-    /// 继承字体权重
+    /// Inherited font weight.
     text_font_weight: ?u16 = null,
 
-    /// 设置单层外阴影
+    /// Set single outer shadow.
     pub fn setShadow(self: *StyleExt, s: Shadow) void {
         self.shadows[0] = s;
         self.shadow_count = 1;
     }
 
-    /// 设置两层外阴影（s1 = 近距精锐，s2 = 远距环境光）
+    /// Set two outer shadows (s1 = near-precise, s2 = far-ambient).
     pub fn setShadows(self: *StyleExt, s1: Shadow, s2: Shadow) void {
         self.shadows[0] = s1;
         self.shadows[1] = s2;
         self.shadow_count = 2;
     }
 
-    /// 设置多层外阴影（CSS 顺序：第一项在最上层），超出 max_shadows 的截断。
+    /// Set multi outer shadow (CSS order: first item topmost), truncate if exceeds max_shadows.
     pub fn setShadowList(self: *StyleExt, list: []const Shadow) void {
         const n = @min(list.len, max_shadows);
         for (list[0..n], 0..) |s, i| self.shadows[i] = s;
         self.shadow_count = @intCast(n);
     }
 
-    /// 设置多层内阴影（CSS 顺序：第一项在最上层），最多 3 层。
+    /// Set multi inset shadow (CSS order: first topmost), max 3 layers.
     pub fn setInsetShadowList(self: *StyleExt, list: []const InsetShadow) void {
         self.inset_shadow = if (list.len > 0) list[0] else null;
         const extra = if (list.len > 1) @min(list.len - 1, self.extra_inset_shadows.len) else 0;
@@ -1680,21 +1983,21 @@ pub const StyleExt = struct {
         self.extra_inset_count = @intCast(extra);
     }
 
-    /// 清除所有外阴影
+    /// Clear all outer shadows.
     pub fn clearShadows(self: *StyleExt) void {
         self.shadow_count = 0;
     }
 };
 
-// ==================== StyleOverride，统一样式覆盖 ====================
+// ==================== StyleOverride, unified style override ====================
 
-/// 样式覆盖结构，所有字段默认 null，表示"不覆盖，用组件默认值"
-/// 统一样式描述（全可选字段）
+/// Style override struct; all fields default null = 'don't override, use component defaults'.
+/// Unified style description (all optional fields).
 ///
-/// 用于 box() 构造节点、组件外部样式覆盖、多层 merge。
-/// 内部通过 applyTo() 转换为紧凑的 Style（存储在 Node 上）。
+/// For box() node construction, component external style override, multi-layer merge. Internal via
+/// applyTo() -> compact Style (stored on Node).
 pub const BoxStyle = struct {
-    // ── 布局字段 ──
+    // -- Layout fields --
     width: ?Sizing = null,
     height: ?Sizing = null,
     direction: ?Direction = null,
@@ -1703,17 +2006,67 @@ pub const BoxStyle = struct {
     gap: ?f32 = null,
     padding: ?Padding = null,
     margin: ?Padding = null,
-    /// 完整 margin 声明（支持 auto）。若与 margin 同时设置，以 margin_spec 为准。
+    /// Complete margin declaration (supports auto). If both margin and margin_spec set, margin_spec
+    /// wins.
     margin_spec: ?Margin = null,
     flex: ?f32 = null,
     flex_shrink: ?f32 = null,
+    /// Flex wrapping (write StyleExt.flex_wrap).
+    flex_wrap: ?FlexWrap = null,
+    /// Blend mode (write StyleExt.blend_mode; non-normal -> node uses blend composite layer).
+    blend_mode: ?BlendMode = null,
+    /// Z-order (write StyleExt.z_index; cross-parent -> use portal, see zindex docs).
+    z_index: ?i16 = null,
+    /// Absolute/sticky positioning four-edge offset (write StyleExt.inset).
+    inset: ?Inset = null,
+    /// Linear gradient background (write StyleExt.gradient).
+    gradient: ?Gradient = null,
+    /// Clip shape (write StyleExt.clip_shape).
+    clip_shape: ?ClipShapeSpec = null,
+    /// Liquid glass / backdrop blur (write StyleExt.glass).
+    glass: ?GlassParams = null,
+    /// Multi-segment gradient background (write StyleExt.multi_gradient; overrides gradient).
+    multi_gradient: ?MultiGradient = null,
+    /// Composite subtree as one group (write StyleExt.composited_group).
+    composited_group: ?bool = null,
+    /// Lens warp of the subtree surface (write StyleExt.content_warp).
+    content_warp: ?ContentWarp = null,
+    /// Placement in grid container (write StyleExt.grid_placement).
+    grid_placement: ?GridPlacement = null,
+    /// Per-corner radius (write StyleExt.corner_radius; when both corner_radius set, this wins).
+    corner_radii: ?CornerRadius = null,
+    /// Multi inset shadow (CSS order, max 3; write StyleExt.inset_shadow / extra_inset_shadows).
+    inset_shadows: ?InsetShadowList = null,
+    // -- StyleExt same-name passthrough (type/semantics in StyleExt; write/reset both per
+    // ext_passthrough generic) --
+    outline: ExtField("outline") = null,
+    flex_basis: ExtField("flex_basis") = null,
+    align_self: ExtField("align_self") = null,
+    no_cross_stretch: ExtField("no_cross_stretch") = null,
+    sticky_insets: ExtField("sticky_insets") = null,
+    tab_index: ExtField("tab_index") = null,
+    aspect_ratio: ExtField("aspect_ratio") = null,
+    min_width: ExtField("min_width") = null,
+    max_width: ExtField("max_width") = null,
+    min_height: ExtField("min_height") = null,
+    max_height: ExtField("max_height") = null,
+    hit_shape: ExtField("hit_shape") = null,
+    shape: ExtField("shape") = null,
+    hit_behavior: ExtField("hit_behavior") = null,
+    hit_roles: ExtField("hit_roles") = null,
+    noise: ExtField("noise") = null,
+    inset_shadow: ExtField("inset_shadow") = null,
+    overflow_fade: ExtField("overflow_fade") = null,
+    keep_rendering_when_transparent: ExtField("keep_rendering_when_transparent") = null,
+    will_change_transform: ExtField("will_change_transform") = null,
+    will_change_opacity: ExtField("will_change_opacity") = null,
     position: ?Position = null,
     display: ?Display = null,
     overflow: ?Overflow = null,
     overflow_hidden: ?bool = null,
     layout_isolation: ?bool = null,
 
-    // ── 视觉字段 ──
+    // -- Visual fields --
     background: ?Color = null,
     opacity: ?f32 = null,
     cursor: ?CursorShape = null,
@@ -1725,41 +2078,64 @@ pub const BoxStyle = struct {
     transform_origin: ?TransformOrigin = null,
 
     // ── Border ──
-    /// 整体 border（color + width + radius 一次性设置）
+    /// Whole border (color + width + radius one-shot).
     border: ?Border = null,
-    /// 细粒度 border_color 覆盖（仅改颜色，不影响 width/radius）
+    /// Fine-grained border_color override (color only, unaffected width/radius).
     border_color: ?Color = null,
-    /// 细粒度 border_width 覆盖（仅改宽度，不影响 color/radius）
+    /// Fine-grained border_width override (width only, unaffected color/radius).
     border_width: ?f32 = null,
-    /// 细粒度四边宽度覆盖
+    /// Fine-grained four-edge width override.
     border_top_width: ?f32 = null,
     border_right_width: ?f32 = null,
     border_bottom_width: ?f32 = null,
     border_left_width: ?f32 = null,
-    /// 细粒度四边颜色覆盖
+    /// Fine-grained four-edge color override.
     border_top_color: ?Color = null,
     border_right_color: ?Color = null,
     border_bottom_color: ?Color = null,
     border_left_color: ?Color = null,
 
-    // ── ext 便捷字段 ──
+    // -- ext convenience fields --
     corner_radius: ?f32 = null,
     shadow: ?Shadow = null,
+    /// Multi outer shadow (CSS order, max max_shadows; when both shadow and shadows set, shadows
+    /// wins).
+    shadows: ?ShadowList = null,
 
-    // ── 文本相关（组件常需覆盖） ──
+    // -- Text-related (components often override) --
     text_color: ?Color = null,
     font_size: ?f32 = null,
     font_weight: ?u16 = null,
 
-    /// DevTools 来源追踪用：返回这个 BoxStyle 实际声明的 StyleField bitset。
-    /// BoxStyle 的细粒度 border_* 最终都落到 StyleField.border；margin_spec
-    /// 同理落到 margin。保持纯计算，不增加 BoxStyle/Node 的运行时尺寸。
+    /// Icon tint: icon / image node tint (YSS `icon-color`), varies by variant/condition. Not into
+    /// Style; view writes to node.
+    icon_color: ?Color = null,
+
+    /// Fields with StyleExt same-name, value-passthrough write (applyTo / needsExt / field mask
+    /// shared).
+    pub const ext_passthrough = [_][]const u8{ "outline", "flex_basis", "align_self", "no_cross_stretch", "sticky_insets", "tab_index", "aspect_ratio", "min_width", "max_width", "min_height", "max_height", "hit_shape", "shape", "hit_behavior", "hit_roles", "noise", "inset_shadow", "overflow_fade", "keep_rendering_when_transparent", "will_change_transform", "will_change_opacity" };
+
+    fn ExtField(comptime name: []const u8) type {
+        const T = @FieldType(StyleExt, name);
+        return if (@typeInfo(T) == .optional) T else ?T;
+    }
+
+    fn anyPassthrough(self: BoxStyle) bool {
+        inline for (ext_passthrough) |name| {
+            if (@field(self, name) != null) return true;
+        }
+        return false;
+    }
+
+    /// DevTools origin trace: return StyleField bitset actually declared by this BoxStyle. BoxStyle
+    /// fine-grained border_* all land StyleField.border; margin_spec lands margin. Pure calc, no
+    /// BoxStyle/Node runtime size increase.
     pub fn styleFieldMask(self: BoxStyle) u64 {
-        comptime std.debug.assert(@typeInfo(StyleField).@"enum".fields.len <= 64);
+        comptime std.debug.assert(@import("zenit_reflection").fields(StyleField).len <= 64);
         var mask: u64 = 0;
         const Add = struct {
             fn field(out: *u64, comptime f: StyleField, present: bool) void {
-                if (present) out.* |= @as(u64, 1) << @intFromEnum(f);
+                if (present) out.* |= @as(u64, 1) << @backingInt(f);
             }
         };
 
@@ -1773,6 +2149,18 @@ pub const BoxStyle = struct {
         Add.field(&mask, .margin, self.margin != null or self.margin_spec != null);
         Add.field(&mask, .flex, self.flex != null);
         Add.field(&mask, .flex_shrink, self.flex_shrink != null);
+        Add.field(&mask, .flex_wrap, self.flex_wrap != null);
+        Add.field(&mask, .z_index, self.z_index != null);
+        Add.field(&mask, .inset, self.inset != null);
+        Add.field(&mask, .gradient, self.gradient != null);
+        Add.field(&mask, .clip_shape, self.clip_shape != null);
+        Add.field(&mask, .composited_group, self.composited_group != null);
+        Add.field(&mask, .content_warp, self.content_warp != null);
+        Add.field(&mask, .grid_placement, self.grid_placement != null);
+        Add.field(&mask, .corner_radius, self.corner_radii != null);
+        inline for (ext_passthrough) |name| {
+            if (comptime @hasField(StyleField, name)) Add.field(&mask, @field(StyleField, name), @field(self, name) != null);
+        }
         Add.field(&mask, .position, self.position != null);
         Add.field(&mask, .overflow, self.overflow != null);
         Add.field(&mask, .overflow_hidden, self.overflow_hidden != null);
@@ -1793,22 +2181,17 @@ pub const BoxStyle = struct {
             self.border_right_color != null or self.border_bottom_color != null or
             self.border_left_color != null);
         Add.field(&mask, .corner_radius, self.corner_radius != null);
-        Add.field(&mask, .shadow, self.shadow != null);
+        Add.field(&mask, .shadow, self.shadow != null or self.shadows != null);
         Add.field(&mask, .text_color, self.text_color != null);
         Add.field(&mask, .text_font_size, self.font_size != null);
         Add.field(&mask, .text_font_weight, self.font_weight != null);
         return mask;
     }
 
-    /// 将 BoxStyle 非 null 的字段覆盖到 Style 上
-    /// ⚠️ **本函数是 void，内部有三处 ensureExtPanic, OOM 下会 abort 整个进程。**
-    /// git_diff sidebar sweep 撞到过（applyMountedComponentStyle -> 这里）。
-    /// 没有当场改成 fallible 是因为 applyTo 是 BoxStyle 的公共 API、调用点很广，
-    /// 改签名要连带改一大批调用方，属于接口级改动。
-    /// **欠账登记在此**：要么把它改成 `!void` 并传播，要么让内部三处降级
-    /// （corner_radius / shadow 都是纯视觉属性，分配失败保持原值即可）。
+    /// Apply non-null BoxStyle fields onto Style. Best effort: ext alloc fail preserves existing
+    /// ext fields. Fallible callers must reserve ext first (toStyleFallible / needsExt).
     pub fn applyTo(self: BoxStyle, style: *Style, maybe_allocator: ?std.mem.Allocator) void {
-        // 布局
+        // Layout.
         if (self.width) |v| style.width = v;
         if (self.height) |v| style.height = v;
         if (self.direction) |v| style.direction = v;
@@ -1819,7 +2202,11 @@ pub const BoxStyle = struct {
         if (self.margin) |v| style.margin = v;
         if (self.margin_spec) |v| {
             if (maybe_allocator) |allocator| {
-                style.setMarginSpec(allocator, v);
+                // Share ext strategy: toStyleFallible pre-allocates ext, this won't re-alloc.
+                style.margin = v.toPadding();
+                if (style.ensureExtFallible(allocator)) |e| {
+                    e.margin_auto_mask = v.auto_mask;
+                } else |_| {}
             } else {
                 style.margin = v.toPadding();
             }
@@ -1831,15 +2218,14 @@ pub const BoxStyle = struct {
         if (self.overflow_hidden) |v| style.overflow_hidden = v;
         if (self.display) |v| style.display = v;
         if (self.layout_isolation) |v| style.layout_isolation = v;
-        // 视觉
-        // Style.background/opacity 字段已删 -> World.paint_state。
-        // BoxStyle 仍保留 background/opacity 字段（公开 API 不变）；这两个值
-        // 由 builder 在 Node.create 后经 node.setBackgroundRaw/setOpacityRaw
-        // 落到 SoA（见 BoxStyle.paintOverride() + builders.applyPaintOverride）。
+        // Visual. Style.background/opacity removed -> World.paint_state. BoxStyle retains
+        // background/opacity fields (public API invariant); builder after Node.create lands these
+        // to SoA via node.setBackgroundRaw/setOpacityRaw (see BoxStyle.paintOverride() +
+        // builders.applyPaintOverride).
         if (self.cursor) |v| style.cursor = v;
         if (self.translate_x) |v| style.translate_x = v;
         if (self.translate_y) |v| style.translate_y = v;
-        // border: 整体先，细粒度后
+        // border: whole first, then fine-grained.
         if (self.border) |v| style.border = v;
         if (self.border_color) |v| style.border.color = v;
         if (self.border_width) |v| style.border.setUniformWidth(v);
@@ -1847,14 +2233,14 @@ pub const BoxStyle = struct {
         if (self.border_right_width) |v| style.border.side_widths[Border.SIDE_RIGHT] = @max(@as(f32, 0), v);
         if (self.border_bottom_width) |v| style.border.side_widths[Border.SIDE_BOTTOM] = @max(@as(f32, 0), v);
         if (self.border_left_width) |v| style.border.side_widths[Border.SIDE_LEFT] = @max(@as(f32, 0), v);
-        // ext 字段需要 allocator
+        // ext fields need allocator.
         if (maybe_allocator) |allocator| {
             if (self.border_top_color != null or
                 self.border_right_color != null or
                 self.border_bottom_color != null or
                 self.border_left_color != null)
             {
-                // 纯视觉属性：分配失败保持原值降级，不 abort 整个进程。
+                // Pure visual: alloc fail keeps old value graceful, no abort.
                 if (style.ensureExtFallible(allocator)) |ext| {
                     var side = ext.border_side_colors orelse BorderSideColors{};
                     if (self.border_top_color) |v| side.top = v;
@@ -1889,6 +2275,83 @@ pub const BoxStyle = struct {
                     e.rotate = v;
                 } else |_| {}
             }
+            if (self.flex_wrap) |v| {
+                if (style.ensureExtFallible(allocator)) |e| {
+                    e.flex_wrap = v;
+                } else |_| {}
+            }
+            if (self.blend_mode) |v| {
+                if (style.ensureExtFallible(allocator)) |e| {
+                    e.blend_mode = v;
+                } else |_| {}
+            }
+            if (self.z_index) |v| {
+                if (style.ensureExtFallible(allocator)) |e| {
+                    e.z_index = v;
+                } else |_| {}
+            }
+            if (self.inset) |v| {
+                if (style.ensureExtFallible(allocator)) |e| {
+                    e.inset = v;
+                } else |_| {}
+            }
+            if (self.gradient) |v| {
+                if (style.ensureExtFallible(allocator)) |e| {
+                    e.gradient = v;
+                } else |_| {}
+            }
+            if (self.clip_shape) |v| {
+                if (style.ensureExtFallible(allocator)) |e| {
+                    e.clip_shape = v;
+                } else |_| {}
+            }
+            if (self.shadows) |v| {
+                if (style.ensureExtFallible(allocator)) |e| {
+                    e.setShadowList(v.items[0..v.len]);
+                } else |_| {}
+            }
+            if (self.glass) |v| {
+                if (style.ensureExtFallible(allocator)) |e| {
+                    e.glass = v;
+                } else |_| {}
+            }
+            if (self.multi_gradient) |v| {
+                if (style.ensureExtFallible(allocator)) |e| {
+                    e.multi_gradient = v;
+                } else |_| {}
+            }
+            if (self.composited_group) |v| {
+                if (style.ensureExtFallible(allocator)) |e| {
+                    e.composited_group = v;
+                } else |_| {}
+            }
+            if (self.content_warp) |v| {
+                if (style.ensureExtFallible(allocator)) |e| {
+                    e.content_warp = v;
+                } else |_| {}
+            }
+            if (self.grid_placement) |v| {
+                if (style.ensureExtFallible(allocator)) |e| {
+                    e.grid_placement = v;
+                } else |_| {}
+            }
+            if (self.corner_radii) |v| {
+                if (style.ensureExtFallible(allocator)) |e| {
+                    e.corner_radius = v;
+                } else |_| {}
+            }
+            if (self.inset_shadows) |v| {
+                if (style.ensureExtFallible(allocator)) |e| {
+                    e.setInsetShadowList(v.items[0..v.len]);
+                } else |_| {}
+            }
+            inline for (ext_passthrough) |name| {
+                if (@field(self, name)) |v| {
+                    if (style.ensureExtFallible(allocator)) |e| {
+                        @field(e, name) = v;
+                    } else |_| {}
+                }
+            }
             if (self.transform_origin) |v| {
                 if (style.ensureExtFallible(allocator)) |e| {
                     e.transform_origin = v;
@@ -1912,19 +2375,36 @@ pub const BoxStyle = struct {
         }
     }
 
-    /// 转换为 Style（从默认 Style 开始 apply）
-    pub fn toStyleFallible(self: BoxStyle, allocator: std.mem.Allocator) !Style {
-        var style = Style{};
-        // Prepare the sole allocation before applyTo can mutate any fields.
-        if (self.margin_spec != null or self.border_top_color != null or
+    /// Convert to a Style (applied on top of the default Style).
+    /// Whether applying this style requires writing StyleExt. Paths with an error channel use this
+    /// to
+    /// allocate the ext first (fallibly); the ext write inside applyTo is best-effort and silently
+    /// skipped on OOM.
+    /// Whether a declared field requires extended storage; shares needsExt's rules.
+    pub fn fieldNeedsExt(comptime name: []const u8) bool {
+        var probe: BoxStyle = .{};
+        @field(probe, name) = @as(@typeInfo(@FieldType(BoxStyle, name)).optional.child, undefined);
+        return probe.needsExt();
+    }
+
+    pub fn needsExt(self: BoxStyle) bool {
+        return self.margin_spec != null or self.border_top_color != null or
             self.border_right_color != null or self.border_bottom_color != null or
             self.border_left_color != null or self.corner_radius != null or
             self.shadow != null or self.scale_x != null or self.scale_y != null or
-            self.rotate != null or self.transform_origin != null or
-            self.text_color != null or self.font_size != null or self.font_weight != null)
-        {
-            _ = try style.ensureExtFallible(allocator);
-        }
+            self.rotate != null or self.transform_origin != null or self.flex_wrap != null or self.blend_mode != null or
+            self.z_index != null or self.inset != null or self.gradient != null or
+            self.clip_shape != null or self.shadows != null or
+            self.glass != null or self.multi_gradient != null or self.composited_group != null or self.content_warp != null or
+            self.grid_placement != null or self.anyPassthrough() or
+            self.corner_radii != null or self.inset_shadows != null or
+            self.text_color != null or self.font_size != null or self.font_weight != null;
+    }
+
+    pub fn toStyleFallible(self: BoxStyle, allocator: std.mem.Allocator) !Style {
+        var style = Style{};
+        // Prepare the sole allocation before applyTo can mutate any fields.
+        if (self.needsExt()) _ = try style.ensureExtFallible(allocator);
         self.applyTo(&style, allocator);
         return style;
     }
@@ -1935,153 +2415,102 @@ pub const BoxStyle = struct {
         return style;
     }
 
-    /// background/opacity 已不在 Style；builder 在 Node.create
-    /// 后用本 override 经 setBackgroundRaw/setOpacityRaw 落到 World.paint_state。
+    /// background/opacity no longer in Style; builder after Node.create uses this override via
+    /// setBackgroundRaw/setOpacityRaw -> World.paint_state.
     pub const PaintOverride = struct { background: ?Color = null, opacity: ?f32 = null };
     pub fn paintOverride(self: BoxStyle) PaintOverride {
         return .{ .background = self.background, .opacity = self.opacity };
     }
 
-    /// 两个 BoxStyle 合并：other 有值则覆盖 self
+    /// Merge two BoxStyle: other values override self.
     pub fn merge(self: BoxStyle, other: BoxStyle) BoxStyle {
+        // Compile-time field traversal: hand-written list once missed display (silent loss on
+        // merge); new fields won't miss. All optional; other has value -> override.
         var result = self;
-        if (other.width != null) result.width = other.width;
-        if (other.height != null) result.height = other.height;
-        if (other.direction != null) result.direction = other.direction;
-        if (other.justify != null) result.justify = other.justify;
-        if (other.align_items != null) result.align_items = other.align_items;
-        if (other.gap != null) result.gap = other.gap;
-        if (other.padding != null) result.padding = other.padding;
-        if (other.margin != null) result.margin = other.margin;
-        if (other.margin_spec != null) result.margin_spec = other.margin_spec;
-        if (other.flex != null) result.flex = other.flex;
-        if (other.flex_shrink != null) result.flex_shrink = other.flex_shrink;
-        if (other.position != null) result.position = other.position;
-        if (other.overflow != null) result.overflow = other.overflow;
-        if (other.overflow_hidden != null) result.overflow_hidden = other.overflow_hidden;
-        if (other.layout_isolation != null) result.layout_isolation = other.layout_isolation;
-        if (other.background != null) result.background = other.background;
-        if (other.opacity != null) result.opacity = other.opacity;
-        if (other.cursor != null) result.cursor = other.cursor;
-        if (other.translate_x != null) result.translate_x = other.translate_x;
-        if (other.translate_y != null) result.translate_y = other.translate_y;
-        if (other.scale_x != null) result.scale_x = other.scale_x;
-        if (other.scale_y != null) result.scale_y = other.scale_y;
-        if (other.rotate != null) result.rotate = other.rotate;
-        if (other.transform_origin != null) result.transform_origin = other.transform_origin;
-        if (other.border != null) result.border = other.border;
-        if (other.border_color != null) result.border_color = other.border_color;
-        if (other.border_width != null) result.border_width = other.border_width;
-        if (other.border_top_width != null) result.border_top_width = other.border_top_width;
-        if (other.border_right_width != null) result.border_right_width = other.border_right_width;
-        if (other.border_bottom_width != null) result.border_bottom_width = other.border_bottom_width;
-        if (other.border_left_width != null) result.border_left_width = other.border_left_width;
-        if (other.border_top_color != null) result.border_top_color = other.border_top_color;
-        if (other.border_right_color != null) result.border_right_color = other.border_right_color;
-        if (other.border_bottom_color != null) result.border_bottom_color = other.border_bottom_color;
-        if (other.border_left_color != null) result.border_left_color = other.border_left_color;
-        if (other.corner_radius != null) result.corner_radius = other.corner_radius;
-        if (other.shadow != null) result.shadow = other.shadow;
-        if (other.text_color != null) result.text_color = other.text_color;
-        if (other.font_size != null) result.font_size = other.font_size;
-        if (other.font_weight != null) result.font_weight = other.font_weight;
+        inline for (@import("zenit_reflection").fields(BoxStyle)) |f| {
+            comptime std.debug.assert(@typeInfo(f.type) == .optional);
+            if (@field(other, f.name) != null) @field(result, f.name) = @field(other, f.name);
+        }
+        // `border` shorthand (width + color): if later sets it, earlier fine-grained border_* void
+        // (CSS shorthand reset long-form); else applyTo writes border then fine-grained, earlier
+        // border_color can reverse later-layer stroke. Long-form by field prefix (no hand-list:
+        // future border_* auto-reset).
+        if (other.border != null) inline for (@import("zenit_reflection").fields(BoxStyle)) |f| {
+            if (comptime std.mem.startsWith(u8, f.name, "border_")) @field(result, f.name) = @field(other, f.name);
+        };
+        // Single and multiple shadows describe the same stack. A later declaration
+        // replaces the entire earlier stack; a multi-shadow declaration wins when
+        // both are explicitly supplied in the same layer, as in applyTo().
+        if (other.shadows != null) {
+            result.shadow = null;
+        } else if (other.shadow != null) {
+            result.shadows = null;
+        }
         return result;
     }
 
-    /// 检查是否所有字段都是 null（空样式）
+    /// Check all fields null (empty style).
     pub fn isEmpty(self: BoxStyle) bool {
-        return self.width == null and
-            self.height == null and
-            self.direction == null and
-            self.justify == null and
-            self.align_items == null and
-            self.gap == null and
-            self.padding == null and
-            self.margin == null and
-            self.margin_spec == null and
-            self.flex == null and
-            self.flex_shrink == null and
-            self.position == null and
-            self.overflow == null and
-            self.overflow_hidden == null and
-            self.layout_isolation == null and
-            self.background == null and
-            self.opacity == null and
-            self.cursor == null and
-            self.translate_x == null and
-            self.translate_y == null and
-            self.scale_x == null and
-            self.scale_y == null and
-            self.rotate == null and
-            self.transform_origin == null and
-            self.border == null and
-            self.border_color == null and
-            self.border_width == null and
-            self.border_top_width == null and
-            self.border_right_width == null and
-            self.border_bottom_width == null and
-            self.border_left_width == null and
-            self.border_top_color == null and
-            self.border_right_color == null and
-            self.border_bottom_color == null and
-            self.border_left_color == null and
-            self.corner_radius == null and
-            self.shadow == null and
-            self.text_color == null and
-            self.font_size == null and
-            self.font_weight == null;
+        inline for (@import("zenit_reflection").fields(BoxStyle)) |f| {
+            if (@field(self, f.name) != null) return false;
+        }
+        return true;
     }
 };
 
-/// 向后兼容别名（已废弃，请使用 BoxStyle）
+/// Backward-compat alias (deprecated, use BoxStyle).
 pub const StyleOverride = BoxStyle;
 
-/// 交互/组件状态快照（从 Signal 系统或组件状态读取）
+/// Interaction/component state snapshot (from Signal system or component state).
 ///
-/// 交互态（hovered/pressed/focused）+ 持久语义态（selected/expanded/invalid）。
-/// 对标 Panda CSS conditions 的 _hover/_active/_focus/_disabled/_checked/
-/// _expanded/_invalid 子集，只收录组件库有真实消费者的条件位。
+/// Interaction state (hovered/pressed/focused) + persistent semantic (selected/expanded/invalid).
+/// Mirrors Panda CSS conditions _hover/_active/_focus/_disabled/_checked/_expanded/_invalid subset
+/// (only conditions with real component consumers).
 pub const InteractionState = struct {
     is_hovered: bool = false,
     is_pressed: bool = false,
     is_focused: bool = false,
+    /// Focus obtained via keyboard or other non-pointer means (CSS :focus-visible).
+    is_focus_visible: bool = false,
     is_disabled: bool = false,
-    /// 持久选中态。selected 与 checked 合一：同一节点上二者不会共存
-    /// （列表行/标签页用 selected 语义，checkbox/radio/switch 用 checked 语义）。
+    /// Persistent selected state. selected and checked merge: same node won't both exist (list
+    /// row/tab = selected, checkbox/radio/switch = checked).
     is_selected: bool = false,
-    /// 展开态（accordion item / tree 节点 / 下拉 chevron）。
+    /// Expanded state (accordion item / tree node / dropdown chevron).
     is_expanded: bool = false,
-    /// 校验失败态（input / textarea / form field）。
+    /// Validation fail state (input / textarea / form field).
     is_invalid: bool = false,
 };
 
-// ==================== Style 位域脏标记系统 ====================
+// ==================== Style bitfield dirty-mark system ====================
 
-/// Style 修改触发的脏标记级别
+/// Dirty-mark level from Style change.
 pub const DirtyLevel = enum {
-    /// 无标脏（cursor, tab_index）
+    /// No mark (cursor, tab_index).
     none,
-    /// 仅渲染脏（background, border.color, opacity, translate, shadow, gradient, outline, corner_radius, scale）
+    /// Render-only dirty (background, border.color, opacity, translate, shadow, gradient, outline,
+    /// corner_radius, scale).
     render,
-    /// 命中/渲染脏（opacity, translate, radius, clip, hit roles 等）
+    /// Hit/render dirty (opacity, translate, radius, clip, hit roles, etc).
     interaction,
-    /// 布局脏（padding, margin, direction, justify, align_items, gap, flex, overflow, position, inset 等）
+    /// Layout dirty (padding, margin, direction, justify, align_items, gap, flex, overflow,
+    /// position, inset, etc).
     layout,
-    /// 尺寸脏（width, height，需要父容器重算）
+    /// Sizing dirty (width, height, parent must recalc).
     sizing,
 
-    /// 返回两个级别中更高的
+    /// Return higher of two levels.
     pub fn max(a: DirtyLevel, b: DirtyLevel) DirtyLevel {
-        return if (@intFromEnum(a) >= @intFromEnum(b)) a else b;
+        return if (@backingInt(a) >= @backingInt(b)) a else b;
     }
 };
 
-/// Style 可设置的字段名枚举
+/// Style settable field name enum.
 pub const StyleField = enum {
-    // sizing 级别
+    // Sizing level.
     width,
     height,
-    // layout 级别
+    // Layout level.
     padding,
     margin,
     direction,
@@ -2107,7 +2536,7 @@ pub const StyleField = enum {
     sticky_insets,
     inset,
     z_index,
-    // render 级别
+    // Render level.
     background,
     border,
     opacity,
@@ -2129,35 +2558,36 @@ pub const StyleField = enum {
     will_change_transform,
     will_change_opacity,
     composited_group,
-    // render 级别（可继承文本属性）
+    content_warp,
+    // Render level (inherited text property).
     text_color,
     text_font_size,
     text_font_weight,
-    // none 级别
+    // None level.
     cursor,
     tab_index,
     layout_isolation,
 };
 
-/// 编译时确定 Style 字段对应的脏标记级别
+/// Compile-time: determine Style field's dirty-mark level.
 pub fn styleDirtyLevel(comptime field: StyleField) DirtyLevel {
     return switch (field) {
         .width, .height => .sizing,
         .padding, .margin, .direction, .justify, .align_items, .gap, .flex, .flex_shrink, .flex_basis, .flex_wrap, .overflow, .position, .aspect_ratio, .grid, .grid_placement, .min_width, .max_width, .min_height, .max_height, .align_self, .no_cross_stretch, .sticky_insets, .inset => .layout,
-        .border, .opacity, .translate_x, .translate_y, .scale_x, .scale_y, .rotate, .transform_origin, .corner_radius, .overflow_hidden, .z_index, .hit_shape, .clip_shape, .hit_behavior, .hit_roles, .will_change_transform, .will_change_opacity, .composited_group => .interaction,
+        .border, .opacity, .translate_x, .translate_y, .scale_x, .scale_y, .rotate, .transform_origin, .corner_radius, .overflow_hidden, .z_index, .hit_shape, .clip_shape, .hit_behavior, .hit_roles, .will_change_transform, .will_change_opacity, .composited_group, .content_warp => .interaction,
         .background, .shadow, .gradient, .outline, .overflow_fade, .text_color, .text_font_size, .text_font_weight => .render,
         .tab_index, .layout_isolation => .none,
         .cursor => .interaction,
     };
 }
 
-/// 编译时根据字段名字符串确定脏标记级别（供 setStyles 使用）
+/// Compile-time: determine dirty-mark level by field name string (for setStyles).
 pub fn styleDirtyLevelByName(comptime name: []const u8) DirtyLevel {
     const field = std.meta.stringToEnum(StyleField, name) orelse @compileError("Unknown Style field: " ++ name);
     return styleDirtyLevel(field);
 }
 
-/// 编译时判断是否是 ext 字段（低频，存储在 StyleExt 中）
+/// Compile-time: is ext field (low-freq, stored in StyleExt).
 pub fn isExtField(comptime field: StyleField) bool {
     return switch (field) {
         .shadow, .gradient, .outline, .corner_radius, .scale_x, .scale_y, .rotate, .transform_origin, .flex_basis, .align_self, .no_cross_stretch, .inset, .sticky_insets, .z_index, .tab_index, .aspect_ratio, .grid, .grid_placement, .min_width, .max_width, .min_height, .max_height, .flex_wrap, .hit_shape, .clip_shape, .hit_behavior, .hit_roles, .overflow_fade, .will_change_transform, .will_change_opacity, .composited_group, .text_color, .text_font_size, .text_font_weight => true,
@@ -2165,10 +2595,10 @@ pub fn isExtField(comptime field: StyleField) bool {
     };
 }
 
-/// 编译时获取 Style 字段的类型
+/// Compile-time: get Style field type.
 pub fn StyleFieldType(comptime field: StyleField) type {
-    // background/opacity 已不在 Style（-> World.paint_state）；
-    // 保留 StyleField 枚举 + setStyle API，类型在此显式给出。
+    // background/opacity no longer in Style (-> World.paint_state); keep StyleField enum + setStyle
+    // API, type explicit here.
     if (comptime field == .background) return Color;
     if (comptime field == .opacity) return f32;
     if (comptime isExtField(field)) {
@@ -2177,18 +2607,18 @@ pub fn StyleFieldType(comptime field: StyleField) type {
     return @TypeOf(@field(@as(Style, .{}), @tagName(field)));
 }
 
-// ==================== 声明式 Transition ====================
+// ==================== Declarative Transition ====================
 
-/// 缓动函数（统一使用 animation/easing.zig 的完整集合）
+/// Easing function (uses full set from animation/easing.zig).
 pub const Easing = @import("../animation/easing.zig").Easing;
 
-/// 过渡配置
+/// Transition config.
 pub const TransitionSpec = struct {
     duration_ms: f32 = 150,
     easing: Easing = .ease_out_quad,
 };
 
-/// 可过渡的属性
+/// Transitionable property.
 pub const TransitionProp = enum(u5) {
     background = 0,
     opacity = 1,
@@ -2201,40 +2631,42 @@ pub const TransitionProp = enum(u5) {
     corner_radius = 8,
     border_width = 9,
     width = 10,
+    /// Text color (TextProps.color); 'all' excludes it, explicit 'color' required.
+    text_color = 11,
 };
 
-/// 单个过渡槽的运行时状态
+/// Single transition slot runtime state.
 pub const TransitionSlot = struct {
     prop: TransitionProp,
     spec: TransitionSpec = .{},
-    // 颜色过渡（background, border_color）
+    // Color transition (background, border_color).
     from_color: Color = Color.TRANSPARENT,
     to_color: Color = Color.TRANSPARENT,
-    // 标量过渡（opacity, translate_x/y, scale_x/y）
+    // Scalar transition (opacity, translate_x/y, scale_x/y).
     from_value: f32 = 0,
     to_value: f32 = 0,
-    /// 动画开始的绝对时间戳（ms）。progress = (now_ms - start_time_ms) / duration_ms，
-    /// 零累积误差。
+    /// Animation start absolute timestamp (ms). progress = (now_ms - start_time_ms) / duration_ms,
+    /// zero cumulative error.
     start_time_ms: f64 = 0,
     active: bool = false,
-    /// 过渡完成时的回调（用于退出动画后销毁节点等）
+    /// Completion callback (node exit-anim destroy, etc).
     on_complete: ?*const fn (*anyopaque) void = null,
     on_complete_ctx: ?*anyopaque = null,
 };
 
-/// 过渡槽集合（最多 12 个属性同时过渡）
+/// Transition slot set (max 12 properties transitioning).
 pub const TransitionSlots = struct {
-    slots: [12]TransitionSlot = [_]TransitionSlot{.{ .prop = .background }} ** 12,
+    slots: [12]TransitionSlot = @as([12]TransitionSlot, @splat(.{ .prop = .background })),
     count: u4 = 0,
     any_active: bool = false,
 
-    /// 查找已有 slot 或分配新 slot
+    /// Find existing slot or alloc new.
     pub fn getOrCreate(self: *TransitionSlots, prop: TransitionProp) ?*TransitionSlot {
-        // 查找已有
+        // Find existing.
         for (self.slots[0..self.count]) |*slot| {
             if (slot.prop == prop) return slot;
         }
-        // 分配新的
+        // Alloc new.
         if (self.count < 12) {
             const slot = &self.slots[self.count];
             slot.* = .{ .prop = prop };
@@ -2244,7 +2676,7 @@ pub const TransitionSlots = struct {
         return null;
     }
 
-    /// 查找已有 slot
+    /// Find existing slot.
     pub fn find(self: *TransitionSlots, prop: TransitionProp) ?*TransitionSlot {
         for (self.slots[0..self.count]) |*slot| {
             if (slot.prop == prop) return slot;
@@ -2282,10 +2714,9 @@ pub const A11yRole = enum {
     grid,
     gridcell,
 
-    // ── 2026-07-31：补组件 a11y 声明时发现的缺口。a11y/tree.zig 的 Role
-    // 早就有这些角色，但组件侧的 A11yRole 没有对应项，于是 Tree/DataTable/
-    // Steps 之类根本无法声明自己的语义（只能退化成 button/list，AT 侧就
-    // 失去了层级/表格/进度的结构信息）。
+    // -- 2026-07-31: a11y gap found when components declared. a11y/tree.zig Role has these, but
+    // component A11yRole missing entries, so Tree/DataTable/Steps couldn't declare self (degrade to
+    // button/list, AT loses structure). --
     tree,
     treeitem,
     row,
@@ -2315,9 +2746,11 @@ pub const A11yRole = enum {
     banner,
     contentinfo,
     generic,
+    /// Scroll area (AXScrollArea). Undeclared ScrollArea auto-inferred by projection.
+    scroll_area,
 };
 
-/// aria-haspopup 值集，ARIA 1.2 spec
+/// aria-haspopup value set, ARIA 1.2 spec.
 pub const HasPopup = enum {
     none,
     menu,
@@ -2370,6 +2803,8 @@ pub const TextInputClient = struct {
 };
 
 pub const A11yValueRange = struct {
+    small_change: ?f32 = null,
+    large_change: ?f32 = null,
     now: f32,
     min: f32,
     max: f32,
@@ -2378,11 +2813,39 @@ pub const A11yValueRange = struct {
 };
 
 pub const A11yProps = struct {
+    pub const ItemSelectionOperation = enum { replace, add, remove };
+    pub const ItemSelection = struct {
+        context: *anyopaque,
+        set: *const fn (*anyopaque, ItemSelectionOperation) bool,
+    };
+    pub const TextScrollRequest = struct { start: u32, end: u32, align_top: bool, text_hash: u64, caret: usize, anchor: ?usize };
+    pub const TextGeometrySegment = struct { start: u32, end: u32, rect: A11yRect };
+    /// Visual row region, including its logical newline if present. An empty
+    /// trailing row has start == end. Spans are ordered without overlap.
+    /// This is visibility data, not glyph ink.
+    pub const TextRowGeometry = struct { start: u32, end: u32, rect: A11yRect };
+    /// Actual visual caret line in layout-world coordinates, before transforms.
+    /// UTF-8 offsets may repeat at bidi boundaries and soft wraps; preserve them.
+    pub const TextCaretGeometry = struct { offset: u32, rect: A11yRect, downstream: bool };
+    /// Transformed and clipped caret line; endpoints retain top-to-bottom order.
+    pub const TextCaretSegment = struct { offset: u32, first: Point, last: Point, downstream: bool };
+    /// Exact caret for point mapping. A visible neighboring glyph can retain
+    /// this candidate even when its own vertical line lies outside the clip.
+    pub const TextCaretCandidate = struct {
+        offset: u32,
+        first: Point,
+        last: Point,
+        downstream: bool,
+        visible: ?struct { first: Point, last: Point } = null,
+    };
+    pub const max_text_geometry_segments = 65536;
     pub const EditableText = struct {
         context: *anyopaque,
         selection_start: u32,
         selection_end: u32,
         caret: u32,
+        /// Plain semantic text with one attribute run and no embedded objects.
+        uniform_format: bool = false,
         /// Visible UTF-8 byte range. Non-scrolling controls use 0..text.len.
         visible_start: u32 = 0,
         visible_end: u32 = std.math.maxInt(u32),
@@ -2390,10 +2853,28 @@ pub const A11yProps = struct {
         /// grapheme boundaries and return false without mutating on failure.
         set_selection: *const fn (context: *anyopaque, start_utf8: u32, end_utf8: u32) bool,
         set_value: ?*const fn (context: *anyopaque, value: []const u8) bool = null,
+        scroll_into_view: ?*const fn (context: *anyopaque, start_utf8: u32, end_utf8: u32, align_top: bool) bool = null,
+        /// Owner-thread query of current display-line boundaries, including
+        /// 0 and text length. Caller owns the returned UTF-8 offset array.
+        line_boundaries: ?*const fn (context: *anyopaque, allocator: std.mem.Allocator) anyerror![]u32 = null,
+        /// Owner-thread shaped visual pieces with canonical UTF-8 spans and
+        /// layout-world logical rectangles (globalRect coordinates, before
+        /// scale/rotation). Cx applies the owner's render transform and clips
+        /// before native publication. Caller owns the array; no widget pointers
+        /// may be retained by platform accessibility readers.
+        geometry_segments: ?*const fn (context: *anyopaque, allocator: std.mem.Allocator) anyerror![]TextGeometrySegment = null,
+        /// Caller-owned shaped caret stops, including empty rows and affinity.
+        /// Width is zero; Cx must transform/clip the vertical segment, not an AABB.
+        caret_geometry: ?*const fn (context: *anyopaque, allocator: std.mem.Allocator) anyerror![]TextCaretGeometry = null,
+        /// Caller-owned current row spans and actual inner-width regions in
+        /// layout-world coordinates. Pending/interpolated wrapping is unavailable.
+        row_geometry: ?*const fn (context: *anyopaque, allocator: std.mem.Allocator) anyerror![]TextRowGeometry = null,
         frame_for_range: ?*const fn (context: *anyopaque, start_utf8: u32, end_utf8: u32, out: *A11yRect) bool = null,
         range_at_point: ?*const fn (context: *anyopaque, x: f32, y: f32, start_utf8: *u32, end_utf8: *u32) bool = null,
     };
 
+    expansion: ?struct { context: *anyopaque, set: *const fn (*anyopaque, bool) bool } = null,
+    item_selection: ?ItemSelection = null,
     role: A11yRole = .none,
     label: ?[]const u8 = null,
     description: ?[]const u8 = null,
@@ -2409,38 +2890,37 @@ pub const A11yProps = struct {
     /// an unrelated AXValue.
     live_text: ?[]const u8 = null,
     hidden: bool = false,
-    /// aria-haspopup，表明此控件激活时会打开浮层（菜单/对话框等）
+    /// aria-haspopup: this control opens popover when activated (menu/dialog/etc).
     has_popup: HasPopup = .none,
 
-    // ── 2026-07-31：以下字段此前在 A11yProps 里根本不存在，
-    // Cx.projectA11yNode 把对应的 a11y State 位**硬编码成 false**，
-    // 于是组件即使想声明也无从声明。补齐后投影层一并接通。
-    /// aria-selected（listbox option / tab / grid row 的选中态）
+    // -- 2026-07-31: fields below never existed in A11yProps; Cx.projectA11yNode **hard-coded to
+    // false**, so components couldn't declare. Now wired.
+    /// aria-selected (listbox option / tab / grid row selected).
     selected: bool = false,
-    /// aria-pressed（toggle button 按下态）
+    /// aria-pressed (toggle button pressed).
     pressed: bool = false,
-    /// aria-required（表单必填）
+    /// aria-required (form required).
     required: bool = false,
-    /// aria-invalid（校验失败）
+    /// aria-invalid (validation fail).
     invalid: bool = false,
-    /// aria-readonly（只读，区别于 disabled）
+    /// aria-readonly (read-only, distinct from disabled).
     readonly: bool = false,
-    /// aria-busy（加载中）
+    /// aria-busy (loading).
     busy: bool = false,
-    /// aria-modal（模态对话框）
+    /// aria-modal (modal dialog).
     modal: bool = false,
-    /// aria-multiline（多行文本域）
+    /// aria-multiline (multiline text).
     multiline: bool = false,
-    /// aria-multiselectable（容器支持多选）
+    /// aria-multiselectable (container supports multi-select).
     multiselectable: bool = false,
     /// Password/secret input. Native bridges expose a secure text subrole and
     /// must not publish value, selection, or range content.
     secure: bool = false,
-    /// aria-indeterminate（三态 checkbox 的中间态）
+    /// aria-indeterminate (tri-state checkbox intermediate).
     indeterminate: bool = false,
 
-    /// aria-valuenow / valuemin / valuemax（slider / progressbar / spinbutton）。
-    /// 三者同时为 0 视为"未提供数值"，投影层原样传 0。
+    /// aria-valuenow / valuemin / valuemax (slider / progressbar / spinbutton). All zero = 'not
+    /// provided'; platform gets zero.
     value_now: f32 = 0,
     value_min: f32 = 0,
     value_max: f32 = 0,
@@ -2455,10 +2935,23 @@ pub const A11yProps = struct {
     row_span: u32 = 1,
     column_index: u32 = 0,
     column_span: u32 = 1,
-    /// aria-activedescendant，容器自身 focus 时，
-    /// 通过此 element_id_raw 告诉 AT 当前激活的子项。0xFFFFFFFF = 无。
-    /// 适用 combobox / listbox / grid 等"虚拟焦点"模式控件。
+    /// Collection logical total count (aria-setsize / aria-rowcount). 0 = unset; platform counts
+    /// visible children. Virtual lists must declare: tree has visible dozens, undeclared ->
+    /// VoiceOver says 'list, 12 items' not actual 100000.
+    set_size: u32 = 0,
+    /// Item position in collection, 1-based (aria-posinset). 0 = unset; platform counts visible
+    /// siblings. Virtual list rows must declare index, else row 5000 reads as row 3.
+    pos_in_set: u32 = 0,
+    /// aria-activedescendant: when container focused, tell AT active child via this element_id_raw.
+    /// 0xFFFFFFFF = none. For combobox / listbox / grid 'virtual focus' controls.
     active_descendant_element_id: u32 = 0xFFFFFFFF,
+    /// Semantic collection (docs/A11Y_ARCHITECTURE.md §12): this node as table exposes all data
+    /// rows to AT, decoupled from render virtualization. See a11y/collection.zig for provider
+    /// lifetime contract.
+    collection: ?a11y_collection.Provider = null,
+    /// This node collection row content container, currently item N: node itself not projected,
+    /// subtree hangs under that item's cell. Only on direct children of `collection` node.
+    collection_item: ?u32 = null,
     /// Explicit editable-text bridge. A textbox role alone is deliberately
     /// insufficient: null keeps native editable protocols fail-closed.
     editable_text: ?EditableText = null,
@@ -2474,36 +2967,38 @@ pub const ElementTag = enum {
     list,
     spacer,
     custom,
+    /// Control flow anchor (Show / Match / For / view DSL boundary). Always display:none, no
+    /// layout/gap/hit/a11y; marks dynamic region position in parent, sibling add/remove keeps
+    /// content at insertion (Solid marker-comment equivalent).
+    anchor,
 };
 
 pub const TextWrap = enum {
     none,
     word,
     char,
-    newline_only, // 只在 \n 断行，不做宽度折行（用于 code fence）
+    newline_only, // Line break on \n only, no width wrapping (code fence).
 };
 
-/// 文本在 node 内容宽内的水平对齐（逐视觉行，类 CSS text-align）。
-/// 只移动绘制位置，不影响测量 / 折行；宿主自己算光标与命中时用
-/// `text_layout.alignLineOffset` 取同一个偏移。
+/// Text horizontal alignment within node content width (per visual line, CSS text-align-like).
+/// Moves draw position only, doesn't affect measure/wrap; host self-computes cursor/hit via
+/// `text_layout.alignLineOffset` for same offset.
 pub const TextAlign = enum(u8) {
     start,
     center,
     end,
 };
 
-/// 文本溢出处理方式（仅对单行文本 wrap=.none 生效）
-/// 类似 CSS text-overflow，纯视觉优化，不影响布局
+/// Text overflow handling (single-line text wrap=.none only). CSS text-overflow-like, pure visual,
+/// no layout impact.
 pub const TextOverflow = enum {
-    clip, // 默认：GPU scissor 硬截断
-    ellipsis, // 末尾省略: "building-a-modern-edi…"
-    ellipsis_smart, // 智能省略（保留后缀）: "building-a-m…editor.md"
+    clip, // Default: GPU scissor hard-truncate.
+    ellipsis, // Ellipsis tail: "building-a-modern-edi..."
+    ellipsis_smart, // Smart ellipsis (keep suffix): "building-a-m...editor.md"
 };
 
-/// 文本内子段样式（Rich Text Span）
-/// 一个 text node 可包含多个 TextSpan，每段有独立的样式覆盖。
-/// null 值表示继承 TextProps 的基础样式。
-/// 下划线样式
+/// Rich Text Span: text node can hold multiple TextSpan, each with style override. Null = inherit
+/// TextProps base style. Underline style.
 pub const UnderlineStyle = enum {
     solid,
     dotted,
@@ -2512,113 +3007,124 @@ pub const UnderlineStyle = enum {
 };
 
 pub const TextSpan = struct {
-    start: u32, // content 中的字节偏移
+    start: u32, // byte offset in content
     end: u32,
-    color: ?Color = null, // null = 继承 TextProps.color
-    font_weight: ?u16 = null, // null = 继承 TextProps.font_weight
+    color: ?Color = null, // null = inherit TextProps.color
+    font_weight: ?u16 = null, // null = inherit TextProps.font_weight
     use_italic_font: bool = false,
-    use_monospace_font: bool = false, // inline code 用等宽字体
+    use_monospace_font: bool = false, // inline code uses monospace font
     strikethrough: bool = false,
-    bg_color: ?Color = null, // inline code 背景
-    /// Inline box 水平 padding，会参与布局/折行/命中，而不只是视觉背景扩展。
+    bg_color: ?Color = null, // inline code background
+    /// Inline box horizontal padding participates in layout/wrapping/hit,
+    /// not just visual background extension.
     inline_box_padding_left: f32 = 0,
     inline_box_padding_right: f32 = 0,
-    /// Inline box 垂直 inset，仅影响背景盒子的绘制，不参与水平布局。
+    /// Inline box vertical inset affects only background rendering,
+    /// not horizontal layout.
     inline_box_inset_top: f32 = 0,
     inline_box_inset_bottom: f32 = 0,
     inline_box_corner_radius: f32 = 0,
     underline: bool = false,
-    underline_color: ?Color = null, // null = 继承 span/text color
+    underline_color: ?Color = null, // null = inherit from span/text color
     underline_style: UnderlineStyle = .solid,
-    /// 下划线相对基线的额外垂直偏移（像素，正值向下）。
-    /// 0 = 默认贴在 line 底部上方 2px；波浪线 diagnostic 常用 +1~+2 下沉到 descender 下方。
+    /// Underline vertical offset relative to baseline (px, positive downward).
+    /// 0 = default 2px above line bottom; wave diagnostic commonly +1-2
+    /// to sink below descender.
     underline_offset: f32 = 0,
-    /// 下划线粗细（像素）。<= 0 表示 style 对应的默认值：
+    /// Underline thickness (px). <= 0 uses style default:
     ///   solid/dashed/dotted -> 1 / 1 / 1.5
-    ///   wavy                -> max(1.0, font_size * 0.12) 由渲染器决定
+    ///   wavy -> max(1.0, font_size * 0.12) determined by renderer
     underline_thickness: f32 = 0,
 };
 
+/// TextProps.font_family: the platform UI font (macOS: SF Pro with its size's optical size and
+/// tracking, what native controls' labels use). Mirrors render's FontSelector.system_ui_family.
+pub const font_family_system_ui: u16 = 0xFFFF;
+
 pub const TextProps = struct {
     content: []const u8 = "",
-    color: Color = theme.dark.color.fg_primary,
+    color: Color = theme.dark.tokens.color.fg_primary,
     font_size: f32 = 14,
     font_weight: u16 = 400,
-    /// 字体族 id(render.FontRegistry 的进程内 id)。0 = 用默认族。
-    /// ⚠ 存 id 不存族名:text_run 每帧重建,塞 slice 会引入悬垂
-    ///   (见 render/font_registry.zig 文件头)。
+    /// Font family id (process-local from render.FontRegistry). 0 = default.
+    /// WARNING: store id not name; text_run rebuilds each frame, slice
+    /// introduces dangling reference (see render/font_registry.zig header).
     font_family: u16 = 0,
     line_height: f32 = 1.4,
     selectable: bool = true,
     wrap: TextWrap = .none,
     max_lines: u16 = 0,
-    /// 基线位置比例 (0.0-1.0)，相对于行高
-    /// 默认 0.75 适用于大多数拉丁字体；CJK 字体可能需要 0.8
-    /// 设为 0 表示使用默认值 0.75
+    /// Baseline position fraction (0.0-1.0) relative to line height.
+    /// Default 0.75 suits most Latin fonts; CJK fonts may need 0.8.
+    /// 0 = use default 0.75
     baseline_ratio: f32 = 0,
     inline_buf: [16]u8 = undefined,
     inline_len: u8 = 0,
-    /// 使用符号字体渲染（FontSelector.symbols_font）
-    /// 用于 list marker 等需要特殊 Unicode 字符的场景
+    /// Use symbol font rendering (FontSelector.symbols_font) for list
+    /// markers and special Unicode characters.
     use_symbols_font: bool = false,
-    /// 使用等宽字体渲染（FontSelector monospace 组）
+    /// Use monospace font rendering (FontSelector monospace group)
     use_monospace_font: bool = false,
-    /// 使用斜体字体渲染
+    /// Use italic font rendering
     use_italic_font: bool = false,
-    /// 删除线
+    /// Platform font smoothing (macOS stem darkening) when rasterizing glyphs. Off for content
+    /// that reproduces iOS, which draws glyphs unsmoothed (macOS smoothing put 23-46 % more ink
+    /// on the iOS tab bar labels). Rendering only: layout is unchanged.
+    font_smoothing: bool = true,
+    /// Strikethrough
     strikethrough: bool = false,
-    /// 等宽字体字符宽度（> 0 时启用快速路径：整行一次塑形 + utf8DisplayWidth 计算 span 背景位置）
+    /// Monospace char width (>0 enables fast path: single shape pass +
+    /// utf8DisplayWidth for span background position)
     monospace_char_width: f32 = 0,
-    /// content 是否由框架 allocator 分配（节点销毁 / setText 换内容时由框架释放）。
-    /// 坑：`getText -> 改 content 指向应用自己的 buffer -> setText` 时 owned 会跟着
-    /// 拷过来仍为 true，节点销毁会 free 应用的 buffer（Invalid free）,
-    /// 指向应用 buffer 时必须显式置 `owned = false`，或直接用 `node.setTextContent`。
+    /// Whether content allocated by framework allocator (freed on
+    /// node destroy/setText). Pitfall: getText -> point to app buffer ->
+    /// setText keeps owned=true, destroy frees app buffer (invalid free).
+    /// Set owned=false explicitly or use node.setTextContent.
     owned: bool = false,
 
-    /// 文本溢出处理（仅 wrap=.none 单行文本生效）
+    /// text overflow handling (wrap=.none single-line only)
     text_overflow: TextOverflow = .clip,
 
-    /// 逐视觉行水平对齐。节点宽由布局决定（`.fit` 宽时行宽 = 节点宽，看不出差别），
-    /// 所以居中折行要配 `.grow` / 固定宽。
+    /// Per-visual-line horizontal alignment. Node width from layout
+    /// (fit width makes line=node width, indistinguishable), so center
+    /// wrapping needs .grow or fixed width.
     text_align: TextAlign = .start,
 
-    /// 右端淡出遮罩宽（px，0 = 关闭；仅 wrap=.none 单行、无 spans 时生效）。
-    /// 在可用宽（node 内容宽）的最后 fade_right px 内，glyph alpha 按位置
-    /// 线性降到 0，类 CSS mask-image 的文本专用最小实现。与 .clip 搭配
-    /// 使用可得到"名字淡出而不是被硬切/省略号"的收尾（浮层控件盖在文字上
-    /// 的场景不再需要任何底色板，透明/玻璃背景上天然正确）。
+    /// Right-edge fade mask width (px, 0=off; wrap=.none no spans).
+    /// Within last fade_right px of available width, glyph alpha drops
+    /// linearly to 0, like CSS mask-image for text. Combine with .clip
+    /// for name-fades-not-cut appearance (overlay floats need no backdrop,
+    /// transparent/glass naturally correct).
     fade_right: f32 = 0,
 
-    /// Rich text spans（按字节偏移划分的子段样式）
-    /// 空 = 单一样式
+    /// Rich text spans (subsegments by byte offset with independent
+    /// styles). Empty = single style
     spans: []const TextSpan = &.{},
-    /// false 时，spans 只影响 paint，不参与文本布局/shape cache。
+    /// When false, spans affect paint only, not text layout/shape cache.
     spans_affect_layout: bool = true,
-    /// spans 数组是否由 allocator 分配（需要在节点销毁时释放）
+    /// Whether spans array allocated by allocator (freed on destroy)
     spans_owned: bool = false,
 
-    /// 设置内联文本内容（≤ inline_buf.len = 16 字节，零分配）。
-    ///
-    /// **不截断**：超长返回 error.InlineContentTooLong。曾经静默截到 16 字节,
-    /// 调用方传入的 placeholder / 月份标签 / 格式化数字悄悄被砍掉一截。长度不受控的
-    /// 内容用 `setContent(allocator, src)`（放得下走 inline，否则 dupe 成 owned）。
-    /// 注意：调用后如果 TextProps 被值传递或复制，必须调用 fixupAfterMove
+    /// Set inline text content (<= inline_buf.len = 16 bytes, zero-alloc).
+    /// Does NOT truncate: oversized returns error.InlineContentTooLong.
+    /// Use setContent(allocator, src) for variable-length. After call,
+    /// if TextProps value-passed/copied, must call fixupAfterMove.
     pub fn setInlineContent(self: *TextProps, src: []const u8) error{InlineContentTooLong}!void {
         if (src.len > self.inline_buf.len) return error.InlineContentTooLong;
         const len: u8 = @intCast(src.len);
         @memcpy(self.inline_buf[0..len], src[0..len]);
         self.inline_len = len;
         self.content = self.inline_buf[0..len];
-        // content 已改指自身 inline_buf，不再是堆内存：必须撤掉 owned。
-        // 否则 `getText -> setInlineContent -> setText` 换掉一段 owned 堆文本时，
-        // 新条目带着 owned=true 指向 inline_buf，节点销毁时 free 它 = Invalid free。
-        // 旧堆内存由 ContentTable.setText 按指针守卫释放。
+        // Content now points to own inline_buf, not heap: must remove
+        // owned. Else getText -> setInlineContent -> setText with owned heap
+        // text creates entry with owned=true -> inline_buf, destroy frees it
+        // (invalid free). Old heap freed by ContentTable.setText.
         self.owned = false;
     }
 
-    /// 设置文本内容的唯一通用入口：放得下 inline 就零分配，否则用 `allocator`
-    /// dupe 成 owned（节点销毁 / 换文本时由 ContentTable 用 Cx allocator 释放，
-    /// 所以 `allocator` 必须是 Cx.allocator）。
+    /// Universal text content entry: fits inline = zero-alloc, else dup
+    /// owned via allocator (freed on destroy/setText by ContentTable using
+    /// Cx allocator, so allocator must be Cx.allocator).
     pub fn setContent(self: *TextProps, allocator: std.mem.Allocator, src: []const u8) std.mem.Allocator.Error!void {
         self.setInlineContent(src) catch {
             self.content = try allocator.dupe(u8, src);
@@ -2627,8 +3133,8 @@ pub const TextProps = struct {
         };
     }
 
-    /// 在结构体被 move/copy 后修复 content 指针
-    /// 当 inline_len > 0 时，content 可能指向旧地址的 inline_buf，需要重新定位到当前地址
+    /// Fix content pointer after struct move/copy. When inline_len > 0,
+    /// content may point to old inline_buf address, needs relocation.
     pub fn fixupAfterMove(self: *TextProps) void {
         if (self.inline_len > 0) {
             self.content = self.inline_buf[0..self.inline_len];
@@ -2647,33 +3153,32 @@ pub const IconProps = struct {
     tint: Color = Color.WHITE,
 };
 
-/// 事件回调引用，组件回调的统一形态。
+/// Event callback reference, unified form for component callbacks.
 ///
-/// ## 为什么有 payload 变体（2026-07-31）
+/// ## Why payload variants
 ///
-/// 此前组件回调分两轨且**不可互换**：
-///   - `?HandlerRef`，无参，只通知"发生了"
-///   - `?*const fn (T, *anyopaque) void`，带值，告诉你"变成了什么"
+/// Callbacks come in two incompatible tracks:
+///   - ?HandlerRef: no-arg, notify only
+///   - ?*const fn (T, *anyopaque) void: value-passing
 ///
-/// docs/API_STABILITY.md 曾声称"已统一为 HandlerRef、Input 是特例"，实测
-/// 是 16 vs 17 的对半分裂。而且**直接把带值那组迁到无参 HandlerRef 会静默
-/// 丢掉 payload**，调用方照常编译，值没了，是最难查的一类回归。
+/// Migrating the value track to no-arg silently loses the payload (the caller compiles, the value
+/// is gone). So HandlerRef has an optional payload channel:
+///   - .callback: no-arg
+///   - .payload_callback: optional value (triggered by invokeWith*)
 ///
-/// 所以先给 HandlerRef 加上可选的 payload 通道，再让两轨并轨：
-///   - `.callback` 仍是无参签名，54 处既有 `.invoke()` 调用点零改动；
-///   - `.payload_callback` 是可选的带值签名，由 `invokeWith*` 触发。
+/// Payload supports bool / []const u8 only (all repo value callbacks use just these: bool for
+/// checkbox/switch/accordion; []const u8 for input/textarea/tabs/radio). No generics:
+/// HandlerRef lives in Node, and generics would pollute the tree type.
 ///
-/// payload 只支持 bool / []const u8 两种，实测全仓 17 个带值回调的载荷
-/// 就这两类（bool: checkbox/switch/accordion；[]const u8: input/textarea/
-/// tabs/radio）。不做泛型是刻意的：HandlerRef 存在 Node 里，泛型会让
-/// EventHandlers 变成 comptime 类型参数，污染整棵树的类型。
-///
-/// ⚠ 组件作者：**同时设置两者时 payload 版本优先**。只设 callback 的
-/// 老代码行为不变。
+/// WARNING Component authors: the payload version takes priority when both are set.
 pub const HandlerRef = struct {
+    /// Event callback type marker (Yix distinguishes events from data
+    /// by receiver param type, see ui.view.isEventProp)
+    pub const zenit_handler = true;
     callback: *const fn (*anyopaque) void,
     context: *anyopaque,
-    /// 可选的带值回调。非 null 时 invokeWithBool/Str 走这条，否则退化为无参。
+    /// Optional value callback. Non-null invokes invokeWithBool/Str via
+    /// this, else degrades to no-arg.
     payload_callback: ?PayloadCallback = null,
 
     pub const PayloadCallback = union(enum) {
@@ -2682,18 +3187,20 @@ pub const HandlerRef = struct {
         drop: *const fn (DropPayload, *anyopaque) void,
     };
 
-    /// drop 回调的完整 payload：换行分隔的 paths + 落点坐标（window 坐标系，
-    /// 与 DragEvent.x/y 同源）。按落点摆放文件（画布拖入）需要坐标,
-    /// 只给 paths 时宿主只能退回全局 .drag 事件自己记位置（下游回归）。
+    /// Drop callback complete payload: newline-separated paths + hit
+    /// point (window coords, DragEvent.x/y source). File placement needs
+    /// coords; paths-only falls back to global .drag self-recording.
     pub const DropPayload = struct {
-        /// 换行分隔的文件路径 / URL 列表；仅回调执行期间有效，需留存自行 dupe。
-        /// 平台拖入时内容由外部进程控制，必须按不可信输入处理。
+        /// Newline-separated file path/URL list; valid only during callback
+        /// execution, must dup to retain. Platform drag externally controlled,
+        /// treat as untrusted input.
         paths: []const u8,
         x: f32,
         y: f32,
         /// 0=none, 1=newline-separated file/URL list, 2=text, 3=internal.
         payload_kind: u8 = 0,
-        /// true 表示后端因容量上限拒绝了整个 payload，`paths` 为空。
+        /// True means backend rejected entire payload for capacity, paths
+        /// empty.
         payload_truncated: bool = false,
         payload_is_untrusted: bool = true,
     };
@@ -2702,9 +3209,9 @@ pub const HandlerRef = struct {
         self.callback(self.context);
     }
 
-    /// 带 bool 值触发。handler 若注册的是无参版本，退化为无参调用
-    /// （不丢事件，只是拿不到值），这样组件可以无条件调 invokeWithBool，
-    /// 不必关心调用方注册了哪种。
+    /// Invoke with bool value. No-arg handler degrades to no-arg call
+    /// (event not lost, value unavailable), so components unconditionally
+    /// call invokeWithBool regardless of registration.
     pub fn invokeWithBool(self: HandlerRef, value: bool) void {
         if (self.payload_callback) |pc| switch (pc) {
             .boolean => |f| return f(value, self.context),
@@ -2714,9 +3221,9 @@ pub const HandlerRef = struct {
         self.callback(self.context);
     }
 
-    /// 带字符串值触发。语义同 invokeWithBool。
-    /// ⚠ slice 生命周期：只保证**回调执行期间**有效（通常指向组件内部
-    /// buffer）。需要留存请自行 dupe。
+    /// Invoke with string value. Semantics match invokeWithBool. WARNING:
+    /// slice lifetime valid ONLY during callback execution (usually
+    /// component buffer). Must dup to retain.
     pub fn invokeWithStr(self: HandlerRef, value: []const u8) void {
         if (self.payload_callback) |pc| switch (pc) {
             .string => |f| return f(value, self.context),
@@ -2726,8 +3233,8 @@ pub const HandlerRef = struct {
         self.callback(self.context);
     }
 
-    /// 带完整 drop payload（paths + 落点坐标）触发。注册的是 string 版本时
-    /// 退化为仅 paths；无参版本退化为无参，同 invokeWithBool 的降级合同。
+    /// Invoke with complete drop payload (paths + coords). String
+    /// registration degrades to paths-only; no-arg degrades to no-arg.
     pub fn invokeWithDrop(self: HandlerRef, payload: DropPayload) void {
         if (self.payload_callback) |pc| switch (pc) {
             .drop => |f| return f(payload, self.context),
@@ -2756,13 +3263,18 @@ pub const EventHandlers = struct {
     on_focus: ?HandlerRef = null,
     on_blur: ?HandlerRef = null,
     on_event: ?GenericEventCallback = null,
-    /// Phase 6: capture 阶段事件处理器（root -> target 路径下行调用）。
-    /// 默认 null = 该节点不参与 capture phase 派发，零开销跳过。
-    /// 用于：focus trap、scroll lock、手势仲裁等需要在祖先拦截的场景。
+    /// Phase 6: capture-phase event handler (root -> target downward).
+    /// Default null = skip capture, zero-cost. For: focus trap, scroll
+    /// lock, gesture arbitration needing ancestor interception.
     on_event_capture: ?GenericEventCallback = null,
     event_context: ?*anyopaque = null,
-    /// 滚轮事件专用处理器（与 on_key_down 对称）。
-    /// on_event 返回 ignored 或不存在时 fallthrough 到这里；context 用 event_context。
+    /// Capture handler's own context (null uses event_context). Component
+    /// root's on_event/event_context belongs to component; template
+    /// onKeyDown/onPointer*/onScroll in capture slot with own context.
+    capture_context: ?*anyopaque = null,
+    /// Dedicated scroll event handler (symmetric with on_key_down).
+    /// Fallthrough if on_event returns ignored or missing; context uses
+    /// event_context.
     on_scroll: ?ScrollEventCallback = null,
     scroll_direction_hint: ?ScrollDirectionHint = null,
     on_key_down: ?KeyEventCallback = null,
@@ -2771,14 +3283,14 @@ pub const EventHandlers = struct {
     on_action: ?actions_mod.ActionHandler = null,
     action_context: ?*anyopaque = null,
 
-    /// 拖放：文件拖入本节点边界（drag.entered）。用于悬停高亮等反馈。
-    /// 非 null 即把本节点标记为 drop target（参与 pointer 命中）。
+    /// Drag: file entered this node boundary (drag.entered). Hover
+    /// highlight feedback. Non-null marks as drop target (pointer hit).
     on_drag_enter: ?HandlerRef = null,
-    /// 拖放：文件拖离本节点边界（drag.exited）。
+    /// Drag: file exited this node boundary (drag.exited).
     on_drag_leave: ?HandlerRef = null,
-    /// 拖放：文件在本节点上放下（drag.dropped）。
-    /// 用 `Cx.strHandlerFrom` 注册可拿到换行分隔的路径列表；
-    /// ⚠ slice 只在回调执行期间有效，需留存请自行 dupe。
+    /// Drag: file dropped on this node (drag.dropped). Register via
+    /// Cx.strHandlerFrom for newline-separated paths. WARNING: slice
+    /// valid only during callback, must dup to retain.
     on_drop: ?HandlerRef = null,
 };
 
@@ -2846,6 +3358,104 @@ test "BoxStyle applies transform fields into StyleExt" {
     try std.testing.expectApproxEqAbs(@as(f32, 20), origin.y, 0.001);
 }
 
+test "BoxStyle.merge / isEmpty 覆盖全部字段（曾漏 display）" {
+    const merged = (BoxStyle{ .gap = 4 }).merge(.{ .display = .none, .gap = 8 });
+    try std.testing.expectEqual(@as(?Display, .none), merged.display);
+    try std.testing.expectEqual(@as(?f32, 8), merged.gap);
+    try std.testing.expect(!(BoxStyle{ .display = .none }).isEmpty());
+    try std.testing.expect((BoxStyle{}).isEmpty());
+
+    // Per-field set carries through merge, isEmpty sees all. donor must
+    // fill every field: BoxStyle new field without follow-up red-flags
+    // donor assertion.
+    const donor = BoxStyle{
+        .width = .{ .px = 1 },
+        .height = .{ .px = 1 },
+        .direction = .row,
+        .justify = .center,
+        .align_items = .center,
+        .gap = 1,
+        .padding = Padding.all(1),
+        .margin = Padding.all(1),
+        .margin_spec = .{},
+        .flex = 1,
+        .flex_shrink = 1,
+        .flex_wrap = .wrap,
+        .blend_mode = .multiply,
+        .z_index = 1,
+        .inset = .{},
+        .gradient = .{ .from = Color.WHITE, .to = Color.WHITE },
+        .clip_shape = .auto,
+        .shadows = ShadowList.of(&.{.{}}),
+        .glass = .{},
+        .multi_gradient = MultiGradient.fromSlice(&.{}, .diagonal),
+        .composited_group = true,
+        .content_warp = .{ .cap = 6, .edge = 2, .fade_start = 4, .fade_width = 14 },
+        .grid_placement = .{},
+        .corner_radii = .{ .each = .{ 1, 2, 3, 4 } },
+        .inset_shadows = InsetShadowList.of(&.{.{}}),
+        .outline = .{ .color = Color.WHITE },
+        .flex_basis = 1,
+        .align_self = .center,
+        .no_cross_stretch = true,
+        .sticky_insets = .{},
+        .tab_index = 1,
+        .aspect_ratio = 1,
+        .min_width = 1,
+        .max_width = 1,
+        .min_height = 1,
+        .max_height = 1,
+        .hit_shape = .rect,
+        .shape = .ellipse,
+        .hit_behavior = .pass_through,
+        .hit_roles = .{},
+        .noise = .{},
+        .inset_shadow = .{},
+        .overflow_fade = .{},
+        .keep_rendering_when_transparent = true,
+        .will_change_transform = true,
+        .will_change_opacity = true,
+        .position = .absolute,
+        .display = .none,
+        .overflow = .hidden,
+        .overflow_hidden = true,
+        .layout_isolation = true,
+        .background = Color.WHITE,
+        .opacity = 0.5,
+        .cursor = .pointer,
+        .translate_x = 1,
+        .translate_y = 1,
+        .scale_x = 1,
+        .scale_y = 1,
+        .rotate = 1,
+        .transform_origin = .{},
+        .border = .{},
+        .border_color = Color.WHITE,
+        .border_width = 1,
+        .border_top_width = 1,
+        .border_right_width = 1,
+        .border_bottom_width = 1,
+        .border_left_width = 1,
+        .border_top_color = Color.WHITE,
+        .border_right_color = Color.WHITE,
+        .border_bottom_color = Color.WHITE,
+        .border_left_color = Color.WHITE,
+        .corner_radius = 1,
+        .shadow = .{},
+        .text_color = Color.WHITE,
+        .font_size = 1,
+        .font_weight = 1,
+        .icon_color = Color.WHITE,
+    };
+    inline for (@import("zenit_reflection").fields(BoxStyle)) |f| {
+        try std.testing.expect(@field(donor, f.name) != null);
+        var one: BoxStyle = .{};
+        @field(one, f.name) = @field(donor, f.name);
+        try std.testing.expect(@field((BoxStyle{}).merge(one), f.name) != null);
+        try std.testing.expect(!one.isEmpty());
+    }
+}
+
 test "BoxStyle styleFieldMask reports only declared aggregate fields" {
     const mask = (BoxStyle{
         .padding = Padding.all(8),
@@ -2854,7 +3464,7 @@ test "BoxStyle styleFieldMask reports only declared aggregate fields" {
     }).styleFieldMask();
     const has = struct {
         fn field(bits: u64, f: StyleField) bool {
-            return (bits & (@as(u64, 1) << @intFromEnum(f))) != 0;
+            return (bits & (@as(u64, 1) << @backingInt(f))) != 0;
         }
     }.field;
 
@@ -2916,7 +3526,7 @@ test "TextProps.setInlineContent 超长报错而非静默截断" {
     try t.setInlineContent("exactly 16 bytes");
     try std.testing.expectEqualStrings("exactly 16 bytes", t.content);
     try std.testing.expectError(error.InlineContentTooLong, t.setInlineContent("seventeen bytes!!"));
-    // 失败时不改动已有内容
+    // On failure, don't modify existing content
     try std.testing.expectEqualStrings("exactly 16 bytes", t.content);
 }
 
@@ -2932,4 +3542,55 @@ test "TextProps.setContent：短文本走 inline 零分配，长文本完整 dup
     defer if (t.owned) alloc.free(t.content);
     try std.testing.expect(t.owned);
     try std.testing.expectEqualStrings(long, t.content);
+}
+
+test "GlassParams.resolve: reduce transparency / increase contrast pick the measured opaque materials" {
+    const saved = a11y_preferences.current();
+    defer a11y_preferences.set(saved);
+    const base = GlassParams{ .backdrop_blur = 20, .specular_opacity = 0.6 };
+    a11y_preferences.set(.{});
+    try std.testing.expectEqual(@as(f32, 0), base.resolve().a11y[0]);
+    a11y_preferences.set(.{ .reduce_transparency = true });
+    const rt = base.resolve();
+    try std.testing.expectEqual(@as(f32, 1), rt.a11y[0]);
+    try std.testing.expectApproxEqAbs(@as(f32, 242.0 / 255.0), rt.a11y[1], 1e-6);
+    try std.testing.expectEqual(@as(f32, 20), rt.backdrop_blur); // regular blur (max blur would dilute background chroma)
+    try std.testing.expectApproxEqAbs(@as(f32, 0.6), rt.specular_opacity, 1e-6); // preserve material specular
+    a11y_preferences.set(.{ .increase_contrast = true, .reduce_transparency = true });
+    const ic = base.resolve();
+    try std.testing.expectEqual(@as(f32, 2), ic.a11y[0]); // high contrast mode (stroke)
+    try std.testing.expectEqual(@as(f32, 0), ic.specular_opacity);
+    // pure blur layer exemption
+    var blur_only = base;
+    blur_only.a11y_exempt = true;
+    try std.testing.expectEqual(@as(f32, 0), blur_only.resolve().a11y[0]);
+}
+
+test "BoxStyle.merge：后层的 border 简写重置前层的细粒度 border_*（CSS 语义）；后层的细粒度字段照常叠在前层简写上" {
+    const lower: BoxStyle = .{ .border_color = Color.hex(0xff0000), .border_width = 1 };
+    const upper: BoxStyle = .{ .border = .{ .width = 0, .color = Color.hex(0x00ff00) } };
+    const m = lower.merge(upper);
+    try std.testing.expect(m.border_color == null and m.border_width == null);
+    try std.testing.expectEqual(@as(f32, 0), m.border.?.width);
+    const m2 = upper.merge(.{ .border_color = Color.hex(0x0000ff) });
+    try std.testing.expect(m2.border != null);
+    try std.testing.expect(m2.border_color.?.eql(Color.hex(0x0000ff)));
+}
+
+test "Color.lerp from transparent fades the target hue in (no dark flash)" {
+    // Ghost Button hover: TRANSPARENT -> opaque bg-hover. Straight per-channel lerp passes
+    // through dark translucent gray; premultiplied lerp keeps the target RGB throughout.
+    const hover = Color.hex(0xF0F0F0);
+    var i: u32 = 1;
+    while (i < 10) : (i += 1) {
+        const c = Color.lerp(Color.TRANSPARENT, hover, @as(f32, @floatFromInt(i)) / 10.0);
+        try std.testing.expectEqual(hover.withAlpha(c.a), c);
+    }
+    try std.testing.expectEqual(hover, Color.lerp(Color.TRANSPARENT, hover, 1.0));
+    try std.testing.expectEqual(Color.TRANSPARENT, Color.lerp(Color.TRANSPARENT, hover, 0.0));
+    // Reverse direction (hover out) likewise keeps the source hue.
+    const out = Color.lerp(hover, Color.TRANSPARENT, 0.5);
+    try std.testing.expectEqual(hover.withAlpha(out.a), out);
+    // Equal alphas: unchanged straight lerp.
+    try std.testing.expectEqual(Color.rgb(127, 127, 127), Color.lerp(Color.BLACK, Color.WHITE, 0.5));
 }

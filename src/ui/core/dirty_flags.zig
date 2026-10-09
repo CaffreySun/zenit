@@ -1,42 +1,39 @@
-//! DirtyFlags, Phase 0 地基（待 Phase 3 接入 Node 拆分）
+//! DirtyFlags - packed dirty state replacing the 13 bools + 2 u32 versions on Node.
 //!
-//! 替代当前 Node 上分散的 13 个布尔 + 2 个 u32 version。
+//! Strict two groups (avoids the Chromium cc::Layer 18-bool chaos):
+//! - **input flags**: upstream writes (what changed)
+//! - **output flags**: downstream reads (what stage needs redo)
 //!
-//! 历史债避免（吸取 Chromium cc::Layer 18 布尔状态混乱教训）：
-//! 严格分两组：
-//! - **input flags**：上游写入端用（"什么属性变了"）
-//! - **output flags**：下游读端用（"什么阶段需要重做"）
+//! A single set must not flip multiple groups; markStyleChanged, markGeometryChanged
+//! etc. decide the input->output mapping, not each call point OR-ing bits.
 //!
-//! 不让单个 set 同时翻多组，`markStyleChanged`、`markGeometryChanged` 等
-//! 高层 API 决定输入到输出的映射，而不是让每个调用点自己 OR 一堆位。
+//! Subtree propagation bits are separate (subtree_*), advanced by markSubtree APIs,
+//! never OR'd with a 'self' flag in the same call.
 //!
-//! 子树传播位是单独的（`subtree_*`），由 `markSubtree` 系列 API 推进，
-//! 永远不与"自身" flag 在同一调用里被 OR。
-//!
-//! 容量：u32 packed，足够当前所有阶段；不再用 u16 因为后续要加 layer 阶段。
-//!
-//! 关键不变量：
-//! 1. `clear()` 后所有位归零（视作 fully clean）
-//! 2. `union(other)` = 集合并
-//! 3. `subtree_*` 永远 ⊇ `*`（局部脏 ⇒ 子树脏）由 promote() 强制
-//! 4. 每个 flag 都有明确语义；不重复表达
+//! Capacity: u32 packed (room for future layer phases). Invariants:
+//! 1. after clear() all bits are zero (fully clean)
+//! 2. union(other) = set union
+//! 3. subtree_* always >= * (local dirty => subtree dirty), enforced by promote()
+//! 4. every flag has clear semantics; no duplication
 
 const std = @import("std");
 const testing = std.testing;
 
-/// 输入域：组件/动画/事件等上游写入；下游不应直接读这些位决策。
+/// input domain: written by components/animations/events etc upstream; downstream must not read
+/// these to make decisions.
 pub const InputFlags = packed struct(u8) {
-    /// 自身 style 属性变化（color、opacity、transform 等）。
+    /// self style property changes (color, opacity, transform etc).
     style_changed: bool = false,
-    /// 自身几何相关 style 变化（width/height/padding/margin/flex/grid）。
+    /// self geometry-related style changes (width/height/padding/margin/flex/grid).
     geometry_changed: bool = false,
-    /// 文本内容/字体相关变化。
+    /// text content/font changes.
     text_changed: bool = false,
-    /// 子节点拓扑变化（增/删/序）。
+    /// child node topology changes (add/remove/reorder).
     structure_changed: bool = false,
-    /// 交互意图（hit_test_visible / pointer-events / focus options）变化。
+    /// interaction intent changes (hit_test_visible / pointer-events / focus options).
     interaction_changed: bool = false,
-    /// 命中几何（rect/path/clip）变化（一般由 geometry_changed 派生，但允许显式置位）。
+    /// hit geometry (rect/path/clip) changes (usually derived from geometry_changed, explicit
+    /// setting allowed).
     hit_geometry_changed: bool = false,
 
     _reserved: u2 = 0,
@@ -55,20 +52,20 @@ pub const InputFlags = packed struct(u8) {
     }
 };
 
-/// 输出域：渲染流水线读取以决定本帧需要做什么。
-/// 所有位均 false = 此节点本帧零工作（fast skip）。
+/// output domain: render pipeline reads to decide what to do this frame. all false = zero work this
+/// frame (fast skip).
 pub const OutputFlags = packed struct(u8) {
-    /// 需要重新布局
+    /// needs re-layout
     needs_layout: bool = false,
-    /// 需要重新生成 paint chunks（display items）
+    /// needs re-generate paint chunks (display items)
     needs_paint: bool = false,
-    /// 需要重新合成（layer transform/opacity 更新即可，paint 可能不变）
+    /// needs re-composite (layer transform/opacity update ok, paint may unchanged)
     needs_composite: bool = false,
-    /// 需要重建命中代理
+    /// needs rebuild hit proxies
     needs_hit_rebuild: bool = false,
-    /// 需要更新交互语义（focus tree / aria projection）
+    /// needs update interaction semantics (focus tree / aria projection)
     needs_interaction_update: bool = false,
-    /// runtime 索引（z-order/runtime_index）需要重排
+    /// runtime indices (z-order/runtime_index) need resorting
     needs_order_update: bool = false,
 
     _reserved: u2 = 0,
@@ -95,7 +92,8 @@ pub const OutputFlags = packed struct(u8) {
     }
 };
 
-/// 子树脏位：祖先方向的"我或我后代有脏"汇总，避免子树扫描。
+/// subtree dirty bits: ancestor-direction summary of 'me or descendants dirty', avoids subtree
+/// scan.
 pub const SubtreeFlags = packed struct(u8) {
     has_layout_dirty: bool = false,
     has_paint_dirty: bool = false,
@@ -119,7 +117,7 @@ pub const SubtreeFlags = packed struct(u8) {
         return @bitCast(a | b);
     }
 
-    /// 把 OutputFlags 的位投影到 SubtreeFlags（用于将自身脏向上 propagate）。
+    /// project OutputFlags bits to SubtreeFlags (for propagating self dirty upward).
     pub fn fromOutput(out: OutputFlags) SubtreeFlags {
         return .{
             .has_layout_dirty = out.needs_layout,
@@ -132,13 +130,13 @@ pub const SubtreeFlags = packed struct(u8) {
     }
 };
 
-/// 完整脏标位汇集。32-bit packed = 内存友好；u64 对齐。
-/// 暂不放在 Node 内部，Phase 3 拆 Node 时把这个推进 LayoutTable/PaintTable 旁。
+/// complete dirty flag collection. 32-bit packed = memory efficient; u64 aligned. not inside Node
+/// yet, Phase 3 Node split will move alongside LayoutTable/PaintTable.
 pub const DirtyFlags = packed struct(u32) {
     input: InputFlags = .{},
     output: OutputFlags = .{},
     subtree: SubtreeFlags = .{},
-    /// 8-bit padding 给未来扩展
+    /// 8-bit padding for future expansion
     _reserved: u8 = 0,
 
     pub const NONE: DirtyFlags = .{};
@@ -151,8 +149,8 @@ pub const DirtyFlags = packed struct(u32) {
         self.* = NONE;
     }
 
-    /// 仅清掉本节点的输出脏位（保留 subtree，那是子树状态）。
-    /// 渲染流水线在某阶段消费完后调用。
+    /// clear only this node's output dirty bits (keep subtree, that's subtree state). render
+    /// pipeline calls after consuming a stage.
     pub fn clearOutputs(self: *DirtyFlags) void {
         self.output = .{};
     }
@@ -162,9 +160,9 @@ pub const DirtyFlags = packed struct(u32) {
     }
 };
 
-/// InputFlags -> OutputFlags 投影。决定哪些上游变更触发哪些下游阶段。
-/// **唯一**的 input->output 映射点，不允许其他地方手动 OR 输出位
-/// （除调度器为合并子树脏汇总时）。
+/// InputFlags -> OutputFlags projection. determines which upstream changes trigger which downstream
+/// stages. **sole** input->output mapping point, no manual output bit OR elsewhere (except
+/// scheduler merging subtree dirty summary).
 pub fn outputFromInput(in: InputFlags) OutputFlags {
     var out = OutputFlags.NONE;
     if (in.geometry_changed) {
@@ -178,7 +176,8 @@ pub fn outputFromInput(in: InputFlags) OutputFlags {
         out.needs_paint = true;
     }
     if (in.style_changed) {
-        // 纯样式（如颜色）只触发 paint；如果同时 geometry_changed 已置位则上面已覆盖
+        // pure style (like color) only triggers paint; if geometry_changed also set, it already
+        // covers above.
         out.needs_paint = true;
     }
     if (in.structure_changed) {

@@ -1,25 +1,25 @@
-/// Form 组件模块
+/// Form component module
 ///
-/// 三层架构:
-/// - Layer 0: FormOf(T)，数据 + 验证层
-/// - Layer 1: FormFieldOf(T)，字段容器 UI
-/// - Layer 2: Form，布局容器
+/// Three-tier architecture:
+/// - Layer 0: FormOf(T), data + validation
+/// - Layer 1: FormFieldOf(T), field container UI
+/// - Layer 2: Form, layout container
 const std = @import("std");
 
-// Layer 0: 数据 + 验证层
+// Layer 0: Data + validation layer
 pub const form_data = @import("form_data.zig");
 pub const FormOf = form_data.FormOf;
 pub const ValidationResult = form_data.ValidationResult;
 pub const ValidateTrigger = form_data.ValidateTrigger;
 pub const FieldMeta = form_data.FieldMeta;
 
-// Layer 1: 字段容器 UI
+// Layer 1: Field container UI
 pub const form_field = @import("form_field.zig");
 pub const FormFieldOf = form_field.FormFieldOf;
 pub const FormFieldResult = form_field.FormFieldResult;
 pub const FormFieldConfig = form_field.FormFieldConfig;
 
-// Layer 2: 布局容器
+// Layer 2: Layout container
 pub const form_layout = @import("form_layout.zig");
 pub const Form = form_layout.Form;
 pub const FormBuilder = form_layout.FormBuilder;

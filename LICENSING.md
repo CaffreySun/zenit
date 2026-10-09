@@ -81,6 +81,14 @@ redistributing zenit means redistributing them under their own terms:
                           default to Lucide, but source-tree exclusion is still
                           required. See the private package README.
 
+  vendor/zls/             ZLS and local Zig 0.17 compatibility fixes, MIT.
+                          Full text: vendor/zls/LICENSE
+                          Source revisions: vendor/zls/PROVENANCE.md
+
+  tools/fixtures/fonts/   Unmodified Lora test fonts, SIL Open Font License 1.1.
+                          Copyright 2011 The Lora Project Authors.
+                          Full text: tools/fixtures/fonts/Lora-OFL.txt
+
   vendor/unicode/         Unicode Character Database, Unicode License V3.
                           Copyright (c) Unicode, Inc.
                           Full text: vendor/unicode/LICENSE.txt

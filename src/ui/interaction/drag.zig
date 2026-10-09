@@ -1,13 +1,14 @@
-//! 窗口内连续 pointer drag 的 headless 交互原语。
+//! Headless pointer drag within a window.
 //!
-//! 设计合同见 docs/DRAG_INTERACTION_DESIGN.md。要点：
-//! - 不产生 Node、不修改业务数据、不决定视觉样式；
-//! - 严格生命周期 `pending -> start -> move* -> end | cancel`，terminal 恰好一次；
-//! - `Machine` 是纯状态机（阈值/轴投影/delta/exactly-once），不依赖 Node/Cx/allocator；
-//! - `Binding` 是 Scope 管理的 raw-event adapter，占用 source 的共享 event slot；
-//! - `Manager` 每 Cx 一个：单会话仲裁、capture/click 抑制/cursor、取消触发器。
+//! Design contract: docs/DRAG_INTERACTION_DESIGN.md. Summary:
+//! - No Node production, no business data change, no style decision;
+//! - Strict lifecycle `pending -> start -> move* -> end | cancel`, terminal exactly once;
+//! - `Machine` pure state machine (threshold/axis projection/delta/exactly-once),
+//!   no Node/Cx/allocator dependency;
+//! - `Binding` is a Scope-managed raw-event adapter, occupies the source event slot;
+//! - `Manager` per-Cx: session arbitration, capture/click suppress/cursor, cancel trigger.
 //!
-//! v1 只覆盖桌面 primary mouse；touch/pen、GestureArena 替换见设计文档 D4。
+//! v1 covers the desktop primary mouse only; touch/pen/GestureArena see design D4.
 
 const std = @import("std");
 const core = @import("../core.zig");
@@ -43,7 +44,7 @@ pub const CancelReason = enum(u8) {
 
 pub const Point = struct { x: f32, y: f32 };
 
-/// generation-safe 句柄（ui.NodeHandle）。
+/// Generation-safe handle (ui.NodeHandle).
 pub const SourceHandle = core.NodeHandle;
 pub const PointerId = u32;
 pub const mouse_pointer_id: PointerId = 0;
@@ -61,26 +62,27 @@ pub const Event = struct {
     source: SourceHandle,
     pointer_id: PointerId,
 
-    /// 未约束的 window logical-point 坐标。
+    /// Unclamped window logical-point coordinate.
     origin_window: Point,
     position_window: Point,
 
-    /// position - origin，未做 axis 投影。
+    /// position - origin, not axis-projected.
     raw_delta: Point,
 
-    /// axis 投影后的累计位移。消费者应优先用它从初始模型值计算结果。
+    /// After axis projection, cumulative displacement. Consumer should compute result from
+    /// initial model value using this.
     delta: Point,
 
-    /// 相对上一次已派发 drag event 的 axis 投影位移。
+    /// Axis projection delta since last dispatched drag event.
     step_delta: Point,
 
-    /// 从 pointer down 起算的单调时间。
+    /// Monotonic time since pointer down.
     elapsed_ns: u64,
     button: events.MouseButton,
     start_modifiers: events.Modifiers,
     modifiers: events.Modifiers,
 
-    /// 仅 phase == .cancel 时非 null。
+    /// Non-null only when phase == .cancel.
     cancel_reason: ?CancelReason = null,
 };
 
@@ -102,18 +104,18 @@ pub const Callback = *const fn (Event, *anyopaque) void;
 pub const Config = struct {
     axis: Axis = .both,
     activation_distance: f32 = 4.0,
-    /// v1 只接受 .left；保留字段是为了让未来扩展无需改变 Config 形状。
+    /// v1 accepts .left only; field reserved so future expansion doesn't reshape Config.
     button: events.MouseButton = .left,
     enabled: bool = true,
 
-    /// null 表示不覆盖系统光标；只在 active 期间生效。
+    /// null = don't override system cursor; only live during active.
     active_cursor: ?core.CursorShape = .grabbing,
 
-    /// 成功 claim down 后同步调用一次，用于 focus、按下跳值等即时行为。
-    /// 它不是 drag phase，pending 结束时没有配对 callback。
+    /// Called once synchronously after down claim, for immediate actions like focus/value jump.
+    /// Not a drag phase; no paired callback at pending end.
     on_pending_down: ?PendingDownCallback = null,
 
-    /// 越过阈值时同步调用一次。false 表示本次序列拒绝启动。
+    /// Called once crossing threshold. false = this sequence rejected.
     can_start: ?StartPredicate = null,
 };
 
@@ -125,22 +127,22 @@ pub const AttachError = error{
     OutOfMemory,
 };
 
-// ---------------------------------------------------------------------------
-// Machine，纯状态机
-// ---------------------------------------------------------------------------
+// -----------
+// Machine: pure state machine
+// -----------
 
-/// 纯状态机：输入 down/move/up/cancel（时间为调用方计算的 elapsed_ns），
-/// 输出零到两个 transition。不依赖 Node、Cx、allocator，可独立单测。
+/// Pure state machine: input down/move/up/cancel (time caller-computed elapsed_ns),
+/// output zero to two transitions. No Node/Cx/allocator; independent unit-testable.
 pub const Machine = struct {
     axis: Axis = .both,
     activation_distance: f32 = 4.0,
 
     state: State = .idle,
     origin: Point = .{ .x = 0, .y = 0 },
-    /// 最近一次观察到的位置（cancel 时作为事件坐标）。
+    /// Latest observed position (cancel event coordinate).
     last_pos: Point = .{ .x = 0, .y = 0 },
     last_elapsed_ns: u64 = 0,
-    /// 最近一次已派发 transition 的位置与投影 delta（step_delta 基准）。
+    /// Latest dispatched position + axis delta (step_delta base).
     last_dispatched_pos: Point = .{ .x = 0, .y = 0 },
     last_dispatched_delta: Point = .{ .x = 0, .y = 0 },
 
@@ -211,7 +213,7 @@ pub const Machine = struct {
         self.origin = pos;
         self.last_pos = pos;
         self.last_elapsed_ns = 0;
-        // start 的 step_delta == delta；down 当场激活时两者都为零。
+        // start has step_delta == delta; down instant activates both to zero.
         self.last_dispatched_pos = pos;
         self.last_dispatched_delta = .{ .x = 0, .y = 0 };
         self.state = .pending;
@@ -236,7 +238,7 @@ pub const Machine = struct {
                 }
             },
             .active => {
-                // 相同坐标不发冗余 move。
+                // No redundant move for same coordinate.
                 if (pos.x != self.last_dispatched_pos.x or pos.y != self.last_dispatched_pos.y) {
                     out.push(self.makeTransition(.move, pos, elapsed_ns));
                 }
@@ -253,8 +255,8 @@ pub const Machine = struct {
             .idle => {},
             .rejected => self.state = .idle,
             .pending => {
-                // down 后没有 move、up 坐标却已越过阈值：依次发 start、end。
-                // 消费方若在 start 上 reject，由 binding 丢弃后续 end。
+                // No move after down, but up past threshold: emit start then end.
+                // If consumer rejects on start, binding discards following end.
                 const raw = Point{ .x = pos.x - self.origin.x, .y = pos.y - self.origin.y };
                 if (self.projectedDistance(raw) >= self.activation_distance) {
                     self.state = .active;
@@ -264,7 +266,7 @@ pub const Machine = struct {
                 self.state = .idle;
             },
             .active => {
-                // end 使用 mouse up 的最终坐标，即便与最后一次 move 相同也要发。
+                // end uses mouse-up final position, even if same as last move.
                 out.push(self.makeTransition(.end, pos, elapsed_ns));
                 self.state = .idle;
             },
@@ -272,8 +274,8 @@ pub const Machine = struct {
         return out;
     }
 
-    /// 任意取消触发。active 恰好发一次 cancel（坐标 = 最近观察位置）；
-    /// pending/rejected 静默回 idle。
+    /// Any cancel trigger. active emits one cancel (position = latest observed);
+    /// pending/rejected silent back to idle.
     pub fn feedCancel(self: *Machine) Output {
         var out = Output{};
         switch (self.state) {
@@ -287,9 +289,9 @@ pub const Machine = struct {
         return out;
     }
 
-    /// can_start 返回 false 时由 binding 调用：丢弃刚发出的 start，本次
-    /// pointer sequence 不再询问 predicate、不发任何 drag callback。
-    /// up 当场越阈值的情形下 machine 已回到 idle，此时保持 idle 即可。
+    /// binding calls when can_start returns false: discard just-emitted start, this
+    /// pointer sequence asks predicate no more, emits no drag callback. Machine already
+    /// back to idle on up-crosses threshold; stay idle.
     pub fn reject(self: *Machine) void {
         std.debug.assert(self.state != .pending);
         if (self.state == .active) self.state = .rejected;
@@ -300,15 +302,16 @@ pub const Machine = struct {
     }
 };
 
-// ---------------------------------------------------------------------------
-// Manager，每 Cx 一个的中心仲裁
-// ---------------------------------------------------------------------------
+// Manager: central arbitrator, one per Cx
 
 pub const Manager = struct {
     session: ?Session = null,
-    /// 每次 claim 递增。callback 重入后用它重新校验 session 身份，
-    /// 避免"旧 session 的后续处理写到新 session 上"。
+    /// Incremented per claim. On reentry, use it to reverify session identity,
+    /// avoid "old session's following handler writing to new session".
     generation: u32 = 0,
+
+    pending_terminals: [max_pending_terminals]PendingTerminal = undefined,
+    pending_terminal_len: u8 = 0,
 
     pub const SessionPhase = enum { pending, active, rejected };
 
@@ -321,6 +324,10 @@ pub const Manager = struct {
         phase: SessionPhase = .pending,
         captured: bool = false,
         cursor_token: ?core.CursorToken = null,
+        /// start callback dispatch started. phase goes active step 1, start callback not until
+        /// step 5; between (setPointerCapture triggers old holder's on_capture_lost, source dies),
+        /// cancel: from consumer view drag never started, must silent (s11.1).
+        start_delivered: bool = false,
     };
 
     fn isCurrent(self: *const Manager, binding: *const Binding, generation: u32) bool {
@@ -328,49 +335,107 @@ pub const Manager = struct {
         return s.binding == binding and self.generation == generation;
     }
 
-    /// Escape 优先消费：有 session（pending/rejected/active 任一）就取消并吞掉。
+    /// Escape priority consumer: any session (pending/rejected/active) cancels + consumed.
     pub fn handleEscape(self: *Manager, cx: *Cx) bool {
         if (self.session == null) return false;
         self.cancel(cx, .escape);
         return true;
     }
 
-    /// 统一取消入口。active 恰好发一次主 callback(.cancel)；pending/rejected
-    /// 静默清理。两者都抑制本次 pointer sequence 的 click。幂等。
+    /// Unified cancel entry. An active session emits one main callback(.cancel); pending/rejected
+    /// clean up silently. Both suppress this pointer sequence's click. Idempotent.
+    ///
+    /// Order contract (terminal path same as `Binding.finishSession`):
+    /// 1. Commit manager state, finish all Binding work **before any user code**
+    ///    (machine wrap-up, terminal event + callback/context snapshot queued);
+    /// 2. Release cursor / capture, hover resync: runs user code synchronously (on_capture_lost,
+    ///    mouse_enter/leave), which may dispose the scope owning Binding;
+    /// 3. Deliver queued terminal callbacks.
+    /// After step 2 there is no more Binding dereference. Terminal callbacks are delivered in
+    /// queue order, exactly once, before the context is destroyed: if Binding is destroyed in
+    /// step 2, destroyResource delivers first (s11.3) and step 3 finds the queue empty.
+    /// Delivery may also happen early via nesting: step 2 user code ending another session (or
+    /// destroying another Binding) flushes the whole queue, so this terminal is delivered before
+    /// this session's capture release / hover resync finishes.
     pub fn cancel(self: *Manager, cx: *Cx, reason: CancelReason) void {
         const session = self.session orelse return;
-        // 先提交清理（commit-before-callback）：callback 重入 cancel/dispose
-        // 时 session 已经为空，走幂等 no-op。
+        // Commit early (commit-before-callback): reentry cancel/dispose sees empty session, idem
+        // no-op.
         self.session = null;
         const binding = session.binding;
 
-        // 被强制终止的 pointer sequence 不再是有效 click；后到的 mouse up
-        // 只做幂等清理（标记在下次 left down 时重置）。
+        // Canceled pointer sequence not valid click; later mouse-up idem cleanup (cleared next left
+        // down).
         cx.dispatcher.cancelClickSynthesisForActivePointer();
 
+        // Main callback only on start dispatched: machine may cross threshold but start callback
+        // not yet to consumer (can_start/on_pending_down reentry canceled, or steps 1~5 canceled)
+        // —from user view drag never started, must silent.
+        if (session.phase == .active and session.start_delivered) {
+            binding.start_modifiers_snapshot = session.start_modifiers;
+            const out = binding.machine.feedCancel();
+            for (out.slice()) |t| {
+                std.debug.assert(t.kind == .cancel);
+                // Queue doesn't run user code; binding still safe to read.
+                self.queueTerminal(binding.terminalFor(t, reason));
+            }
+        }
+        binding.machine.reset();
+
+        // ---- Below runs user code, no more binding dereference ----
         if (session.cursor_token) |token| cx.releaseCursor(token);
         if (session.captured) {
             if (cx.dispatcher.releasePointerCaptureFor(session.source)) {
                 cx.resyncPointerAfterCaptureRelease(cx.mouse_x, cx.mouse_y, null);
             }
         }
-
-        // 主 callback 只在 session 已 active（start 已派发）时才发：machine
-        // 可能已越阈值但 start 回调尚未送达消费者（can_start/on_pending_down
-        // 重入取消），此时从用户视角 drag 从未开始，必须静默。
-        if (session.phase == .active) {
-            binding.start_modifiers_snapshot = session.start_modifiers;
-            const out = binding.machine.feedCancel();
-            for (out.slice()) |t| {
-                std.debug.assert(t.kind == .cancel);
-                binding.dispatchTransition(t, reason);
-            }
-        }
-        binding.machine.reset();
+        self.flushTerminals();
     }
 
-    /// Node lifecycle：source 所在子树被 detach/destroy 时取消 session。
-    /// 只用稳定 id 判定，不解引用可能已失效的指针。
+    /// Queued but not-yet-delivered terminal callbacks (end / cancel). Snapshot callback +
+    /// event, no Binding dereference on deliver.
+    pub const PendingTerminal = struct {
+        /// Identity-compare only (destroyResource delivers first), no deref on deliver.
+        binding: *const Binding,
+        event: Event,
+        callback: Callback,
+        context: *anyopaque,
+    };
+
+    /// Terminal cleanup step 2 user code may nest trigger another session's terminal,
+    /// so FIFO not single-slot. Queue doesn't run user code; deliver all via `flushTerminals`
+    /// by queue order, exactly once.
+    const max_pending_terminals = 8;
+
+    fn queueTerminal(self: *Manager, p: PendingTerminal) void {
+        if (self.pending_terminal_len == max_pending_terminals) {
+            // 8-level nesting terminal cleanup to get here (each level new + end session in prior's
+            // capture/hover callback)—runaway reentry.
+            @panic("drag: 嵌套的终止回调超过上限（终止清理中的用户代码反复启动并终止拖拽）");
+        }
+        self.pending_terminals[self.pending_terminal_len] = p;
+        self.pending_terminal_len += 1;
+    }
+
+    fn flushTerminals(self: *Manager) void {
+        while (self.pending_terminal_len > 0) {
+            const p = self.pending_terminals[0];
+            // Dequeue before callback: reentry terminal path sees updated queue.
+            std.mem.copyForwards(PendingTerminal, self.pending_terminals[0 .. self.pending_terminal_len - 1], self.pending_terminals[1..self.pending_terminal_len]);
+            self.pending_terminal_len -= 1;
+            p.callback(p.event, p.context);
+        }
+    }
+
+    fn hasPendingTerminalFor(self: *const Manager, binding: *const Binding) bool {
+        for (self.pending_terminals[0..self.pending_terminal_len]) |p| {
+            if (p.binding == binding) return true;
+        }
+        return false;
+    }
+
+    /// Node lifecycle: source's subtree detached/destroyed -> cancel session.
+    /// Identity stable-id only, no deref of stale pointer.
     pub fn handleSubtreeInvalidation(self: *Manager, cx: *Cx, subtree_root: *Node) void {
         const session = self.session orelse return;
         if (isNodeInSubtree(subtree_root, session.source.id)) {
@@ -387,35 +452,33 @@ fn isNodeInSubtree(root: *Node, node_id: u32) bool {
     return false;
 }
 
-// ---------------------------------------------------------------------------
-// Binding, Scope 管理的 raw-event adapter
-// ---------------------------------------------------------------------------
+// Binding: raw-event adapter managed by Scope
 
 pub const Binding = struct {
     cx: *Cx,
-    /// 只在 source 自己的 event handler 内解引用（handler 挂在 source 上，
-    /// 事件到达即证明节点存活）；跨帧持有一律走 source_handle。
+    /// Only deref within source's own event handler (handler on source;
+    /// event arrival proves node alive); cross-frame hold via source_handle.
     source_node: *Node,
-    /// claim 时经 registry 往返校验后写入。
+    /// Written after registry round-trip validation on claim.
     source_handle: SourceHandle = .{ .id = 0, .generation = 0 },
     config: Config,
     callback: Callback,
     context: *anyopaque,
     machine: Machine,
     enabled: bool,
-    /// down 时刻的 Instant，elapsed_ns 的基准。
-    down_instant: ?std.time.Instant = null,
-    /// 最近一次输入携带的修饰键（move 无实时值时退化为最近已知值）。
+    /// down instant, elapsed_ns base.
+    down_instant: ?@import("zenit_time").Instant = null,
+    /// Latest input modifiers (move without realtime degraded to latest-known).
     cur_modifiers: events.Modifiers = .{},
-    /// terminal 派发需要的 down 时刻快照（session 清空后仍可用）。
+    /// down instant snapshot for terminal dispatch (session cleared after still usable).
     start_modifiers_snapshot: events.Modifiers = .{},
 
-    /// 在 source 上注册 drag 行为。Binding 由 scope 管理，调用方不手动 free；
-    /// 失败是事务性的，不留半注册状态。
+    /// Register drag on source. Binding is scope-managed, caller doesn't free;
+    /// failure is transactional, no half-registered state.
     ///
-    /// 生命周期合同（docs/DRAG_INTERACTION_DESIGN.md §11.3）：attach 在
-    /// callback context 创建**之后**调用，则 scope 逆序清理保证 cancel 回调
-    /// 先于 context 销毁。
+    /// Lifecycle contract (docs/DRAG_INTERACTION_DESIGN.md s11.3): attach after the callback
+    /// context is created; reverse cleanup guarantees the cancel callback runs before the context
+    /// is destroyed.
     pub fn attach(
         scope: *Scope,
         cx: *Cx,
@@ -437,9 +500,9 @@ pub const Binding = struct {
         {
             return AttachError.EventSlotOccupied;
         }
-        // source 若已注册进 registry，其 id 必须解析回自己；解析到别的节点
-        // 说明句柄不稳定（例如 id 复用未被 registry 跟踪）。未注册的新节点
-        // 允许通过，claim 时再做往返校验。
+        // If source already registered, its id must resolve back; resolve to other node means
+        // stale handle (e.g., id reuse untracked). Unregistered new node ok; claim round-trip
+        // validates.
         const source_handle: SourceHandle = blk: {
             const h = cx.node_registry.handleFor(source);
             if (cx.node_registry.resolve(h, null)) |resolved| {
@@ -469,7 +532,7 @@ pub const Binding = struct {
         };
         scope.registerResource(binding, destroyResource) catch return AttachError.OutOfMemory;
 
-        // 所有可失败操作已完成，才占用 event slot。
+        // All failables done before occupying event slot.
         ev.on_event = sourceEventHandler;
         ev.event_context = binding;
         return binding;
@@ -478,14 +541,18 @@ pub const Binding = struct {
     fn destroyResource(ptr: *anyopaque, allocator: std.mem.Allocator) void {
         const binding: *Binding = @ptrCast(@alignCast(ptr));
         const cx = binding.cx;
-        // scope dispose 时若 session 属于本 binding：cancel 回调先于 context
-        // 销毁（context 注册在前、逆序清理在后，构造期可证明）。
+        // This binding's terminal callback queued but not delivered (terminal cleanup's user code
+        // unloaded it): context still there (reverse cleanup), deliver first, outer cleanup finds
+        // queue empty.
+        if (cx.drag_manager.hasPendingTerminalFor(binding)) cx.drag_manager.flushTerminals();
+        // scope deinit: if session owns this binding, cancel callback before context dies (context
+        // registered first, reverse cleanup after; constructible from order).
         if (cx.drag_manager.session) |s| {
             if (s.binding == binding) cx.drag_manager.cancel(cx, .scope_disposed);
         }
-        // 摘除 event slot：只在 source 仍以同一身份存活时动它。节点可能已经
-        // 先于 scope 销毁（或从未注册），此时跳过，与既有组件的
-        // scope-owned event_context 同一暴露面。
+        // Detach event slot: only touch if source still lives same identity. Node may die before
+        // scope (or never registered), skip, same exposure as existing component scope-owned
+        // event_context.
         const live_source = cx.node_registry.resolve(binding.source_handle, null) orelse
             if (cx.node_registry.isCurrentIdentity(binding.source_handle, binding.source_node)) binding.source_node else null;
         if (live_source) |node| {
@@ -523,12 +590,12 @@ pub const Binding = struct {
         return s.binding == self and s.phase == .active;
     }
 
-    // -- 内部 --
+    // -- internal --
 
     fn elapsedNs(self: *const Binding) u64 {
         const down = self.down_instant orelse return 0;
-        const now = std.time.Instant.now() catch return 0;
-        // 时钟相同或倒退时不下溢。
+        const now = @import("zenit_time").Instant.now(self.cx.io) catch return 0;
+        // No underflow when clock same or backward.
         if (now.order(down) == .lt) return 0;
         return now.since(down);
     }
@@ -551,14 +618,13 @@ pub const Binding = struct {
         };
     }
 
-    /// 派发一个 transition 给消费者。调用前 session 已按 commit-before-callback
-    /// 处理完毕；这里只复制事件与 callback，不在 callback 后解引用 self 之外
-    /// 无法证明存活的状态。
+    /// Dispatch one transition to consumer. Session committed (commit-before-callback) before;
+    /// here only copy event + callback, no deref self-outside proof of life.
     fn dispatchTransition(self: *Binding, t: Machine.Transition, reason: ?CancelReason) void {
-        // 注意：terminal (end/cancel) 调用时 manager.session 已清空，
-        // buildEvent 需要的 session 信息由调用方传入快照。
+        // Note: terminal (end/cancel) call with manager.session cleared;
+        // buildEvent-needed session info passed caller snapshot.
         const s = self.cx.drag_manager.session orelse blk: {
-            // terminal 路径：session 已清，退化用 binding 自身缓存。
+            // Terminal path: session cleared, buildEvent uses binding cache.
             break :blk Manager.Session{
                 .binding = self,
                 .source = self.source_handle,
@@ -573,13 +639,14 @@ pub const Binding = struct {
         cb(event, ctx);
     }
 
-    /// 激活序列（§8.2）：标 active -> 抑制 click -> capture -> cursor -> start 回调。
-    /// 返回 false 表示激活中止（source 失效或 callback 重入清了 session）。
+    /// Activation sequence (s8.2): mark active -> suppress click -> capture -> cursor -> start
+    /// callback. false = activation aborted (source stale or reentry cleared session).
     fn activate(self: *Binding, t: Machine.Transition, generation: u32) bool {
         const cx = self.cx;
         const manager = &cx.drag_manager;
 
-        // can_start：越过阈值时同步询问一次；拒绝则本序列静默作废且抑制 click。
+        // can_start: asked once synchronously when the threshold is crossed; if rejected, the
+        // sequence is silently voided and click is suppressed.
         if (self.config.can_start) |predicate| {
             const s = manager.session.?;
             const request = StartRequest{
@@ -594,7 +661,7 @@ pub const Binding = struct {
             };
             const ctx = self.context;
             const allowed = predicate(request, ctx);
-            // predicate 可重入：重新校验 session。
+            // Predicate reentrant: reverify session.
             if (!manager.isCurrent(self, generation)) return false;
             if (!allowed) {
                 self.machine.reject();
@@ -604,53 +671,94 @@ pub const Binding = struct {
             }
         }
 
-        // 1. manager 将 session 标为 active。
+        // 1. manager mark session active.
         manager.session.?.phase = .active;
-        // 2. 抑制本次 pointer sequence 的 click synthesis。
+        // 2. Suppress this pointer sequence click.
         cx.dispatcher.cancelClickSynthesisForActivePointer();
-        // 3. 设置 pointer capture（source 必须仍可解析，否则走 detach 清理）。
+        // 3. Set pointer capture (source must resolve else detach cleanup).
         const source = cx.node_registry.resolve(manager.session.?.source, null) orelse {
             manager.cancel(cx, .source_detached);
             return false;
         };
+        const source_handle = manager.session.?.source;
         cx.setPointerCapture(source);
+        // setPointerCapture releases old capture first, triggers on_capture_lost (user code),
+        // may cancel session or destroy binding: only identity-compare, no self deref.
+        // setPointerCapture may grant capture to source even if session gone; match-release to
+        // clean,
+        // else capture on node without session until next left-up auto-clears.
+        if (!manager.isCurrent(self, generation)) {
+            if (cx.dispatcher.releasePointerCaptureFor(source_handle)) {
+                cx.resyncPointerAfterCaptureRelease(cx.mouse_x, cx.mouse_y, null);
+            }
+            return false;
+        }
         manager.session.?.captured = true;
-        // 4. 设置可选 active cursor。
+        // 4. Set optional active cursor.
         if (self.config.active_cursor) |shape| {
-            // 拿不到 cursor lease 只是「拖拽期间不换光标」，拖拽本身照常
-            // 进行（cursor_token 保持 null，finishSession/cancel 都处理 null）。
-            //
-            // 不能 panic：acquireCursor 的 error.NoPointerCapture 是可恢复的
-            // 协议状态，而且能被**合法的 app 回调**触发，setPointerCapture
-            // 会先 release 旧 capture 并触发 on_capture_lost，若 app 在那个
-            // 回调里把 capture 转给别的节点（对失去 capture 做出响应，完全
-            // 合理），外层 setPointerCapture 会因 epoch 变化提前返回，这里就
-            // 拿不到 capture 了。库不该因为 app 的合法用法杀掉宿主进程。
+            // Failing to acquire a cursor lease only means "drag doesn't change cursor"; drag
+            // proceeds
+            // (cursor_token stays null; finishSession/cancel handle null). Must not panic:
+            // acquireCursor error.NoPointerCapture is a recoverable protocol state triggered by a
+            // **legal app callback**: setPointerCapture first releases, triggering on_capture_lost;
+            // if
+            // the app moves capture elsewhere (a reasonable response), the outer setPointerCapture
+            // fails
+            // early and the lease cannot be acquired. The library must not kill the host over legal
+            // app usage.
             manager.session.?.cursor_token = cx.acquireCursor(source, shape) catch |err| switch (err) {
                 error.OutOfMemory => @panic("OOM: drag cursor lease"),
                 error.NoPointerCapture => null,
             };
         }
-        // 5. 发出 start callback。
+        // 5. Emit start callback. Mark "dispatched" first: cancel in start callback gets cancel.
+        manager.session.?.start_delivered = true;
         self.dispatchTransition(t, null);
         return manager.isCurrent(self, generation);
     }
 
-    /// 终止清理 + end 回调。session 快照先落 binding 缓存再清 manager。
+    /// Terminal cleanup + end callback. Session is snapshotted to the binding cache before clear.
+    /// Same principle as `Manager.cancel` (commit-before-callback): finish Binding work + snapshot,
+    /// then release capture (triggers on_capture_lost user code); no self deref afterwards.
+    /// Unlike cancel, no hover resync here (natural mouse-up resyncs in handleMouseUpEx after
+    /// dispatch), so the end callback runs before hover resync.
     fn finishSession(self: *Binding, t: Machine.Transition) void {
         const cx = self.cx;
-        const session = cx.drag_manager.session.?;
+        const manager = &cx.drag_manager;
+        const session = manager.session.?;
         self.start_modifiers_snapshot = session.start_modifiers;
-        cx.drag_manager.session = null;
+        manager.session = null;
+        // Snapshot before reset (same order as cancel), buildEvent reads machine.origin.
+        manager.queueTerminal(self.terminalFor(t, null));
+        self.machine.reset();
+
+        // ---- Below runs user code, no more self deref ----
         if (session.cursor_token) |token| cx.releaseCursor(token);
         if (session.captured) {
-            // 自然 mouse up 时 dispatcher 也会自动清 capture；这里带比对释放，
-            // 与之幂等共存（up 之外的路径同样安全）。hover resync 由
-            // handleMouseUpEx 的 had_pointer_capture 分支负责。
+            // Natural mouse-up dispatcher auto-clears capture; here match-release,
+            // idem coexist (up path equally safe). hover resync from handleMouseUpEx
+            // had_pointer_capture.
             _ = cx.dispatcher.releasePointerCaptureFor(session.source);
         }
-        self.machine.reset();
-        self.dispatchTransition(t, null);
+        manager.flushTerminals();
+    }
+
+    /// Terminal event (end / cancel) snapshot: manager.session cleared; session info from binding
+    /// cache.
+    fn terminalFor(self: *Binding, t: Machine.Transition, reason: ?CancelReason) Manager.PendingTerminal {
+        const s = Manager.Session{
+            .binding = self,
+            .source = self.source_handle,
+            .pointer_id = mouse_pointer_id,
+            .button = self.config.button,
+            .start_modifiers = self.start_modifiers_snapshot,
+        };
+        return .{
+            .binding = self,
+            .event = self.buildEvent(t, s, reason),
+            .callback = self.callback,
+            .context = self.context,
+        };
     }
 
     fn processOutput(self: *Binding, out: Machine.Output, generation: u32) void {
@@ -659,13 +767,14 @@ pub const Binding = struct {
             if (!manager.isCurrent(self, generation)) return;
             switch (t.kind) {
                 .start => {
-                    // 激活失败（reject / source 失效 / callback 重入清 session）
-                    // 时丢弃剩余 transition（例如 up 越阈值的 end）。
+                    // Activation failure (reject / source stale / reentry cleared): discard
+                    // remaining (e.g.
+                    // up-crosses-threshold end).
                     if (!self.activate(t, generation)) return;
                 },
                 .move => self.dispatchTransition(t, null),
                 .end => self.finishSession(t),
-                .cancel => unreachable, // cancel 只经 Manager.cancel 派发
+                .cancel => unreachable, // cancel only via Manager.cancel dispatch
             }
         }
     }
@@ -679,11 +788,11 @@ pub const Binding = struct {
             .mouse_down => |e| {
                 if (!binding.enabled) return .ignored;
                 if (e.button != binding.config.button) return .ignored;
-                // 每个 Cx 同时最多一个 session；新的非同序列 down 不抢占。
+                // Per-Cx at most one session; new non-sequence down doesn't preempt.
                 if (manager.session != null) return .ignored;
                 if (binding.machine.state != .idle) return .ignored;
 
-                // 稳定句柄往返校验：拿不到就不 claim。
+                // Stable handle round-trip: can't claim if unresolvable.
                 const handle = cx.node_registry.handleFor(binding.source_node);
                 const resolved = cx.node_registry.resolve(handle, null) orelse return .ignored;
                 if (resolved != binding.source_node) return .ignored;
@@ -700,12 +809,12 @@ pub const Binding = struct {
                 };
                 binding.start_modifiers_snapshot = e.modifiers;
                 binding.cur_modifiers = e.modifiers;
-                binding.down_instant = std.time.Instant.now() catch null;
+                binding.down_instant = @import("zenit_time").Instant.now(binding.cx.io) catch null;
 
                 const out = binding.machine.feedDown(.{ .x = e.x, .y = e.y });
 
-                // 顺序固定：提交 pending ownership -> on_pending_down -> 按
-                // generation 重新校验 -> (activation_distance==0) 激活序列。
+                // Order fixed: commit pending ownership -> on_pending_down -> reverify generation
+                // -> (activation_distance==0) activation.
                 if (binding.config.on_pending_down) |pending_cb| {
                     const pending_event = PendingDownEvent{
                         .source = handle,
@@ -738,15 +847,16 @@ pub const Binding = struct {
                 const generation = manager.generation;
                 const out = binding.machine.feedUp(.{ .x = e.x, .y = e.y }, binding.elapsedNs());
                 if (out.len == 0) {
-                    // pending 未越阈值（click 保持有效）或 rejected 的收尾：
-                    // 静默清 session。rejected 的 click 抑制已在 reject 时置位。
+                    // pending not cross threshold (click stays valid) or rejected wrap-up:
+                    // silent clear. rejected click suppress already set.
                     manager.session = null;
                     binding.machine.reset();
                     return .stop;
                 }
                 binding.processOutput(out, generation);
-                // up 越阈值但 can_start 拒绝：sequence 已随 up 结束，session
-                // 不能留到下一次 down（end 正常派发时 finishSession 已清）。
+                // up crosses threshold but can_start rejected: sequence ends with up, session
+                // can't carry (finishSession already cleared). end normally delivered when
+                // finishSession.
                 if (manager.isCurrent(binding, generation)) {
                     manager.session = null;
                     binding.machine.reset();
@@ -758,9 +868,7 @@ pub const Binding = struct {
     }
 };
 
-// ---------------------------------------------------------------------------
-// Machine 单测（§18.1）
-// ---------------------------------------------------------------------------
+// Machine unit tests (S18.1)
 
 const testing = std.testing;
 
@@ -790,7 +898,7 @@ test "Machine: 阈值边界 — 小于不激活、等于激活" {
 test "Machine: vertical 轴投影只看 dy" {
     var m = Machine{ .axis = .vertical, .activation_distance = 4 };
     _ = m.feedDown(.{ .x = 0, .y = 0 });
-    // dx 巨大也不激活
+    // Large dx doesn't activate
     try testing.expectEqual(@as(u8, 0), m.feedMove(.{ .x = 100, .y = 3 }, 1).len);
     const out = m.feedMove(.{ .x = 100, .y = 5 }, 2);
     try testing.expectEqual(@as(u8, 1), out.len);
@@ -879,7 +987,7 @@ test "Machine: active cancel 恰好一次，坐标用最近观察位置" {
     try testing.expectEqual(Phase.cancel, out.buf[0].kind);
     try expectPoint(8, 6, out.buf[0].position);
     try testing.expectEqual(@as(u64, 5), out.buf[0].elapsed_ns);
-    // 幂等：再 cancel 无输出
+    // Idempotent: cancel again no output
     try testing.expectEqual(@as(u8, 0), m.feedCancel().len);
 }
 

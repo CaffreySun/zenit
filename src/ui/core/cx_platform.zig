@@ -1,5 +1,6 @@
-//! Cx ↔ 平台：SystemSdk 挂载与窗口身份（多窗口 a11y 路由键）、原生文本输入
-//! 会话（焦点文本客户端解析、IME 光标矩形 / 丢弃 preedit）、无障碍播报。
+//! Cx <-> platform: SystemSdk mounting and window identity (multi-window a11y routing key), native
+//! text input
+//! session (focused text client parsing, IME cursor rect / preedit discard), a11y announcement.
 
 const core = @import("../core.zig");
 const Cx = core.Cx;
@@ -110,8 +111,9 @@ pub fn refreshTextInputSession(self: *Cx) void {
             null
     else
         null;
-    // 焦点解析留在 Cx（要碰 focus_manager / node_registry），对账交给
-    // 状态机（三态语义与下发失败重试在那里，可独立单测）。
+    // Focus parsing stays in Cx (needs to touch focus_manager / node_registry), account to state
+    // machine
+    // (three-state semantics and retry on dispatch failure there, independently testable).
     self.text_input_session.reconcile(
         .{ .node = next_node, .context = next_context },
         textInputHost(self),
@@ -122,7 +124,7 @@ pub fn deactivateTextInputSession(self: *Cx) void {
     self.text_input_session.deactivate(textInputHost(self));
 }
 
-/// 把 Cx 的平台能力包成状态机要的 Host（它不该知道 system_sdk）。
+/// Package Cx's platform capability into state machine's Host (it shouldn't know system_sdk).
 fn textInputHost(self: *Cx) text_input_session_mod.Host {
     const Adapter = struct {
         fn setEnabled(ctx: *anyopaque, enabled: bool) bool {

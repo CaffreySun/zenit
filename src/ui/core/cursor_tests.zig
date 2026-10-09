@@ -9,7 +9,7 @@ const Fixture = struct {
     b: *ui.Node,
 
     fn init() !Fixture {
-        const cx = try ui.Cx.init(testing.allocator);
+        const cx = try ui.Cx.init(testing.allocator, std.testing.io);
         errdefer cx.deinit();
         cx.setViewport(300, 100);
         const root = try ui.box(cx, .{ .width = .{ .px = 300 }, .height = .{ .px = 100 }, .direction = .row }, .{});

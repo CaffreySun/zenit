@@ -1,5 +1,6 @@
-//! Cx 光标：cursor lease（acquire/update/release/replay）、命中决策、
-//! 自定义光标 / override / 自动化虚拟光标，以及最终 cursor shape 同步到平台。
+//! Cx cursor: cursor lease (acquire/update/release/replay), hit decisions,
+//! custom cursor / override / auto virtual cursor, final cursor shape sync to
+//! platform.
 
 const std = @import("std");
 const core = @import("../core.zig");
@@ -103,8 +104,10 @@ pub fn setCursorOverride(self: *Cx, shape: ?CursorShape) void {
 
 pub fn setCustomCursor(self: *Cx, desc: CustomCursorDesc) void {
     self.custom_cursor.set(self.allocator, desc, rasterizeCursorSvg);
-    // store 只管缓存与 active 选择；下发是 Cx 的职责，必须在这里推一次，
-    // 否则「shape 停在 .custom 期间换位图内容」不会重新下发到系统。
+    // Store only manages caching and active selection; dispatching is Cx's responsibility, must
+    // push once here,
+    // otherwise 'shape stays in .custom during bitmap content change' will not re-dispatch to the
+    // system.
     updateCursorShape(self);
 }
 
@@ -140,8 +143,9 @@ pub fn updateCursorShape(self: *Cx) void {
         });
     }
     const resolved = self.cursor_state.decision.shape;
-    // .custom：解析到当前激活位图；未注册或后端不支持位图光标时
-    // 降级到 custom_cursor_fallback（走固定形状路径）。
+    // .custom: resolves to currently active bitmap; when unregistered or bitmap cursors unsupported
+    // by backend
+    // falls back to custom_cursor_fallback (fixed shape path).
     var shape = resolved;
     var custom_key: ?u64 = null;
     if (resolved == .custom) {
@@ -179,7 +183,7 @@ pub fn updateCursorShape(self: *Cx) void {
                     };
                 }
             } else {
-                sdk.setCursorShape(self.window_id, @intFromEnum(shape)) catch {
+                sdk.setCursorShape(self.window_id, @backingInt(shape)) catch {
                     accepted = false;
                 };
             }
@@ -213,7 +217,7 @@ pub fn updateCursorShape(self: *Cx) void {
     }
 }
 
-/// 把 `svg.rasterize` 适配成 CustomCursorStore 要的注入签名。
+/// Adapt svg.rasterize to the injection signature CustomCursorStore requires.
 fn rasterizeCursorSvg(
     allocator: std.mem.Allocator,
     svg_data: []const u8,

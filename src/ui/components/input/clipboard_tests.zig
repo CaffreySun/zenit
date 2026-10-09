@@ -13,12 +13,20 @@ const Backend = struct {
     length_error: ?sdk_mod.SdkError = null,
     grow_to: ?[]const u8 = null,
     reads: usize = 0,
+    writes: usize = 0,
+    copied: [128]u8 = undefined,
+    copied_len: usize = 0,
     queries: usize = 0,
     fn deinit(_: *anyopaque, _: std.mem.Allocator) void {}
     fn pump(_: *anyopaque, _: *sdk_mod.EventQueue, _: u32) sdk_mod.SdkError!sdk_mod.PumpResult {
         return .{ .should_continue = true };
     }
-    fn set(_: *anyopaque, _: []const u8) sdk_mod.SdkError!void {}
+    fn set(ctx: *anyopaque, value: []const u8) sdk_mod.SdkError!void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.writes += 1;
+        self.copied_len = @min(value.len, self.copied.len);
+        @memcpy(self.copied[0..self.copied_len], value[0..self.copied_len]);
+    }
     fn len(ctx: *anyopaque) sdk_mod.SdkError!usize {
         const self: *@This() = @ptrCast(@alignCast(ctx));
         self.queries += 1;
@@ -74,16 +82,16 @@ fn Fixture(comptime kind: u8) type {
             errdefer self.sdk.deinit();
             self.doc = input.TextareaDocument.init(doc_allocator);
             errdefer self.doc.deinit();
-            self.wrap = input.TextareaWrapMap.init(t.allocator);
+            self.wrap = input.TextareaWrapMap.init(t.allocator, @import("std").testing.io);
             errdefer self.wrap.deinit();
-            self.cx = try core.Cx.init(t.allocator);
+            self.cx = try core.Cx.init(t.allocator, std.testing.io);
             errdefer self.cx.deinit();
             self.cx.system_sdk = &self.sdk;
             const handler: core.HandlerRef = .{ .callback = notify, .context = self };
             self.state = if (kind == 2)
-                .{ .allocator = state_allocator, .doc = &self.doc, .wrap_map = &self.wrap, .cx_ref = self.cx, .on_change = handler }
+                .{ .io = @import("std").testing.io, .allocator = state_allocator, .doc = &self.doc, .wrap_map = &self.wrap, .cx_ref = self.cx, .on_change = handler }
             else
-                .{ .allocator = state_allocator, .multiline = kind == 1, .accept_newline = kind == 1, .textarea_doc = if (kind == 1) &self.doc else null, .cx_ref = self.cx, .on_change = handler };
+                .{ .io = @import("std").testing.io, .allocator = state_allocator, .multiline = kind == 1, .accept_newline = kind == 1, .textarea_doc = if (kind == 1) &self.doc else null, .cx_ref = self.cx, .on_change = handler };
             errdefer self.state.deinit();
             if (kind == 2) try self.doc.setTextChecked("seed") else _ = try self.state.setTextChecked("seed");
             self.select(4, null);
@@ -138,14 +146,14 @@ fn longPaste(comptime kind: u8) !void {
     var f: Fixture(kind) = undefined;
     try f.init(t.allocator, t.allocator);
     defer f.deinit();
-    f.backend.text = "漢" ** 2000 ++ "\r\ntail";
+    f.backend.text = (@as([("漢").len * (2000)]u8, @bitCast(@as([2000][("漢").len]u8, @splat(("漢").*)))) ++ "") ++ "\r\ntail";
     f.paste();
-    try t.expectEqualStrings("漢" ** 2000 ++ "\ntail", f.state.getText());
+    try t.expectEqualStrings((@as([("漢").len * (2000)]u8, @bitCast(@as([2000][("漢").len]u8, @splat(("漢").*)))) ++ "") ++ "\ntail", f.state.getText());
     try t.expectEqual(@as(usize, 1), f.calls);
     f.state.undo();
     try t.expectEqualStrings("seed", f.state.getText());
     f.state.redo();
-    try t.expectEqualStrings("漢" ** 2000 ++ "\ntail", f.state.getText());
+    try t.expectEqualStrings((@as([("漢").len * (2000)]u8, @bitCast(@as([2000][("漢").len]u8, @splat(("漢").*)))) ++ "") ++ "\ntail", f.state.getText());
 }
 
 test "shared multiline clipboard accepts complete text beyond fixed input capacity" {
@@ -186,9 +194,9 @@ test "clipboard grows between query and read and basic backends keep working" {
         try f.init(t.allocator, t.allocator);
         defer f.deinit();
         f.backend.text = "small";
-        f.backend.grow_to = "漢" ** 2000;
+        f.backend.grow_to = (@as([("漢").len * (2000)]u8, @bitCast(@as([2000][("漢").len]u8, @splat(("漢").*)))) ++ "");
         f.paste();
-        try t.expectEqualStrings(if (kind == 0) "漢" ** 682 else "漢" ** 2000, f.state.getText());
+        try t.expectEqualStrings(if (kind == 0) (@as([("漢").len * (682)]u8, @bitCast(@as([682][("漢").len]u8, @splat(("漢").*)))) ++ "") else (@as([("漢").len * (2000)]u8, @bitCast(@as([2000][("漢").len]u8, @splat(("漢").*)))) ++ ""), f.state.getText());
         try t.expectEqual(@as(usize, 2), f.backend.reads);
         f.state.undo();
         f.select(4, 0);
@@ -201,7 +209,7 @@ test "clipboard grows between query and read and basic backends keep working" {
         f.calls = 0;
         const undo = f.undoCount();
         const redo = f.redoCount();
-        f.backend.text = "x" ** 6000;
+        f.backend.text = (@as([("x").len * (6000)]u8, @bitCast(@as([6000][("x").len]u8, @splat(("x").*)))) ++ "");
         f.paste();
         try f.expectUnchanged(undo, redo);
     }
@@ -236,7 +244,7 @@ test "clipboard allocation failure is atomic across read filtering document and 
                 var f: Fixture(kind) = undefined;
                 try f.init(if (fail_model) t.allocator else failing.allocator(), if (fail_model) failing.allocator() else t.allocator);
                 defer f.deinit();
-                f.backend.text = "漢" ** 2000 ++ "\r\ntail";
+                f.backend.text = (@as([("漢").len * (2000)]u8, @bitCast(@as([2000][("漢").len]u8, @splat(("漢").*)))) ++ "") ++ "\r\ntail";
                 const undo = f.undoCount();
                 const redo = f.redoCount();
                 failing.fail_index = failing.alloc_index + failure;
@@ -251,12 +259,12 @@ test "clipboard allocation failure is atomic across read filtering document and 
                 } else {
                     succeeded = true;
                 }
-                try t.expectEqualStrings(if (kind == 0) "漢" ** 682 else "漢" ** 2000 ++ "\ntail", f.state.getText());
+                try t.expectEqualStrings(if (kind == 0) (@as([("漢").len * (682)]u8, @bitCast(@as([682][("漢").len]u8, @splat(("漢").*)))) ++ "") else (@as([("漢").len * (2000)]u8, @bitCast(@as([2000][("漢").len]u8, @splat(("漢").*)))) ++ "") ++ "\ntail", f.state.getText());
                 try t.expectEqual(@as(usize, 1), f.calls);
                 f.state.undo();
                 try t.expectEqualStrings("seed", f.state.getText());
                 f.state.redo();
-                try t.expectEqualStrings(if (kind == 0) "漢" ** 682 else "漢" ** 2000 ++ "\ntail", f.state.getText());
+                try t.expectEqualStrings(if (kind == 0) (@as([("漢").len * (682)]u8, @bitCast(@as([682][("漢").len]u8, @splat(("漢").*)))) ++ "") else (@as([("漢").len * (2000)]u8, @bitCast(@as([2000][("漢").len]u8, @splat(("漢").*)))) ++ "") ++ "\ntail", f.state.getText());
                 if (succeeded) break;
             }
             try t.expect(succeeded);
@@ -316,13 +324,13 @@ test "password input: Cmd+C / Cmd+X 不写剪贴板、不删文本" {
     var rec: Rec = .{};
     var sdk = sdk_mod.SystemSdk.init(t.allocator, &rec, &Rec.vtable, .{ .clipboard = true });
     defer sdk.deinit();
-    const cx = try core.Cx.init(t.allocator);
+    const cx = try core.Cx.init(t.allocator, std.testing.io);
     defer cx.deinit();
     cx.system_sdk = &sdk;
 
     inline for (.{ input.InputType.password, input.InputType.text }) |ty| {
         rec.sets = 0;
-        var s: input.TextInputState = .{ .allocator = t.allocator, .cx_ref = cx, .input_type = ty };
+        var s: input.TextInputState = .{ .io = @import("std").testing.io, .allocator = t.allocator, .cx_ref = cx, .input_type = ty };
         defer s.deinit();
         _ = try s.setTextChecked("secret");
         s.selection_anchor = 0;
@@ -333,9 +341,51 @@ test "password input: Cmd+C / Cmd+X 不写剪贴板、不删文本" {
             try t.expectEqual(@as(usize, 0), rec.sets);
             try t.expectEqualStrings("secret", s.getText());
         } else {
-            // 对照组：普通输入框照常复制 + 剪切
+            // Control: normal input box copy + cut as usual
             try t.expectEqual(@as(usize, 2), rec.sets);
             try t.expectEqualStrings("", s.getText());
         }
     }
+}
+
+test "readonly Input selects copies and fences every editing event" {
+    var f: Fixture(0) = undefined;
+    try f.init(t.allocator, t.allocator);
+    defer f.deinit();
+    f.state.readonly = true;
+    const undo = f.state.undo_count;
+    const redo = f.state.redo_count;
+    f.event(.{ .key_down = .{ .key = .c, .modifiers = .{ .super = true } } });
+    try t.expectEqualStrings("seed", f.backend.copied[0..f.backend.copied_len]);
+    const mutations = [_]Event{
+        .{ .text_input = .{ .text = "changed" } },
+        .{ .ime_preedit = .{ .text = "中", .cursor_utf8_offset = 3 } },
+        .{ .ime_commit = .{ .text = "中" } },
+        .{ .key_down = .{ .key = .delete } },
+        .{ .key_down = .{ .key = .forward_delete } },
+        .{ .key_down = .{ .key = .@"return" } },
+        .{ .key_down = .{ .key = .tab } },
+        .{ .key_down = .{ .key = .x, .modifiers = .{ .super = true } } },
+        .{ .key_down = .{ .key = .v, .modifiers = .{ .super = true } } },
+        .{ .key_down = .{ .key = .z, .modifiers = .{ .super = true } } },
+        .{ .key_down = .{ .key = .z, .modifiers = .{ .super = true, .shift = true } } },
+    };
+    for (mutations) |event| f.event(event);
+    try t.expectEqualStrings("seed", f.state.getText());
+    try t.expectEqual(undo, f.state.undo_count);
+    try t.expectEqual(redo, f.state.redo_count);
+    try t.expectEqual(@as(usize, 0), f.calls);
+    try t.expectEqual(@as(usize, 0), f.backend.reads);
+    try t.expectEqual(@as(usize, 1), f.backend.writes);
+    f.event(.{ .key_down = .{ .key = .end } });
+    f.event(.{ .key_down = .{ .key = .left, .modifiers = .{ .shift = true } } });
+    try t.expectEqualStrings("d", f.state.getSelectedText().?);
+    f.event(.{ .key_down = .{ .key = .c, .modifiers = .{ .super = true } } });
+    try t.expectEqualStrings("d", f.backend.copied[0..f.backend.copied_len]);
+    f.event(.{ .key_down = .{ .key = .a, .modifiers = .{ .super = true } } });
+    try t.expectEqualStrings("seed", f.state.getSelectedText().?);
+    f.event(.{ .mouse_down = .{ .x = 5, .y = 5 } });
+    f.event(.{ .mouse_up = .{ .x = 5, .y = 5 } });
+    try t.expect(f.state.focused);
+    try t.expectEqualStrings("seed", f.state.getText());
 }

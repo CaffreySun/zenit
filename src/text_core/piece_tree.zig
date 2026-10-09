@@ -1,11 +1,11 @@
-/// PieceTree，基于 SumTree 的高性能文本存储引擎
+/// PieceTree: SumTree-based high-performance text storage engine.
 ///
-/// 替代 PieceTable 的链表结构，使用 SumTree(TreePiece, PieceSummary) 实现：
-/// - 插入/删除: O(log P)（P = piece 数量）
-/// - 行索引维护: 嵌入在 Summary 中，O(1) 获取行数，O(log P) 行号⟷偏移转换
-/// - 不再需要 rebuildLineIndex()
+/// SumTree(TreePiece, PieceSummary) implementation:
+/// - insert/delete: O(log P) (P = piece count)
+/// - line index maintenance: embedded Summary, O(1) line count, O(log P) line<->offset
+/// - no rebuildLineIndex() needed
 ///
-/// 与 PieceTable 的公共 API 功能对等，用于无缝替换。
+/// Common API matches PieceTable.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Atomic = std.atomic.Value;
@@ -13,29 +13,29 @@ const sum_tree = @import("sum_tree.zig");
 const SumTree = sum_tree.SumTree;
 const piece_stats = @import("piece_stats.zig");
 
-/// Piece 来源
+/// piece source.
 pub const Source = enum { original, add };
 
-/// PieceSummary，每个子树的聚合摘要
+/// PieceSummary: per-subtree aggregate digest.
 ///
-/// 对齐 Zed TextSummary：嵌入 first/last/longest_row_chars，
-/// O(log N) 维护文档最长行，无需全文件扫描。
+/// align Zed TextSummary: embed first/last/longest_row_chars, O(log N) maintain
+/// longest doc line, no full-file scan.
 pub const PieceSummary = struct {
     bytes: usize = 0,
-    lines: usize = 0, // 换行符数量
-    /// 第一行的字符数（用于相邻 piece 拼接时计算跨 piece 行宽）
+    lines: usize = 0, // newline count.
+    /// first line chars (adjacent-piece concat calc cross-piece row width).
     first_line_chars: u32 = 0,
-    /// 最后一行的字符数（同上，last_line + next.first_line 可能形成最长行）
+    /// last line chars (same; last_line + next.first_line may form longest).
     last_line_chars: u32 = 0,
-    /// 此子树内最长行的字符数
+    /// longest row chars in subtree.
     longest_row_chars: u32 = 0,
 
     pub const ZERO: PieceSummary = .{};
 
-    /// 合并两个 summary（对齐 Zed TextSummary::AddAssign）。
-    /// 关键：拼接处 self.last_line + other.first_line 可能形成新的最长行。
+    /// merge two summaries (align Zed TextSummary::AddAssign). key: concat
+    /// self.last_line + other.first_line may form new longest.
     pub fn add(self: PieceSummary, other: PieceSummary) PieceSummary {
-        // 拼接处的行宽 = self 最后一行 + other 第一行
+        // concat-point line width = self last + other first.
         const joined_chars: u32 = self.last_line_chars +| other.first_line_chars;
         var longest = self.longest_row_chars;
         if (joined_chars > longest) longest = joined_chars;
@@ -44,12 +44,12 @@ pub const PieceSummary = struct {
         return .{
             .bytes = self.bytes + other.bytes,
             .lines = self.lines + other.lines,
-            // first_line_chars: 如果 self 没有换行，first_line 延伸到 other.first_line
+            // first_line_chars: self no newline, first extends to other.first_line.
             .first_line_chars = if (self.lines == 0)
                 self.first_line_chars +| other.first_line_chars
             else
                 self.first_line_chars,
-            // last_line_chars: 如果 other 没有换行，last_line 从 self.last_line 延伸
+            // last_line_chars: other no newline, last extends from self.last_line.
             .last_line_chars = if (other.lines == 0)
                 self.last_line_chars +| other.last_line_chars
             else
@@ -59,7 +59,7 @@ pub const PieceSummary = struct {
     }
 };
 
-/// TreePiece, SumTree 的叶节点 item
+/// TreePiece: SumTree leaf item.
 pub const TreePiece = struct {
     source: Source,
     start: usize,
@@ -79,7 +79,7 @@ pub const TreePiece = struct {
         };
     }
 
-    /// 从文本内容构造 TreePiece（一次遍历计算所有统计信息）
+    /// construct TreePiece from text content (one pass compute all stats).
     pub fn fromText(source: Source, start: usize, text: []const u8) TreePiece {
         const stats = PieceTree.scanTextStats(text);
         return .{
@@ -94,14 +94,14 @@ pub const TreePiece = struct {
     }
 };
 
-/// Dimension: 按字节偏移查找
+/// dimension: seek by byte offset.
 pub const ByteDim = struct {
     pub fn fromSummary(s: PieceSummary) usize {
         return s.bytes;
     }
 };
 
-/// Dimension: 按行号查找
+/// dimension: seek by line number.
 pub const LineDim = struct {
     pub fn fromSummary(s: PieceSummary) usize {
         return s.lines;
@@ -148,20 +148,20 @@ fn hasValidPieceBounds(piece: TreePiece, source_buf: []const u8) bool {
     return piece.length <= source_buf.len - piece.start;
 }
 
-/// 零拷贝 chunk 迭代器，逐 piece 返回 []const u8 直接切片
+/// Zero-copy chunk iterator; each piece returns a direct `[]const u8` slice.
 ///
-/// 用法：
+/// usage:
 ///   var it = piece_tree.chunksInRange(start, len);
-///   while (it.next()) |chunk| { ... }  // chunk 是零拷贝引用
+///   while (it.next()) |chunk| { ... }  // chunk is a zero-copy ref.
 pub fn ChunkIterator(comptime Container: type) type {
     return struct {
         const Self = @This();
         container: *const Container,
-        index: usize, // 当前 piece 在 SumTree 中的 item index
-        offset_in_piece: usize, // 当前 piece 内的起始偏移
-        remaining: usize, // 剩余要迭代的字节数
+        index: usize, // current piece SumTree item index.
+        offset_in_piece: usize, // offset within current piece.
+        remaining: usize, // bytes left to iterate.
 
-        /// 返回当前 chunk 的零拷贝切片，推进到下一个 piece
+        /// return current chunk zero-copy slice, advance to next piece.
         pub fn next(self: *Self) ?[]const u8 {
             if (self.remaining == 0) return null;
             const piece = self.container.tree.get(self.index) orelse return null;
@@ -177,7 +177,7 @@ pub fn ChunkIterator(comptime Container: type) type {
             return result;
         }
 
-        /// 重定位到新的字节偏移（用于 tree-sitter 非顺序回调）
+        /// relocate to new byte offset (tree-sitter non-sequential callback).
         pub fn seekTo(self: *Self, byte_offset: usize, total_len: usize) void {
             const clamped = @min(byte_offset, total_len);
             const seek_result = self.container.tree.seek(ByteDim, clamped);
@@ -188,19 +188,19 @@ pub fn ChunkIterator(comptime Container: type) type {
     };
 }
 
-/// PieceTreeSnapshot，后台线程安全的只读文档视图
+/// PieceTreeSnapshot: bg-thread-safe read-only doc view.
 ///
-/// 通过 COW snapshot 共享 SumTree 节点（引用计数）和 append pages。
-/// 用于后台 tree-sitter 解析等场景。
+/// share SumTree nodes (refcount) and append pages via COW snapshot. bg
+/// tree-sitter parse etc.
 pub const PieceTreeSnapshot = struct {
     tree: Tree,
-    original_buffer: []const u8, // 只读共享（不可变）
+    original_buffer: []const u8, // read-only shared (immutable).
     original_page: ?*AddBufferPage = null,
     add_pages: []const *AddBufferPage,
     allocator: Allocator,
 
-    /// 零拷贝：返回 offset 处所在 piece 内的直接 slice（不拷贝）。
-    /// 返回从 offset 到该 piece 末尾的连续内存区域。
+    /// zero-copy: return direct slice in piece containing offset (no copy). from offset
+    /// to piece end continuous memory.
     pub const ChunkResult = struct {
         ptr: [*]const u8,
         len: usize,
@@ -352,7 +352,7 @@ pub const PieceTreeSnapshot = struct {
         }
     }
 
-    /// 零拷贝 chunk 迭代器：逐 piece 返回直接引用，无 memcpy
+    /// zero-copy chunk iterator: per-piece direct ref, no memcpy.
     pub fn chunksInRange(self: *const PieceTreeSnapshot, start: usize, len: usize) ChunkIterator(PieceTreeSnapshot) {
         const total = self.totalLength();
         const clamped_start = @min(start, total);
@@ -388,7 +388,7 @@ pub const PieceTreeSnapshot = struct {
     }
 };
 
-/// PieceTree，基于 B-tree 的文本存储
+/// PieceTree: B-tree text storage.
 pub const PieceTree = struct {
     /// Bound the local scan performed by lineToOffset/offsetToLine inside a
     /// single piece. Large initial files used to be represented by one piece,
@@ -403,29 +403,31 @@ pub const PieceTree = struct {
     add_pages: std.ArrayList(*AddBufferPage),
     add_pages_total_len: usize,
     allocator: Allocator,
-    /// 保护主线程 mutation 与后台 `snapshot()` 互斥。
-    /// 只锁"结构体字段的修改"与"snapshot 的读出"；scan/遍历 snapshot 本身完全无锁。
-    /// 粒度：snapshot 内 O(log P) tree 节点 refcount + O(P_pages) add_page refcount，
-    /// 几十微秒级持锁时间，不影响主线程编辑延迟。
-    snapshot_mutex: std.Thread.Mutex = .{},
+    /// protect main-thread mutation vs bg `snapshot()` mutual exclude. lock only
+    /// 'struct field mutate' + 'snapshot read'; scan/traverse snapshot itself lock-free.
+    /// granule: snapshot O(log P) tree refcount + O(P_pages) add_page refcount, tens
+    /// microsec lock hold, no main-thread edit delay.
+    io: std.Io,
+    snapshot_mutex: std.Io.Mutex = .init,
 
-    pub fn init(allocator: Allocator) PieceTree {
+    pub fn init(allocator: Allocator, io: std.Io) PieceTree {
         return .{
+            .io = io,
             .tree = Tree.init(allocator),
             .original_buffer = &[_]u8{},
             .original_page = null,
-            .add_buffer = std.ArrayList(u8){},
-            .add_pages = std.ArrayList(*AddBufferPage){},
+            .add_buffer = @as(std.ArrayList(u8), .empty),
+            .add_pages = @as(std.ArrayList(*AddBufferPage), .empty),
             .add_pages_total_len = 0,
             .allocator = allocator,
         };
     }
 
-    pub fn initFromBuffer(allocator: Allocator, content: []const u8) !PieceTree {
-        var self = init(allocator);
+    pub fn initFromBuffer(allocator: Allocator, io: std.Io, content: []const u8) !PieceTree {
+        var self = init(allocator, io);
         errdefer self.deinit();
         if (content.len > 0) {
-            // original buffer 通过共享页持有，便于 snapshot 跨线程延长其生命周期。
+            // original buffer held by shared pages, snapshot cross-thread lifespan extend.
             const page = try AddBufferPage.create(allocator, 0, content);
             self.original_page = page;
             self.original_buffer = page.data;
@@ -450,15 +452,15 @@ pub const PieceTree = struct {
         self.add_pages.deinit(self.allocator);
     }
 
-    /// 创建只读快照（后台线程安全）
-    /// SumTree COW O(1) + add page 元数据拷贝
+    /// create read-only snapshot (bg-thread-safe).
+    /// SumTree COW O(1) + add page metadata copy.
     ///
-    /// 后台线程可调用（见 word_index.zig 的 bgLoop）。
-    /// 通过 `snapshot_mutex` 与主线程 mutation 互斥，避免读到 half-mutated 的
-    /// add_pages 指针/tree root（会导致 bg 线程 SIGSEGV）。
+    /// bg-thread callable (word_index.zig bgLoop). via `snapshot_mutex` main-thread
+    /// mutation exclude, avoid reading half-mutated add_pages pointer/tree root (bg
+    /// thread SIGSEGV).
     pub fn snapshot(self: *PieceTree, alloc: Allocator) !PieceTreeSnapshot {
-        self.snapshot_mutex.lock();
-        defer self.snapshot_mutex.unlock();
+        self.snapshot_mutex.lockUncancelable(self.io);
+        defer self.snapshot_mutex.unlock(self.io);
 
         const pages = try alloc.alloc(*AddBufferPage, self.add_pages.items.len);
         for (self.add_pages.items, 0..) |page, i| {
@@ -500,7 +502,7 @@ pub const PieceTree = struct {
             std.debug.assert(self.active);
             self.tree_transaction.commit();
             self.active = false;
-            self.owner.snapshot_mutex.unlock();
+            self.owner.snapshot_mutex.unlock(self.owner.io);
         }
 
         /// Always defer deinit; an uncommitted batch is rolled back in full.
@@ -513,12 +515,12 @@ pub const PieceTree = struct {
             }
             self.owner.add_pages_total_len = self.add_len;
             self.active = false;
-            self.owner.snapshot_mutex.unlock();
+            self.owner.snapshot_mutex.unlock(self.owner.io);
         }
     };
 
     pub fn beginTransaction(self: *PieceTree) Transaction {
-        self.snapshot_mutex.lock();
+        self.snapshot_mutex.lockUncancelable(self.io);
         return .{
             .owner = self,
             .tree_transaction = self.tree.beginTransaction(),
@@ -527,9 +529,9 @@ pub const PieceTree = struct {
         };
     }
 
-    // ===== 编辑操作 =====
+    // ===== edit ops =====
 
-    /// 在 pos 位置插入文本，O(log P)
+    /// insert text at pos, O(log P).
     pub fn insert(self: *PieceTree, pos: usize, text: []const u8) !void {
         var tx = self.beginTransaction();
         defer tx.deinit();
@@ -554,7 +556,7 @@ pub const PieceTree = struct {
             return self.insertUnlocked(pos, copy);
         }
 
-        // 追加到 add_buffer
+        // append to add_buffer.
         const add_start = self.add_buffer.items.len;
         try self.add_buffer.appendSlice(self.allocator, text);
         self.appendAddPages(add_start, text) catch |err| {
@@ -567,36 +569,36 @@ pub const PieceTree = struct {
             return;
         }
 
-        // 用 ByteDim seek 找到目标 piece
+        // seek target piece via ByteDim.
         const seek_result = self.tree.seek(ByteDim, pos);
 
         if (seek_result.item == null or seek_result.preceding == pos) {
-            // 在 piece 边界上，直接 insert
+            // piece boundary, direct insert.
             try self.insertPiecesAt(seek_result.index, add_start, text);
             return;
         }
 
-        // 在 piece 中间，需要 split
+        // piece middle, need split.
         const piece_idx = seek_result.index;
         const piece = seek_result.item.?;
         const offset_in_piece = seek_result.offset_in_item;
 
-        // 前缀 piece
+        // prefix piece.
         const prefix_buf = self.getBuffer(piece.source);
         const prefix = TreePiece.fromText(piece.source, piece.start, prefix_buf[piece.start .. piece.start + offset_in_piece]);
 
-        // 后缀 piece
+        // suffix piece.
         const suffix_start = piece.start + offset_in_piece;
         const suffix_len = piece.length - offset_in_piece;
         const suffix = TreePiece.fromText(piece.source, suffix_start, self.getBuffer(piece.source)[suffix_start .. suffix_start + suffix_len]);
 
-        // 替换原 piece 为 prefix
+        // replace original piece with prefix.
         try self.tree.replace(piece_idx, prefix);
         try self.insertPiecesAt(piece_idx + 1, add_start, text);
         try self.tree.insert(piece_idx + 1 + insertedPieceCount(text.len), suffix);
     }
 
-    /// 删除 [start, start+length) 范围，O(log P)
+    /// delete [start, start+length) range, O(log P).
     pub fn delete(self: *PieceTree, start: usize, length: usize) !void {
         var tx = self.beginTransaction();
         defer tx.deinit();
@@ -611,12 +613,11 @@ pub const PieceTree = struct {
 
         const end_pos = start + length;
 
-        // 找到 start 所在的 piece
+        // find start piece.
         const start_seek = self.tree.seek(ByteDim, start);
         if (start_seek.item == null) return;
 
-        // 找到 end 所在的 piece
-        // 注意: end_pos 可能恰好在 piece 边界上
+        // find end piece. note: end_pos may be exact piece boundary.
         var end_seek: Tree.SeekResult(ByteDim) = undefined;
         if (end_pos >= total) {
             end_seek = .{
@@ -629,27 +630,27 @@ pub const PieceTree = struct {
             end_seek = self.tree.seek(ByteDim, end_pos);
         }
 
-        // 情况 1: 删除范围完全在一个 piece 内部
+        // case 1: delete range entirely within one piece.
         if (start_seek.index == end_seek.index and end_seek.item != null) {
             const piece = start_seek.item.?;
             const start_in_piece = start_seek.offset_in_item;
             const end_in_piece = end_seek.offset_in_item;
 
             if (start_in_piece == 0 and end_in_piece == piece.length) {
-                // 整个 piece 被删除
+                // entire piece deleted.
                 try self.tree.remove(start_seek.index);
             } else if (start_in_piece == 0) {
-                // 删除 piece 前缀
+                // delete piece prefix.
                 const buf = self.getBuffer(piece.source);
                 const new_start = piece.start + end_in_piece;
                 const new_len = piece.length - end_in_piece;
                 try self.tree.replace(start_seek.index, TreePiece.fromText(piece.source, new_start, buf[new_start .. new_start + new_len]));
             } else if (end_in_piece == piece.length) {
-                // 删除 piece 后缀
+                // delete piece suffix.
                 const buf = self.getBuffer(piece.source);
                 try self.tree.replace(start_seek.index, TreePiece.fromText(piece.source, piece.start, buf[piece.start .. piece.start + start_in_piece]));
             } else {
-                // 从 piece 中间删除，分裂为两个
+                // delete middle, split to two.
                 const buf = self.getBuffer(piece.source);
                 const prefix = TreePiece.fromText(piece.source, piece.start, buf[piece.start .. piece.start + start_in_piece]);
                 const suffix_start = piece.start + end_in_piece;
@@ -661,13 +662,13 @@ pub const PieceTree = struct {
             return;
         }
 
-        // 情况 2: 删除跨越多个 piece
-        // 步骤: 先收集要处理的索引范围，然后从后向前修改
+        // case 2: delete span multiple pieces. steps: collect indices then rear-to-front
+        // modify.
 
-        // 处理 end piece（如果部分删除）
+        // handle end piece (partial delete if).
         var end_idx = end_seek.index;
         if (end_seek.item != null and end_seek.offset_in_item > 0) {
-            // end piece 前半部分被删除
+            // end piece front half deleted.
             const end_piece = end_seek.item.?;
             const off = end_seek.offset_in_item;
             const buf = self.getBuffer(end_piece.source);
@@ -677,7 +678,7 @@ pub const PieceTree = struct {
             end_idx = end_seek.index;
         }
 
-        // 删除中间的完整 piece（从后向前删除以保持索引稳定）
+        // delete middle full pieces (rear-to-front to keep indices stable).
         {
             const first_full_remove = if (start_seek.offset_in_item > 0)
                 start_seek.index + 1
@@ -693,7 +694,7 @@ pub const PieceTree = struct {
             }
         }
 
-        // 处理 start piece（如果部分删除）
+        // handle start piece (partial delete if).
         if (start_seek.offset_in_item > 0) {
             const piece = start_seek.item.?;
             const buf = self.getBuffer(piece.source);
@@ -701,39 +702,39 @@ pub const PieceTree = struct {
         }
     }
 
-    // ===== 查询 API =====
+    // ===== query API =====
 
-    /// 总字节数 O(1)
+    /// total bytes O(1).
     pub fn totalLength(self: *const PieceTree) usize {
         return self.tree.summary().bytes;
     }
 
-    /// 总行数 O(1): newlines + 1
+    /// total lines O(1): newlines + 1.
     pub fn lineCount(self: *const PieceTree) usize {
         return self.tree.summary().lines + 1;
     }
 
-    /// 最长行的字符数 O(1)：从 SumTree 根节点 summary 直接读取。
-    /// 对齐 Zed DisplaySnapshot::longest_row()，不需要扫描全文件。
+    /// longest row chars O(1): SumTree root summary direct read. align
+    /// Zed DisplaySnapshot::longest_row(), no full-file scan.
     pub fn longestRowChars(self: *const PieceTree) u32 {
         return self.tree.summary().longest_row_chars;
     }
 
-    /// 获取 [start, start+length) 范围的文本
-    /// 按字节维度定位起始 piece，随后顺序遍历；不对每个碎片重新查树。
+    /// get [start, start+length) text. locate start piece by byte dim, then
+    /// sequential traverse; no re-seek each fragment.
     pub fn getText(self: *const PieceTree, start: usize, length: usize, buffer: []u8) ![]const u8 {
         const total = self.totalLength();
         if (start > total or length > total - start) return error.InvalidRange;
         if (buffer.len < length) return error.BufferTooSmall;
         if (length == 0) return buffer[0..0];
 
-        // O(log P) 定位起始 piece
+        // O(log P) locate start piece.
         var pieces = self.tree.iterator();
         var offset_in_piece = pieces.seekTo(ByteDim, start) orelse return error.CorruptPieceTree;
         var copied: usize = 0;
         var remaining = length;
 
-        // 从定位到的 piece 开始逐个复制
+        // copy sequentially from located piece.
         while (remaining > 0) {
             const piece = pieces.next() orelse return error.CorruptPieceTree;
             const source_buf = self.getBuffer(piece.source);
@@ -751,16 +752,15 @@ pub const PieceTree = struct {
 
             copied += to_copy;
             remaining -= to_copy;
-            offset_in_piece = 0; // 后续 piece 从头开始
+            offset_in_piece = 0; // next pieces from head.
         }
 
         if (remaining != 0) return error.CorruptPieceTree;
         return buffer[0..copied];
     }
 
-    /// 零拷贝：返回 offset 处所在 piece 内的直接 slice（不拷贝）。
-    /// 返回从 offset 到该 piece 末尾的连续内存区域。
-    /// tree-sitter read callback 用此避免每次 4KB memcpy。
+    /// zero-copy: return direct slice in piece at offset (no copy). from offset to piece
+    /// end continuous memory. tree-sitter read callback avoids 4KB memcpy per call.
     pub const ChunkResult = struct {
         ptr: [*]const u8,
         len: usize,
@@ -784,7 +784,7 @@ pub const PieceTree = struct {
         };
     }
 
-    /// 获取指定行的内容
+    /// get specified line content.
     pub fn getLine(self: *const PieceTree, line: usize, buffer: []u8) ![]const u8 {
         const lc = self.lineCount();
         if (line >= lc) return error.InvalidLine;
@@ -798,7 +798,7 @@ pub const PieceTree = struct {
         return self.getText(start, end - start, buffer);
     }
 
-    /// 字节偏移 -> 行号，真正 O(log P)：B-tree 下降同时追踪 line_count
+    /// byte offset -> line number, true O(log P): B-tree descend tracking line_count.
     pub fn offsetToLine(self: *const PieceTree, offset: usize) usize {
         const root = self.tree.root orelse return 0;
         const total = self.totalLength();
@@ -826,7 +826,7 @@ pub const PieceTree = struct {
                 var lines: usize = 0;
                 for (leaf.items[0..leaf.len]) |piece| {
                     if (piece.length > remaining) {
-                        // 在此 piece 内部分扫描
+                        // within-piece partial scan.
                         const buf = self.getBuffer(piece.source);
                         for (buf[piece.start .. piece.start + remaining]) |byte| {
                             if (byte == '\n') lines += 1;
@@ -841,7 +841,8 @@ pub const PieceTree = struct {
         }
     }
 
-    /// 行号 -> 行起始字节偏移，真正 O(log P)：B-tree 下降同时追踪 byte_offset 和 line_count
+    /// line number -> line start byte offset, true O(log P): B-tree descend tracking
+    /// byte_offset and line_count.
     pub fn lineToOffset(self: *const PieceTree, target_line: usize) usize {
         if (target_line == 0) return 0;
         const root = self.tree.root orelse return 0;
@@ -868,7 +869,7 @@ pub const PieceTree = struct {
                 var byte_offset: usize = 0;
                 for (leaf.items[0..leaf.len]) |piece| {
                     if (piece.newline_count >= remaining) {
-                        // 在此 piece 内找第 remaining 个 \n
+                        // find remaining-th \n within piece.
                         const buf = self.getBuffer(piece.source);
                         var count: usize = 0;
                         for (buf[piece.start .. piece.start + piece.length], 0..) |byte, j| {
@@ -887,21 +888,19 @@ pub const PieceTree = struct {
         }
     }
 
-    // ===== Anchor API（稳定位置标记） =====
+    // ===== anchor API (stable position markers) =====
 
-    /// 创建一个 anchor 指向文档 offset 处。
-    /// 编辑后 anchor 会自动跟随内容移动（参考 Zed `text::Anchor`）。
+    /// create anchor at doc offset. after edit anchor auto-follow content (ref Zed
+    /// `text::Anchor`).
     ///
-    /// 实现：基于 PieceTree 的 `(source, buffer_offset)` 对。
-    /// original_buffer 和 add_buffer 都是 append-only，所以 buffer_offset 是该字节的永久坐标。
+    /// impl: (source, buffer_offset) pair on PieceTree. original_buffer and add_buffer
+    /// append-only, so buffer_offset permanent byte coordinate.
     ///
-    /// 特殊情况：
-    ///   - offset == 0 -> 返回 `Anchor.START`（跨任何编辑都指向文档起点）
-    ///   - offset == totalLength() -> 返回 `Anchor.END`（跨任何编辑都指向文档末尾）
+    /// special: offset==0 -> `Anchor.START` (any edit point doc start); offset==totalLength()
+    /// -> `Anchor.END` (any edit point doc end). need 'anchor current char' not forever
+    /// endpoints, use `anchorAtStrict`.
     ///
-    /// 如果你需要"锚定当前字符"（而不是永远指向端点），用 `anchorAtStrict`。
-    ///
-    /// 复杂度：O(log P)
+    /// complexity: O(log P).
     pub fn anchorAt(self: *const PieceTree, offset: usize, bias: AnchorBias) Anchor {
         const total = self.totalLength();
         if (offset == 0) return Anchor.START;
@@ -909,11 +908,12 @@ pub const PieceTree = struct {
         return self.anchorAtStrict(offset, bias);
     }
 
-    /// 类似 `anchorAt`，但不走 START/END 特殊常量，即使在 offset 0 或 totalLength 上
-    /// 也返回 normal anchor（基于当前 piece 的 buffer_offset）。
+    /// Like `anchorAt`, but bypasses the START/END constants even at offset 0 or totalLength and
+    /// returns a normal anchor (based on the current piece buffer_offset).
     ///
-    /// 用途：Find/Selection 等场景需要 anchor 在编辑后跟随对应字符位置移动，
-    /// 不是"永远锁在文档起/终点"。
+    /// Use case: Find/Selection need the anchor to follow the character position after edits, not
+    /// be
+    /// locked to doc start/end.
     pub fn anchorAtStrict(self: *const PieceTree, offset: usize, bias: AnchorBias) Anchor {
         const total = self.totalLength();
         const clamped = @min(offset, total);
@@ -928,7 +928,7 @@ pub const PieceTree = struct {
             };
         }
 
-        // 文档末尾（offset == total，且 total > 0）-> 退到最后一个 piece 的末尾
+        // End of document (offset == total and total > 0) -> retreat to last piece end
         if (clamped > 0 and self.tree.count() > 0) {
             const last = self.tree.get(self.tree.count() - 1) orelse return Anchor.END;
             return .{
@@ -939,25 +939,25 @@ pub const PieceTree = struct {
             };
         }
 
-        // 空文档 -> fallback to START
+        // Empty document -> fallback to START
         return Anchor.START;
     }
 
-    /// 解析 anchor -> 当前文档 offset。
+    /// Resolve an anchor to the current document offset.
     ///
-    /// 算法（对齐 Zed bias 语义）：
+    /// Algorithm (Zed bias semantics):
     ///
-    /// 1. 扫所有 piece 找包含 `(source, buffer_offset)` 的 piece
-    /// 2. 命中时（即 target_offset 落在 piece 的 [start, start+length] 内）：
-    ///    - 若在 piece 内部（start < target < end）：直接返回 `doc_offset + (target - piece.start)`
-    ///    - 若在 piece 边界上（target == piece.start 或 target == piece.end）：
-    ///      bias 决定返回当前 piece 的边界还是下/上一 piece 的边界
-    ///      .left 倾向 preceding piece 的末尾；.right 倾向 following piece 的起点
-    /// 3. 未命中（anchor 的 buffer 区间被删除）：
-    ///    - .left -> 回退到 preceding 边界（删除区间的左端 doc offset）
-    ///    - .right -> 回退到 succeeding 边界（删除区间的右端 doc offset）
+    /// 1. Scan all pieces to find the piece containing (source, buffer_offset)
+    /// 2. On hit (target_offset within piece [start, start+length]):
+    ///    - Strictly inside (start < target < end): return doc_offset + (target - piece.start)
+    ///    - On a piece boundary (target == piece.start or piece.end):
+    ///      bias picks the boundary: .left prefers the preceding piece end; .right the following
+    ///      piece start
+    /// 3. On miss (anchor's buffer range deleted):
+    ///    - .left -> preceding boundary (left doc offset of the deleted range)
+    ///    - .right -> succeeding boundary (right doc offset of the deleted range)
     ///
-    /// 复杂度：O(P)（v1 线性扫；v2 可加 source+offset -> piece_index 缓存）
+    /// Complexity: O(P) linear scan; could cache source+offset -> piece_index
     pub fn resolveAnchor(self: *const PieceTree, anchor: Anchor) usize {
         switch (anchor.kind) {
             .start_of_document => return 0,
@@ -971,12 +971,13 @@ pub const PieceTree = struct {
         var doc_offset: usize = 0;
         var best_before: usize = 0;
         var best_after: ?usize = null;
-        // 记录所有命中的 piece，bias 决定选哪个。
-        // 典型场景：insert 发生后，original buffer 被 split，前后两个 piece 都"触碰"
-        // 原 target_offset（前 piece 的 end == target；后 piece 的 start == target）。
-        var inner_hit: ?usize = null; // piece 内部命中（非边界）
-        var trailing_edge_hit: ?usize = null; // target == piece_end（.left 倾向）
-        var leading_edge_hit: ?usize = null; // target == piece_start（.right 倾向）
+        // Record all matching pieces; bias chooses which one to use.
+        // Typical scenario: after insert, original buffer split, both pieces touch
+        // original target_offset (piece.end == target for former, piece.start == target for
+        // latter).
+        var inner_hit: ?usize = null; // interior hit (non-boundary)
+        var trailing_edge_hit: ?usize = null; // target == piece_end (.left preferred)
+        var leading_edge_hit: ?usize = null; // target == piece_start (.right preferred)
 
         const count = self.tree.count();
         var i: usize = 0;
@@ -985,21 +986,21 @@ pub const PieceTree = struct {
             const piece_end = piece.start + piece.length;
 
             if (piece.source == target_source) {
-                // Case 1: 严格内部命中
+                // Case 1: strictly interior hit
                 if (target_offset > piece.start and target_offset < piece_end) {
                     inner_hit = doc_offset + (target_offset - piece.start);
                 }
-                // Case 2: target 正好在 piece 末尾（trailing edge）
+                // Case 2: target at piece end (trailing edge)
                 else if (target_offset == piece_end and target_offset > piece.start) {
                     trailing_edge_hit = doc_offset + piece.length;
                 }
-                // Case 3: target 正好在 piece 起点（leading edge）
+                // Case 3: target at piece start (leading edge)
                 else if (target_offset == piece.start and target_offset < piece_end) {
                     if (leading_edge_hit == null) leading_edge_hit = doc_offset;
                 }
-                // Case 4: 空 piece 且 target 正好在边界上（极罕见，忽略）
+                // Case 4: empty piece and target on boundary (rare, ignore)
 
-                // 未命中时记录回退候选
+                // Record fallback candidates on miss
                 if (target_offset > piece_end) {
                     best_before = doc_offset + piece.length;
                 } else if (target_offset < piece.start and best_after == null) {
@@ -1010,10 +1011,10 @@ pub const PieceTree = struct {
             doc_offset += piece.length;
         }
 
-        // 优先级：inner hit 最确定
+        // Priority: inner hit most certain
         if (inner_hit) |h| return h;
 
-        // 边界命中：bias 决定方向
+        // Boundary hit: bias decides the direction
         switch (anchor.bias) {
             .left => {
                 if (trailing_edge_hit) |h| return h;
@@ -1025,14 +1026,14 @@ pub const PieceTree = struct {
             },
         }
 
-        // 完全未命中：回退
+        // Complete miss: fallback
         return switch (anchor.bias) {
             .left => best_before,
             .right => best_after orelse doc_offset,
         };
     }
 
-    // Anchor 相关类型（从 core/anchor.zig 重新导出，方便调用方）
+    // Anchor-related types (re-exported from core/anchor.zig for caller convenience)
     pub const Anchor = @import("anchor.zig").Anchor;
     pub const AnchorBias = @import("anchor.zig").Bias;
     pub const AnchorRange = @import("anchor.zig").AnchorRange;
@@ -1051,9 +1052,9 @@ pub const PieceTree = struct {
         };
     }
 
-    // ===== 内部辅助 =====
+    // ===== internal helpers =====
 
-    /// 零拷贝 chunk 迭代器：逐 piece 返回直接引用，无 memcpy
+    /// Zero-copy chunk iterator: return direct references per piece, no memcpy
     pub fn chunksInRange(self: *const PieceTree, start: usize, len: usize) ChunkIterator(PieceTree) {
         const total = self.totalLength();
         const clamped_start = @min(start, total);
@@ -1130,12 +1131,11 @@ pub const PieceTree = struct {
         return (text_len + ADD_BUFFER_PAGE_SIZE - 1) / ADD_BUFFER_PAGE_SIZE;
     }
 
-    /// 扫描文本统计信息（对齐 Zed TextSummary::from(str)）。
-    /// 一次遍历计算 newline_count + first/last/longest_row_chars。
+    /// Scan text stats (aligns Zed TextSummary::from(str)).
+    /// Single pass computes newline_count + first/last/longest_row_chars.
     ///
-    /// 实现已析出到 piece_stats.zig（见该文件的模块头：为什么搬、接口切在哪、
-    /// 非法 UTF-8 / 末尾截断序列 / 行宽饱和这几个坑）。这里只留委托，保持
-    /// `PieceTree.scanTextStats` 这个旧调用点（TreePiece.fromText 及测试）不变。
+    /// Implemented in piece_stats.zig (see its module header: illegal UTF-8, truncated sequences,
+    /// row width saturation). Delegation kept here for PieceTree.scanTextStats call sites.
     const TextStats = piece_stats.TextStats;
 
     fn scanTextStats(text: []const u8) TextStats {
@@ -1143,10 +1143,10 @@ pub const PieceTree = struct {
     }
 };
 
-// ===== 单元测试 =====
+// ===== unit tests =====
 
 test "PieceTree: init and deinit" {
-    var pt = PieceTree.init(std.testing.allocator);
+    var pt = PieceTree.init(std.testing.allocator, std.testing.io);
     defer pt.deinit();
 
     try std.testing.expectEqual(@as(usize, 0), pt.totalLength());
@@ -1155,7 +1155,7 @@ test "PieceTree: init and deinit" {
 
 test "PieceTree: init from buffer" {
     const content = "Hello\nWorld\n";
-    var pt = try PieceTree.initFromBuffer(std.testing.allocator, content);
+    var pt = try PieceTree.initFromBuffer(std.testing.allocator, std.testing.io, content);
     defer pt.deinit();
 
     try std.testing.expectEqual(@as(usize, 12), pt.totalLength());
@@ -1163,7 +1163,7 @@ test "PieceTree: init from buffer" {
 }
 
 test "PieceTree: insert at beginning" {
-    var pt = PieceTree.init(std.testing.allocator);
+    var pt = PieceTree.init(std.testing.allocator, std.testing.io);
     defer pt.deinit();
 
     try pt.insert(0, "Hello");
@@ -1175,7 +1175,7 @@ test "PieceTree: insert at beginning" {
 }
 
 test "PieceTree: insert at end" {
-    var pt = PieceTree.init(std.testing.allocator);
+    var pt = PieceTree.init(std.testing.allocator, std.testing.io);
     defer pt.deinit();
 
     try pt.insert(0, "Hello");
@@ -1188,7 +1188,7 @@ test "PieceTree: insert at end" {
 }
 
 test "PieceTree: snapshot shares add pages without copying contiguous add buffer" {
-    var pt = PieceTree.init(std.testing.allocator);
+    var pt = PieceTree.init(std.testing.allocator, std.testing.io);
     defer pt.deinit();
 
     const large = try std.testing.allocator.alloc(u8, ADD_BUFFER_PAGE_SIZE + 32);
@@ -1208,7 +1208,7 @@ test "PieceTree: snapshot shares add pages without copying contiguous add buffer
 }
 
 test "PieceTree: insert in middle" {
-    var pt = PieceTree.init(std.testing.allocator);
+    var pt = PieceTree.init(std.testing.allocator, std.testing.io);
     defer pt.deinit();
 
     try pt.insert(0, "Hello World");
@@ -1222,7 +1222,7 @@ test "PieceTree: insert in middle" {
 
 test "PieceTree: get line" {
     const content = "Line 1\nLine 2\nLine 3\n";
-    var pt = try PieceTree.initFromBuffer(std.testing.allocator, content);
+    var pt = try PieceTree.initFromBuffer(std.testing.allocator, std.testing.io, content);
     defer pt.deinit();
 
     try std.testing.expectEqual(@as(usize, 4), pt.lineCount());
@@ -1237,11 +1237,11 @@ test "PieceTree: get line" {
 }
 
 test "PieceTree: delete from middle" {
-    var pt = PieceTree.init(std.testing.allocator);
+    var pt = PieceTree.init(std.testing.allocator, std.testing.io);
     defer pt.deinit();
 
     try pt.insert(0, "Hello World");
-    try pt.delete(5, 1); // 删除空格
+    try pt.delete(5, 1); // delete space
     try std.testing.expectEqual(@as(usize, 10), pt.totalLength());
 
     var buffer: [100]u8 = undefined;
@@ -1250,7 +1250,7 @@ test "PieceTree: delete from middle" {
 }
 
 test "PieceTree: delete from beginning" {
-    var pt = PieceTree.init(std.testing.allocator);
+    var pt = PieceTree.init(std.testing.allocator, std.testing.io);
     defer pt.deinit();
 
     try pt.insert(0, "Hello World");
@@ -1263,7 +1263,7 @@ test "PieceTree: delete from beginning" {
 }
 
 test "PieceTree: delete from end" {
-    var pt = PieceTree.init(std.testing.allocator);
+    var pt = PieceTree.init(std.testing.allocator, std.testing.io);
     defer pt.deinit();
 
     try pt.insert(0, "Hello World");
@@ -1276,14 +1276,14 @@ test "PieceTree: delete from end" {
 }
 
 test "PieceTree: delete across pieces" {
-    var pt = PieceTree.init(std.testing.allocator);
+    var pt = PieceTree.init(std.testing.allocator, std.testing.io);
     defer pt.deinit();
 
     try pt.insert(0, "Hello");
     try pt.insert(5, " World");
     try pt.insert(11, "!");
 
-    try pt.delete(3, 5); // 删除 "lo Wo"
+    try pt.delete(3, 5); // Delete "lo Wo"
     try std.testing.expectEqual(@as(usize, 7), pt.totalLength());
 
     var buffer: [100]u8 = undefined;
@@ -1292,7 +1292,7 @@ test "PieceTree: delete across pieces" {
 }
 
 test "PieceTree: line index after insert newline" {
-    var pt = PieceTree.init(std.testing.allocator);
+    var pt = PieceTree.init(std.testing.allocator, std.testing.io);
     defer pt.deinit();
 
     try pt.insert(0, "Hello World");
@@ -1309,7 +1309,7 @@ test "PieceTree: line index after insert newline" {
 }
 
 test "PieceTree: line index after insert multiple newlines" {
-    var pt = PieceTree.init(std.testing.allocator);
+    var pt = PieceTree.init(std.testing.allocator, std.testing.io);
     defer pt.deinit();
 
     try pt.insert(0, "ABCD");
@@ -1327,7 +1327,7 @@ test "PieceTree: line index after insert multiple newlines" {
 
 test "PieceTree: line index after delete newline" {
     const content = "Line 1\nLine 2\nLine 3";
-    var pt = try PieceTree.initFromBuffer(std.testing.allocator, content);
+    var pt = try PieceTree.initFromBuffer(std.testing.allocator, std.testing.io, content);
     defer pt.deinit();
 
     try std.testing.expectEqual(@as(usize, 3), pt.lineCount());
@@ -1344,7 +1344,7 @@ test "PieceTree: line index after delete newline" {
 
 test "PieceTree: line index after delete across lines" {
     const content = "AAA\nBBB\nCCC\nDDD";
-    var pt = try PieceTree.initFromBuffer(std.testing.allocator, content);
+    var pt = try PieceTree.initFromBuffer(std.testing.allocator, std.testing.io, content);
     defer pt.deinit();
 
     try std.testing.expectEqual(@as(usize, 4), pt.lineCount());
@@ -1360,7 +1360,7 @@ test "PieceTree: line index after delete across lines" {
 }
 
 test "PieceTree: line consistency through multiple edits" {
-    var pt = PieceTree.init(std.testing.allocator);
+    var pt = PieceTree.init(std.testing.allocator, std.testing.io);
     defer pt.deinit();
 
     try pt.insert(0, "Line 1\n");
@@ -1395,7 +1395,7 @@ test "PieceTree: line consistency through multiple edits" {
 }
 
 test "PieceTree: consecutive newline inserts" {
-    var pt = try PieceTree.initFromBuffer(std.testing.allocator, "Press hello\n");
+    var pt = try PieceTree.initFromBuffer(std.testing.allocator, std.testing.io, "Press hello\n");
     defer pt.deinit();
 
     var buffer: [256]u8 = undefined;
@@ -1419,7 +1419,7 @@ test "PieceTree: consecutive newline inserts" {
 }
 
 test "PieceTree: insert newline at line start" {
-    var pt = try PieceTree.initFromBuffer(std.testing.allocator, "ABC");
+    var pt = try PieceTree.initFromBuffer(std.testing.allocator, std.testing.io, "ABC");
     defer pt.deinit();
 
     var buffer: [256]u8 = undefined;
@@ -1440,7 +1440,7 @@ test "PieceTree: insert newline at line start" {
 
 test "PieceTree: offsetToLine and lineToOffset" {
     const content = "Hello\nWorld\nFoo\n";
-    var pt = try PieceTree.initFromBuffer(std.testing.allocator, content);
+    var pt = try PieceTree.initFromBuffer(std.testing.allocator, std.testing.io, content);
     defer pt.deinit();
 
     // line 0 = "Hello\n" (0..6)
@@ -1463,11 +1463,11 @@ test "PieceTree: offsetToLine and lineToOffset" {
 }
 
 test "PieceTree: equivalence with PieceTable for mixed operations" {
-    // 等价性测试: 对相同操作序列验证 PieceTree 和 PieceTable 结果一致
+    // Equivalence test: verify PieceTree and PieceTable results match for same operations
     const piece_table_mod = @import("piece_table.zig");
     const PieceTable = piece_table_mod.PieceTable;
 
-    var pt_tree = PieceTree.init(std.testing.allocator);
+    var pt_tree = PieceTree.init(std.testing.allocator, std.testing.io);
     defer pt_tree.deinit();
 
     var pt_table = try PieceTable.init(std.testing.allocator);
@@ -1494,13 +1494,13 @@ test "PieceTree: equivalence with PieceTable for mixed operations" {
             },
         }
 
-        // 验证总长度一致
+        // Verify total length match
         try std.testing.expectEqual(pt_table.total_length, pt_tree.totalLength());
 
-        // 验证行数一致
+        // Verify line count match
         try std.testing.expectEqual(pt_table.lineCount(), pt_tree.lineCount());
 
-        // 验证全文一致
+        // Verify full text match
         var buf1: [1024]u8 = undefined;
         var buf2: [1024]u8 = undefined;
         const text1 = try pt_tree.getText(0, pt_tree.totalLength(), &buf1);
@@ -1512,7 +1512,7 @@ test "PieceTree: equivalence with PieceTable for mixed operations" {
 test "PieceTree: lineToOffset/offsetToLine brute force verification" {
     const alloc = std.testing.allocator;
 
-    // 各种文档内容
+    // Various document contents
     const cases = [_][]const u8{
         "Hello\nWorld\nFoo\n",
         "abc",
@@ -1527,14 +1527,14 @@ test "PieceTree: lineToOffset/offsetToLine brute force verification" {
 
     for (cases) |content| {
         var pt = if (content.len > 0)
-            try PieceTree.initFromBuffer(alloc, content)
+            try PieceTree.initFromBuffer(alloc, std.testing.io, content)
         else
-            PieceTree.init(alloc);
+            PieceTree.init(alloc, std.testing.io);
         defer pt.deinit();
 
         const lc = pt.lineCount();
 
-        // 暴力计算行偏移表
+        // Brute force compute line offset table
         var line_starts_buf: [128]usize = undefined;
         var brute_lc: usize = 1;
         line_starts_buf[0] = 0;
@@ -1545,17 +1545,17 @@ test "PieceTree: lineToOffset/offsetToLine brute force verification" {
             }
         }
 
-        // 验证 lineCount
+        // Verify lineCount
         try std.testing.expectEqual(brute_lc, lc);
 
-        // 验证 lineToOffset
+        // Verify lineToOffset
         for (0..lc) |line| {
             const expected = line_starts_buf[line];
             const got = pt.lineToOffset(line);
             try std.testing.expectEqual(expected, got);
         }
 
-        // 验证 offsetToLine
+        // Verify offsetToLine
         for (0..content.len + 1) |offset| {
             var expected_line: usize = 0;
             for (content[0..@min(offset, content.len)]) |b| {
@@ -1566,16 +1566,16 @@ test "PieceTree: lineToOffset/offsetToLine brute force verification" {
         }
     }
 
-    // 编辑后验证：模拟多次插入产生多个 piece
+    // Post-edit verify: simulate multiple inserts producing multiple pieces
     {
-        var pt = PieceTree.init(alloc);
+        var pt = PieceTree.init(alloc, std.testing.io);
         defer pt.deinit();
 
         try pt.insert(0, "AAA\n");
         try pt.insert(4, "BBB\n");
         try pt.insert(8, "CCC");
 
-        // 全文 = "AAA\nBBB\nCCC" (3 pieces)
+        // Full text = "AAA\nBBB\nCCC" (3 pieces)
         try std.testing.expectEqual(@as(usize, 3), pt.lineCount());
         try std.testing.expectEqual(@as(usize, 0), pt.lineToOffset(0));
         try std.testing.expectEqual(@as(usize, 4), pt.lineToOffset(1));
@@ -1591,7 +1591,7 @@ test "PieceTree: lineToOffset/offsetToLine brute force verification" {
 }
 
 test "PieceTree: getText rejects corrupt piece bounds" {
-    var pt = PieceTree.init(std.testing.allocator);
+    var pt = PieceTree.init(std.testing.allocator, std.testing.io);
     defer pt.deinit();
 
     try pt.insert(0, "abc");
@@ -1611,7 +1611,7 @@ test "PieceTree: getText rejects corrupt piece bounds" {
 }
 
 test "PieceTreeSnapshot remains readable during concurrent source edits" {
-    var pt = PieceTree.init(std.testing.allocator);
+    var pt = PieceTree.init(std.testing.allocator, std.testing.io);
     defer pt.deinit();
 
     const seed = "0123456789abcdef\n";
@@ -1682,10 +1682,10 @@ test "PieceTreeSnapshot remains readable during concurrent source edits" {
 }
 
 test "ChunkIterator: basic single piece" {
-    var pt = try PieceTree.initFromBuffer(std.testing.allocator, "hello world");
+    var pt = try PieceTree.initFromBuffer(std.testing.allocator, std.testing.io, "hello world");
     defer pt.deinit();
 
-    // 全范围迭代
+    // Full range iteration
     var it = pt.chunksInRange(0, pt.totalLength());
     var result: [64]u8 = undefined;
     var pos: usize = 0;
@@ -1697,7 +1697,7 @@ test "ChunkIterator: basic single piece" {
 }
 
 test "ChunkIterator: multiple pieces after edit" {
-    var pt = try PieceTree.initFromBuffer(std.testing.allocator, "abcdef");
+    var pt = try PieceTree.initFromBuffer(std.testing.allocator, std.testing.io, "abcdef");
     defer pt.deinit();
     try pt.insert(3, "XYZ"); // "abcXYZdef"
 
@@ -1711,15 +1711,15 @@ test "ChunkIterator: multiple pieces after edit" {
         chunk_count += 1;
     }
     try std.testing.expectEqualSlices(u8, "abcXYZdef", result[0..pos]);
-    try std.testing.expect(chunk_count >= 2); // 至少 2 个 piece
+    try std.testing.expect(chunk_count >= 2); // at least 2 pieces
 }
 
 test "ChunkIterator: sub-range" {
-    var pt = try PieceTree.initFromBuffer(std.testing.allocator, "0123456789");
+    var pt = try PieceTree.initFromBuffer(std.testing.allocator, std.testing.io, "0123456789");
     defer pt.deinit();
     try pt.insert(5, "AB"); // "01234AB56789"
 
-    // 只迭代 offset 3..9 -> "34AB56"
+    // Iterate only offset 3..9 -> "34AB56"
     var it = pt.chunksInRange(3, 6);
     var result: [64]u8 = undefined;
     var pos: usize = 0;
@@ -1731,7 +1731,7 @@ test "ChunkIterator: sub-range" {
 }
 
 test "ChunkIterator: empty range" {
-    var pt = try PieceTree.initFromBuffer(std.testing.allocator, "abc");
+    var pt = try PieceTree.initFromBuffer(std.testing.allocator, std.testing.io, "abc");
     defer pt.deinit();
 
     var it = pt.chunksInRange(1, 0);
@@ -1739,7 +1739,7 @@ test "ChunkIterator: empty range" {
 }
 
 test "ChunkIterator: snapshot" {
-    var pt = try PieceTree.initFromBuffer(std.testing.allocator, "hello");
+    var pt = try PieceTree.initFromBuffer(std.testing.allocator, std.testing.io, "hello");
     defer pt.deinit();
     try pt.insert(5, " world");
 
@@ -1757,7 +1757,7 @@ test "ChunkIterator: snapshot" {
 }
 
 test "PieceTreeSnapshot: getChunkAt returns direct slice inside piece" {
-    var pt = try PieceTree.initFromBuffer(std.testing.allocator, "hello");
+    var pt = try PieceTree.initFromBuffer(std.testing.allocator, std.testing.io, "hello");
     defer pt.deinit();
     try pt.insert(5, " world");
 
@@ -1774,7 +1774,7 @@ test "PieceTreeSnapshot: getChunkAt returns direct slice inside piece" {
 }
 
 test "PieceTreeSnapshot retains original buffer after source deinit" {
-    var pt = try PieceTree.initFromBuffer(std.testing.allocator, "hello world");
+    var pt = try PieceTree.initFromBuffer(std.testing.allocator, std.testing.io, "hello world");
     var snap = try pt.snapshot(std.testing.allocator);
     pt.deinit();
     defer snap.deinit();
@@ -1788,9 +1788,9 @@ test "PieceTreeSnapshot retains original buffer after source deinit" {
 }
 
 test "ChunkIterator: matches getText" {
-    var pt = try PieceTree.initFromBuffer(std.testing.allocator, "The quick brown fox jumps over the lazy dog");
+    var pt = try PieceTree.initFromBuffer(std.testing.allocator, std.testing.io, "The quick brown fox jumps over the lazy dog");
     defer pt.deinit();
-    // 制造多个 piece
+    // Create multiple pieces
     try pt.insert(10, "!!!"); // after "quick"
     try pt.insert(0, ">>> ");
     try pt.delete(20, 5);
@@ -1810,27 +1810,27 @@ test "ChunkIterator: matches getText" {
 }
 
 test "PieceTree: longestRowChars basic" {
-    // 简单多行文本
-    var pt = try PieceTree.initFromBuffer(std.testing.allocator, "short\na longer line here\nhi\n");
+    // Simple multi-line text
+    var pt = try PieceTree.initFromBuffer(std.testing.allocator, std.testing.io, "short\na longer line here\nhi\n");
     defer pt.deinit();
     // "a longer line here" = 18 chars
     try std.testing.expectEqual(@as(u32, 18), pt.longestRowChars());
 }
 
 test "PieceTree: longestRowChars single line" {
-    var pt = try PieceTree.initFromBuffer(std.testing.allocator, "hello world");
+    var pt = try PieceTree.initFromBuffer(std.testing.allocator, std.testing.io, "hello world");
     defer pt.deinit();
     try std.testing.expectEqual(@as(u32, 11), pt.longestRowChars());
 }
 
 test "PieceTree: longestRowChars empty" {
-    var pt = try PieceTree.initFromBuffer(std.testing.allocator, "");
+    var pt = try PieceTree.initFromBuffer(std.testing.allocator, std.testing.io, "");
     defer pt.deinit();
     try std.testing.expectEqual(@as(u32, 0), pt.longestRowChars());
 }
 
 test "PieceTree: longestRowChars after insert extends line" {
-    var pt = try PieceTree.initFromBuffer(std.testing.allocator, "abc\ndef\n");
+    var pt = try PieceTree.initFromBuffer(std.testing.allocator, std.testing.io, "abc\ndef\n");
     defer pt.deinit();
     try std.testing.expectEqual(@as(u32, 3), pt.longestRowChars());
     // Insert " extended" after "abc" -> "abc extended\ndef\n"
@@ -1839,7 +1839,7 @@ test "PieceTree: longestRowChars after insert extends line" {
 }
 
 test "PieceTree: longestRowChars after delete shrinks" {
-    var pt = try PieceTree.initFromBuffer(std.testing.allocator, "short\nvery long line content here\nhi\n");
+    var pt = try PieceTree.initFromBuffer(std.testing.allocator, std.testing.io, "short\nvery long line content here\nhi\n");
     defer pt.deinit();
     // "very long line content here" = 27 chars
     try std.testing.expectEqual(@as(u32, 27), pt.longestRowChars());
@@ -1851,7 +1851,7 @@ test "PieceTree: longestRowChars after delete shrinks" {
 
 test "PieceTree: longestRowChars cross-piece join" {
     // Two pieces that join: "abc" + "defghij\nxy" -> first line "abcdefghij" = 10 chars
-    var pt = try PieceTree.initFromBuffer(std.testing.allocator, "abc");
+    var pt = try PieceTree.initFromBuffer(std.testing.allocator, std.testing.io, "abc");
     defer pt.deinit();
     try std.testing.expectEqual(@as(u32, 3), pt.longestRowChars());
     try pt.insert(3, "defghij\nxy");
@@ -1875,7 +1875,7 @@ test "PieceTree: scanTextStats no newline" {
     try std.testing.expectEqual(@as(u32, 6), stats.longest_row_chars);
 }
 
-// 析出后的回归护栏：委托必须逐字段等价（含非法 UTF-8 与截断序列）。
+// Regression guard after factoring: delegation must field-by-field match
 test "PieceTree: scanTextStats delegates to piece_stats.scan unchanged" {
     const cases = [_][]const u8{
         "",
@@ -1883,7 +1883,7 @@ test "PieceTree: scanTextStats delegates to piece_stats.scan unchanged" {
         "abc",
         "hello\nworld foo bar\nhi\n",
         "héllo\nwörld\n",
-        "abc\u{4F60}"[0..5], // 截断的 3 字节序列
+        "abc\u{4F60}"[0..5], // truncated 3-byte sequence
         "\xff\xfe\xc0\x80\x8f",
         "ab\r\ncd\r\n",
     };
@@ -1891,7 +1891,7 @@ test "PieceTree: scanTextStats delegates to piece_stats.scan unchanged" {
         const via_pt = PieceTree.scanTextStats(text);
         const via_mod = piece_stats.scan(text);
         try std.testing.expectEqualDeep(via_mod, via_pt);
-        // 逐字段显式比对（expectEqualDeep 对 struct 的失败信息不直观）
+        // Explicit field-by-field comparison (expectEqualDeep has poor error messages)
         try std.testing.expectEqual(via_mod.newline_count, via_pt.newline_count);
         try std.testing.expectEqual(via_mod.first_line_chars, via_pt.first_line_chars);
         try std.testing.expectEqual(via_mod.last_line_chars, via_pt.last_line_chars);
@@ -1900,29 +1900,29 @@ test "PieceTree: scanTextStats delegates to piece_stats.scan unchanged" {
 }
 
 test "PieceTree: longestRowChars multi-piece insert builds correct cross-piece join" {
-    // 模拟大文件场景：多次 insert 在同一行追加，跨 piece 拼接
-    var pt = try PieceTree.initFromBuffer(std.testing.allocator, "line1\nline2\nline3\n");
+    // Large file scenario: append to same line multiple times, concatenate across pieces
+    var pt = try PieceTree.initFromBuffer(std.testing.allocator, std.testing.io, "line1\nline2\nline3\n");
     defer pt.deinit();
     try std.testing.expectEqual(@as(u32, 5), pt.longestRowChars());
 
-    // 在 line2 末尾追加（offset=11, 在 "line2" 之后 "\n" 之前）
+    // Append at end of line2 (offset 11, before "\n" after "line2")
     try pt.insert(11, " appended text here!!!!");
     // "line2 appended text here!!!!" = 5 + 23 = 28 chars
     try std.testing.expectEqual(@as(u32, 28), pt.longestRowChars());
 
-    // 再追加更多
+    // Append more
     try pt.insert(11 + 23, " and even more stuff");
     // "line2 appended text here!!!! and even more stuff" = 48 chars
     try std.testing.expectEqual(@as(u32, 48), pt.longestRowChars());
 }
 
 test "PieceTree: longestRowChars matches brute-force scan on constructed content" {
-    // 构造一个有已知最长行的多行内容
+    // Construct multi-line content with known longest line
     const allocator = std.testing.allocator;
-    var buf = std.ArrayList(u8){};
+    var buf = @as(std.ArrayList(u8), .empty);
     defer buf.deinit(allocator);
 
-    // 生成 1000 行，其中第 500 行最长（200 字符）
+    // Generate 1000 lines with line 500 longest (200 chars)
     var expected_longest: u32 = 0;
     for (0..1000) |i| {
         const line_len: usize = if (i == 500) 200 else @min(i % 80 + 10, 79);
@@ -1933,12 +1933,12 @@ test "PieceTree: longestRowChars matches brute-force scan on constructed content
         if (line_len > expected_longest) expected_longest = @intCast(line_len);
     }
 
-    var pt = try PieceTree.initFromBuffer(allocator, buf.items);
+    var pt = try PieceTree.initFromBuffer(allocator, std.testing.io, buf.items);
     defer pt.deinit();
     try std.testing.expectEqual(expected_longest, pt.longestRowChars());
 
-    // 现在在第 700 行插入一个更长的行
-    // 找到第 700 行的偏移
+    // Now insert longer line at line 700
+    // Find offset of line 700
     var offset: usize = 0;
     var line: usize = 0;
     for (buf.items, 0..) |byte, idx| {
@@ -1950,7 +1950,7 @@ test "PieceTree: longestRowChars matches brute-force scan on constructed content
             }
         }
     }
-    // 在这个位置插入 300 个 'Y' + '\n'
+    // Insert 300 'Y's + '\n' at this position
     var insert_buf: [301]u8 = undefined;
     @memset(insert_buf[0..300], 'Y');
     insert_buf[300] = '\n';
@@ -1990,7 +1990,7 @@ test "PieceSummary: line widths saturate instead of overflowing" {
 // ============================================================================
 
 test "Anchor: START and END resolve to 0 and totalLength" {
-    var pt = try PieceTree.initFromBuffer(std.testing.allocator, "Hello, World");
+    var pt = try PieceTree.initFromBuffer(std.testing.allocator, std.testing.io, "Hello, World");
     defer pt.deinit();
 
     try std.testing.expectEqual(@as(usize, 0), pt.resolveAnchor(PieceTree.Anchor.START));
@@ -1998,7 +1998,7 @@ test "Anchor: START and END resolve to 0 and totalLength" {
 }
 
 test "Anchor: anchorAt(0) returns START" {
-    var pt = try PieceTree.initFromBuffer(std.testing.allocator, "abc");
+    var pt = try PieceTree.initFromBuffer(std.testing.allocator, std.testing.io, "abc");
     defer pt.deinit();
 
     const a = pt.anchorAt(0, .right);
@@ -2007,7 +2007,7 @@ test "Anchor: anchorAt(0) returns START" {
 }
 
 test "Anchor: anchorAt(total) returns END" {
-    var pt = try PieceTree.initFromBuffer(std.testing.allocator, "abc");
+    var pt = try PieceTree.initFromBuffer(std.testing.allocator, std.testing.io, "abc");
     defer pt.deinit();
 
     const a = pt.anchorAt(3, .left);
@@ -2016,7 +2016,7 @@ test "Anchor: anchorAt(total) returns END" {
 }
 
 test "Anchor: normal anchor resolves to correct offset" {
-    var pt = try PieceTree.initFromBuffer(std.testing.allocator, "Hello, World");
+    var pt = try PieceTree.initFromBuffer(std.testing.allocator, std.testing.io, "Hello, World");
     defer pt.deinit();
 
     const a = pt.anchorAt(5, .left); // after "Hello"
@@ -2026,140 +2026,141 @@ test "Anchor: normal anchor resolves to correct offset" {
 }
 
 test "Anchor: stability across insertions BEFORE anchor" {
-    var pt = try PieceTree.initFromBuffer(std.testing.allocator, "Hello, World");
+    var pt = try PieceTree.initFromBuffer(std.testing.allocator, std.testing.io, "Hello, World");
     defer pt.deinit();
 
-    // Anchor 指向 "World" 的 W
+    // Anchor points to 'W' in "World"
     const anchor_world = pt.anchorAt(7, .right);
     try std.testing.expectEqual(@as(usize, 7), pt.resolveAnchor(anchor_world));
 
-    // 在开头插入 "<<" (2 字节)
+    // Insert "<<" (2 bytes) at start
     try pt.insert(0, "<<");
-    // anchor 应自动跟随到新的 "World" 起点（offset 9）
+    // anchor should auto-follow to new "World" start (offset 9)
     try std.testing.expectEqual(@as(usize, 9), pt.resolveAnchor(anchor_world));
 }
 
 test "Anchor: stability across insertions AFTER anchor" {
-    var pt = try PieceTree.initFromBuffer(std.testing.allocator, "Hello, World");
+    var pt = try PieceTree.initFromBuffer(std.testing.allocator, std.testing.io, "Hello, World");
     defer pt.deinit();
 
-    const anchor_mid = pt.anchorAt(5, .left); // 指向 "Hello" 末尾
+    const anchor_mid = pt.anchorAt(5, .left); // Point to end of "Hello"
     try std.testing.expectEqual(@as(usize, 5), pt.resolveAnchor(anchor_mid));
 
-    // 在末尾追加
+    // Append at end
     try pt.insert(12, "!!!");
-    // anchor 位置不变
+    // anchor position unchanged
     try std.testing.expectEqual(@as(usize, 5), pt.resolveAnchor(anchor_mid));
 }
 
 test "Anchor: stability across deletions BEFORE anchor" {
-    var pt = try PieceTree.initFromBuffer(std.testing.allocator, "Hello, World");
+    var pt = try PieceTree.initFromBuffer(std.testing.allocator, std.testing.io, "Hello, World");
     defer pt.deinit();
 
     const anchor_world = pt.anchorAt(7, .right);
     try std.testing.expectEqual(@as(usize, 7), pt.resolveAnchor(anchor_world));
 
-    // 删除 "Hello, " (7 字节)
+    // Delete "Hello, " (7 bytes)
     try pt.delete(0, 7);
-    // anchor 跟随到新的 "World" 起点（offset 0）
+    // anchor follows to new "World" start (offset 0)
     try std.testing.expectEqual(@as(usize, 0), pt.resolveAnchor(anchor_world));
 }
 
 test "Anchor: stability across deletions AFTER anchor" {
-    var pt = try PieceTree.initFromBuffer(std.testing.allocator, "Hello, World");
+    var pt = try PieceTree.initFromBuffer(std.testing.allocator, std.testing.io, "Hello, World");
     defer pt.deinit();
 
     const anchor_mid = pt.anchorAt(5, .left);
 
-    // 删除 "World" (5 字节，位置 7..12)
+    // Delete "World" (5 bytes, position 7..12)
     try pt.delete(7, 5);
-    // anchor 位置不变
+    // anchor position unchanged
     try std.testing.expectEqual(@as(usize, 5), pt.resolveAnchor(anchor_mid));
 }
 
 test "Anchor: bias left vs right on insert AT anchor position" {
-    var pt = try PieceTree.initFromBuffer(std.testing.allocator, "abcdef");
+    var pt = try PieceTree.initFromBuffer(std.testing.allocator, std.testing.io, "abcdef");
     defer pt.deinit();
 
-    // Anchor 位于 offset 3（"abc|def"）
+    // Anchor at offset 3 ("abc|def")
     const a_left = pt.anchorAt(3, .left);
     const a_right = pt.anchorAt(3, .right);
     try std.testing.expectEqual(@as(usize, 3), pt.resolveAnchor(a_left));
     try std.testing.expectEqual(@as(usize, 3), pt.resolveAnchor(a_right));
 
-    // 在 offset 3 插入 "XYZ" -> 文档变为 "abcXYZdef"
+    // Insert "XYZ" at offset 3 -> doc becomes "abcXYZdef"
     try pt.insert(3, "XYZ");
 
-    // Bias 语义（对齐 Zed）：
-    //   .left  -> anchor 粘在 insert 之前的字符后 -> 位置不变（3）
-    //   .right -> anchor 粘在 insert 之后的字符前 -> 随 insert 移动到右边（6）
+    // Bias semantics (aligns Zed):
+    //   .left  -> anchor sticks after the char before the insert -> position unchanged (3)
+    //   .right -> anchor sticks before the char after the insert -> moves right (6)
     //
-    // 实现细节：insert 把原 original piece split 成 "abc"(0..3) 和 "def"(3..6)，
-    // 中间插入 add piece。target_offset=3 同时命中：
-    //   - "abc" piece 的 trailing edge (piece_end=3) -> doc_offset=3
-    //   - "def" piece 的 leading edge (piece_start=3) -> doc_offset=6
-    // .left 选 trailing；.right 选 leading。
+    // Detail: insert splits the original piece into "abc"(0..3) and "def"(3..6) and puts the add
+    // piece between. target_offset=3 matches both:
+    //   - "abc" piece trailing edge (piece_end=3) -> doc_offset=3
+    //   - "def" piece leading edge (piece_start=3) -> doc_offset=6
+    // .left chooses trailing; .right chooses leading.
     try std.testing.expectEqual(@as(usize, 3), pt.resolveAnchor(a_left));
     try std.testing.expectEqual(@as(usize, 6), pt.resolveAnchor(a_right));
 }
 
 test "Anchor: falls back to left boundary when inside deleted range (.left bias)" {
-    var pt = try PieceTree.initFromBuffer(std.testing.allocator, "abcdefghij");
+    var pt = try PieceTree.initFromBuffer(std.testing.allocator, std.testing.io, "abcdefghij");
     defer pt.deinit();
 
-    // Anchor 指向 offset 5 (字符 'f')
+    // Anchor points to offset 5 (character 'f')
     const a_left = pt.anchorAt(5, .left);
     try std.testing.expectEqual(@as(usize, 5), pt.resolveAnchor(a_left));
 
-    // 删除 [3, 8) -> 删掉 "defgh"
+    // Delete [3, 8) -> remove "defgh"
     try pt.delete(3, 5);
-    // anchor 所在 buffer 字节已不在任何 piece 中
-    // .left bias -> 回退到 delete range 的左边界（doc offset 3）
+    // anchor's buffer bytes no longer in any piece
+    // .left bias -> fallback to delete range left boundary (doc offset 3)
     try std.testing.expectEqual(@as(usize, 3), pt.resolveAnchor(a_left));
 }
 
 test "Anchor: falls back to right boundary when inside deleted range (.right bias)" {
-    var pt = try PieceTree.initFromBuffer(std.testing.allocator, "abcdefghij");
+    var pt = try PieceTree.initFromBuffer(std.testing.allocator, std.testing.io, "abcdefghij");
     defer pt.deinit();
 
     const a_right = pt.anchorAt(5, .right);
     try std.testing.expectEqual(@as(usize, 5), pt.resolveAnchor(a_right));
 
     try pt.delete(3, 5);
-    // .right bias -> 回退到 delete range 的右边界（doc offset 3，和 left 相同因为删除后右边直接接上）
+    // .right bias -> fallback to delete range right boundary (offset same: 3, deletion joins
+    // directly)
     try std.testing.expectEqual(@as(usize, 3), pt.resolveAnchor(a_right));
 }
 
 test "Anchor: survives complex edit sequence" {
-    var pt = try PieceTree.initFromBuffer(std.testing.allocator, "The quick brown fox");
+    var pt = try PieceTree.initFromBuffer(std.testing.allocator, std.testing.io, "The quick brown fox");
     defer pt.deinit();
 
-    // 多个 anchor 指向不同字符
+    // Multiple anchors at different characters
     const a_quick = pt.anchorAt(4, .right); // 'q'
     const a_brown = pt.anchorAt(10, .right); // 'b'
     const a_fox = pt.anchorAt(16, .right); // 'f'
 
-    // 多次编辑：替换 "quick" 为 "very swift"
+    // Multiple edits: replace "quick" with "very swift"
     try pt.delete(4, 5); // "The  brown fox"
     try pt.insert(4, "very swift"); // "The very swift brown fox"
 
-    // anchor 位置应正确反映新 doc 中对应字符
-    // 原 'q' 所在的 buffer 字节已被删除 -> 回退到 delete 边界 (offset 4)
+    // anchor positions should correctly reflect new doc chars,
+    // original 'q' buffer byte deleted -> fallback to delete boundary (offset 4)
     try std.testing.expectEqual(@as(usize, 4), pt.resolveAnchor(a_quick));
-    // 'b' 和 'f' 的 buffer 字节未动，跟随新 offset（长度 +5）
+    // 'b' and 'f' buffer bytes unchanged, follow new offset (length +5)
     try std.testing.expectEqual(@as(usize, 15), pt.resolveAnchor(a_brown));
     try std.testing.expectEqual(@as(usize, 21), pt.resolveAnchor(a_fox));
 }
 
 test "Anchor: resolveAnchorRange returns pair" {
-    var pt = try PieceTree.initFromBuffer(std.testing.allocator, "hello world");
+    var pt = try PieceTree.initFromBuffer(std.testing.allocator, std.testing.io, "hello world");
     defer pt.deinit();
 
     const r: PieceTree.AnchorRange = .{
         .start = pt.anchorAt(0, .right),
         .end = pt.anchorAt(5, .left),
     };
-    // 用 piece_tree 内的 resolve，不是 document 的 resolveAnchorRange（那个在 document 层）
+    // Use resolve inside piece_tree, not document.resolveAnchorRange (that's document layer)
     const s = pt.resolveAnchor(r.start);
     const e = pt.resolveAnchor(r.end);
     try std.testing.expectEqual(@as(usize, 0), s);
@@ -2167,38 +2168,38 @@ test "Anchor: resolveAnchorRange returns pair" {
 }
 
 test "Anchor: normal anchor pointsTo predicate" {
-    var pt = try PieceTree.initFromBuffer(std.testing.allocator, "abcdef");
+    var pt = try PieceTree.initFromBuffer(std.testing.allocator, std.testing.io, "abcdef");
     defer pt.deinit();
 
     const a = pt.anchorAt(3, .left);
-    // anchor 指向 original buffer 的 offset 3
+    // anchor points to offset 3 in original buffer
     try std.testing.expect(a.pointsTo(.original, 3));
     try std.testing.expect(!a.pointsTo(.original, 4));
     try std.testing.expect(!a.pointsTo(.add, 3));
 }
 
 test "Anchor: insert + anchor survives in add buffer" {
-    var pt = try PieceTree.initFromBuffer(std.testing.allocator, "AB");
+    var pt = try PieceTree.initFromBuffer(std.testing.allocator, std.testing.io, "AB");
     defer pt.deinit();
 
-    // 先 insert，让后续 anchor 落到 add buffer
+    // Insert first, make subsequent anchor fall in add buffer
     try pt.insert(1, "XYZ"); // "AXYZB"
 
-    const a_y = pt.anchorAt(2, .right); // 'Y' 在 add buffer
+    const a_y = pt.anchorAt(2, .right); // 'Y' in add buffer
     try std.testing.expectEqual(@as(usize, 2), pt.resolveAnchor(a_y));
 
-    // 再插入东西
+    // Insert more
     try pt.insert(0, "<<"); // "<<AXYZB"
     try std.testing.expectEqual(@as(usize, 4), pt.resolveAnchor(a_y));
 }
 
 fn checkTransactionalAllocationFailures(comptime deleting: bool) !void {
-    const baseline = "first line\nsecond line\n" ** 5000;
-    const inserted = "inserted\n" ** 16000;
+    const baseline = (@as([("first line\nsecond line\n").len * (5000)]u8, @bitCast(@as([5000][("first line\nsecond line\n").len]u8, @splat(("first line\nsecond line\n").*)))) ++ "");
+    const inserted = (@as([("inserted\n").len * (16000)]u8, @bitCast(@as([16000][("inserted\n").len]u8, @splat(("inserted\n").*)))) ++ "");
     var fail_at: usize = 0;
     while (fail_at < 2000) : (fail_at += 1) {
         var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
-        var pt = try PieceTree.initFromBuffer(failing.allocator(), baseline);
+        var pt = try PieceTree.initFromBuffer(failing.allocator(), std.testing.io, baseline);
         defer pt.deinit();
         var snap = try pt.snapshot(std.testing.allocator);
         defer snap.deinit();
@@ -2229,7 +2230,7 @@ test "PieceTree transactions preserve text and release split nodes on every allo
 }
 
 test "PieceTree transaction rollback keeps prior snapshots and anchors valid" {
-    var pt = try PieceTree.initFromBuffer(std.testing.allocator, "hello world\n");
+    var pt = try PieceTree.initFromBuffer(std.testing.allocator, std.testing.io, "hello world\n");
     defer pt.deinit();
     const anchor = pt.anchorAtStrict(6, .right);
     var snap = try pt.snapshot(std.testing.allocator);
@@ -2251,9 +2252,9 @@ test "PieceTree transaction rollback keeps prior snapshots and anchors valid" {
 }
 
 test "PieceTree insertion accepts a borrowed add-buffer chunk across reallocation" {
-    var pt = PieceTree.init(std.testing.allocator);
+    var pt = PieceTree.init(std.testing.allocator, std.testing.io);
     defer pt.deinit();
-    const content = "abcdef\n" ** 500;
+    const content = (@as([("abcdef\n").len * (500)]u8, @bitCast(@as([500][("abcdef\n").len]u8, @splat(("abcdef\n").*)))) ++ "");
     try pt.insert(0, content);
     const chunk = pt.getChunkAt(0).?;
     try pt.insert(0, chunk.ptr[0..chunk.len]);
@@ -2262,15 +2263,14 @@ test "PieceTree insertion accepts a borrowed add-buffer chunk across reallocatio
     try std.testing.expectEqualStrings(content ++ content, try pt.getText(0, pt.totalLength(), buf));
 }
 
-// ============================================================================
-// 边界 & 树形状补充测试
+// ========================================================================
+// Boundary & tree shape supplemental tests
 //
-// 既有 66 条覆盖了常规插入/删除/行索引/anchor/事务。这组专打此前没测过的
-// 分支：空文档退化、单字符、超长行、无换行大文件、非法 UTF-8、以及
-// SumTree 分裂/合并路径上的树形状不变量。
-// ============================================================================
+// Covers branches not otherwise tested: empty doc, single char, long lines,
+// no-newline large file, invalid UTF-8, and SumTree split/merge shape invariants.
+// ========================================================================
 
-/// 确定性 LCG（与 sum_tree.zig 的 fuzzy 测试同款乘数）。
+/// Deterministic LCG (same multiplier as sum_tree.zig fuzzy test).
 const Lcg = struct {
     state: u64,
 
@@ -2278,7 +2278,7 @@ const Lcg = struct {
         return .{ .state = seed };
     }
 
-    /// 返回 [0, mod) 的 usize。mod 必须非零。
+    /// Return usize in [0, mod). mod must be nonzero.
     fn below(self: *Lcg, mod: usize) usize {
         self.state = self.state *% 6364136223846793005 +% 1442695040888963407;
         const m: u64 = @intCast(mod);
@@ -2286,23 +2286,24 @@ const Lcg = struct {
     }
 };
 
-/// 树形状不变量校验。只断言本实现**必须**成立的性质：
-///   1. 所有叶子深度相同（高度只在根部分裂/坍缩时变化，splitInternalInsert
-///      造的新节点高度取自兄弟，merge 不改深度，所以深度必然均匀）；
-///   2. 每个节点项数 ≤ BRANCHING_FACTOR（分裂总是 4/5，插入有容量守卫）；
-///   3. Σ(piece.length) == tree.summary().bytes == totalLength()；
-///   4. piece 总数 == tree.count()。
-/// 刻意**不**断言「叶子填充 ≥ MIN_CHILDREN」：removeInNode 只对直接子节点
-/// rebalance、不上抛，欠满是本实现允许的中间态（见 sum_tree.zig:631）。
+/// Tree shape invariants check. Asserts only properties this implementation must satisfy:
+///   1. All leaves same depth (height changes only at root split/collapse, splitInternalInsert
+///      new node inherits sibling height, merge doesn't change it, so depth stays uniform);
+///   2. Each node items <= BRANCHING_FACTOR (split always 4/5, insert has capacity guard);
+///   3. Sum(piece.length) == tree.summary().bytes == totalLength();
+///   4. piece count == tree.count().
+/// Intentionally no "leaf fill >= MIN_CHILDREN" assert: removeInNode only rebalances direct
+/// children and doesn't propagate, so underfull is an allowed intermediate state (see
+/// sum_tree.zig:631).
 const PieceTreeShape = struct {
-    /// B-tree 参数照抄 sum_tree.zig（BRANCHING_FACTOR=8）。
+    /// B-tree params copied from sum_tree.zig (BRANCHING_FACTOR=8).
     const branching_factor: usize = 8;
-    /// 退化成链表时的深度上限。8 叉树下 512 piece 只需深度 2；6 是宽松护栏，
-    /// 专门抓「树退化成线性」这类结构灾难。
+    /// Degenerate-to-chain depth ceiling. 8-way 512 pieces only need depth 2; 6 is loose guard
+    /// to catch structural disasters like linear degradation.
     const max_depth: usize = 6;
 
     fn check(pt: *const PieceTree, alloc: std.mem.Allocator) !void {
-        var depths = std.ArrayList(usize){};
+        var depths = @as(std.ArrayList(usize), .empty);
         defer depths.deinit(alloc);
         var piece_count: usize = 0;
         var byte_sum: usize = 0;
@@ -2351,33 +2352,33 @@ const PieceTreeShape = struct {
 
 test "PieceTree: empty document degenerate paths stay consistent" {
     const alloc = std.testing.allocator;
-    var pt = PieceTree.init(alloc);
+    var pt = PieceTree.init(alloc, std.testing.io);
     defer pt.deinit();
 
     try std.testing.expectEqual(@as(usize, 0), pt.totalLength());
     try std.testing.expectEqual(@as(usize, 1), pt.lineCount());
     try std.testing.expectEqual(@as(u32, 0), pt.longestRowChars());
     try std.testing.expectEqual(@as(usize, 0), pt.tree.count());
-    // 查询在空文档上必须安全
+    // Query on empty doc must be safe
     try std.testing.expectEqual(@as(usize, 0), pt.offsetToLine(0));
     try std.testing.expectEqual(@as(usize, 0), pt.lineToOffset(0));
     try std.testing.expectEqual(@as(?PieceTree.ChunkResult, null), pt.getChunkAt(0));
     var buf: [4]u8 = undefined;
     try std.testing.expectEqualStrings("", try pt.getText(0, 0, &buf));
     try std.testing.expectEqual(@as(usize, 0), pt.resolveAnchor(PieceTree.Anchor.END));
-    // initFromBuffer("") 与 init() 等价（0 个 piece）；空树形状检查也必须安全
-    var pt2 = try PieceTree.initFromBuffer(alloc, "");
+    // initFromBuffer("") equals init() (0 pieces); empty tree shape check also safe
+    var pt2 = try PieceTree.initFromBuffer(alloc, std.testing.io, "");
     defer pt2.deinit();
     try std.testing.expectEqual(@as(usize, 0), pt2.tree.count());
     try std.testing.expectEqual(@as(usize, 0), pt2.totalLength());
     try PieceTreeShape.check(&pt2, alloc);
-    // 空文档上删除 0 长度是合法 no-op
+    // Delete 0 length on empty doc is legal no-op
     try pt.delete(0, 0);
     try std.testing.expectEqual(@as(usize, 0), pt.totalLength());
 }
 
 test "PieceTree: single character round-trips through every read path" {
-    var pt = try PieceTree.initFromBuffer(std.testing.allocator, "x");
+    var pt = try PieceTree.initFromBuffer(std.testing.allocator, std.testing.io, "x");
     defer pt.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), pt.totalLength());
@@ -2405,7 +2406,7 @@ test "PieceTree: single character round-trips through every read path" {
     defer snap.deinit();
     try std.testing.expectEqualStrings("x", try snap.getText(0, 1, &buf));
 
-    // 逐字节打满再清空：piece 反复 split/replace/remove 的最小压力路径
+    // Byte-by-byte fill then clear: minimal stress path for repeated split/replace/remove
     try pt.delete(0, 1);
     try std.testing.expectEqual(@as(usize, 0), pt.totalLength());
     try std.testing.expectEqual(@as(usize, 0), pt.tree.count());
@@ -2414,7 +2415,7 @@ test "PieceTree: single character round-trips through every read path" {
 }
 
 test "PieceTree: single character inserted into empty tree" {
-    var pt = PieceTree.init(std.testing.allocator);
+    var pt = PieceTree.init(std.testing.allocator, std.testing.io);
     defer pt.deinit();
     try pt.insert(0, "Q");
     var buf: [4]u8 = undefined;
@@ -2423,14 +2424,14 @@ test "PieceTree: single character inserted into empty tree" {
 }
 
 test "PieceTree: deleting everything then editing again stays consistent" {
-    var pt = try PieceTree.initFromBuffer(std.testing.allocator, "aa\nbb\ncc\n");
+    var pt = try PieceTree.initFromBuffer(std.testing.allocator, std.testing.io, "aa\nbb\ncc\n");
     defer pt.deinit();
     try pt.delete(0, pt.totalLength());
     try std.testing.expectEqual(@as(usize, 0), pt.totalLength());
     try std.testing.expectEqual(@as(usize, 1), pt.lineCount());
     try PieceTreeShape.check(&pt, std.testing.allocator);
 
-    // 文档清空后（tree.count()==0）再走 insert 的「空树 push」分支
+    // After clear (tree.count()==0), insert exercises empty-tree push branch
     try pt.insert(0, "fresh\ncontent\n");
     var buf: [64]u8 = undefined;
     try std.testing.expectEqualStrings("fresh\ncontent\n", try pt.getText(0, pt.totalLength(), &buf));
@@ -2440,41 +2441,41 @@ test "PieceTree: deleting everything then editing again stays consistent" {
 
 test "PieceTree: single very long line survives piece boundaries and cross-piece joins" {
     const alloc = std.testing.allocator;
-    // 行长跨过 initial_piece_bytes(2048) 与 ADD_BUFFER_PAGE_SIZE(64KiB) 两个分片阈值
+    // Line length spans initial_piece_bytes(2048) and ADD_BUFFER_PAGE_SIZE(64KiB) thresholds
     const line_len: usize = 150_000;
     const content = try alloc.alloc(u8, line_len);
     defer alloc.free(content);
     @memset(content, 'L');
 
-    var pt = try PieceTree.initFromBuffer(alloc, content);
+    var pt = try PieceTree.initFromBuffer(alloc, std.testing.io, content);
     defer pt.deinit();
     try std.testing.expectEqual(@as(usize, line_len), pt.totalLength());
     try std.testing.expectEqual(@as(usize, 1), pt.lineCount());
     try std.testing.expectEqual(@as(u32, @intCast(line_len)), pt.longestRowChars());
     try PieceTreeShape.check(&pt, alloc);
 
-    // 在长行中间插入等长内容：split -> prefix/add/suffix 三段
+    // Insert equal-length content mid-long-line: split -> prefix/add/suffix
     const mid = line_len / 2;
     try pt.insert(mid, content);
     try std.testing.expectEqual(@as(usize, line_len * 2), pt.totalLength());
     try std.testing.expectEqual(@as(u32, @intCast(line_len * 2)), pt.longestRowChars());
     try PieceTreeShape.check(&pt, alloc);
 
-    // 全量读回并逐段比对
+    // Full read-back and segment compare
     const full = try alloc.alloc(u8, pt.totalLength());
     defer alloc.free(full);
     try std.testing.expectEqual(@as(usize, line_len * 2), (try pt.getText(0, pt.totalLength(), full)).len);
     try std.testing.expectEqualSlices(u8, content, full[0..line_len]);
     try std.testing.expectEqualSlices(u8, content, full[line_len..]);
 
-    // 行坐标在超长单行上必须全程为 0
+    // Line coords on ultra-long single line must always be 0
     var off: usize = 0;
     while (off <= pt.totalLength()) : (off += 997) {
         try std.testing.expectEqual(@as(usize, 0), pt.offsetToLine(@min(off, pt.totalLength())));
     }
     try std.testing.expectEqual(@as(usize, 0), pt.lineToOffset(0));
 
-    // ChunkIterator 跨多个 piece 拼回全文
+    // ChunkIterator stitches full text across multiple pieces
     var it = pt.chunksInRange(0, pt.totalLength());
     var assembled: usize = 0;
     while (it.next()) |chunk| assembled += chunk.len;
@@ -2487,7 +2488,7 @@ test "PieceTree: long line that exceeds one add-buffer page" {
     defer alloc.free(big);
     @memset(big, 'z');
 
-    var pt = PieceTree.init(alloc); // 空树：insert 走 pushInsertedPieces 多页路径
+    var pt = PieceTree.init(alloc, std.testing.io); // Empty tree: insert exercises pushInsertedPieces multi-page path
     defer pt.deinit();
     try pt.insert(0, big);
     try std.testing.expectEqual(big.len, pt.totalLength());
@@ -2498,7 +2499,7 @@ test "PieceTree: long line that exceeds one add-buffer page" {
     defer alloc.free(full);
     try std.testing.expectEqualSlices(u8, big, try pt.getText(0, pt.totalLength(), full));
 
-    // 删除跨 add 页边界的内容后，剩余字节仍然正确
+    // After delete spanning add page boundary, remaining bytes still correct
     try pt.delete(ADD_BUFFER_PAGE_SIZE - 4, 8);
     const rest = try alloc.alloc(u8, pt.totalLength());
     defer alloc.free(rest);
@@ -2512,18 +2513,18 @@ test "PieceTree: large file with no newlines keeps offset<->line trivial" {
     const size: usize = 1024 * 1024;
     const content = try alloc.alloc(u8, size);
     defer alloc.free(content);
-    // 半随机可校验内容（不用 '\n'）
+    // Semi-random verifiable content (no '\n')
     var rng = Lcg.init(7);
     for (content) |*b| b.* = @intCast('a' + @as(u32, @intCast(rng.below(26))));
 
-    var pt = try PieceTree.initFromBuffer(alloc, content);
+    var pt = try PieceTree.initFromBuffer(alloc, std.testing.io, content);
     defer pt.deinit();
     try std.testing.expectEqual(size, pt.totalLength());
     try std.testing.expectEqual(@as(usize, 1), pt.lineCount());
     try std.testing.expectEqual(@as(usize, size / PieceTree.initial_piece_bytes), pt.tree.count());
     try PieceTreeShape.check(&pt, alloc);
 
-    // 抽样读回并校验（分段 getText 走跨 piece 路径）
+    // Sample read-back and verify (getText segments span pieces)
     var buf: [4096]u8 = undefined;
     var off: usize = 0;
     while (off < size) : (off += 61_234) {
@@ -2532,18 +2533,17 @@ test "PieceTree: large file with no newlines keeps offset<->line trivial" {
         try std.testing.expectEqualSlices(u8, content[off .. off + n], try pt.getText(off, n, &buf));
     }
 
-    // 任意 offset 都在第 0 行
+    // Any offset always on line 0
     var probe: usize = 0;
     while (probe < size) : (probe += 123_457) {
         try std.testing.expectEqual(@as(usize, 0), pt.offsetToLine(probe));
     }
 
-    // 1MiB 无换行文件在文件中间插入一个换行：lineCount 1->2，坐标全部正确。
-    // 语义对齐既有测试 "offsetToLine and lineToOffset"：lineToOffset(k) 返回
-    // 第 k 个 '\n' 之后的字节（lineToOffsetInNode 的 `byte_offset + j + 1`），
-    // 所以 '\n' 插在 mid 时 line 1 从 mid+1 开始；offsetToLine 则只数严格位于
-    // offset 之前的 '\n'。此前把 lineToOffset(1) 断言成 mid，差 1 是本测试
-    // 写错了预期，不是实现错。
+    // 1MiB no-newline file, insert newline mid-file: lineCount 1->2, coordinates all correct.
+    // Semantics match test "offsetToLine and lineToOffset": lineToOffset(k) returns the byte after
+    // the k-th '\n' (lineToOffsetInNode `byte_offset + j + 1`), so '\n' at mid means line 1 starts
+    // at
+    // mid+1; offsetToLine counts only '\n' strictly before offset.
     const mid = size / 2;
     try pt.insert(mid, "\n");
     try std.testing.expectEqual(@as(usize, 2), pt.lineCount());
@@ -2552,9 +2552,9 @@ test "PieceTree: large file with no newlines keeps offset<->line trivial" {
     try std.testing.expectEqual(@as(usize, 1), pt.offsetToLine(mid + 1));
     try std.testing.expectEqual(@as(usize, 1), pt.offsetToLine(mid + 5));
     try std.testing.expectEqual(@as(usize, 0), pt.offsetToLine(mid - 1));
-    // getLine(k) 的区间是 [lineToOffset(k), lineToOffset(k+1))，**含行尾的
-    // '\n'**（见 getLine 实现：end = lineToOffset(line+1)）。所以 line 0 是
-    // content[0..mid] 再加那个插入的换行，长度 mid+1，不是 mid。
+    // getLine(k)'s range is [lineToOffset(k), lineToOffset(k+1)), **including line-end '\n'**
+    // (see getLine impl: end = lineToOffset(line+1)). So line 0 is content[0..mid] plus the
+    // inserted newline, length mid+1, not mid.
     const line_buf = try alloc.alloc(u8, mid + 1);
     defer alloc.free(line_buf);
     const line0 = try pt.getLine(0, line_buf);
@@ -2567,22 +2567,22 @@ test "PieceTree: large file with no newlines keeps offset<->line trivial" {
 test "PieceTree: invalid UTF-8 bytes are stored and returned verbatim" {
     const alloc = std.testing.allocator;
     const cases = [_][]const u8{
-        "\xff", // 孤立非法字节
-        "\xc3\x28", // 2 字节 lead 后跟 ASCII（非法 continuation）
-        "\xe2\x82", // 3 字节序列被截断
-        "\xf0\x9f\x98", // 4 字节序列被截断
-        "ok\xff\xfe\xc0\x80ok", // 合法 + 非法混合
-        "a\xc0\x80b", // NUL 的过长编码
+        "\xff", // isolated illegal byte
+        "\xc3\x28", // 2-byte lead followed by ASCII (illegal continuation)
+        "\xe2\x82", // 3-byte sequence truncated
+        "\xf0\x9f\x98", // 4-byte sequence truncated
+        "ok\xff\xfe\xc0\x80ok", // Valid + invalid mixed
+        "a\xc0\x80b", // NUL overlong encoding
     };
 
     for (cases) |content| {
-        var pt = try PieceTree.initFromBuffer(alloc, content);
+        var pt = try PieceTree.initFromBuffer(alloc, std.testing.io, content);
         defer pt.deinit();
         const buf = try alloc.alloc(u8, content.len);
         defer alloc.free(buf);
         try std.testing.expectEqualStrings(content, try pt.getText(0, content.len, buf));
 
-        // 中间插入 + 删除后字节仍然原样
+        // After middle insert + delete, bytes unchanged
         try pt.insert(content.len / 2, "\xff");
         try pt.delete(content.len / 2, 1);
         try std.testing.expectEqualStrings(content, try pt.getText(0, content.len, buf));
@@ -2591,62 +2591,64 @@ test "PieceTree: invalid UTF-8 bytes are stored and returned verbatim" {
 
 test "PieceTree: invalid UTF-8 does not corrupt byte-exact reads or summary aggregation" {
     const alloc = std.testing.allocator;
-    // 3 字节汉字序列在缓冲区末尾方向被截断（E4 BD 后紧跟 '\n'）：
-    // 这是 scanTextStats 的 advance 修正路径 + 已知怪癖（见 piece_stats.zig
-    // 模块头的坑位说明）。本测试不硬编码怪癖算术，只锁两条无歧义不变量：
-    //   1. 字节级读写完全不受多字节解码影响（存储层是纯字节）；
-    //   2. Summary 聚合与对同一缓冲的单遍 scan 一致（统计自洽）。
-    const tail = "\u{4F60}"[0..2]; // E4 BD（缺第 3 字节）
-    var content = std.ArrayList(u8){};
+    // 3-byte Chinese sequence truncated at buffer end (E4 BD then '\n'):
+    // exercises the scanTextStats advance-correction path and a known quirk (see piece_stats.zig
+    // module header). The test doesn't hard-code quirk arithmetic; it locks two unambiguous
+    // invariants:
+    //   1. byte-level read/write is unaffected by multibyte decoding (storage is pure bytes);
+    //   2. Summary aggregation matches a single-pass scan of the same buffer (stats self-consistent).
+    const tail = "\u{4F60}"[0..2]; // E4 BD (3rd byte missing)
+    var content = @as(std.ArrayList(u8), .empty);
     defer content.deinit(alloc);
     try content.appendSlice(alloc, "aaa\n");
     try content.appendSlice(alloc, "\u{4F60}");
     try content.appendSlice(alloc, tail);
     try content.appendSlice(alloc, "\nbbb\n");
 
-    var pt = try PieceTree.initFromBuffer(alloc, content.items);
+    var pt = try PieceTree.initFromBuffer(alloc, std.testing.io, content.items);
     defer pt.deinit();
 
     var buf: [64]u8 = undefined;
     try std.testing.expectEqualStrings(content.items, try pt.getText(0, pt.totalLength(), &buf));
-    // line0 是纯 ASCII，其边界由真实字节扫描（lineToOffsetInNode）决定
+    // line0 pure ASCII, boundary determined by true byte scan (lineToOffsetInNode)
     try std.testing.expectEqualStrings("aaa\n", try pt.getLine(0, &buf));
-    // Summary 行数 == 单遍 scan 的 newline_count + 1（单 piece 下的自洽性）
+    // Summary line count == single-pass scan newline_count + 1 (self-consistency in single piece)
     try std.testing.expectEqual(
         PieceTree.scanTextStats(content.items).newline_count + 1,
         pt.lineCount(),
     );
 
-    // snapshot 路径读回同样字节
+    // snapshot path read-back same bytes
     var snap = try pt.snapshot(alloc);
     defer snap.deinit();
     try std.testing.expectEqualStrings(content.items, try snap.getText(0, snap.totalLength(), &buf));
 }
 
 test "PieceTree: offset beyond total clamps instead of panicking" {
-    var pt = try PieceTree.initFromBuffer(std.testing.allocator, "abc\ndef\n");
+    var pt = try PieceTree.initFromBuffer(std.testing.allocator, std.testing.io, "abc\ndef\n");
     defer pt.deinit();
     try std.testing.expectEqual(@as(usize, 2), pt.offsetToLine(999));
     try std.testing.expectEqual(@as(usize, 0), pt.lineToOffset(0));
-    // 超界行号退化为文档末尾（现有行为：返回末 piece 累计偏移）
+    // Out-of-range line number degrades to document end (current behavior: returns the last
+    // piece's cumulative offset).
     try std.testing.expectEqual(pt.totalLength(), pt.lineToOffset(999));
     var tiny: [4]u8 = undefined;
     try std.testing.expectError(error.InvalidRange, pt.getText(9, 1, &tiny));
     try std.testing.expectError(error.InvalidPosition, pt.insert(99, "x"));
     try std.testing.expectError(error.InvalidRange, pt.delete(99, 1));
-    // start == total 是合法的（末尾插入）
+    // start == total is legal (append at end)
     try pt.insert(pt.totalLength(), "!");
     try std.testing.expectError(error.InvalidLine, pt.getLine(99, &tiny));
 }
 
 test "PieceTree: many small edits keep the tree a balanced B-tree" {
     const alloc = std.testing.allocator;
-    var pt = try PieceTree.initFromBuffer(alloc, "");
+    var pt = try PieceTree.initFromBuffer(alloc, std.testing.io, "");
     defer pt.deinit();
 
-    // 用「可精确重放的字符串模型」做 oracle：每一步编辑后 both 全文一致 +
-    // 树形状合法。LCG 保证可复现。
-    var model = std.ArrayList(u8){};
+    // Use an exactly replayable string model as oracle: after every edit both full texts match and
+    // the tree shape is valid. The LCG makes runs reproducible.
+    var model = @as(std.ArrayList(u8), .empty);
     defer model.deinit(alloc);
 
     var rng = Lcg.init(20260730);
@@ -2658,7 +2660,7 @@ test "PieceTree: many small edits keep the tree a balanced B-tree" {
     while (step < 400) : (step += 1) {
         const op = rng.below(10);
         if (op < 6) {
-            // 插入 1..12 个字符
+            // Insert 1..12 chars
             const n = 1 + rng.below(12);
             var tmp: [12]u8 = undefined;
             for (0..n) |i| tmp[i] = alphabet[rng.below(alphabet.len)];
@@ -2666,14 +2668,14 @@ test "PieceTree: many small edits keep the tree a balanced B-tree" {
             try pt.insert(pos, tmp[0..n]);
             try model.insertSlice(alloc, pos, tmp[0..n]);
         } else if (op < 9 and model.items.len > 0) {
-            // 删除 1..40 字节
+            // Delete 1..40 bytes
             const pos = rng.below(model.items.len);
             const max_del = @min(40, model.items.len - pos);
             const n = 1 + rng.below(max_del);
             try pt.delete(pos, n);
             try model.replaceRange(alloc, pos, n, "");
         } else {
-            // 替换：等价于 delete + insert（覆盖 deleteUnlocked 的跨 piece 分支）
+            // Replace: equivalent to delete + insert (covers deleteUnlocked cross-piece branch)
             if (model.items.len == 0) continue;
             const pos = rng.below(model.items.len);
             const max_del = @min(20, model.items.len - pos);
@@ -2687,7 +2689,7 @@ test "PieceTree: many small edits keep the tree a balanced B-tree" {
             try model.insertSlice(alloc, pos, tmp[0..insert_n]);
         }
 
-        // 每步校验：长度、全文、行数、最长行、树形状
+        // Each step verify: length, full text, line count, longest line, tree shape
         try std.testing.expectEqual(model.items.len, pt.totalLength());
         if (model.items.len > 0) {
             var pos: usize = 0;
@@ -2712,17 +2714,16 @@ test "PieceTree: many small edits keep the tree a balanced B-tree" {
             } else cur += 1;
         }
         if (cur > longest) longest = cur;
-        // 注意：PieceTree 按 code point 计数，但本测试 alphabet 全 ASCII，两口径一致
+        // Note: PieceTree counts code points, but alphabet all ASCII, same result
         try std.testing.expectEqual(longest, pt.longestRowChars());
 
         if (step % 40 == 0) try PieceTreeShape.check(&pt, alloc);
     }
     try PieceTreeShape.check(&pt, alloc);
-    // 刻意**不**断言 tree.count() 的具体量级：piece 数量取决于合并/分裂策略
-    // （相邻同源 piece 会被合并），是实现细节而非契约。这个循环的价值在于
-    // 「每步之后全文与 model 逐字节一致 + PieceTreeShape.check 通过」，那才是
-    // B-tree 不变量。此前这里写了 `count() > 20`，实测随机序列下会被合并到
-    // 20 以下而变红，断言的是实现细节，不是行为。
+    // Intentionally don't assert piece count magnitude: it depends on merge/split policy (adjacent
+    // same-source pieces merge), an implementation detail, not a contract. The loop's value is
+    // "text matches the model bytewise each step + PieceTreeShape.check passes", the B-tree
+    // invariant. Random sequences can merge below any fixed count (e.g. `count() > 20`).
 }
 
 test "PieceTree: document entirely of newlines" {
@@ -2732,14 +2733,14 @@ test "PieceTree: document entirely of newlines" {
     defer alloc.free(content);
     @memset(content, '\n');
 
-    var pt = try PieceTree.initFromBuffer(alloc, content);
+    var pt = try PieceTree.initFromBuffer(alloc, std.testing.io, content);
     defer pt.deinit();
     try std.testing.expectEqual(n, pt.totalLength());
     try std.testing.expectEqual(n + 1, pt.lineCount());
     try std.testing.expectEqual(@as(u32, 0), pt.longestRowChars());
     try PieceTreeShape.check(&pt, alloc);
 
-    // line k 的起点必是 k（每行都是空行）
+    // line k start must be k (every line empty)
     var k: usize = 0;
     while (k <= n) : (k += 317) {
         try std.testing.expectEqual(k, pt.lineToOffset(k));
@@ -2752,9 +2753,9 @@ test "PieceTree: document entirely of newlines" {
 
 test "PieceTree: snapshot line coordinates match the live tree" {
     const alloc = std.testing.allocator;
-    var pt = try PieceTree.initFromBuffer(alloc, "l0\nl1\nl2\nl3\n");
+    var pt = try PieceTree.initFromBuffer(alloc, std.testing.io, "l0\nl1\nl2\nl3\n");
     defer pt.deinit();
-    try pt.insert(3, "INSERTED\n"); // 多 piece
+    try pt.insert(3, "INSERTED\n"); // Multiple pieces
     var snap = try pt.snapshot(alloc);
     defer snap.deinit();
 
@@ -2771,18 +2772,19 @@ test "PieceTree: snapshot line coordinates match the live tree" {
 }
 
 test "PieceTree: ChunkIterator seekTo repositions for non-sequential readers" {
-    var pt = try PieceTree.initFromBuffer(std.testing.allocator, "0123456789abcdefghij");
+    var pt = try PieceTree.initFromBuffer(std.testing.allocator, std.testing.io, "0123456789abcdefghij");
     defer pt.deinit();
-    try pt.insert(10, "---"); // 制造 3 个 piece
+    try pt.insert(10, "---"); // Create 3 pieces
 
     const total = pt.totalLength();
     const buf = try std.testing.allocator.alloc(u8, total);
     defer std.testing.allocator.free(buf);
-    // oracle：正序全量
+    // oracle: full forward scan
     const oracle = try pt.getText(0, total, buf);
 
-    // tree-sitter 式非顺序读法：读一段 -> seek 到中段 -> 读到尾 -> 再 seek 回头部
-    var got = std.ArrayList(u8){};
+    // tree-sitter-style nonsequential read: read segment -> seek mid -> read to end -> seek back to
+    // head
+    var got = @as(std.ArrayList(u8), .empty);
     defer got.deinit(std.testing.allocator);
 
     var it = pt.chunksInRange(0, total);
@@ -2799,32 +2801,32 @@ test "PieceTree: ChunkIterator seekTo repositions for non-sequential readers" {
     while (it.next()) |c| try got.appendSlice(std.testing.allocator, c);
     try std.testing.expectEqualStrings(oracle, got.items);
 
-    // seek 超出 total：钳到末尾，读出空
+    // Seek past total: clamp to end, read empty
     it.seekTo(total * 2, total);
     try std.testing.expectEqual(@as(?[]const u8, null), it.next());
 }
 
 test "PieceTree: anchors survive a delete that empties the document" {
-    var pt = try PieceTree.initFromBuffer(std.testing.allocator, "abcdef");
+    var pt = try PieceTree.initFromBuffer(std.testing.allocator, std.testing.io, "abcdef");
     defer pt.deinit();
     const a = pt.anchorAtStrict(3, .right);
     try std.testing.expectEqual(@as(usize, 3), pt.resolveAnchor(a));
     try pt.delete(0, 6);
-    // 文档清空：anchor 回退到 0（.right 且无 best_after 时落在 doc_offset）
+    // Empty doc: anchor revert to 0 (.right with no best_after lands at doc_offset)
     try std.testing.expectEqual(@as(usize, 0), pt.resolveAnchor(a));
-    // 清空后 anchorAtStrict 也不 panic
+    // anchorAtStrict doesn't panic after empty
     const b = pt.anchorAtStrict(0, .left);
     try std.testing.expectEqual(@as(usize, 0), pt.resolveAnchor(b));
 }
 
 test "PieceTree: many-piece insert then full read matches (no newline, 300 pieces)" {
     const alloc = std.testing.allocator;
-    var pt = PieceTree.init(alloc);
+    var pt = PieceTree.init(alloc, std.testing.io);
     defer pt.deinit();
-    var expect = std.ArrayList(u8){};
+    var expect = @as(std.ArrayList(u8), .empty);
     defer expect.deinit(alloc);
 
-    // 300 次随机位置小插入，制造 300+ piece 的树（高度 2~3）
+    // 300 random-position small inserts, create 300+ piece tree (height 2-3)
     var rng = Lcg.init(99);
     var step: usize = 0;
     while (step < 300) : (step += 1) {
@@ -2838,7 +2840,7 @@ test "PieceTree: many-piece insert then full read matches (no newline, 300 piece
     defer alloc.free(buf);
     try std.testing.expectEqualSlices(u8, expect.items, try pt.getText(0, pt.totalLength(), buf));
     try PieceTreeShape.check(&pt, alloc);
-    // 逐 offset 校验 offsetToLine（全程无换行 -> 恒 0）
+    // Verify offsetToLine per offset (no newlines -> always 0)
     var off: usize = 0;
     while (off <= pt.totalLength()) : (off += 7) {
         try std.testing.expectEqual(@as(usize, 0), pt.offsetToLine(off));
@@ -2847,11 +2849,11 @@ test "PieceTree: many-piece insert then full read matches (no newline, 300 piece
 
 test "PieceTree fragmented range reads match immutable snapshot after COW edit" {
     const allocator = std.testing.allocator;
-    const original = "abcd" ** 256;
-    var tree = try PieceTree.initFromBuffer(allocator, original);
+    const original = (@as([("abcd").len * (256)]u8, @bitCast(@as([256][("abcd").len]u8, @splat(("abcd").*)))) ++ "");
+    var tree = try PieceTree.initFromBuffer(allocator, std.testing.io, original);
     defer tree.deinit();
     for (0..256) |i| try tree.insert(i * 6 + 2, "XY");
-    const expected = "abXYcd" ** 256;
+    const expected = (@as([("abXYcd").len * (256)]u8, @bitCast(@as([256][("abXYcd").len]u8, @splat(("abXYcd").*)))) ++ "");
     var snapshot = try tree.snapshot(allocator);
     defer snapshot.deinit();
     try tree.insert(0, "prefix");
@@ -2872,7 +2874,7 @@ test "PieceTree fragmented range reads match immutable snapshot after COW edit" 
 }
 
 test "PieceTree public edits never retain zero-byte pieces" {
-    var tree = try PieceTree.initFromBuffer(std.testing.allocator, "");
+    var tree = try PieceTree.initFromBuffer(std.testing.allocator, std.testing.io, "");
     defer tree.deinit();
     const Op = struct { start: usize, remove: usize = 0, insert: []const u8 = "" };
     for ([_]Op{

@@ -1,29 +1,33 @@
-/// Event System - 事件定义和调度
+/// Event System: event definitions and dispatch.
 ///
-/// Phase 3.3+: 完整事件系统
-///
-/// 支持:
-/// - 鼠标事件: mouse_down, mouse_up, click, double_click, mouse_move, mouse_enter, mouse_leave, scroll
-/// - 键盘事件: key_down, key_up
-/// - 文本输入: text_input, ime_preedit, ime_commit
-/// - 焦点事件: focus, blur
-/// - 事件传播: capture -> target -> bubble (DOM 风格)
+/// Supports:
+/// - mouse events: mouse_down, mouse_up, click, double_click, mouse_move, mouse_enter, mouse_leave,
+///   scroll
+/// - keyboard events: key_down, key_up
+/// - text input: text_input, ime_preedit, ime_commit
+/// - focus events: focus, blur
+/// - event propagation: capture -> target -> bubble (DOM style)
 const std = @import("std");
 
-/// 多击判定窗口与像素容差。
-/// 300ms / 5px 在桌面编辑器里偏紧，容易让双击/三击感觉“慢一拍”或“没吃到”。
+/// Platform's standard application shortcut modifier.
+pub fn primaryModifier(modifiers: Modifiers) bool {
+    return if (@import("builtin").target.os.tag == .windows) modifiers.ctrl else modifiers.super;
+}
+
+/// Multi-click detection window and pixel tolerance. 300ms / 5px is tight in desktop editors,
+/// making double-click/triple-click feel one frame late or missed.
 pub const multi_click_interval_ns: u64 = 450 * std.time.ns_per_ms;
 pub const multi_click_slop_px: f32 = 8.0;
 pub const multi_click_slop_sq: f32 = multi_click_slop_px * multi_click_slop_px;
 
-/// 鼠标按钮
+/// Mouse button
 pub const MouseButton = enum {
     left,
     right,
     middle,
 };
 
-/// 鼠标按键事件 (mouse_down / mouse_up)
+/// Mouse button events (mouse_down / mouse_up)
 pub const MouseButtonEvent = struct {
     x: f32,
     y: f32,
@@ -31,7 +35,7 @@ pub const MouseButtonEvent = struct {
     modifiers: Modifiers = .{},
 };
 
-/// 点击事件 (完整点击: down + up 在同一元素)
+/// Click event (complete click: down + up on same element)
 pub const ClickEvent = struct {
     x: f32,
     y: f32,
@@ -40,20 +44,20 @@ pub const ClickEvent = struct {
     click_count: u8 = 1,
 };
 
-/// 鼠标移动事件
+/// Mouse move event
 pub const MouseMoveEvent = struct {
     x: f32,
     y: f32,
     dx: f32 = 0,
     dy: f32 = 0,
-    /// 宿主经 `Cx.handleMouseMoveEx` 传入时为实时值；旧 `handleMouseMove`
-    /// 入口退化为 `.{}`（不伪称实时）。
+    /// Host passes real-time value via Cx.handleMouseMoveEx; old handleMouseMove degenerates to .{}
+    /// (does not feign real-time).
     modifiers: Modifiers = .{},
 };
 
-/// 键盘按键代码
+/// Keyboard key codes
 pub const KeyCode = enum(u16) {
-    // 字母键
+    // Letter keys
     a = 0,
     s = 1,
     d = 2,
@@ -81,7 +85,7 @@ pub const KeyCode = enum(u16) {
     n = 45,
     m = 46,
 
-    // 数字键
+    // Number keys
     @"1" = 18,
     @"2" = 19,
     @"3" = 20,
@@ -93,7 +97,7 @@ pub const KeyCode = enum(u16) {
     @"9" = 25,
     @"0" = 29,
 
-    // 功能键
+    // Function keys
     @"return" = 36,
     tab = 48,
     space = 49,
@@ -101,13 +105,13 @@ pub const KeyCode = enum(u16) {
     escape = 53,
     forward_delete = 117,
 
-    // 箭头键
+    // Arrow keys
     left = 123,
     right = 124,
     down = 125,
     up = 126,
 
-    // 修饰键
+    // Modifier keys
     left_shift = 56,
     right_shift = 60,
     left_ctrl = 59,
@@ -117,7 +121,7 @@ pub const KeyCode = enum(u16) {
     left_super = 55,
     right_super = 54,
 
-    // 符号键
+    // Symbol keys
     slash = 44,
     minus = 27,
     equal = 24,
@@ -130,13 +134,13 @@ pub const KeyCode = enum(u16) {
     backslash = 42,
     grave = 50,
 
-    // 特殊键
+    // Special keys
     home = 115,
     end = 119,
     page_up = 116,
     page_down = 121,
 
-    // 功能键 F1-F12（macOS keycode）
+    // Function keys F1-F12 (macOS keycode)
     f1 = 122,
     f2 = 120,
     f3 = 99,
@@ -150,53 +154,145 @@ pub const KeyCode = enum(u16) {
     f11 = 103,
     f12 = 111,
 
-    // 未知
+    // Unknown
     unknown = 0xFFFF,
 
     pub fn fromRawKeycode(raw: u16) KeyCode {
-        return std.meta.intToEnum(KeyCode, raw) catch .unknown;
+        return std.enums.fromInt(KeyCode, raw) orelse .unknown;
+    }
+
+    /// Translate Win32 virtual-key codes into Zenit's logical key enum.
+    /// Letter and digit VKs are layout-independent physical shortcuts here;
+    /// committed characters continue to arrive through text_input.
+    pub fn fromWindowsVirtualKey(vk: u16) KeyCode {
+        return switch (vk) {
+            0x41 => .a,
+            0x42 => .b,
+            0x43 => .c,
+            0x44 => .d,
+            0x45 => .e,
+            0x46 => .f,
+            0x47 => .g,
+            0x48 => .h,
+            0x49 => .i,
+            0x4A => .j,
+            0x4B => .k,
+            0x4C => .l,
+            0x4D => .m,
+            0x4E => .n,
+            0x4F => .o,
+            0x50 => .p,
+            0x51 => .q,
+            0x52 => .r,
+            0x53 => .s,
+            0x54 => .t,
+            0x55 => .u,
+            0x56 => .v,
+            0x57 => .w,
+            0x58 => .x,
+            0x59 => .y,
+            0x5A => .z,
+            0x30 => .@"0",
+            0x31 => .@"1",
+            0x32 => .@"2",
+            0x33 => .@"3",
+            0x34 => .@"4",
+            0x35 => .@"5",
+            0x36 => .@"6",
+            0x37 => .@"7",
+            0x38 => .@"8",
+            0x39 => .@"9",
+            0x0D => .@"return",
+            0x09 => .tab,
+            0x20 => .space,
+            0x08 => .delete,
+            0x1B => .escape,
+            0x2E => .forward_delete,
+            0x25 => .left,
+            0x27 => .right,
+            0x28 => .down,
+            0x26 => .up,
+            0x24 => .home,
+            0x23 => .end,
+            0x21 => .page_up,
+            0x22 => .page_down,
+            0xA0 => .left_shift,
+            0xA1 => .right_shift,
+            0xA2 => .left_ctrl,
+            0xA3 => .right_ctrl,
+            0xA4 => .left_alt,
+            0xA5 => .right_alt,
+            0x5B => .left_super,
+            0x5C => .right_super,
+            0xBF => .slash,
+            0xBD => .minus,
+            0xBB => .equal,
+            0xDB => .left_bracket,
+            0xDD => .right_bracket,
+            0xBE => .period,
+            0xBC => .comma,
+            0xBA => .semicolon,
+            0xDE => .quote,
+            0xDC => .backslash,
+            0xC0 => .grave,
+            0x70 => .f1,
+            0x71 => .f2,
+            0x72 => .f3,
+            0x73 => .f4,
+            0x74 => .f5,
+            0x75 => .f6,
+            0x76 => .f7,
+            0x77 => .f8,
+            0x78 => .f9,
+            0x79 => .f10,
+            0x7A => .f11,
+            0x7B => .f12,
+            else => .unknown,
+        };
     }
 };
 
-/// 键盘事件
+/// Keyboard event
 pub const KeyEvent = struct {
     key: KeyCode = .unknown,
     raw_keycode: u16 = 0,
     modifiers: Modifiers = .{},
 };
 
-/// 文本输入事件
+/// Text input event
 pub const TextInputEvent = struct {
     text: []const u8,
 };
 
-/// IME replacementRange 哨兵：本次 preedit/commit 不修订已提交文本（现行为）。
+/// IME replacementRange sentinel: this preedit/commit does not revise submitted text (current
+/// behavior).
 pub const ime_no_replacement: u32 = 0xFFFF_FFFF;
 
-/// IME 预编辑事件
+/// IME preedit event
 pub const ImePreeditEvent = struct {
     text: []const u8,
     cursor_utf8_offset: u32 = 0,
-    /// replacementRange 换算成的 UTF-8 字节区间（相对文档）；再変換等把已
-    /// 提交文本拉回合成态时非哨兵。
+    /// replacementRange converted to UTF-8 byte range (relative to document); re-convert and
+    /// similar operations that pull submitted text back into composition mode when not sentinel.
     replace_start_utf8: u32 = ime_no_replacement,
     replace_end_utf8: u32 = ime_no_replacement,
 };
 
-/// IME 提交事件
+/// IME commit event
 pub const ImeCommitEvent = struct {
     text: []const u8,
-    /// replacementRange 换算成的 UTF-8 字节区间（相对文档）；非哨兵时本次
-    /// commit 应替换该区间而不是落在光标处。
+    /// replacementRange converted to UTF-8 byte range (relative to document); when not sentinel,
+    /// this commit should replace that range rather than land at cursor.
     replace_start_utf8: u32 = ime_no_replacement,
     replace_end_utf8: u32 = ime_no_replacement,
 };
 
-/// 触控板滚动手势阶段（对应 NSEvent.phase）。鼠标滚轮与惯性事件为 .none。
-/// 一个手势总是从 may_begin 或 began 开始，以 ended 或 cancelled 结束。
+/// Trackpad scroll gesture phase (corresponds to NSEvent.phase). Mouse wheel and momentum events
+/// are .none.
+/// A gesture always starts with may_begin or began, ending with ended or cancelled.
 pub const ScrollPhase = enum(u8) {
     none,
-    /// 手指放下但还没移动；随后是 began 或 cancelled
+    /// Finger down but not yet moved; followed by began or cancelled.
     may_begin,
     began,
     changed,
@@ -204,10 +300,11 @@ pub const ScrollPhase = enum(u8) {
     cancelled,
 };
 
-/// 松手后的惯性阶段（对应 NSEvent.momentumPhase）。非惯性事件为 .none。
+/// Momentum phase after finger lift (corresponds to NSEvent.momentumPhase). Non-momentum events are
+/// .none.
 pub const MomentumPhase = enum(u8) { none, began, changed, ended };
 
-/// 滚轮事件
+/// Scroll wheel event
 pub const ScrollEvent = struct {
     dx: f32,
     dy: f32,
@@ -215,38 +312,39 @@ pub const ScrollEvent = struct {
     y: f32,
     phase: ScrollPhase = .none,
     momentum: MomentumPhase = .none,
-    /// 事件发生时的修饰键状态（Cmd/Ctrl+滚轮 = 缩放 等画布交互需要）
+    /// Modifier key state when event occurs (Cmd/Ctrl+scroll = zoom and similar canvas interactions
+    /// require this).
     modifiers: Modifiers = .{},
 
-    /// 手指离开触控板（ended 之后可能有惯性，cancelled 没有）
+    /// Finger left trackpad (ended may be followed by momentum, cancelled has none).
     pub fn phaseEnded(self: ScrollEvent) bool {
         return self.phase == .ended or self.phase == .cancelled;
     }
 
-    /// 松手后的惯性事件
+    /// Momentum event after lift
     pub fn isMomentum(self: ScrollEvent) bool {
         return self.momentum != .none;
     }
 
-    /// 触控板事件（有手势阶段或惯性）；false = 鼠标滚轮
+    /// Trackpad event (has gesture phase or momentum); false = mouse wheel.
     pub fn isTrackpad(self: ScrollEvent) bool {
         return self.isMomentum() or self.phase != .none;
     }
 };
 
-/// 连续手势阶段
+/// Continuous gesture phase
 pub const GesturePhase = enum(u8) { began, changed, ended, cancelled };
 
-/// 触控板捏合（magnify）事件
+/// Trackpad pinch (magnify) event
 pub const MagnifyEvent = struct {
-    /// 相对增量：new_scale = old_scale * (1 + magnification)，典型值 0.01~0.05
+    /// Relative delta: new_scale = old_scale * (1 + magnification), typical range 0.01~0.05.
     magnification: f32,
     x: f32,
     y: f32,
     phase: GesturePhase,
 };
 
-/// 拖放事件（Finder / 浏览器拖入）
+/// Drag event (Finder / browser drag-in)
 pub const DragEvent = struct {
     pub const Kind = enum(u8) { entered, updated, exited, dropped };
     pub const PayloadKind = enum(u8) { none = 0, file_or_url = 1, text = 2, internal = 3 };
@@ -254,20 +352,19 @@ pub const DragEvent = struct {
     x: f32,
     y: f32,
     kind: Kind,
-    /// dropped 时有效。`payload_kind == .file_or_url` 时是换行分隔列表；
-    /// `.text` / `.internal` 时是单个 UTF-8 payload，可合法包含换行。
-    /// slice 仅事件派发期间有效，需要保留时自行 dupe。内容（含
-    /// file-promise 文件名）由外部进程控制，不可直接当作命令、HTML 或
-    /// 无需复验的授权路径使用。
+    /// Valid when dropped. When payload_kind == .file_or_url, is newline-separated list; .text /
+    /// .internal is single UTF-8 payload, may contain newlines. Slice valid only during dispatch;
+    /// copy if retention needed. Content (including file-promise names) controlled by external
+    /// process, must not be used as command, HTML, or unvalidated auth path.
     paths: []const u8 = "",
     payload_kind: PayloadKind = .none,
-    /// 后端容量不足时为 true；此时 `paths` 会整体置空，避免消费半条路径。
+    /// Backend out of capacity: paths fully cleared to avoid consuming partial list.
     payload_truncated: bool = false,
-    /// 平台拖入数据始终为不可信；自动化/应用内合成事件可显式设为 false。
+    /// Platform drag data always untrusted; automation/internal synthesis may explicitly set false.
     payload_is_untrusted: bool = true,
 };
 
-/// 修饰键状态
+/// Modifier key state
 pub const Modifiers = packed struct {
     shift: bool = false,
     ctrl: bool = false,
@@ -278,34 +375,34 @@ pub const Modifiers = packed struct {
     pub const NONE = Modifiers{};
 };
 
-/// 事件传播阶段
+/// Event propagation phase
 pub const EventPhase = enum {
-    /// 捕获阶段: 从根到目标
+    /// Capture phase: root to target
     capture,
-    /// 目标阶段: 在目标元素上
+    /// Target phase: on target element
     target,
-    /// 冒泡阶段: 从目标到根
+    /// Bubble phase: target to root
     bubble,
 };
 
-/// 焦点变化原因
+/// Focus change reason
 pub const FocusReason = enum {
     click,
     tab,
     programmatic,
 };
 
-/// 焦点事件
+/// Focus event
 pub const FocusEvent = struct {
-    /// 关联节点 ID (focus 时为失焦节点, blur 时为获焦节点)
+    /// Related node ID (blurred node on focus, focused node on blur)
     related_node_id: ?u32 = null,
-    /// 焦点变化原因
+    /// Focus change reason
     reason: FocusReason = .programmatic,
 };
 
-/// 事件类型联合
+/// Event type union
 pub const Event = union(enum) {
-    // 鼠标事件
+    // Mouse event
     mouse_down: MouseButtonEvent,
     mouse_up: MouseButtonEvent,
     click: ClickEvent,
@@ -317,27 +414,27 @@ pub const Event = union(enum) {
     magnify: MagnifyEvent,
     drag: DragEvent,
 
-    // 键盘事件
+    // Keyboard event
     key_down: KeyEvent,
     key_up: KeyEvent,
 
-    // 文本输入
+    // Text input
     text_input: TextInputEvent,
     ime_preedit: ImePreeditEvent,
     ime_commit: ImeCommitEvent,
 
-    // 焦点事件
+    // Focus event
     focus: FocusEvent,
     blur: FocusEvent,
 };
 
-/// 事件处理结果
+/// Event handling result
 pub const EventResult = enum {
-    /// 事件未处理，继续传播，默认行为允许执行
+    /// Event unhandled, continue propagation, default action allowed.
     ignored,
-    /// 事件已处理，继续传播，默认行为应被阻止
+    /// Event handled, continue propagation, default action should be prevented.
     handled,
-    /// 事件已处理，停止传播，默认行为应被阻止
+    /// Event handled, stop propagation, default action should be prevented.
     stop,
 };
 
@@ -348,8 +445,6 @@ pub fn preventsDefault(result: EventResult) bool {
 pub fn stopsPropagation(result: EventResult) bool {
     return result == .stop;
 }
-
-// ========== 测试 ==========
 
 test "Event creation" {
     const click = ClickEvent{ .x = 100, .y = 200 };
@@ -371,6 +466,14 @@ test "KeyCode: fromRawKeycode" {
     try std.testing.expectEqual(KeyCode.@"return", KeyCode.fromRawKeycode(36));
     try std.testing.expectEqual(KeyCode.tab, KeyCode.fromRawKeycode(48));
     try std.testing.expectEqual(KeyCode.unknown, KeyCode.fromRawKeycode(0xFFFE));
+}
+
+test "KeyCode: Win32 virtual keys" {
+    try std.testing.expectEqual(KeyCode.a, KeyCode.fromWindowsVirtualKey(0x41));
+    try std.testing.expectEqual(KeyCode.v, KeyCode.fromWindowsVirtualKey(0x56));
+    try std.testing.expectEqual(KeyCode.escape, KeyCode.fromWindowsVirtualKey(0x1B));
+    try std.testing.expectEqual(KeyCode.left, KeyCode.fromWindowsVirtualKey(0x25));
+    try std.testing.expectEqual(KeyCode.unknown, KeyCode.fromWindowsVirtualKey(0xFF));
 }
 
 test "Event union: mouse_down" {

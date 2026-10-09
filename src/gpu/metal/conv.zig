@@ -1,7 +1,7 @@
-/// 类型转换模块
+/// Type conversion module
 ///
-/// 提供 gpu.zig 前端类型 <-> Metal 原生类型的转换
-/// 参考: wgpu-hal/src/metal/conv.rs
+/// Provides conversions between gpu.zig frontend types <-> Metal native types
+/// Reference: wgpu-hal/src/metal/conv.rs
 const gpu = @import("../gpu.zig");
 const mtl = @import("metal_bindings.zig");
 
@@ -76,14 +76,14 @@ pub fn toMetalPixelFormat(format: gpu.TextureFormat) mtl.MTLPixelFormat {
         .bc7_rgba_unorm => .BC7_RGBAUnorm,
         .bc7_rgba_unorm_srgb => .BC7_RGBAUnorm_sRGB,
 
-        // Metal 不支持的格式，使用最近的等价格式。
-        // depth24plus 的 WebGPU 语义就是"至少 24 位、实现自选"，Metal 在
-        // Apple Silicon 上本就无 D24, Depth32Float 是规范授权的合规实现
-        // （Dawn/wgpu 同此），不是降级。
+        // Metal unsupported formats, use nearest equivalent format.
+        // depth24plus WebGPU semantics = "at least 24 bits, implementation-chosen"; Metal on
+        // Apple Silicon has no D24, Depth32Float is standards-compliant (same as Dawn/wgpu),
+        // not a fallback.
         .depth24_plus => .Depth32Float,
         .depth24_plus_stencil8 => .Depth32Float_Stencil8,
-        // Metal 原生支持 RGB10A2；此前占位回退到 BGRA8, 10 位掉 8 位
-        // （HDR/宽色域 banding）且通道序 RGB->BGR，调用方毫无感知。
+        // Metal natively supports RGB10A2; prior fallback to BGRA8 lost 10-bit depth (HDR/wide
+        // color banding) and swapped channels RGB->BGR, undetected by caller.
         .rgb10a2_unorm => .RGB10A2Unorm,
     };
 }
@@ -108,17 +108,17 @@ pub fn toMetalTextureUsage(usage: gpu.TextureUsages) c_ulong {
     var result: c_ulong = 0;
 
     if (usage.texture_binding) {
-        result |= @intFromEnum(mtl.MTLTextureUsage.ShaderRead);
+        result |= @backingInt(mtl.MTLTextureUsage.ShaderRead);
     }
     if (usage.storage_binding) {
-        result |= @intFromEnum(mtl.MTLTextureUsage.ShaderWrite);
+        result |= @backingInt(mtl.MTLTextureUsage.ShaderWrite);
     }
     if (usage.render_attachment) {
-        result |= @intFromEnum(mtl.MTLTextureUsage.RenderTarget);
+        result |= @backingInt(mtl.MTLTextureUsage.RenderTarget);
     }
 
-    // Metal 总是允许 PixelFormatView
-    result |= @intFromEnum(mtl.MTLTextureUsage.PixelFormatView);
+    // Metal always allows PixelFormatView
+    result |= @backingInt(mtl.MTLTextureUsage.PixelFormatView);
 
     return result;
 }
@@ -128,11 +128,11 @@ pub fn toMetalTextureUsage(usage: gpu.TextureUsages) c_ulong {
 // ============================================================================
 
 pub fn toMetalResourceOptions(usage: gpu.BufferUsages) mtl.MTLResourceOptions {
-    // 判断存储模式
+    // Determine storage mode
     const storage_mode: mtl.MTLStorageMode = if (usage.map_read or usage.map_write)
-        .Shared // CPU 可见
+        .Shared // CPU visible
     else
-        .Private; // 仅 GPU（最快）
+        .Private; // GPU only (fastest)
 
     return mtl.resourceOptionsFromStorageMode(storage_mode);
 }

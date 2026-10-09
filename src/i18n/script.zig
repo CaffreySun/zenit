@@ -1,44 +1,41 @@
-//! Script detection + run split, Phase 6 文本流水线
-//!
-//! 在 bidi.splitRuns 之后再按 script（拉丁/CJK/阿拉伯/希伯来等）切分；
-//! 同 direction + 同 script 的连续 codepoint 形成一个 shaping run。
-//!
-//! 简化版：覆盖最常见 6 种 script + Common（标点等）。
-//! 完整 ISO 15924 / Unicode Script Extensions 留 v0.3+。
-//!
-//! 设计参照：
+//! Script detection + run split for the text pipeline.
+//! After bidi.splitRuns, split by script (Latin/CJK/Arabic/Hebrew/etc).
+//! Consecutive codepoints with same direction and script form one shaping run.
+//! Simplified: covers the 6 most common scripts + Common (punctuation, etc).
+//! Full ISO 15924 / Unicode Script Extensions are not supported.
+//! Design references:
 //! - ICU u_getScript / hb_unicode_script
-//! - Skia SkShaper RunIterator 内部 script run 切分
+//! - Skia SkShaper RunIterator script run split
 
 const std = @import("std");
 const testing = std.testing;
 
 pub const Script = enum(u8) {
-    /// 通用（数字、ASCII 标点、空格，跟前一个真 script 走）
+    /// Common (digits, ASCII punctuation, spaces; follows preceding true script).
     common,
-    /// 拉丁
+    /// Latin
     latin,
-    /// 希腊
+    /// Greek
     greek,
-    /// 西里尔
+    /// Cyrillic
     cyrillic,
-    /// 阿拉伯
+    /// Arabic
     arabic,
-    /// 希伯来
+    /// Hebrew
     hebrew,
-    /// CJK（中日韩统一表意 + Hiragana + Katakana + Hangul）
+    /// CJK (unified Han + Hiragana + Katakana + Hangul).
     cjk,
-    /// 天城（印地等）
+    /// Devanagari (Hindi, etc).
     devanagari,
-    /// 泰文
+    /// Thai
     thai,
-    /// 其他（fallback）
+    /// Other (fallback).
     other,
 };
 
 /// codepoint -> Script
 pub fn classify(cp: u32) Script {
-    // ASCII 控制 + 标点 + 数字
+    // ASCII control + punctuation + digits.
     if (cp < 0x80) {
         if ((cp >= 'A' and cp <= 'Z') or (cp >= 'a' and cp <= 'z')) return .latin;
         return .common;
@@ -61,7 +58,7 @@ pub fn classify(cp: u32) Script {
     // Thai
     if (cp >= 0x0E00 and cp <= 0x0E7F) return .thai;
     // CJK
-    if (cp >= 0x3000 and cp <= 0x303F) return .common; // CJK 标点
+    if (cp >= 0x3000 and cp <= 0x303F) return .common; // CJK punctuation
     if (cp >= 0x3040 and cp <= 0x309F) return .cjk; // Hiragana
     if (cp >= 0x30A0 and cp <= 0x30FF) return .cjk; // Katakana
     if (cp >= 0x3400 and cp <= 0x4DBF) return .cjk; // CJK Ext A
@@ -72,17 +69,17 @@ pub fn classify(cp: u32) Script {
 }
 
 pub const ScriptRun = struct {
-    /// utf-8 byte offset 起始
+    /// UTF-8 byte offset start.
     start: u32,
-    /// 结束（exclusive）
+    /// End (exclusive).
     end: u32,
-    /// 主导 script
+    /// Dominant script.
     script: Script,
 };
 
-/// 在已知 byte range 内（来自 bidi.splitRuns 后的单个 direction run）按 script 切分。
-/// common（数字/标点）不开新 run，跟前一个真 script。如果开头就是 common，
-/// 会等到第一个真 script 才确定 run 起点的 script。
+/// Within known byte range (from single direction run after bidi.splitRuns), split by script.
+/// Common (digits/punctuation) doesn't start new run; follows preceding true script. If leading
+/// common, waits for first true script to determine run start.
 pub fn splitScriptRuns(
     text: []const u8,
     bidi_start: u32,
@@ -106,7 +103,7 @@ pub fn splitScriptRuns(
 
         if (real_script) |s| {
             if (current_script == null) {
-                // 头一个真 script
+                // First true script.
                 current_script = s;
             } else if (s != current_script.?) {
                 // flush
@@ -119,7 +116,7 @@ pub fn splitScriptRuns(
                 current_start = byte_pos;
             }
         }
-        // common: 不切；跟当前 run 走
+        // common: don't split; follows current run.
 
         byte_pos += cp_byte_len;
     }
@@ -157,7 +154,7 @@ test "classify: Arabic" {
 }
 
 test "classify: CJK" {
-    try testing.expectEqual(Script.cjk, classify(0x4E2D)); // 中
+    try testing.expectEqual(Script.cjk, classify(0x4E2D)); // Chinese character U+4E2D
     try testing.expectEqual(Script.cjk, classify(0x3042)); // あ Hiragana
     try testing.expectEqual(Script.cjk, classify(0xAC00)); // 가 Hangul
 }
@@ -167,7 +164,7 @@ test "classify: Devanagari" {
 }
 
 test "splitScriptRuns: pure latin → 1 latin run" {
-    var runs: std.ArrayListUnmanaged(ScriptRun) = .{};
+    var runs: std.ArrayListUnmanaged(ScriptRun) = .empty;
     defer runs.deinit(testing.allocator);
     try splitScriptRuns("Hello World", 0, 11, &runs, testing.allocator);
     try testing.expectEqual(@as(usize, 1), runs.items.len);
@@ -175,14 +172,16 @@ test "splitScriptRuns: pure latin → 1 latin run" {
 }
 
 test "splitScriptRuns: latin + CJK + latin → 3 runs" {
-    var runs: std.ArrayListUnmanaged(ScriptRun) = .{};
+    var runs: std.ArrayListUnmanaged(ScriptRun) = .empty;
     defer runs.deinit(testing.allocator);
 
-    // "Hi 中文 Bye" (utf-8): "Hi " latin + common, "中文" CJK 6 bytes, " Bye" common + latin
-    // bytes: H=72, i=69, ' '=20 (3 bytes) + E4 B8 AD E6 96 87 (6 bytes) + ' Bye' (4 bytes) = 13 total
+    // Example "Hi <two Han characters> Bye" (utf-8): "Hi " is latin + common, the two Han
+    // characters are CJK (6 bytes), " Bye" is common + latin; bytes: H=72, i=69, ' '=20 (3 bytes total) + E4 B8 AD E6 96 87
+    // (6 bytes) + ' Bye' (4 bytes) = 13 total
     const text = "Hi \xE4\xB8\xAD\xE6\x96\x87 Bye";
     try splitScriptRuns(text, 0, @intCast(text.len), &runs, testing.allocator);
-    // 期望：latin run（含尾随空格 common）-> CJK run -> latin run（含 ' ' 前导 common）
+    // Expected: latin run (with trailing space common) -> CJK run -> latin run (with ' ' leading
+    // common).
     try testing.expectEqual(@as(usize, 3), runs.items.len);
     try testing.expectEqual(Script.latin, runs.items[0].script);
     try testing.expectEqual(Script.cjk, runs.items[1].script);
@@ -190,7 +189,7 @@ test "splitScriptRuns: latin + CJK + latin → 3 runs" {
 }
 
 test "splitScriptRuns: pure common (digits) → 1 common run" {
-    var runs: std.ArrayListUnmanaged(ScriptRun) = .{};
+    var runs: std.ArrayListUnmanaged(ScriptRun) = .empty;
     defer runs.deinit(testing.allocator);
     try splitScriptRuns("123 456", 0, 7, &runs, testing.allocator);
     try testing.expectEqual(@as(usize, 1), runs.items.len);
@@ -198,7 +197,7 @@ test "splitScriptRuns: pure common (digits) → 1 common run" {
 }
 
 test "splitScriptRuns: hebrew run" {
-    var runs: std.ArrayListUnmanaged(ScriptRun) = .{};
+    var runs: std.ArrayListUnmanaged(ScriptRun) = .empty;
     defer runs.deinit(testing.allocator);
     // ש = D7 A9
     try splitScriptRuns("\xD7\xA9", 0, 2, &runs, testing.allocator);
@@ -207,7 +206,7 @@ test "splitScriptRuns: hebrew run" {
 }
 
 test "splitScriptRuns: empty range → 0 runs" {
-    var runs: std.ArrayListUnmanaged(ScriptRun) = .{};
+    var runs: std.ArrayListUnmanaged(ScriptRun) = .empty;
     defer runs.deinit(testing.allocator);
     try splitScriptRuns("hello", 2, 2, &runs, testing.allocator);
     try testing.expectEqual(@as(usize, 0), runs.items.len);

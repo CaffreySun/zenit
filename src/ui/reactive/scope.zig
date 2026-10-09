@@ -9,15 +9,13 @@ const effect_mod = @import("effect.zig");
 const Memo = @import("memo.zig").Memo;
 const memo_mod = @import("memo.zig");
 
-/// Scope: 响应式资源的生命周期容器
+/// Scope: lifecycle container for reactive resources.
 ///
-/// 替代 SignalOwner 的帧级 Arena 策略，用于保留模式。
-/// 每个组件 mount 时创建一个 Scope，dispose 时递归清理所有资源。
-///
-/// 设计要点:
-/// - 不使用 Arena，用普通 allocator 逐个分配（因为需要独立销毁）
-/// - SignalOwner 保留为共享的依赖追踪上下文（current_effect、is_tracking、batch_ctx）
-/// - dispose() 顺序：子 Scope -> cleanups -> Effect 从 Signal subscribers 中移除 -> 释放内存
+/// Retained mode: each component creates one Scope on mount; dispose recursively cleans it.
+/// Design points:
+/// - no Arena; resources allocated individually (must support independent destruction)
+/// - SignalOwner stays the shared tracking context (current_effect, is_tracking, batch_ctx)
+/// - dispose() order: child Scopes -> cleanups -> Effects unsubscribed -> free memory
 const context_mod = @import("context.zig");
 
 pub const ALIVE_SENTINEL: u32 = 0x5C0E_A11E;
@@ -34,14 +32,15 @@ pub const Scope = struct {
     owner: *SignalOwner,
     disposed: bool = false,
     dispose_pending: bool = false,
-    /// 生存哨兵，语义同 Node.alive_sentinel：
-    /// disposeNow 末尾会 allocator.destroy(self)，二次 dispose 读到的 `disposed`
-    /// 可能是 0xaa 覆写值（非 0 ⇒ true），double dispose 会退化成静默 early-return。
+    /// alive sentinel, semantics match Node.alive_sentinel:
+    /// disposeNow end calls allocator.destroy(self), double dispose reads `disposed`
+    /// may be 0xaa overwrite value (non-zero => true), double dispose degrades to silent
+    /// early-return.
     alive_sentinel: u32 = ALIVE_SENTINEL,
     deferred_disposal: SignalOwner.DeferredDisposal = .{},
 
-    /// Context API: 零分配 slot 数组（每个 scope 最多 8 个 context）
-    context_entries: [context_mod.max_context_slots]context_mod.ContextSlot = [_]context_mod.ContextSlot{.{}} ** context_mod.max_context_slots,
+    /// Context API: zero-allocation slot array (up to 8 context per scope)
+    context_entries: [context_mod.max_context_slots]context_mod.ContextSlot = @as([context_mod.max_context_slots]context_mod.ContextSlot, @splat(.{})),
     context_count: u5 = 0,
 
     pub const CleanupFn = *const fn (*anyopaque) void;
@@ -51,31 +50,32 @@ pub const Scope = struct {
         ctx: *anyopaque,
     };
 
-    /// 通用资源条目：dispose 时由 destroyFn 释放
+    /// generic resource entry: freed by destroyFn on dispose
     pub const ResourceDestroyFn = *const fn (*anyopaque, Allocator) void;
     pub const ResourceEntry = struct {
         ptr: *anyopaque,
         destroyFn: ResourceDestroyFn,
     };
 
-    /// 创建 Scope
+    /// create Scope
     pub fn init(allocator: Allocator, parent: ?*Scope, owner: *SignalOwner) !*Scope {
         const scope = try allocator.create(Scope);
-        // Scope 用 caller 的 allocator（非 owner arena），父注册失败不回收
-        // 就是真泄漏（实测 416B/次）
+        // Scope uses caller's allocator (not owner arena), parent registration failure is a true
+        // leak
+        // (measured 416B per occurrence)
         errdefer allocator.destroy(scope);
         scope.* = .{
             .allocator = allocator,
             .parent = parent,
-            .children = .{},
-            .signals = .{},
-            .effects = .{},
-            .cleanups = .{},
-            .resources = .{},
+            .children = .empty,
+            .signals = .empty,
+            .effects = .empty,
+            .cleanups = .empty,
+            .resources = .empty,
             .owner = owner,
         };
 
-        // 注册到父 Scope
+        // register to parent Scope
         if (parent) |p| {
             try p.children.append(allocator, scope);
         }
@@ -83,14 +83,14 @@ pub const Scope = struct {
         return scope;
     }
 
-    /// 递归销毁 Scope 及其所有资源
+    /// Recursively destroy the Scope and all its resources.
     ///
-    /// 顺序：
-    /// 1. 递归销毁子 Scope
-    /// 2. 执行清理回调（逆序）
-    /// 3. 清理 Effect（从 Signal subscribers 中移除 + 释放内存）
-    /// 4. 清理 Signal（释放 subscribers 列表 + 释放内存）
-    /// 5. 释放自身
+    /// Order:
+    /// 1. recursively destroy child Scopes
+    /// 2. run cleanup callbacks (reverse order)
+    /// 3. clean Effects (remove from Signal subscribers + free)
+    /// 4. clean Signals (free subscribers list + free)
+    /// 5. free self
     pub fn dispose(self: *Scope) void {
         if (self.disposed) return;
         if (self.owner.reactive_callback_depth > 0) {
@@ -126,11 +126,11 @@ pub const Scope = struct {
     }
 
     fn disposeNow(self: *Scope) void {
-        // 生存哨兵（交叉 review 的元规则：哨兵检查必须支配同一指针上
-        // 的所有其它字段访问）。放在 disposeNow 而不是 dispose：这里才是两条
-        // 路径（同步 / deferred）共同的销毁入口，末尾会 allocator.destroy(self)。
-        // 不查的话，二次进入读到的 `disposed` 可能是 0xaa 覆写值（非 0 ⇒ true），
-        // double dispose 退化成静默 early-return，与 Node 那条同型。
+        // Alive sentinel: the check must dominate all other field accesses on the same pointer.
+        // Done in disposeNow, not dispose, because disposeNow is the common entry for both paths
+        // (sync / deferred) and calls allocator.destroy(self) at the end. Without the check, a
+        // double entry reads `disposed`, which may be a 0xaa overwrite (non-zero => true); with it,
+        // double dispose degrades to a silent early return, same as Node.
         if (self.alive_sentinel != ALIVE_SENTINEL) {
             @panic("Scope.disposeNow: scope 已被释放（double dispose）或内存已损坏");
         }
@@ -141,24 +141,23 @@ pub const Scope = struct {
         // Detach before callbacks: a child cleanup can dispose its former
         // parent, so no later cleanup may dereference that parent pointer.
         if (self.parent) |parent| {
-            if (!parent.disposed) {
-                for (parent.children.items, 0..) |child, index| {
-                    if (child == self) {
-                        _ = parent.children.swapRemove(index);
-                        break;
-                    }
+            for (parent.children.items, 0..) |child, index| {
+                if (child == self) {
+                    _ = parent.children.orderedRemove(index);
+                    break;
                 }
             }
             self.parent = null;
         }
 
-        // 1. 递归销毁子 Scope
-        for (self.children.items) |child| {
-            child.disposeNow();
+        // 1. Destroy children in creation order. Each child detaches first;
+        // its cleanup may also dispose a sibling, so reread the live list.
+        while (self.children.items.len != 0) {
+            self.children.items[0].disposeNow();
         }
         self.children.deinit(self.allocator);
 
-        // 2. 执行清理回调（逆序）
+        // 2. run cleanup callbacks (reverse order)
         var i = self.cleanups.items.len;
         while (i > 0) {
             i -= 1;
@@ -167,9 +166,9 @@ pub const Scope = struct {
         }
         self.cleanups.deinit(self.allocator);
 
-        // 3. 清理 Effects：注销 graph node（自动断 source/observer 边）+ 释放
-        // 单轨清理路径，graph.destroyNode 处理所有 cleanup；
-        // 不再遍历 effect.dependencies / signal.subscribers 列表。
+        // 3. clean Effects: unregister graph node (auto-disconnect source/observer edges) + free;
+        // single cleanup path, graph.destroyNode handles all cleanup;
+        // no longer traverse effect.dependencies / signal.subscribers lists.
         for (self.effects.items) |effect| {
             if (effect.graph_node_raw != 0xFFFFFFFF) {
                 const gid: @import("graph.zig").NodeId = @bitCast(effect.graph_node_raw);
@@ -180,7 +179,7 @@ pub const Scope = struct {
         }
         self.effects.deinit(self.allocator);
 
-        // 4. 清理 Signals：同上走 graph 单轨
+        // 4. clean Signals: same single path via graph
         for (self.signals.items) |signal| {
             if (signal.graph_node_raw != 0xFFFFFFFF) {
                 const gid: @import("graph.zig").NodeId = @bitCast(signal.graph_node_raw);
@@ -191,9 +190,9 @@ pub const Scope = struct {
         }
         self.signals.deinit(self.allocator);
 
-        // 5. 释放通用资源（逆序）
-        // 与 cleanup 保持一致，避免早注册的资源先释放节点/上下文，
-        // 让后注册且依赖这些对象的资源在 dispose 时访问悬垂指针。
+        // 5. free generic resources (reverse order),
+        // consistent with cleanup, avoid early resource freeing node/context
+        // that later-registered resources depend on reading dangling pointers during dispose.
         i = self.resources.items.len;
         while (i > 0) {
             i -= 1;
@@ -202,24 +201,228 @@ pub const Scope = struct {
         }
         self.resources.deinit(self.allocator);
 
-        // 7. 释放自身
-        // 投毒：释放后再被当活 scope 使用时，dispose 入口的哨兵会当场 panic。
+        // 7. free self;
+        // poisoned: using as live scope after free causes panic at dispose entry sentinel.
         self.alive_sentinel = DEAD_SENTINEL;
         self.allocator.destroy(self);
     }
 
-    /// 创建子 Scope
+    /// create child Scope
     pub fn childScope(self: *Scope) !*Scope {
         return Scope.init(self.allocator, self, self.owner);
     }
 
-    /// 在此 Scope 中创建 Signal
+    /// create Signal in this Scope
     pub fn createSignal(self: *Scope, comptime T: type, initial: T) !*Signal(T) {
         const signal = try Signal(T).createInScope(self, initial);
         return signal;
     }
 
-    /// 在此 Scope 中创建 Effect
+    pub const TextOptions = struct {
+        /// initial buffer capacity; doubled when insufficient.
+        capacity: usize = 0,
+    };
+
+    /// allocate state released with this scope (address stable `*T`), shared by multiple event
+    /// handlers
+    /// (`ui.on.call(state, T.method)`). differs from `cx.bindState`: latter lives until Cx
+    /// destroyed,
+    /// repeated component/page mounts accumulate; here reclaimed with mounting scope. does not call
+    /// `T.deinit`,
+    /// call `onCleanup` if needed.
+    pub fn createState(self: *Scope, comptime T: type, initial: T) !*T {
+        const p = try self.allocator.create(T);
+        p.* = initial;
+        try self.adoptResource(@ptrCast(p), struct {
+            fn destroy(raw: *anyopaque, allocator: Allocator) void {
+                allocator.destroy(@as(*T, @ptrCast(@alignCast(raw))));
+            }
+        }.destroy);
+        return p;
+    }
+
+    /// owning-type text signal (docs/SIGNAL_API_DESIGN.md §4.8): `set` copies content into signal's
+    /// own buffer (double-buffered + doubled), allocation failure leaves value unchanged. `get`
+    /// slice valid only
+    /// within current sync call and while signal not written again (see `Signal.get`), use `dupe` /
+    /// `getInto` to hold across calls. text input components' `value` requires this.
+    pub fn createText(self: *Scope, initial: []const u8, opts: TextOptions) !*Signal([]const u8) {
+        return self.createOwnedSlice(u8, initial, opts.capacity);
+    }
+
+    /// Owning list signal `Signal([]const E)`: `set` copies elements into the signal's
+    /// double-buffer,
+    /// so the caller may pass a temporary buffer (row keys, expanded node ids, file paths).
+    /// `E == []const u8` also copies string bytes; other elements are shallow-copied, so borrowed
+    /// fields inside them stay the caller's and must remain valid while current.
+    /// As with `createText`, a read slice is valid only in the current sync call and until the next
+    /// write.
+    pub fn createList(self: *Scope, comptime E: type, initial: []const E) !*Signal([]const E) {
+        return self.createOwnedSlice(E, initial, 0);
+    }
+
+    /// select signal storage by value type (Yix's `var x: T = signal(v)` uses): `[]const u8`
+    /// creates owning-type text (same createText),
+    /// other `[]const E` creates owning-type list (same createList), other types same createSignal.
+    /// selects by type itself, aliases work same.
+    pub fn createSignalFor(self: *Scope, comptime T: type, initial: T) !*Signal(T) {
+        comptime rejectMutableSlice(T);
+        if (T == []const u8) return self.createText(initial, .{});
+        if (comptime constSliceChild(T)) |E| return self.createList(E, initial);
+        return self.createSignal(T, initial);
+    }
+
+    fn createOwnedSlice(self: *Scope, comptime E: type, initial: []const E, capacity: usize) !*Signal([]const E) {
+        const Store = @import("signal.zig").SliceStore(E);
+        const ts = try self.allocator.create(Store);
+        errdefer self.allocator.destroy(ts);
+        ts.* = .{ .allocator = self.allocator };
+        const cap = @max(initial.len, capacity);
+        if (cap > 0) ts.bufs[0] = try self.allocator.alloc(E, cap);
+        errdefer ts.deinit();
+        if (!ts.fill(0, initial)) return error.OutOfMemory;
+        const signal = try Signal([]const E).createInScope(self, ts.current(initial.len));
+        signal.slice_store = ts;
+        return signal;
+    }
+
+    /// explicit dependency watch: calls `f` with `(ctx, new, old)` when `src` changes (values not
+    /// equal), function body not tracked.
+    /// not called at creation (matches Vue `watch`). `src` accepts `*Signal` / `*Memo` / derived /
+    /// `Source`.
+    /// `old` of owning-type text valid only in this call and when single write between two
+    /// triggers.
+    pub fn watch(self: *Scope, src: anytype, ctx: anytype, comptime f: anytype) !void {
+        const source_mod = @import("source.zig");
+        const S = @TypeOf(source_mod.toSource(src));
+        const T = S.Value;
+        const Ctx = @TypeOf(ctx);
+        // text source: `old` saved as watch's own copy. owning-type text is double-buffered, two
+        // writes
+        // (or resize) in one batch overwrites/frees previous buffer, direct slice save becomes
+        // dangling.
+        const is_text = T == []const u8;
+        const Buf = std.ArrayListUnmanaged(u8);
+        const State = struct {
+            src: S,
+            ctx: Ctx,
+            allocator: Allocator,
+            old: if (is_text) Buf else T = if (is_text) .empty else undefined,
+            next: if (is_text) Buf else void = if (is_text) .empty else {},
+            primed: bool = false,
+
+            const Self = @This();
+
+            fn oldValue(st: *const Self) T {
+                return if (is_text) st.old.items else st.old;
+            }
+
+            fn run(st: *Self) void {
+                const v = st.src.get();
+                if (!st.primed) {
+                    if (is_text) {
+                        st.old.clearRetainingCapacity();
+                        st.old.appendSlice(st.allocator, v) catch return; // left unprimed; retry next time
+                    } else st.old = v;
+                    st.primed = true;
+                    return;
+                }
+                if (@import("eq.zig").eqlValue(T, st.oldValue(), v)) return;
+                if (is_text) {
+                    st.next.clearRetainingCapacity();
+                    st.next.appendSlice(st.allocator, v) catch {
+                        // could not copy new value: notify normally, but `old` next time not
+                        // reliable, reprime.
+                        std.log.warn("[reactive.watch] could not copy the new text value; old will be re-primed", .{});
+                        st.primed = false;
+                        callUntracked(st, v, st.old.items);
+                        return;
+                    };
+                    callUntracked(st, v, st.old.items);
+                    std.mem.swap(Buf, &st.old, &st.next);
+                } else {
+                    const old = st.old;
+                    st.old = v;
+                    callUntracked(st, v, old);
+                }
+            }
+
+            fn callUntracked(st: *Self, v: T, old: T) void {
+                ownerOf(st.src).untrack(struct {
+                    fn call(args: struct { *Self, T, T }) void {
+                        f(args[0].ctx, args[1], args[2]);
+                    }
+                }.call, .{ st, v, old });
+            }
+
+            fn destroy(ptr: *anyopaque, allocator: Allocator) void {
+                const st: *Self = @ptrCast(@alignCast(ptr));
+                if (is_text) {
+                    st.old.deinit(allocator);
+                    st.next.deinit(allocator);
+                }
+                allocator.destroy(st);
+            }
+        };
+        source_mod.checkBorrow(self, src);
+        const st = try self.allocator.create(State);
+        st.* = .{ .src = source_mod.toSource(src), .ctx = ctx, .allocator = self.allocator };
+        try self.adoptResource(st, State.destroy);
+        try self.createEffect(st, State.run);
+    }
+
+    /// writable derived (matches Angular `linkedSignal`): returns local writable signal, initial
+    /// value from `src`;
+    /// when `src` changes resets to `reset(new_src, current)` (`reset == null` takes `new_src`
+    /// directly).
+    /// use instead of "write signal in effect to sync state".
+    pub fn linked(self: *Scope, comptime T: type, src: anytype, comptime reset: ?fn (T, T) T) !*Signal(T) {
+        const source_mod = @import("source.zig");
+        const S = @TypeOf(source_mod.toSource(src));
+        if (S.Value != T) @compileError("scope.linked: source value type is " ++ @typeName(S.Value) ++ ", expected " ++ @typeName(T));
+        source_mod.checkBorrow(self, src);
+        // text: local value must be owning-type, else initial value directly borrows source
+        // signal's buffer (source resize becomes dangling).
+        const sig = if (T == []const u8)
+            try self.createText(source_mod.toSource(src).peek(), .{})
+        else
+            try self.createSignal(T, source_mod.toSource(src).peek());
+        const State = struct {
+            src: S,
+            sig: *Signal(T),
+            primed: bool = false,
+
+            fn run(st: *@This()) void {
+                const v = st.src.get();
+                if (!st.primed) {
+                    st.primed = true;
+                    return;
+                }
+                const next = if (reset) |r| r(v, st.sig.peek()) else v;
+                st.sig.set(next);
+            }
+
+            fn destroy(ptr: *anyopaque, allocator: Allocator) void {
+                allocator.destroy(@as(*@This(), @ptrCast(@alignCast(ptr))));
+            }
+        };
+        const st = try self.allocator.create(State);
+        st.* = .{ .src = source_mod.toSource(src), .sig = sig };
+        try self.adoptResource(st, State.destroy);
+        try self.createEffect(st, State.run);
+        return sig;
+    }
+
+    fn ownerOf(src: anytype) *SignalOwner {
+        return switch (src) {
+            .value => unreachable,
+            .signal => |s| s.owner,
+            .memo => |m| m.owner,
+            .derived => |d| d.owner,
+        };
+    }
+
+    /// create Effect in this Scope
     pub fn createEffect(
         self: *Scope,
         context: anytype,
@@ -230,7 +433,7 @@ pub const Scope = struct {
         _ = try EffectType.createInScope(self, context);
     }
 
-    /// 在此 Scope 中创建 Memo
+    /// create Memo in this Scope
     pub fn createMemo(
         self: *Scope,
         comptime T: type,
@@ -240,7 +443,22 @@ pub const Scope = struct {
         return memo_mod.createMemoInScope(self, T, context, computeFn);
     }
 
-    /// 注册清理回调（Scope dispose 时执行）
+    /// derived value, static hoisting at runtime: create memo compute once, if no dependencies
+    /// recorded shrinks to static value (not in dependency graph), else keeps memo.
+    /// Yix's computed / property expressions generated by it, see `memo.deriveInScope`.
+    pub fn derive(
+        self: *Scope,
+        comptime T: type,
+        context: anytype,
+        comptime computeFn: anytype,
+    ) !@import("source.zig").Source(T) {
+        return switch (try memo_mod.deriveInScope(self, T, context, computeFn)) {
+            .value => |v| @import("source.zig").Source(T).of(v),
+            .memo => |m| .{ .memo = m },
+        };
+    }
+
+    /// register cleanup callback (runs on Scope dispose)
     pub fn onCleanup(self: *Scope, comptime T: type, ctx: *T, comptime cleanupFn: fn (*T) void) !void {
         const wrapper = struct {
             fn invoke(ptr: *anyopaque) void {
@@ -254,29 +472,31 @@ pub const Scope = struct {
         });
     }
 
-    /// 注册 Signal 到此 Scope
+    /// register Signal to this Scope
     pub fn registerSignal(self: *Scope, signal: *SignalBase) !void {
         try self.signals.append(self.allocator, signal);
     }
 
-    /// 注册 Effect 到此 Scope
+    /// register Effect to this Scope
     pub fn registerEffect(self: *Scope, effect: *EffectBase) !void {
         try self.effects.append(self.allocator, effect);
     }
 
-    /// 注册通用资源（dispose 时由 destroyFn(ptr, allocator) 释放）
+    /// Register a generic resource (freed by destroyFn(ptr, allocator) on dispose).
     ///
-    /// ⚠️ 登记本身可失败（resources 扩容）。失败时 ptr 仍归调用方，绝大多数调用方
-    /// 是「create -> 初始化 -> registerResource」三步，第三步失败就把对象漏掉了
-    /// （全仓扫出 65 处）。除非你在登记前后另有 errdefer，否则用 adoptResource。
+    /// WARNING: registration can fail (resources resize); ptr stays the caller's, so the usual
+    /// "create -> init -> registerResource" leaks on failure. Use adoptResource unless you add
+    /// your own errdefer.
     pub fn registerResource(self: *Scope, ptr: *anyopaque, destroyFn: ResourceDestroyFn) !void {
         try self.resources.append(self.allocator, .{ .ptr = ptr, .destroyFn = destroyFn });
     }
 
-    /// 登记资源，**登记失败就当场用同一个 destroyFn 释放它**，然后把错误抛回去。
-    /// 语义：调用成功 ⇒ 资源归 scope；调用失败 ⇒ 资源已被释放，调用方不得再碰 ptr。
-    /// 前提：调用时 ptr 指向的对象已经初始化到 destroyFn 能安全处理的程度
-    /// （destroyFn 会读它的字段去 free），别在 `state.* = .{…}` 之前登记。
+    /// register resource, **free it immediately with same destroyFn if registration fails**, then
+    /// throw error back.
+    /// semantics: call succeeds => resource owned by scope; call fails => resource already freed,
+    /// caller must not touch ptr.
+    /// precondition: at call time ptr points to object initialized to safe degree for destroyFn
+    /// (destroyFn will read its fields to free), do not register before `state.* = .{…}`.
     pub fn adoptResource(self: *Scope, ptr: *anyopaque, destroyFn: ResourceDestroyFn) !void {
         self.resources.append(self.allocator, .{ .ptr = ptr, .destroyFn = destroyFn }) catch |err| {
             destroyFn(ptr, self.allocator);
@@ -284,16 +504,16 @@ pub const Scope = struct {
         };
     }
 
-    /// 在当前 scope 注册一个 context 值
+    /// register a context value in current scope
     pub fn setContext(self: *Scope, type_id: usize, ptr: *anyopaque) !void {
-        // 查找已有 slot
+        // search for existing slot
         for (self.context_entries[0..self.context_count]) |*slot| {
             if (slot.type_id == type_id) {
                 slot.ptr = ptr;
                 return;
             }
         }
-        // 分配新 slot
+        // allocate new slot
         if (self.context_count < context_mod.max_context_slots) {
             self.context_entries[self.context_count] = .{ .type_id = type_id, .ptr = ptr };
             self.context_count += 1;
@@ -303,13 +523,13 @@ pub const Scope = struct {
         }
     }
 
-    /// 沿 parent 链向上查找 context 值
+    /// find context value walking up parent chain
     pub fn getContext(self: *Scope, type_id: usize) ?*anyopaque {
-        // 先查自身
+        // search self first
         for (self.context_entries[0..self.context_count]) |slot| {
             if (slot.type_id == type_id) return slot.ptr;
         }
-        // 递归父 scope
+        // recurse parent scope
         if (self.parent) |p| {
             return p.getContext(type_id);
         }
@@ -317,7 +537,7 @@ pub const Scope = struct {
     }
 };
 
-// ===== 测试 =====
+// ===== tests =====
 
 test "Scope: init/dispose" {
     const allocator = std.testing.allocator;
@@ -385,7 +605,7 @@ test "Scope: nested scopes dispose correctly" {
     _ = try parent_scope.childScope();
     _ = try parent_scope.childScope();
 
-    // 销毁父 Scope 应该递归销毁子 Scope
+    // destroying parent Scope should recursively destroy child Scopes
     parent_scope.dispose();
 }
 
@@ -425,10 +645,10 @@ test "Scope: createEffect with auto-tracking" {
         }
     }.run);
 
-    // Effect 创建时执行一次
+    // Effect executes once on creation
     try std.testing.expectEqual(@as(i32, 1), effect_run_count);
 
-    // Signal 变化触发 Effect
+    // Signal change triggers Effect
     count.set(1);
     try std.testing.expectEqual(@as(i32, 2), effect_run_count);
 
@@ -441,7 +661,7 @@ test "Scope: dispose stops effects" {
     var owner = try SignalOwner.init(allocator);
     defer owner.deinit();
 
-    // 在 owner 的 Arena 上创建一个 Signal（跨 Scope 存活）
+    // create Signal on owner's Arena (survives across Scopes)
     const count = try Signal(i32).create(owner, 0);
 
     var effect_run_count: i32 = 0;
@@ -464,11 +684,11 @@ test "Scope: dispose stops effects" {
         count.set(1);
         try std.testing.expectEqual(@as(i32, 2), effect_run_count);
 
-        // 销毁 Scope -> Effect 被清理
+        // Scope destruction -> Effect cleanup
         scope.dispose();
     }
 
-    // Scope 销毁后，Signal 变化不再触发 Effect
+    // after Scope destroyed, Signal change no longer triggers Effect
     count.set(2);
     try std.testing.expectEqual(@as(i32, 2), effect_run_count);
 }
@@ -514,7 +734,7 @@ test "Scope: disposing one sibling scope keeps the other active" {
     try std.testing.expectEqual(@as(i32, 2), a_runs);
     try std.testing.expectEqual(@as(i32, 2), b_runs);
 
-    // 只销毁 scope_a，不应影响 scope_b
+    // destroying only scope_a should not affect scope_b
     scope_a.dispose();
 
     count.set(2);
@@ -560,7 +780,8 @@ test "Scope: disposed sibling is not queued during owner batch" {
 
     scope_a.dispose();
 
-    // batch 内两次 set：scope_b 的 effect 只应排队并运行一次，scope_a 不应被误排队
+    // two sets in batch: scope_b's effect should queue and run once only, scope_a not queued by
+    // mistake
     try owner.batch(struct {
         fn update(ctx: anytype) void {
             ctx.count.set(1);
@@ -613,7 +834,7 @@ test "Scope: dispose after batch+untrack+nested chain stops all effects" {
         }
     }.run);
 
-    // A: trigger true 时，在 untrack 内 batch 更新 source
+    // A: when trigger true, batch update source in untrack
     try scope.createEffect(.{
         .owner = owner,
         .trigger = trigger,
@@ -652,7 +873,7 @@ test "Scope: dispose after batch+untrack+nested chain stops all effects" {
     try std.testing.expectEqual(@as(i32, 2), c_runs);
     try std.testing.expectEqual(@as(i32, 4), leaf_value);
 
-    // dispose 后，这三个 effect 都不应再被 source/mirror/trigger 变化触发
+    // after dispose, all three effects should not be triggered by source/mirror/trigger changes
     scope.dispose();
 
     source.set(3);
@@ -709,10 +930,10 @@ test "Scope: child scope disposed with parent" {
         }
     }.cleanup);
 
-    // 销毁父 Scope
+    // destroy parent Scope
     parent_scope.dispose();
 
-    // 两个 cleanup 都应该执行
+    // both cleanups should execute
     try std.testing.expectEqual(@as(i32, 1), parent_cleanup);
     try std.testing.expectEqual(@as(i32, 1), child_cleanup);
 }
@@ -782,16 +1003,18 @@ test "Scope: parent dispose handles cross-scope signal dependencies" {
 
     try std.testing.expectEqual(@as(i32, 1), runs);
 
-    // 之前这里会在 consumer_scope.dispose() 中访问 producer_scope 已释放的 Signal。
+    // previously this would access producer_scope's freed Signal in consumer_scope.dispose().
     parent_scope.dispose();
 }
 
 test "allocation campaign: Scope/Memo/Effect 构造路径 OOM 不泄漏不半注册" {
-    // 逐 fail-index 扫描三条构造路径。testing.allocator 在测试尾自动查泄漏，
-    // FailingAllocator 首中后永久失败，所以每轮独立建整套 owner/scope。
-    // 锁的性质：构造失败时 (a) caller-allocator 内存全部归还（Scope 路径曾
-    // 实测漏 416B）；(b) 注册表不留半注册态（graph_node_raw 仍 0xFFFFFFFF
-    // 的 EffectBase）；(c) 已建的 graph node 被回退。
+    // scan three construction paths per fail-index. testing.allocator auto-checks leaks at test
+    // end,
+    // FailingAllocator permanently fails after first hit, so each round independently builds
+    // owner/scope.
+    // invariants locked: construction failure => (a) caller-allocator frees all (Scope path once
+    // measured 416B leak); (b) registry has no half-register state (graph_node_raw still 0xFFFFFFFF
+    // EffectBase); (c) built graph nodes rolled back.
     var fail_index: usize = 0;
     while (fail_index < 64) : (fail_index += 1) {
         var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
@@ -802,17 +1025,17 @@ test "allocation campaign: Scope/Memo/Effect 构造路径 OOM 不泄漏不半注
         var owner = SignalOwner.init(alloc) catch continue;
         defer owner.deinit();
 
-        // pushTracking 在 OOM 时按治理策略 @panic（tracking 栈失步不可恢复），
-        // 不属于本测试要锁的性质，预热容量让它在本测试内永不分配
+        // pushTracking panics on OOM per policy (tracking stack skew unrecoverable),
+        // not part of invariants this test locks, preheat capacity to prevent allocation here
         owner.graph.tracking_stack.ensureTotalCapacity(alloc, 8) catch continue;
 
         const scope = Scope.init(alloc, null, owner) catch continue;
         defer scope.dispose();
 
-        // 子 scope（覆盖父注册失败分支）
+        // child scope (covers parent registration failure branch)
         _ = scope.childScope() catch {};
 
-        // effect（覆盖 registerEffect 后 createNodeRaw 失败分支）
+        // effect (covers createNodeRaw failure after registerEffect branch)
         var effect_runs: u32 = 0;
         scope.createEffect(.{ .runs = &effect_runs }, struct {
             fn run(ctx: anytype) void {
@@ -820,7 +1043,7 @@ test "allocation campaign: Scope/Memo/Effect 构造路径 OOM 不泄漏不半注
             }
         }.run) catch {};
 
-        // memo（覆盖两次分配 + graph 注册 + registerResource 各失败点）
+        // memo (covers two allocations + graph register + registerResource failure points)
         const m = scope.createMemo(i32, .{}, struct {
             fn compute(_: anytype) i32 {
                 return 7;
@@ -828,8 +1051,8 @@ test "allocation campaign: Scope/Memo/Effect 构造路径 OOM 不泄漏不半注
         }.compute) catch continue;
         try std.testing.expectEqual(@as(i32, 7), m.get());
 
-        // 半注册态检查：走到这里的 effect 要么完整（graph node 有效），
-        // 要么根本不在注册表里
+        // half-register check: effects reaching here either complete (graph node valid),
+        // or not in registry at all
         for (scope.effects.items) |eb| {
             try std.testing.expect(eb.graph_node_raw != 0xFFFFFFFF);
         }
@@ -852,7 +1075,8 @@ test "Scope: adoptResource 登记失败时当场跑 destroyFn，不留孤儿也�
     const scope = try Scope.init(a, null, owner);
     defer scope.dispose();
 
-    // 第一次：resources 首次扩容那一步失败 -> 对象必须被 destroyFn 收掉，错误抛回。
+    // first: resources first resize failed -> object must be claimed by destroyFn, error thrown
+    // back.
     const first = try a.create(u64);
     first.* = 1;
     failing.fail_index = failing.alloc_index;
@@ -861,11 +1085,65 @@ test "Scope: adoptResource 登记失败时当场跑 destroyFn，不留孤儿也�
     try std.testing.expectEqual(@as(usize, 1), Probe.destroyed);
     try std.testing.expectEqual(@as(usize, 0), scope.resources.items.len);
 
-    // 第二次：成功 -> 归 scope，dispose 时恰好释放一次。
+    // second: success -> owned by scope, disposed exactly once.
     const second = try a.create(u64);
     second.* = 2;
     try scope.adoptResource(@ptrCast(second), Probe.destroy);
     try std.testing.expectEqual(@as(usize, 1), scope.resources.items.len);
     scope.dispose();
     try std.testing.expectEqual(@as(usize, 2), Probe.destroyed);
+}
+
+/// `E` of `[]const E`; null for other types (`Scope.createSignalFor` / `resolveModelFor` use it to
+/// pick owning-type list)
+pub fn constSliceChild(comptime T: type) ?type {
+    return switch (@typeInfo(T)) {
+        .pointer => |ptr| if (ptr.size == .slice and ptr.attrs.@"const" and ptr.sentinel() == null) ptr.child else null,
+        else => null,
+    };
+}
+
+/// mutable slice of `[]E` as signal / Model value: unclear if write is borrow or copy, compile
+/// error directly, require `[]const E`
+pub fn rejectMutableSlice(comptime T: type) void {
+    switch (@typeInfo(T)) {
+        .pointer => |ptr| if (ptr.size == .slice and !ptr.attrs.@"const")
+            @compileError("a signal / Model of a mutable slice " ++ @typeName(T) ++ " is not supported; use []const " ++ @typeName(ptr.child) ++ " (the signal keeps its own copy)"),
+        else => {},
+    }
+}
+
+test "Scope: child cleanup disposing sibling during parent teardown runs once" {
+    const allocator = std.testing.allocator;
+    var owner = try SignalOwner.init(allocator);
+    defer owner.deinit();
+    const parent = try Scope.init(allocator, null, owner);
+    const first = try parent.childScope();
+    const second = try parent.childScope();
+    const third = try parent.childScope();
+    const Probe = struct {
+        sibling: *Scope,
+        calls: [4]u32 = @splat(0),
+        fn firstCleanup(self: *@This()) void {
+            self.calls[0] += 1;
+            self.sibling.dispose();
+        }
+        fn secondCleanup(self: *@This()) void {
+            self.calls[1] += 1;
+        }
+        fn thirdCleanup(self: *@This()) void {
+            self.calls[2] += 1;
+        }
+        fn parentCleanup(self: *@This()) void {
+            std.debug.assert(self.calls[0] == 1 and self.calls[1] == 1 and self.calls[2] == 1);
+            self.calls[3] += 1;
+        }
+    };
+    var probe: Probe = .{ .sibling = second };
+    try first.onCleanup(Probe, &probe, Probe.firstCleanup);
+    try second.onCleanup(Probe, &probe, Probe.secondCleanup);
+    try third.onCleanup(Probe, &probe, Probe.thirdCleanup);
+    try parent.onCleanup(Probe, &probe, Probe.parentCleanup);
+    parent.dispose();
+    try std.testing.expectEqual(@as([4]u32, @splat(1)), probe.calls);
 }

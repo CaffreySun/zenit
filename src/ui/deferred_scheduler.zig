@@ -74,6 +74,7 @@ pub const DrainResult = struct {
 
 pub const DeferredScheduler = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     tasks_by_id: TaskIdMap,
     task_ids_by_key: TaskKeyMap,
     due_heap: std.ArrayList(*Task),
@@ -81,13 +82,14 @@ pub const DeferredScheduler = struct {
     next_task_id: u64 = 1,
     next_enqueue_seq: u64 = 1,
 
-    pub fn init(allocator: std.mem.Allocator) DeferredScheduler {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io) DeferredScheduler {
         return .{
             .allocator = allocator,
+            .io = io,
             .tasks_by_id = TaskIdMap.init(allocator),
             .task_ids_by_key = TaskKeyMap.init(allocator),
-            .due_heap = .{},
-            .ready_heap = .{},
+            .due_heap = .empty,
+            .ready_heap = .empty,
         };
     }
 
@@ -197,7 +199,7 @@ pub const DeferredScheduler = struct {
             const task_version = task.version;
             const remaining = budget_us - result.used_budget_us;
             const slice_budget = @min(remaining, SINGLE_SLICE_BUDGET_US);
-            var slice_timer = std.time.Timer.start() catch null;
+            var slice_timer = @import("zenit_time").Timer.start(self.io) catch null;
             const task_result = task.runSlice(cx_ptr, slice_budget);
             const elapsed_us = elapsedSliceUs(&slice_timer, slice_budget);
 
@@ -284,8 +286,9 @@ pub const DeferredScheduler = struct {
         }
     }
 
-    /// 只读：距最近一个未到期任务 ready 的剩余 ns。无 pending 任务返回 null，
-    /// 已有到期任务返回 0。供主循环算 pump 阻塞超时用，不消费任何状态。
+    /// Read-only: remaining ns until nearest pending task ready. Null if no pending; 0 if tasks
+    /// already due.
+    /// Used by main loop to calculate pump block timeout; does not consume any state.
     pub fn nextReadyDelayNs(self: *const DeferredScheduler, now_ns: u64) ?u64 {
         return self.nextDelayNs(now_ns);
     }
@@ -413,14 +416,15 @@ pub const DeferredScheduler = struct {
         };
     }
 
-    fn elapsedSliceUs(timer: *?std.time.Timer, slice_budget_us: u32) u32 {
+    fn elapsedSliceUs(timer: *?@import("zenit_time").Timer, slice_budget_us: u32) u32 {
         if (timer.*) |*slice_timer| {
             const elapsed_ns = slice_timer.read();
             const elapsed_us = @max(@divFloor(elapsed_ns, std.time.ns_per_us), 1);
             return @intCast(@min(elapsed_us, slice_budget_us));
         }
-        // 如果 monotonic timer 不可用，保守地按完整 slice 预算计费，
-        // 避免在受限环境里因为“0 成本”而无界透支一帧。
+        // If monotonic timer unavailable, conservatively charge full slice budget to avoid
+        // unbounded
+        // overspend in constrained environments due to zero-cost illusion.
         return slice_budget_us;
     }
 };
@@ -493,7 +497,7 @@ fn makeTestTask(allocator: std.mem.Allocator, priority: TaskPriority, version: u
 }
 
 test "DeferredScheduler: higher priority runs first" {
-    var scheduler = DeferredScheduler.init(testing.allocator);
+    var scheduler = DeferredScheduler.init(testing.allocator, testing.io);
     defer scheduler.deinit();
 
     var high_runs: u32 = 0;
@@ -510,7 +514,7 @@ test "DeferredScheduler: higher priority runs first" {
 }
 
 test "DeferredScheduler: newer version replaces older task" {
-    var scheduler = DeferredScheduler.init(testing.allocator);
+    var scheduler = DeferredScheduler.init(testing.allocator, testing.io);
     defer scheduler.deinit();
 
     var old_runs: u32 = 0;
@@ -529,7 +533,7 @@ test "DeferredScheduler: newer version replaces older task" {
 }
 
 test "DeferredScheduler: delayed task waits until ready time" {
-    var scheduler = DeferredScheduler.init(testing.allocator);
+    var scheduler = DeferredScheduler.init(testing.allocator, testing.io);
     defer scheduler.deinit();
 
     var runs: u32 = 0;
@@ -554,10 +558,10 @@ test "DeferredScheduler: delayed task waits until ready time" {
 }
 
 test "DeferredScheduler: nextReadyDelayNs reports nearest pending deadline without consuming" {
-    var scheduler = DeferredScheduler.init(testing.allocator);
+    var scheduler = DeferredScheduler.init(testing.allocator, testing.io);
     defer scheduler.deinit();
 
-    // 空 scheduler：无定时唤醒需求
+    // Empty scheduler: no timed wake-up needed
     try testing.expectEqual(@as(?u64, null), scheduler.nextReadyDelayNs(0));
 
     var runs: u32 = 0;
@@ -567,16 +571,16 @@ test "DeferredScheduler: nextReadyDelayNs reports nearest pending deadline witho
 
     try testing.expectEqual(@as(?u64, 100), scheduler.nextReadyDelayNs(0));
     try testing.expectEqual(@as(?u64, 30), scheduler.nextReadyDelayNs(70));
-    // 已到期 -> 0（应立即唤醒）
+    // Expired -> 0 (should wake immediately)
     try testing.expectEqual(@as(?u64, 0), scheduler.nextReadyDelayNs(100));
-    // 只读：查询不消费任务
+    // Read-only: query does not consume tasks
     try testing.expectEqual(@as(u32, 0), runs);
     const ready = scheduler.drain(undefined, 1000, 100);
     try testing.expectEqual(@as(u32, 1), ready.ran_tasks);
 }
 
 test "DeferredScheduler: same version merges into one scheduled task" {
-    var scheduler = DeferredScheduler.init(testing.allocator);
+    var scheduler = DeferredScheduler.init(testing.allocator, testing.io);
     defer scheduler.deinit();
 
     var old_runs: u32 = 0;
@@ -603,7 +607,7 @@ test "DeferredScheduler: same version merges into one scheduled task" {
 }
 
 test "DeferredScheduler: runSlice may replace itself without reusing freed task" {
-    var scheduler = DeferredScheduler.init(testing.allocator);
+    var scheduler = DeferredScheduler.init(testing.allocator, testing.io);
     defer scheduler.deinit();
 
     var old_runs: u32 = 0;

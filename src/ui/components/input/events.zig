@@ -1,5 +1,5 @@
 const ImeText = @import("ime_text.zig").ImeText;
-/// Input Events，事件派发 + fireOnChange
+/// Input Events, event dispatch + fireOnChange
 const core_ui = @import("../../core.zig");
 const events = @import("../../events.zig");
 const Event = events.Event;
@@ -8,14 +8,40 @@ const state_mod = @import("state.zig");
 const TextInputState = state_mod.TextInputState;
 const editable_block = @import("../editable_block/mod.zig");
 
-/// 文本变化时触发 on_change 回调
+/// Trigger on_change callback on text change
 pub inline fn fireOnChange(state: *TextInputState) void {
     if (state.on_change) |h| h.invokeWithStr(state.getText());
 }
 
-/// 输入框事件处理器
+/// Input event handler
+///
+/// Each event is one user edit transaction (TextInputState.beginUserEdit): at exit, value binding
+/// (fireOnChange -> binding.onBufferChanged) detects whether the parent rewrote/rejected the edit
+/// and corrects the buffer in place using the transaction-entry checkpoint.
 pub fn inputEventHandler(event: Event, context: ?*anyopaque) EventResult {
     const state: *TextInputState = @ptrCast(@alignCast(context orelse return .ignored));
+    if (state.disabled) return .ignored;
+    state.beginUserEdit();
+    defer state.endUserEdit();
+    return handleEvent(state, event);
+}
+
+fn handleEvent(state: *TextInputState, event: Event) EventResult {
+    if (state.readonly) {
+        switch (event) {
+            .text_input, .ime_preedit, .ime_commit => return .handled,
+            .key_down => |e| {
+                if (e.key == .tab) return .ignored; // Focus traversal, never insert indentation.
+                const allowed = switch (e.key) {
+                    .left, .right, .up, .down, .home, .end, .page_up, .page_down, .escape => true,
+                    .a, .c => events.primaryModifier(e.modifiers),
+                    else => false,
+                };
+                if (!allowed) return .handled;
+            },
+            else => {},
+        }
+    }
 
     switch (event) {
         .key_down, .mouse_down, .focus, .blur => state.endImePendingCommit(),
@@ -33,13 +59,13 @@ pub fn inputEventHandler(event: Event, context: ?*anyopaque) EventResult {
             }
 
             if (state.imeIsComposing()) {
-                // 候选阶段收到空格通常是"翻页/选词"操作，不应直接落文本。
+                // Space in candidate phase usually 'page/word select' action, shouldn't land text.
                 if (state_mod.isImeSelectionSpace(filtered)) {
                     state.markImeSelectionHighlight();
                     state.updateScrollX();
                     return .handled;
                 }
-                // 某些输入法在 commit 时只上报 text_input（无 ime_commit）。
+                // Some IME only report text_input (no ime_commit) on commit.
                 state.handleImeCommitEventChecked(filtered) catch return .handled;
                 state.updateScrollX();
                 fireOnChange(state);
@@ -77,13 +103,14 @@ pub fn inputEventHandler(event: Event, context: ?*anyopaque) EventResult {
         },
         .key_down => |e| {
             if (state.ime_replacement != null and (e.modifiers.super or e.modifiers.ctrl) and e.key != .z) state.cancelImeComposition();
-            // 剪贴板快捷键 (在 handleKeyDown 之前拦截)
-            if (e.modifiers.super) {
+            // Clipboard shortcuts (intercepted before handleKeyDown)
+            if (events.primaryModifier(e.modifiers)) {
                 if (state.cx_ref) |cx| {
                     if (core_ui.platform_services.clipboardAvailable(cx.system_sdk)) {
                         switch (e.key) {
                             .c => {
-                                // Cmd+C: 复制（密码框禁用，同 NSSecureTextField）
+                                // Cmd+C: copy (disabled for password fields, like
+                                // NSSecureTextField)
                                 if (state.input_type == .password) return .handled;
                                 if (state.getSelectedText()) |sel| {
                                     _ = core_ui.platform_services.clipboardSetText(cx.system_sdk, sel);
@@ -91,7 +118,8 @@ pub fn inputEventHandler(event: Event, context: ?*anyopaque) EventResult {
                                 return .handled;
                             },
                             .x => {
-                                // Cmd+X: 剪切（密码框禁用：既不写剪贴板也不删文本）
+                                // Cmd+X: cut (disabled for password fields: neither write clipboard
+                                // nor delete text)
                                 if (state.input_type == .password) return .handled;
                                 if (state.getSelectedText()) |sel| {
                                     if (core_ui.platform_services.clipboardSetText(cx.system_sdk, sel)) {
@@ -150,6 +178,13 @@ pub fn inputEventHandler(event: Event, context: ?*anyopaque) EventResult {
                 return .handled;
             }
 
+            if (!state.accept_newline and e.key == .@"return" and !e.modifiers.super and !e.modifiers.ctrl) {
+                if (state.on_submit) |h| {
+                    h.invokeWithStr(state.getText());
+                    return .handled;
+                }
+            }
+
             if (state.accept_newline and e.key == .@"return" and !e.modifiers.super and !e.modifiers.ctrl) {
                 state.insertTextChecked("\n") catch return .handled;
                 state.updateScrollX();
@@ -173,15 +208,16 @@ pub fn inputEventHandler(event: Event, context: ?*anyopaque) EventResult {
             return .ignored;
         },
         .mouse_down => |e| {
+            state.drag_pointer = null;
             if (state.imeIsComposing()) {
                 state.cancelImeComposition();
             }
             const pos = state.hitTestCursorPosAt(e.x, e.y);
-            state.focused = true; // 确保点击即聚焦
+            state.focused = true; // Ensure click focuses
             const down_click_count = state.registerMouseDownClickCount(e.x, e.y);
 
             if (down_click_count >= 3) {
-                // 三击在按下阶段立刻全选，避免等 mouse_up 后才生效的迟滞感
+                // Triple-click select all immediately on press, avoid lag waiting for mouse_up.
                 state.selectAll();
                 state.suspend_drag_until_mouse_up = true;
                 state.is_dragging = false;
@@ -191,7 +227,7 @@ pub fn inputEventHandler(event: Event, context: ?*anyopaque) EventResult {
             }
 
             if (down_click_count == 2 and !e.modifiers.shift) {
-                // 双击在按下阶段立刻选词，提升 input/textarea 选词响应速度
+                // Double-click select word immediately on press, speed up input/textarea response.
                 state.selectWordAt(pos);
                 state.suspend_drag_until_mouse_up = true;
                 state.is_dragging = false;
@@ -200,14 +236,14 @@ pub fn inputEventHandler(event: Event, context: ?*anyopaque) EventResult {
                 return .handled;
             }
 
-            // 单击：定位光标，设置拖拽锚点
+            // Single-click: position cursor, set drag anchor
             state.suspend_drag_until_mouse_up = false;
             if (e.modifiers.shift) {
                 if (state.selection_anchor == null) {
                     state.selection_anchor = state.cursor_pos;
                 }
             } else {
-                state.selection_anchor = pos; // 新锚点 = 点击位置
+                state.selection_anchor = pos; // New anchor = click position
             }
             state.cursor_pos = pos;
             state.is_dragging = true;
@@ -215,7 +251,8 @@ pub fn inputEventHandler(event: Event, context: ?*anyopaque) EventResult {
             state.updateScrollX();
             return .handled;
         },
-        .mouse_up => |_| {
+        .mouse_up => {
+            state.drag_pointer = null;
             state.is_dragging = false;
             state.suspend_drag_until_mouse_up = false;
             state.markVisualDirty();
@@ -227,6 +264,7 @@ pub fn inputEventHandler(event: Event, context: ?*anyopaque) EventResult {
                 return .handled;
             }
             if (state.is_dragging) {
+                state.drag_pointer = .{ .x = e.x, .y = e.y, .time_ms = if (state.cx_ref) |cx| cx.frame_time_ms else 0 };
                 const pos = state.hitTestCursorPosAt(e.x, e.y);
                 if (pos != state.cursor_pos) {
                     state.cursor_pos = pos;
@@ -239,15 +277,15 @@ pub fn inputEventHandler(event: Event, context: ?*anyopaque) EventResult {
         },
         .click => |e| {
             if (e.click_count >= 2 and state.consecutive_mouse_downs >= e.click_count) {
-                // 已在 mouse_down 阶段处理过双击/三击，避免重复命中测试。
+                // Already handled double/triple-click in mouse_down phase; avoid repeat hit-test.
                 return .handled;
             }
             if (e.click_count >= 3) {
-                // 三击全选
+                // Triple-click select all
                 state.selectAll();
                 state.updateScrollX();
             } else if (e.click_count == 2) {
-                // 双击选词
+                // Double-click select word
                 const pos = state.hitTestCursorPosAt(e.x, e.y);
                 state.selectWordAt(pos);
                 state.updateScrollX();
@@ -255,7 +293,7 @@ pub fn inputEventHandler(event: Event, context: ?*anyopaque) EventResult {
             return .handled;
         },
         .scroll => |scroll| {
-            // 多行模式：转发 scroll 事件给 VirtualList 的 ScrollArea
+            // Multiline mode: forward scroll events to VirtualList ScrollArea
             if (state.multiline) {
                 if (state.vl_state) |vl_state| {
                     const scroll_area_event = @import("../scroll_area/event.zig");
@@ -273,9 +311,9 @@ pub fn inputEventHandler(event: Event, context: ?*anyopaque) EventResult {
 
 test "input event route commits full long text once and new key starts independent input" {
     const t = @import("std").testing;
-    var state: TextInputState = .{ .allocator = t.allocator };
+    var state: TextInputState = .{ .io = @import("std").testing.io, .allocator = t.allocator };
     defer state.deinit();
-    const value = "中" ** 200;
+    const value = (@as([("中").len * (200)]u8, @bitCast(@as([200][("中").len]u8, @splat(("中").*)))) ++ "");
     _ = inputEventHandler(.{ .ime_commit = .{ .text = value } }, &state);
     _ = inputEventHandler(.{ .text_input = .{ .text = value } }, &state);
     try t.expectEqualStrings(value, state.getText());
@@ -298,7 +336,7 @@ test "input fallback notifies only successful commit and exact duplicate is sile
     };
     var observer: Observer = .{};
     var failing = t.FailingAllocator.init(t.allocator, .{});
-    var s: TextInputState = .{ .allocator = failing.allocator(), .on_change = .{ .callback = Observer.notify, .context = &observer } };
+    var s: TextInputState = .{ .io = @import("std").testing.io, .allocator = failing.allocator(), .on_change = .{ .callback = Observer.notify, .context = &observer } };
     defer s.deinit();
     _ = s.setText("seed");
     s.cursor_pos = 4;
@@ -340,7 +378,7 @@ test "shared input keyboard equal-length undo redo notifies the published text" 
         var doc = state_mod.TextareaDocument.init(t.allocator);
         defer doc.deinit();
         var observer: Observer = .{};
-        var s: TextInputState = .{ .allocator = t.allocator, .multiline = multiline, .textarea_doc = if (multiline) &doc else null, .on_change = .{ .callback = Observer.notify, .context = &observer, .payload_callback = .{ .string = Observer.changed } } };
+        var s: TextInputState = .{ .io = @import("std").testing.io, .allocator = t.allocator, .multiline = multiline, .textarea_doc = if (multiline) &doc else null, .on_change = .{ .callback = Observer.notify, .context = &observer, .payload_callback = .{ .string = Observer.changed } } };
         defer s.deinit();
         _ = try s.setTextChecked("old");
         s.cursor_pos = 3;
@@ -376,7 +414,7 @@ test "shared input Enter allocation failure keeps text selection history and not
         var doc = state_mod.TextareaDocument.init(failing.allocator());
         defer doc.deinit();
         var observer: Observer = .{};
-        var s: TextInputState = .{ .allocator = failing.allocator(), .multiline = multiline, .accept_newline = true, .textarea_doc = if (multiline) &doc else null, .on_change = .{ .callback = Observer.notify, .context = &observer } };
+        var s: TextInputState = .{ .io = @import("std").testing.io, .allocator = failing.allocator(), .multiline = multiline, .accept_newline = true, .textarea_doc = if (multiline) &doc else null, .on_change = .{ .callback = Observer.notify, .context = &observer } };
         defer s.deinit();
         _ = try s.setTextChecked("seed");
         s.cursor_pos = 4;
@@ -413,7 +451,7 @@ test "shared input modifier deletion at a boundary preserves redo and stays sile
         var doc = state_mod.TextareaDocument.init(t.allocator);
         defer doc.deinit();
         var observer: Observer = .{};
-        var s: TextInputState = .{ .allocator = t.allocator, .multiline = multiline, .textarea_doc = if (multiline) &doc else null, .on_change = .{ .callback = Observer.notify, .context = &observer } };
+        var s: TextInputState = .{ .io = @import("std").testing.io, .allocator = t.allocator, .multiline = multiline, .textarea_doc = if (multiline) &doc else null, .on_change = .{ .callback = Observer.notify, .context = &observer } };
         defer s.deinit();
         _ = try s.setTextChecked(if (multiline) "a\nb" else "ab");
         try s.insertTextChecked("!");
@@ -443,7 +481,7 @@ test "shared input plain boundary deletion neither allocates nor consumes redo" 
                 var failing = t.FailingAllocator.init(t.allocator, .{});
                 var doc = state_mod.TextareaDocument.init(failing.allocator());
                 defer doc.deinit();
-                var s: TextInputState = .{ .allocator = failing.allocator(), .multiline = multiline, .textarea_doc = if (multiline) &doc else null };
+                var s: TextInputState = .{ .io = @import("std").testing.io, .allocator = failing.allocator(), .multiline = multiline, .textarea_doc = if (multiline) &doc else null };
                 defer s.deinit();
                 _ = try s.setTextChecked("seed");
                 try s.insertTextChecked("!");
@@ -485,7 +523,7 @@ test "shared input failed history and reconversion cancellation do not notify" {
             var doc = state_mod.TextareaDocument.init(failing.allocator());
             defer doc.deinit();
             var observer: Observer = .{};
-            var s: TextInputState = .{ .allocator = failing.allocator(), .multiline = multiline, .textarea_doc = if (multiline) &doc else null, .on_change = .{ .callback = Observer.notify, .context = &observer } };
+            var s: TextInputState = .{ .io = @import("std").testing.io, .allocator = failing.allocator(), .multiline = multiline, .textarea_doc = if (multiline) &doc else null, .on_change = .{ .callback = Observer.notify, .context = &observer } };
             defer s.deinit();
             _ = try s.setTextChecked("old");
             s.selection_anchor = 0;
@@ -530,9 +568,9 @@ test "shared input Enter capacity rejection preserves redo and stays silent" {
         var doc = state_mod.TextareaDocument.init(t.allocator);
         defer doc.deinit();
         var observer: Observer = .{};
-        var s: TextInputState = .{ .allocator = t.allocator, .multiline = multiline, .accept_newline = true, .textarea_doc = if (multiline) &doc else null, .textarea_max_bytes = 4, .on_change = .{ .callback = Observer.notify, .context = &observer } };
+        var s: TextInputState = .{ .io = @import("std").testing.io, .allocator = t.allocator, .multiline = multiline, .accept_newline = true, .textarea_doc = if (multiline) &doc else null, .textarea_max_bytes = 4, .on_change = .{ .callback = Observer.notify, .context = &observer } };
         defer s.deinit();
-        const original = if (multiline) "seed" else "a" ** editable_block.MAX_INPUT_BYTES;
+        const original = if (multiline) "seed" else (@as([("a").len * (editable_block.MAX_INPUT_BYTES)]u8, @bitCast(@as([editable_block.MAX_INPUT_BYTES][("a").len]u8, @splat(("a").*)))) ++ "");
         _ = try s.setTextChecked(original);
         s.selection_anchor = 0;
         try s.insertTextChecked("x");
@@ -567,7 +605,7 @@ test "shared keyboard deletion variants retain selected Unicode on failure and u
             var failing = t.FailingAllocator.init(t.allocator, .{});
             var doc = state_mod.TextareaDocument.init(failing.allocator());
             defer doc.deinit();
-            var s: TextInputState = .{ .allocator = failing.allocator(), .multiline = multiline, .textarea_doc = if (multiline) &doc else null };
+            var s: TextInputState = .{ .io = @import("std").testing.io, .allocator = failing.allocator(), .multiline = multiline, .textarea_doc = if (multiline) &doc else null };
             defer s.deinit();
             _ = try s.setTextChecked("a漢b");
             s.cursor_pos = 1;
@@ -611,7 +649,7 @@ test "buffer backed multiline commands keep the current line after newline" {
         .{ .text = "漢\n", .cursor = 4 },
     };
     for (cases) |case| {
-        var s: TextInputState = .{ .allocator = t.allocator, .multiline = true };
+        var s: TextInputState = .{ .io = @import("std").testing.io, .allocator = t.allocator, .multiline = true };
         defer s.deinit();
         _ = try s.setTextChecked(case.text);
         try s.insertTextChecked("!");

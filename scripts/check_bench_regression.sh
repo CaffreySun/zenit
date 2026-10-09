@@ -1,34 +1,34 @@
 #!/usr/bin/env bash
-# 比较两份 bench JSON，min_ns 退步超阈值时 exit 1
+# Compare two bench JSONs, exit 1 if min_ns regression exceeds threshold.
 #
-# 用法：scripts/check_bench_regression.sh <baseline.json> <current.json> [threshold_pct]
-# threshold_pct 默认 15（current.min > baseline.min * 1.15 视为退步）
+# Usage: scripts/check_bench_regression.sh <baseline.json> <current.json> [threshold_pct]
+# threshold_pct defaults to 15 (current.min > baseline.min * 1.15 counts as regression).
 #
-# ── 为什么阈值不是唯一的判据（2026-07-31 实测）─────────────────────────
-# 同一份未改动的代码连跑 11 轮，62 个 bench 里 **18 个抖动 >15%**，
-# 最大的 a11y_tree_children_50 抖到 87%（2613→4875ns）。抖动大的不只是
-# 纳秒级：element_create_append_100 在 12.7µs 量级也有 25%。
+# Why a threshold alone is insufficient: on unmodified code, **18 of 62 benches varied >15%**
+# across 11 runs; a11y_tree_children_50 swung 87% (2613->4875ns). Large jitter is not limited
+# to nanoseconds: element_create_append_100 at 12.7us shows 25%.
 #
-# 也就是说单看一次采样、卡 15%，必然周期性假红 —— 而假红的代价是所有人
-# 学会无视这个门禁，比没有门禁更糟。
+# Single sample + 15% threshold gives periodic false reds, worse than no gate (everyone
+# learns to ignore it).
 #
-# 两道防线：
-#   1. NOISE_FLOOR_NS  —— 低于地板的只报告不阻塞（计时器分辨率就盖过差异）。
-#   2. BENCH_RERUN_CMD —— 超标的 bench **复测确认**：设了该环境变量时，脚本
-#      重跑一轮 bench 再比一次，仍超标才判红；回落即视为离群（[flaky]）。
-#      只复测 suspect，所以额外成本是一轮 bench，不是一轮 × N。
-# 未设 BENCH_RERUN_CMD 时退化为单次判定（向后兼容），并打印提示。
-# ──────────────────────────────────────────────────────────────────────
+# Two safeguards:
+#   1. NOISE_FLOOR_NS: below the floor only report, don't block (timer resolution masks
+#      differences).
+#   2. BENCH_RERUN_CMD: suspect benches are **retested to confirm**: if set, the script reruns
+#      the bench and retests; red only if still over threshold, else cleared as outlier ([flaky]).
+#      Only suspects are retested, so extra cost is one bench run.
+# Without BENCH_RERUN_CMD it degrades to a single verdict and prints a hint.
 
 set -euo pipefail
 
 BASELINE="${1:?baseline.json required}"
 CURRENT="${2:?current.json required}"
 THRESHOLD_PCT="${3:-15}"
-# 新旧 min_ns 都低于此值的 benchmark 只报告、不阻塞（见下方 [noise] 分支）。
+# Benchmark with both old/new min_ns below this value report only don't block (see [noise] branch
+# below).
 NOISE_FLOOR_NS="${NOISE_FLOOR_NS:-200}"
-# 超标后的复测命令：给定则重跑并二次确认，输出写到 $BENCH_RERUN_OUT。
-# 例：BENCH_RERUN_CMD='zig build bench -- json=%OUT%'
+# Over-threshold retest command: set then rerun and double-check, output to $BENCH_RERUN_OUT.
+# Example: BENCH_RERUN_CMD='zig build bench -- json=%OUT%'
 BENCH_RERUN_CMD="${BENCH_RERUN_CMD:-}"
 
 if ! command -v jq >/dev/null 2>&1; then
@@ -36,12 +36,12 @@ if ! command -v jq >/dev/null 2>&1; then
     exit 2
 fi
 
-# ── fail closed：先显式校验两份输入 ────────────────────────────────────
-# 历史 bug：唯一的输入校验发生在 `done < <(jq ...)` 这个 process substitution 里，
-# 它的失败**不会**传播到主 shell（set -e 对 <(...) 无效），while 读到空输入即
-# 正常结束，脚本照常打印 "All bench checks passed." 并 exit 0。
-# 实测三种情况全部静默放行：current.json 不存在 / 内容损坏 / results 为空数组。
-# 最后一种最危险 —— bench 一个都没跑，jq 连错误都不报，门禁完全失效。
+# -- fail closed: explicitly validate both inputs first --
+# Input validation inside `done < <(jq ...)` process substitution does not propagate failure
+# to the main shell (set -e is a no-op on <(...)), and read treats empty input as normal end,
+# so the script would print 'All bench checks passed.' and exit 0.
+# Three cases passed silently: current.json missing / corrupted / results empty array.
+# The last is the worst: no bench ran, jq doesn't even error, the gate is void.
 validate_bench_json() {
     local role="$1" path="$2"
     if [[ ! -f "$path" ]]; then
@@ -72,36 +72,35 @@ validate_bench_json "current"  "$CURRENT"
 fail=0
 suspects=()
 while read -r name; do
-    # 用 min_ns 比对 —— 抗系统 noise 比 median 强；CI 跑多次取 min
+    # Use min_ns compare — stronger noise resistance than median; CI runs multiple take min
     base=$(jq -r --arg n "$name" '.results[] | select(.name==$n) | .min_ns' "$BASELINE")
     curr=$(jq -r --arg n "$name" '.results[] | select(.name==$n) | .min_ns' "$CURRENT")
     if [[ -z "$base" || "$base" == "null" ]]; then
         echo "  [skip] $name (no baseline)"
         continue
     fi
-    # baseline = 0 通常 ReleaseFast 把 bench body 整个 dead-code-eliminated
+    # baseline = 0 usually ReleaseFast dead-code-eliminates entire bench body
     if awk -v b="$base" 'BEGIN{exit !(b == 0)}'; then
         echo "  [skip] $name (baseline=0; bench likely DCE'd)"
         continue
     fi
-    # 噪声地板：新旧 min_ns 都低于 NOISE_FLOOR_NS 时只报告不阻塞。
+    # Noise floor: when new/old min_ns are both below NOISE_FLOOR_NS, report only, don't block.
     #
-    # 依据（2026-07-31 实测）：在**完全未改动**的代码上连跑三轮，
-    # frame_dashboard_drawcall_count 偏离基线 46%、element_table_unlink_relink
-    # 37%、encode_stream_100_rect_homogeneous 22% —— 全部是 <200ns 的
-    # microbenchmark，计时器分辨率与调度抖动就足以盖过真实差异。
-    # 对这些用 15% 阈值把关只会让 CI 永久红，进而训练所有人无视它。
+    # On **unchanged** code, frame_dashboard_drawcall_count was 46% off baseline,
+    # element_table_unlink_relink 37%, encode_stream_100_rect_homogeneous 22% -- all <200ns
+    # microbenchmarks where timer resolution and scheduling jitter mask real differences.
+    # A 15% threshold there only makes CI permanently red and trains everyone to ignore it.
     #
-    # 超过地板的 benchmark（真正跑得久、信号稳）仍然严格把关。
-    # 只看 baseline 会漏掉量级跃迁（例如 60ns -> 10us）：current 已越过地板
-    # 时信号足够大，必须进入正常回归判定。
+    # Over-floor benchmarks (long-running, stable signal) are still strictly gated.
+    # The baseline alone misses scale jumps (e.g. 60ns -> 10us): if current is over the floor,
+    # the signal is big enough and must enter normal regression judgement.
     if awk -v b="$base" -v c="$curr" -v f="$NOISE_FLOOR_NS" 'BEGIN{exit !(b < f && c < f)}'; then
         ratio_n=$(awk -v c="$curr" -v b="$base" 'BEGIN{printf "%.1f", (c/b)*100}')
         echo "  [noise]   $name: ${base}ns → ${curr}ns (${ratio_n}%; <${NOISE_FLOOR_NS}ns 不阻塞)"
         continue
     fi
 
-    # 计算 ratio = curr / base * 100
+    # Calculate ratio = curr / base * 100
     ratio=$(awk -v c="$curr" -v b="$base" 'BEGIN{printf "%.1f", (c/b)*100}')
     pct_over=$(awk -v c="$curr" -v b="$base" -v t="$THRESHOLD_PCT" 'BEGIN{printf "%.1f", ((c/b)-1)*100}')
 
@@ -113,8 +112,8 @@ while read -r name; do
     fi
 done < <(jq -r '.results[].name' "$CURRENT")
 
-# ── 复测确认 ────────────────────────────────────────────────────────────
-# 只有超标的 bench 才需要二次确认，所以复测一轮即可覆盖全部 suspect。
+# ── retest confirm ────────────────────────────────────────────────────────
+# Only over-threshold benches need second verify, so one retest round covers all suspect.
 if [[ ${#suspects[@]} -eq 0 ]]; then
     echo "All bench checks passed."
     exit 0

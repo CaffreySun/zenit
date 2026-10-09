@@ -1,21 +1,15 @@
-//! Bench main entry，注册所有 bench cases 并运行
-//!
-//! 运行：
-//!   zig build bench
-//!   zig build bench -- 关键字              # 过滤
-//!   zig build bench -- json=path/to.json   # 输出 JSON
-//!
-//! Phase 0 基线录入：
-//! - reactive_1k_signal_fanout：1k 个 effect 订阅同一 signal，set 一次的开销
-//! - resource_pool_cycle：alloc / release / endFrame 循环
-//! - slotmap_alloc_free：ElementId SlotMap alloc + free 循环
+//! Bench main entry, register & run all bench cases. Run: `zig build bench` or
+//! `zig build bench -- keyword` (filter) or `zig build bench -- json=path/to.json`
+//! (output). Baseline: reactive_1k_signal_fanout (1k effects subscribe one
+//! signal, set cost), resource_pool_cycle (alloc/release/endFrame), slotmap_alloc_free
+//! (ElementId SlotMap alloc+free).
 
 const std = @import("std");
 const runner = @import("runner.zig");
 
-// reactive symbols 走 facade re-export (core.zig 已 pub 出来)，
-// 不再保留独立 reactive bench module，解决 facade 拉 Cx 时 core.zig 同时
-// 属 reactive + zenit 两个 module 的冲突。
+// reactive symbols via facade re-export (core.zig pub); no separate reactive
+// bench module, resolve facade-pulling-Cx conflict where core was dual reactive+
+// zenit.
 const zenit = @import("zenit");
 const Signal = zenit.ui_core.Signal;
 const SignalOwner = zenit.ui_core.SignalOwner;
@@ -33,7 +27,7 @@ const PaintTable = zenit.PaintTable;
 const DisplayItem = zenit.DisplayItem;
 const Bounds = zenit.Bounds;
 
-// v0.2-P4 layer bench 只测算法层面的 enum/packed struct
+// v0.2-P4 layer bench only tests algorithm enum/packed struct.
 const PromotionHint = zenit.PromotionHintForBench;
 
 // v0.2-P5 GpuDraw + DisplayItem encoder
@@ -54,8 +48,7 @@ const AccessibilityTree = zenit.AccessibilityTree;
 const A11yDirtyFlag = zenit.A11yDirtyFlag;
 const GestureArena = zenit.GestureArena;
 
-// v0.2-P8 ControlledProp + Select headless
-const ControlledProp = zenit.ControlledProp;
+// v0.2-P8 Select headless
 const select_headless = zenit.select_headless_mod;
 
 const resource_pool = @import("resource_pool");
@@ -72,7 +65,7 @@ const FanoutState = struct {
     target: i32 = 0,
 };
 
-fn fanoutSetup(allocator: std.mem.Allocator) anyerror!*anyopaque {
+fn fanoutSetup(allocator: std.mem.Allocator, _: std.Io) anyerror!*anyopaque {
     const owner = try SignalOwner.init(allocator);
     errdefer owner.deinit();
 
@@ -125,7 +118,7 @@ const PoolState = struct {
     pool: ResourcePool,
 };
 
-fn poolSetup(allocator: std.mem.Allocator) anyerror!*anyopaque {
+fn poolSetup(allocator: std.mem.Allocator, _: std.Io) anyerror!*anyopaque {
     const pool = try ResourcePool.init(allocator, 3);
     const state = try allocator.create(PoolState);
     state.* = .{ .pool = pool };
@@ -157,7 +150,7 @@ const SlotState = struct {
     map: SlotMap(u32),
 };
 
-fn slotSetup(allocator: std.mem.Allocator) anyerror!*anyopaque {
+fn slotSetup(allocator: std.mem.Allocator, _: std.Io) anyerror!*anyopaque {
     const state = try allocator.create(SlotState);
     state.* = .{ .map = SlotMap(u32).init(allocator) };
     return @ptrCast(state);
@@ -177,10 +170,8 @@ fn slotBody(allocator: std.mem.Allocator, ctx: *runner.BenchCtx) anyerror!void {
     ctx.blackbox(id);
 }
 
-// ============================================================================
-// diamond glitch set, A->B(memo), A->C(memo), [B,C]->D(effect)
-// 写 A 时 D 必须只跑一次（拓扑序保证）+ B/C 都已根据新 A 重算的值。
-// ============================================================================
+// diamond glitch set: A->B(memo), A->C(memo), [B,C]->D(effect). Write A
+// must run D once (topo sort) + B/C both recomputed with new A value.
 
 const Memo = zenit.ui_core.Memo;
 const createMemo = zenit.ui_core.createMemo;
@@ -194,7 +185,7 @@ const DiamondState = struct {
     target: i32 = 0,
 };
 
-fn diamondSetup(allocator: std.mem.Allocator) anyerror!*anyopaque {
+fn diamondSetup(allocator: std.mem.Allocator, _: std.Io) anyerror!*anyopaque {
     const owner = try SignalOwner.init(allocator);
     errdefer owner.deinit();
     const a = try Signal(i32).create(owner, 0);
@@ -248,9 +239,8 @@ fn diamondBody(allocator: std.mem.Allocator, ctx: *runner.BenchCtx) anyerror!voi
     ctx.blackbox(state.run_count.*);
 }
 
-// ============================================================================
-// lazy memo unused，创建 memo 但没下游读，set source 不应触发计算
-// ============================================================================
+// lazy memo unused: memo created but no downstream read; set source shouldn't
+// trigger compute.
 
 const LazyState = struct {
     owner: *SignalOwner,
@@ -258,7 +248,7 @@ const LazyState = struct {
     target: i32 = 0,
 };
 
-fn lazyMemoSetup(allocator: std.mem.Allocator) anyerror!*anyopaque {
+fn lazyMemoSetup(allocator: std.mem.Allocator, _: std.Io) anyerror!*anyopaque {
     const owner = try SignalOwner.init(allocator);
     errdefer owner.deinit();
     const a = try Signal(i32).create(owner, 0);
@@ -267,7 +257,8 @@ fn lazyMemoSetup(allocator: std.mem.Allocator) anyerror!*anyopaque {
     while (i < 100) : (i += 1) {
         _ = try createMemo(owner, i32, .{ .a = a }, struct {
             fn compute(c: anytype) i32 {
-                // 故意昂贵：100 个 memo 都依赖 a；如果 lazy 正确，set a 时它们都不算
+                // Deliberately expensive: 100 memo depend a; if lazy correct, set a doesn't
+                // compute any.
                 var s: i32 = 0;
                 var k: i32 = 0;
                 while (k < 100) : (k += 1) s +%= c.a.get();
@@ -295,10 +286,8 @@ fn lazyMemoBody(allocator: std.mem.Allocator, ctx: *runner.BenchCtx) anyerror!vo
     ctx.blackbox(state.target);
 }
 
-// ============================================================================
-// topological chain 10, A -> M1 -> M2 -> ... -> M10 -> effect
-// 写 A 时 effect 应只触发一次，所有 memo 拓扑序更新。
-// ============================================================================
+// topological chain 10: A->M1->M2->...->M10->effect. Set A runs effect once,
+// all memo topo-updated.
 
 const ChainState = struct {
     owner: *SignalOwner,
@@ -307,7 +296,7 @@ const ChainState = struct {
     target: i32 = 0,
 };
 
-fn chainSetup(allocator: std.mem.Allocator) anyerror!*anyopaque {
+fn chainSetup(allocator: std.mem.Allocator, _: std.Io) anyerror!*anyopaque {
     const owner = try SignalOwner.init(allocator);
     errdefer owner.deinit();
     const a = try Signal(i32).create(owner, 0);
@@ -353,11 +342,9 @@ fn chainBody(allocator: std.mem.Allocator, ctx: *runner.BenchCtx) anyerror!void 
     ctx.blackbox(state.final_count.*);
 }
 
-// ============================================================================
-// 10k node tree build + traverse, element_table SoA 性能
-// 模拟 layout pass 的"建树 + 全量遍历"工作量；一旦 layout 切到 ElementTable
-// 这就是 zero-dirty 帧的 baseline 工作。
-// ============================================================================
+// 10k node tree build + traverse; element_table SoA performance. Simulates
+// layout pass "build + full traverse" workload; once layout switches to
+// ElementTable, this is zero-dirty baseline.
 
 const TreeState = struct {
     table: ElementTable,
@@ -365,11 +352,11 @@ const TreeState = struct {
     target_id: ElementId,
 };
 
-fn treeSetup(allocator: std.mem.Allocator) anyerror!*anyopaque {
+fn treeSetup(allocator: std.mem.Allocator, _: std.Io) anyerror!*anyopaque {
     var t = ElementTable.init(allocator);
     errdefer t.deinit();
 
-    // 建 10k node 平衡树（depth 100, 100 child each）
+    // Build 10k balanced tree (depth 100, 100 child each).
     const root = try t.create(.{ .tag = .container, .key = 0 });
     var target: ElementId = root;
     var i: u32 = 0;
@@ -398,7 +385,7 @@ fn treeTeardown(allocator: std.mem.Allocator, ptr: *anyopaque) void {
 fn tree10kTraverseBody(allocator: std.mem.Allocator, ctx: *runner.BenchCtx) anyerror!void {
     _ = allocator;
     const state: *TreeState = @ptrCast(@alignCast(ctx.state.?));
-    // 全树 DFS：ElementTable.children iterator
+    // Full-tree DFS via ElementTable.children iterator.
     var stack: [128]ElementId = undefined;
     stack[0] = state.root;
     var sp: usize = 1;
@@ -417,21 +404,19 @@ fn tree10kTraverseBody(allocator: std.mem.Allocator, ctx: *runner.BenchCtx) anye
     ctx.blackbox(visited);
 }
 
-// ============================================================================
-// IntrinsicCache hit rate
-// 1k 不同 LayoutInput key，先 put 一遍，然后 100 次随机命中读
-// ============================================================================
+// IntrinsicCache hit rate: 1k different LayoutInput key, put once, then 100
+// random hits.
 
 const CacheState = struct {
     cache: IntrinsicCache,
     keys: [1024]u64,
 };
 
-fn cacheSetup(allocator: std.mem.Allocator) anyerror!*anyopaque {
+fn cacheSetup(allocator: std.mem.Allocator, _: std.Io) anyerror!*anyopaque {
     const state = try allocator.create(CacheState);
     state.cache = .{};
 
-    // 用 hashLayoutInput 生成 1024 个不同 hash
+    // Generate 1024 different hash via hashLayoutInput.
     var i: usize = 0;
     while (i < 1024) : (i += 1) {
         const inp = LayoutInput{
@@ -453,36 +438,31 @@ fn cacheTeardown(allocator: std.mem.Allocator, ptr: *anyopaque) void {
 fn cacheLookupBody(allocator: std.mem.Allocator, ctx: *runner.BenchCtx) anyerror!void {
     _ = allocator;
     const state: *CacheState = @ptrCast(@alignCast(ctx.state.?));
-    // 4-entry direct mapped cache：大量 key 自相覆盖；只有 last 4 命中。
-    // 但接口仍 O(1)，bench 验证调用本身开销。
+    // 4-entry direct-mapped cache: many keys self-collide; only last 4 hit. Interface
+    // still O(1); bench verifies call overhead.
     const key = state.keys[ctx.iter_index % 1024];
     const got = state.cache.get(key);
     ctx.blackbox(got);
 }
 
-// ============================================================================
-// ElementTable 子树 unlink 中间节点
-// ============================================================================
+// ElementTable subtree unlink middle node.
 
 fn unlinkBody(allocator: std.mem.Allocator, ctx: *runner.BenchCtx) anyerror!void {
     _ = allocator;
     const state: *TreeState = @ptrCast(@alignCast(ctx.state.?));
-    // 取 target 节点并 unlink + appendChild 回去
+    // Get target node, unlink + appendChild back.
     const tgt = state.target_id;
     if (state.table.isValid(tgt)) {
         state.table.unlink(tgt);
-        // 重新挂回 root（避免 tree 退化）
+        // Re-hang to root (prevent tree decay).
         state.table.appendChild(state.root, tgt);
     }
     ctx.blackbox(tgt);
 }
 
-// ============================================================================
-// single_signal_color_change_paint
-// 端到端测：signal.set -> effect run -> 写 dirty hashmap entry。
-// 这是"单 signal 改色 -> paint dirty 落地"路径的真实成本。
-// plan 矩阵 #2 目标 < 100µs。
-// ============================================================================
+// single_signal_color_change_paint: end-to-end signal.set -> effect run ->
+// dirty hashmap write. Real cost of "single signal color -> paint dirty";
+// plan matrix #2 target < 100 us.
 
 const SingleSignalState = struct {
     owner: *SignalOwner,
@@ -492,7 +472,7 @@ const SingleSignalState = struct {
     target_color: u32,
 };
 
-fn singleSignalColorSetup(allocator: std.mem.Allocator) anyerror!*anyopaque {
+fn singleSignalColorSetup(allocator: std.mem.Allocator, _: std.Io) anyerror!*anyopaque {
     const owner = try SignalOwner.init(allocator);
     errdefer owner.deinit();
     const sig = try Signal(u32).create(owner, 0xFF0000FF);
@@ -506,8 +486,8 @@ fn singleSignalColorSetup(allocator: std.mem.Allocator) anyerror!*anyopaque {
         .target_color = 0xFF0000FF,
     };
 
-    // 创建 effect：模拟 reactive effect 收到 color 变化后通知 paint dirty
-    // 这是真实场景里 button.style.background = signal.get() 的 reactive 桥
+    // Create effect: simulate reactive effect seeing color change, notify paint
+    // dirty (real app: button.style.background = signal.get() reactive bridge).
     try createEffect(owner, .{
         .signal = sig,
         .dirty_set = &state.dirty_set,
@@ -517,10 +497,11 @@ fn singleSignalColorSetup(allocator: std.mem.Allocator) anyerror!*anyopaque {
     }, struct {
         fn run(ctx: anytype) void {
             const new_color = ctx.signal.get();
-            // 模拟"颜色变化 -> 标 paint dirty"
+            // Simulate "color change -> mark paint dirty".
             ctx.target_color.* = new_color;
-            // 诊断路径：bench 里模拟 dirty 标记的假负载，不是真渲染管线。
-            // 分配失败只让这一轮少标一个 id，测的是 signal 传播开销本身。
+            // Diagnostic path: bench simulates dirty-mark fake load, not true render
+            // pipeline. Alloc fail only skips one id this round, measures signal propagation
+            // cost itself.
             ctx.dirty_set.put(ctx.allocator, ctx.target_id, 1) catch {};
         }
     }.run);
@@ -538,19 +519,17 @@ fn singleSignalColorTeardown(allocator: std.mem.Allocator, ptr: *anyopaque) void
 fn singleSignalColorBody(allocator: std.mem.Allocator, ctx: *runner.BenchCtx) anyerror!void {
     _ = allocator;
     const state: *SingleSignalState = @ptrCast(@alignCast(ctx.state.?));
-    // 模拟用户改色：signal.set 触发 reactive 链路全程跑一遍
+    // Simulate user color change: signal.set triggers full reactive pipeline.
     const new_color: u32 = @intCast(0xFF000000 | (ctx.iter_index & 0xFFFFFF));
     state.color_signal.set(new_color);
     ctx.blackbox(state.target_color);
     ctx.blackbox(state.dirty_set.count());
 }
 
-// ============================================================================
-// signal_color_change_realistic
-// 更真实场景：1 个 color signal 驱动 10 个 Button 的 background；
-// 改色触发 10 个 effect 同时跑，每个 effect 模拟"读 signal + 改 style + 标 dirty"
-// 这接近真实 dashboard 里"theme 切换"的 reactive 工作量。
-// ============================================================================
+// signal_color_change_realistic: 1 color signal drives 10 Button background;
+// color change triggers 10 effect simultaneously, each simulates "read signal +
+// change style + mark dirty"—closer to real dashboard "theme switch" reactive
+// work.
 
 const RealisticState = struct {
     owner: *SignalOwner,
@@ -560,7 +539,7 @@ const RealisticState = struct {
     allocator: std.mem.Allocator,
 };
 
-fn realisticSetup(allocator: std.mem.Allocator) anyerror!*anyopaque {
+fn realisticSetup(allocator: std.mem.Allocator, _: std.Io) anyerror!*anyopaque {
     const owner = try SignalOwner.init(allocator);
     errdefer owner.deinit();
     const theme = try Signal(u32).create(owner, 0xFF0000FF);
@@ -569,12 +548,12 @@ fn realisticSetup(allocator: std.mem.Allocator) anyerror!*anyopaque {
     state.* = .{
         .owner = owner,
         .theme_signal = theme,
-        .button_colors = [_]u32{0} ** 10,
+        .button_colors = @as([10]u32, @splat(0)),
         .dirty_set = .{},
         .allocator = allocator,
     };
 
-    // 10 个 button 各创建 effect 订阅 theme 变化
+    // 10 buttons each create effect subscribing to theme change.
     var i: u32 = 0;
     while (i < 10) : (i += 1) {
         const Slot = struct {
@@ -594,9 +573,10 @@ fn realisticSetup(allocator: std.mem.Allocator) anyerror!*anyopaque {
         try createEffect(owner, slot_ctx, struct {
             fn run(ctx: anytype) void {
                 const new_color = ctx.theme_sig.get();
-                // 模拟"读 signal -> 算出 style -> 写 Node 字段 -> 标 dirty"完整链路
+                // Simulate "read signal -> compute style -> write Node field -> mark dirty"
+                // full path.
                 ctx.color_slot.* = new_color;
-                // 诊断路径：同上，bench 假负载。
+                // Diagnostic path: same as above, bench fake load.
                 ctx.dirty.put(ctx.alloc, ctx.slot_id, 1) catch {};
             }
         }.run);
@@ -621,10 +601,8 @@ fn realisticBody(allocator: std.mem.Allocator, ctx: *runner.BenchCtx) anyerror!v
     ctx.blackbox(state.dirty_set.count());
 }
 
-// ============================================================================
-// ElementTable 1k create + appendChild 链
-// 模拟 v0.5 取代 *Node god-object 后的真"创建节点"路径
-// ============================================================================
+// ElementTable 1k create + appendChild chain. Simulates v0.5's replacement of
+// *Node god-object with true "create node" path.
 
 fn elementCreateAppendBody(allocator: std.mem.Allocator, ctx: *runner.BenchCtx) anyerror!void {
     var table = ElementTable.init(allocator);
@@ -638,10 +616,8 @@ fn elementCreateAppendBody(allocator: std.mem.Allocator, ctx: *runner.BenchCtx) 
     _ = ctx;
 }
 
-// ============================================================================
-// World 4 表 ensureSlot 同步路径
-// 模拟 builders 在 createElement 时对 layout/paint table ensureSlot 的成本
-// ============================================================================
+// World 4-table ensureSlot sync path: builder layout/paint table ensureSlot cost
+// during createElement.
 
 const FourTablesState = struct {
     elements: ElementTable,
@@ -649,7 +625,7 @@ const FourTablesState = struct {
     paint: PaintTable,
 };
 
-fn fourTablesSetup(allocator: std.mem.Allocator) anyerror!*anyopaque {
+fn fourTablesSetup(allocator: std.mem.Allocator, _: std.Io) anyerror!*anyopaque {
     const state = try allocator.create(FourTablesState);
     state.* = .{
         .elements = ElementTable.init(allocator),
@@ -670,16 +646,14 @@ fn fourTablesTeardown(allocator: std.mem.Allocator, ptr: *anyopaque) void {
 fn fourTablesEnsureBody(allocator: std.mem.Allocator, ctx: *runner.BenchCtx) anyerror!void {
     _ = allocator;
     const state: *FourTablesState = @ptrCast(@alignCast(ctx.state.?));
-    // 一次 element create + 同步 layout/paint table 写入
+    // one element create + sync layout/paint table write.
     const id = try state.elements.create(.{ .tag = .container, .key = ctx.iter_index });
     try state.layout.ensureSlot(id);
     try state.paint.ensureSlot(id);
     ctx.blackbox(id);
 }
 
-// ============================================================================
-// ElementId hot path 验证 (世界扫 1k IDs)
-// ============================================================================
+// ElementId hot path verify (scan 1k IDs via world).
 
 fn elementIdHotPathBody(allocator: std.mem.Allocator, ctx: *runner.BenchCtx) anyerror!void {
     _ = allocator;
@@ -693,15 +667,13 @@ fn elementIdHotPathBody(allocator: std.mem.Allocator, ctx: *runner.BenchCtx) any
     _ = ctx.iter_index;
 }
 
-// ============================================================================
-// Bounds.unionWith hot path（layerize 累计 bounds）
-// ============================================================================
+// Bounds.unionWith hot path (layerize accumulate bounds).
 
 const BoundsBenchState = struct {
     bounds: [256]Bounds,
 };
 
-fn boundsSetup(allocator: std.mem.Allocator) anyerror!*anyopaque {
+fn boundsSetup(allocator: std.mem.Allocator, _: std.Io) anyerror!*anyopaque {
     const state = try allocator.create(BoundsBenchState);
     for (&state.bounds, 0..) |*b, i| {
         b.* = .{
@@ -729,23 +701,21 @@ fn boundsUnionBody(allocator: std.mem.Allocator, ctx: *runner.BenchCtx) anyerror
     ctx.blackbox(acc);
 }
 
-// ============================================================================
-// PaintChunk content_hash batch invalidation
-// 模拟一帧内 1k chunks 全部 content_hash mismatch 触发重录
-// ============================================================================
+// PaintChunk content_hash batch invalidation: simulate 1k chunks all content_hash
+// mismatch triggering re-record.
 
 const PaintBatchState = struct {
     table: PaintTable,
 };
 
-fn paintBatchSetup(allocator: std.mem.Allocator) anyerror!*anyopaque {
+fn paintBatchSetup(allocator: std.mem.Allocator, _: std.Io) anyerror!*anyopaque {
     const state = try allocator.create(PaintBatchState);
     state.* = .{ .table = PaintTable.init(allocator) };
     var i: u32 = 0;
     while (i < 1000) : (i += 1) {
         const eid: ElementId = .{ .index = @intCast(i), .generation = 0 };
         try state.table.ensureSlot(eid);
-        // 初始 hash
+        // Initial hash.
         _ = try state.table.beginRecord(eid, 1);
         state.table.endRecord(eid, .NONE);
     }
@@ -761,7 +731,7 @@ fn paintBatchTeardown(allocator: std.mem.Allocator, ptr: *anyopaque) void {
 fn paintBatchInvalidateBody(allocator: std.mem.Allocator, ctx: *runner.BenchCtx) anyerror!void {
     _ = allocator;
     const state: *PaintBatchState = @ptrCast(@alignCast(ctx.state.?));
-    // 全部 chunk 用新 hash 触发 cache miss
+    // All chunks new hash -> cache miss.
     var miss_count: u32 = 0;
     var i: u32 = 0;
     while (i < 1000) : (i += 1) {
@@ -775,9 +745,7 @@ fn paintBatchInvalidateBody(allocator: std.mem.Allocator, ctx: *runner.BenchCtx)
     ctx.blackbox(miss_count);
 }
 
-// ============================================================================
-// PropertyStateRef pack/unpack（renderer 每 chunk 读 16B 引用）
-// ============================================================================
+// PropertyStateRef pack/unpack (renderer reads 16B ref per chunk).
 
 fn propertyStateRefBody(allocator: std.mem.Allocator, ctx: *runner.BenchCtx) anyerror!void {
     _ = allocator;
@@ -792,16 +760,14 @@ fn propertyStateRefBody(allocator: std.mem.Allocator, ctx: *runner.BenchCtx) any
     ctx.blackbox(back);
 }
 
-// ============================================================================
-// IntrinsicCache miss-path（模拟 layout pass 第一次测每节点）
-// ============================================================================
+// IntrinsicCache miss-path (simulate layout pass first-measure each node).
 
 const IntrinsicCacheState = struct {
     cache: IntrinsicCache,
     keys: [256]u64,
 };
 
-fn intrinsicCacheMissSetup(allocator: std.mem.Allocator) anyerror!*anyopaque {
+fn intrinsicCacheMissSetup(allocator: std.mem.Allocator, _: std.Io) anyerror!*anyopaque {
     const state = try allocator.create(IntrinsicCacheState);
     state.cache = .{};
     for (&state.keys, 0..) |*k, i| {
@@ -821,7 +787,7 @@ fn intrinsicCacheMissTeardown(allocator: std.mem.Allocator, ptr: *anyopaque) voi
 fn intrinsicCacheMissBody(allocator: std.mem.Allocator, ctx: *runner.BenchCtx) anyerror!void {
     _ = allocator;
     const state: *IntrinsicCacheState = @ptrCast(@alignCast(ctx.state.?));
-    // 256 个不同 key 反复 put（4-entry cache 必然多数 miss）
+    // 256 different key repeatedly put (4-entry cache guaranteed mostly miss).
     const k = state.keys[ctx.iter_index % state.keys.len];
     state.cache.put(k, .{ .size = .{ .width = 100, .height = 50 } });
 }
@@ -843,7 +809,7 @@ fn layoutEpochScanBody(allocator: std.mem.Allocator, ctx: *runner.BenchCtx) anye
 }
 
 // ============================================================================
-// AvailableSpace fit-content path - 模拟 Constraint passing
+// AvailableSpace fit-content path: simulates constraint passing
 // ============================================================================
 
 fn availableSpaceTransformBody(allocator: std.mem.Allocator, ctx: *runner.BenchCtx) anyerror!void {
@@ -854,7 +820,7 @@ fn availableSpaceTransformBody(allocator: std.mem.Allocator, ctx: *runner.BenchC
             200,
         ),
     };
-    // 模拟 Constraint passing：subtract padding + clamp + hash 决定 cache key
+    // Simulate Constraint passing: subtract padding + clamp + hash for cache key.
     const w_after = inp.available_space.width.subtractDefinite(20).clampMax(800);
     const h_after = inp.available_space.height.subtractDefinite(10).clampMax(600);
     const inp2 = LayoutInput{
@@ -874,14 +840,14 @@ const A11yDrainState = struct {
     drain_count: u32,
 };
 
-fn a11yDrainSetup(allocator: std.mem.Allocator) anyerror!*anyopaque {
+fn a11yDrainSetup(allocator: std.mem.Allocator, _: std.Io) anyerror!*anyopaque {
     const state = try allocator.create(A11yDrainState);
     state.* = .{ .tree = AccessibilityTree.init(allocator), .drain_count = 0 };
-    // 预填 100 个 a11y nodes
+    // Pre-fill 100 a11y nodes.
     var i: u32 = 0;
     while (i < 100) : (i += 1) {
         try state.tree.upsert(.{
-            .element = .{ .index = @intCast(i), .generation = 0 },
+            .element = zenit.AXId.node(.{ .index = @intCast(i), .generation = 0 }),
             .role = .button,
             .state = .{ .focusable = true },
             .label_hash = i,
@@ -896,7 +862,7 @@ fn a11yDrainTeardown(allocator: std.mem.Allocator, ptr: *anyopaque) void {
     allocator.destroy(state);
 }
 
-fn a11yDrainCb(ctx: *anyopaque, id: zenit.ElementId, flag: zenit.A11yDirtyFlag) void {
+fn a11yDrainCb(ctx: *anyopaque, id: zenit.AXId, flag: zenit.A11yDirtyFlag) void {
     const c: *A11yDrainState = @ptrCast(@alignCast(ctx));
     c.drain_count +%= 1;
     _ = id;
@@ -908,27 +874,24 @@ fn a11yDrainBody(allocator: std.mem.Allocator, ctx: *runner.BenchCtx) anyerror!v
     const state: *A11yDrainState = @ptrCast(@alignCast(ctx.state.?));
     state.drain_count = 0;
     state.tree.drainDirty(state, a11yDrainCb);
-    // 重新标 dirty 100 个让下轮 bench 有事可 drain
-    // 诊断路径：bench fixture 的重置步骤，失败只影响下一轮的样本量，
-    // 不参与任何产品代码路径。
+    // Mark dirty 100 again for next bench round to drain. Diagnostic: fixture
+    // reset; fail only impacts next round sample size, outside product code.
     var i: u32 = 0;
     while (i < 100) : (i += 1) {
-        state.tree.markDirty(.{ .index = @intCast(i), .generation = 0 }, .{ .state_changed = true }) catch {};
+        state.tree.markDirty(zenit.AXId.node(.{ .index = @intCast(i), .generation = 0 }), .{ .state_changed = true }) catch {};
     }
     ctx.blackbox(state.drain_count);
 }
 
-// ============================================================================
-// select_headless typeahead 匹配
-// ============================================================================
+// select_headless typeahead match.
 
-fn typeaheadSetup(allocator: std.mem.Allocator) anyerror!*anyopaque {
+fn typeaheadSetup(allocator: std.mem.Allocator, _: std.Io) anyerror!*anyopaque {
     const state = try allocator.create(SelectBenchState);
     state.* = .{
-        .state = select_headless.SelectState(i32).init(.{}),
+        .state = select_headless.SelectState(i32){},
         .options = undefined,
     };
-    // 10 选项不同首字母
+    // 10 options different first letter.
     const labels = [_][]const u8{ "Apple", "Banana", "Cherry", "Date", "Elderberry", "Fig", "Grape", "Honeydew", "Kiwi", "Lemon" };
     for (&state.options, 0..) |*opt, i| {
         opt.* = .{ .value = @intCast(i), .label = labels[i] };
@@ -945,16 +908,14 @@ fn typeaheadBody(allocator: std.mem.Allocator, ctx: *runner.BenchCtx) anyerror!v
     ctx.blackbox(state.state.highlight_index);
 }
 
-// ============================================================================
-// a11y tree.children lookup（O(N) scan）
-// ============================================================================
+// a11y tree.children lookup (O(N) scan).
 
 const A11yChildrenState = struct {
     tree: AccessibilityTree,
-    out: std.ArrayListUnmanaged(zenit.ElementId) = .{},
+    out: std.ArrayListUnmanaged(zenit.AXId) = .empty,
 };
 
-fn a11yChildrenSetup(allocator: std.mem.Allocator) anyerror!*anyopaque {
+fn a11yChildrenSetup(allocator: std.mem.Allocator, _: std.Io) anyerror!*anyopaque {
     const state = try allocator.create(A11yChildrenState);
     state.* = .{ .tree = AccessibilityTree.init(allocator) };
     errdefer allocator.destroy(state);
@@ -963,12 +924,12 @@ fn a11yChildrenSetup(allocator: std.mem.Allocator) anyerror!*anyopaque {
     // Reallocating and freeing 50 IDs per iteration made this benchmark vary
     // by 2.8x on unchanged code and mostly measured the GPA, not tree.children.
     try state.out.ensureTotalCapacity(allocator, 50);
-    const parent: zenit.ElementId = .{ .index = 0, .generation = 0 };
+    const parent = zenit.AXId.node(.{ .index = 0, .generation = 0 });
     try state.tree.upsert(.{ .element = parent, .role = .group });
     var i: u32 = 1;
     while (i <= 50) : (i += 1) {
         try state.tree.upsert(.{
-            .element = .{ .index = @intCast(i), .generation = 0 },
+            .element = zenit.AXId.node(.{ .index = @intCast(i), .generation = 0 }),
             .parent = parent,
             .role = .listitem,
             .sibling_index = i - 1,
@@ -987,28 +948,26 @@ fn a11yChildrenTeardown(allocator: std.mem.Allocator, ptr: *anyopaque) void {
 fn a11yChildrenBody(allocator: std.mem.Allocator, ctx: *runner.BenchCtx) anyerror!void {
     const state: *A11yChildrenState = @ptrCast(@alignCast(ctx.state.?));
     state.out.clearRetainingCapacity();
-    const parent: zenit.ElementId = .{ .index = 0, .generation = 0 };
+    const parent = zenit.AXId.node(.{ .index = 0, .generation = 0 });
     try state.tree.children(parent, &state.out, allocator);
     ctx.blackbox(state.out.items.len);
 }
 
-// ============================================================================
-// encode_dashboard_typical (50 rect + 30 text + 10 image 混合)
-// ============================================================================
+// encode_dashboard_typical (50 rect + 30 text + 10 image mix).
 
 const DashboardEncodeState = struct {
     items: [90]DisplayItem,
     out: [90]GpuDraw,
 };
 
-fn dashboardSetup(allocator: std.mem.Allocator) anyerror!*anyopaque {
+fn dashboardSetup(allocator: std.mem.Allocator, _: std.Io) anyerror!*anyopaque {
     const state = try allocator.create(DashboardEncodeState);
     var i: usize = 0;
     // 50 rect
     while (i < 50) : (i += 1) {
         state.items[i] = .{ .kind = .rect };
     }
-    // 30 text（同 font）
+    // 30 text (same font).
     while (i < 80) : (i += 1) {
         state.items[i] = .{ .kind = .text, .resource_handle = 1 };
     }
@@ -1031,16 +990,14 @@ fn dashboardEncodeBody(allocator: std.mem.Allocator, ctx: *runner.BenchCtx) anye
     ctx.blackbox(written);
 }
 
-// ============================================================================
-// shaping_cache_warm_hit_rate（100 次 lookup，全命中）
-// ============================================================================
+// shaping_cache_warm_hit_rate (100 lookup, all hit).
 
 const ShapingWarmState = struct {
     cache: ShapingCache,
     keys: [128]ShapingKey,
 };
 
-fn shapingWarmSetup(allocator: std.mem.Allocator) anyerror!*anyopaque {
+fn shapingWarmSetup(allocator: std.mem.Allocator, _: std.Io) anyerror!*anyopaque {
     const state = try allocator.create(ShapingWarmState);
     state.* = .{ .cache = ShapingCache.init(allocator, 256), .keys = undefined };
     state.cache.beginFrame();
@@ -1076,9 +1033,7 @@ fn shapingWarmBody(allocator: std.mem.Allocator, ctx: *runner.BenchCtx) anyerror
     ctx.blackbox(got);
 }
 
-// ============================================================================
-// GlyphRun.xToCluster 复杂 cluster（10 codepoints, 不均匀 advance）
-// ============================================================================
+// GlyphRun.xToCluster complex cluster (10 codepoints, uneven advance).
 
 const GlyphRun = zenit.GlyphRun;
 
@@ -1088,12 +1043,12 @@ const XToClusterState = struct {
     run: GlyphRun,
 };
 
-fn xToClusterSetup(allocator: std.mem.Allocator) anyerror!*anyopaque {
+fn xToClusterSetup(allocator: std.mem.Allocator, _: std.Io) anyerror!*anyopaque {
     const state = try allocator.create(XToClusterState);
     for (&state.glyphs, 0..) |*g, i| {
         g.* = .{
             .glyph_id = @intCast(i + 1),
-            .x_advance = @floatFromInt(8 + (i % 4) * 3), // 8/11/14/17 px 不均
+            .x_advance = @floatFromInt(8 + (i % 4) * 3), // 8/11/14/17 px uneven.
         };
     }
     for (&state.clusters, 0..) |*c, i| {
@@ -1125,16 +1080,14 @@ fn xToClusterBody(allocator: std.mem.Allocator, ctx: *runner.BenchCtx) anyerror!
     ctx.blackbox(cluster);
 }
 
-// ============================================================================
-// PropertyScrollNode array update simulation
-// 模拟 1000 scroll containers 每帧更新 offset
-// ============================================================================
+// PropertyScrollNode array update simulation: simulate 1000 scroll containers
+// update offset per frame.
 
 const ScrollArrayState = struct {
     nodes: [1000]zenit.PropertyScrollNode,
 };
 
-fn scrollArraySetup(allocator: std.mem.Allocator) anyerror!*anyopaque {
+fn scrollArraySetup(allocator: std.mem.Allocator, _: std.Io) anyerror!*anyopaque {
     const state = try allocator.create(ScrollArrayState);
     for (&state.nodes, 0..) |*n, i| {
         n.* = .{ .node_id = @intCast(i), .viewport_w = 800, .viewport_h = 600 };
@@ -1150,7 +1103,7 @@ fn scrollArrayTeardown(allocator: std.mem.Allocator, ptr: *anyopaque) void {
 fn scrollOffsetUpdateBody(allocator: std.mem.Allocator, ctx: *runner.BenchCtx) anyerror!void {
     _ = allocator;
     const state: *ScrollArrayState = @ptrCast(@alignCast(ctx.state.?));
-    // 1000 个 scroll node 全部 update offset（模拟每帧滚动事件）
+    // 1000 scroll node all update offset (simulate per-frame scroll event).
     for (&state.nodes) |*n| {
         n.scroll_offset_y = @floatFromInt(ctx.iter_index & 0xFFFF);
         n.is_scrolling = true;
@@ -1166,7 +1119,7 @@ const HintCollectState = struct {
     inputs: [1000]zenit.PromotionHintForBench,
 };
 
-fn hintCollectSetup(allocator: std.mem.Allocator) anyerror!*anyopaque {
+fn hintCollectSetup(allocator: std.mem.Allocator, _: std.Io) anyerror!*anyopaque {
     const state = try allocator.create(HintCollectState);
     for (&state.inputs, 0..) |*h, i| {
         h.* = .{
@@ -1204,17 +1157,15 @@ fn scrollLookupBody(allocator: std.mem.Allocator, ctx: *runner.BenchCtx) anyerro
     ctx.blackbox(offset);
 }
 
-// ============================================================================
-// ElementId pack/unpack via World.elements
-// 验证 first-class ElementId API 在 World 路径上的开销
-// ============================================================================
+// ElementId pack/unpack via World.elements: verify first-class ElementId API
+// cost on World path.
 
 const ElementWorldState = struct {
     table: ElementTable,
     ids: [1000]ElementId,
 };
 
-fn elementWorldSetup(allocator: std.mem.Allocator) anyerror!*anyopaque {
+fn elementWorldSetup(allocator: std.mem.Allocator, _: std.Io) anyerror!*anyopaque {
     const state = try allocator.create(ElementWorldState);
     state.* = .{ .table = ElementTable.init(allocator), .ids = undefined };
     var i: u32 = 0;
@@ -1254,19 +1205,16 @@ fn elementLinksReadBody(allocator: std.mem.Allocator, ctx: *runner.BenchCtx) any
     ctx.blackbox(links);
 }
 
-// ============================================================================
-// LayoutTable.markLaidOut throughput
-// 模拟 layout pass 写 1k 节点 rect 的开销
-// ============================================================================
+// LayoutTable.markLaidOut throughput: simulate layout pass writing 1k node rect.
 
 const LayoutTableState = struct {
     table: LayoutTable,
 };
 
-fn layoutTableSetup(allocator: std.mem.Allocator) anyerror!*anyopaque {
+fn layoutTableSetup(allocator: std.mem.Allocator, _: std.Io) anyerror!*anyopaque {
     const state = try allocator.create(LayoutTableState);
     state.* = .{ .table = LayoutTable.init(allocator) };
-    // 预分配 1k 个 slot
+    // Pre-allocate 1k slots.
     var i: u32 = 0;
     while (i < 1000) : (i += 1) {
         try state.table.ensureSlot(.{ .index = @intCast(i), .generation = 0 });
@@ -1304,9 +1252,7 @@ fn layoutTableRectReadBody(allocator: std.mem.Allocator, ctx: *runner.BenchCtx) 
     ctx.blackbox(r);
 }
 
-// ============================================================================
-// LayoutTable.epoch read hot path（cache invalidation 检查）
-// ============================================================================
+// LayoutTable.epoch read hot path (cache invalidation check).
 
 fn layoutTableEpochReadBody(allocator: std.mem.Allocator, ctx: *runner.BenchCtx) anyerror!void {
     _ = allocator;
@@ -1316,9 +1262,7 @@ fn layoutTableEpochReadBody(allocator: std.mem.Allocator, ctx: *runner.BenchCtx)
     ctx.blackbox(e);
 }
 
-// ============================================================================
-// Signal alone (无 observer) - 测 set 的最低开销
-// ============================================================================
+// Signal alone (no observer)—minimum set cost.
 
 const SignalAloneState = struct {
     owner: *SignalOwner,
@@ -1326,7 +1270,7 @@ const SignalAloneState = struct {
     target: i32,
 };
 
-fn signalAloneSetup(allocator: std.mem.Allocator) anyerror!*anyopaque {
+fn signalAloneSetup(allocator: std.mem.Allocator, _: std.Io) anyerror!*anyopaque {
     const owner = try SignalOwner.init(allocator);
     errdefer owner.deinit();
     const sig = try Signal(i32).create(owner, 0);
@@ -1349,9 +1293,7 @@ fn signalAloneBody(allocator: std.mem.Allocator, ctx: *runner.BenchCtx) anyerror
     ctx.blackbox(state.target);
 }
 
-// ============================================================================
-// Signal create + immediate set + 不创建 effect
-// ============================================================================
+// Signal create + immediate set, no effect.
 
 fn signalCreateBody(allocator: std.mem.Allocator, ctx: *runner.BenchCtx) anyerror!void {
     _ = ctx;
@@ -1367,7 +1309,7 @@ fn signalCreateBody(allocator: std.mem.Allocator, ctx: *runner.BenchCtx) anyerro
 
 fn ownerDeinitBody(allocator: std.mem.Allocator, ctx: *runner.BenchCtx) anyerror!void {
     _ = ctx;
-    // 每次 iter create + deinit 一个新 owner with 1k signals
+    // Each iter create+deinit new owner with 1k signals.
     var owner = try SignalOwner.init(allocator);
     var i: u32 = 0;
     while (i < 1000) : (i += 1) {
@@ -1376,23 +1318,21 @@ fn ownerDeinitBody(allocator: std.mem.Allocator, ctx: *runner.BenchCtx) anyerror
     owner.deinit();
 }
 
-// ============================================================================
-// PaintTable content_hash 命中率
-// 模拟 paint pass：1000 次 beginRecord，前 800 次同 hash 应直接 cache hit。
-// ============================================================================
+// PaintTable content_hash hit rate: simulate paint pass 1000 beginRecord;
+// first 800 same hash should direct cache hit.
 
 const PaintCacheState = struct {
     table: PaintTable,
     target_id: ElementId,
 };
 
-fn paintCacheSetup(allocator: std.mem.Allocator) anyerror!*anyopaque {
+fn paintCacheSetup(allocator: std.mem.Allocator, _: std.Io) anyerror!*anyopaque {
     var t = PaintTable.init(allocator);
     errdefer t.deinit();
 
     const eid: ElementId = .{ .index = 0, .generation = 0 };
     try t.ensureSlot(eid);
-    // 初次录制建立 cache
+    // First record establish cache.
     _ = try t.beginRecord(eid, 0xCAFEBABE);
     try t.pushItem(eid, .{
         .kind = .rect,
@@ -1414,14 +1354,12 @@ fn paintCacheTeardown(allocator: std.mem.Allocator, ptr: *anyopaque) void {
 fn paintCacheBody(allocator: std.mem.Allocator, ctx: *runner.BenchCtx) anyerror!void {
     _ = allocator;
     const state: *PaintCacheState = @ptrCast(@alignCast(ctx.state.?));
-    // 同 hash -> 永远命中 -> 不重新录制
+    // same hash -> always hit -> no re-record.
     const hit = !(try state.table.beginRecord(state.target_id, 0xCAFEBABE));
     ctx.blackbox(hit);
 }
 
-// ============================================================================
-// ElementId 打包/解包 hot path
-// ============================================================================
+// ElementId pack/unpack hot path.
 
 fn elementIdRoundtripBody(allocator: std.mem.Allocator, ctx: *runner.BenchCtx) anyerror!void {
     _ = allocator;
@@ -1434,10 +1372,8 @@ fn elementIdRoundtripBody(allocator: std.mem.Allocator, ctx: *runner.BenchCtx) a
     ctx.blackbox(back);
 }
 
-// ============================================================================
-// PaintTable 重新录制 (hash mismatch) 路径
-// 模拟 reactive 触发 paint chunk 失效后的重录开销
-// ============================================================================
+// PaintTable re-record (hash mismatch) path: simulate reactive trigger paint
+// chunk invalidate then re-record.
 
 const PaintRecordState = struct {
     table: PaintTable,
@@ -1445,7 +1381,7 @@ const PaintRecordState = struct {
     counter: u64,
 };
 
-fn paintRecordSetup(allocator: std.mem.Allocator) anyerror!*anyopaque {
+fn paintRecordSetup(allocator: std.mem.Allocator, _: std.Io) anyerror!*anyopaque {
     var t = PaintTable.init(allocator);
     errdefer t.deinit();
 
@@ -1467,7 +1403,7 @@ fn paintRecordBody(allocator: std.mem.Allocator, ctx: *runner.BenchCtx) anyerror
     _ = allocator;
     const state: *PaintRecordState = @ptrCast(@alignCast(ctx.state.?));
     state.counter +%= 1;
-    // 每次 hash 不同 -> 必须重新录制
+    // Each hash different -> must re-record.
     const new_hash = state.counter;
     _ = try state.table.beginRecord(state.target_id, new_hash);
     try state.table.pushItem(state.target_id, .{
@@ -1495,9 +1431,7 @@ fn promotionHintShouldBody(allocator: std.mem.Allocator, ctx: *runner.BenchCtx) 
     ctx.blackbox(should);
 }
 
-// ============================================================================
-// PromotionHint primaryReason 分支序列
-// ============================================================================
+// PromotionHint primaryReason branch sequence.
 
 fn promotionHintReasonBody(allocator: std.mem.Allocator, ctx: *runner.BenchCtx) anyerror!void {
     _ = allocator;
@@ -1529,9 +1463,7 @@ fn promotionHintPackBody(allocator: std.mem.Allocator, ctx: *runner.BenchCtx) an
     ctx.blackbox(back);
 }
 
-// ============================================================================
-// encodeOne 单 DisplayItem -> GpuDraw 转换
-// ============================================================================
+// encodeOne single DisplayItem -> GpuDraw conversion.
 
 fn encodeOneBody(allocator: std.mem.Allocator, ctx: *runner.BenchCtx) anyerror!void {
     _ = allocator;
@@ -1549,16 +1481,14 @@ fn encodeOneBody(allocator: std.mem.Allocator, ctx: *runner.BenchCtx) anyerror!v
     ctx.blackbox(draw);
 }
 
-// ============================================================================
-// encodeStream 100 同质 rect -> 1 batch
-// ============================================================================
+// encodeStream 100 homogeneous rect -> 1 batch.
 
 const StreamState = struct {
     items: [100]DisplayItem,
     out: [100]GpuDraw,
 };
 
-fn streamSetup(allocator: std.mem.Allocator) anyerror!*anyopaque {
+fn streamSetup(allocator: std.mem.Allocator, _: std.Io) anyerror!*anyopaque {
     const state = try allocator.create(StreamState);
     for (&state.items) |*item| {
         item.* = .{ .kind = .rect };
@@ -1578,12 +1508,10 @@ fn streamHomogeneousBody(allocator: std.mem.Allocator, ctx: *runner.BenchCtx) an
     ctx.blackbox(written);
 }
 
-// ============================================================================
-// encodeStream 50 rect + 50 text 交替 -> 100 separate batches
-// (worst case：完全无 batching)
-// ============================================================================
+// encodeStream 50 rect + 50 text alternating -> 100 separate batches
+// (worst case: zero batching).
 
-fn streamWorstCaseSetup(allocator: std.mem.Allocator) anyerror!*anyopaque {
+fn streamWorstCaseSetup(allocator: std.mem.Allocator, _: std.Io) anyerror!*anyopaque {
     const state = try allocator.create(StreamState);
     for (&state.items, 0..) |*item, i| {
         item.* = .{
@@ -1601,13 +1529,10 @@ fn streamWorstCaseBody(allocator: std.mem.Allocator, ctx: *runner.BenchCtx) anye
     ctx.blackbox(written);
 }
 
-// ============================================================================
-// BiDi splitRuns 混合脚本（拉丁 + 阿拉伯）
-//
-// ⚠ 这是**孤立模块**的 microbenchmark，不代表框架支持 RTL。
-// src/i18n/bidi.zig 未接入渲染管线（本 benchmark 是它唯一的调用点），
-// 详见该文件头部说明。别把这条 benchmark 的存在当成 RTL 可用的证据。
-// ============================================================================
+// BiDi splitRuns mixed script (Latin + Arabic). WARNING: **isolated module**
+// microbenchmark, doesn't mean framework RTL-capable. src/i18n/bidi.zig unhooked
+// from render pipeline (this bench its only callsite); see file header. Don't treat
+// this bench existence as RTL evidence.
 
 const BidiBenchState = struct {
     text: []const u8,
@@ -1615,12 +1540,12 @@ const BidiBenchState = struct {
     allocator: std.mem.Allocator,
 };
 
-fn bidiSetup(allocator: std.mem.Allocator) anyerror!*anyopaque {
+fn bidiSetup(allocator: std.mem.Allocator, _: std.Io) anyerror!*anyopaque {
     const state = try allocator.create(BidiBenchState);
-    // "Hello مرحبا World" - 混合 LTR/RTL
+    // "Hello مرحبا World" - mixed LTR/RTL.
     state.* = .{
         .text = "Hello \xD9\x85\xD8\xB1\xD8\xAD\xD8\xA8\xD8\xA7 World",
-        .runs = .{},
+        .runs = .empty,
         .allocator = allocator,
     };
     return @ptrCast(state);
@@ -1640,9 +1565,7 @@ fn bidiBody(allocator: std.mem.Allocator, ctx: *runner.BenchCtx) anyerror!void {
     ctx.blackbox(state.runs.items.len);
 }
 
-// ============================================================================
-// linebreak findBreakOpportunities (CJK 文本)
-// ============================================================================
+// linebreak findBreakOpportunities (CJK text).
 
 const LineBreakBenchState = struct {
     text: []const u8,
@@ -1650,12 +1573,12 @@ const LineBreakBenchState = struct {
     allocator: std.mem.Allocator,
 };
 
-fn linebreakSetup(allocator: std.mem.Allocator) anyerror!*anyopaque {
+fn linebreakSetup(allocator: std.mem.Allocator, _: std.Io) anyerror!*anyopaque {
     const state = try allocator.create(LineBreakBenchState);
-    // 30 个 CJK 字符（每个 3 字节）
+    // 30 CJK char (3 bytes each).
     state.* = .{
         .text = "中文段落示例显示如何处理换行符号在常规情况下表现得很好",
-        .breaks = .{},
+        .breaks = .empty,
         .allocator = allocator,
     };
     return @ptrCast(state);
@@ -1684,7 +1607,7 @@ const ShapingState = struct {
     key: ShapingKey,
 };
 
-fn shapingSetup(allocator: std.mem.Allocator) anyerror!*anyopaque {
+fn shapingSetup(allocator: std.mem.Allocator, _: std.Io) anyerror!*anyopaque {
     const state = try allocator.create(ShapingState);
     state.* = .{
         .cache = ShapingCache.init(allocator, 256),
@@ -1692,7 +1615,7 @@ fn shapingSetup(allocator: std.mem.Allocator) anyerror!*anyopaque {
     };
     state.cache.beginFrame();
 
-    // 预填充 cache
+    // Pre-fill cache.
     const glyphs = [_]GlyphPosition{
         .{ .glyph_id = 1, .x_advance = 8 },
         .{ .glyph_id = 2, .x_advance = 7 },
@@ -1732,7 +1655,7 @@ const A11yState_bench = struct {
     tree: AccessibilityTree,
 };
 
-fn a11ySetup(allocator: std.mem.Allocator) anyerror!*anyopaque {
+fn a11ySetup(allocator: std.mem.Allocator, _: std.Io) anyerror!*anyopaque {
     const state = try allocator.create(A11yState_bench);
     state.* = .{ .tree = AccessibilityTree.init(allocator) };
     return @ptrCast(state);
@@ -1749,27 +1672,25 @@ fn a11yUpsertBody(allocator: std.mem.Allocator, ctx: *runner.BenchCtx) anyerror!
     const state: *A11yState_bench = @ptrCast(@alignCast(ctx.state.?));
     const eid: ElementId = .{ .index = @truncate(ctx.iter_index & 0x7F), .generation = 0 };
     try state.tree.upsert(.{
-        .element = eid,
+        .element = zenit.AXId.node(eid),
         .role = .button,
         .state = .{ .focusable = true },
         .label_hash = ctx.iter_index,
     });
-    // 清 dirty 防止内存爆涨
+    // Clear dirty prevent memory explosion.
     if ((ctx.iter_index & 0xFF) == 0xFF) {
         state.tree.dirty.clearRetainingCapacity();
     }
 }
 
-// ============================================================================
-// GestureArena dispatch（tap recognition）
-// ============================================================================
+// GestureArena dispatch (tap recognition).
 
 const GestureBenchState = struct {
     arena: GestureArena,
     counter: u64,
 };
 
-fn gestureSetup(allocator: std.mem.Allocator) anyerror!*anyopaque {
+fn gestureSetup(allocator: std.mem.Allocator, _: std.Io) anyerror!*anyopaque {
     const state = try allocator.create(GestureBenchState);
     state.* = .{ .arena = GestureArena.init(allocator), .counter = 0 };
     _ = try state.arena.addRecognizer(.{
@@ -1803,56 +1724,16 @@ fn a11yDiffBody(allocator: std.mem.Allocator, ctx: *runner.BenchCtx) anyerror!vo
     _ = allocator;
     const state: *A11yState_bench = @ptrCast(@alignCast(ctx.state.?));
     const eid: ElementId = .{ .index = 0, .generation = 0 };
-    // 偶数 iter：checked=true；奇数：checked=false。每次 upsert 应触发 state_changed dirty
+    // Even iter: checked=true; odd: checked=false. Each upsert should trigger
+    // state_changed dirty.
     try state.tree.upsert(.{
-        .element = eid,
+        .element = zenit.AXId.node(eid),
         .role = .checkbox,
         .state = .{ .checked = (ctx.iter_index & 1) == 0 },
     });
     if ((ctx.iter_index & 0xFF) == 0xFF) {
         state.tree.dirty.clearRetainingCapacity();
     }
-}
-
-// ============================================================================
-// ControlledProp read (uncontrolled mode)
-// ============================================================================
-
-fn controlledReadBody(allocator: std.mem.Allocator, ctx: *runner.BenchCtx) anyerror!void {
-    _ = allocator;
-    const Prop = ControlledProp(i32);
-    const p: Prop = .{ .uncontrolled = .{ .default = 42 } };
-    const internal: i32 = @intCast(ctx.iter_index & 0xFFFF);
-    const got = p.read(internal);
-    ctx.blackbox(got);
-}
-
-// ============================================================================
-// ControlledProp write (uncontrolled mode 写 internal)
-// ============================================================================
-
-const ControlledWriteState = struct {
-    internal: i32,
-};
-
-fn controlledWriteSetup(allocator: std.mem.Allocator) anyerror!*anyopaque {
-    const state = try allocator.create(ControlledWriteState);
-    state.* = .{ .internal = 0 };
-    return @ptrCast(state);
-}
-
-fn controlledWriteTeardown(allocator: std.mem.Allocator, ptr: *anyopaque) void {
-    const state: *ControlledWriteState = @ptrCast(@alignCast(ptr));
-    allocator.destroy(state);
-}
-
-fn controlledWriteBody(allocator: std.mem.Allocator, ctx: *runner.BenchCtx) anyerror!void {
-    _ = allocator;
-    const state: *ControlledWriteState = @ptrCast(@alignCast(ctx.state.?));
-    const Prop = ControlledProp(i32);
-    const p: Prop = .{ .uncontrolled = .{ .default = 0 } };
-    p.write(&state.internal, @intCast(ctx.iter_index & 0xFFFF));
-    ctx.blackbox(state.internal);
 }
 
 // ============================================================================
@@ -1864,10 +1745,10 @@ const SelectBenchState = struct {
     options: [10]select_headless.Option(i32),
 };
 
-fn selectSetup(allocator: std.mem.Allocator) anyerror!*anyopaque {
+fn selectSetup(allocator: std.mem.Allocator, _: std.Io) anyerror!*anyopaque {
     const state = try allocator.create(SelectBenchState);
     state.* = .{
-        .state = select_headless.SelectState(i32).init(.{}),
+        .state = select_headless.SelectState(i32){},
         .options = undefined,
     };
     for (&state.options, 0..) |*opt, i| {
@@ -1892,13 +1773,13 @@ fn selectStepBody(allocator: std.mem.Allocator, ctx: *runner.BenchCtx) anyerror!
 // Registration + main
 // ============================================================================
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
 
     var filter: ?[]const u8 = null;
     var json_path: ?[]const u8 = null;
@@ -1919,7 +1800,7 @@ pub fn main() !void {
             .teardown = fanoutTeardown,
             .body = fanoutBody,
         },
-        // v0.2-P1 新增（每 phase ≥ 3 条 bench gate 强制）
+        // v0.2-P1 added (>=3 bench per phase enforced).
         .{
             .name = "reactive_diamond_no_glitch_set",
             .setup = diamondSetup,
@@ -1950,7 +1831,7 @@ pub fn main() !void {
             .teardown = slotTeardown,
             .body = slotBody,
         },
-        // v0.2-P2 新增（每 phase ≥ 3 条 bench gate 强制）
+        // v0.2-P2 added (>=3 bench per phase enforced).
         .{
             .name = "element_table_10k_dfs_traverse",
             .setup = treeSetup,
@@ -1969,7 +1850,7 @@ pub fn main() !void {
             .teardown = treeTeardown,
             .body = unlinkBody,
         },
-        // v0.2-P3 新增（每 phase ≥ 3 条 bench gate 强制）
+        // v0.2-P3 added (>=3 bench per phase enforced).
         .{
             .name = "paint_chunk_content_hash_hit",
             .setup = paintCacheSetup,
@@ -1988,8 +1869,8 @@ pub fn main() !void {
             .teardown = paintRecordTeardown,
             .body = paintRecordBody,
         },
-        // v0.2-P4 新增（layer_tree 真集成 bench 等 v0.3 主路径切换；
-        // 当前测算法层面 PromotionHint 的 fast path）
+        // v0.2-P4 added (layer_tree true-integrated bench pending v0.3 main-path
+        // switch; currently algorithm level PromotionHint fast-path).
         .{
             .name = "promotion_hint_should_promote",
             .setup = null,
@@ -2008,7 +1889,7 @@ pub fn main() !void {
             .teardown = null,
             .body = promotionHintPackBody,
         },
-        // v0.2-P5 新增
+        // v0.2-P5 added.
         .{
             .name = "encode_one_display_item",
             .setup = null,
@@ -2027,7 +1908,7 @@ pub fn main() !void {
             .teardown = streamTeardown,
             .body = streamWorstCaseBody,
         },
-        // v0.2-P6 新增
+        // v0.2-P6 added.
         .{
             .name = "bidi_split_runs_mixed_lr_rtl",
             .setup = bidiSetup,
@@ -2046,7 +1927,7 @@ pub fn main() !void {
             .teardown = shapingTeardown,
             .body = shapingBody,
         },
-        // v0.2-P7 新增
+        // v0.2-P7 added.
         .{
             .name = "a11y_tree_upsert",
             .setup = a11ySetup,
@@ -2065,26 +1946,14 @@ pub fn main() !void {
             .teardown = a11yTeardown,
             .body = a11yDiffBody,
         },
-        // v0.2-P8 新增
-        .{
-            .name = "controlled_prop_read",
-            .setup = null,
-            .teardown = null,
-            .body = controlledReadBody,
-        },
-        .{
-            .name = "controlled_prop_write",
-            .setup = controlledWriteSetup,
-            .teardown = controlledWriteTeardown,
-            .body = controlledWriteBody,
-        },
+        // v0.2-P8 added.
         .{
             .name = "select_state_machine_arrow_down",
             .setup = selectSetup,
             .teardown = selectTeardown,
             .body = selectStepBody,
         },
-        // v0.3-P1 新增
+        // v0.3-P1 added.
         .{
             .name = "reactive_signal_alone_no_effect",
             .setup = signalAloneSetup,
@@ -2103,7 +1972,7 @@ pub fn main() !void {
             .teardown = null,
             .body = ownerDeinitBody,
         },
-        // v0.3-P2 新增
+        // v0.3-P2 added.
         .{
             .name = "layout_table_mark_laid_out",
             .setup = layoutTableSetup,
@@ -2122,7 +1991,7 @@ pub fn main() !void {
             .teardown = layoutTableTeardown,
             .body = layoutTableEpochReadBody,
         },
-        // v0.3-P3 新增（ElementId first-class 路径）
+        // v0.3-P3 added (ElementId first-class path).
         .{
             .name = "element_id_is_valid_check",
             .setup = elementWorldSetup,
@@ -2141,7 +2010,7 @@ pub fn main() !void {
             .teardown = elementWorldTeardown,
             .body = elementLinksReadBody,
         },
-        // v0.3-P4 新增
+        // v0.3-P4 added.
         .{
             .name = "scroll_offset_update_1k_nodes",
             .setup = scrollArraySetup,
@@ -2160,7 +2029,7 @@ pub fn main() !void {
             .teardown = scrollArrayTeardown,
             .body = scrollLookupBody,
         },
-        // v0.3-P5 新增
+        // v0.3-P5 added.
         .{
             .name = "encode_dashboard_typical",
             .setup = dashboardSetup,
@@ -2179,7 +2048,7 @@ pub fn main() !void {
             .teardown = xToClusterTeardown,
             .body = xToClusterBody,
         },
-        // v0.3-P6 新增
+        // v0.3-P6 added.
         .{
             .name = "a11y_tree_drain_dirty",
             .setup = a11yDrainSetup,
@@ -2198,7 +2067,7 @@ pub fn main() !void {
             .teardown = a11yChildrenTeardown,
             .body = a11yChildrenBody,
         },
-        // v0.4-P1 新增
+        // v0.4-P1 added.
         .{
             .name = "intrinsic_cache_miss_put",
             .setup = intrinsicCacheMissSetup,
@@ -2217,7 +2086,7 @@ pub fn main() !void {
             .teardown = null,
             .body = availableSpaceTransformBody,
         },
-        // v0.4-P2 新增（v0.5 真删除 render IR 前的算法层 baseline）
+        // v0.4-P2 added (v0.5 algorithm baseline before true render-IR deletion).
         .{
             .name = "bounds_union_256_chunks",
             .setup = boundsSetup,
@@ -2236,7 +2105,7 @@ pub fn main() !void {
             .teardown = null,
             .body = propertyStateRefBody,
         },
-        // v0.4-P3 新增（v0.5 拆 Node 字段前的 4 表路径 baseline）
+        // v0.4-P3 added (v0.5 4-table path baseline before Node field split).
         .{
             .name = "element_create_append_100",
             .setup = null,
@@ -2255,7 +2124,7 @@ pub fn main() !void {
             .teardown = null,
             .body = elementIdHotPathBody,
         },
-        // 真测 plan 矩阵 #2 "单 signal 改色 -> paint" 端到端
+        // Real benchmark plan matrix #2 "single signal color -> paint" end-to-end.
         .{
             .name = "single_signal_color_change_paint",
             .setup = singleSignalColorSetup,
@@ -2268,8 +2137,8 @@ pub fn main() !void {
             .teardown = realisticTeardown,
             .body = realisticBody,
         },
-        // v0.5-P3 frame-level scenario benches (§5 退出标准 #1/#3/#4/#5/#8)。
-        // 起步：#1 10k 节点零脏帧，目标 < 0.5ms。
+        // v0.5-P3 frame-level scenario benches (v0.5 §5 exit criteria #1/#3/#4/#5/#8).
+        // Start: #1 10k nodes zero-dirty frame, target < 0.5ms.
         .{
             .name = "frame_10k_nodes_zero_dirty_relayout",
             .setup = frameZeroDirty10kSetup,
@@ -2308,26 +2177,20 @@ pub fn main() !void {
         },
     };
 
-    var json_file: ?std.fs.File = null;
-    defer if (json_file) |f| f.close();
+    var json_file: ?std.Io.File = null;
+    defer if (json_file) |f| f.close(io);
     if (json_path) |p| {
-        json_file = try std.fs.cwd().createFile(p, .{ .truncate = true });
+        json_file = try std.Io.Dir.cwd().createFile(io, p, .{ .truncate = true });
     }
 
-    try runner.run(allocator, &cases, filter, json_file);
+    try runner.run(allocator, io, &cases, filter, json_file);
 }
 
-// ============================================================================
-// v0.5-P3 Frame-level scenario benches, v0.5 §5 退出标准 #1/#3/#4/#5/#8
-//
-// 与上方 micro bench 不同：这一组吃完整 Cx (init/setViewport/layout/render)
-// 路径，目标是在帧级 wall-clock 上 gate 退出标准的真数字。详见
-// docs/V05_ALIGNMENT_PLAN.md §5。
-//
-// 起步 case：#1 frame_10k_nodes_zero_dirty_relayout, 10k 节点零脏帧。
-// 命中 cx.render() 的 fast-path（time_unchanged + isTreeFullyClean），
-// 模拟生产 idle frame 的实际开销。
-// ============================================================================
+// Frame-level scenario benches. Unlike micro benches above: full Cx
+// (init/setViewport/layout/render), gating on real wall-clock. See
+// docs/V05_ALIGNMENT_PLAN.md section 5. First case: frame_10k_nodes_zero_dirty_relayout, 10k nodes
+// zero-dirty. Hits the cx.render() fast path (time_unchanged + isTreeFullyClean),
+// simulating the real cost of a production idle frame.
 
 const Cx = zenit.Cx;
 const Node = zenit.Node;
@@ -2339,15 +2202,15 @@ const FrameZeroDirtyState = struct {
     cx: *Cx,
 };
 
-fn frameZeroDirty10kSetup(allocator: std.mem.Allocator) anyerror!*anyopaque {
-    const cx = try Cx.init(allocator);
+fn frameZeroDirty10kSetup(allocator: std.mem.Allocator, io: std.Io) anyerror!*anyopaque {
+    const cx = try Cx.init(allocator, io);
     errdefer cx.deinit();
     cx.setViewport(1280, 800);
 
-    // 直接命令式 build：root 一个 vstack，下挂 100 个 row，每 row 100 个 leaf
-    // text-less 占位 box -> 共 100*100 + 100 + 1 = 10101 ≈ 10k 节点。
-    // 不用 ui.box() 的 tuple API（10k 不能字面量化），而是 Node.create +
-    // cx.linkNodeToWorld + parent.appendChild，与 box() 内部完全等价。
+    // Direct imperative build: root 1 vstack, 100 rows beneath it, each row 100 leaves.
+    // Placeholder boxes without text -> total 100*100 + 100 + 1 = 10101 ≈ 10k nodes.
+    // Avoid ui.box() tuple API (10k can't be literalized); use Node.create +
+    // cx.linkNodeToWorld + parent.appendChild, equivalent to box() internals.
     const ui_core = zenit.ui_core;
     const root = try ui_core.Node.create(
         allocator,
@@ -2392,12 +2255,12 @@ fn frameZeroDirty10kSetup(allocator: std.mem.Allocator) anyerror!*anyopaque {
     }
 
     cx.root = root;
-    // 先跑一次完整 layout + render，把 dirty bits 全清掉、display_list 缓存
-    // 填好。后续 body 调用都走 fast-path。
+    // Run complete layout + render once to clear all dirty bits and populate
+    // display_list cache. Subsequent body calls take fast-path.
     cx.layout();
     _ = cx.render();
 
-    // sanity: 节点真的建起来了 + display_list 真有内容
+    // Sanity check: nodes built successfully + display_list has content.
     std.debug.assert(root.children.items.len == rows);
     std.debug.assert(root.children.items[0].children.items.len == cols);
     std.debug.assert(cx.display_list.count() > 0);
@@ -2415,21 +2278,20 @@ fn frameZeroDirty10kTeardown(allocator: std.mem.Allocator, state_ptr: *anyopaque
 
 fn frameZeroDirty10kBody(_: std.mem.Allocator, ctx: *runner.BenchCtx) anyerror!void {
     const state: *FrameZeroDirtyState = @ptrCast(@alignCast(ctx.state.?));
-    // 不改 frame_time_ms -> time_unchanged -> render() 走 fast-path return cache。
-    // layout() 早返（had_dirty == false）；render() 早返（fully clean + cache valid）。
+    // Without changing frame_time_ms -> time_unchanged -> render() fast-path
+    // returns cache. layout() bails early (had_dirty == false); render() bails
+    // early (fully clean + cache valid).
     state.cx.layout();
     const items = state.cx.render();
     ctx.blackbox(items.len);
 }
 
-// ----------------------------------------------------------------------------
-// #5 frame_dashboard_drawcall_count, typical dashboard 画面，draw call < 600
-//
-// dashboard fixture：header bar + sidebar (12 nav items) + main 4×4 card grid
-// (16 cards × 3 text + 1 background = 4 nodes/card)。每节点产 1 fill_rect (背
-// 景色) + text 节点产 1 text_run，总 display_item 期望 ~150-250。门槛 600 给
-// 真实工程量留 2-3× margin（v0.5 §5 退出标准 #5）。
-// ----------------------------------------------------------------------------
+// Benchmark #5: frame_dashboard_drawcall_count, typical dashboard screen <
+// 600 draw calls. Dashboard fixture: header bar + sidebar (12 nav items) +
+// main 4x4 card grid (16 cards x 3 text + 1 bg = 4 nodes/card). Each node
+// produces 1 fill_rect (background) + text nodes produce 1 text_run, expected
+// ~150-250 display_items. The 600 threshold leaves 2-3x margin for real-world
+// content.
 
 const FrameDashboardState = struct {
     cx: *Cx,
@@ -2459,7 +2321,7 @@ fn buildCardNode(allocator: std.mem.Allocator, cx: *Cx, idx: u32) anyerror!*Node
     });
     try card.appendChild(allocator, title);
 
-    // 用一个简短数字字符串作为 value (avoid allocator-owned format)
+    // Use brief numeric string as value (avoid allocator-owned format).
     const value_strings = [_][]const u8{
         "42",  "108", "256", "512",  "1024", "2048", "4096", "8192",
         "16K", "32K", "64K", "128K", "256K", "512K", "1M",   "2M",
@@ -2480,8 +2342,8 @@ fn buildCardNode(allocator: std.mem.Allocator, cx: *Cx, idx: u32) anyerror!*Node
     return card;
 }
 
-fn frameDashboardSetup(allocator: std.mem.Allocator) anyerror!*anyopaque {
-    const cx = try Cx.init(allocator);
+fn frameDashboardSetup(allocator: std.mem.Allocator, io: std.Io) anyerror!*anyopaque {
+    const cx = try Cx.init(allocator, io);
     errdefer cx.deinit();
     cx.setViewport(1280, 800);
 
@@ -2591,8 +2453,8 @@ fn frameDashboardSetup(allocator: std.mem.Allocator) anyerror!*anyopaque {
     cx.linkNodeToWorld(main_pane);
     try body.appendChild(allocator, main_pane);
 
-    // 6×6 = 36 cards × 4 nodes = ~144 + sidebar/header/structural ≈ 200+
-    // display_items，给 600 阈值留 ~3× headroom 但又是真实工程量。
+    // 6x6 = 36 cards x 4 nodes = ~144 + sidebar/header/structural ≈ 200+
+    // display_items, gives 600 threshold ~3x headroom yet still real engineering.
     var row_i: u32 = 0;
     while (row_i < 6) : (row_i += 1) {
         const grid_row = try ui_core.Node.create(
@@ -2616,9 +2478,9 @@ fn frameDashboardSetup(allocator: std.mem.Allocator) anyerror!*anyopaque {
     _ = cx.render();
 
     const drawcall_count = cx.lowerForEncoderPaintTable().len;
-    // §5 退出标准 #5: typical dashboard < 600 draw calls。当前 fixture
-    // (header + 16 nav + 36 cards × 4 nodes) ≈ 176 display_items，~3.4×
-    // headroom。assert 是真 gate，若回归到 600+ bench setup 直接 panic。
+    // v0.5 exit criterion #5: typical dashboard < 600 draw calls. Current
+    // fixture (header + 16 nav + 36 cards x 4 nodes) ≈ 176 display_items, ~3.4x
+    // headroom. assert is real gate; regression to 600+ causes panic.
     std.debug.assert(drawcall_count > 30);
     std.debug.assert(drawcall_count < 600);
 
@@ -2641,24 +2503,17 @@ fn frameDashboardBody(_: std.mem.Allocator, ctx: *runner.BenchCtx) anyerror!void
     ctx.blackbox(items.len);
 }
 
-// ----------------------------------------------------------------------------
-// #8 frame_diamond_set_no_double_paint, diamond reactive 拓扑下，源 signal
-// 翻动一次后单一节点 paint 只被重录一次 (no glitch / no double paint)。
-//
-// 树形 (cx 内 1 个 target_box)；reactive owner 单独 (与 cx 共享 allocator):
-//   A: Signal(i32)
-//   B: Memo  = A.get() * 10
-//   C: Memo  = A.get() + 100
-//   effect(B,C): target_box.setBackground(rgba based on B+C)
-//
-// 期望: A.set(N) -> reactive 同步 propagate (B/C/effect 各跑一次拓扑序保证)
-// -> effect setBackground 让 target_box render-dirty -> cx.render() 重录该
-// 节点的 paint 一次 (display_list_own_prebuild_count == 1)。如果有 glitch
-// 即 effect 跑 2 次或 paint pass 重录 2 次，count > 1 -> setup 阶段断言失败。
-//
-// micro reactive_diamond_no_glitch_set 测纯 reactive；本 case 测 reactive +
-// paint 复合的 frame 时长，作为 v0.5 §5 #8 的可量化 gate。
-// ----------------------------------------------------------------------------
+// Benchmark #8: frame_diamond_set_no_double_paint. Diamond reactive topology: after one
+// signal flip, the node paints exactly once (no glitch / no double paint).
+// Tree: 1 target_box in cx; reactive owner separate (shares allocator with cx):
+// A: Signal(i32), B: Memo = A.get() * 10, C: Memo = A.get() + 100,
+// effect(B,C): target_box.setBackground(rgba based on B+C).
+// Expected: A.set(N) -> reactive propagates synchronously (B/C/effect each run once in
+// topological order) -> setBackground marks target_box render-dirty -> cx.render()
+// repaints that node once (display_list_own_prebuild_count == 1). On a glitch (effect runs
+// 2x or paint redraws 2x), count > 1 -> setup asserts fail. Micro
+// reactive_diamond_no_glitch_set tests pure reactive; this case tests reactive + paint
+// composition frame time.
 
 const FrameDiamondState = struct {
     cx: *Cx,
@@ -2669,8 +2524,8 @@ const FrameDiamondState = struct {
     target_value: i32 = 0,
 };
 
-fn frameDiamondSetup(allocator: std.mem.Allocator) anyerror!*anyopaque {
-    const cx = try Cx.init(allocator);
+fn frameDiamondSetup(allocator: std.mem.Allocator, io: std.Io) anyerror!*anyopaque {
+    const cx = try Cx.init(allocator, io);
     errdefer cx.deinit();
     cx.setViewport(800, 600);
 
@@ -2705,8 +2560,9 @@ fn frameDiamondSetup(allocator: std.mem.Allocator) anyerror!*anyopaque {
     cx.layout();
     _ = cx.render();
 
-    // reactive graph: A -> B(memo), A -> C(memo), effect(B, C) -> setBackground。
-    // owner 与 cx 用同 allocator，但生命周期独立（cx.deinit 后 owner 仍需 deinit）。
+    // Reactive graph: A -> B(memo), A -> C(memo), effect(B, C) ->
+    // setBackground. Owner and cx use same allocator but independent
+    // lifetimes (cx.deinit doesn't destroy owner).
     const owner = try SignalOwner.init(allocator);
     errdefer owner.deinit();
     const a = try Signal(i32).create(owner, 0);
@@ -2730,7 +2586,8 @@ fn frameDiamondSetup(allocator: std.mem.Allocator) anyerror!*anyopaque {
     }, struct {
         fn run(eff_ctx: anytype) void {
             const sum = eff_ctx.b.get() + eff_ctx.c.get();
-            // 用 sum 派生 RGB；强制每次 set 颜色都不同 -> 真触发 markRenderDirty
+            // Derive RGB from sum; force different color each set -> ensures
+            // markRenderDirty triggers.
             const r: u8 = @intCast(@as(u32, @bitCast(sum)) & 0xFF);
             const g: u8 = @intCast((@as(u32, @bitCast(sum)) >> 8) & 0xFF);
             const b_ch: u8 = @intCast((@as(u32, @bitCast(sum)) >> 16) & 0xFF);
@@ -2739,20 +2596,23 @@ fn frameDiamondSetup(allocator: std.mem.Allocator) anyerror!*anyopaque {
         }
     }.run);
 
-    // ===== 真正的 #8 gate：a.set 后单帧 effect 拓扑序保证 ==========
-    // effect 在 createEffect 时已立即 fire 一次（建立依赖），先 reset。
+    // ===== True #8 gate: after a.set, single-frame effect topology
+    // guarantee =====. Effect already fired once on createEffect (establishes
+    // dependencies); reset first.
     counter.* = 0;
     a.set(42);
-    // reactive diamond 拓扑保证: B/C 各重算 1 次，effect 跑 1 次（不 glitch
-    // 成 2 次）。这是 §5 #8 的核心 gate。
+    // Reactive diamond topology guarantee: B/C each recomputed once, effect
+    // fires once (no glitch into 2x). This is §5 #8 core gate.
     if (counter.* != 1) {
         std.debug.panic("frame_diamond: effect expected 1 fire after a.set, got {d} (glitch!)", .{counter.*});
     }
-    // 验证 reactive 真正改了 node style + render dirty 路径活
+    // Verify reactive actually changed node style + render dirty path is
+    // live.
     if (!target_box.frame_state.state_bits.dirty.core.render) {
         std.debug.panic("frame_diamond: setBackground 没触发 render dirty — reactive→paint 链断了", .{});
     }
-    // 跑一帧消化 dirty，让稳态 body 跑在 dirty propagation 真实路径上
+    // Run one frame to consume dirty, keep steady-state body on true dirty
+    // propagation path.
     cx.layout();
     _ = cx.render();
 
@@ -2778,23 +2638,20 @@ fn frameDiamondTeardown(allocator: std.mem.Allocator, state_ptr: *anyopaque) voi
 fn frameDiamondBody(_: std.mem.Allocator, ctx: *runner.BenchCtx) anyerror!void {
     const state: *FrameDiamondState = @ptrCast(@alignCast(ctx.state.?));
     state.target_value +%= 1;
-    state.a.set(state.target_value); // reactive: B/C/effect 各 1 次
+    state.a.set(state.target_value); // reactive: B/C/effect each fires once.
     state.cx.layout();
-    _ = state.cx.render(); // paint pass: target_box 重录 1 次
+    _ = state.cx.render(); // paint pass: target_box redraws once.
     ctx.blackbox(state.effect_run_count.*);
 }
 
-// ----------------------------------------------------------------------------
-// #3 frame_scrollarea_1k_items_scroll, 1k items 在 overflow_hidden 容器里
-// scroll 一帧 < 3ms (60fps frame budget)。
-//
-// 不依赖 ScrollArea component (避免拉 components/scroll_area/* 进 facade)：
-// 直接 raw cx 构 viewport (overflow_hidden, 固定高 600) + content (1k items)；
-// scroll 通过 content.setTranslateY 模拟。setTranslateY 当前走 markRenderDirty
-// (translate composite-only 路径未切)，所以这测的是 "content translate +
-// 1k visible items 的 layout/render fast-path 整帧时长"，给 §5 #3 在 60fps
-// 预算下做工程量级 gate。后续 translate 切到 composite-only 时数字会再降。
-// ----------------------------------------------------------------------------
+// Benchmark #3: frame_scrollarea_1k_items_scroll, 1k items in an
+// overflow_hidden container scroll one frame < 3ms (60fps frame budget).
+// Doesn't depend on the ScrollArea component (avoids pulling components/scroll_area/*):
+// builds directly with raw cx: viewport (overflow_hidden, fixed height 600) +
+// content (1k items); scroll simulated via content translate_y. Translate currently walks
+// markRenderDirty (no composite-only path yet), so this measures "content translate + 1k
+// visible items layout/render fast-path full frame time". Numbers will drop once translate
+// switches to composite-only.
 
 const FrameScrollState = struct {
     cx: *Cx,
@@ -2802,14 +2659,14 @@ const FrameScrollState = struct {
     scroll_offset: f32 = 0,
 };
 
-fn frameScrollSetup(allocator: std.mem.Allocator) anyerror!*anyopaque {
-    const cx = try Cx.init(allocator);
+fn frameScrollSetup(allocator: std.mem.Allocator, io: std.Io) anyerror!*anyopaque {
+    const cx = try Cx.init(allocator, io);
     errdefer cx.deinit();
     cx.setViewport(800, 600);
 
     const ui_core = zenit.ui_core;
 
-    // root viewport: overflow_hidden + 固定 800×600
+    // Root viewport: overflow_hidden + fixed 800x600.
     const viewport = try ui_core.Node.create(
         allocator,
         cx.nextId(),
@@ -2824,7 +2681,7 @@ fn frameScrollSetup(allocator: std.mem.Allocator) anyerror!*anyopaque {
     cx.linkNodeToWorld(viewport);
     viewport.setBackgroundRaw(Color.rgba(20, 24, 30, 255));
 
-    // content pane: 1k items × 24px = 24000px 高
+    // Content pane: 1k items x 24px = 24000px height.
     const content = try ui_core.Node.create(
         allocator,
         cx.nextId(),
@@ -2854,7 +2711,7 @@ fn frameScrollSetup(allocator: std.mem.Allocator) anyerror!*anyopaque {
         row.setBackgroundRaw(if (i % 2 == 0) Color.rgba(28, 32, 38, 255) else Color.rgba(32, 36, 42, 255));
         try content.appendChild(allocator, row);
 
-        // 简短 label，复用静态字符串避免 allocator 麻烦
+        // Brief label, reuse static string to avoid allocator hassle.
         const labels = [_][]const u8{
             "Item A", "Item B", "Item C", "Item D", "Item E",
             "Item F", "Item G", "Item H", "Item I", "Item J",
@@ -2870,7 +2727,7 @@ fn frameScrollSetup(allocator: std.mem.Allocator) anyerror!*anyopaque {
     cx.layout();
     _ = cx.render();
 
-    // sanity: 真有 1000 row + 第一行有 text
+    // Sanity check: truly has 1000 rows + first row has text.
     std.debug.assert(content.children.items.len == 1000);
     std.debug.assert(content.children.items[0].children.items.len == 1);
 
@@ -2887,10 +2744,10 @@ fn frameScrollTeardown(allocator: std.mem.Allocator, state_ptr: *anyopaque) void
 
 fn frameScrollBody(_: std.mem.Allocator, ctx: *runner.BenchCtx) anyerror!void {
     const state: *FrameScrollState = @ptrCast(@alignCast(ctx.state.?));
-    // 模拟 scroll: 每帧 translate 5px。-12000 ~ 0 之间循环避免无限增长。
-    // setTranslateY pub fn 已删 (v0.5 round 9 dead code cleanup)，走
-    // setStyle(.translate_y, value), translate_y 是非-ext 字段，无 allocator
-    // 也能写。setStyle 的 .interaction dirty level 自动 markRenderDirty。
+    // Simulate scroll: translate 5px per frame. Cycle between -12000 ~ 0 to
+    // prevent unbounded growth. Use setStyle(.translate_y, value); translate_y is a
+    // non-ext field, writable without allocator. setStyle's .interaction dirty
+    // level auto-marks render dirty.
     state.scroll_offset -= 5.0;
     if (state.scroll_offset < -12000) state.scroll_offset = 0;
     state.content.setStyle(null, .translate_y, state.scroll_offset);
@@ -2899,20 +2756,15 @@ fn frameScrollBody(_: std.mem.Allocator, ctx: *runner.BenchCtx) anyerror!void {
     ctx.blackbox(state.cx.display_list.count());
 }
 
-// ----------------------------------------------------------------------------
-// #4 frame_transform_promoted_no_paint, will_change_transform 节点经 layer_tree
-// promote 为 composited surface 后，setRotate 触发 composite-only 路径，
-// paint 不重录 (display_list_own_prebuild_count == 0)。
-//
-// 核心 invariant 链 (markCompositeDirty in node.zig:1460):
-//   self_needs_render_dirty = (promoted == null) and !isOutOfBandRenderUnit
-// 节点 promoted=composited surface -> self_needs_render_dirty=false -> 不冒泡
-// render dirty -> render() 不重 paint 该节点 -> prebuild_count == 0 当帧。
-//
-// 当前 setTranslateX 走 markRenderDirtyTracked (line 1148, translate
-// composite-only 路径未切)，setRotate 走 markCompositeDirty (line 1176,
-// 已切)，所以本 case 必用 setRotate。
-// ----------------------------------------------------------------------------
+// Benchmark #4: frame_transform_promoted_no_paint, will_change_transform
+// node promoted to composited surface via layer_tree, setRotate triggers
+// composite-only path, paint not redrawn (display_list_own_prebuild_count
+// == 0). Invariant chain (markCompositeDirty in node.zig):
+// self_needs_render_dirty = (promoted == null) and !isOutOfBandRenderUnit.
+// A promoted node -> self_needs_render_dirty=false -> doesn't bubble render dirty ->
+// render() doesn't repaint the node -> prebuild_count == 0 that frame.
+// setTranslateX walks markRenderDirtyTracked (no composite-only path yet), while setRotate
+// walks markCompositeDirty, so this case must use setRotate.
 
 const FrameTransformState = struct {
     cx: *Cx,
@@ -2920,8 +2772,8 @@ const FrameTransformState = struct {
     rotate_value: f32 = 0,
 };
 
-fn frameTransformSetup(allocator: std.mem.Allocator) anyerror!*anyopaque {
-    const cx = try Cx.init(allocator);
+fn frameTransformSetup(allocator: std.mem.Allocator, io: std.Io) anyerror!*anyopaque {
+    const cx = try Cx.init(allocator, io);
     errdefer cx.deinit();
     cx.setViewport(800, 600);
 
@@ -2939,7 +2791,7 @@ fn frameTransformSetup(allocator: std.mem.Allocator) anyerror!*anyopaque {
     );
     cx.linkNodeToWorld(root);
 
-    // target: 200×200 will_change_transform 让 layer_tree promote 它。
+    // Target: 200x200 will_change_transform lets layer_tree promote it.
     const target = try ui_core.Node.create(
         allocator,
         cx.nextId(),
@@ -2951,19 +2803,20 @@ fn frameTransformSetup(allocator: std.mem.Allocator) anyerror!*anyopaque {
     );
     cx.linkNodeToWorld(target);
     target.setBackgroundRaw(Color.rgba(80, 120, 160, 255));
-    // 直接走 composited_group=true 路径让 layer_tree promote (layer_tree.zig:800
-    // shouldPromoteLayer：effect.kind == .composited_group -> return true)。
-    // 比 will_change_transform 路径稳，后者还要 scene_runtime 同步 ext 才生效。
+    // Go directly to composited_group=true path to promote via layer_tree
+    // (layer_tree.zig:800 shouldPromoteLayer: effect.kind == .composited_group ->
+    // return true). More stable than will_change_transform path, which needs
+    // scene_runtime to sync ext to take effect.
     (try target.style.ensureExtFallible(allocator)).composited_group = true;
     try root.appendChild(allocator, target);
 
     cx.root = root;
     cx.layout();
     _ = cx.render();
-    cx.layout(); // 第二帧让 layer_tree promote 真生效 (如果 promotion 是 t+1 帧)
+    cx.layout(); // Second frame lets layer_tree promotion take real effect (if promotion is t+1 frame).
     _ = cx.render();
 
-    // 验证 promotion 真生效，这是 #4 的前置条件
+    // Verify promotion truly took effect, this is #4 precondition.
     if (target.meta.per_frame.caches.commands.promoted == null) {
         std.debug.panic(
             "frame_transform: target node not promoted to composited surface — " ++
@@ -2972,12 +2825,13 @@ fn frameTransformSetup(allocator: std.mem.Allocator) anyerror!*anyopaque {
         );
     }
 
-    // ===== #4 真正的 gate：setRotate -> composite-only path =====
+    // ===== #4 true gate: setRotate -> composite-only path =====.
     cx.perf.resetFrame();
     target.setRotate(allocator, 0.1);
 
-    // setRotate 路径下 markCompositeDirty(target) 应该不冒泡 render dirty
-    // （因 target promoted），target 自己的 dirty.core.render 也不该被设
+    // Under setRotate path markCompositeDirty(target) should not bubble render
+    // dirty (because target promoted), and target's own dirty.core.render
+    // shouldn't be set either.
     if (target.frame_state.state_bits.dirty.core.render) {
         std.debug.panic(
             "frame_transform: target promoted but markCompositeDirty 还冒泡了 render dirty " ++
@@ -2989,7 +2843,7 @@ fn frameTransformSetup(allocator: std.mem.Allocator) anyerror!*anyopaque {
     cx.layout();
     _ = cx.render();
 
-    // §5 #4 核心 gate: paint 重录次数 = 0
+    // v0.5 #4 core gate: paint redraws 0 times.
     if (cx.perf.display_list_own_prebuild_count != 0) {
         std.debug.panic(
             "frame_transform: setRotate 触发 paint 重录！expected display_list_own_prebuild_count == 0, got {d}",
@@ -3018,18 +2872,13 @@ fn frameTransformBody(allocator: std.mem.Allocator, ctx: *runner.BenchCtx) anyer
     ctx.blackbox(state.cx.perf.display_list_own_prebuild_count);
 }
 
-// ----------------------------------------------------------------------------
-// v0.8 §2.2, frame_select_1k_keyboard_pagedown
-//
-// mountSelectHeadless 接 1k options + virtualize=true，open popover，每帧
-// 模拟 PageDown (state.machine 走 page_down action) 然后 layout + render。
-// 目标 (v0.7 plan 退出阈值): < 5ms median per frame。
-//
-// 检测要点：
-// - virtualize=true 路径下 popover content 只 mount ~10 个 pool node
-// - state machine PageDown 改 highlight_index，VL ensureVisible 滚到目标行
-// - aria-activedescendant 字段也跟随 (v0.8 §2.1 wire-up 已 land)
-// ----------------------------------------------------------------------------
+// frame_select_1k_keyboard_pagedown: mount SelectHeadless with 1k options + virtualize=true, open
+// the popover; each frame simulates PageDown (state machine page_down action) then layout +
+// render. Target: < 5ms median per frame.
+// Points checked:
+// - with virtualize=true the popover content mounts only ~10 pool nodes
+// - PageDown changes highlight_index and VL ensureVisible scrolls to the target row
+// - the aria-activedescendant field follows the highlight.
 
 const FrameSelect1kState = struct {
     cx: *Cx,
@@ -3039,8 +2888,8 @@ const FrameSelect1kState = struct {
     item_count: usize,
 };
 
-fn frameSelect1kSetup(allocator: std.mem.Allocator) anyerror!*anyopaque {
-    const cx = try Cx.init(allocator);
+fn frameSelect1kSetup(allocator: std.mem.Allocator, io: std.Io) anyerror!*anyopaque {
+    const cx = try Cx.init(allocator, io);
     errdefer cx.deinit();
     cx.setViewport(800, 600);
 
@@ -3059,15 +2908,15 @@ fn frameSelect1kSetup(allocator: std.mem.Allocator) anyerror!*anyopaque {
         o.* = .{ .value = @intCast(i), .label = "Item" };
     }
 
-    const mount_result = try zenit.select_headless_mount.mountSelectHeadless(i32, .{
+    const mount_result = try zenit.select_headless_mount.SelectHeadless(i32, .{
         .options = opts,
         .virtualize = true,
-        .max_dropdown_height = 240, // 视口 ~8 行 × 30px
-    }, scope, cx);
+        .max_dropdown_height = 240, // Viewport ~8 rows x 30px.
+    }).mount(scope, cx);
     try root.appendChild(allocator, mount_result.wrapper);
 
-    // 打开下拉，让 VL 真 render pool nodes
-    mount_result.is_open.set(true);
+    // Open dropdown, let VL truly render pool nodes.
+    mount_result.open.?.set(true);
     cx.layout();
     _ = cx.render();
 
@@ -3075,7 +2924,7 @@ fn frameSelect1kSetup(allocator: std.mem.Allocator) anyerror!*anyopaque {
     st.* = .{
         .cx = cx,
         .scope = scope,
-        .state = mount_result.state,
+        .state = &zenit.select_headless_mount.stateOf(i32, mount_result).nav,
         .options = opts,
         .item_count = opts.len,
     };
@@ -3092,7 +2941,7 @@ fn frameSelect1kTeardown(allocator: std.mem.Allocator, state_ptr: *anyopaque) vo
 
 fn frameSelect1kBody(_: std.mem.Allocator, ctx: *runner.BenchCtx) anyerror!void {
     const st: *FrameSelect1kState = @ptrCast(@alignCast(ctx.state.?));
-    // 每帧 step 一次 PageDown, wrap 防止 highlight 卡在末尾
+    // Step PageDown once per frame, wrap to prevent highlight stuck at end.
     if (st.state.highlight_index) |hi| {
         if (hi + 10 >= st.item_count) {
             st.state.highlight_index = 0;

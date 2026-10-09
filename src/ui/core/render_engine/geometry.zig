@@ -1,5 +1,5 @@
-/// 纯几何工具函数：rect 运算、变换、sticky 偏移
-/// 不依赖任何其他渲染子模块
+/// Pure geometry utilities: rect ops, transforms, sticky offsets. Independent of any other render
+/// submodule.
 const std = @import("std");
 
 const types = @import("../types.zig");
@@ -65,9 +65,10 @@ pub fn computeOpacityLayerBounds(
         }
     }
 
-    // 必须遍历**全部**阴影层（最多 max_shadows 层），只算 shadows[0] 会让后面大 blur
-    // 阴影超出 surface 纹理边界被矩形截断（Modal 双阴影 blur=80/offset_y=32 曾露馅）。
-    // 正 spread 同样外扩阴影形状（负 spread 只会收缩，不增大外溢）。
+    // Must traverse **all** shadow layers (max max_shadows), only shadow[0] lets later large-blur
+    // shadow exceed surface texture boundary, clipped by rectangle (Modal double shadows
+    // blur=80/offset_y=32 once leaked). Positive spread also expands shadow shape (negative only
+    // shrinks, doesn't expand overflow).
     for (node.style.shadowSlice()) |shadow| {
         const spread = @max(@as(f32, 0), shadow.spread);
         const blur_x = (shadow.blur * 2 + spread) * scale_x_abs;
@@ -112,23 +113,27 @@ pub fn canInlineLeafOpacity(
     return true;
 }
 
-/// solveSticky 的全部输入。坐标约定：`self_rect`/`parent_rect` 是布局 rect（相对各自父节点），
-/// `parent_origin`/`clip`/`constraint` 是屏幕坐标。
+/// All inputs to solveSticky. Coordinate convention: `self_rect`/`parent_rect` are layout rects
+/// (relative to their parents), `parent_origin`/`clip`/`constraint` are screen coordinates.
 pub const StickyInput = struct {
-    /// sticky 节点自身的布局 rect（相对父节点）。
+    /// Sticky node's own layout rect (relative to parent).
     self_rect: ComputedRect,
-    /// sticky 节点自身的 translate：参与自然位置（与 tick/globalRect 的屏幕坐标累加一致）。
+    /// Sticky node's own translate: participates in natural position (screen coord accumulation
+    /// same as tick/globalRect).
     self_translate: Point = .{ .x = 0, .y = 0 },
-    /// 父节点的屏幕原点 = tick 递归传下来的 offset（已含全部祖先的 rect + translate + sticky，
-    /// 其中包括父节点自己的，**不要**再加 parent_rect.x/y 或父节点 translate）。
+    /// Parent's screen origin = tick recursively passed offset (contains all ancestor rects +
+    /// translates + sticky, including parent's own; **don't** re-add parent_rect.x/y or parent
+    /// translate).
     parent_origin: Point,
-    /// 父节点布局 rect，只用其 w/h；null = 无父节点，不做钳制。
+    /// Parent layout rect, use only w/h; null = no parent, no clamping.
     parent_rect: ?ComputedRect,
     parent_padding: Padding = Padding.ZERO,
     insets: StickyInsets,
-    /// 吸附区域：全部 overflow_hidden 祖先框 ∩ 窗口视口（不含 sticky 自身）。
+    /// Adhesion region: all overflow_hidden ancestor frames INTERSECT window viewport (not
+    /// including sticky itself).
     clip: ComputedRect,
-    /// 显式钳制容器（屏幕坐标，已扣 padding）；非 null 时取代父节点 content box。
+    /// Explicit clamp container (screen coords, padding subtracted); when non-null, replaces parent
+    /// content box.
     constraint: ?ComputedRect = null,
 };
 
@@ -137,9 +142,10 @@ pub const StickyResult = struct {
     state: StickyState = .{},
 };
 
-/// sticky 偏移求解（纯函数，无副作用）。
-/// 某方向自然位置越过吸附线时补偿到吸附线，再被钳制容器（默认父节点 content box）
-/// 截短，保证 sticky 不越出容器。top 与 bottom（left 与 right）同时触发时后者覆盖前者。
+/// Solve sticky offset (pure function, no side effects). When natural position crosses adhesion
+/// line in a direction, compensate to adhesion line, then clamp container (default parent content
+/// box) trims, ensure sticky stays in container. top and bottom (left and right) simultaneous:
+/// latter wins.
 pub fn solveSticky(in: StickyInput) StickyResult {
     const natural_x = in.parent_origin.x + in.self_rect.x + in.self_translate.x;
     const natural_y = in.parent_origin.y + in.self_rect.y + in.self_translate.y;
@@ -207,13 +213,14 @@ pub fn solveSticky(in: StickyInput) StickyResult {
     };
 }
 
-/// tick 侧的 sticky 写回：由节点构造 StickyInput -> solveSticky -> 写回偏移与状态，变化时标脏。
-/// clip: sticky 的吸附区域（祖先裁剪交集）；null = 交集为空，没有可吸附的区域，偏移与状态清零
-/// （不能保留上一帧的值：globalRect / 命中 / 锚定 popover 都会读到它）。
-/// offset_x/y: 父节点的屏幕原点（tick 递归累加的全部祖先 rect + translate + sticky）。
+/// Tick-side sticky writeback: node constructs StickyInput -> solveSticky -> write offset and
+/// state, mark dirty on change. clip: sticky's adhesion region (ancestor clip intersection); null =
+/// intersection empty, no adhesion region, zero offset and state (can't retain last frame's:
+/// globalRect / hit / pinned popover all read it). offset_x/y: parent's screen origin (tick
+/// recursively accumulated all ancestor rects + translates + sticky).
 pub fn computeStickyOffset(node: *Node, offset_x: f32, offset_y: f32, clip: ?ComputedRect) void {
     const result: StickyResult = if (clip) |c| blk: {
-        // 通过全局 hook 从 World.LayoutTable 读 rect。
+        // Read rect from World.LayoutTable via global hook.
         const parent = node.parent;
         break :blk solveSticky(.{
             .self_rect = node.rectFromWorldOrFallback(),
@@ -227,13 +234,14 @@ pub fn computeStickyOffset(node: *Node, offset_x: f32, offset_y: f32, clip: ?Com
     } else .{};
 
     const sticky = &node.frame_state.frame_local.runtime.sticky;
-    // 状态位变化也算变化（方案 §7.4）：devtools / e2e 序列化读的是同一份 runtime.sticky。
+    // State bit change also counts as change (plan §7.4): devtools / e2e serialization reads same
+    // runtime.sticky.
     const changed = result.offset.x != sticky.x or result.offset.y != sticky.y or !result.state.eql(sticky.state);
     sticky.x = result.offset.x;
     sticky.y = result.offset.y;
     sticky.state = result.state;
 
-    // 变化 -> 标脏渲染 + 清除祖先渲染缓存
+    // Change -> mark render dirty + clear ancestor render cache.
     if (changed) {
         node.markInteractionDirty();
         node.frame_state.state_bits.dirty.core.render = true;

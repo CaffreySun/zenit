@@ -1,9 +1,9 @@
-/// Form 布局容器
+/// Form layout container
 ///
-/// 纯布局组件，为 FormField 提供统一的排列方式。
-/// 类似 SwiftUI 的 Form 容器。
+/// Pure layout component that provides uniform arrangement for FormField elements.
+/// Similar to SwiftUI's Form container.
 ///
-/// 用法:
+/// Usage:
 /// ```zig
 /// const form_node = try Form(.{ .layout = .vertical, .gap = 16 }).mount(scope, cx);
 /// try form_node.appendChild(allocator, field1_wrapper);
@@ -11,6 +11,7 @@
 /// ```
 const std = @import("std");
 const core = @import("../../core.zig");
+const view = @import("../../view.zig");
 const Cx = core.Cx;
 const Node = core.Node;
 const box = core.box;
@@ -18,45 +19,48 @@ const Sizing = core.Sizing;
 const Scope = core.Scope;
 const Padding = core.Padding;
 
-/// Form 布局方式
+/// Form layout direction.
 pub const FormLayout = enum {
-    /// 字段垂直排列（默认）
+    /// Fields arranged vertically (default).
     vertical,
-    /// 字段水平排列
+    /// Fields arranged horizontally.
     horizontal,
 };
 
-/// Form 配置
+/// Form config.
 pub const FormProps = struct {
-    /// 布局方式
+    /// Layout direction.
     layout: FormLayout = .vertical,
-    /// 字段间距
+    /// Field spacing.
     gap: f32 = 16,
-    /// 内边距
+    /// Padding.
     padding: ?Padding = null,
-    /// 宽度
+    /// Width.
     width: ?f32 = null,
 };
 
-/// Form mount 结果
+/// Form mount result.
 pub const FormResult = struct {
-    /// 根容器节点
+    /// Root container node.
     node: *Node,
+    /// `ui.view` integration (see src/ui/view_parts.zig).
+    pub fn viewParts(self: FormResult) core.ViewParts {
+        return .{ .root = self.node, .slot = self.node };
+    }
 };
 
-/// 创建 Form 布局容器
-pub fn Form(props: FormProps) FormBuilder {
-    return FormBuilder{ .props = props };
+/// Create Form layout container.
+pub fn Form(props: anytype) FormBuilder {
+    return .{ .props = @import("../../reactive.zig").props.coerce(FormProps, props) };
 }
 
 pub const FormBuilder = struct {
     props: FormProps,
 
     pub fn mount(self: FormBuilder, scope: *Scope, cx: *Cx) !FormResult {
-        _ = scope;
         const p = self.props;
 
-        const wrapper = try box(cx, .{
+        const wrapper = try view.render(scope, cx, view.box(.{ .style = core.BoxStyle{
             .width = if (p.width) |w| .{ .px = w } else .{ .grow = .{} },
             .height = .{ .fit = .{} },
             .direction = switch (p.layout) {
@@ -65,55 +69,29 @@ pub const FormBuilder = struct {
             },
             .gap = p.gap,
             .padding = p.padding orelse Padding.all(0),
-        }, .{});
+        } }, {}));
         wrapper.meta.ownership.meta.component_name = "Form";
 
         return .{ .node = wrapper };
     }
 };
 
-/// Form 分组标题
-pub fn FormSection(title: []const u8, cx: *Cx) !*Node {
-    const t = cx.tokens;
-    const allocator = cx.allocator;
-
-    const section = try box(cx, .{
-        .width = .{ .grow = .{} },
-        .height = .{ .fit = .{} },
-        .direction = .column,
-        .gap = 12,
-    }, .{});
+/// Form group title.
+pub fn FormSection(title: []const u8, scope: *Scope, cx: *Cx) !*Node {
+    const S = @import("styles.zig");
+    const section = try view.render(scope, cx, view.col(.{ .style = S.section }, .{
+        view.text(.{ .style = S.sectionTitle }, title),
+        view.box(.{ .style = S.sectionDivider }, {}),
+    }));
     section.meta.ownership.meta.component_name = "FormSection";
-
-    // 标题
-    const title_node = try box(cx, .{
-        .width = .{ .fit = .{} },
-        .height = .{ .fit = .{} },
-    }, .{});
-    title_node.setText(.{
-        .content = title,
-        .color = t.color.fg_primary,
-        .font_size = 16,
-        .font_weight = 600,
-    });
-    try section.appendChild(allocator, title_node);
-
-    // 分割线
-    const divider = try box(cx, .{
-        .width = .{ .grow = .{} },
-        .height = .{ .px = 1 },
-        .background = t.color.separator,
-    }, .{});
-    try section.appendChild(allocator, divider);
-
     return section;
 }
 
-// ========== 测试 ==========
+// ========== Tests ==========
 
 test "Form: vertical layout" {
     const allocator = std.testing.allocator;
-    var ctx = try Cx.init(allocator);
+    var ctx = try Cx.init(allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
@@ -132,7 +110,7 @@ test "Form: vertical layout" {
 
 test "Form: horizontal layout" {
     const allocator = std.testing.allocator;
-    var ctx = try Cx.init(allocator);
+    var ctx = try Cx.init(allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
@@ -150,28 +128,30 @@ test "Form: horizontal layout" {
 
 test "FormSection: title and divider" {
     const allocator = std.testing.allocator;
-    var ctx = try Cx.init(allocator);
+    var ctx = try Cx.init(allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
     ctx.root = root;
 
-    const section = try FormSection("Personal Info", ctx);
+    const scope = try Scope.init(allocator, null, ctx.owner);
+    defer scope.dispose();
+    const section = try FormSection("Personal Info", scope, ctx);
     try root.appendChild(allocator, section);
 
-    // section 应有 2 个子节点: title + divider
+    // Section should have 2 children: title + divider.
     try std.testing.expectEqual(@as(usize, 2), section.children.items.len);
 
-    // 标题文本
+    // Title text.
     const title_node = section.children.items[0];
     try std.testing.expectEqualStrings("Personal Info", title_node.getText().?.content);
 
-    // 分割线高度 1px
+    // Divider height 1px.
     const divider = section.children.items[1];
     try std.testing.expectEqual(Sizing{ .px = 1 }, divider.style.height);
 }
 
-// 逐分配点 OOM sweep，见 src/ui/components/oom_sweep.zig
+// Per-allocation OOM sweep, see src/ui/components/oom_sweep.zig.
 test "form: mount 在任意分配点失败时不泄漏（sweep）" {
     const sw = @import("../oom_sweep.zig");
     try sw.sweepMount("form", struct {

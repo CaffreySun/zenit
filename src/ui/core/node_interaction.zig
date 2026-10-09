@@ -1,19 +1,17 @@
-//! node_interaction, v0.12 §N3 god-object split: 从 node.zig 抽出
-//! 交互/焦点/Hit-Test 子域（17 方法）。
+//! node_interaction: interaction/focus/hit-test domain (17 methods) split out of node.zig.
 //!
-//! 范式同 §N1/§N2：Node-typed free function + @import("node.zig") 循环
-//! import；node.zig 保留 thin delegate（原 pub/private 可见性）。
+//! Pattern: Node-typed free functions + @import("node.zig") circular import;
+//! node.zig keeps thin delegates (original pub/private visibility).
 //!
-//! 与前两刀差异：本子域方法在 node.zig 里**非连续**（与树结构/调试
-//! 元数据/geometry 方法交错），逐方法迁移而非整块切。
+//! The methods in node.zig are **non-contiguous** (interleaved with tree/debug/geometry methods).
 //!
-//! 跨子域依赖（生命周期 §N4 才抽，本刀先升 pub）：
-//!   - rectFromWorldOrFallback（已 §N1 前就 pub）
-//!   - releasePathGeometry / releaseCustomClipGeometry -> §N3 升 pub
-//!   - invalidateCustomClipGeometryCache（§N1 已升 pub，本刀随迁过来）
-//! ProviderFn 类型（HitProxyProviderFn/CustomClipGeometryProviderFn）
-//! 留 node.zig（Node struct 内 pub const，签名含 *const Node，无外部
-//! caller），本模块经 node_mod.Node.XxxFn 引用。
+//! Cross-domain deps (promoted to pub):
+//!   - rectFromWorldOrFallback
+//!   - releasePathGeometry / releaseCustomClipGeometry
+//!   - invalidateCustomClipGeometryCache
+//! ProviderFn types (HitProxyProviderFn/CustomClipGeometryProviderFn) stay in node.zig
+//! (Node struct pub const; signature has *const Node); this module refs them via
+//! node_mod.Node.XxxFn.
 
 const std = @import("std");
 const node_mod = @import("node.zig");
@@ -38,9 +36,9 @@ const parseSvgDocumentPathCommands = svg_path.parseSvgDocumentPathCommands;
 const HitProxyProviderFn = node_mod.Node.HitProxyProviderFn;
 const CustomClipGeometryProviderFn = node_mod.Node.CustomClipGeometryProviderFn;
 
-// ─────────────────────────────────────────────────────────────────────
-// 焦点 / 交互可见性
-// ─────────────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
+// Focus / interaction visibility
+// ---------------------------------------------------------------------------
 
 pub fn setFocusable(self: *Node, focusable: bool) void {
     if (self.behavior.interaction.focusable == focusable) return;
@@ -81,8 +79,8 @@ pub fn setFocusScope(self: *Node, focus_scope: ?focus_mod.FocusScopeConfig) void
     self.markOrderDirty();
 }
 
-/// 只在左键按下时被读取（Cx.handleMouseDownEx），不参与 focus order / 命中 /
-/// 布局，因此无需标脏。
+/// Read only on left mouse down (Cx.handleMouseDownEx); not in focus order / hit / layout;
+/// no need to dirty.
 pub fn setPointerDownFocus(self: *Node, policy: node_mod.PointerDownFocus) void {
     self.behavior.interaction.pointer_down_focus = policy;
 }
@@ -91,7 +89,7 @@ pub fn setPointerDownFocus(self: *Node, policy: node_mod.PointerDownFocus) void 
 // custom draw / hit proxy / clip geometry
 // ─────────────────────────────────────────────────────────────────────
 
-/// 设置 custom_draw 回调并冒泡标记 has_custom_draw_subtree
+/// Set custom_draw callback and bubble-mark has_custom_draw_subtree.
 pub fn setCustomDraw(self: *Node, draw_fn: *const fn (DrawContext, ?*anyopaque) anyerror!void, draw_ctx: ?*anyopaque) void {
     self.meta.per_frame.custom_hooks.draw = .{ .callback = draw_fn, .context = draw_ctx };
     if (!self.frame_state.state_bits.flags.has_custom_draw_subtree) {
@@ -201,7 +199,7 @@ pub fn ensureCustomClipGeometry(self: *Node, allocator: Allocator) !void {
     self.meta.per_frame.custom_hooks.clip_meta.cache_epoch = self.meta.per_frame.custom_hooks.clip_meta.epoch;
 }
 
-/// 冒泡标记 has_custom_draw_subtree（子节点添加时调用）
+/// Bubble-mark has_custom_draw_subtree (call on child node add).
 pub fn markCustomDrawSubtree(self: *Node) void {
     if (self.frame_state.state_bits.flags.has_custom_draw_subtree) return;
     self.frame_state.state_bits.flags.has_custom_draw_subtree = true;
@@ -213,10 +211,10 @@ pub fn markCustomDrawSubtree(self: *Node) void {
     }
 }
 
-/// 冒泡标记 has_text_subtree（setText 非空时调用；appendChild 时由父链并入）。
-/// 保守不清位：删文本后保持 true, collectContentFlags.has_text 的消费者
-/// （auto_stabilize_text / layerize text_with_transform_animation）只会因此
-/// 更保守，不会漏。
+/// Bubble-mark has_text_subtree (call when setText non-empty; parent chains on appendChild).
+/// Conservative: keep true after delete; consumers of collectContentFlags.has_text
+/// (auto_stabilize_text / layerize text_with_transform_animation) only get more conservative, never
+/// miss.
 pub fn markSubtreeText(self: *Node) void {
     if (self.frame_state.state_bits.flags.has_text_subtree) return;
     self.frame_state.state_bits.flags.has_text_subtree = true;
@@ -228,9 +226,8 @@ pub fn markSubtreeText(self: *Node) void {
     }
 }
 
-/// 冒泡标记 has_before_render_subtree（addBeforeRender 时调用）。
-/// 保守不清位：hook 删除后保持 true -> hasBeforeRenderHookSubtree 多算 true
-/// -> 拒绝缓存，方向安全。
+/// Bubble-mark has_before_render_subtree (call on addBeforeRender). Conservative: keep true
+/// after delete; hasBeforeRenderHookSubtree over-counts true; rejects cache; safe direction.
 pub fn markSubtreeBeforeRenderHook(self: *Node) void {
     if (self.frame_state.state_bits.flags.has_before_render_subtree) return;
     self.frame_state.state_bits.flags.has_before_render_subtree = true;
@@ -242,8 +239,8 @@ pub fn markSubtreeBeforeRenderHook(self: *Node) void {
     }
 }
 
-/// 自增 clip_meta.epoch -> 使 ensureCustomClipGeometry 缓存失效
-/// （dirty 子域 §N1 跨模块调）
+/// Increment clip_meta.epoch -> invalidate ensureCustomClipGeometry cache (dirty domain §N1
+/// cross-module call).
 pub fn invalidateCustomClipGeometryCache(self: *Node) void {
     self.meta.per_frame.custom_hooks.clip_meta.epoch +%= 1;
 }

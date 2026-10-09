@@ -1,7 +1,7 @@
-//! 进程级 Node -> World 路由钩子：Node 的 content / paint / layout-output / rect
-//! 读写与 dirty / structure 通知经这里转发到当前 active World（SoA 表）。
-//! Cx.init 注册这些回调并维护 g_active_world*；多 Cx 并存时用 Cx.createNode
-//! 显式归属，不依赖这里的全局。
+//! Process-level Node -> World router hooks: Node content/paint/layout-output/rect
+//! read/write and dirty/structure notifications routed here to active World (SoA table).
+//! Cx.init registers these callbacks and maintains g_active_world*; when multiple Cx coexist
+//! use Cx.createNode to explicitly affiliate, independent of globals here.
 
 const core = @import("../core.zig");
 const Cx = core.Cx;
@@ -15,15 +15,15 @@ const cx_world_sync = @import("cx_world_sync.zig");
 const layout_table = core.layout_table;
 const world = core.world;
 
-/// 当前 active World（v0.2-P3 全局静态；v0.3 per-Cx）
+/// Active World (v0.2-P3 global static; v0.3 per-Cx)
 pub var g_active_world: ?*world.World = null;
 
-/// 当前 active World 的 id，与 g_active_world 同步维护，
-/// onNodeCreate 用它给 Node.world_id 盖章。
+/// Active World id, synced with g_active_world;
+/// onNodeCreate uses it to stamp Node.world_id.
 pub var g_active_world_id: u16 = core_node.INVALID_WORLD_ID;
 
-/// 单调递增的 World id 分配器。每个 Cx 拿一个唯一 id（不复用，复用会让
-/// 已释放 Cx 的陈旧 Node 与新 Cx 假匹配，正是本字段要防的问题）。
+/// Monotonically incrementing World id allocator. Each Cx gets unique id (never reuse;
+/// reuse lets stale Node from freed Cx falsely match new Cx, exactly the problem this prevents).
 pub var g_next_world_id: u16 = 0;
 
 pub fn onPaintBackgroundWrite(element_id_raw: u32, c: core_types.Color) void {
@@ -56,7 +56,7 @@ pub fn onPaintOpacityRead(element_id_raw: u32) ?f32 {
     return (w.paint_state.get(eid) orelse return null).opacity;
 }
 
-/// 镜像 Node.setLayoutOutput 写到 World.layout_output。
+/// Mirror Node.setLayoutOutput write to World.layout_output.
 pub fn onLayoutOutputWrite(element_id_raw: u32, v: core_node.NodeLayoutOutput) void {
     const w = g_active_world orelse return;
     if (element_id_raw == 0xFFFFFFFF) return;
@@ -80,8 +80,8 @@ pub fn onLayoutOutputPtr(element_id_raw: u32) ?*core_node.NodeLayoutOutput {
     return w.layout_output.getPtr(eid);
 }
 
-/// 镜像 Node.setText 写到 World.content (ContentTable)。
-/// element_id_raw == 0xFFFFFFFF 的 standalone Node 暂不镜像（fallback storage 留 stage 2）。
+/// Mirror Node.setText write to World.content (ContentTable).
+/// element_id_raw == 0xFFFFFFFF standalone Node not yet mirrored (fallback stage 2).
 pub fn onContentTextWrite(element_id_raw: u32, t: ?core_types.TextProps) void {
     const w = g_active_world orelse return;
     if (element_id_raw == 0xFFFFFFFF) return;
@@ -106,7 +106,7 @@ pub fn onContentIconWrite(element_id_raw: u32, ic: ?core_types.IconProps) void {
     w.content.setIcon(eid, ic);
 }
 
-// read 端，Node.getText/getImage/getIcon 从 World.content 拿值。
+// Read side: Node.getText/getImage/getIcon pull value from World.content.
 pub fn onContentTextRead(element_id_raw: u32) ?core_types.TextProps {
     const w = g_active_world orelse return null;
     if (element_id_raw == 0xFFFFFFFF) return null;
@@ -130,9 +130,9 @@ pub fn onContentIconRead(element_id_raw: u32) ?core_types.IconProps {
     return null;
 }
 
-/// v0.5-P3 N-2 (2026-05-03): Node.create hook，自动注册新 node 到 active World。
-/// 让所有 Node.create 路径（包括 test mock）都有 element_id，
-/// setLayoutRect 真写 World，frame_state.rect fallback 字段不再被消费。
+/// v0.5-P3 N-2 (2026-05-03): Node.create hook, auto-register new node to active World.
+/// All Node.create paths (including test mock) now have element_id;
+/// setLayoutRect truly writes World, frame_state.rect fallback never consumed.
 pub fn onNodeCreate(node: *Node) void {
     const w = g_active_world orelse return;
     if (node.element_id_raw != 0xFFFFFFFF) return;
@@ -141,15 +141,15 @@ pub fn onNodeCreate(node: *Node) void {
         .key = node.id,
     }) catch return;
     node.element_id_raw = eid.raw();
-    // 同时记下 owner, element_id 本身不含 World 标识（两个 World 都从
-    // index 0 分配），只有这个字段能区分"窗口 A 的 0x8"和"窗口 B 的 0x8"。
+    // Also record owner, element_id itself lacks World marker (both Worlds allocate from
+    // index 0); only this field distinguishes 'window A 0x8' vs 'window B 0x8'.
     node.world_id = g_active_world_id;
     node.world_ref = w;
 }
 
-/// 组件 paint 期 setLayoutRect 的 World 同步。
-/// 写入 LayoutTable 让"自己改 rect"的子节点（cursor / selection / 等）也
-/// 透明走 World 表，read path 命中 World 而非 fallback。
+/// Component paint-phase setLayoutRect World sync.
+/// Write LayoutTable so 'self-mutating rect' children (cursor/selection/etc) also
+/// transparently use World table, read-path hits World not fallback.
 pub fn onRectWrite(element_id_raw: u32, r: ComputedRect) void {
     const w = g_active_world orelse return;
     if (element_id_raw == 0xFFFFFFFF) return;
@@ -159,15 +159,15 @@ pub fn onRectWrite(element_id_raw: u32, r: ComputedRect) void {
     w.layout.markLaidOut(eid, .{ .width = r.w, .height = r.h }, lr);
 }
 
-/// v0.5-P3 Stage 4-2 (session 27): 全局 rect 查询，给不带 cx 的 fn 用。
+/// v0.5-P3 Stage 4-2 (session 27): global rect query, for functions without cx.
 pub fn onRectQuery(element_id_raw: u32) ?ComputedRect {
     const w = g_active_world orelse return null;
     if (element_id_raw == 0xFFFFFFFF) return null;
     const eid = world.ElementId.fromRaw(element_id_raw);
-    // Stage 4-2 关键：World.createElement 自动 seed layout slot（默认全 0），
-    // 所以 layout.rect() 几乎总返回 Some。我们必须靠 epoch == 0 来识别"slot
-    // 存在但还没 markLaidOut" 的情况，回退到 node.rect。否则手动 `node.rect =`
-    // 的测试 + Stage 4-2 切换会读到 0。
+    // Stage 4-2 critical: World.createElement auto-seeds layout slot (default all 0),
+    // so layout.rect() almost always returns Some. Must use epoch == 0 to detect 'slot
+    // exists but not markLaidOut yet', fall back to node.rect. Else manual `node.rect =`
+    // tests + Stage 4-2 switch read zero.
     if (w.layout.epoch(eid) == 0) return null;
     if (w.layout.rect(eid)) |r| {
         return ComputedRect.init(r.x, r.y, r.width, r.height);
@@ -183,10 +183,11 @@ pub fn nodeBelongsToActiveWorldForTest(node: *const Node) bool {
     return nodeBelongsToActiveWorld(node);
 }
 
-/// 校验：node 是否属于当前 active World。
-/// 返回 false 意味着**跨 Cx 串台**，拿 A 窗口的节点去改 B 窗口的 World。
-/// world_id == INVALID 的节点是 cx-less mock（测试直接 Node.create），
-/// 它们本就走 standalone fallback，不参与 World 路由，放行。
+/// Validate: node belongs to active World.
+/// Return false means **cross-Cx wire crossing**, taking node from Window A to mutate Window B
+/// World.
+/// world_id == INVALID node is cx-less mock (test direct Node.create);
+/// they use standalone fallback anyway, not World routing, pass through.
 pub fn nodeBelongsToActiveWorld(node: *const Node) bool {
     if (node.world_id == core_node.INVALID_WORLD_ID) return true;
     return node.world_id == g_active_world_id;
@@ -202,11 +203,11 @@ pub fn onNodeDirty(element_id_raw: u32, kind: core_node.DirtyKind) void {
         .structure => .{ .input = .{ .structure_changed = true } },
         .interaction => .{ .input = .{ .interaction_changed = true } },
     };
-    w.markDirty(eid, flags) catch {}; // OOM 容错——dirty 丢一次 frame 仍跑旧路径
+    w.markDirty(eid, flags) catch {}; // OOM tolerance - dirty lost one frame, still follows old path
 }
 
-/// Node.appendChild / unlink 时同步 World.elements 父子链表。
-/// 任一端 element_id_raw == 0xFFFFFFFF 即为旧路径节点，hook 直接 return（旧路径仍跑）。
+/// Node.appendChild / unlink sync World.elements parent-child list.
+/// Either endpoint element_id_raw == 0xFFFFFFFF = old-path node, hook return (old path continues).
 pub fn onNodeStructure(parent_raw: u32, child_raw: u32, kind: core_node.StructureKind) void {
     const w = g_active_world orelse return;
     if (parent_raw == 0xFFFFFFFF or child_raw == 0xFFFFFFFF) return;
@@ -215,7 +216,7 @@ pub fn onNodeStructure(parent_raw: u32, child_raw: u32, kind: core_node.Structur
     if (!w.elements.isValid(parent_eid) or !w.elements.isValid(child_eid)) return;
     switch (kind) {
         .append => {
-            // 如果 child 已有 parent（reparent 场景），先 unlink。
+            // If child already has parent (reparent), unlink first.
             const existing = w.elements.links(child_eid) orelse return;
             if (!existing.parent.isNull()) w.elements.unlink(child_eid);
             w.elements.appendChild(parent_eid, child_eid);

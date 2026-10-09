@@ -1,11 +1,10 @@
-//! DevTools 的 Box Model 可视化，从 devtools.zig 析出。
+//! DevTools Box Model visualization.
 //!
-//! 画 Inspector 里那张「margin / border / padding / content」同心矩形图。
-//! 这一段是纯构建：只读 Node 的布局产物与主题 token，输出一棵展示用节点树，
-//! 不碰 DevTools 的面板状态、选中项、tab 切换、事件分发，它夹在 4800 行的
-//! devtools.zig 里纯粹是历史堆积。
+//! Draws the 'margin / border / padding / content' concentric rectangles like Inspector. Pure
+//! construction: reads Node's layout products and theme tokens, outputs a display node tree; does
+//! not touch DevTools panel state, selection, tab switching or event dispatch.
 //!
-//! 唯一入口是 `build`，由 Layout Tab 调用一次。
+//! Sole entry point is `build`, called once by the Layout Tab.
 
 const std = @import("std");
 const core = @import("../core.zig");
@@ -16,7 +15,7 @@ const Color = core.Color;
 const theme = core.theme;
 const Padding = core.Padding;
 
-// ========== Box Model 可视化 ==========
+// ========== Box Model Visualization ==========
 
 pub const Colors = struct {
     margin_bg: Color,
@@ -29,19 +28,18 @@ pub const Colors = struct {
 pub fn colors(t: *const theme.ThemeTokens) Colors {
     _ = t;
     return .{
-        .margin_bg = Color.rgba(243, 171, 115, 50), // 橙色半透明
-        .border_bg = Color.rgba(253, 221, 140, 60), // 黄色半透明
-        .padding_bg = Color.rgba(147, 196, 125, 50), // 绿色半透明
-        .content_bg = Color.rgba(130, 175, 220, 60), // 蓝色半透明
+        .margin_bg = Color.rgba(243, 171, 115, 50), // orange semi-transparent
+        .border_bg = Color.rgba(253, 221, 140, 60), // yellow semi-transparent
+        .padding_bg = Color.rgba(147, 196, 125, 50), // green semi-transparent
+        .content_bg = Color.rgba(130, 175, 220, 60), // blue semi-transparent
         .label_fg = Color.rgba(100, 100, 100, 255),
     };
 }
 
-/// Chrome DevTools 风格 Box Model 可视化
-/// 这里按当前引擎语义直接画：
-/// - `node.rect` = 节点整体 rect（外框）
-/// - `content` = rect 减去 padding 后的内容区
-/// - padding 四边按真实比例填充在 rect 与 content 之间
+/// Chrome DevTools style Box Model visualization, drawn per current engine semantics:
+/// - `node.rect` = node overall rect (outer frame)
+/// - `content` = rect minus padding, the content area
+/// - padding four sides fill proportionally between rect and content
 pub fn build(cx: *Cx, node: *Node, parent: *Node) !void {
     const t = cx.tokens;
     const c = colors(t);
@@ -150,12 +148,13 @@ pub fn build(cx: *Cx, node: *Node, parent: *Node) !void {
         .align_items = .center,
         .border = .{ .width = 1, .color = Color.rgba(79, 111, 196, 255) },
     }, .{});
-    // content 建好到挂上 stage 之间还有一次可失败的 text 分配，门控 errdefer 守窗口，
-    // 挂接用 adoptChild（append 失败它自己收尸，所以让位标志要在 adopt 之前翻）。
+    // Between content built and mounted on stage text allocation may fail, gate errdefer protects
+    // window, use adoptChild (append failure cleans itself, so let-ready flag must flip before
+    // adopt).
     var content_owned = true;
     errdefer if (content_owned) cx.freeNode(content);
     content.setMargin(.{ .left = content_x, .top = content_y });
-    var content_buf: [96]u8 = undefined; // f32 {d:.0} 最长 39 位 ×2 + 分隔符 < 96
+    var content_buf: [96]u8 = undefined; // f32 {d:.0} longest 39 chars *2 + separators < 96
     const content_str = std.fmt.bufPrint(&content_buf, "{d:.0} x {d:.0}", .{ content_w, content_h }) catch unreachable;
     const content_label = try core.text(cx, "", .{ .font_size = 10, .color = c.label_fg, .font_weight = 600 });
     if (content_label.getText()) |__old_t| {
@@ -217,7 +216,8 @@ fn label(cx: *Cx, text_content: []const u8, fg: Color) !*Node {
 }
 
 fn value(cx: *Cx, val: f32, fg: Color) !*Node {
-    // 本地缓冲足够任何 f32（{d:.1} 最长 < 64）；setContent 拷贝，不依赖缓冲生命周期。
+    // Local buffer enough for any f32 ({d:.1} < 64); setContent copies, independent of buffer
+    // lifetime.
     var buf: [64]u8 = undefined;
     const str = if (val == 0)
         "-"

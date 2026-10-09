@@ -1,16 +1,17 @@
-//! LayoutOutputTable, v0.10 §L NodeLayoutOutput SoA, dense by ElementId
+//! LayoutOutputTable: NodeLayoutOutput SoA, dense by ElementId
 //!
-//! 与 ElementTable 一一对应：每个 element 创建时同步 ensureSlot。
-//! Stage 1 (本提交): 双写期。Node.visuals.layout_output 仍是 source of truth；
-//! 此表是**非 owning 镜像**, shallow copy NodeLayoutOutput（含 ?PathGeometry
-//! 指针的别名拷贝）。in-place 字段仍负责 path 的 clone/freePathGeometry
-//! 生命周期；本表 clear **不 free**（否则与 in-place double-free）。
+//! One-to-one with ElementTable: ensureSlot on element create. Currently dual-write:
+//! Node.visuals.layout_output remains the source of truth; this table is a **non-owning mirror**, a
+//! shallow copy of NodeLayoutOutput (aliasing ?PathGeometry pointers). The in-place fields still
+//! own the path clone/freePathGeometry lifecycle; clearing this table **doesn't free** (else
+//! double-free with the in-place fields).
 //!
-//! Stage 3 删 in-place 字段后，本表成 source of truth，届时 clear 路径才
-//! 接管 freePathGeometry（见 V10_ALIGNMENT_PLAN.md §L Stage 3 + 风险节）。
+//! When the in-place fields are deleted, this table becomes the source of truth and clear takes
+//! over freePathGeometry (see V10_ALIGNMENT_PLAN.md section L, Stage 3 + risk section).
 //!
-//! NodeLayoutOutput.artifacts.text_layout 是定长 TextLayout struct（无堆/
-//! 无自指 slice），普通值拷贝即可，无 §a ContentTable 的 fixupAfterMove 问题。
+//! NodeLayoutOutput.artifacts.text_layout is a fixed-size TextLayout struct (no heap, no
+//! self-referential slice), so a plain value copy is safe, with no ContentTable fixupAfterMove
+//! issue.
 
 const std = @import("std");
 const testing = std.testing;
@@ -25,7 +26,7 @@ pub const LayoutOutputTable = struct {
     items: std.ArrayListUnmanaged(NodeLayoutOutput),
 
     pub fn init(allocator: std.mem.Allocator) LayoutOutputTable {
-        return .{ .allocator = allocator, .items = .{} };
+        return .{ .allocator = allocator, .items = .empty };
     }
 
     pub fn deinit(self: *LayoutOutputTable) void {
@@ -33,8 +34,8 @@ pub const LayoutOutputTable = struct {
         self.* = undefined;
     }
 
-    /// Grow items 到 index。NodeLayoutOutput 无自指 slice（TextLayout 定长、
-    /// PathGeometry 是指针），ArrayList 扩容 move 不需要 re-fixup。
+    /// Grow items to index. NodeLayoutOutput has no self-referential slice (TextLayout fixed,
+    /// PathGeometry pointer), ArrayList realloc move needs no re-fixup.
     pub fn ensureSlot(self: *LayoutOutputTable, id: ElementId) !void {
         if (id.isNull()) return;
         const idx = id.index;
@@ -48,7 +49,8 @@ pub const LayoutOutputTable = struct {
         return self.items.items[id.index];
     }
 
-    /// 取可变指针（layout_engine per-frame 原地改 artifacts 用，避免整 struct 回写）。
+    /// Get mutable pointer (layout_engine per-frame in-place modify artifacts, avoid whole struct
+    /// write-back).
     pub fn getPtr(self: *LayoutOutputTable, id: ElementId) ?*NodeLayoutOutput {
         if (id.isNull() or id.index >= self.items.items.len) return null;
         return &self.items.items[id.index];
@@ -59,8 +61,8 @@ pub const LayoutOutputTable = struct {
         self.items.items[id.index] = v;
     }
 
-    /// Cx.destroyElement 调。Stage 1: 非 owning 镜像，**只重置不 free**
-    /// （path geometry 由 in-place 字段的 owner 释放）。Stage 3 接管 free。
+    /// Cx.destroyElement call. Stage 1: non-owning mirror, **only reset not free** (path geometry
+    /// owner by in-place field). Stage 3 take free.
     pub fn clear(self: *LayoutOutputTable, id: ElementId) void {
         if (id.isNull() or id.index >= self.items.items.len) return;
         self.items.items[id.index] = .{};
@@ -84,7 +86,7 @@ test "LayoutOutputTable: ensureSlot grows up to index" {
     const id = ElementId{ .index = 3, .generation = 1 };
     try t.ensureSlot(id);
     try testing.expectEqual(@as(usize, 4), t.items.items.len);
-    // 默认空 NodeLayoutOutput
+    // Default empty NodeLayoutOutput
     const got = t.get(id).?;
     try testing.expect(got.vector.fill.path == null);
     try testing.expect(got.artifacts.children_bbox == null);

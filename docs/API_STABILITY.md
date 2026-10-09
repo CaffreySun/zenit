@@ -20,13 +20,19 @@ carries a v1 compatibility promise.
 - `App.Config` (`window` / `font` / `clear_color` / `pump_timeout_ms` / `frame_pacing` / `idle_wait_ms` / `idle_skip_frames`)
 - `FrameStats` **existence and the getLastFrameStats() entry point** (the field set is under Unstable)
 
+### View tree (`ui.view`, `ui.on`): the app-facing way to build UI
+- `ui.view`: `render / mount`, elements `box / row / col / text / fmt / icon / spacer / with / component / attrs / setup / list / listWith / show (+ fallback) / match / each / eachWith`, style parts `when / hover / styleBy`
+- `ui.on`: `set / toggle / update / assign / call / bind`
+- `ViewParts` (the component protocol: `viewParts` on results, `viewMount` on builders)
+- Element and style-part types (`Box`, `Text`, `When`, …) are Unstable: write elements through the functions above, not by naming their types (except in helper return types, see VIEW_DSL.md)
+
 ### Builders and core types (`ui`)
-- `box / hstack / vstack / text / textFmt / image / imageTint / svg / svgTint / icon / iconTint / spacer / clickable / grid`
+- Node-level builders, for code inside components: `box / hstack / vstack / text / textFmt / image / imageTint / svg / svgTint / icon / iconTint / spacer / clickable / grid`
 - `Cx` (public method subset: `setTheme` / `themeSignal` / `bindState` / `on` / `setViewport` / `handleMouse* / handleKey*` event entries)
 - `Node` (public methods such as `appendChild / removeChild / setText / getText / setStyle / markLayoutDirty / markRenderDirty`)
-- `Scope` (`childScope / createSignal / createEffect / registerResource / dispose`)
+- `Scope` (`childScope / createSignal / createMemo / createEffect / registerResource / dispose`): the only app-facing way to create reactive state
 - Style types: `Style / Color / Padding / Margin / Border / Outline / Sizing / Shadow / Gradient / CornerRadius / BlendMode / Direction / FlexWrap / TextWrap / CursorShape / TextProps / ImageProps`
-- Reactivity: `Signal / Memo / createEffect / createMemo`
+- Reactivity: the `Signal / Memo` types (created through `Scope`); host entry points on `Cx` (events, timers, deferred work, before-render/after-layout hooks) batch signal writes
 - Control flow: `Show / For / Match`
 - Events: `HandlerRef` (the uniform widget-callback shape) / `EventCallback`
 - Theming: `ui.theme.light / dark / high_contrast`; new `ThemeTokens` fields are allowed
@@ -36,11 +42,11 @@ carries a v1 compatibility promise.
   belong to the selected provider's catalog; the same names across providers are not
   promised.
 
-### widgets (`ui.widgets`, 45 components)
+### widgets (`ui.widgets`, 44 components)
 Button / Input / Textarea / Checkbox / Switch / Radio / Slider / SelectHeadless /
 ComboBox / Badge / Tag / Chip / Card / Alert / Notifier / Progress / Spinner /
 Skeleton / Timeline / Breadcrumb / Steps / Rate / Tabs / Accordion / Tree / Table /
-DataTable / NumberStepper / TagsInput / FileUpload / Menu / DropdownMenu / Tooltip /
+DataTable / NumberStepper / TagsInput / FileUpload / Menu / Tooltip /
 Popover / Modal / Sheet / Calendar / DatePicker / DateRangePicker / Markdown /
 VirtualList / ScrollArea / Grid / Form / GlassBox
 
@@ -59,7 +65,7 @@ the returned struct**.
 - `ui.gesture`
 - The slot-customization surface of `ui.select_headless` (`render_trigger` / `render_item` ctx structs)
 - The `FrameStats` **field set** (observability is still expanding: encode/flush breakdown, draw counts added on 2026-07-30)
-- `ui.theme_schema`, the recipe system (`ConditionalStyle` parsing details)
+- DevTools presentation helpers, the recipe system (`ConditionalStyle` parsing details)
 - `ui.fx`, `GlassParams / GlassSurface` (Liquid Glass is still iterating)
 - `ui.control_flow` (exports beyond `Show/For/Match`)
 - Fields labeled "internal" in mount results (e.g. `InputResult.state`)

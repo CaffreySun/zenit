@@ -54,11 +54,15 @@ pub fn main() !void {
 - 设置 `cx.root` / `cx.is_mounted`
 - 跑主循环（事件 pump + dispatch + resize 检测 + 每帧渲染）直到窗口关闭
 
-State / 事件 handler 推荐用 `cx.bindState` + `cx.on`，不需要分配 u64 id：
+状态用 signal，事件用 `ui.on` 组合子直接写 signal；多个 handler 共享的状态结构体用
+`scope.createState`（随 scope 释放），方法用 `ui.on.call`：
 
 ```zig
-const counter = try cx.bindState(Counter, .{});
-const click = cx.on(Counter, counter, Counter.increment);
+const count = try scope.createSignal(i32, 0);
+W.Button(.{ .label = "+1", .on_click = ui.on.update(count, inc) })
+
+const form = try scope.createState(FormState, .{});
+W.Button(.{ .label = "Submit", .on_click = ui.on.call(form, FormState.submit) })
 ```
 
 ## 构建依赖

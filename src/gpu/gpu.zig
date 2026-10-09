@@ -1,11 +1,11 @@
-/// Zenit GPU - 跨平台 GPU 抽象层
+/// Zenit GPU - cross-platform GPU abstraction layer.
 ///
-/// 基于 wgpu API 设计，使用 Zig 实现
+/// Based on wgpu API design; Zig implementation.
 ///
-/// 当前支持: macOS Metal
-/// 未来计划: Windows (D3D12), Linux (Vulkan), WebGPU
+/// Backends: macOS Metal, Windows D3D12 renderer entry points, Null reference.
+/// Windows integration tracked in docs/WINDOWS_ARM64_PORT.md.
 ///
-/// 参考: https://docs.rs/wgpu/latest/wgpu/
+/// Reference: https://docs.rs/wgpu/latest/wgpu/
 const builtin = @import("builtin");
 const std = @import("std");
 
@@ -16,21 +16,26 @@ pub const backend_contract = @import("backend_contract.zig");
 // Backend Selection
 // ============================================================================
 
-/// 可选后端。`metal` 是生产后端；`null_backend` 是无设备的确定性参考实现，
-/// 用来**证伪抽象**，只有第二个实现真的编译通过，才能确认 `Backend.*` 的
-/// 签名是 backend-neutral 的，而不是把 Metal 语义焊死在了里面。
-pub const BackendKind = enum { metal, null_backend };
+/// Optional backend. `metal` is production; `null_backend` is device-less
+/// deterministic reference, **falsify abstraction**: only second implementation
+/// truly compiling confirms `Backend.*` backend-neutral, Metal semantics not
+/// baked in.
+pub const BackendKind = enum { metal, null_backend, d3d12 };
 
-/// 选中的后端种类。
+/// Selected backend kind.
 ///
-/// 默认跟随平台（macOS -> Metal）。`-Dgpu-backend=null` 可切到参考实现，
-/// 这是 C1「让抽象长出第二个实现」的入口。选择发生在**编译期**：切换后端
-/// 不引入任何运行时分支或虚调用（见 RENDERER_RHI_PLAN.md §8 的停止条件）。
+/// `-Dgpu-backend=d3d12` selects Windows renderer backend;
+/// `-Dgpu-backend=null` selects reference. **Compile-time** selection: backend
+/// switch introduces no runtime branch or vcall.
 pub const backend_kind: BackendKind = blk: {
     const opts = @import("build_options");
     if (@hasDecl(opts, "gpu_backend")) {
         if (std.mem.eql(u8, opts.gpu_backend, "null")) break :blk .null_backend;
         if (std.mem.eql(u8, opts.gpu_backend, "metal")) break :blk .metal;
+        if (std.mem.eql(u8, opts.gpu_backend, "d3d12")) {
+            if (builtin.target.os.tag != .windows) @compileError("D3D12 backend requires Windows");
+            break :blk .d3d12;
+        }
         @compileError("unknown -Dgpu-backend value: " ++ opts.gpu_backend);
     }
     break :blk if (builtin.target.os.tag == .macos)
@@ -39,88 +44,98 @@ pub const backend_kind: BackendKind = blk: {
         @compileError("Unsupported platform - only macOS Metal is currently implemented");
 };
 
+/// Render-target and all BGRA8 color texture format in the render pipeline (target,
+/// offscreen layer, color-glyph page, each pipeline color attach, readback staging).
+/// Paired with `shader_colors_encoded`. All backends use non-_sRGB: blend in sRGB-encoded
+/// values, matching AppKit (docs/SRGB_BLENDING_PLAN.md). The glass/blur native model and
+/// fit constants are premised on this. D3D12 HLSL and Metal use identical dials
+/// (glass.hlsl generated from glass.metal).
+pub const color_format: TextureFormat = .bgra8_unorm;
+
+/// Shaders receive sRGB-encoded colors (else linear). See `color_format`.
+pub const shader_colors_encoded: bool = true;
+
 pub const Backend = switch (backend_kind) {
     .metal => @import("metal/backend.zig"),
     .null_backend => @import("null/backend.zig"),
+    .d3d12 => @import("d3d12/renderer_device.zig"),
 };
 
-// 抽象的守门人：后端漏实现契约里的符号时，这里当场编译失败并指名道姓，
-// 而不是等到某个调用点被实例化才报一个难以定位的 undefined。
+// Abstraction gatekeeper: backend missing contract symbol fails compile,
+// names specifically, not deferred undefined at instantiation.
 comptime {
     backend_contract.verify(Backend, @tagName(backend_kind));
 }
 
-// ============================================================================
-// Core Types (类似 wgpu 的主要入口点)
-// ============================================================================
+// Core Types (main entry points like wgpu)
 
-/// Instance - GPU 交互的起点
+/// Instance - GPU interaction start point.
 pub const Instance = Backend.Instance;
 
-/// Adapter - 物理图形设备的句柄
+/// Adapter - physical graphics device handle.
 pub const Adapter = Backend.Adapter;
 
-/// Device - 打开的设备连接，用于创建资源
+/// Device - open device connection, create resources.
 pub const Device = Backend.Device;
 
-/// Queue - 命令队列，用于提交命令
+/// Queue - command queue, submit commands.
 pub const Queue = Backend.Queue;
 
-/// Surface - 窗口表面，用于呈现
+/// Surface - window surface, present.
 pub const Surface = Backend.Surface;
 
 // ============================================================================
 // Resource Types
 // ============================================================================
 
-/// Buffer - GPU 可访问的缓冲区
+/// Buffer - GPU-accessible buffer.
 pub const Buffer = Backend.Buffer;
 
-/// Texture - GPU 纹理
+/// Texture - GPU texture.
 pub const Texture = Backend.Texture;
 
-/// TextureView - 纹理视图
+/// TextureView - texture view.
 pub const TextureView = Backend.TextureView;
 
-/// Sampler - 纹理采样器
+/// Sampler - texture sampler.
 pub const Sampler = Backend.Sampler;
 
 // ============================================================================
 // Pipeline Types
 // ============================================================================
 
-/// ShaderModule - 编译的着色器模块
+/// ShaderModule - compiled shader module.
 pub const ShaderModule = Backend.ShaderModule;
 
-/// RenderPipeline - 渲染管线
+/// RenderPipeline - render pipeline.
 pub const RenderPipeline = Backend.RenderPipeline;
 
-/// ComputePipeline - 计算管线
+/// ComputePipeline - compute pipeline.
 pub const ComputePipeline = Backend.ComputePipeline;
 
-/// BindGroup - 绑定组
+/// BindGroup - bind group.
 pub const BindGroup = Backend.BindGroup;
 
-/// BindGroupLayout - 绑定组布局
+/// BindGroupLayout - bind group layout.
 pub const BindGroupLayout = Backend.BindGroupLayout;
 
-/// PipelineLayout - 管线布局
+/// PipelineLayout - pipeline layout.
 pub const PipelineLayout = Backend.PipelineLayout;
 
 // ============================================================================
 // Command Encoding
 // ============================================================================
 
-/// CommandEncoder - 命令编码器
+/// CommandEncoder - command encoder.
 pub const CommandEncoder = Backend.CommandEncoder;
 
-/// CommandBuffer - 已编码的命令缓冲区
+/// CommandBuffer - encoded command buffer.
 pub const CommandBuffer = Backend.CommandBuffer;
 
-/// RenderPass - 渲染通道编码器
+/// RenderPass - render pass encoder.
 pub const RenderPass = Backend.RenderPass;
 
-/// ComputePass - 计算通道编码器
+/// ComputePass - compute pass encoder.
 pub const ComputePass = Backend.ComputePass;
 
 // ============================================================================
@@ -136,7 +151,7 @@ pub const ResourceKind = resource_pool.ResourceKind;
 // Common Structures
 // ============================================================================
 
-/// 颜色（RGBA，范围 0.0-1.0）
+/// Color (RGBA, range 0.0-1.0).
 pub const Color = struct {
     r: f32,
     g: f32,
@@ -151,18 +166,16 @@ pub const Color = struct {
     pub const TRANSPARENT = Color{ .r = 0, .g = 0, .b = 0, .a = 0 };
 };
 
-/// 3D 尺寸
+/// 3D extent.
 pub const Extent3D = struct {
     width: u32,
     height: u32,
     depth: u32 = 1,
 };
 
-// ============================================================================
-// Enums (类似 wgpu 的枚举类型)
-// ============================================================================
+// Enums (enum types like wgpu)
 
-/// 纹理格式
+/// Texture format.
 pub const TextureFormat = enum {
     // 8-bit formats
     r8_unorm,
@@ -235,7 +248,7 @@ pub const TextureFormat = enum {
     bc7_rgba_unorm_srgb,
 };
 
-/// 纹理维度
+/// Texture dimension.
 pub const TextureDimension = enum {
     @"1d",
     @"2d",
@@ -250,7 +263,7 @@ pub const TextureMemory = enum {
     host_upload,
 };
 
-/// 纹理视图维度
+/// Texture view dimension.
 pub const TextureViewDimension = enum {
     @"1d",
     @"2d",
@@ -260,7 +273,7 @@ pub const TextureViewDimension = enum {
     @"3d",
 };
 
-/// 纹理使用标志
+/// Texture usage flags.
 pub const TextureUsages = packed struct(u32) {
     copy_src: bool = false,
     copy_dst: bool = false,
@@ -270,7 +283,7 @@ pub const TextureUsages = packed struct(u32) {
     _padding: u27 = 0,
 };
 
-/// 缓冲区使用标志
+/// Buffer usage flags.
 pub const BufferUsages = packed struct(u32) {
     map_read: bool = false,
     map_write: bool = false,
@@ -285,20 +298,20 @@ pub const BufferUsages = packed struct(u32) {
     _padding: u22 = 0,
 };
 
-/// 加载操作
+/// Load operation.
 pub const LoadOp = enum {
     load,
     clear,
     dont_care,
 };
 
-/// 存储操作
+/// Store operation.
 pub const StoreOp = enum {
     store,
     discard,
 };
 
-/// 基元拓扑
+/// Primitive topology.
 pub const PrimitiveTopology = enum {
     point_list,
     line_list,
@@ -307,33 +320,33 @@ pub const PrimitiveTopology = enum {
     triangle_strip,
 };
 
-/// 索引格式
+/// Index format.
 pub const IndexFormat = enum {
     uint16,
     uint32,
 };
 
-/// 正面方向
+/// Front-face direction.
 pub const FrontFace = enum {
-    ccw, // 逆时针
-    cw, // 顺时针
+    ccw, // Counter-clockwise.
+    cw, // Clockwise.
 };
 
-/// 剔除模式
+/// Cull mode.
 pub const CullMode = enum {
     none,
     front,
     back,
 };
 
-/// 多边形模式
+/// Polygon mode.
 pub const PolygonMode = enum {
     fill,
     line,
     point,
 };
 
-/// 比较函数
+/// Comparison function.
 pub const CompareFunction = enum {
     never,
     less,
@@ -345,7 +358,7 @@ pub const CompareFunction = enum {
     always,
 };
 
-/// 模板操作
+/// Stencil operation.
 pub const StencilOperation = enum {
     keep,
     zero,
@@ -357,7 +370,7 @@ pub const StencilOperation = enum {
     decrement_wrap,
 };
 
-/// 混合因子
+/// Blend factor.
 pub const BlendFactor = enum {
     zero,
     one,
@@ -374,7 +387,7 @@ pub const BlendFactor = enum {
     one_minus_constant,
 };
 
-/// 混合操作
+/// Blend operation.
 pub const BlendOperation = enum {
     add,
     subtract,
@@ -383,7 +396,7 @@ pub const BlendOperation = enum {
     max,
 };
 
-/// 顶点格式
+/// Vertex format.
 pub const VertexFormat = enum {
     uint8x2,
     uint8x4,
@@ -417,13 +430,13 @@ pub const VertexFormat = enum {
     sint32x4,
 };
 
-/// 顶点步进模式
+/// Vertex step mode.
 pub const VertexStepMode = enum {
     vertex,
     instance,
 };
 
-/// 地址模式
+/// Address mode.
 pub const AddressMode = enum {
     clamp_to_edge,
     repeat,
@@ -431,19 +444,19 @@ pub const AddressMode = enum {
     clamp_to_border,
 };
 
-/// 过滤模式
+/// Filter mode.
 pub const FilterMode = enum {
     nearest,
     linear,
 };
 
-/// Mipmap 过滤模式
+/// Mipmap filter mode.
 pub const MipmapFilterMode = enum {
     nearest,
     linear,
 };
 
-/// 着色器阶段
+/// Shader stage.
 pub const ShaderStages = packed struct(u32) {
     vertex: bool = false,
     fragment: bool = false,
@@ -451,27 +464,23 @@ pub const ShaderStages = packed struct(u32) {
     _padding: u29 = 0,
 };
 
-// ============================================================================
-// Descriptors (类似 wgpu 的描述符结构)
-// ============================================================================
+// Descriptors (descriptor structs like wgpu)
 
-/// Instance 描述符
+/// Instance descriptor.
 pub const InstanceDescriptor = struct {
-    /// **当前被所有后端忽略。** 后端选择是编译期决定的（`-Dgpu-backend=metal|null`，
-    /// 见 build.zig），运行时描述符管不着；Metal / Null 两个后端的 `Instance.init`
-    /// 都直接丢弃整个 descriptor。
-    ///
-    /// 保留这个字段只为对齐 wgpu 的描述符形状，设置它不会有任何效果，尤其是
-    /// `Backends` 里列出的 vulkan / dx12 / dx11 / gl / browser_webgpu **都没有
-    /// 对应实现**，别把它当成"打开某后端"的开关。
+    /// **Currently ignored by all backends.** Backend selection is compile-time
+    /// (`-Dgpu-backend=metal|null`; see build.zig); Metal and Null both discard the descriptor
+    /// in `Instance.init`. Kept for wgpu descriptor shape alignment; setting has no effect.
+    /// `Backends` entries vulkan / dx12 / dx11 / gl / browser_webgpu are **unimplemented**,
+    /// not a backend-select switch.
     backends: Backends = .all,
 };
 
-/// 后端选择位域。
+/// Backend selection bitfield.
 ///
-/// 注意：这是 wgpu 形状的占位定义，**不代表 zenit 真的实现了这些后端**。
-/// 目前只有 Metal 与 Null 两个真实后端，且都靠 `-Dgpu-backend=` 在编译期选定。
-/// 见 `InstanceDescriptor.backends` 的说明。
+/// Note: wgpu shape placeholder; **doesn't mean zenit implements these backends**.
+/// Currently Metal and Null only; both via `-Dgpu-backend=` compile-time select.
+/// See `InstanceDescriptor.backends`.
 pub const Backends = packed struct(u32) {
     vulkan: bool = false,
     metal: bool = false,
@@ -491,14 +500,14 @@ pub const Backends = packed struct(u32) {
     };
 };
 
-/// Device 描述符
+/// Device descriptor.
 pub const DeviceDescriptor = struct {
     label: ?[]const u8 = null,
     required_features: Features = .{},
     required_limits: Limits = .{},
 };
 
-/// 功能标志
+/// Feature flags.
 pub const Features = packed struct(u64) {
     depth_clip_control: bool = false,
     depth32float_stencil8: bool = false,
@@ -510,7 +519,7 @@ pub const Features = packed struct(u64) {
     _padding: u57 = 0,
 };
 
-/// 限制
+/// Limits.
 pub const Limits = struct {
     max_texture_dimension_1d: u32 = 8192,
     max_texture_dimension_2d: u32 = 8192,
@@ -538,7 +547,7 @@ pub const Limits = struct {
     max_compute_workgroups_per_dimension: u32 = 65535,
 };
 
-/// Buffer 描述符
+/// Buffer descriptor.
 pub const BufferDescriptor = struct {
     label: ?[]const u8 = null,
     size: u64,
@@ -546,7 +555,7 @@ pub const BufferDescriptor = struct {
     mapped_at_creation: bool = false,
 };
 
-/// Texture 描述符
+/// Texture descriptor.
 pub const TextureDescriptor = struct {
     label: ?[]const u8 = null,
     size: Extent3D,
@@ -559,7 +568,7 @@ pub const TextureDescriptor = struct {
     view_formats: []const TextureFormat = &.{},
 };
 
-/// TextureView 描述符
+/// TextureView descriptor
 pub const TextureViewDescriptor = struct {
     label: ?[]const u8 = null,
     format: ?TextureFormat = null,
@@ -570,7 +579,7 @@ pub const TextureViewDescriptor = struct {
     array_layer_count: ?u32 = null,
 };
 
-/// Sampler 描述符
+/// Sampler descriptor
 pub const SamplerDescriptor = struct {
     label: ?[]const u8 = null,
     address_mode_u: AddressMode = .clamp_to_edge,
@@ -585,30 +594,36 @@ pub const SamplerDescriptor = struct {
     max_anisotropy: u16 = 1,
 };
 
-/// ShaderModule 描述符
+/// ShaderModule descriptor
 pub const ShaderModuleDescriptor = struct {
     label: ?[]const u8 = null,
     source: ShaderSource,
 };
 
-/// 着色器源码
+/// Shader source code
 pub const ShaderSource = union(enum) {
     wgsl: []const u8,
     spirv: []const u32,
     msl: []const u8, // Metal Shading Language
+    hlsl: HlslSource,
     glsl: struct {
         code: []const u8,
         stage: ShaderStages,
     },
 };
 
-/// BindGroupLayout 描述符
+/// HLSL entry manifests make shader stages explicit instead of guessing from names.
+pub const ShaderStage = enum { vertex, fragment, compute };
+pub const HlslEntryPoint = struct { name: []const u8, stage: ShaderStage };
+pub const HlslSource = struct { code: []const u8, entry_points: []const HlslEntryPoint };
+
+/// BindGroupLayout descriptor
 pub const BindGroupLayoutDescriptor = struct {
     label: ?[]const u8 = null,
     entries: []const BindGroupLayoutEntry,
 };
 
-/// BindGroupLayout 条目
+/// BindGroupLayout entry
 pub const BindGroupLayoutEntry = struct {
     binding: u32,
     visibility: ShaderStages,
@@ -616,7 +631,7 @@ pub const BindGroupLayoutEntry = struct {
     count: ?u32 = null,
 };
 
-/// 绑定类型
+/// Binding type
 pub const BindingType = union(enum) {
     buffer: BufferBindingLayout,
     sampler: SamplerBindingLayout,
@@ -624,40 +639,40 @@ pub const BindingType = union(enum) {
     storage_texture: StorageTextureBindingLayout,
 };
 
-/// Buffer 绑定布局
+/// Buffer binding layout
 pub const BufferBindingLayout = struct {
     ty: BufferBindingType = .uniform,
     has_dynamic_offset: bool = false,
     min_binding_size: ?u64 = null,
 };
 
-/// Buffer 绑定类型
+/// Buffer binding type
 pub const BufferBindingType = enum {
     uniform,
     storage,
     read_only_storage,
 };
 
-/// Sampler 绑定布局
+/// Sampler binding layout
 pub const SamplerBindingLayout = struct {
     ty: SamplerBindingType = .filtering,
 };
 
-/// Sampler 绑定类型
+/// Sampler binding type
 pub const SamplerBindingType = enum {
     filtering,
     non_filtering,
     comparison,
 };
 
-/// Texture 绑定布局
+/// Texture binding layout
 pub const TextureBindingLayout = struct {
     sample_type: TextureSampleType = .float,
     view_dimension: TextureViewDimension = .@"2d",
     multisampled: bool = false,
 };
 
-/// 纹理采样类型
+/// Texture sampling type
 pub const TextureSampleType = enum {
     float,
     unfilterable_float,
@@ -666,54 +681,54 @@ pub const TextureSampleType = enum {
     uint,
 };
 
-/// StorageTexture 绑定布局
+/// StorageTexture binding layout
 pub const StorageTextureBindingLayout = struct {
     access: StorageTextureAccess = .write_only,
     format: TextureFormat,
     view_dimension: TextureViewDimension = .@"2d",
 };
 
-/// 存储纹理访问
+/// Storage texture access
 pub const StorageTextureAccess = enum {
     write_only,
     read_only,
     read_write,
 };
 
-/// BindGroup 描述符
+/// BindGroup descriptor
 pub const BindGroupDescriptor = struct {
     label: ?[]const u8 = null,
     layout: BindGroupLayout,
     entries: []const BindGroupEntry,
 };
 
-/// BindGroup 条目
+/// BindGroup entry
 pub const BindGroupEntry = struct {
     binding: u32,
     resource: BindingResource,
 };
 
-/// 绑定资源
+/// Binding resource
 pub const BindingResource = union(enum) {
     buffer: BufferBinding,
     sampler: Sampler,
     texture_view: TextureView,
 };
 
-/// Buffer 绑定
+/// Buffer binding
 pub const BufferBinding = struct {
     buffer: Buffer,
     offset: u64 = 0,
     size: ?u64 = null,
 };
 
-/// PipelineLayout 描述符
+/// PipelineLayout descriptor
 pub const PipelineLayoutDescriptor = struct {
     label: ?[]const u8 = null,
     bind_group_layouts: []const BindGroupLayout,
 };
 
-/// RenderPipeline 描述符
+/// RenderPipeline descriptor
 pub const RenderPipelineDescriptor = struct {
     label: ?[]const u8 = null,
     layout: ?PipelineLayout = null,
@@ -724,28 +739,28 @@ pub const RenderPipelineDescriptor = struct {
     fragment: ?FragmentState = null,
 };
 
-/// 顶点状态
+/// Vertex state
 pub const VertexState = struct {
     module: ShaderModule,
     entry_point: []const u8 = "main",
     buffers: []const VertexBufferLayout = &.{},
 };
 
-/// 顶点缓冲区布局
+/// Vertex buffer layout
 pub const VertexBufferLayout = struct {
     array_stride: u64,
     step_mode: VertexStepMode = .vertex,
     attributes: []const VertexAttribute,
 };
 
-/// 顶点属性
+/// Vertex attribute
 pub const VertexAttribute = struct {
     format: VertexFormat,
     offset: u64,
     shader_location: u32,
 };
 
-/// 基元状态
+/// Primitive state
 pub const PrimitiveState = struct {
     topology: PrimitiveTopology = .triangle_list,
     strip_index_format: ?IndexFormat = null,
@@ -755,7 +770,7 @@ pub const PrimitiveState = struct {
     polygon_mode: PolygonMode = .fill,
 };
 
-/// 深度模板状态
+/// Depth-stencil state
 pub const DepthStencilState = struct {
     format: TextureFormat,
     depth_write_enabled: bool,
@@ -769,7 +784,7 @@ pub const DepthStencilState = struct {
     depth_bias_clamp: f32 = 0.0,
 };
 
-/// 模板面状态
+/// Stencil face state
 pub const StencilFaceState = struct {
     compare: CompareFunction = .always,
     fail_op: StencilOperation = .keep,
@@ -777,28 +792,28 @@ pub const StencilFaceState = struct {
     pass_op: StencilOperation = .keep,
 };
 
-/// 多重采样状态
+/// Multisample state
 pub const MultisampleState = struct {
     count: u32 = 1,
     mask: u64 = 0xFFFFFFFF,
     alpha_to_coverage_enabled: bool = false,
 };
 
-/// 片段状态
+/// Fragment state
 pub const FragmentState = struct {
     module: ShaderModule,
     entry_point: []const u8 = "main",
     targets: []const ColorTargetState,
 };
 
-/// 颜色目标状态
+/// Color target state
 pub const ColorTargetState = struct {
     format: TextureFormat,
     blend: ?BlendState = null,
     write_mask: ColorWrites = ColorWrites.all,
 };
 
-/// 颜色写入标志
+/// Color write flags
 pub const ColorWrites = packed struct(u32) {
     red: bool = false,
     green: bool = false,
@@ -814,7 +829,7 @@ pub const ColorWrites = packed struct(u32) {
     };
 };
 
-/// 混合状态
+/// Blend state
 pub const BlendState = struct {
     color: BlendComponent,
     alpha: BlendComponent,
@@ -846,14 +861,14 @@ pub const BlendState = struct {
     };
 };
 
-/// 混合分量
+/// Blend component
 pub const BlendComponent = struct {
     src_factor: BlendFactor,
     dst_factor: BlendFactor,
     operation: BlendOperation,
 };
 
-/// ComputePipeline 描述符
+/// ComputePipeline descriptor
 pub const ComputePipelineDescriptor = struct {
     label: ?[]const u8 = null,
     layout: ?PipelineLayout = null,
@@ -861,7 +876,7 @@ pub const ComputePipelineDescriptor = struct {
     entry_point: []const u8 = "main",
 };
 
-/// RenderPass 颜色附件
+/// RenderPass color attachment
 pub const RenderPassColorAttachment = struct {
     view: TextureView,
     resolve_target: ?TextureView = null,
@@ -870,7 +885,7 @@ pub const RenderPassColorAttachment = struct {
     clear_value: Color = Color.BLACK,
 };
 
-/// RenderPass 深度模板附件
+/// RenderPass depth-stencil attachment
 pub const RenderPassDepthStencilAttachment = struct {
     view: TextureView,
     depth_load_op: LoadOp = .load,
@@ -883,32 +898,31 @@ pub const RenderPassDepthStencilAttachment = struct {
     stencil_read_only: bool = false,
 };
 
-/// RenderPass 描述符
+/// RenderPass descriptor
 pub const RenderPassDescriptor = struct {
     label: ?[]const u8 = null,
     color_attachments: []const RenderPassColorAttachment,
     depth_stencil_attachment: ?RenderPassDepthStencilAttachment = null,
 };
 
-/// ComputePass 描述符
+/// ComputePass descriptor
 pub const ComputePassDescriptor = struct {
     label: ?[]const u8 = null,
 };
 
 test {
-    // ⚠ Zig 不会递归收集被 import 文件里的 test 块，`pub const x =
-    // @import(...)` 这种顶层再导出**不会**让它的 test 被收集（见 build.zig
-    // 里 text.zig->font_catalog 那次「3ms 就跑完了」的记录）。要跑就必须在
-    // 这里显式引用一次。
+    // WARNING: Zig doesn't recursively collect test blocks from imported files;
+    // `pub const x = @import(...)` re-exports at top level **don't** collect their tests
+    // (see build.zig text.zig->font_catalog '3ms ran to completion' note). Must
+    // explicitly reference here to run.
     //
-    // 2026-09-22 实测：加 resource_pool / bind_group / conv 之前 test-gpu 是
-    // 10 个，之后 22 个，前面 12 个（含 ABA、epoch 退休等关键不变量）
-    // 一直没跑过。
+    // Without explicit references, resource_pool / bind_group / conv tests (including key
+    // invariants like ABA, epoch retirement) never ran.
     _ = rhi;
     _ = backend_contract;
     _ = resource_pool;
-    // metal/* 的测试只在 Metal 后端下有意义（bind_group 依赖
-    // Backend.BindGroupLayout，Null 后端没有该类型）。
+    // metal/* tests meaningful only under Metal backend (bind_group depends on
+    // Backend.BindGroupLayout, Null backend lacks it).
     if (backend_kind == .metal) {
         _ = @import("metal/bind_group.zig");
         _ = @import("metal/conv.zig");
@@ -916,22 +930,22 @@ test {
 }
 
 test "both backends satisfy the renderer contract" {
-    // C1 的核心断言：契约不是只对**当前选中**的后端成立，而是对**两个**
-    // 后端都成立。只校验选中的那个是循环论证，那正是"抽象从未被证伪"
-    // 的老状态（见 docs/internal/RHI_SECOND_BACKEND_ASSESSMENT.md）。
+    // Core assertion: the contract holds for **both** backends, not just the **currently
+    // selected** one. Verifying only the selected backend is circular.
     //
-    // verify 是 comptime 的：这两行任一不满足都会让本文件编译失败，
-    // 所以测试体本身无需运行时断言。
+    // verify is comptime: either line failing makes this file fail to compile, so the test
+    // body itself needs no runtime assertions.
     backend_contract.verify(@import("metal/backend.zig"), "metal");
     backend_contract.verify(@import("null/backend.zig"), "null");
 }
 
 test "backend selection is compile-time and matches the built backend" {
-    // 后端选择必须是 comptime 常量：切后端不引入运行时分支或虚调用
-    // （RENDERER_RHI_PLAN.md §8 的停止条件之一）。
+    // Backend selection must be comptime constant: switching backends introduces no
+    // runtime branches or virtual calls.
     comptime std.debug.assert(@TypeOf(backend_kind) == BackendKind);
     switch (backend_kind) {
         .metal => try std.testing.expect(Backend == @import("metal/backend.zig")),
         .null_backend => try std.testing.expect(Backend == @import("null/backend.zig")),
+        .d3d12 => try std.testing.expect(Backend == @import("d3d12/renderer_device.zig")),
     }
 }

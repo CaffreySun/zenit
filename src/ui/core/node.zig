@@ -12,15 +12,14 @@ const render_engine = @import("render_engine/mod.zig");
 const render_cache = @import("render_cache.zig");
 const svg_path = @import("svg_path.zig");
 const debug_trace = @import("debug_trace.zig");
-/// World 是 Node 各类属性（rect / paint / content / layout_output）的
-/// source of truth。node.zig 直接 import 它**不构成循环**, world.zig
-/// 及其依赖的表模块都不反向 import node.zig（已核实）。
-/// 这是拆掉 19 个进程级全局回调的前提：Node 能直接拿到 owner World，
-/// 就不需要"用全局变量把 World 偷渡进来"。
+/// World is Node property source of truth (rect/paint/content/layout_output). node.zig imports it
+/// **no cycle**, world.zig and its dependencies don't back-import node.zig (verified).
+/// This is premise for removing 19 process-level global callbacks: Node can get owner World
+/// directly, no need to "smuggle World via global variable".
 const world_mod = @import("world.zig");
 
-/// `Node.world_id` 的哨兵值：尚未注册到任何 World
-/// （cx-less 的 test mock、或 Cx.init 之前建的裸节点）。
+/// Sentinel for Node.world_id: not yet registered to any World (cx-less test mock or naked Node
+/// before Cx.init).
 pub const INVALID_WORLD_ID: u16 = 0xFFFF;
 
 var bracket_debug_node_cache: ?u32 = null;
@@ -40,7 +39,7 @@ fn bracketDebugNodeFilter() ?u32 {
     return parsed;
 }
 
-// 升 pub, node_render_cache.zig 跨模块调（纯 debug helper）
+// upgrade pub, node_render_cache.zig cross-module call (pure debug helper)
 pub fn shouldLogBracketNode(node_id: u32) bool {
     const filter = bracketDebugNodeFilter() orelse return false;
     return node_id == filter;
@@ -89,42 +88,40 @@ const computePathBounds = svg_path.computePathBounds;
 const parseSvgPathCommands = svg_path.parseSvgPathCommands;
 const parseSvgDocumentPathCommands = svg_path.parseSvgDocumentPathCommands;
 
-/// UI 树的核心数据结构，所有可见元素的运行时表示。
-/// 包含 style、布局结果(rect)、子节点、脏标记、渲染缓存、事件处理等全部运行时状态。
-/// 布局引擎、渲染引擎、事件系统均直接操作此结构。
-///
-// dirty 通知钩子。Cx.init 设置；core.zig 内的回调把 (element_id_raw, kind)
-// 转成 world.markDirty 调用。Node 不直接 import core.zig 避免循环依赖。
-// callback 单元 + 15 dirty 方法整体搬到 node_dirty.zig，
-// 此处 re-export 保持 node.DirtyKind / node.setDirtyNotifyCallback 公开 API 不破。
+/// Core UI tree data structure, runtime representation of all visible elements. Contains style,
+/// layout result (rect), children, dirty marks, render cache, event handling, all runtime state.
+/// Layout/render/event engines operate directly on this.
+// Dirty notify hook. Cx.init sets; core.zig callbacks convert (element_id_raw, kind) to
+// world.markDirty call. Node doesn't import core.zig to avoid cycle. Callback unit + 15 dirty
+// methods moved to node_dirty.zig, re-export here keeps node.DirtyKind/node.setDirtyNotifyCallback
+// public API unbroken.
 pub const DirtyKind = node_dirty.DirtyKind;
 pub const DirtyNotifyFn = node_dirty.DirtyNotifyFn;
 pub const setDirtyNotifyCallback = node_dirty.setDirtyNotifyCallback;
 
-// v0.5-P3 Stage 3-2 (2026-05-01): structure 通知钩子。Node.appendChild / removeChild
-// 调用此钩子让 Cx 同步 World.elements 父子链表。Node 不持 World 指针避免循环依赖；
-// 父/子双方的 element_id_raw == 0xFFFFFFFF 时为旧路径节点，hook 直接 return。
-// structure callback 单元 + 7 树结构方法整体搬到
-// node_tree.zig。此处 re-export 保持公开 API（外部 core.zig 调
-// setStructureNotifyCallback）。
+// v0.5-P3 Stage 3-2 (2026-05-01): structure notify hook. Node.appendChild/removeChild call hook let
+// Cx sync World.elements parent-child list. Node has no World pointer to avoid cycle; both node
+// parties element_id_raw == 0xFFFFFFFF are legacy nodes, hook return. Structure callback unit + 7
+// tree methods moved to node_tree.zig. Re-export here keeps public API (core.zig
+// setStructureNotifyCallback).
 pub const StructureKind = node_tree.StructureKind;
 pub const StructureNotifyFn = node_tree.StructureNotifyFn;
 pub const setStructureNotifyCallback = node_tree.setStructureNotifyCallback;
 
-// v0.5-P3 Stage 4-2 (session 27): 全局 rect 查询钩子。给不带 cx 的 fn（如
-// computeStickyOffset / tickBeforeRender / event_dispatcher hit-test）从 World.LayoutTable
-// 读 rect 用；查询失败时 caller 应回退到 node.rect。
+// v0.5-P3 Stage 4-2 (session 27): global rect query hook. For cx-less functions
+// (computeStickyOffset/tickBeforeRender/event_dispatcher hit-test) read from World.LayoutTable;
+// fail caller should fallback to node.rect.
 pub const RectQueryFn = node_lifecycle.RectQueryFn;
 pub const setRectQueryCallback = node_lifecycle.setRectQueryCallback;
 pub const RectWriteFn = node_lifecycle.RectWriteFn;
 pub const setRectWriteCallback = node_lifecycle.setRectWriteCallback;
 pub const NodeCreateHookFn = node_lifecycle.NodeCreateHookFn;
 pub const setNodeCreateHook = node_lifecycle.setNodeCreateHook;
-/// P0-3 阶段 2：跨 Cx 串台检测（见 node_lifecycle.zig 顶部说明）。
+/// P0-3 stage 2: cross-Cx cross-talk detection (see node_lifecycle.zig top note).
 pub const setWorldOwnershipCheck = node_lifecycle.setWorldOwnershipCheck;
-/// 显式指定 owner World 的节点创建（P0-3 多窗口入口，见 Cx.createNode）。
+/// Node create with explicit owner World (P0-3 multi-window entry, see Cx.createNode).
 pub const createIn = node_lifecycle.createIn;
-/// standalone fallback storage 显式回收（GPA leak check 覆盖不到，需手动收）。
+/// Explicit recover standalone fallback storage (GPA leak check can't cover, need manual).
 pub const deinitStandaloneRects = node_lifecycle.deinitStandaloneRects;
 pub const standaloneRectCount = node_lifecycle.standaloneRectCount;
 pub const prelayoutZeroRectReads = struct {
@@ -132,17 +129,15 @@ pub const prelayoutZeroRectReads = struct {
         return node_lifecycle.prelayout_zero_rect_reads;
     }
 };
-// RectQuery/RectWrite/NodeCreateHook callback 单元 + standalone
-// fallback rect storage（g_standalone_rects + Get/Set）整体搬到
-// node_lifecycle.zig（§L standalone 陷阱核心，整体迁移防半截）。
-// 此处 re-export 保持公开 API（外部 core.zig 调 setRect*Callback）。
+// RectQuery/RectWrite/NodeCreateHook callback unit + standalone fallback rect storage
+// (g_standalone_rects + Get/Set) moved to node_lifecycle.zig (§L standalone pitfall core, migrate
+// whole to prevent partial). Re-export here keeps public API (core.zig setRect*Callback).
 
-// §a NodeContent SoA + §b paint state SoA 的
-// callback/standalone-fallback/路由 全抽到 paint_content_accessor.zig。
-// 这里 re-export 公开 callback 类型 + registrar（core.zig 用
-// core_node.setContentTextWriteCallback 等注册 World 镜像 hook）。
-// Node 上的 get/setText/Image/Icon + getBackground/setBackgroundRaw 等
-// 方法降为 thin one-liner，delegate 到 pca.* 路由 free function。
+// §a NodeContent SoA + §b paint state SoA callback/standalone-fallback/routing all extracted to
+// paint_content_accessor.zig. Re-export here callback types + registrar (core.zig
+// setContentTextWriteCallback etc register World mirror hook). Node get/setText/Image/Icon +
+// getBackground/setBackgroundRaw etc methods drop to thin one-liner, delegate to pca.* routing free
+// function.
 const pca = @import("paint_content_accessor.zig");
 const node_dirty = @import("node_dirty.zig");
 const node_render_cache = @import("node_render_cache.zig");
@@ -173,8 +168,8 @@ pub const setContentTextReadCallback = pca.setContentTextReadCallback;
 pub const setContentImageReadCallback = pca.setContentImageReadCallback;
 pub const setContentIconReadCallback = pca.setContentIconReadCallback;
 
-/// Text hash 缓存，避免同一帧多次 render 重复 hash 同 content/spans。
-/// 把原本平铺在 Node 上的 7 个 cached_text_* 字段 collapse 进来，节省 Node 6 字段槽。
+/// Text hash cache, avoid same content/spans multi-render same frame hash again. 7 cached_text_*
+/// fields on Node collapse here, save 6 field slots.
 pub const TextHashCache = struct {
     content_version: u32 = 0,
     content_ptr: usize = 0,
@@ -185,8 +180,8 @@ pub const TextHashCache = struct {
     spans_hash: u64 = 0,
 };
 
-/// Custom clip geometry 元数据，provider fn + context + cache 状态。
-/// 把 5 个相关字段 collapse 进来，节省 Node 4 字段槽。
+/// Custom clip geometry metadata, provider fn + context + cache state. 5 related fields collapse
+/// here, save 4 field slots.
 pub const CustomClipMeta = struct {
     provider: ?Node.CustomClipGeometryProviderFn = null,
     provider_context: ?*anyopaque = null,
@@ -195,18 +190,18 @@ pub const CustomClipMeta = struct {
     cache_epoch: u32 = 0,
 };
 
-/// 节点 paint 信息：paint_order + subtree paint range（子树命中测试的 [min, max] 区间）。
-/// paint_order + subtree_paint_min/max 3 字段 collapsed -> 1。
+/// Node paint info: paint_order + subtree paint range ([min, max] hit-test). paint_order +
+/// subtree_paint_min/max 3 fields collapsed -> 1.
 pub const PaintInfo = struct {
-    /// 此节点在 paint pass 的全局序号
+    /// this node global paint pass sequence number
     order: u64 = 0,
-    /// 子树命中测试 paint_order 范围 [min, max]
+    /// subtree hit-test paint_order range [min, max]
     subtree_min: u64 = 0,
     subtree_max: u64 = 0,
 };
 
-/// 节点 hit-test 索引元数据。
-/// hit_proxy_start/len + hit_epoch + hit_clip_chain_id 4 字段 collapsed -> 1。
+/// Node hit-test index metadata. hit_proxy_start/len + hit_epoch + hit_clip_chain_id 4 fields
+/// collapsed -> 1.
 pub const HitIndex = struct {
     proxy_start: u32 = 0,
     proxy_len: u16 = 0,
@@ -214,19 +209,19 @@ pub const HitIndex = struct {
     clip_chain_id: ?u32 = null,
 };
 
-/// 动画 linger 帧计数，保留几帧 promote 状态以避免动画结束瞬间 layer 收缩闪烁。
-/// composite/opacity/transform linger 3 字段 collapsed -> 1。
+/// animation linger frame count, keep promote state few frames to avoid animation end layer shrink
+/// flicker. composite/opacity/transform linger 3 fields collapsed -> 1.
 pub const AnimationLinger = struct {
     composite: u8 = 0,
     opacity: u8 = 0,
     transform: u8 = 0,
 };
 
-/// 矢量路径描边状态（与 path_geometry 独立）。
-/// stroke_geometry/color/width/line_join 4 字段 collapsed -> 1。
-// NodeLayoutOutput 及子 struct 移到独立 node_layout_output.zig
-// (让 node.zig 与 layout_output_table.zig 都能引用而不成环)。这里 re-export
-// 保持 node.NodeStroke / node.NodeLayoutOutput 等旧引用点不破。
+/// vector path stroke state (independent of path_geometry). stroke_geometry/color/width/line_join 4
+/// fields collapsed -> 1.
+// NodeLayoutOutput and child structs moved to standalone node_layout_output.zig (let node.zig and
+// layout_output_table.zig both reference without cycle). Re-export here keeps
+// node.NodeStroke/node.NodeLayoutOutput etc old ref points unbroken.
 const nlo = @import("node_layout_output.zig");
 pub const NodeGeometries = nlo.NodeGeometries;
 pub const NodeStroke = nlo.NodeStroke;
@@ -234,12 +229,11 @@ pub const NodeVector = nlo.NodeVector;
 pub const LayoutArtifacts = nlo.LayoutArtifacts;
 pub const NodeLayoutOutput = nlo.NodeLayoutOutput;
 
-// NodeLayoutOutput SoA, World.LayoutOutputTable 是 source
-// of truth（in-place 字段已删）。callback/standalone-fallback/路由全在 pca
-// (paint_content_accessor.zig，与 §a content / §b paint 同型)。cx-less
-// mock (element_id==0xFFFFFFFF, hit_runtime/tests Node.create) 走 pca
-// standalone heap pool（稳定地址，供 layoutOutputPtr 指针逃逸/原地改）。
-// 这里 re-export callback 类型 + registrar（core.zig 注册 World hook）。
+// NodeLayoutOutput SoA, World.LayoutOutputTable is source of truth (in-place fields deleted).
+// Callback/standalone-fallback/routing all in pca (paint_content_accessor.zig, same shape as §a
+// content/§b paint). cx-less mock (element_id==0xFFFFFFFF, hit_runtime/tests Node.create) use pca
+// standalone heap pool (stable address, layoutOutputPtr escapes/in-place change). Re-export
+// callback types + registrar (core.zig register World hook).
 pub const LayoutOutputWriteFn = pca.LayoutOutputWriteFn;
 pub const LayoutOutputReadFn = pca.LayoutOutputReadFn;
 pub const LayoutOutputPtrFn = pca.LayoutOutputPtrFn;
@@ -247,25 +241,26 @@ pub const setLayoutOutputWriteCallback = pca.setLayoutOutputWriteCallback;
 pub const setLayoutOutputReadCallback = pca.setLayoutOutputReadCallback;
 pub const setLayoutOutputPtrCallback = pca.setLayoutOutputPtrCallback;
 
-/// Custom draw 回调 + context（v0.5: fn ptr + context 2 字段 collapsed -> ?CustomDraw）。
+/// Custom draw callback + context (v0.5: fn ptr + context 2 fields collapsed -> ?CustomDraw).
 pub const CustomDraw = struct {
     callback: *const fn (DrawContext, ?*anyopaque) anyerror!void,
     context: ?*anyopaque = null,
 };
 
-/// Custom hit test 回调 + context（v0.5: fn ptr + context 2 字段 collapsed -> ?CustomHitTest）。
+/// Custom hit test callback + context (v0.5: fn ptr + context 2 fields collapsed ->
+/// ?CustomHitTest).
 pub const CustomHitTest = struct {
     callback: Node.CustomHitTestFn,
     context: ?*anyopaque = null,
 };
 
-/// Hit proxy provider 回调 + context（v0.5: 2 字段 collapsed -> ?HitProxyProvider）。
+/// Hit proxy provider callback + context (v0.5: 2 fields collapsed -> ?HitProxyProvider).
 pub const HitProxyProvider = struct {
     callback: Node.HitProxyProviderFn,
     context: ?*anyopaque = null,
 };
 
-/// Hit-test dirty bits（v0.5: 3 个 bool 字段 collapsed -> 1 packed struct）。
+/// Hit-test dirty bits (v0.5: 3 bool fields collapsed -> 1 packed struct).
 pub const HitDirty = packed struct(u8) {
     geometry: bool = false,
     semantics: bool = false,
@@ -273,8 +268,8 @@ pub const HitDirty = packed struct(u8) {
     _reserved: u5 = 0,
 };
 
-/// Runtime-index dirty bits（v0.5: 4 个 bool 字段 collapsed -> 1 packed struct）。
-/// dirty / subtree_dirty / full_rebuild / subtree_full_rebuild
+/// Runtime-index dirty bits (v0.5: 4 bool fields collapsed -> 1 packed struct).
+/// dirty/subtree_dirty/full_rebuild/subtree_full_rebuild
 pub const RuntimeIndexFlags = packed struct(u8) {
     dirty: bool = true,
     subtree_dirty: bool = true,
@@ -283,36 +278,40 @@ pub const RuntimeIndexFlags = packed struct(u8) {
     _reserved: u4 = 0,
 };
 
-/// 左键按下时，框架对键盘焦点做什么（见 `NodeInteraction.pointer_down_focus`）。
+/// Left mouse down, what framework does to keyboard focus (see
+/// `NodeInteraction.pointer_down_focus`).
 pub const PointerDownFocus = enum {
-    /// 默认：焦点交给命中节点自身或最近的 focusable 祖先；一路都没有则清空焦点。
+    /// default: give focus to hit node self or nearest focusable ancestor; none all the way clear
+    /// focus.
     transfer,
-    /// 保持按下前的焦点不变：既不转移给任何节点，也不清空。
-    /// 适用于工具栏按钮、悬浮操作条、非模态面板等"点了只执行动作、
-    /// 不该打断正在编辑的那个节点"的 UI。
+    /// keep pre-click focus unchanged: don't move to any node, don't clear. Use for toolbar
+    /// buttons, floating action bar, non-modal panel etc "click to act, don't interrupt editing
+    /// node" UI.
     preserve,
 };
 
-/// 节点交互元数据（v0.5: focus + semantics 5 字段 collapsed -> 1 NodeInteraction）。
+/// Node interaction metadata (v0.5: focus + semantics 5 fields collapsed -> 1 NodeInteraction).
 pub const NodeInteraction = struct {
-    /// 焦点管理
+    /// Focus management
     focusable: bool = false,
     tab_index: ?i32 = null,
     focus_scope: ?focus_mod.FocusScopeConfig = null,
-    /// 左键按下的默认焦点行为是否作用于本节点所在的这段父链。
+    /// Whether the default left-click focus behavior applies to nodes in this parent chain.
     ///
-    /// 按下时框架从命中节点出发沿父链向上逐个检查：先遇到 `.preserve` 的节点
-    /// -> 焦点原样保留（按下前谁持有就还是谁，没人持有就继续空着）；先遇到
-    /// focusable 节点 -> 焦点交给它。节点自身既 `.preserve` 又 focusable 时
-    /// `.preserve` 优先（可 Tab 到、但鼠标点击不抢焦点的按钮）。因此把它设在
-    /// 工具栏容器上即可覆盖整条工具栏，而工具栏里更深处的 focusable 子节点
-    /// （如内嵌 Input）仍会正常拿到焦点。
+    /// On click the framework walks from the hit node up the parent chain: the first `.preserve`
+    /// node -> focus unchanged (whoever had focus keeps it, or stays empty); the first focusable
+    /// node -> receives focus. A node that is both `.preserve` and focusable: `.preserve` wins
+    /// (tab-reachable, but a mouse click does not steal focus, e.g. toolbar buttons). Set on a
+    /// toolbar container it covers the whole toolbar; a deeper focusable child (e.g. embedded
+    /// Input)
+    /// still takes focus normally.
     ///
-    /// 只影响框架的默认焦点决策：mouse_down/click 照常分发，handler 里显式
-    /// 调用的聚焦不受限制。判定在分发 mouse_down 之前按当时的树做出，与
-    /// focusable 目标的确定时机一致。
+    /// Only affects the framework default focus decision: mouse_down/click dispatch normally and
+    /// explicit focus calls in handlers are unrestricted. Decided before mouse_down dispatch
+    /// against
+    /// the current tree, same timing as focusable target lookup.
     pointer_down_focus: PointerDownFocus = .transfer,
-    /// 无障碍属性
+    /// a11y attributes
     a11y: ?A11yProps = null,
     /// Synchronous platform text-input endpoint. The focused node is the only
     /// node whose client is active; Cx owns native session activation.
@@ -321,23 +320,23 @@ pub const NodeInteraction = struct {
     /// Async clients may wait for their output; errors and local UI changes
     /// must invalidate explicitly. Preedit and keyboard defaults are unchanged.
     deferred_text_input_redraw: bool = false,
-    /// Key context (Action dispatch 系统)
+    /// Key context (Action dispatch system)
     key_context: ?[]const u8 = null,
 };
 
-/// 节点代理引用（v0.5: interaction_delegate + inspect_delegate 2 字段 collapsed -> 1）。
+/// Node delegate reference (v0.5: interaction_delegate + inspect_delegate 2 fields collapsed -> 1).
 pub const NodeDelegate = struct {
     interaction: ?*Node = null,
     inspect: ?*Node = null,
 };
 
-/// 节点生命周期钩子（v0.5: on_mount + on_cleanup 2 字段 collapsed -> 1）。
+/// Node lifecycle hooks (v0.5: on_mount + on_cleanup 2 fields collapsed -> 1).
 pub const NodeLifecycle = struct {
     on_mount: ?HandlerRef = null,
     on_cleanup: ?HandlerRef = null,
 };
 
-/// Sticky 视觉补偿偏移（v0.5: x + y 2 字段 collapsed -> 1）。
+/// Sticky visual compensation offset (v0.5: x + y 2 fields collapsed -> 1).
 pub const StickyOffset = struct {
     x: f32 = 0,
     y: f32 = 0,
@@ -348,11 +347,11 @@ pub const StickyOffset = struct {
     }
 };
 
-/// Sticky 吸附状态（每帧由 tick 与偏移一起写入，只读观测用）。
-/// - engaged_*：该方向产生了非零补偿（离开自然位置）。
-/// - pinned：有补偿且没有被钳制容器截短，正贴在吸附边上。
-/// - constrained：钳制容器截短了想要的补偿（被推着走 / 正在交接，含已被完全推回自然位置的情形）。
-/// pinned 与 constrained 互斥。
+/// Sticky engagement state (each frame by tick and offset write, read-only observe). engaged_*:
+/// this direction non-zero compensation (away from natural). pinned: compensation and not
+/// clamp-container cut short, pinned to engagement edge. constrained: clamp-container cut desired
+/// compensation (pushed/in-handoff, includes fully pushed back natural). pinned and constrained
+/// mutually exclusive.
 pub const StickyState = packed struct(u8) {
     engaged_top: bool = false,
     engaged_bottom: bool = false,
@@ -367,134 +366,132 @@ pub const StickyState = packed struct(u8) {
     }
 };
 
-/// 节点的世界坐标变换 + 其逆（hit-test 使用）。
-/// world_transform + inverse_world_transform 2 字段 collapsed -> 1。
+/// Node world coordinate transform + inverse (hit-test use). world_transform +
+/// inverse_world_transform 2 fields collapsed -> 1.
 pub const WorldTransform = struct {
     matrix: Transform2D = .{},
     inverse: Transform2D = .{},
 };
 
-/// 节点 render command 缓存（own subtree + promoted layer 各一份）。
-/// cached_commands + promoted_cached_commands 2 字段 collapsed -> 1。
+/// Node render command cache (own subtree + promoted layer each one). cached_commands +
+/// promoted_cached_commands 2 fields collapsed -> 1.
 pub const RenderCache = struct {
     own: ?CachedRenderSlice = null,
     promoted: ?CachedRenderSlice = null,
-    /// 下游回归：非 promoted 干净子树的跨帧 display payload 缓存。
-    /// prebuild pass 对 stamp 命中的干净子树直接 splice，免全树 paint 重录。
+    /// downstream regression: non-promoted clean subtree cross-frame display payload cache.
+    /// prebuild pass splice clean subtree stamp hits directly, skip full tree paint re-record.
     subtree_payload: ?CachedRenderSlice = null,
 };
 
-/// before_render hooks (主 + 子 list)。
-/// on_before_render + before_render_hook_count + before_render_hooks 3 字段 collapsed -> 1。
+/// before_render hooks (main + child list). on_before_render + before_render_hook_count +
+/// before_render_hooks 3 fields collapsed -> 1.
 pub const BeforeRenderHooks = struct {
     main: ?*const fn (*Node) void = null,
     count: u8 = 0,
-    hooks: [8]?*const fn (*Node) void = [_]?*const fn (*Node) void{null} ** 8,
+    hooks: [8]?*const fn (*Node) void = @as([8]?*const fn (*Node) void, @splat(null)),
 };
 
-/// 节点关联的 Scope 状态：scope ptr + binding back-pointer。
-/// scope + scope_binding_node_slot 2 字段 collapsed -> 1。
-/// scope 是组件根节点的响应式范围；slot 是 bindScopeToNode 注册的 back pointer，
-/// clearNodeScopes 在 freeNode 前 null 化以避免父 scope dispose 时碰到 stale ptr。
+/// Scope state associated with node: scope ptr + binding back-pointer. scope +
+/// scope_binding_node_slot 2 fields collapsed -> 1. Scope is component root node reactive range;
+/// slot is bindScopeToNode register back pointer, clearNodeScopes null before freeNode to avoid
+/// stale ptr when parent scope dispose.
 pub const ScopeBinding = struct {
     scope: ?*Scope = null,
     node_slot: ?*?*Node = null,
 };
 
-/// 节点版本号（content / composite），用于 paint cache 失效检测。
-/// content_version + composite_version 2 字段 collapsed -> 1。
+/// Node version (content/composite) for paint cache invalidation. content_version +
+/// composite_version 2 fields collapsed -> 1.
 pub const NodeVersions = struct {
     content: u32 = 1,
     composite: u32 = 1,
 };
 
-/// 节点元数据：组件类型名 + 测试标识符（DevTools / test_harness 用）。
-/// component_name + test_id 2 字段 collapsed -> 1。
+/// Node metadata: component type name + test identifier (DevTools/test_harness use). component_name
+/// + test_id 2 fields collapsed -> 1.
 pub const NodeMeta = struct {
     component_name: ?[]const u8 = null,
     test_id: ?[]const u8 = null,
 };
 
-/// 布局阶段产出（layout pass artifacts）。
-/// children_bbox + text_layout 2 字段 collapsed -> 1。
-/// 两者均由 layout_engine 写入，render/hit 阶段只读消费。
-// LayoutArtifacts / NodeVector / NodeLayoutOutput / NodeGeometries 定义已移
-// node_layout_output.zig（见上方 nlo re-export 块）。
+/// Layout phase output (layout pass artifacts). children_bbox + text_layout 2 fields collapsed ->
+/// 1. Both written by layout_engine, render/hit phases read-only consume.
+// LayoutArtifacts/NodeVector/NodeLayoutOutput/NodeGeometries defs moved node_layout_output.zig (see
+// above nlo re-export block).
 
-/// 自定义渲染/命中钩子集合。
-/// custom_draw + custom_hit_test + hit_proxy_provider + custom_clip_meta
-/// 4 字段 collapsed -> 1 sub-struct CustomHooks（节省 Node 3 字段槽）。
-/// 大多数节点全 null/默认，集中在一处便于 cache locality。
+/// Custom render/hit hooks collection. custom_draw + custom_hit_test + hit_proxy_provider +
+/// custom_clip_meta 4 fields collapsed -> 1 sub-struct CustomHooks (save 3 field slots). Most nodes
+/// all null/default, concentrate saves cache locality.
 pub const CustomHooks = struct {
-    /// Custom draw 回调：替代子节点递归，直接往 lowering_buffer 写 DisplayItem。
+    /// Custom draw callback: replace child recursion, directly write DisplayItem to
+    /// lowering_buffer.
     draw: ?CustomDraw = null,
-    /// Custom hit test 回调
+    /// Custom hit test callback
     hit_test: ?CustomHitTest = null,
-    /// Hit proxy provider（命中代理替身）
+    /// Hit proxy provider (hit substitute).
     hit_proxy: ?HitProxyProvider = null,
-    /// Custom clip mask provider + cache 元数据
+    /// Custom clip mask provider + cache metadata
     clip_meta: CustomClipMeta = .{},
 };
 
-/// 节点缓存集合（versions + text hash cache + paint cache）。
-/// versions + cached_text_hash + render_cache 3 字段 collapsed -> 1 NodeCaches（节省 Node 2 字段槽）。
+/// Node cache collection (versions + text hash cache + paint cache). versions + cached_text_hash +
+/// render_cache 3 fields collapsed -> 1 NodeCaches (save 2 field slots).
 pub const NodeCaches = struct {
-    /// content/composite 版本号（paint cache 失效检测用）
+    /// content/composite version (paint cache invalidation)
     versions: NodeVersions = .{},
-    /// 文本 hash cache（避免每帧重 hash）
+    /// text hash cache (skip per-frame re-hash)
     text_hash: TextHashCache = .{},
     /// Last published semantics, including borrowed text/span contents.
     text_signature: text_change.Signature = text_change.signature(null),
-    /// 命令缓存（own + promoted）
+    /// command cache (own + promoted)
     commands: RenderCache = .{},
 };
 
-/// 节点位图/图标内容（image + icon 互斥用）。
-/// image + icon 2 字段 collapsed -> 1 sub-struct NodeMedia（节省 Node 1 字段槽）。
-/// 大多数节点 image=null icon=null。
+/// Node bitmap/icon content (image + icon mutually exclusive). image + icon 2 fields collapsed -> 1
+/// sub-struct NodeMedia (save 1 field slot). Most nodes image=null icon=null.
 pub const NodeMedia = struct {
-    /// 位图（CALayer texture / texture_id 引用）
+    /// bitmap (CALayer texture/texture_id reference)
     image: ?ImageProps = null,
-    /// 矢量图标（icon_id 索引，按 size 解析）
+    /// vector icon (icon_id index, resolve by size)
     icon: ?IconProps = null,
 };
 
-// NodeContent / NodeVisuals 已删，content (§a) +
-// layout_output (§L) 全 SoA 化到 World，Node 不再有 visuals 字段。
+// NodeContent/NodeVisuals deleted, content (§a) + layout_output (§L) all SoA to World, Node no
+// visuals field.
 
-/// 节点 ownership：identity + lifetime 合并集合。
-/// P-Node-SoA-2: NodeIdentity (meta + debug_slots) + NodeLifetime (hooks + scope + delegate)
-/// 5 字段 collapsed -> 1 NodeOwnership（节省 Node 1 字段槽）。
+/// Node ownership: identity + lifetime merged collection. P-Node-SoA-2: NodeIdentity (meta +
+/// debug_slots) + NodeLifetime (hooks + scope + delegate) 5 fields collapsed -> 1 NodeOwnership
+/// (save 1 field slot).
 pub const NodeOwnership = struct {
-    /// component_name + test_id（identity.meta）
+    /// component_name + test_id (identity.meta)
     meta: NodeMeta = .{},
-    /// DevTools 调试用 state/signal 关联槽（identity.debug_slots）
+    /// DevTools debug state/signal association slots (identity.debug_slots)
     debug_slots: DebugSlots = .{},
-    /// on_mount + on_cleanup 钩子（lifetime.hooks）
+    /// on_mount + on_cleanup hooks (lifetime.hooks)
     hooks: NodeLifecycle = .{},
-    /// 关联的 reactive Scope binding（lifetime.scope）
+    /// associated reactive Scope binding (lifetime.scope)
     scope: ScopeBinding = .{},
-    /// interaction/inspect 代理节点（lifetime.delegate）
+    /// interaction/inspect delegate node (lifetime.delegate)
     delegate: NodeDelegate = .{},
 };
 
-/// 节点空间索引（world transform + paint order + hit index 3 类索引数据）。
-/// world_xform + paint_info + hit_index 3 字段 collapsed -> 1 NodeSpatial（节省 Node 2 字段槽）。
-/// 全部由 layout/paint/hit pass 写入；render/event 阶段只读消费。
+/// Node spatial index (world transform + paint order + hit index 3 index data). world_xform +
+/// paint_info + hit_index 3 fields collapsed -> 1 NodeSpatial (save 2 field slots). All written by
+/// layout/paint/hit pass; render/event read-only consume.
 pub const NodeSpatial = struct {
     /// world transform + inverse
     world: WorldTransform = .{},
-    /// paint order index（DFS 序号 + subtree 范围）
+    /// paint order index (DFS number + subtree range)
     paint: PaintInfo = .{},
-    /// hit test 索引（proxy ranges + epoch + clip chain）
+    /// hit test index (proxy ranges + epoch + clip chain)
     hit: HitIndex = .{},
 };
 
-/// 节点 dirty 标记集合（layout / pipeline / hit / runtime_index 4 个 packed structs）。
-/// core_dirty + runtime_index + pipeline_dirty + hit_dirty 4 字段 collapsed -> 1 NodeDirty（节省 Node 3 字段槽）。
-/// 子字段名保持原样，仅多一层 .core/.runtime/.pipeline/.hit 的访问跳跃。
+/// Node dirty marks collection (layout/pipeline/hit/runtime_index 4 packed structs). core_dirty +
+/// runtime_index + pipeline_dirty + hit_dirty 4 fields collapsed -> 1 NodeDirty (save 3 field
+/// slots). Sub-field names unchanged, only add .core/.runtime/.pipeline/.hit access hop.
 pub const NodeDirty = struct {
-    /// layout/render dirty bits（4 bool packed）
+    /// layout/render dirty bits (4 bool packed)
     core: CoreDirty = .{},
     /// runtime_index 4 bool packed
     runtime: RuntimeIndexFlags = .{},
@@ -504,75 +501,103 @@ pub const NodeDirty = struct {
     hit: HitDirty = .{},
 };
 
-/// setTheme 主题重放钩子：boxStyled/textStyled 等具名样式函数挂载于此，
-/// setTheme 时用新 tokens 重跑样式函数。
+/// setTheme replay hook: boxStyled/textStyled etc named style functions mount here, setTheme re-run
+/// style functions with new tokens.
 pub const ThemeHook = *const fn (*Node, *const types.ThemeTokens, std.mem.Allocator) void;
 
-/// 节点钩子集合（before_render hooks + hook-owned state slots）。
-/// before_render + hook_slots 2 字段 collapsed -> 1 NodeHooks（节省 Node 1 字段槽）。
+/// view-layer runtime style theme replay: scope-owned style state inline here, hang on node,
+/// setTheme call. Separate from component own on_theme, both non-overlapping (component root often
+/// own on_theme).
+pub const ViewThemeReplay = struct {
+    run: *const fn (*ViewThemeReplay, *const types.ThemeTokens) void,
+    /// node may have multi-layer runtime style (text style + box style, component root attrs
+    /// layer): intrusive singly-linked list
+    next: ?*ViewThemeReplay = null,
+};
+
+/// view-layer style host opaque reference (core independent of view types): call destroy on node
+/// free.
+pub const StyleHostRef = struct {
+    ptr: *anyopaque,
+    destroy: *const fn (*anyopaque) void,
+    /// component imperative style write (setBackground etc) give to host component inline layer;
+    /// return false means host applying, caller still write.
+    write_inline: *const fn (*anyopaque, *const types.BoxStyle) bool,
+    /// strip component inline layer fields (non-null fields in params), fallback to below
+    unset_inline: *const fn (*anyopaque, *const types.BoxStyle) void,
+};
+
+/// Node hook collection (before_render hooks + hook-owned state slots). before_render + hook_slots
+/// 2 fields collapsed -> 1 NodeHooks (save 1 field slot).
 pub const NodeHooks = struct {
     /// on_before_render main + extra hook ring
     before_render: BeforeRenderHooks = .{},
-    /// setTheme-only 主题重放 hook（boxStyled/textStyled 等具名样式函数挂载）
+    /// setTheme-only theme replay hook (boxStyled/textStyled etc named style function mount)
     on_theme: ?ThemeHook = null,
-    /// useFocusRing / useAnimatedBackground / useHoverHighlight / 组件 anim_state 4 个 ?*anyopaque slot
+    /// view-layer runtime style (currently static, change only with theme) theme replay list head,
+    /// see ViewThemeReplay
+    view_theme: ?*ViewThemeReplay = null,
+    /// view-layer style layer host (all node runtime box style is its layer), destroy on node free
+    style_host: ?StyleHostRef = null,
+    /// useFocusRing/useAnimatedBackground/useHoverHighlight/component anim_state 4 ?*anyopaque slot
     slots: HookSlots = .{},
 };
 
-/// 节点每帧 state 集合（caches + hooks + custom_hooks）。
-/// P-Node-SoA-4: caches + hooks + custom_hooks 3 字段 collapsed -> 1 NodePerFrameState（-2 fields）。
+/// Node per-frame state collection (caches + hooks + custom_hooks). P-Node-SoA-4: caches + hooks +
+/// custom_hooks 3 fields collapsed -> 1 NodePerFrameState (-2 fields).
 pub const NodePerFrameState = struct {
     caches: NodeCaches = .{},
     hooks: NodeHooks = .{},
     custom_hooks: CustomHooks = .{},
 };
 
-/// P-Node-SoA-5b (2026-05-02): frame_local 合并 spatial + runtime。
+/// P-Node-SoA-5b (2026-05-02): frame_local merge spatial + runtime.
 pub const NodeFrameLocal = struct {
     spatial: NodeSpatial = .{},
     runtime: NodeRuntime = .{},
 };
 
-/// P-Node-SoA-5b (2026-05-02): behavior 合并 events + interaction。
+/// P-Node-SoA-5b (2026-05-02): behavior merge events + interaction.
 pub const NodeBehavior = struct {
     events: EventHandlers = .{},
     interaction: NodeInteraction = .{},
 };
 
-/// P-Node-SoA-6 (2026-05-02): 终极 frame state 合并，state_bits + frame_local。
-/// 这两个都是 per-frame transient state，逻辑高度相关。
-/// v0.5-P3 N-2 (2026-05-03): rect 字段已删，element_id != 0xFFFFFFFF 节点的 rect
-/// 在 World.LayoutTable，element_id == 0xFFFFFFFF (standalone Node.create 节点)
-/// 的 rect 在 g_standalone_rects (out-of-line hashmap, key by node ptr)。
+/// P-Node-SoA-6 (2026-05-02): ultimate frame state merge, state_bits + frame_local. Both per-frame
+/// transient state, logic highly related. v0.5-P3 N-2 (2026-05-03): rect field deleted, element_id
+/// != 0xFFFFFFFF node rect in World.LayoutTable, element_id == 0xFFFFFFFF (standalone Node.create
+/// node) rect in g_standalone_rects (out-of-line hashmap, key by node ptr).
 pub const NodeFrameState = struct {
     state_bits: NodeStateBits = .{},
     frame_local: NodeFrameLocal = .{},
 };
 
-/// P-Node-SoA-6 (2026-05-02): meta 合并 ownership + per_frame。
+/// P-Node-SoA-6 (2026-05-02): meta merge ownership + per_frame.
 pub const NodeMetadata = struct {
     ownership: NodeOwnership = .{},
     per_frame: NodePerFrameState = .{},
 };
 
-/// 节点运行时视觉状态（sticky 位置补偿 + 动画 linger 帧计数 + 动画运行时槽）。
-/// sticky_offset + animation_linger 2 字段 collapsed -> 1 NodeRuntime（节省 Node 1 字段槽）。
-/// P-Node-SoA-1 (2026-05-02): merged former NodeAnimRuntime (transitions + commands) here，
-/// 多省 1 字段槽（-> Node 23 fields）。两者均 lazily 分配，绝大多数节点是 null/null。
+/// Node runtime visual state (sticky position compensation + animation linger frame count +
+/// animation runtime slot). sticky_offset + animation_linger 2 fields collapsed -> 1 NodeRuntime
+/// (save 1 field slot). P-Node-SoA-1 (2026-05-02): merged former NodeAnimRuntime (transitions +
+/// commands) here, save 1 more field slot (-> Node 23 fields). Both lazily allocated, vast majority
+/// nodes null/null.
 pub const NodeRuntime = struct {
-    /// sticky 位置 x/y
+    /// sticky position x/y
     sticky: StickyOffset = .{},
-    /// 动画 linger 帧计数（composite/opacity/transform）
+    /// animation linger frame count (composite/opacity/transform)
     linger: AnimationLinger = .{},
-    /// 声明式 Transition 运行时状态（former NodeAnimRuntime.transitions）
+    /// declarative Transition runtime state (former NodeAnimRuntime.transitions)
     transitions: ?*types.TransitionSlots = null,
-    /// 命令式节点动画（由 animateNode 分配；former NodeAnimRuntime.commands）
+    /// imperative node animation (allocated by animateNode; former NodeAnimRuntime.commands)
     commands: ?*@import("../animation/node_animator.zig").NodeAnimations = null,
 };
 
-/// 由 hooks 拥有的不透明 state slot（4 个独立用途的指针；指向 hook 私有的 state struct）。
-/// 4 个 `?*anyopaque` 字段 collapsed -> 1。
+/// opaque state slot owned by hooks (4 independent use pointers; point to hook private state
+/// struct). 4 ?*anyopaque fields collapsed -> 1.
 pub const HookSlots = struct {
+    hover_listeners: ?*anyopaque = null,
     /// useFocusRing
     focus_ring_anim: ?*anyopaque = null,
     /// Distinguishes useFocusRing from legacy custom use of the opaque slot.
@@ -582,12 +607,14 @@ pub const HookSlots = struct {
     animated_bg_state: ?*anyopaque = null,
     /// useHoverHighlight
     hover_highlight_state: ?*anyopaque = null,
-    /// 组件自定义 anim_state（供 on_before_render 使用）
+    /// component custom anim_state (for on_before_render use)
     anim_state: ?*anyopaque = null,
+    /// view-layer time-loop style (`ui.view.loop`) runtime, for its before_render hook fetch
+    view_loop: ?*anyopaque = null,
 };
 
-/// 散落 bool flags（v0.5: 11 个 bool collapsed -> 1 packed struct）。
-/// 不包括 dirty propagation 位（那些在 CoreDirty / PipelineDirty / RuntimeIndexFlags / HitDirty）。
+/// scattered bool flags (v0.5: 11 bool collapsed -> 1 packed struct). Excludes dirty propagation
+/// bits (those in CoreDirty/PipelineDirty/RuntimeIndexFlags/HitDirty).
 pub const NodeFlags = packed struct(u16) {
     out_of_viewport: bool = false,
     hit_test_visible: bool = true,
@@ -595,49 +622,53 @@ pub const NodeFlags = packed struct(u16) {
     manual_transform_animation_active: bool = false,
     manual_opacity_animation_active: bool = false,
     has_custom_draw_subtree: bool = false,
-    /// 子树（含自身）存在 text 内容。setText 非空置位并沿祖先冒泡，appendChild
-    /// /reparent 时并入父链；保守不清位（删文本后保持 true，只增不减）。
-    /// collectContentFlags.has_text 的 O(1) 数据源，替代旧 subtreeHasText
-    /// 每节点递归下钻（整帧 O(n·depth)）。
+    /// subtree (incl self) has text content. setText non-empty set and bubble ancestor,
+    /// appendChild/reparent merge parent chain. Conservative: the bit is never cleared (stays true
+    /// after the text is deleted; it only grows, never shrinks). collectContentFlags.has_text O(1) data source, replace old
+    /// subtreeHasText per-node recursion (full frame O(n*depth)).
     has_text_subtree: bool = false,
-    /// 子树（含自身）存在 before_render hook。addBeforeRender 置位并冒泡，
-    /// appendChild 并入父链；保守不清位。hasBeforeRenderHookSubtree 的 O(1) 源。
+    /// subtree (incl self) has before_render hook. addBeforeRender set and bubble, appendChild
+    /// merge parent chain. Conservative: the bit is never cleared. O(1) source for
+    /// hasBeforeRenderHookSubtree.
     has_before_render_subtree: bool = false,
     disable_render_cache: bool = false,
     test_id_owned: bool = false,
     is_mounted: bool = false,
     inspectable: bool = true,
     inspect_pick_disabled: bool = false,
-    /// before_render hook 的影响范围声明（默认 false = 保守，影响整棵子树）。
+    /// Declares the impact scope of a before_render hook (default false = conservative, affects the
+    /// whole subtree).
     ///
-    /// 背景：prebuildDisplayPayloadSubtrees 遇到挂了 before_render hook 的节点
-    /// 会置 display_payload_prefix_broken，让 paint 顺序在其之后的**一切**都退回
-    /// fresh emit。这条闸门防的是真问题（hook 在 render 期改 transform/内容，
-    /// prebuild 预录的是 hook 运行前的状态 -> 半 prebuilt 半 fresh 的双份合成，
-    /// GlassLab 拖拽球闪烁的根因）。但代价是整条前缀，对"hook 只回填自己几何"
-    /// 的场景（编辑器的滚动同步 / 尺寸回填）是巨大的误伤。
+    /// prebuildDisplayPayloadSubtrees sets display_payload_prefix_broken on a node with a
+    /// before_render hook, so everything after it in paint order falls back to fresh emit. The gate
+    /// prevents a real problem: a hook that changes transform/content during render while prebuild
+    /// pre-recorded the pre-hook state yields double composite (half prebuilt, half fresh; GlassLab
+    /// drag-ball flicker). The cost is the whole prefix, a large collateral for hooks that only
+    /// refill their own geometry (editor scroll sync / size refill).
     ///
-    /// 置 true 表示调用方担保：**本 hook 只改本节点自身的几何/样式/内容，
-    /// 不触碰任何后代或兄弟节点的 transform、内容与可见性**。此时闸门降级为
-    /// "只让本节点自己不参与跨帧缓存"，不再打断整条 paint 前缀。
+    /// Setting true is the caller's guarantee: **this hook only changes this node's own
+    /// geometry/style/content, and touches no descendant/sibling transform or content visibility**.
+    /// The gate then downgrades to "this node skips the cross-frame cache only" and no longer
+    /// breaks the whole paint prefix.
     ///
-    /// ⚠ 担保错了的表现是残影/双份合成，不是崩溃，必须配逐帧像素对照验收，
-    /// 逃生阀见 ZENIT_DISABLE_HOOK_SELF_SCOPE。
+    /// A wrong guarantee shows as ghosting/double composite, not a crash; validate with per-frame
+    /// pixel-by-pixel acceptance. Escape valve: ZENIT_DISABLE_HOOK_SELF_SCOPE.
     before_render_hook_affects_self_only: bool = false,
     _reserved: u2 = 0,
 };
 
-/// 核心 dirty bits（v0.5: layout/subtree_layout/render/subtree_render 4 bool collapsed -> 1 packed struct）。
-/// 这些是 zenit dirty propagation 主链路。
+/// core dirty bits (v0.5: layout/subtree_layout/render/subtree_render 4 bool collapsed -> 1 packed
+/// struct). These are zenit dirty propagation main circuit.
 pub const CoreDirty = packed struct(u8) {
     layout: bool = true,
-    subtree_layout: bool = true, // 原名 subtree_dirty（指 subtree_layout_dirty）
+    subtree_layout: bool = true, // former subtree_dirty (means subtree_layout_dirty)
     render: bool = true,
     subtree_render: bool = true,
     _reserved: u4 = 0,
 };
 
-/// Pipeline dirty bits（v0.5: order / interaction / composite × (self+subtree) 6 bool collapsed -> 1 packed struct）。
+/// Pipeline dirty bits (v0.5: order/interaction/composite x (self+subtree) 6 bool collapsed -> 1
+/// packed struct).
 pub const PipelineDirty = packed struct(u8) {
     order: bool = true,
     subtree_order: bool = true,
@@ -648,13 +679,13 @@ pub const PipelineDirty = packed struct(u8) {
     _reserved: u2 = 0,
 };
 
-/// Devtools debug slots，状态指针池 + signal ref 池，仅 inspector/devtools 消费。
-/// 把 4 个 debug_* 字段 collapse 进来，节省 Node 3 字段槽。
+/// Devtools debug slots, state pointer pool + signal ref pool, inspector/devtools only consume.
+/// Collapse 4 debug_* fields, save 3 field slots.
 pub const DebugSlots = struct {
     state_count: u8 = 0,
-    state_ptrs: [8]?*anyopaque = [_]?*anyopaque{null} ** 8,
+    state_ptrs: [8]?*anyopaque = @as([8]?*anyopaque, @splat(null)),
     signal_count: u8 = 0,
-    signals: [8]?DebugSignalRef = [_]?DebugSignalRef{null} ** 8,
+    signals: [8]?DebugSignalRef = @as([8]?DebugSignalRef, @splat(null)),
 };
 
 /// P-Node-SoA-5: dirty (NodeDirty) + flags (NodeFlags) collapsed.
@@ -663,8 +694,8 @@ pub const NodeStateBits = struct {
     flags: NodeFlags = .{},
 };
 
-/// 应用层不直接构造 Node，而是通过 `ui.box()` / `ui.text()` / `ui.image()` 等
-/// 工厂函数创建（见 core.zig）。这些函数内部调用 `Node.create()` 并设置对应的 tag。
+/// application doesn't directly construct Node, use `ui.box()/ui.text()/ui.image()` etc factory
+/// functions (see core.zig). Functions internally call `Node.create()` and set tag.
 pub const ALIVE_SENTINEL: u32 = 0x5A11_5A11;
 pub const DEAD_SENTINEL: u32 = 0xDEAD_0DE0;
 
@@ -684,30 +715,28 @@ pub const Node = struct {
     /// Called after capture ownership is cleared. Must tolerate cancellation.
     on_capture_lost: ?*const fn (*Node) void = null,
 
-    /// 链接到 World.elements 中的 ElementId（u32 raw 形式存避免 import 循环）。
+    /// link to World.elements ElementId (u32 raw form store avoid import cycle).
     element_id_raw: u32 = 0xFFFFFFFF,
 
-    /// 本节点归属哪个 World（= 哪个 Cx / 哪个窗口）。0xFFFF = 未注册。
+    /// Which World this node belongs to (= which Cx/window). 0xFFFF = unregistered.
     ///
-    /// **为什么需要**：`element_id_raw` 是 `{index:u24, generation:u8}`，
-    /// **不含任何 World 标识**，而每个 World 都从 index 0 开始分配，于是
-    /// 窗口 A 的 eid 0x8 与窗口 B 的 eid 0x8 完全无法区分，
-    /// `SlotMap.isValid` 只校验 index 范围 + generation，拿 A 的 id 去查 B 的
-    /// World 会**假匹配并返回错误数据**（core.zig 旧注释断言"id 不匹配则
-    /// isValid 保护"是错的）。
+    /// Why needed: `element_id_raw` is `{index:u24, generation:u8}` with **no World id** and each
+    /// World starts at index 0, so window A's eid 0x8 and window B's eid 0x8 are indistinguishable.
+    /// `SlotMap.isValid` checks only index range + generation, so querying World B with A's id
+    /// **false-matches and returns wrong data**.
     ///
-    /// 有了 owner 标识，Node↔World 的路由才能被校验（当前阶段）乃至完全
-    /// 摆脱进程级全局回调（后续阶段）。见 Zenit_P0-3_RootCause_2026-07-29.md。
+    /// With an owner id, Node<->World routing can be validated, or process-level global callbacks
+    /// shed entirely. See Zenit_P0-3_RootCause_2026-07-29.md.
     world_id: u16 = INVALID_WORLD_ID,
 
-    /// 本节点所属 World 的直接指针（null = 未注册，走 standalone fallback）。
+    /// this node owner World direct pointer (null = unregistered, fallback standalone).
     ///
-    /// P0-3 阶段 3：这是拆掉 19 个进程级全局回调（g_rect_query /
-    /// g_structure_notify / g_paint_* / g_content_* / g_layout_output_* …）的
-    /// 关键，有了它，Node 的属性访问可以直接 `node.world_ref.?.layout.rect(eid)`，
-    /// 不必再"用全局变量把 World 偷渡进来"。
-    /// 与 world_id 同时由 onNodeCreate 写入；world_id 保留用于**跨 Cx 串台断言**
-    /// （指针相等无法区分"同一个 World 被释放后地址复用"的情况）。
+    /// P0-3 stage 3: key to shedding 19 process-level global callbacks
+    /// (g_rect_query/g_structure_notify/g_paint_*/g_content_*/g_layout_output_*...), with it Node
+    /// property access can `node.world_ref.?.layout.rect(eid)` directly, no need to "smuggle World
+    /// via global". Written together with world_id by onNodeCreate; world_id kept for **cross-Cx
+    /// cross-talk assertion** (pointer equal can't distinguish "same World freed then address
+    /// reused").
     world_ref: ?*world_mod.World = null,
 
     children: std.ArrayList(*Node),
@@ -716,57 +745,58 @@ pub const Node = struct {
     deferred_disposal: @import("../reactive/deferred_disposal.zig").Entry = .{},
     pending_free_cx: ?*anyopaque = null,
     freeing: bool = false,
-    /// 生存哨兵：init 写 ALIVE，destroy 前写 DEAD。
+    /// Alive sentinel: init writes ALIVE, destroy writes DEAD before freeing.
     ///
-    /// 由来（交叉 review 二-2）：`freeing` 只能挡**同一次 teardown 内**的
-    /// 重入。真正的 double free（内存已还给 allocator、甚至已被复用）挡不住,
-    /// 更糟的是 Debug 下 Zig 会把释放后的内存写成 0xaa，于是 `freeing` 读出来是
-    /// true（0xaa ≠ 0），freeNodeNow 会**静默 early-return**，把一个可检测的
-    /// double free 变成无声的 no-op。
+    /// `freeing` only blocks re-entry **within the same teardown**. A real double free (memory
+    /// returned to the allocator, maybe reused) cannot be blocked, and Debug Zig writes 0xaa to
+    /// freed
+    /// memory so `freeing` reads true (0xaa != 0): freeNodeNow would **silently early-return**,
+    /// turning a detectable double free into a silent no-op.
     ///
-    /// 有了哨兵就能区分三种状态：ALIVE（正常）/ 本次 teardown 进行中（freeing=true
-    /// 且 alive_sentinel==ALIVE）/ 已释放（sentinel 既不是 ALIVE 也不是 DEAD，
-    /// 或正好是 DEAD），后两者都 panic 而不是装作没事。
+    /// The sentinel distinguishes three states: ALIVE (normal) / this teardown in progress
+    /// (freeing=true and alive_sentinel==ALIVE) / freed (sentinel neither ALIVE nor DEAD, or
+    /// exactly
+    /// DEAD). The latter two panic rather than pretend fine.
     ///
-    /// **结论的适用范围**（交叉 review 判据1/2：检测能力类结论必须带
-    /// 构建模式限定词，缺失性结论必须带覆盖数字）：
-    /// - 哨兵在**所有构建模式**下都存在（用 @panic 不用 assert）。
-    /// - 但它挡的那个「0xaa 让 freeing 读出 true 从而静默 no-op」形态是
-    ///   **Debug/ReleaseSafe 的 DebugAllocator 毒化行为**；ReleaseFast 下
-    ///   读到的是复用内存，哨兵可能假阴（复用成同类型且新 init 写回 ALIVE）。
-    ///   所以哨兵是**第一条皮带**，allocator 自身的 double-free 检测是第二条，
-    ///   两条都不能省。
-    /// - 实测覆盖：zenit test（Debug + ReleaseSafe）、下游编辑器两条 OOM sweep
-    ///   （2335 + 1178 个注入点，Debug + ReleaseSafe）全绿。
+    /// Scope (build-mode qualified):
+    /// - The sentinel exists in **all build modes** (uses @panic, not assert).
+    /// - The "0xaa makes freeing read true -> silent no-op" form is **Debug/ReleaseSafe
+    ///   DebugAllocator poison behavior**; in ReleaseFast reused memory may be read and the
+    ///   sentinel
+    ///   can false-negative (same type reused and a new init writes ALIVE). So the sentinel is the
+    ///   **first belt** and the allocator's own double-free detection the second; neither can be
+    ///   skipped.
+    /// - Coverage: zenit tests (Debug + ReleaseSafe) and downstream editor OOM sweeps (2335 + 1178
+    ///   injection points, Debug + ReleaseSafe) all pass.
     alive_sentinel: u32 = ALIVE_SENTINEL,
 
-    // visuals 字段已删，content (§a) + layout_output (§L)
-    // 全 SoA 化到 World (ContentTable / LayoutOutputTable)。Node 顶层 10->9。
+    // visuals field deleted, content (§a) + layout_output (§L) all SoA to World
+    // (ContentTable/LayoutOutputTable). Node top-level 10->9.
 
-    /// P-Node-SoA-6 (2026-05-02): rect + state_bits + frame_local 三合一。
+    /// P-Node-SoA-6 (2026-05-02): rect + state_bits + frame_local three-way.
     frame_state: NodeFrameState = .{},
 
-    /// P-Node-SoA-6 (2026-05-02): ownership + per_frame 合并。
+    /// P-Node-SoA-6 (2026-05-02): ownership + per_frame merge.
     meta: NodeMetadata = .{},
 
-    /// P-Node-SoA-5b: events + interaction 合并 -> behavior。
+    /// P-Node-SoA-5b: events + interaction merge -> behavior.
     behavior: NodeBehavior = .{},
 
-    /// 从全局 World 读 rect，失败回退 standalone fallback storage。
-    /// 给不带 cx 的 fn（computeStickyOffset / tickBeforeRender 等）用。
+    /// read rect from global World, fallback standalone fallback storage on fail. For cx-less
+    /// functions (computeStickyOffset/tickBeforeRender etc) use.
     pub fn rectFromWorldOrFallback(self: *const Node) ComputedRect {
         return node_lifecycle.rectFromWorldOrFallback(self);
     }
 
-    /// 组件层"自己改子节点 rect"的统一写入口。
-    /// 写入 World.LayoutTable + 维护 standalone fallback storage。
+    /// component-layer "change own child rect" unified write entry. Write World.LayoutTable +
+    /// maintain standalone fallback storage.
     pub fn setLayoutRect(self: *Node, r: ComputedRect) void {
         node_lifecycle.setLayoutRect(self, r);
     }
 
-    /// Partial setters, layout_engine 频繁做 partial updates；这些 helper 把
-    /// "read current -> modify -> setLayoutRect" 封装成单调用，让 layout 路径不
-    /// 直接写 frame_state.rect 字段，使得真删字段时改这里就行。
+    /// Partial setters, layout_engine frequent partial updates; helpers encapsulate "read current
+    /// -> modify -> setLayoutRect" single call, let layout path not directly write frame_state.rect
+    /// field, so when truly delete field change here.
     pub fn setLayoutW(self: *Node, w: f32) void {
         node_lifecycle.setLayoutW(self, w);
     }
@@ -783,21 +813,38 @@ pub const Node = struct {
         node_lifecycle.setLayoutY(self, y);
     }
 
-    /// v0.9-§a stage 3 (2026-05-13): NodeContent SoA, World.content 是 source of truth.
-    /// element_id_raw == 0xFFFFFFFF (mock test 不带 cx) 落 standalone fallback hashmap by node ptr.
-    // content accessor 路由全在 pca；这里只做
-    // element_id_raw + node_ptr 的薄转发（方法必须留 Node 容器内）。
+    /// v0.9-§a stage 3 (2026-05-13): NodeContent SoA, World.content is source of truth.
+    /// element_id_raw == 0xFFFFFFFF (mock test cx-less) fall standalone fallback hashmap by node
+    /// ptr.
+    // content accessor routing all in pca; here just thin forward element_id_raw + node_ptr
+    // (methods must stay Node container).
     /// Publishes text and invalidates measurement or paint as needed. Re-publish
     /// borrowed content/spans after mutating them; identical writes are inert.
     /// Ownership changes still reach the storage layer even when pixels match.
-    pub fn setText(self: *Node, t: ?TextProps) void {
+    pub fn setText(self: *Node, t_in: ?TextProps) void {
+        var t = t_in;
+        // ownership: explicit owned=true writer declare transfer; without declare but write back
+        // node already owned same content (getText -> change style fields -> setText) preserve
+        // ownership.
+        if (t) |*nt| {
+            if (self.getTextRaw()) |old| {
+                // pointer and length both same means write-back: original truncate (same pointer,
+                // shorter) if recover ownership, later free whole allocation wrong length; not
+                // recover worst case leak this block, not corrupt heap.
+                if (!nt.owned and old.owned and old.content.len > 0 and
+                    old.content.ptr == nt.content.ptr and old.content.len == nt.content.len) nt.owned = true;
+                if (!nt.spans_owned and old.spans_owned and old.spans.len > 0 and
+                    old.spans.ptr == nt.spans.ptr and old.spans.len == nt.spans.len) nt.spans_owned = true;
+            }
+        }
         const next = text_change.signature(t);
         const previous = self.meta.per_frame.caches.text_signature;
         pca.writeText(self.world_ref, self.element_id_raw, @intFromPtr(self), t);
-        // 子树 text 标志：非空文本置位并冒泡（保守不清位，见 NodeFlags 注释）。
+        // subtree text flag: non-empty setText set and bubble (the bit is never cleared, see
+        // NodeFlags note).
         if (t != null) node_interaction.markSubtreeText(self);
-        // 内容换了，按 (version, ptr, len) 记的 text hash 必须作废：等长换文本
-        // 时这三项可以全都不变（见 invalidateTextHashCache 的注释）。
+        // content changed, text hash by (version, ptr, len) record must invalid: same-length
+        // content swap these three can all unchanged (see invalidateTextHashCache note).
         node_render_cache.invalidateTextHashCache(self);
         self.meta.per_frame.caches.text_signature = next;
         if (next.layout != previous.layout) {
@@ -807,11 +854,12 @@ pub const Node = struct {
         }
     }
 
-    /// 便捷换文本：dupe 新内容并标记 owned，旧 owned 内容由 setText 自动释放。
-    /// 应用侧状态栏/标签类「同节点换文案」场景用这个即可，无需手工管理 owned 标记。
-    /// 换文本内容。内容真的变了才标脏：新内容的宽高要重新测量（也会重画），
-    /// 调用方不必再手动 markSizingDirty，漏掉它时文本按旧宽度排，更长的新内容
-    /// 会冲出父容器（通知卡片的「刚刚 -> 1 分钟前」就是这么溢出的）。
+    /// quick setText: dupe new content and mark owned, old owned content by setText auto-free.
+    /// App-side status bar/label "same node change text" use this, no hand-manage owned. Change
+    /// text content. Content really changed only dirty: new content width/height need re-measure
+    /// (also re-paint), caller no need hand markSizingDirty, miss it text layout by old width,
+    /// longer new content explodes parent (notification card "just now" -> "1 min ago" so
+    /// overflow).
     pub fn setTextContent(self: *Node, alloc: std.mem.Allocator, content: []const u8) !void {
         var t: TextProps = self.getText() orelse .{};
         const changed = !std.mem.eql(u8, t.content, content);
@@ -826,9 +874,9 @@ pub const Node = struct {
         pca.writeImage(self.world_ref, self.element_id_raw, @intFromPtr(self), img);
     }
 
-    /// 改图标着色，不关心存储形态：iconTint 对带 icon_id 的资源走 icon 表，
-    /// 无预烘焙 rep 的资源退回 image（svgTint），调用方各自只判一种时，另一种
-    /// 静默不变色（Rate hover 不变色即此）。两者都没有时返回 false。
+    /// change icon tint, don't care storage form: iconTint on icon_id resource go icon table, no
+    /// pre-baked rep fallback image (svgTint), caller when judge one type other silently unchanged
+    /// (Rate hover unchanged here). Both absent return false.
     pub fn setTint(self: *Node, tint: Color) bool {
         if (self.getIcon()) |old| {
             var ic = old;
@@ -847,7 +895,19 @@ pub const Node = struct {
         pca.writeIcon(self.world_ref, self.element_id_raw, @intFromPtr(self), ic);
     }
 
+    /// read text (value copy). Returned copy **no ownership** (`owned`/`spans_owned` always false):
+    /// ownership only writer declare fresh-allocate content, read-modify-write copy can't bring it
+    /// back - else caller change `.content` to own buffer then `setText`, node destroy will free
+    /// caller memory. Original write-back same pointer setText keep node original ownership.
     pub fn getText(self: *const Node) ?TextProps {
+        var t = pca.readText(self.world_ref, self.element_id_raw, @intFromPtr(self)) orelse return null;
+        t.owned = false;
+        t.spans_owned = false;
+        return t;
+    }
+
+    /// raw read with ownership flag, only for node cleanup/setText recover path.
+    pub fn getTextRaw(self: *const Node) ?TextProps {
         return pca.readText(self.world_ref, self.element_id_raw, @intFromPtr(self));
     }
 
@@ -859,9 +919,9 @@ pub const Node = struct {
         return pca.readIcon(self.world_ref, self.element_id_raw, @intFromPtr(self));
     }
 
-    // NodeLayoutOutput 字段已删 -> World.LayoutOutputTable
-    // 是 source of truth；cx-less mock 走 pca standalone heap pool。thin
-    // delegate 到 pca（element_id + node_ptr 两参，pca 内分流 World/standalone）。
+    // NodeLayoutOutput field deleted -> World.LayoutOutputTable is source of truth; cx-less mock
+    // use pca standalone heap pool. Thin delegate to pca (element_id + node_ptr two params, pca
+    // internal route World/standalone).
     pub fn getLayoutOutput(self: *const Node) NodeLayoutOutput {
         return pca.readLayoutOutput(self.world_ref, self.element_id_raw, @intFromPtr(self));
     }
@@ -870,9 +930,9 @@ pub const Node = struct {
         pca.writeLayoutOutput(self.world_ref, self.element_id_raw, @intFromPtr(self), v);
     }
 
-    /// 稳定地址：供 owner 方法原地改子字段 + display_list 指针逃逸 caller。
-    /// cx-backed 走 World slot（dense by element_id，帧内稳定）；cx-less
-    /// mock 走 pca standalone heap pool（地址永久稳定）。
+    /// stable address: owner method in-place change child field + display_list pointer escape
+    /// caller. cx-backed World slot (dense by element_id, frame stable); cx-less mock pca
+    /// standalone heap pool (permanent stable).
     pub fn layoutOutputPtr(self: *Node) ?*NodeLayoutOutput {
         return pca.layoutOutputPtr(self.world_ref, self.element_id_raw, @intFromPtr(self));
     }
@@ -898,9 +958,9 @@ pub const Node = struct {
     }
 
     pub fn addBeforeRender(self: *Node, hook: *const fn (*Node) void) void {
-        // 子树 hook 标志：置位并沿祖先冒泡（供 hasBeforeRenderHookSubtree O(1) 读）。
-        // 组件层还有大量 `before_render.main =` 直赋值不经过本函数，那些由
-        // tick.zig 的 tickBeforeRender 每次执行时折叠自愈（见其注释）。
+        // subtree hook flag: set and bubble ancestor (for hasBeforeRenderHookSubtree O(1) read).
+        // Component-layer lots `before_render.main =` direct assign not through function, those by
+        // tick.zig tickBeforeRender every run fold self-heal (see its note).
         node_interaction.markSubtreeBeforeRenderHook(self);
         if (self.meta.per_frame.hooks.before_render.main == hook) return;
         for (self.meta.per_frame.hooks.before_render.hooks[0..self.meta.per_frame.hooks.before_render.count]) |existing| {
@@ -940,12 +1000,12 @@ pub const Node = struct {
         node_interaction.setFocusScope(self, focus_scope);
     }
 
-    /// 见 `NodeInteraction.pointer_down_focus`。
+    /// see `NodeInteraction.pointer_down_focus`.
     pub fn setPointerDownFocus(self: *Node, policy: PointerDownFocus) void {
         node_interaction.setPointerDownFocus(self, policy);
     }
 
-    /// 沿 parent 链向上查找；self 是 ancestor 后代（含 self）返回 true。
+    /// walk up parent chain; self ancestor-descendant (incl self) return true.
     pub fn isDescendantOf(self: *Node, ancestor: *Node) bool {
         return node_tree.isDescendantOf(self, ancestor);
     }
@@ -954,13 +1014,18 @@ pub const Node = struct {
         return node_tree.appendChild(self, allocator, child);
     }
 
-    /// 使用现有子节点指针重排 children 顺序。
-    /// 不创建/销毁节点，不触发 runtime registry rebuild，只标记 order/layout dirty。
+    /// insert child before (before null append). before must be direct child.
+    pub fn insertChildBefore(self: *Node, allocator: Allocator, child: *Node, before: ?*Node) !void {
+        return node_tree.insertChildBefore(self, allocator, child, before);
+    }
+
+    /// re-order children order by existing child pointer. Don't create/destroy node, don't trigger
+    /// runtime registry rebuild, only mark order/layout dirty.
     pub fn replaceChildOrder(self: *Node, allocator: Allocator, ordered_children: []const *Node) !void {
         return node_tree.replaceChildOrder(self, allocator, ordered_children);
     }
 
-    /// 设置 custom_draw 回调并冒泡标记 has_custom_draw_subtree
+    /// set custom_draw callback and bubble mark has_custom_draw_subtree
     pub fn setCustomDraw(self: *Node, draw_fn: *const fn (DrawContext, ?*anyopaque) anyerror!void, draw_ctx: ?*anyopaque) void {
         node_interaction.setCustomDraw(self, draw_fn, draw_ctx);
     }
@@ -1013,31 +1078,32 @@ pub const Node = struct {
         return node_interaction.ensureCustomClipGeometry(self, allocator);
     }
 
-    /// 冒泡标记 has_custom_draw_subtree（子节点添加时调用）
-    // 升 pub, node_tree 经 self.markCustomDrawSubtree() 跨模块调
+    /// bubble mark has_custom_draw_subtree (on child add call)
+    // upgrade pub, node_tree cross-module call via self.markCustomDrawSubtree()
     pub fn markCustomDrawSubtree(self: *Node) void {
         node_interaction.markCustomDrawSubtree(self);
     }
 
-    /// 冒泡标记 has_text_subtree（setText 非空 / 子树添加时调用）
+    /// bubble mark has_text_subtree (setText non-empty/child add call)
     pub fn markSubtreeText(self: *Node) void {
         node_interaction.markSubtreeText(self);
     }
 
-    /// 冒泡标记 has_before_render_subtree（addBeforeRender / 子树添加时调用）
+    /// bubble mark has_before_render_subtree (addBeforeRender/child add call)
     pub fn markSubtreeBeforeRenderHook(self: *Node) void {
         node_interaction.markSubtreeBeforeRenderHook(self);
     }
 
-    /// 计算节点的全局绝对坐标（遍历祖先链累积 rect + translate + sticky）
+    /// compute node global absolute coordinates (walk ancestor chain accumulate rect + translate +
+    /// sticky)
     pub fn globalRect(self: *const Node) ComputedRect {
         return node_lifecycle.globalRect(self);
     }
 
-    // ==================== 可继承属性 resolve（向上遍历 parent 链） ====================
+    // ==================== inheritable property resolve (walk up parent chain) ====================
 
-    // 可继承属性 resolve 已析出到 node_inherit.zig（node.zig 里唯一的
-    // 向上遍历 + 零副作用读路径）。Node.InheritedTextStyle 路径保持不变。
+    // inheritable property resolve extracted to node_inherit.zig (node.zig only upwalk +
+    // zero-side-effect read path). Node.InheritedTextStyle path unchanged.
     pub const InheritedTextStyle = node_inherit.InheritedTextStyle;
 
     pub fn resolveInheritedTextStyle(self: *const Node) InheritedTextStyle {
@@ -1056,28 +1122,27 @@ pub const Node = struct {
         return node_inherit.resolveTextFontWeight(self);
     }
 
-    // ==================== 类型安全的 Style 修改 API ====================
+    // ==================== type-safe Style change API ====================
 
-    /// 给 DevTools 记录 builder / 具名样式函数的公共声明来源。来源表是 World
-    /// 上的稀疏调试数据，不扩 Node，也不在这里做昂贵的 debug-info 解析。
+    /// give DevTools record builder/named style function public declaration source. Source table
+    /// sparse debug data on World, don't expand Node, don't expensive debug-info parse here.
     pub fn recordStyleBaseOrigin(self: *Node, fields: u64, address: usize, kind: world_mod.StyleOriginKind) void {
         const w = self.world_ref orelse return;
         w.recordStyleBase(self.element_id_raw, fields, .{ .address = address, .kind = kind });
     }
 
-    /// 读取某字段的 last-writer；null field 用于尚未进入 StyleField 的
-    /// TextStyle.line_height 等属性，此时只查询公共来源。
+    /// read some field last-writer; null field for TextStyle.line_height etc unenter StyleField
+    /// yet, then query public source only.
     pub fn styleOrigin(self: *const Node, field: ?types.StyleField) ?world_mod.StyleOrigin {
         const w = self.world_ref orelse return null;
-        const field_index: ?u8 = if (field) |f| @intCast(@intFromEnum(f)) else null;
+        const field_index: ?u8 = if (field) |f| @intCast(@backingInt(f)) else null;
         return w.styleOrigin(self.element_id_raw, field_index);
     }
 
-    /// 设置单个 style 字段，编译时自动选择正确的标脏级别
-    /// 低频字段自动分配 StyleExt（需要提供 allocator）。
-    /// ext 字段 + 字面量 null -> 编译错误；ext 字段 + 运行时 null ->
-    /// debug assert + error 日志（曾经的静默跳过让下游 10 处 z_index 全部
-    /// 哑火且无任何信号，下游回归）。
+    /// set single style field, compile-time pick correct dirty level. Low-freq field auto-allocate
+    /// StyleExt (need provide allocator). ext field + literal null -> compile error; ext field +
+    /// runtime null -> debug assert + error log (prior silent skip let downstream 10 z_index all
+    /// mute no signal, downstream regression).
     pub fn setStyle(self: *Node, maybe_allocator: anytype, comptime field: types.StyleField, value: types.StyleFieldType(field)) void {
         const AllocArg = @TypeOf(maybe_allocator);
         if (comptime AllocArg != std.mem.Allocator and AllocArg != ?std.mem.Allocator and AllocArg != @TypeOf(null)) {
@@ -1086,7 +1151,7 @@ pub const Node = struct {
         if (comptime types.isExtField(field) and AllocArg == @TypeOf(null)) {
             @compileError("setStyle(." ++ @tagName(field) ++ ") 是 StyleExt 字段：allocator 传 null 会丢弃写入，必须传实际 allocator");
         }
-        // background/opacity 已不在 Style -> SoA Raw 写路径。
+        // background/opacity not in Style -> SoA raw write path.
         if (comptime field == .background) {
             self.setBackgroundRaw(value);
         } else if (comptime field == .opacity) {
@@ -1097,7 +1162,7 @@ pub const Node = struct {
                 const ext = self.style.ensureExtPanic(allocator);
                 @field(ext, @tagName(field)) = value;
             } else {
-                // 运行时 null：写入无法进行。曾静默跳过，现在必须可见。
+                // runtime null: write can't happen. Prior silent skip, now must visible.
                 std.log.err("setStyle(.{s}) 需要 allocator，写入被丢弃", .{@tagName(field)});
                 std.debug.assert(false);
                 return;
@@ -1106,7 +1171,7 @@ pub const Node = struct {
             @field(self.style, @tagName(field)) = value;
         }
         if (self.world_ref) |w| {
-            w.recordStyleField(self.element_id_raw, @intCast(@intFromEnum(field)), .{
+            w.recordStyleField(self.element_id_raw, @intCast(@backingInt(field)), .{
                 .address = @returnAddress(),
                 .kind = .set_style,
             });
@@ -1129,7 +1194,7 @@ pub const Node = struct {
         }
     }
 
-    /// 设置完整数值 margin，并清除已有的 auto margin 标记。
+    /// set full value margin, clear any auto margin mark.
     pub fn setMargin(self: *Node, margin: types.Padding) void {
         if (std.meta.eql(self.style.margin, margin) and self.style.marginAutoMask() == 0) return;
         self.style.margin = margin;
@@ -1137,14 +1202,14 @@ pub const Node = struct {
         self.markSizingDirty();
     }
 
-    /// 设置完整 margin 声明（支持 auto）。
+    /// set full margin declaration (support auto).
     pub fn setMarginSpec(self: *Node, allocator: Allocator, margin: types.Margin) void {
         if (types.Margin.eql(self.style.marginSpec(), margin)) return;
         self.style.setMarginSpec(allocator, margin);
         self.markSizingDirty();
     }
 
-    /// 设置 margin.left，并清除 left auto 标记。
+    /// set margin.left, clear left auto mark.
     pub fn setMarginLeft(self: *Node, value: f32) void {
         if (@abs(self.style.margin.left - value) < 0.001 and !self.style.marginLeftIsAuto()) return;
         self.style.margin.left = value;
@@ -1152,7 +1217,7 @@ pub const Node = struct {
         self.markSizingDirty();
     }
 
-    /// 设置 margin.top，并清除 top auto 标记。
+    /// set margin.top, clear top auto mark.
     pub fn setMarginTop(self: *Node, value: f32) void {
         if (@abs(self.style.margin.top - value) < 0.001 and !self.style.marginTopIsAuto()) return;
         self.style.margin.top = value;
@@ -1170,11 +1235,12 @@ pub const Node = struct {
         self.markLayoutDirty();
     }
 
-    /// 设置 border.color（如果配置了过渡则自动插值）
+    /// set border.color (auto interpolate if transition configured)
     pub fn setBorderColor(self: *Node, color: types.Color) void {
+        if (self.routeInlineStyle(.{ .border_color = color })) return;
         if (self.frame_state.frame_local.runtime.transitions) |slots| {
             if (slots.find(.border_color)) |slot| {
-                if (!types.Color.eql(color, slot.to_color)) {
+                if (!types.Color.eql(color, if (slot.active) slot.to_color else self.style.border.color)) {
                     slot.from_color = self.style.border.color;
                     slot.to_color = color;
                     slot.start_time_ms = render_engine.current_frame_time_ms;
@@ -1190,11 +1256,11 @@ pub const Node = struct {
         self.markRenderDirtyTracked(.border_change, "setBorderColor");
     }
 
-    /// 设置 border.width（如果配置了过渡则自动插值）
+    /// set border.width (auto interpolate if transition configured)
     pub fn setBorderWidth(self: *Node, width: f32) void {
         if (self.frame_state.frame_local.runtime.transitions) |slots| {
             if (slots.find(.border_width)) |slot| {
-                if (@abs(width - slot.to_value) > 0.01) {
+                if (@abs(width - (if (slot.active) slot.to_value else self.style.border.width)) > 0.01) {
                     slot.from_value = self.style.border.width;
                     slot.to_value = width;
                     slot.start_time_ms = render_engine.current_frame_time_ms;
@@ -1209,8 +1275,8 @@ pub const Node = struct {
         self.markLayoutDirty();
     }
 
-    /// 设置四边 border.color 覆盖（top, right, bottom, left）
-    /// 传 null 表示该边回退到 border.color
+    /// set four-edge border.color override (top, right, bottom, left). Pass null edge fallback to
+    /// border.color
     pub fn setBorderSideColors(
         self: *Node,
         allocator: Allocator,
@@ -1229,9 +1295,9 @@ pub const Node = struct {
         self.markRenderDirtyTracked(.border_change, "setBorderSideColors");
     }
 
-    // ==================== 声明式 Transition API ====================
+    // ==================== declarative Transition API ====================
 
-    /// 配置属性过渡（需要 allocator 分配 TransitionSlots）
+    /// configure property transition (need allocator allocate TransitionSlots)
     fn setTransition(self: *Node, allocator: Allocator, prop: types.TransitionProp, spec: types.TransitionSpec) void {
         if (self.frame_state.frame_local.runtime.transitions == null) {
             self.frame_state.frame_local.runtime.transitions = allocator.create(types.TransitionSlots) catch return;
@@ -1242,13 +1308,16 @@ pub const Node = struct {
         }
     }
 
-    /// 设置 background 颜色（如果配置了过渡则自动插值）
-    /// style.background 字段已删；source of truth 是
-    /// World.paint_state（element_id!=0xFFFFFFFF）或 standalone fallback（mock）。
+    /// Set background color (auto-interpolate if a transition is configured).
+    /// style.background field deleted; source of truth is World.paint_state
+    /// (element_id!=0xFFFFFFFF) or standalone fallback (mock).
     pub fn setBackground(self: *Node, color: types.Color) void {
+        if (self.routeInlineStyle(.{ .background = color })) return;
         if (self.frame_state.frame_local.runtime.transitions) |slots| {
             if (slots.find(.background)) |slot| {
-                if (!types.Color.eql(color, slot.to_color)) {
+                // idle compare current: slot built to_color default, not compare current, write
+                // same as current also start empty transition (mount time view apply like this)
+                if (!types.Color.eql(color, if (slot.active) slot.to_color else self.getBackground())) {
                     slot.from_color = self.getBackground();
                     slot.to_color = color;
                     slot.start_time_ms = render_engine.current_frame_time_ms;
@@ -1264,17 +1333,19 @@ pub const Node = struct {
         self.markRenderDirtyTracked(.background_change, "setBackground");
     }
 
-    /// 设置 opacity（如果配置了过渡则自动插值）
+    /// set opacity (auto interpolate if transition configured)
     pub fn setOpacity(self: *Node, value: f32) void {
+        if (self.routeInlineStyle(.{ .opacity = value })) return;
         if (self.frame_state.frame_local.runtime.transitions) |slots| {
             if (slots.find(.opacity)) |slot| {
-                if (@abs(value - slot.to_value) > 0.001) {
+                if (@abs(value - (if (slot.active) slot.to_value else self.getOpacity())) > 0.001) {
                     slot.from_value = self.getOpacity();
                     slot.to_value = value;
                     slot.start_time_ms = render_engine.current_frame_time_ms;
                     slot.active = true;
                     slots.any_active = true;
-                    // opacity 是 composite 属性：权威组合（四条写入路径收口的最后一处）。
+                    // opacity is composite property: authority composition (four write path
+                    // bottleneck last place).
                     self.markCompositePropDirty();
                 }
                 return;
@@ -1285,32 +1356,67 @@ pub const Node = struct {
         self.markCompositePropDirty();
     }
 
-    /// 无副作用 background 写入口。SoA 唯一写路径。
-    /// 不触发 transition / dirty / 去重。路由细节见 pca.writeBackground。
+    /// node has view style host, component imperative style write become host component inline
+    /// layer (overlay own style, lose caller stack, undo cascade back); no host return false,
+    /// caller direct write.
+    pub fn routeInlineStyle(self: *Node, partial: types.BoxStyle) bool {
+        const h = self.meta.per_frame.hooks.style_host orelse return false;
+        return h.write_inline(h.ptr, &partial);
+    }
+
+    /// imperative set style fields group (component inline style). With view style host go
+    /// component inline layer; else direct write to node
+    /// (background/opacity/border_color/translate_x via interpolate setter).
+    pub fn setStyleInline(self: *Node, allocator: std.mem.Allocator, partial: types.BoxStyle) void {
+        if (self.routeInlineStyle(partial)) return;
+        var rest = partial;
+        rest.background = null;
+        rest.opacity = null;
+        rest.border_color = null;
+        rest.translate_x = null;
+        rest.applyTo(&self.style, allocator);
+        if (partial.background) |c| self.setBackground(c);
+        if (partial.opacity) |o| self.setOpacity(o);
+        if (partial.border_color) |c| self.setBorderColor(c);
+        if (partial.translate_x) |x| self.setTranslateX(x);
+        self.markLayoutDirty();
+    }
+
+    /// strip prior setStyleInline/interpolate setter write component inline style (`fields`
+    /// non-null fields; value self ignore), let properties cascade back (own element
+    /// style/default). No view style host nothing to do.
+    pub fn unsetStyleInline(self: *Node, fields: types.BoxStyle) void {
+        const h = self.meta.per_frame.hooks.style_host orelse return;
+        h.unset_inline(h.ptr, &fields);
+    }
+
+    /// side-effect-free background write entry. SoA only write path. Don't trigger
+    /// transition/dirty/dedup. Route detail see pca.writeBackground.
     pub fn setBackgroundRaw(self: *Node, color: types.Color) void {
         pca.writeBackground(self.world_ref, self.element_id_raw, @intFromPtr(self), color);
     }
 
-    /// 无副作用 opacity 写入口。语义同 setBackgroundRaw。
+    /// side-effect-free opacity write entry. Semantics like setBackgroundRaw.
     pub fn setOpacityRaw(self: *Node, value: f32) void {
         pca.writeOpacity(self.world_ref, self.element_id_raw, @intFromPtr(self), value);
     }
 
-    /// style.background 字段已删，从 World.paint_state
-    /// (element_id!=0xFFFFFFFF) 或 standalone fallback (mock) 读。无数据时返回默认。
+    /// style.background field deleted, from World.paint_state (element_id!=0xFFFFFFFF) or
+    /// standalone fallback (mock) read. No data return default.
     pub fn getBackground(self: *const Node) types.Color {
         return pca.readBackground(self.world_ref, self.element_id_raw, @intFromPtr(self));
     }
 
-    /// 本节点连同子树不进入绘制：display:none，或完全透明且未要求透明时保持渲染。
-    /// 渲染 / tick 遍历里所有"跳过不可见子树"的判断都走这一个判据。
+    /// this node plus subtree no enter paint: display:none, or fully transparent and don't require
+    /// transparent render. All paint/tick traverse "skip invisible subtree" logic use this one
+    /// criterion.
     pub fn isPaintSkipped(self: *const Node) bool {
         if (self.style.display == .none) return true;
         return self.getOpacity() == 0 and !self.style.keep_rendering_when_transparent();
     }
 
-    /// 自身及所有祖先都不是 display:none（即"在渲染树里"）。焦点遍历 / 无障碍用它
-    /// 排除被隐藏子树里的节点。
+    /// self and all ancestor not display:none (i.e. "in paint tree"). Focus traverse/a11y use it
+    /// exclude hidden subtree nodes.
     pub fn isDisplayedInTree(self: *const Node) bool {
         var cur: ?*const Node = self;
         while (cur) |n| : (cur = n.parent) {
@@ -1319,7 +1425,7 @@ pub const Node = struct {
         return true;
     }
 
-    /// display 切换：会改变兄弟排布（占位 / gap），标脏自身与父节点布局并重绘。
+    /// display switch: change sibling layout (occupy/gap), mark self and parent layout re-draw.
     pub fn setDisplay(self: *Node, d: types.Display) void {
         if (self.style.display == d) return;
         self.style.display = d;
@@ -1333,18 +1439,42 @@ pub const Node = struct {
         return pca.readOpacity(self.world_ref, self.element_id_raw, @intFromPtr(self));
     }
 
-    /// 设置 translate_x（如果配置了过渡则自动插值）
+    /// set text color (auto interpolate if text_color transition configured). Non-text node ignore.
+    pub fn setTextColor(self: *Node, color: types.Color) void {
+        const cur = self.getText() orelse return;
+        if (self.frame_state.frame_local.runtime.transitions) |slots| {
+            if (slots.find(.text_color)) |slot| {
+                if (!types.Color.eql(color, if (slot.active) slot.to_color else cur.color)) {
+                    slot.from_color = cur.color;
+                    slot.to_color = color;
+                    slot.start_time_ms = render_engine.current_frame_time_ms;
+                    slot.active = true;
+                    slots.any_active = true;
+                    self.markRenderDirty();
+                }
+                return;
+            }
+        }
+        var tp = cur;
+        tp.color = color;
+        self.setText(tp);
+        self.markRenderDirty();
+    }
+
+    /// set translate_x (auto interpolate if transition configured)
     pub fn setTranslateX(self: *Node, value: f32) void {
+        if (self.routeInlineStyle(.{ .translate_x = value })) return;
         if (self.frame_state.frame_local.runtime.transitions) |slots| {
             if (slots.find(.translate_x)) |slot| {
-                if (@abs(value - slot.to_value) > 0.1) {
+                if (@abs(value - (if (slot.active) slot.to_value else self.style.translate_x)) > 0.1) {
                     slot.from_value = self.style.translate_x;
                     slot.to_value = value;
                     slot.start_time_ms = render_engine.current_frame_time_ms;
                     slot.active = true;
                     slots.any_active = true;
-                    // translate 是 composite 类属性：统一权威失效组合（interaction+
-                    // composite+cache 失效），与 transition tick / animator / hooks 一致。
+                    // translate is composite-type property: unified authority invalidation
+                    // composition (interaction + composite + cache invalid), match transition
+                    // tick/animator/hooks.
                     self.markCompositePropDirty();
                 }
                 return;
@@ -1354,11 +1484,11 @@ pub const Node = struct {
         self.markCompositePropDirty();
     }
 
-    /// 设置 rotate（如果配置了过渡则自动插值）
+    /// set rotate (auto interpolate if transition configured)
     pub fn setRotate(self: *Node, allocator: Allocator, value: f32) void {
         if (self.frame_state.frame_local.runtime.transitions) |slots| {
             if (slots.find(.rotate)) |slot| {
-                if (@abs(value - slot.to_value) > 0.001) {
+                if (@abs(value - (if (slot.active) slot.to_value else self.style.rotate())) > 0.001) {
                     slot.from_value = self.style.rotate();
                     slot.to_value = value;
                     slot.start_time_ms = render_engine.current_frame_time_ms;
@@ -1375,8 +1505,9 @@ pub const Node = struct {
         self.markCompositeDirty();
     }
 
-    /// 立即设值并同步 transition slot（**不**触发动画）：首帧定位/瞬移场景用。
-    /// 组件不得直接改写 slot 的 from/to_value（引擎内部状态），统一走这里。
+    /// immediate set value and sync transition slot (**don't** trigger animation): first-frame
+    /// position/teleport scene use. Component must not directly rewrite slot from/to_value (engine
+    /// private state), all via here.
     pub fn snapTransition(self: *Node, allocator: Allocator, prop: types.TransitionProp, value: f32) void {
         if (self.frame_state.frame_local.runtime.transitions) |slots| {
             if (slots.find(prop)) |slot| {
@@ -1418,7 +1549,7 @@ pub const Node = struct {
         }
     }
 
-    /// 设置 transform_origin（影响 scale/rotate 的基准点）
+    /// set transform_origin (affect scale/rotate baseline)
     pub fn setTransformOrigin(self: *Node, allocator: Allocator, value: types.TransformOrigin) void {
         const ext = self.style.ensureExtPanic(allocator);
         ext.transform_origin = value;
@@ -1426,14 +1557,14 @@ pub const Node = struct {
         self.markCompositeDirty();
     }
 
-    /// 设置 width（如果配置了过渡则自动插值）
+    /// set width (auto interpolate if transition configured)
     pub fn setWidth(self: *Node, value: f32) void {
         if (self.frame_state.frame_local.runtime.transitions) |slots| {
             if (slots.find(.width)) |slot| {
                 if (@abs(value - slot.to_value) > 0.1) {
                     const current = switch (self.style.width) {
                         .px => |v| v,
-                        else => self.rectFromWorldOrFallback().w, // 从 layout 结果取当前宽度
+                        else => self.rectFromWorldOrFallback().w, // from layout result take current width
                     };
                     slot.from_value = current;
                     slot.to_value = value;
@@ -1449,9 +1580,9 @@ pub const Node = struct {
         self.markLayoutDirty();
     }
 
-    /// 一次性为多个属性配置隐式动画过渡
-    /// 之后通过 setBackground/setOpacity/setBorderColor/setTranslateX/setTranslateY/setWidth
-    /// 修改属性时自动走过渡动画。
+    /// one-time configure implicit animation transition for multiple properties. Afterward change
+    /// via setBackground/setOpacity/setBorderColor/setTranslateX/setTranslateY/setWidth
+    /// auto-transition animate.
     pub fn enableImplicitAnimation(
         self: *Node,
         allocator: Allocator,
@@ -1463,11 +1594,12 @@ pub const Node = struct {
         }
     }
 
-    /// 应用 CSS 风格的 comptime transition 解析结果
+    /// Apply a CSS style's comptime transition parse result.
     ///
-    /// 用法:
+    /// usage:
     /// ```zig
-    /// node.applyTransition(allocator, comptime recipe.transition("background 200ms ease-out, opacity 150ms"));
+    /// node.applyTransition(allocator, comptime recipe.transition("background 200ms ease-out,
+    /// opacity 150ms"));
     /// ```
     pub fn applyTransition(self: *Node, allocator: Allocator, entries: []const recipe_mod.TransitionEntry) void {
         for (entries) |entry| {
@@ -1503,9 +1635,8 @@ pub const Node = struct {
         return active;
     }
 
-    // 15 dirty 方法实现整体搬到 node_dirty.zig。
-    // 以下为 thin delegate，保持原 pub/private 可见性 + node.zig 内
-    // self.markX() caller 零改（仍调本地 delegate）。
+    // 15 dirty methods impl moved to node_dirty.zig. Below thin delegate, keep original pub/private
+    // visibility + node.zig self.markX() caller zero change (still call local delegate).
     pub fn markLayoutDirty(self: *Node) void {
         node_dirty.markLayoutDirty(self);
     }
@@ -1524,14 +1655,14 @@ pub const Node = struct {
     pub fn markInteractionDirty(self: *Node) void {
         node_dirty.markInteractionDirty(self);
     }
-    // 升 pub, node_interaction 经 self.markHit*Dirty() 跨模块调
+    // upgrade pub, node_interaction cross-module call via self.markHit*Dirty()
     pub fn markHitSemanticsDirty(self: *Node) void {
         node_dirty.markHitSemanticsDirty(self);
     }
     pub fn markHitStructureDirty(self: *Node) void {
         node_dirty.markHitStructureDirty(self);
     }
-    // 升 pub, node_tree 经 self.bubbleChildRuntimeIndexDirty() 跨模块调
+    // upgrade pub, node_tree cross-module call via self.bubbleChildRuntimeIndexDirty()
     pub fn bubbleChildRuntimeIndexDirty(self: *Node, full_rebuild: bool) void {
         node_dirty.bubbleChildRuntimeIndexDirty(self, full_rebuild);
     }
@@ -1542,12 +1673,14 @@ pub const Node = struct {
         node_dirty.markCompositeDirty(self);
     }
 
-    /// composite 类属性（opacity/translate/scale/rotate）写入后的唯一权威失效组合。
+    /// composite property (opacity/translate/scale/rotate) write unique authority invalidation
+    /// composition.
     pub fn markCompositePropDirty(self: *Node) void {
         node_dirty.markCompositePropDirty(self);
     }
 
-    /// composite 属性逐帧动画驱动专用（不 bump content 版本，保 surface 复用）。
+    /// composite property per-frame animation drive (don't bump content version, keep surface
+    /// reuse).
     pub fn markCompositeAnimFrameDirty(self: *Node) void {
         node_dirty.markCompositeAnimFrameDirty(self);
     }
@@ -1583,9 +1716,21 @@ pub const Node = struct {
         self.meta.ownership.debug_slots.signal_count += 1;
     }
 
-    // 渲染缓存 6 方法 + TextHashSnapshot 抽到
-    // node_render_cache.zig。以下 thin delegate（buildCachedRenderSlice
-    // 原 static fn 已移为模块级 free function，不再在 Node 上暴露）。
+    pub fn removeDebugSignal(self: *Node, ptr: *anyopaque) void {
+        const slots = &self.meta.ownership.debug_slots;
+        var i: usize = 0;
+        while (i < slots.signal_count) {
+            if (slots.signals[i] != null and slots.signals[i].?.ptr == ptr) {
+                slots.signal_count -= 1;
+                std.mem.copyForwards(?DebugSignalRef, slots.signals[i..slots.signal_count], slots.signals[i + 1 .. slots.signal_count + 1]);
+                slots.signals[slots.signal_count] = null;
+            } else i += 1;
+        }
+    }
+
+    // render cache 6 methods + TextHashSnapshot extract to node_render_cache.zig. Below thin
+    // delegate (buildCachedRenderSlice former static fn now module-level free function, no longer
+    // expose on Node).
     pub const TextHashSnapshot = node_render_cache.TextHashSnapshot;
 
     pub fn cacheRenderCommands(self: *Node, allocator: Allocator, commands: []const DisplayItem, scroll_ox: f32, scroll_oy: f32) void {
@@ -1635,8 +1780,8 @@ pub const Node = struct {
         return node_render_cache.getOrComputeTextHashes(self, t);
     }
 
-    /// 从父节点移除子节点，递归触发 onCleanup。
-    /// 注意: 不释放 child 内存。调用者需手动 `cx.freeNode(child)` 释放。
+    /// remove child from parent, recursively trigger onCleanup. Note: don't free child memory.
+    /// Caller need hand `cx.freeNode(child)` free.
     pub fn removeChild(self: *Node, child: *Node) void {
         node_tree.removeChild(self, child);
     }
@@ -1649,22 +1794,22 @@ pub const Node = struct {
         node_tree.removeChildRetained(self, child);
     }
 
-    /// 保留模式: 递归销毁节点及其子树
+    /// retention mode: recursively destroy node and subtree
     ///
-    /// 注意: 不负责 dispose scope。Scope 的生命周期由 Scope 树管理
-    /// （父 Scope.dispose() 递归 dispose 子 Scope）。调用者应在 destroy
-    /// 之前先 dispose scope，再 clearNodeScopes 清除悬垂指针。
+    /// Note: don't dispose scope. Scope lifecycle managed by Scope tree (parent Scope.dispose()
+    /// recursive dispose child). Caller should dispose scope before destroy, then clearNodeScopes
+    /// clear stale ptr.
     pub fn destroy(self: *Node, allocator: Allocator) void {
         node_lifecycle.destroy(self, allocator);
     }
 
-    /// 移除所有子节点，递归触发 onCleanup。
-    /// 注意: 不释放子节点内存。调用者需对每个子节点手动 `cx.freeNode()` 释放。
+    /// remove all children, recursively trigger onCleanup. Note: don't free children memory. Caller
+    /// need hand `cx.freeNode()` each child free.
     pub fn removeAllChildren(self: *Node) void {
         node_tree.removeAllChildren(self);
     }
 
-    // 升 pub, node_interaction 跨模块调（生命周期 §N4 抽出随迁）
+    // upgrade pub, node_interaction cross-module call (lifecycle §N4 extract migrate)
     pub fn releasePathGeometry(self: *Node, allocator: Allocator) void {
         node_lifecycle.releasePathGeometry(self, allocator);
     }
@@ -1677,23 +1822,23 @@ pub const Node = struct {
         node_lifecycle.releaseCustomClipGeometry(self, allocator);
     }
 
-    /// freeNode 用，把节点持有的 path 堆内存（path /
-    /// stroke / custom_clip）经 World.layout_output slot 释放。必须在
-    /// elements.destroy 之前调（element_id 还有效，layoutOutputPtr 能拿到
-    /// slot；之后 slot 复用会脏）。语义同 §a freeNode 先 free owned text。
+    /// freeNode use, free node own path heap (path/stroke/custom_clip) via World.layout_output
+    /// slot. Must before elements.destroy call (element_id still valid, layoutOutputPtr can get
+    /// slot; after slot reuse will dirty). Semantics like §a freeNode free owned text first.
     pub fn releaseAllGeometry(self: *Node, allocator: Allocator) void {
         node_lifecycle.releaseAllGeometry(self, allocator);
     }
 
-    // 升 pub, node_dirty.zig 跨模块调（交互子域 Stage 3 抽出时随迁）
+    // upgrade pub, node_dirty.zig cross-module call (interaction sub-domain Stage 3 extract
+    // migrate)
     pub fn invalidateCustomClipGeometryCache(self: *Node) void {
         node_interaction.invalidateCustomClipGeometryCache(self);
     }
 };
 
-// fireMountIfNeeded / fireCleanupCallbacks / clearNodeScopes
-// 原即 file-scope free fn（非 Node 方法），整体搬到 node_lifecycle.zig。
-// 此处 re-export 保持公开 API（外部 core/control_flow/hooks 等调）。
+// fireMountIfNeeded/fireCleanupCallbacks/clearNodeScopes prior file-scope free fn (not Node
+// method), moved to node_lifecycle.zig. Re-export here keep public API (external
+// core/control_flow/hooks etc call).
 pub const fireMountIfNeeded = node_lifecycle.fireMountIfNeeded;
 pub const fireCleanupCallbacks = node_lifecycle.fireCleanupCallbacks;
 pub const clearNodeScopes = node_lifecycle.clearNodeScopes;

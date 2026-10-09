@@ -1,24 +1,25 @@
-/// Context，通用跨层级依赖注入
+/// Context: generic cross-layer dependency injection
 ///
-/// 基于 Scope 树向上查找，零额外分配（栈内 8 slot）。
+/// Searches up the Scope tree; zero extra allocation (8 stack slots).
 ///
-/// 用法:
+/// Usage:
 /// ```zig
-/// // 提供者
+/// // Provider
 /// const ThemeCtx = Context(*ThemeTokens);
 /// try ThemeCtx.provide(scope, &my_tokens);
 ///
-/// // 消费者（任意子 scope 中）
+/// // Consumer (in any child scope)
 /// const tokens = ThemeCtx.consume(scope) orelse &default_tokens;
 /// ```
 const std = @import("std");
 const Scope = @import("scope.zig").Scope;
 
-/// 生成类型唯一 ID。
+/// Generate unique type ID.
 ///
-/// 不能使用空泛型函数的地址：ReleaseFast 的 identical-code folding 会把
-/// 不同 `T` 的空函数合并到同一地址，导致 context 槽碰撞及错误类型指针转换。
-/// 每个泛型实例的可变静态 token 必须有独立、可观察的存储地址。
+/// Cannot use a generic function address: ReleaseFast's identical-code folding merges
+/// empty functions of different T to one address, colliding context slots and casting to
+/// the wrong pointer type. Each generic instance needs its own observable token storage
+/// address.
 fn typeId(comptime T: type) usize {
     const S = struct {
         var token: struct { type_marker: ?*T = null } = .{};
@@ -26,15 +27,15 @@ fn typeId(comptime T: type) usize {
     return @intFromPtr(&S.token);
 }
 
-/// 泛型 Context，通过类型参数自动选择不同的 slot
+/// Generic Context, auto-select slot by type parameter
 pub fn Context(comptime T: type) type {
     return struct {
-        /// 在当前 scope 注册一个 context 值
+        /// Register a context value in current scope
         pub fn provide(scope: *Scope, value: *T) !void {
             try scope.setContext(typeId(T), @ptrCast(value));
         }
 
-        /// 沿 parent 链向上查找最近的 context 值
+        /// Walk up parent chain to find nearest context value
         pub fn consume(scope: *Scope) ?*T {
             if (scope.getContext(typeId(T))) |ptr| {
                 return @ptrCast(@alignCast(ptr));
@@ -44,7 +45,7 @@ pub fn Context(comptime T: type) type {
     };
 }
 
-/// Scope 上下文条目（内联在 scope.zig 的 ContextSlot 中）
+/// Scope context entry (inlined in scope.zig's ContextSlot)
 pub const ContextSlot = struct {
     type_id: usize = 0,
     ptr: ?*anyopaque = null,

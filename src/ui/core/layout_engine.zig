@@ -21,37 +21,40 @@ const AlignItems = types.AlignItems;
 pub const max_layout_recursion_depth: usize = 128;
 pub var layout_depth_limit_hits: u64 = 0;
 
-/// 布局过程中 frame_allocator 分配失败的次数。
+/// Number of frame_allocator allocation failures during layout.
 ///
-/// 两个 >512 子节点的慢路径（flex_shrink 的 shrink_deltas、grid 的 placements）
-/// 在分配失败时都选择降级而不是崩，这和 `layout_depth_limit_hits` 是同一套
-/// 姿态。但降级的后果是**静默的错误布局**（收缩不生效 ⇒ 溢出；grid 直接不排
-/// 版），从画面上看不出是 OOM 还是布局写错了。计数器让它可诊断。
+/// The >512-children slow paths (shrink_deltas for flex_shrink, placements for grid) degrade on
+/// allocation failure instead of crashing, like `layout_depth_limit_hits`. Degrading yields
+/// **silently wrong layout** (shrink not applied => overflow; grid not laid out), so this counter
+/// makes OOM distinguishable from a layout bug.
 pub var layout_alloc_failure_hits: u64 = 0;
 var g_layout_recursion_depth: usize = 0;
 
-/// display:none，节点连同子树不参与布局（不占空间、不计 gap、不撑父容器）。
+/// display: none—node and subtree don't participate in layout (no space, gap excluded, no parent
+/// expansion).
 pub inline fn isDisplayNone(n: *const Node) bool {
     return n.style.display == .none;
 }
 
-/// 不参与 flex / grid 流式排布的子节点：absolute（单独定位）或 display:none。
-/// 布局引擎所有"跳过非流式子节点"的遍历都走这一个判据。
+/// Children that do not take part in flex / grid flow layout: absolute (positioned separately) or
+/// display:none.
+/// Every layout-engine traversal that skips non-flow children uses this single predicate.
 pub inline fn isOutOfFlow(n: *const Node) bool {
     return n.style.position == .absolute or isDisplayNone(n);
 }
 
-/// display:none 子树的布局收尾：自身尺寸归零（位置保留，computeChildrenBBox /
-/// 命中剪枝因 w/h = 0 自然排除），整棵子树清 layout 脏位，不清的话被隐藏子树
-/// 的脏位每帧都在，idle 停帧门控永远判"还有布局要做"。onMount 照常触发：节点
-/// 仍在树上（与卸载不同），只是不显示。
+/// Layout finalization for a display:none subtree: own size is zeroed (position is kept;
+/// computeChildrenBBox / hit-test pruning exclude it since w/h = 0) and the layout dirty bits of
+/// the whole subtree are cleared. Otherwise the hidden subtree stays dirty every frame and idle
+/// frame-gating always sees pending layout work. onMount still fires: the node is still in the
+/// tree (unlike unmount), just not displayed.
 fn collapseDisplayNone(node: *Node) void {
     const r = node.rectFromWorldOrFallback();
     if (r.w != 0 or r.h != 0) node.setLayoutRect(types.ComputedRect.init(r.x, r.y, 0, 0));
     settleHiddenSubtree(node, 0);
 }
 
-/// 递归（按深度而非宽度设上限，宽子树不会漏清脏位）。
+/// Recursion (depth limit, not width; wide subtrees won't miss dirty-bit clearing).
 fn settleHiddenSubtree(n: *Node, depth: usize) void {
     n.frame_state.state_bits.dirty.core.layout = false;
     n.frame_state.state_bits.dirty.core.subtree_layout = false;
@@ -82,16 +85,15 @@ fn releaseShapedFallbackFontRefs(glyphs: []const text_module.ShapedGlyph) void {
     }
 }
 
-// IntrinsicCache，同一节点同一 (axis, content_version) 的 intrinsic
-// 测量结果跨 calcIntrinsicSize 调用复用。
-// 当前 Node god-object 不便扩字段；用 (node.id, axis) -> 值的 hashmap，按
-// node.caches.versions.content 失效。
+// IntrinsicCache: reuses the intrinsic measurement for the same node and the same
+// (axis, content_version) across calcIntrinsicSize calls.
+// Keyed by a (node.id, axis) -> value hashmap, invalidated by node.caches.versions.content.
 //
-// 单线程模型（owner.assertThread 保证）下用静态变量；v0.2-P3 拆 Node 时迁到
-// LayoutTable 旁。
+// Uses a static variable under the single-threaded model (guaranteed by owner.assertThread);
+// move next to LayoutTable when Node is split.
 const IntrinsicCacheEntry = struct {
     value: f32,
-    /// 写入时的 content_version；命中要求当前 version 匹配
+    /// content_version at write time; hit requires current version match
     content_version: u32,
 };
 
@@ -100,10 +102,10 @@ var g_intrinsic_cache_refcount: u32 = 0;
 var g_intrinsic_cache_allocator: Allocator = undefined;
 
 fn intrinsicCacheKey(world_id: u16, node_id: u32, is_main_row: bool) u64 {
-    // key 必须含 world_id（2026-07-30 审查发现）：本表是进程级共享，而 node.id
-    // 是 per-Cx 计数器、两个窗口的 id 完全重叠，不混 world_id 的话，窗口 B
-    // 的节点会命中窗口 A 同 id 节点的 intrinsic 尺寸（content_version 也是
-    // per-node 小计数器，极易相等），布局直接串台。
+    // The key must include world_id: this table is process-wide, while node.id is a per-Cx counter
+    // and ids of two windows fully overlap. Without world_id, a node in window B would hit the
+    // intrinsic size of the same-id node in window A (content_version is also a small per-node
+    // counter and easily equal), mixing up layouts.
     return (@as(u64, world_id) << 33) | (@as(u64, node_id) << 1) |
         (if (is_main_row) @as(u64, 1) else 0);
 }
@@ -122,21 +124,21 @@ fn intrinsicCacheLookup(node: *const Node, is_main_row: bool) ?f32 {
 fn intrinsicCacheStore(node: *const Node, is_main_row: bool, value: f32) void {
     if (g_intrinsic_cache_refcount == 0) return;
     const key = intrinsicCacheKey(node.world_id, node.id, is_main_row);
-    // 安全降级：纯 memoization 缓存。写不进去只是下次重新测量，
-    // 结果完全相同（intrinsicCacheStore 无副作用）。
+    // Safe degradation: this is a pure memoization cache. A failed write only means re-measuring
+    // next time with an identical result (intrinsicCacheStore has no side effects).
     g_intrinsic_cache.put(g_intrinsic_cache_allocator, key, .{
         .value = value,
         .content_version = node.meta.per_frame.caches.versions.content,
     }) catch {};
 }
 
-/// 启用 intrinsic cache（refcount-based 多 Cx 嵌套安全）。
-/// 第一个 Cx.init 时 alloc + setup；后续 Cx.init 只 refcount++。
+/// Enable intrinsic cache (refcounted, safe for nested multi-Cx). The first Cx.init allocates and
+/// sets up; later Cx.init only does refcount++.
 ///
-/// ⚠️ 已知边界（2026-07-30 审查）：allocator 绑定**第一个** Cx 的。若两个 Cx
-/// 用不同 allocator 且先 init 的先 deinit（refcount 1->不释放表），后续 put 仍
-/// 用第一个的 allocator，那个 allocator 若已销毁即 UAF。App 场景两者都是
-/// 同一个 GPA 不触发；多 App 各持 allocator 时需把本表迁 per-Cx 才安全。
+/// Known edge: the allocator is bound to the **first** Cx. If two Cx use different allocators and
+/// the first-init Cx deinits first (refcount 1 -> no release), later puts still use the first
+/// allocator; if it is destroyed => UAF. Not triggered when all Cx share one GPA; multiple App
+/// each holding its own allocator need per-Cx table migration.
 pub fn enableIntrinsicCache(allocator: Allocator) void {
     if (g_intrinsic_cache_refcount == 0) {
         g_intrinsic_cache_allocator = allocator;
@@ -145,7 +147,7 @@ pub fn enableIntrinsicCache(allocator: Allocator) void {
     g_intrinsic_cache_refcount += 1;
 }
 
-/// 关闭 cache（refcount-- ；最后一个 Cx.deinit 时释放）。
+/// Disable cache (refcount--; last Cx.deinit releases).
 pub fn disableIntrinsicCache() void {
     if (g_intrinsic_cache_refcount == 0) return;
     g_intrinsic_cache_refcount -= 1;
@@ -155,66 +157,68 @@ pub fn disableIntrinsicCache() void {
     }
 }
 
-/// 布局上下文，传递帧级 allocator 给所有布局函数
-/// frame_allocator 在帧末自动清空，用于替代栈上固定大小数组
+/// Layout context, pass frame allocator to all layout functions.
+/// frame_allocator auto-clears at frame end, replaces fixed-size arrays on stack.
 pub const LayoutContext = struct {
     frame_allocator: Allocator,
-    /// 让 layout pass measureIntrinsicTextWidth 走 GlyphRun pipeline
-    /// 替代直调 measureTextWidthWithSpans。null 时降级到旧路径（兼容
-    /// 既有 layoutNode 测试 fixtures）。
+    /// Let layout pass measureIntrinsicTextWidth use GlyphRun pipeline, replaces
+    /// direct measureTextWidthWithSpans. null -> downgrade to old path (compat with
+    /// existing layoutNode test fixtures).
     shaping_cache: ?*shaping_cache_mod.ShapingCache = null,
     font_system: ?*text_module.FontSystem = null,
-    /// 父节点 flex_shrink 已把这个节点的某一轴定死（见 isShrinkableFit）：它自己
-    /// layoutChildren 末尾的 fit 回填不得再按子节点实际尺寸改这一轴，否则收缩被
-    /// 撑回内容高度、ScrollArea 永远滚不动。只对 == 该节点生效，孙节点读到也不匹配。
+    /// Parent flex_shrink pinned this node on one axis (see isShrinkableFit): its own
+    /// layoutChildren fit backfill end must not re-fit this axis per child actual size,
+    /// else shrink gets propped back to content height, ScrollArea never scrolls.
+    /// Only matches == this node, grandchild sees mismatch.
     frozen_node: ?*const Node = null,
     frozen_axis_is_width: bool = false,
 };
 
-/// CSS flex item 自动最小尺寸：overflow ≠ visible（这里是 overflow_hidden）的项
-/// 最小尺寸为 0，可以被压到内容以下；普通 fit 项最小尺寸就是内容本身。
+/// CSS flex item auto-min: overflow != visible (here overflow_hidden) items min
+/// size 0, can be squeezed below content; normal fit items min is content itself.
 fn isShrinkableFit(child: *const Node, is_row: bool) bool {
     const main_sizing = if (is_row) child.style.width else child.style.height;
     return main_sizing == .fit and child.style.overflow_hidden and child.style.flex_shrink > 0;
 }
 
-/// 快速计算 UTF-8 字符串的 Unicode 字符数（非字节数）
-/// 用于文本 intrinsic 尺寸估算
+/// Fast count Unicode chars (not bytes) in UTF-8 string.
+/// For text intrinsic estimate.
 fn countUtf8Chars(bytes: []const u8) usize {
     var count: usize = 0;
     var i: usize = 0;
     while (i < bytes.len) {
-        // UTF-8 续字节以 0b10xxxxxx 开头，只计数起始字节
+        // UTF-8 continuation bytes start 0b10xxxxxx, count heads only
         if (bytes[i] & 0xC0 != 0x80) count += 1;
         i += 1;
     }
     return count;
 }
 
-/// 融合 sizing 自带的 min/max 与节点 ext.min_X / ext.max_X，得到该轴最终生效的 (min, max)。
+/// Merge sizing's built-in min/max with node ext.min_X / ext.max_X into the effective (min,max)
+/// for this axis.
 ///
-/// 设计动机：以前 `style.height = .fit{.max=N}` 的 max 与 `ext.max_height` 是两条独立的 clamp 路径，
-/// row layout / grid 用 `style.max_height()` (= ext)，但 fit intrinsic 计算用的是 `fit.max`。
-/// 中间件（如 popover autosize）只更新一处时另一处不生效（小窗口 popup 撑爆是这个 bug）。
+/// Why: `style.height = .fit{.max=N}` and `ext.max_height` are two clamp paths; row layout/grid
+/// use `style.max_height()` (=ext), fit intrinsic uses `fit.max`. Middleware (e.g. popover
+/// autosize) updating only one leaves the other stale (small popup bursting oversized).
 ///
-/// 现在统一融合：
 ///   effective_min = max(sizing_mm.min, ext.min)
 ///   effective_max = min(sizing_mm.max, ext.max)
 ///
-/// 默认值（fit{}/grow{} 的 min=0,max=inf；ext 同款默认）下融合不变 -> 向后兼容。
+/// Defaults (fit{}/grow{} min=0,max=inf; ext same) merge unchanged.
 pub fn effectiveMinMax(sizing: Sizing, node: *const Node, comptime is_width: bool) struct { min: f32, max: f32 } {
     const ext_min: f32 = if (is_width) node.style.min_width() else node.style.min_height();
     const ext_max: f32 = if (is_width) node.style.max_width() else node.style.max_height();
     return switch (sizing) {
         .grow => |mm| .{ .min = @max(mm.min, ext_min), .max = @min(mm.max, ext_max) },
         .fit => |mm| .{ .min = @max(mm.min, ext_min), .max = @min(mm.max, ext_max) },
-        // px / percent 走 ext clamp（layout 后续会按 ext 再 clamp 一次，这里不重复）
+        // px / percent -> ext clamp (layout later reclamped by ext, no repeat here)
         else => .{ .min = ext_min, .max = ext_max },
     };
 }
 
-/// resolveSize 用于已知 child sizing + 容器可用空间 -> child 实际尺寸。
-/// **不**走 effectiveMinMax，调用方持有 child node 时直接用上面的 helper。
+/// resolveSize for known child sizing + container available space -> child
+/// actual size. **Not** effective_min_max, caller holding child node uses
+/// helper above directly.
 fn resolveSize(sizing: Sizing, available: f32, intrinsic: f32) f32 {
     return switch (sizing) {
         .px => |v| v,
@@ -225,31 +229,31 @@ fn resolveSize(sizing: Sizing, available: f32, intrinsic: f32) f32 {
 }
 
 fn measureIntrinsicTextWidth(t: types.TextProps) f32 {
-    // layout pass 入口 (layoutNode) 在 g_active_shaping_cache /
-    // g_active_font_system 设进 thread-local；measureIntrinsicTextWidth 这条
-    // calc-chain 没 ctx 参数，用 globals 替代。layoutNode 退出时清回 null。
+    // layout pass entry (layoutNode) sets thread-local
+    // g_active_shaping_cache / g_active_font_system; this measureIntrinsicTextWidth
+    // calc-chain has no ctx param, uses globals instead. layoutNode exit clears back.
     return measureIntrinsicTextWidthCtx(g_active_shaping_cache, g_active_font_system, t);
 }
 
 var g_active_shaping_cache: ?*shaping_cache_mod.ShapingCache = null;
 var g_active_font_system: ?*text_module.FontSystem = null;
 
-/// GlyphRun 管线的字体解析钩子。
+/// GlyphRun pipeline font-resolver hook.
 ///
-/// == 为什么不能只靠 FontSystem.findFont(family="system") ==
-/// findFont 是**按名字**查系统已安装字体。App 用 `loadFont(path)` 从文件
-/// 装进来的字体（Inter / Lora / JetBrains Mono 这类随仓库发布的）根本不在
-/// 系统字体库里，按名字查必然 miss 并静默回退到别的族，于是 shape 管线
-/// 与 renderer 用两套字体，同一段文本两个宽度。
-/// `setDefaultFamily("Inter")` 治不了这个：它只是把 "system" 换成 "Inter"
-/// 再去查系统库，Inter 没装照样 miss（实测把 1.442px 的偏差放大到 3.783px）。
+/// == Why not just FontSystem.findFont(family='system') ==
+/// findFont queries installed system fonts **by name**. An App using `loadFont(path)` (Inter /
+/// Lora / JetBrains Mono shipped with the repo) has fonts that exist nowhere in the system
+/// library; the by-name query misses and silently falls back to another family, so shaping and
+/// renderer use two fonts and the same text gets two widths.
+/// `setDefaultFamily('Inter')` does not fix this: it only replaces 'system' with 'Inter' in the
+/// system query, which still misses when Inter is not installed.
 ///
-/// 所以这里让 App 直接把**它自己那套 FontSelector 选出来的 `*Font`** 交回来，
-/// 与 renderer 走同一个选择逻辑，从根上保证「量的和画的是同一个字体对象」。
-/// 返回的 Font 由 App 持有，管线只借用不释放（与 findFont 的所有权相反，
-/// 见 shapeViaPipeline 里的 owned 分支）。
-/// `content` 必须传：渲染端的 CJK/韩文回退是按内容选的，解析器不看字节
-/// 就永远追不上渲染端（见 FontSelector.resolveFonts 的注释）。
+/// So the App hands back **its own FontSelector-picked `*Font`**, running the same picker logic,
+/// guaranteeing 'measured and drawn use the same Font object'. The returned Font is owned by the
+/// App; the pipeline borrows and never releases it (opposite of findFont, see the owned branch in
+/// shapeViaPipeline). `content` must be passed: render-side CJK/Korean fallback is picked by
+/// content, so a parser ignoring the bytes can never match render (see
+/// FontSelector.resolveFonts).
 pub const ShapeFontResolveFn = *const fn (
     ctx: *anyopaque,
     content: []const u8,
@@ -257,10 +261,10 @@ pub const ShapeFontResolveFn = *const fn (
     font_weight: u16,
     use_italic: bool,
     use_monospace: bool,
-    /// 字体族 id(render.FontRegistry)。0 = 默认族。
-    /// ⚠ 这个参数是「量的和画的是同一个字体」的一部分:渲染端 resolveFonts
-    ///   会按 family 选 face,测量端不传就会退回默认族，于是自定义字体的
-    ///   文本光标/选区系统性偏移(与历史上那次 2.758px 同款)。
+    /// Font family id (render.FontRegistry). 0 = default family.
+    /// Part of 'measured and drawn use the same font': render-side resolveFonts picks the face by
+    /// family; if measure omits it, it falls to the default family and custom-font text
+    /// cursor/selection are systematically offset.
     font_family: u16,
 ) ?*text_module.Font;
 
@@ -286,39 +290,58 @@ var g_shape_font_resolver_ctx: ?*anyopaque = null;
 var g_drawn_text_measure: ?DrawnTextMeasureFn = null;
 var g_drawn_text_measure_ctx: ?*anyopaque = null;
 var drawn_text_measure_debug_logged = false;
+var g_context_font_owner: ?*anyopaque = null;
 
-/// App 启动时装一次；传 null 卸载（回到 findFont 老路）。
+/// Load once app startup; pass null unload (revert to findFont old path).
 pub fn setShapeFontResolver(f: ?ShapeFontResolveFn, ctx: ?*anyopaque) void {
+    g_context_font_owner = null;
     g_shape_font_resolver = f;
     g_shape_font_resolver_ctx = ctx;
 }
 
 /// Borrow the host's default UI face; ownership stays with the host.
 pub fn resolveDefaultTextFont(text: []const u8, size: f32, weight: u16, italic: bool) ?*text_module.Font {
+    return resolveTextFont(text, size, weight, italic, false, 0);
+}
+
+pub fn resolveTextFont(text: []const u8, size: f32, weight: u16, italic: bool, mono: bool, family: u16) ?*text_module.Font {
     const resolve = g_shape_font_resolver orelse return null;
-    return resolve(g_shape_font_resolver_ctx orelse return null, text, size, weight, italic, false, 0);
+    return resolve(g_shape_font_resolver_ctx orelse return null, text, size, weight, italic, mono, family);
+}
+
+pub fn setContextFontHooks(owner: *anyopaque, resolve: ?ShapeFontResolveFn, measure: ?DrawnTextMeasureFn, ctx: ?*anyopaque) void {
+    setShapeFontResolver(resolve, ctx);
+    setDrawnTextMeasure(measure, ctx);
+    g_context_font_owner = owner;
+}
+
+pub fn clearContextFontHooks(owner: *anyopaque) void {
+    if (g_context_font_owner != owner) return;
+    setShapeFontResolver(null, null);
+    setDrawnTextMeasure(null, null);
 }
 
 /// Install the application's authoritative "width as drawn" callback.
 /// Passing null removes it and restores the internal shaping fallback.
 pub fn setDrawnTextMeasure(f: ?DrawnTextMeasureFn, ctx: ?*anyopaque) void {
+    g_context_font_owner = null;
     g_drawn_text_measure = f;
     g_drawn_text_measure_ctx = ctx;
 }
 
-/// 给 text_layout.measureProportional 注入式回调。
-/// pipeline 不可用时返 NaN，caller fallback 到 platform measure。
-/// 在 **layout 之外**(draw / overlay / 命中测试)临时装上同一套 GlyphRun
-/// 测量钩子,用完还原。
+/// Inject the hook into text_layout.measureProportional. GlyphRun pipeline unavailable -> NaN,
+/// caller falls back to platform measure.
 ///
-/// # 为什么必须有它
+/// Outside **layout** (draw/overlay/hit-test), temporarily mounts the same GlyphRun measure
+/// hook, then restores.
 ///
-/// 钩子平时只在 `layoutNode` 期间装着(见下方 setShapeMeasureFn 处的注释)。
-/// 于是同一段文字:布局期按 **shaping 宽度**算,而 overlay 期
-/// `measureProportional` 找不到钩子、降级到**平台 measure**。两条路径的
-/// 宽度不一致，表现就是选区高亮/光标与字形逐渐错位,越往行尾偏得越多。
+/// # Why it's required
 ///
-/// 调用方式(RAII 风格):
+/// Hooks only live during `layoutNode` (see setShapeMeasureFn below). Same text: **layout** uses
+/// shaping width, but overlay `measureProportional` finds no hook and falls to **platform
+/// measure**. The paths mismatch, so selection highlight/caret drift toward the line end.
+///
+/// Caller (RAII style):
 /// ```zig
 /// var guard = beginExternalShapeMeasure(cx);
 /// defer guard.end();
@@ -354,9 +377,9 @@ fn shapeMeasureBridge(text: []const u8, font_size: f32, font_weight: u16, use_it
     return shapeViaPipeline(g_active_shaping_cache, g_active_font_system, text, font_size, font_weight, use_italic, use_monospace, 0, false, 0) orelse std.math.nan(f32);
 }
 
-/// cx-aware variant, spans 空时走 GlyphRun pipeline (cache 命中
-/// 直接返回 total_advance)，否则降级到 measureTextWidthWithSpans 走旧 span
-/// 处理路径。完全切换需要 GlyphRun 支持 sub-range shape，是 phase D+ 工作。
+/// cx-aware variant, spans empty -> GlyphRun pipeline (cache hit direct return
+/// total_advance), else downgrade to measureTextWidthWithSpans old span path.
+/// Full switch needs GlyphRun sub-range shape, phase D+ work.
 fn measureIntrinsicTextWidthCtx(
     cache: ?*shaping_cache_mod.ShapingCache,
     fs: ?*text_module.FontSystem,
@@ -378,7 +401,7 @@ fn measureIntrinsicTextWidthCtx(
         );
         return layout.max_line_width;
     }
-    // 单行 measure 且无 spans -> GlyphRun pipeline fast path
+    // Single-line measure no spans -> GlyphRun pipeline fast path
     if (layout_spans.len == 0) {
         if (shapeViaPipeline(cache, fs, t.content, t.font_size, t.font_weight, t.use_italic_font, t.use_monospace_font, t.font_family, t.use_symbols_font, t.monospace_char_width)) |w| {
             return w;
@@ -396,12 +419,12 @@ fn measureIntrinsicTextWidthCtx(
     );
 }
 
-/// 内部 helper：从 layout_engine 走 GlyphRun pipeline 测一段文本宽度。
-/// 参考 cx.shapeText / measureSegmentWidthCtx 同款 ShapingKey schema。
-/// 失败 (FontLookupFailed / OOM) 返 null，caller 降级旧路径。
-/// Shape and measure through the same font resolver used by the renderer.
-/// Render-time rich-text chunk positioning also uses this entry point so it
-/// cannot silently fall back to a different family than layout/drawing.
+/// Internal helper: measure text width via the GlyphRun pipeline from layout_engine. Mirrors
+/// cx.shapeText / measureSegmentWidthCtx and uses the same ShapingKey schema.
+/// Fail (FontLookupFailed/OOM) -> null, caller falls back to the old path.
+/// Shapes and measures through the same font resolver used by the renderer. Render-time
+/// rich-text chunk positioning also uses this entry point so it cannot silently fall back to a
+/// different family than layout/drawing.
 pub fn shapeViaPipeline(
     cache_opt: ?*shaping_cache_mod.ShapingCache,
     fs_opt: ?*text_module.FontSystem,
@@ -422,7 +445,7 @@ pub fn shapeViaPipeline(
     if (g_drawn_text_measure) |measure| {
         if (g_drawn_text_measure_ctx) |ctx| {
             if (measure(ctx, text, font_size, font_weight, use_italic, use_monospace, font_family, use_symbols, monospace_char_width)) |width| {
-                if (!drawn_text_measure_debug_logged and std.posix.getenv("ZENIT_TEXT_MEASURE_IDENTITY_CHECK") != null) {
+                if (!drawn_text_measure_debug_logged and @import("zenit_environment").has("ZENIT_TEXT_MEASURE_IDENTITY_CHECK")) {
                     drawn_text_measure_debug_logged = true;
                     std.log.info("[text-measure-source] drawn-active", .{});
                 }
@@ -445,17 +468,18 @@ pub fn shapeViaPipeline(
     const key = shaping_cache_mod.ShapingKey{
         .text_hash = hasher.final(),
         .text_len = @intCast(text.len),
-        // family 必须进 key:换族要重新塑形,否则命中上一族的缓存。
+        // family must enter key: family change needs re-shape, else hit previous
+        // family cache.
         .font_id = (@as(u32, font_family) << 1) | (if (use_monospace) @as(u32, 1) else 0),
         .max_width = 0,
         .font_size = font_size,
     };
     if (cache.lookup(key)) |run| return run.total_advance;
 
-    // 优先问 App 的解析器：它返回 renderer 正在用的**同一个** *Font，
-    // 从而让 shape 管线（光标/选区/命中）与绘制走同一套度量。
-    // 拿不到才回落到按名字查系统字体（无 App 的裸 Cx / 单测走这条）。
-    // 所有权不同：resolver 借用（App 持有），findFont 是新建必须 deinit。
+    // Priority ask App's resolver: it returns renderer-running **same** *Font,
+    // let shape pipeline (caret/selection/hit) measure same as draw. Fallback
+    // by-name query system fonts (no App bare Cx / unit test goes this).
+    // Ownership differs: resolver borrow (App holds), findFont new -> must deinit.
     var owned_font: ?*text_module.Font = null;
     defer if (owned_font) |f| f.deinit();
     const font = blk: {
@@ -483,10 +507,11 @@ pub fn shapeViaPipeline(
     const run = text_shaper_adapter.fromShapedGlyphs(cache.allocator, shaped, metrics, .ltr) catch return null;
     defer cache.allocator.free(run.glyphs);
     defer cache.allocator.free(run.clusters);
-    // shaper 按 font 自己的 pixelSize 出 advance。resolver 可能给回一个
-    // 邻近字号的预载字体（FontSelector 只在差值超 epsilon 时才 derive），
-    // 此时必须按请求字号缩放，与 FontSelector.measureTextWidth 的
-    // `font_size / font.pixelSize()` 完全同式，两条路才对得上。
+    // Shaper per font's own pixelSize shapes advance. Resolver may return
+    // neighboring-size font preloaded (FontSelector only derives past epsilon),
+    // must scale to requested size, exactly same formula as
+    // FontSelector.measureTextWidth `font_size / font.pixelSize()`,
+    // both paths align.
     const font_px = font.pixelSize();
     const text_scale: f32 = if (font_px > 0) font_size / font_px else 1.0;
     const total = run.total_advance * text_scale;
@@ -539,14 +564,15 @@ test "shapeViaPipeline prefers the authoritative drawn-width callback" {
     try std.testing.expectEqual(@as(usize, 1), Bridge.calls);
 }
 
-/// 计算节点的 intrinsic 尺寸 (fit 模式用)
-/// 文本节点返回文本估算尺寸，容器节点递归累加子节点
+/// Calculate node intrinsic size (fit mode). Text nodes return text estimate,
+/// container nodes recursively sum children.
 fn calcIntrinsicSize(node: *Node, comptime is_main_row: bool) f32 {
-    // 子树布局脏 -> 后代尺寸可能已变，但本节点 content_version 不随后代变化，
-    // 缓存条目无法察觉，必须绕过缓存重算（修 stale intrinsic 布局 bug）。
+    // Subtree layout dirty -> offspring size may changed, but node
+    // content_version doesn't track offspring change; cache entry can't see;
+    // must bypass cache to recalc (fix stale intrinsic layout bug).
     const subtree_dirty = node.frame_state.state_bits.dirty.core.layout or
         node.frame_state.state_bits.dirty.core.subtree_layout;
-    // cache 查询（按 node.id + content_version）
+    // Cache lookup (by node.id + content_version)
     if (!subtree_dirty) {
         if (intrinsicCacheLookup(node, is_main_row)) |cached| return cached;
     }
@@ -560,10 +586,10 @@ fn calcIntrinsicSize(node: *Node, comptime is_main_row: bool) f32 {
 }
 
 fn calcIntrinsicSizeUncached(node: *Node, comptime is_main_row: bool) f32 {
-    // 文本节点：估算文本内容尺寸 + 节点自身 padding
+    // Text node: estimate text size + node self padding
     if (node.getText()) |t| {
         const pad = if (is_main_row) node.style.padding.horizontal() else node.style.padding.vertical();
-        // 多行文本：使用已计算的 text_layout
+        // Multi-line text: use computed text_layout
         if (t.wrap != .none) {
             if (node.getLayoutOutput().artifacts.text_layout) |tl| {
                 if (is_main_row) {
@@ -573,22 +599,22 @@ fn calcIntrinsicSizeUncached(node: *Node, comptime is_main_row: bool) f32 {
                 }
             }
         }
-        // 单行文本：优先使用精确测量，fallback 到估算
+        // Single-line text: prefer precise measure, fallback estimate
         const text_size = if (is_main_row) blk: {
             const measured = measureIntrinsicTextWidth(t);
             if (measured > 0) break :blk measured;
-            // fallback: 粗略估算
+            // fallback: rough estimate
             const char_count = countUtf8Chars(t.content);
             break :blk @as(f32, @floatFromInt(char_count)) * t.font_size * 0.6;
         } else t.font_size * t.line_height;
         return text_size + pad;
     }
 
-    // 容器节点：累加子节点主轴尺寸
+    // Container node: sum children main-axis
     if (node.children.items.len == 0) return 0;
 
     const pad = if (is_main_row) node.style.padding.horizontal() else node.style.padding.vertical();
-    // absolute 子节点不参与 intrinsic 计算（避免 overlay 影响布局）
+    // Absolute children don't participate in intrinsic (avoid overlay impact layout)
     var flow_count: usize = 0;
     for (node.children.items) |child| {
         if (child.style.position != .absolute) flow_count += 1;
@@ -602,9 +628,9 @@ fn calcIntrinsicSizeUncached(node: *Node, comptime is_main_row: bool) f32 {
 
     const child_is_row = node.style.direction.isRow();
 
-    // 主轴和交叉轴取决于容器自身的方向
+    // Main and cross axis depend on container's own direction
     if (child_is_row == is_main_row) {
-        // 同方向：累加子节点主轴
+        // Same direction: sum children main
         var total: f32 = 0;
         for (node.children.items) |child| {
             if (isOutOfFlow(child)) continue;
@@ -612,7 +638,7 @@ fn calcIntrinsicSizeUncached(node: *Node, comptime is_main_row: bool) f32 {
         }
         return total + gap_total + pad;
     } else {
-        // 交叉方向：取子节点最大值
+        // Cross direction: take max of children
         var max_size: f32 = 0;
         for (node.children.items) |child| {
             if (isOutOfFlow(child)) continue;
@@ -622,18 +648,19 @@ fn calcIntrinsicSizeUncached(node: *Node, comptime is_main_row: bool) f32 {
     }
 }
 
-/// 计算单个子节点的 intrinsic 主轴尺寸
-/// 注意: .grow 子节点在 .fit 父容器中没有可分配空间，
-/// 应回退到 intrinsic 尺寸计算（与 CSS flex-grow in fit-content 行为一致）
+/// Calculate single child intrinsic main-axis. Note: .grow child in .fit parent
+/// has no space to allocate, should fallback to intrinsic (matches CSS
+/// flex-grow in fit-content).
 fn calcChildIntrinsicSize(child: *Node, comptime is_main_row: bool) f32 {
     if (isOutOfFlow(child)) return 0;
-    // flex_basis > 0 时，作为 intrinsic 主轴尺寸（fit 父容器计算用）
+    // flex_basis > 0 -> intrinsic main-axis (fit parent compute use)
     if (child.style.flex_basis() > 0) return child.style.flex_basis();
     const sizing = if (is_main_row) child.style.width else child.style.height;
     return switch (sizing) {
         .px => |v| v,
-        // grow / fit 的 min/max 与 ext.min_X / ext.max_X 通过 effectiveMinMax 融合（统一 clamp 路径）。
-        // 否则 .fit{.max=N} 与 ext.max=M 不同步时一处生效一处不生效（小窗口 popup 撑爆 bug）。
+        // grow/fit min/max with ext.min_X/ext.max_X merged via effectiveMinMax
+        // (unified clamp). Else .fit{.max=N} and ext.max=M out-of-sync ->
+        // one works one doesn't (small popup bust-oversized bug).
         .grow, .fit => blk: {
             const mm = effectiveMinMax(sizing, child, is_main_row);
             break :blk std.math.clamp(calcIntrinsicSize(child, is_main_row), mm.min, mm.max);
@@ -651,8 +678,8 @@ const ResolvedAxisMargins = struct {
     end: f32,
 };
 
-/// 主轴尺寸：flex_basis / px / grow / fit / percent，统一减去 flex_shrink 的
-/// 收缩量。`is_row` 决定读 width 还是 height，这是 row/column 唯一的区别。
+/// Main size: flex_basis/px/grow/fit/percent, unified minus flex_shrink shrink.
+/// `is_row` pick width or height, only difference between row/column.
 fn resolveMainAxisSize(
     child: *Node,
     comptime is_row: bool,
@@ -663,21 +690,21 @@ fn resolveMainAxisSize(
     const sizing = if (is_row) child.style.width else child.style.height;
     const avail = if (is_row) available.width else available.height;
 
-    // flex_basis > 0 且非 grow 时，用 flex_basis 作为主轴尺寸
+    // flex_basis > 0 and non-grow -> use flex_basis as main
     if (child.style.flex_basis() > 0 and sizing != .grow) {
         return @max(0, child.style.flex_basis() - shrink_delta);
     }
     return @max(0, switch (sizing) {
         .px => |v| v - shrink_delta,
-        // grow 由 flex_unit 分配，不参与收缩（收缩只在 flex_total == 0 时计算）
+        // grow allocated per flex_unit, skips shrink (shrink only when flex_total==0)
         .grow => child.style.flex * flex_unit,
         .fit => calcIntrinsicSize(child, is_row) - shrink_delta,
         .percent => |p| avail * p / 100.0 - shrink_delta,
     });
 }
 
-/// 交叉轴尺寸：px / grow / fit / percent，外加 align stretch 的覆盖。
-/// 交叉轴不参与 flex_shrink。
+/// Cross size: px/grow/fit/percent, plus align-stretch override.
+/// Cross not participate in flex_shrink.
 fn resolveCrossAxisSize(
     child: *Node,
     comptime is_row: bool,
@@ -694,7 +721,8 @@ fn resolveCrossAxisSize(
         .fit => calcIntrinsicSize(child, !is_row),
         .percent => |p| avail * p / 100.0,
     };
-    // stretch 覆盖：只对内容驱动的尺寸（grow / fit）生效，px / percent 是显式尺寸
+    // stretch override: only applies to content-driven sizing (grow / fit); px / percent are
+    // explicit sizes
     if ((sizing == .grow or sizing == .fit) and cross_align == .stretch) {
         size = avail - margin_cross;
     }
@@ -720,14 +748,14 @@ fn resolveAxisMargins(
     return .{ .start = start_value, .end = end_value };
 }
 
-/// Measure 阶段：计算节点在给定约束下的精确 intrinsic size
+/// Measure phase: computes the node's precise intrinsic size under given constraints.
 ///
-/// 与 calcIntrinsicSize 的区别：
-/// - measureNode 在已知宽度时执行文本折行（解决"宽度决定高度"问题）
-/// - 结果更精确，用于 fit 容器消除回填
+/// Difference from calcIntrinsicSize:
+/// - measureNode wraps text once width is known (resolves "width determines height")
+/// - result is more precise, used to eliminate backfill in fit containers
 ///
-/// constraints.definite_width != null -> 文本可以折行，返回精确高度
-/// constraints.definite_width == null -> 返回最小 intrinsic 尺寸
+/// constraints.definite_width != null -> text can wrap, returns exact height
+/// constraints.definite_width == null -> returns minimum intrinsic size
 pub fn measureNode(node: *Node, constraints: types.LayoutConstraints) Size {
     if (!enterLayoutRecursion()) {
         return Size.init(
@@ -737,24 +765,24 @@ pub fn measureNode(node: *Node, constraints: types.LayoutConstraints) Size {
     }
     defer leaveLayoutRecursion();
 
-    // 文本节点
+    // text node
     if (node.getText()) |t| {
         const pad_w = node.style.padding.horizontal();
         const pad_h = node.style.padding.vertical();
 
-        // 宽度
+        // width
         const text_w = blk: {
             if (constraints.definite_width) |dw| {
                 break :blk dw;
             }
-            // intrinsic width: 精确测量
+            // intrinsic width: precise measurement
             const measured = measureIntrinsicTextWidth(t);
             if (measured > 0) break :blk measured + pad_w;
             const char_count = countUtf8Chars(t.content);
             break :blk @as(f32, @floatFromInt(char_count)) * t.font_size * 0.6 + pad_w;
         };
 
-        // 高度：有确切宽度时执行文本折行
+        // height: performs text wrapping with definite width
         const text_h = blk: {
             if (t.wrap != .none) {
                 const avail_w = if (constraints.definite_width) |dw|
@@ -765,7 +793,7 @@ pub fn measureNode(node: *Node, constraints: types.LayoutConstraints) Size {
                     0;
 
                 if (avail_w > 0) {
-                    // 执行折行计算
+                    // execute wrapping calculation
                     const tl = text_layout.computeTextLayout(
                         t.content,
                         avail_w,
@@ -778,12 +806,12 @@ pub fn measureNode(node: *Node, constraints: types.LayoutConstraints) Size {
                         t.use_monospace_font,
                         t.spans,
                     );
-                    // 缓存到 node 上，避免后续 layout 阶段重复计算
+                    // cache to node, avoiding redundant computation in subsequent layout phase
                     if (node.layoutOutputPtr()) |lo| lo.artifacts.text_layout = tl;
                     break :blk tl.total_height + pad_h;
                 }
             }
-            // 单行或无宽度约束
+            // single-line or no width constraint
             break :blk t.font_size * t.line_height + pad_h;
         };
 
@@ -793,7 +821,7 @@ pub fn measureNode(node: *Node, constraints: types.LayoutConstraints) Size {
         );
     }
 
-    // 容器节点：递归 measure 子节点
+    // container node: recursively measure children
     if (node.children.items.len == 0) {
         return Size.init(
             std.math.clamp(node.style.padding.horizontal(), constraints.min_width, constraints.max_width),
@@ -815,14 +843,14 @@ pub fn measureNode(node: *Node, constraints: types.LayoutConstraints) Size {
         const margin_main = if (is_row) child.style.marginHorizontal() else child.style.marginVertical();
         const margin_cross = if (is_row) child.style.marginVertical() else child.style.marginHorizontal();
 
-        // 子节点的 intrinsic size
+        // child's intrinsic size
         const child_main_sizing = if (is_row) child.style.width else child.style.height;
         const child_cross_sizing = if (is_row) child.style.height else child.style.width;
 
         const child_main: f32 = switch (child_main_sizing) {
             .px => |v| v + margin_main,
             .grow, .fit => blk: {
-                // 对 fit 子节点：如果有确切主轴尺寸约束，传递给子节点
+                // for fit children: if definite main-axis constraint exists, pass to child
                 const child_constraints = if (is_row)
                     types.LayoutConstraints{ .max_width = @max(@as(f32, 0), constraints.max_width - pad_w - margin_main) }
                 else
@@ -830,7 +858,7 @@ pub fn measureNode(node: *Node, constraints: types.LayoutConstraints) Size {
                 const child_size = measureNode(child, child_constraints);
                 break :blk (if (is_row) child_size.width else child_size.height) + margin_main;
             },
-            .percent => 0, // percent in intrinsic = auto (CSS 规范)
+            .percent => 0, // percent in intrinsic = auto (CSS spec)
         };
 
         const child_cross: f32 = switch (child_cross_sizing) {
@@ -867,16 +895,13 @@ pub fn layoutNode(node: *Node, available: Size, ctx: LayoutContext) void {
     if (!enterLayoutRecursion()) return;
     defer leaveLayoutRecursion();
 
-    // GlyphRun pipeline globals, measureIntrinsicTextWidth 这条
-    // calc-chain 没 ctx 参数，layout pass 入口 set/restore globals 让
-    // measureIntrinsicTextWidth 能走 cache。嵌套 layoutNode (递归 child)
-    // 时保存外层值，确保 unwind 时还原。
+    // GlyphRun pipeline globals: measureIntrinsicTextWidth's call chain has no ctx parameter, so
+    // the layout pass sets/restores globals at entry so it can use the cache.
+    // Outer values are saved across nested layoutNode (recursive child) so unwinding restores them.
     //
-    // 同时给 text_layout.measureProportional 安装
-    // shapeMeasureBridge 回调，让 *所有* legacy 测量路径
-    // (computeTextLayout / findLineBreak / measureSpanAware / textarea
-    // 直调 / input/text_utils 直调) 自动走 pipeline，无需改 caller。
-    // 嵌套 layoutNode 时 prev/restore 保护。
+    // Also installs shapeMeasureBridge as the text_layout.measureProportional callback, so *all*
+    // legacy measurement paths (computeTextLayout / findLineBreak / measureSpanAware / textarea
+    // direct / input/text_utils direct) use the pipeline without caller changes.
     const prev_cache = g_active_shaping_cache;
     const prev_fs = g_active_font_system;
     g_active_shaping_cache = ctx.shaping_cache;
@@ -885,18 +910,19 @@ pub fn layoutNode(node: *Node, available: Size, ctx: LayoutContext) void {
     defer {
         g_active_shaping_cache = prev_cache;
         g_active_font_system = prev_fs;
-        // 嵌套退出 / 顶层退出都还原；prev_cache=null 时 unset，否则保持 set
+        // unwind at nested exit or top-level exit; unset if prev_cache=null, otherwise keep set
         if (prev_cache == null and prev_fs == null) {
             text_layout.setShapeMeasureFn(null);
         }
     }
 
-    // layout_isolation debug assert: isolation 节点不能是 fit（否则内部变化影响外部尺寸）
+    // layout_isolation debug assert: isolation node cannot be fit (else internal changes affect
+    // outer sizing)
     if (node.style.layout_isolation) {
         std.debug.assert(node.style.width != .fit and node.style.height != .fit);
     }
 
-    // 只对根节点计算自身尺寸；子节点的尺寸由 layoutChildren 负责
+    // compute self-size only for root node; children's sizes are layoutChildren's responsibility
     if (node.parent == null) {
         const intrinsic_w = calcIntrinsicSize(node, true);
         const intrinsic_h = calcIntrinsicSize(node, false);
@@ -910,7 +936,7 @@ pub fn layoutNode(node: *Node, available: Size, ctx: LayoutContext) void {
 
     if (node.children.items.len > 0) {
         if (node.frame_state.state_bits.dirty.core.layout) {
-            // 当前节点脏 -> 全量布局子节点（flex 计算依赖兄弟关系）
+            // current node dirty -> full layout children (flex depends on sibling relations)
             const content_w = w - node.style.padding.horizontal();
             const content_h = h - node.style.padding.vertical();
             if (node.style.grid() != null) {
@@ -928,9 +954,10 @@ pub fn layoutNode(node: *Node, available: Size, ctx: LayoutContext) void {
             else
                 node.style.width == .fit;
 
-            // fit 容器不能只递归脏子树：它的自身尺寸依赖后代的实际布局结果。
-            // 典型场景是深层 wrap text 变高后，直接子节点只带 subtree_dirty，
-            // 若这里不 full layout，父容器会继续持有旧 rect，overflow_hidden 会把内容裁掉。
+            // fit containers cannot recurse only dirty subtree: their self-size depends on actual
+            // layout results of descendants.
+            // Typical scenario: wrapped text deepens, direct child only has subtree_dirty;
+            // skip full layout here -> parent keeps old rect, overflow_hidden clips content.
             if (own_main_fit or own_cross_fit) {
                 const content_w = w - node.style.padding.horizontal();
                 const content_h = h - node.style.padding.vertical();
@@ -940,10 +967,10 @@ pub fn layoutNode(node: *Node, available: Size, ctx: LayoutContext) void {
                     layoutChildren(node, Size.init(content_w, content_h), ctx);
                 }
             } else
-            // Grid 容器: 直接子节点 layout_dirty 时需 full relayout。
-            // Grid 的 track sizing（包括隐式 auto 行）依赖子节点尺寸，
-            // 且子节点位置由 auto-placement 决定（兄弟相关），
-            // 因此任何子节点脏都需要全量重算。
+            // Grid container: needs full relayout when direct child layout_dirty.
+            // Grid track sizing (including implicit auto rows) depends on child sizes,
+            // and child positions are determined by auto-placement (sibling-related),
+            // so any dirty child requires full recalculation.
             if (node.style.grid() != null) {
                 var need_full = false;
                 for (node.children.items) |child| {
@@ -965,9 +992,10 @@ pub fn layoutNode(node: *Node, available: Size, ctx: LayoutContext) void {
                 }
             } else {
                 const is_row = node.style.direction.isRow();
-                // 仅子树有脏节点 -> 检查是否有 flex 兄弟依赖
-                // 如果存在 grow 子节点，一个子节点的尺寸变化会影响其他 flex 兄弟的分配，
-                // 此时必须回退到全量重布局
+                // subtree has dirty nodes -> check for flex sibling dependency.
+                // If grow children exist, one child's size change affects flex allocation of other
+                // siblings,
+                // fallback to full relayout required.
                 var has_flex_children = false;
                 for (node.children.items) |child| {
                     if (isOutOfFlow(child)) continue;
@@ -979,8 +1007,10 @@ pub fn layoutNode(node: *Node, available: Size, ctx: LayoutContext) void {
                 }
 
                 if (has_flex_children) {
-                    // 优化：只有”直接子节点布局可能影响兄弟分配”时才全量布局。
-                    // 典型滚动场景只是深层 subtree_dirty（直接子节点尺寸不变），无需回退全量。
+                    // optimization: full layout only when "direct child layout may affect sibling
+                    // allocation".
+                    // Typical scroll scenario is only deep subtree_dirty (direct child size
+                    // unchanged), no fallback.
                     var must_full_layout = false;
                     for (node.children.items) |child| {
                         if (isOutOfFlow(child)) continue;
@@ -1002,14 +1032,14 @@ pub fn layoutNode(node: *Node, available: Size, ctx: LayoutContext) void {
                     } else {
                         for (node.children.items) |child| {
                             if (child.frame_state.state_bits.dirty.core.layout or child.frame_state.state_bits.dirty.core.subtree_layout) {
-                                // absolute 且自身 layout-dirty 的子节点必须走
-                                // layoutAbsoluteChild 重新 resolve 尺寸/定位：
-                                // 上面的 must_full_layout 判定有意跳过 absolute
-                                //（不影响 flow 兄弟），但 fallback 若只递归
-                                // layoutNode(child, 旧rect)，**首帧布局之后才
-                                // append 的 absolute 子节点 rect 恒为 0**,
-                                // 画布对象后挂的文字 label 因此永远不渲染
-                                //（下游应用 sticky 文本消失的根因）。
+                                // Absolute layout-dirty children must call layoutAbsoluteChild to
+                                // re-resolve size/position:
+                                // the must_full_layout path above intentionally skips absolute
+                                // children (they do not affect flow
+                                // siblings), but the fallback recursion layoutNode(child, old_rect)
+                                // leaves **absolute children
+                                // appended after the first layout with rect = 0**, so text labels
+                                // on canvas objects never render.
                                 if (isDisplayNone(child)) {
                                     collapseDisplayNone(child);
                                 } else if (child.style.position == .absolute and absoluteChildNeedsResolve(child)) {
@@ -1021,9 +1051,10 @@ pub fn layoutNode(node: *Node, available: Size, ctx: LayoutContext) void {
                         }
                     }
                 } else {
-                    // 无 flex 依赖时，若直接子节点 layout_dirty（尺寸/位置样式变化），
-                    // 仍需 full layout 才能更新该子节点在父容器内的 rect。
-                    // 仅递归 layoutNode(child) 不会重算 flow child 的 x/y/w/h。
+                    // without flex dependency: if direct child layout_dirty (size/position style
+                    // changed),
+                    // still need full layout to update that child's rect in parent.
+                    // Just recursing layoutNode(child) won't recalculate flow child x/y/w/h.
                     var must_full_layout = false;
                     for (node.children.items) |child| {
                         if (isOutOfFlow(child)) continue;
@@ -1045,14 +1076,14 @@ pub fn layoutNode(node: *Node, available: Size, ctx: LayoutContext) void {
                     } else {
                         for (node.children.items) |child| {
                             if (child.frame_state.state_bits.dirty.core.layout or child.frame_state.state_bits.dirty.core.subtree_layout) {
-                                // absolute 且自身 layout-dirty 的子节点必须走
-                                // layoutAbsoluteChild 重新 resolve 尺寸/定位：
-                                // 上面的 must_full_layout 判定有意跳过 absolute
-                                //（不影响 flow 兄弟），但 fallback 若只递归
-                                // layoutNode(child, 旧rect)，**首帧布局之后才
-                                // append 的 absolute 子节点 rect 恒为 0**,
-                                // 画布对象后挂的文字 label 因此永远不渲染
-                                //（下游应用 sticky 文本消失的根因）。
+                                // Absolute layout-dirty children must call layoutAbsoluteChild to
+                                // re-resolve size/position:
+                                // the must_full_layout path above intentionally skips absolute
+                                // children (they do not affect flow
+                                // siblings), but the fallback recursion layoutNode(child, old_rect)
+                                // leaves **absolute children
+                                // appended after the first layout with rect = 0**, so text labels
+                                // on canvas objects never render.
                                 if (isDisplayNone(child)) {
                                     collapseDisplayNone(child);
                                 } else if (child.style.position == .absolute and absoluteChildNeedsResolve(child)) {
@@ -1066,24 +1097,24 @@ pub fn layoutNode(node: *Node, available: Size, ctx: LayoutContext) void {
                 }
             }
         }
-        // 两者都 false -> 跳过整个子树（增量布局核心优化）
+        // both false -> skip entire subtree (core optimization for incremental layout)
     }
 
-    // layout 完成后：overflow_hidden 节点如果本次 layout_dirty（尺寸/位置可能变了），
-    // 必须 invalidate 渲染缓存 + 标脏渲染。
-    // 不做这一步会导致：
-    // 1. 旧缓存的 push_clip rect 和子节点坐标已过期 -> 复用错误缓存
-    // 2. 新 mount 首帧子节点未完全 layout -> 渲染+缓存了不完整内容 ->
-    //    后续帧 subtree_render_dirty 已清零 -> 复用不完整缓存 -> 部分内容永久丢失
-    // markRenderDirty 向上冒泡 subtree_render_dirty，确保祖先 overflow_hidden 容器
-    //（如 scroll_area）的缓存也被正确 invalidate。
+    // After layout: an overflow_hidden node that is layout_dirty this pass (size/position may have
+    // changed) must invalidate its render cache and be marked render dirty. Otherwise:
+    // 1. the old cache's push_clip rect and child coordinates are stale -> wrong cache reused
+    // 2. children mounted in the first frame, not fully laid out -> incomplete content is rendered
+    //    and
+    //    cached -> later subtree_render_dirty is cleared -> incomplete cache reused, content lost
+    // markRenderDirty bubbles subtree_render_dirty up, so ancestor overflow_hidden containers
+    // (e.g. scroll_area) caches are invalidated too.
     if (node.frame_state.state_bits.dirty.core.layout and node.style.overflow_hidden) {
         node.invalidateRenderCache();
         node.markRenderDirty();
     }
 
-    // 计算子节点包围盒（hitTest 剪枝用）
-    // 只在 layout_dirty 或 subtree_dirty 时重算，避免每帧冗余计算
+    // compute child bounding box (for hitTest culling)
+    // only recalculate on layout_dirty or subtree_dirty, avoid redundant per-frame computation
     if (node.frame_state.state_bits.dirty.core.layout or node.frame_state.state_bits.dirty.core.subtree_layout) {
         computeChildrenBBox(node);
     }
@@ -1091,13 +1122,14 @@ pub fn layoutNode(node: *Node, available: Size, ctx: LayoutContext) void {
     node.frame_state.state_bits.dirty.core.layout = false;
     node.frame_state.state_bits.dirty.core.subtree_layout = false;
 
-    // 触发 onMount 生命周期钩子（仅当前节点）。
-    // 子节点会在各自 layoutNode 调用末尾触发，避免每帧全树扫描。
+    // trigger onMount lifecycle hook (current node only).
+    // children fire in their own layoutNode call tail, avoiding full-tree scan per frame.
     node_mod.fireMountIfNeeded(node);
 }
 
-/// 计算子节点包围盒 union（相对于父坐标系，含 translate 偏移）
-/// hitTest 时先检查包围盒，不包含鼠标位置则跳过整个子树
+/// compute children's bounding box union (relative to parent coordinate system, includes translate
+/// offset)
+/// hitTest checks bbox first, skip entire subtree if mouse not in bbox
 fn computeChildrenBBox(node: *Node) void {
     const lo = node.layoutOutputPtr() orelse return;
     if (node.children.items.len == 0) {
@@ -1113,9 +1145,9 @@ fn computeChildrenBBox(node: *Node) void {
 
     for (node.children.items) |child| {
         if (child.getOpacity() == 0) continue;
-        // z>0 子节点同样计入：z_index 只影响同级顺序、不逃逸裁剪，它们和 z=0 一样
-        // 画在父节点的 opacity surface 里，必须撑大 surface 包围盒（geometry 用它
-        // 算 surface bounds），否则溢出父框的 z>0 子节点会被纹理边界截掉。
+        // z>0 children also count: z_index affects sibling order only, doesn't escape clipping,
+        // drawn in parent's opacity surface like z=0, must expand surface bbox (geometry uses it
+        // for surface bounds), else z>0 children overflow parent frame get clipped by texture edge.
         const cx = child.rectFromWorldOrFallback().x + child.style.translate_x + child.frame_state.frame_local.runtime.sticky.x;
         const cy = child.rectFromWorldOrFallback().y + child.style.translate_y + child.frame_state.frame_local.runtime.sticky.y;
         if (child.rectFromWorldOrFallback().w <= 0 or child.rectFromWorldOrFallback().h <= 0) continue;
@@ -1127,7 +1159,7 @@ fn computeChildrenBBox(node: *Node) void {
     }
 
     if (has_flow) {
-        // 包围盒添加少量 margin 容纳阴影/outline 溢出
+        // bbox adds margin to accommodate shadow/outline overflow
         const margin: f32 = 8;
         lo.artifacts.children_bbox = types.ComputedRect.init(
             min_x - margin,
@@ -1140,8 +1172,8 @@ fn computeChildrenBBox(node: *Node) void {
     }
 }
 
-/// 批量 reverse，镜像翻转直接子节点在主轴上的位置
-/// 相对坐标系下只需修改直接子节点的 rect，无需递归偏移后代 O(N)
+/// batch reverse: mirror-flip direct children's position on main axis,
+/// in relative coords only direct children's rect changes, no O(N) recursive descendant offset
 fn batchReverseChildren(
     children: []*Node,
     comptime is_row: bool,
@@ -1153,9 +1185,11 @@ fn batchReverseChildren(
         const child_size = if (is_row) child.rectFromWorldOrFallback().w else child.rectFromWorldOrFallback().h;
         const new_pos = main_start + (main_end - ((if (is_row) child.rectFromWorldOrFallback().x else child.rectFromWorldOrFallback().y) - main_start + child_size));
 
-        // 位置变了必须标脏：后代的世界坐标由祖先链累加得出，父节点挪了位置
-        // 而不标脏，整棵子树会带着过期坐标留到下一帧（命中测试、裁剪、合成
-        // 全部错位）。摆放循环里有同样的检查，这里此前漏了。
+        // position change must mark dirty: descendants' world coords accumulate from ancestor
+        // chain,
+        // parent moved but not marked dirty -> entire subtree carries stale coords to next frame
+        // (hit test, clipping, compositing all misaligned). layout loop has same check, missed
+        // here.
         const old_pos = if (is_row) child.rectFromWorldOrFallback().x else child.rectFromWorldOrFallback().y;
         if (old_pos != new_pos) {
             child.frame_state.state_bits.dirty.core.layout = true;
@@ -1168,18 +1202,18 @@ fn batchReverseChildren(
     }
 }
 
-/// 计算子节点在主轴上的尺寸（comptime 分支避免 runtime 调用 comptime 参数）
+/// compute child size on main axis (comptime branch avoids runtime comptime parameter call)
 fn calcChildMainSize(child: *Node, comptime is_row: bool, available: Size) f32 {
     const main_sizing = if (is_row) child.style.width else child.style.height;
     return switch (main_sizing) {
         .px => |v| v,
-        .grow => 0, // flex 子节点在 wrap 中按最小尺寸算
+        .grow => 0, // flex children in wrap use minimum size
         .fit => calcIntrinsicSize(child, is_row),
         .percent => |p| if (is_row) available.width * p / 100.0 else available.height * p / 100.0,
     };
 }
 
-/// 计算子节点在交叉轴上的尺寸
+/// compute child size on cross axis
 fn calcChildCrossSize(child: *Node, comptime is_row: bool, available: Size) f32 {
     const cross_sizing = if (is_row) child.style.height else child.style.width;
     const margin_cross = if (is_row) child.style.marginVertical() else child.style.marginHorizontal();
@@ -1194,8 +1228,8 @@ fn calcChildCrossSize(child: *Node, comptime is_row: bool, available: Size) f32 
     };
 }
 
-/// 计算子节点的 basis 尺寸（用于 flex_shrink 加权计算）
-/// flex_basis > 0 时返回 flex_basis，否则返回主轴实际尺寸
+/// compute child's basis size (for flex_shrink weighted calculation)
+/// flex_basis > 0 returns flex_basis, else returns main axis actual size
 fn childBasisSize(child: *Node, is_row: bool, available: Size) f32 {
     if (child.style.flex_basis() > 0) return child.style.flex_basis();
     const main_sizing = if (is_row) child.style.width else child.style.height;
@@ -1207,7 +1241,7 @@ fn childBasisSize(child: *Node, is_row: bool, available: Size) f32 {
     };
 }
 
-/// Flex wrap 布局：子节点溢出时自动换行
+/// flex wrap layout: children auto-wrap when overflowing
 fn layoutChildrenWrap(parent: *Node, available: Size, ctx: LayoutContext) void {
     if (parent.style.direction.isRow()) {
         layoutChildrenWrapImpl(parent, available, true, ctx);
@@ -1221,8 +1255,8 @@ fn layoutChildrenWrapImpl(parent: *Node, available: Size, comptime is_row: bool,
     const gap = style.gap;
     const main_available = if (is_row) available.width else available.height;
 
-    // Pass 1: 分行，当累计主轴尺寸超过可用空间时换行
-    // 用固定大小的行结构（从 64 扩到 256 支持大量 tag/badge wrap 布局）
+    // Pass 1: distribute into rows, wrap when accumulated main axis exceeds available space,
+    // use fixed-size row structure (expanded 64->256 to support large tag/badge wrap layouts)
     const max_lines = 256;
     var line_starts: [max_lines]usize = undefined;
     var line_ends: [max_lines]usize = undefined;
@@ -1243,7 +1277,7 @@ fn layoutChildrenWrapImpl(parent: *Node, available: Size, comptime is_row: bool,
         const needed = if (line_has_flow) child_main_outer + gap else child_main_outer;
 
         if (line_has_flow and line_main + needed > main_available and n_lines < max_lines) {
-            // 结束当前行
+            // end current row
             line_starts[n_lines] = line_start;
             line_ends[n_lines] = i;
             n_lines += 1;
@@ -1255,18 +1289,18 @@ fn layoutChildrenWrapImpl(parent: *Node, available: Size, comptime is_row: bool,
             line_has_flow = true;
         }
     }
-    // 最后一行
+    // last row
     if (n_lines < max_lines) {
         line_starts[n_lines] = line_start;
         line_ends[n_lines] = children.len;
         n_lines += 1;
     } else {
-        // 超过 max_lines 限制，将剩余子节点合并到最后一行
+        // exceeds max_lines limit, merge remaining children into last row
         line_ends[max_lines - 1] = children.len;
         std.log.warn("[layoutChildrenWrap] exceeded max_lines={d}, merging remaining children into last line", .{max_lines});
     }
 
-    // Pass 2: 计算每行的交叉轴高度（取该行最大子节点）
+    // Pass 2: compute each row's cross-axis height (take max child size in row)
     for (0..n_lines) |line_idx| {
         var max_cross: f32 = 0;
         for (children[line_starts[line_idx]..line_ends[line_idx]]) |child| {
@@ -1277,7 +1311,7 @@ fn layoutChildrenWrapImpl(parent: *Node, available: Size, comptime is_row: bool,
         line_cross_sizes[line_idx] = max_cross;
     }
 
-    // Pass 3: 布局每行
+    // Pass 3: layout each row
     const pad_main_start: f32 = if (is_row) style.padding.left else style.padding.top;
     const pad_cross_start: f32 = if (is_row) style.padding.top else style.padding.left;
     var cross_cursor: f32 = pad_cross_start;
@@ -1334,10 +1368,10 @@ fn layoutChildrenWrapImpl(parent: *Node, available: Size, comptime is_row: bool,
         cross_cursor += line_cross + gap;
     }
 
-    // fit 容器回填: wrap 后 cross axis 的实际尺寸 = 所有行高之和
+    // fit container backfill: wrap's actual cross-axis size = sum of all row heights
     if (n_lines > 0) {
         const pad_cross_end: f32 = if (is_row) style.padding.bottom else style.padding.right;
-        // cross_cursor 多加了一个 gap，减去后加 padding
+        // cross_cursor added extra gap, subtract it and add padding
         const total_cross = cross_cursor - gap + pad_cross_end;
         const cross_fit = if (is_row) style.height == .fit else style.width == .fit;
         if (cross_fit) {
@@ -1351,7 +1385,7 @@ fn layoutChildrenWrapImpl(parent: *Node, available: Size, comptime is_row: bool,
         }
     }
 
-    // Reverse: 主轴方向翻转（相对坐标，无需 parent.rect.x/y）
+    // reverse: flip main axis direction (relative coords, no parent.rect.x/y needed)
     if (style.direction.isReverse()) {
         const main_start = if (is_row) style.padding.left else style.padding.top;
         const main_end = if (is_row) parent.rectFromWorldOrFallback().w - style.padding.right else parent.rectFromWorldOrFallback().h - style.padding.bottom;
@@ -1366,7 +1400,7 @@ fn layoutChildrenWrapImpl(parent: *Node, available: Size, comptime is_row: bool,
         }
     }
 
-    // wrap_reverse: 交叉轴方向翻转行（相对坐标）
+    // wrap_reverse: flip row direction on cross axis (relative coords)
     if (style.flex_wrap() == .wrap_reverse) {
         const cross_start = if (is_row) style.padding.top else style.padding.left;
         const cross_end = if (is_row) parent.rectFromWorldOrFallback().h - style.padding.bottom else parent.rectFromWorldOrFallback().w - style.padding.right;
@@ -1382,23 +1416,28 @@ fn layoutChildrenWrapImpl(parent: *Node, available: Size, comptime is_row: bool,
     }
 }
 
-// fitResizeAfterLayout 函数已删除。
-// 等价逻辑在 layoutChildren 内 inline（搜 "fit_resize_block:"）。
-// 真消除回填需要 layoutNode 主签名换 LayoutInput + Constraint 向下传递，
-// 那是 v0.4-P1 后续 layoutNode 完整重写工作（继续 in v0.5）。
+// fitResizeAfterLayout function deleted.
+// Equivalent logic inlined in layoutChildren (search "fit_resize_block:").
+// True backfill elimination requires layoutNode signature change to LayoutInput + Constraint
+// downward passing,
+// that's v0.4-P1 later layoutNode complete rewrite work (continuing in v0.5).
 
-/// Absolute 子节点布局（支持 CSS inset 定位模型）
+/// Absolute child layout (supports the CSS inset positioning model)
 ///
-/// 定位优先级：inset > static-position-origin（margin 只参与外边距修正，不单独充当定位 API）
-/// - left + right 同时设定 -> width=grow 时拉伸填满两侧 inset 之间（CSS width:auto 的等价物）；
-///   px/percent/fit 仍按自身解析（fit = 内容固有尺寸，空 box 为 0），剩余空间交给 margin 分配
-/// - top + bottom 同时设定 -> 同理，height=grow 才拉伸
-/// - 只设一侧 -> 从该侧偏移，尺寸由 width/height 决定
-/// - 全 auto -> 退回到 containing block 起点作为 static position origin，再叠加 margin
-/// 增量布局里 absolute 子节点什么时候要重新 resolve 尺寸（而不是按旧 rect 只递归子树）：
-/// 自身 layout 脏；或者宽 / 高是 fit 且子树有布局变化，fit 尺寸取决于后代，按旧 rect
-/// 当可用空间排子节点时，可收缩的后代会被挤回旧尺寸，容器只缩不涨
-/// （Popover 下拉面板：列表行变多后高度不恢复，实测复现）。
+/// Positioning priority: inset > static-position-origin (margin only corrects, never positions)
+/// - left + right both set -> width=grow stretches to fill the inset gap (CSS width:auto);
+///   px/percent/fit still resolve themselves (fit = intrinsic size, empty box is 0), the rest
+///   goes to margin
+/// - top + bottom both set -> same, height=grow stretches
+/// - only one set -> offset from that side, size from width/height
+/// - all auto -> containing block origin as static position origin, stack margin
+///
+/// In incremental layout, an absolute child must re-resolve its size (instead of just recursing
+/// into the subtree with its old rect) when: its own layout is dirty; or its width/height is fit
+/// and the subtree has layout changes. A fit size depends on descendants; if children are laid out
+/// using the old rect as available space, shrinkable descendants get squeezed back to the old size
+/// and the container only shrinks, never grows (Popover dropdown: height does not recover after
+/// more rows are added).
 fn absoluteChildNeedsResolve(child: *const Node) bool {
     const bits = child.frame_state.state_bits.dirty.core;
     if (bits.layout) return true;
@@ -1406,16 +1445,17 @@ fn absoluteChildNeedsResolve(child: *const Node) bool {
     return child.style.width == .fit or child.style.height == .fit;
 }
 
-/// 确定宽度后为 wrap 文本节点计算/缓存折行（flex 与 absolute 两条布局路径
-/// 共用，absolute 定位的文本节点曾走不到折行计算，wrap 永远按单行渲染）。
-/// 返回折行总高（含垂直 padding），供 fit 高度使用；不适用时返回 null。
+/// compute/cache wrapped text line breaks after width is set (shared by flex and absolute layout
+/// paths,
+/// absolute-positioned text nodes previously skipped wrapping, wrap always rendered single-line).
+/// returns wrapped total height (with vertical padding), for fit height use; null if inapplicable.
 fn computeWrapTextLayoutForWidth(child: *Node, child_width: f32) ?f32 {
     const t = child.getText() orelse return null;
     if (t.wrap == .none) return null;
     const text_avail_w = child_width - child.style.padding.horizontal();
     if (text_avail_w <= 0) return null;
     const layout_spans = if (t.spans_affect_layout) t.spans else &.{};
-    // 缓存命中检查（layoutOutputPtr 给稳定地址，isCacheValid 收 *const）
+    // cache hit check (layoutOutputPtr gives stable address, isCacheValid takes *const)
     if (child.layoutOutputPtr()) |c_lo| {
         const need_recompute = if (c_lo.artifacts.text_layout) |*tl|
             !text_layout.isCacheValid(tl, t.content, text_avail_w, t.font_weight, t.font_size, t.use_italic_font, t.use_monospace_font, t.wrap, t.max_lines, layout_spans)
@@ -1460,7 +1500,7 @@ fn layoutAbsoluteChild(parent: *Node, child: *Node, ctx: LayoutContext) void {
     const cb_w = @max(@as(f32, 0), parent_rect.w);
     const cb_h = @max(@as(f32, 0), parent_rect.h);
 
-    // ── 水平轴 ──
+    // --- horizontal axis ---
     const left_val = inset.left.resolve(cb_w);
     const right_val = inset.right.resolve(cb_w);
 
@@ -1490,7 +1530,7 @@ fn layoutAbsoluteChild(parent: *Node, child: *Node, ctx: LayoutContext) void {
             new_x = left_val.? + resolved.start;
         }
     } else if (left_val) |lv| {
-        // 只有 left -> 从左侧偏移
+        // only left -> offset from left side
         child_width = switch (child.style.width) {
             .px => |v| v,
             .grow => |mm| std.math.clamp(cb_w - lv - margin.horizontal(), mm.min, mm.max),
@@ -1499,7 +1539,7 @@ fn layoutAbsoluteChild(parent: *Node, child: *Node, ctx: LayoutContext) void {
         };
         new_x = lv + (if (child.style.marginLeftIsAuto()) 0 else margin.left);
     } else if (right_val) |rv| {
-        // 只有 right -> 从右侧偏移
+        // only right -> offset from right side
         child_width = switch (child.style.width) {
             .px => |v| v,
             .grow => |mm| std.math.clamp(cb_w - rv - margin.horizontal(), mm.min, mm.max),
@@ -1508,7 +1548,7 @@ fn layoutAbsoluteChild(parent: *Node, child: *Node, ctx: LayoutContext) void {
         };
         new_x = cb_w - rv - (if (child.style.marginRightIsAuto()) 0 else margin.right) - child_width;
     } else {
-        // 无 inset -> 以 containing block 起点作为 static position origin，再应用 margin
+        // no inset -> use containing block origin as static position origin, apply margin
         child_width = switch (child.style.width) {
             .px => |v| v,
             .grow => |mm| std.math.clamp(@max(0, cb_w - margin.horizontal()), mm.min, mm.max),
@@ -1518,7 +1558,7 @@ fn layoutAbsoluteChild(parent: *Node, child: *Node, ctx: LayoutContext) void {
         new_x = if (child.style.marginLeftIsAuto()) 0 else margin.left;
     }
 
-    // ── 垂直轴 ──
+    // --- vertical axis ---
     const top_val = inset.top.resolve(cb_h);
     const bottom_val = inset.bottom.resolve(cb_h);
 
@@ -1564,7 +1604,7 @@ fn layoutAbsoluteChild(parent: *Node, child: *Node, ctx: LayoutContext) void {
         };
         new_y = cb_h - bv - (if (child.style.marginBottomIsAuto()) 0 else margin.bottom) - child_height;
     } else {
-        // 无 inset -> 以 containing block 起点作为 static position origin，再应用 margin
+        // no inset -> use containing block origin as static position origin, apply margin
         child_height = switch (child.style.height) {
             .px => |v| v,
             .grow => |mm| std.math.clamp(@max(0, cb_h - margin.vertical()), mm.min, mm.max),
@@ -1574,11 +1614,12 @@ fn layoutAbsoluteChild(parent: *Node, child: *Node, ctx: LayoutContext) void {
         new_y = if (child.style.marginTopIsAuto()) 0 else margin.top;
     }
 
-    // 独立 min/max 约束 clamp
+    // independent min/max constraint clamp
     child_width = std.math.clamp(child_width, child.style.min_width(), child.style.max_width());
     child_height = std.math.clamp(child_height, child.style.min_height(), child.style.max_height());
 
-    // 文本折行：absolute 文本节点同样要在定宽后断行（canvas 覆盖层 label 场景）
+    // text wrapping: absolute text nodes also wrap after definite width (canvas overlay label
+    // scenario)
     if (computeWrapTextLayoutForWidth(child, child_width)) |wrapped_h| {
         if (child.style.height == .fit) {
             child_height = std.math.clamp(wrapped_h, child.style.min_height(), child.style.max_height());
@@ -1596,9 +1637,10 @@ fn layoutAbsoluteChild(parent: *Node, child: *Node, ctx: LayoutContext) void {
     child.setLayoutH(child_height);
     layoutNode(child, Size.init(child_width, child_height), ctx);
 
-    // absolute + fit 高度修正：calcIntrinsicSize 阶段 text_layout 尚未生成，
-    // 导致 wrap text 的 fit 高度被低估为单行。layoutNode 完成后 text shaping
-    // 已执行，此时回读子节点实际内容高度并更新 child.rect.h。
+    // absolute + fit height correction: text_layout not generated during calcIntrinsicSize,
+    // causing wrapped text fit height underestimated as single-line.
+    // after layoutNode completes text shaping executes, re-read child's actual content height and
+    // update child.rect.h.
     if (child.style.height == .fit and top_val == null and bottom_val == null and child.children.items.len > 0) {
         var actual_content: f32 = 0;
         const child_is_row = child.style.direction.isRow();
@@ -1627,26 +1669,39 @@ fn layoutAbsoluteChild(parent: *Node, child: *Node, ctx: LayoutContext) void {
             child.setLayoutH(fit_h);
         }
     }
+
+    // anchor right / anchor bottom only: above calculated x / y before layout using pre-layout size
+    // (fit is pre-wrap single-line estimate); subtree layout's wrap backfill may change final size,
+    // re-anchor by final size, else bottom-right positioned panel overflows containing block
+    // (storybook GlassAdapt regular panel: bottom 20 but edge out 22 pt).
+    if (left_val == null) if (right_val) |rv| {
+        const x = cb_w - rv - (if (child.style.marginRightIsAuto()) 0 else margin.right) - child.rectFromWorldOrFallback().w;
+        if (x != new_x) child.setLayoutX(x);
+    };
+    if (top_val == null) if (bottom_val) |bv| {
+        const y = cb_h - bv - (if (child.style.marginBottomIsAuto()) 0 else margin.bottom) - child.rectFromWorldOrFallback().h;
+        if (y != new_y) child.setLayoutY(y);
+    };
 }
 
 fn layoutChildren(parent: *Node, available: Size, ctx: LayoutContext) void {
     const style = parent.style;
     const is_row = style.direction.isRow();
 
-    // Wrap 模式：分行布局
+    // wrap mode: row-by-row (line-broken) layout
     if (style.flex_wrap() != .no_wrap) {
         layoutChildrenWrap(parent, available, ctx);
         return;
     }
 
-    // Pass 1: 计算固定尺寸、flex 总量和 flow 子节点数
+    // pass 1: compute fixed sizes, flex total, and flow child count
     var used_space: f32 = 0;
     var flex_total: f32 = 0;
     var flow_count: usize = 0;
     var main_auto_margin_count: usize = 0;
 
     for (parent.children.items) |child| {
-        // absolute 子节点不参与 flow 布局
+        // absolute children don't participate in flow layout
         if (isOutOfFlow(child)) continue;
         flow_count += 1;
 
@@ -1660,23 +1715,25 @@ fn layoutChildren(parent: *Node, available: Size, ctx: LayoutContext) void {
         }
         const main_sizing = if (is_row) child.style.width else child.style.height;
 
-        // flex_basis > 0 时，用 flex_basis 替代 width/height 作为主轴尺寸贡献
+        // when flex_basis > 0, use flex_basis replacing width/height as main axis size contribution
         if (child.style.flex_basis() > 0 and main_sizing != .grow) {
             used_space += child.style.flex_basis() + margin_main;
         } else switch (main_sizing) {
             .px => |v| used_space += v + margin_main,
             .grow => {
                 flex_total += child.style.flex;
-                // grow 子节点自身不占 used_space（尺寸由 remaining 分配），但它的
-                // 主轴 margin 是实打实的固定开销，必须和 .px/.fit/.percent 一样计入，
-                // 否则 remaining 被高估，带 margin 的 flex 子节点会溢出父容器。
-                // auto margin 在 marginHorizontal/Vertical 里已按 0 计，不会和
-                // main_auto_margin_count 的分配重复。
+                // grow children's self-size doesn't take used_space (allocated from remaining),
+                // but their main-axis margin is real fixed cost, must count with .px/.fit/.percent,
+                // else remaining overestimated, flex children with margin overflow parent.
+                // auto margin already counted as 0 in marginHorizontal/Vertical, won't duplicate
+                // with main_auto_margin_count allocation.
                 used_space += margin_main;
             },
             .fit => {
-                // fit 的 intrinsic 只有在存在 flex 兄弟时才影响布局（用于计算 remaining）。
-                // 延迟到确认 flex_total > 0 后再补算，避免对大量 fit 子节点的冗余 intrinsic 计算。
+                // fit's intrinsic only affects layout when flex siblings exist (for computing
+                // remaining).
+                // defer until confirming flex_total > 0 to avoid redundant intrinsic calculation on
+                // many fit children.
                 used_space += margin_main;
             },
             .percent => |p| {
@@ -1686,9 +1743,11 @@ fn layoutChildren(parent: *Node, available: Size, ctx: LayoutContext) void {
         }
     }
 
-    // Gap: space_* 模式不使用 style.gap，由 justify 计算间距
-    // 注意：只排除主轴方向 .fit 的情况（fit 容器宽度由内容决定，无剩余空间可分配）
-    // .grow / .px / .percent 父容器都有确定的主轴尺寸，space_* 应该生效
+    // Gap: space_* modes do not use style.gap; spacing is computed from justify.
+    // Only exclude the case where the main axis is .fit (a fit container's size comes from its
+    // content,
+    // so there is no free space to distribute).
+    // Parents with .grow / .px / .percent have a definite main-axis size, so space_* should apply.
     const main_is_fit = if (is_row) style.width == .fit else style.height == .fit;
     const is_space_mode = !main_is_fit and
         flex_total == 0 and
@@ -1696,24 +1755,24 @@ fn layoutChildren(parent: *Node, available: Size, ctx: LayoutContext) void {
             style.justify == .space_around or
             style.justify == .space_evenly);
 
-    // fit 子节点的 intrinsic 只在需要精确 used_space 时才补算：
-    // - flex_total > 0: 需要 remaining 来分配 flex 空间
-    // - is_space_mode: 需要 remaining 来分配 justify 间距
-    // - justify == .center/.end: 需要精确 remaining 来计算偏移
-    // 对于最常见的 "所有子节点都是 fit/px，无 flex 无 justify" 场景，
-    // 完全跳过 calcIntrinsicSize，避免对 3000+ 子节点的冗余递归。
-    // - has_shrinkable_fit: flex_shrink 也要精确的 used_space。存在「可收缩的 fit 子节点」
-    //   时不补算，溢出量只剩 px 子节点之和，收缩整段不触发，fit + max 被夹住的容器
-    //  （popover chrome 被 autosize 限高）里 ScrollArea 容器仍按内容高度排，后面的
-    //   footer 被推出容器外，列表也滚不动（下游编辑器插入菜单，2026-09-28）。
-    //   「可收缩」按 CSS flex item 自动最小尺寸：overflow ≠ visible（这里是
-    //   overflow_hidden）的项最小尺寸为 0；普通 fit 项最小尺寸就是内容本身，
-    //   不因它补算，否则 ScrollArea 容器 -> content（普通 fit）这一层也会被当成
-    //   溢出去压，内容等于视口就再也滚不动了。收缩量的分配算法不变。
-    //   只在父节点主轴自己是 fit 时启用（fit 只可能因 max 上限而溢出）：px / grow 容器
-    //   尤其是「px 0 + overflow_hidden」这个到处在用的隐藏惯用法（Modal 关着的
-    //   barrier、showNode），依赖子节点在隐藏期保持内容尺寸，压成 0 会让 Quick Open
-    //   这类 Modal 重开后面板停在 0 高（native gate panel_infra 实测）。
+    // Fit children's intrinsic size is backfilled only when a precise used_space is needed:
+    // - flex_total > 0: need remaining for flex space
+    // - is_space_mode: need remaining for justify spacing
+    // - justify == .center/.end: need precise remaining for offset
+    // The common case "all children fit/px, no flex no justify" skips calcIntrinsicSize entirely,
+    // avoiding redundant recursion on 3000+ children.
+    // - has_shrinkable_fit: flex_shrink also needs a precise used_space. If "shrinkable fit
+    //   children" exist and backfill is skipped, the overflow sum counts only px children, shrink
+    //   never triggers, and in a fit + max boxed container (popover chrome with autosize-limited
+    //   height) ScrollArea lays out by content height: footer pushed out, list cannot scroll.
+    //   "Shrinkable" follows the CSS flex item auto minimum size: overflow != visible items have
+    //   min 0; normal fit items' min is their content, so they skip backfill, else ScrollArea ->
+    //   content (normal fit) would also count as overflow and content = viewport can no longer
+    //   scroll. Shrink amount allocation is unchanged.
+    //   Only enabled when the parent's main axis is itself fit (fit only overflows from a max
+    //   ceiling): px / grow containers, esp. the "px 0 + overflow_hidden" hiding pattern (Modal
+    //   closed barrier, showNode), rely on children keeping content size while hidden; squeezing
+    //   to 0 leaves a reopened Modal panel at 0 height (native gate panel_infra).
     var has_shrinkable_fit = false;
     if (main_is_fit) for (parent.children.items) |child| {
         if (isOutOfFlow(child)) continue;
@@ -1748,17 +1807,18 @@ fn layoutChildren(parent: *Node, available: Size, ctx: LayoutContext) void {
         used_space += gap_count * style.gap;
     }
 
-    // 剩余空间
+    // remaining space
     const main_available = if (is_row) available.width else available.height;
 
-    // flex_shrink: 当溢出且无 flex-grow 子节点时，按 CSS 加权收缩算法分配收缩量
-    // 快速路径: flow_count <= 512 用栈上数组；否则用 frame_allocator 动态分配
-    var shrink_stack: [512]f32 = [_]f32{0} ** 512;
+    // flex_shrink: when overflowing with no flex-grow children, distribute shrink amount by CSS
+    // weighted algorithm
+    // fast path: flow_count <= 512 use stack array; else allocate from frame_allocator
+    var shrink_stack: [512]f32 = @as([512]f32, @splat(0));
     const shrink_deltas: []f32 = if (flow_count <= 512)
         shrink_stack[0..flow_count]
     else blk: {
         const buf = ctx.frame_allocator.alloc(f32, flow_count) catch {
-            // 降级：shrink_deltas 为空 ⇒ 下面的 flex_shrink 整段跳过，溢出不收缩。
+            // degrade: shrink_deltas empty => skip flex_shrink entirely, no shrink on overflow.
             layout_alloc_failure_hits +|= 1;
             std.log.warn("[layoutChildren] shrink_deltas alloc failed (flow_count={d}), flex_shrink disabled for this node", .{flow_count});
             break :blk &[_]f32{};
@@ -1768,7 +1828,7 @@ fn layoutChildren(parent: *Node, available: Size, ctx: LayoutContext) void {
     };
     const overflow = used_space - main_available;
     if (overflow > 0 and flex_total == 0 and shrink_deltas.len > 0) {
-        // 计算加权总量: sum(basis_i * shrink_i)
+        // compute weighted sum: sum(basis_i * shrink_i)
         var weighted_total: f32 = 0;
         var idx: usize = 0;
         for (parent.children.items) |child| {
@@ -1788,16 +1848,18 @@ fn layoutChildren(parent: *Node, available: Size, ctx: LayoutContext) void {
                 shrink_deltas[idx] = (basis * child.style.flex_shrink / weighted_total) * overflow;
                 idx += 1;
             }
-            // 调整 used_space（收缩后不再溢出）
+            // adjust used_space (after shrink no longer overflows)
             used_space -= overflow;
         }
     }
 
-    // main-fit 容器的主轴最终尺寸由下方 fit 回填决定（= clamp(内容 + padding)），
-    // 与 main_available 可能不同（被祖先交叉轴 stretch 拉宽时）。justify / auto-margin
-    // 的剩余空间按预测的回填尺寸算，首轮就把子节点放在终态位置，避免每次全量布局
-    // 「先按拉伸宽摆 -> 回填后再挪回」来回翻转把子节点反复标脏。预测值只依赖
-    // intrinsic 估算；折行等导致的偏差由回填后的 repositionMainAxis 兜底。
+    // The main-fit container's final main-axis size is set by the backfill below
+    // (= clamp(content + padding)) and may differ from main_available (when an ancestor's
+    // cross-axis stretch made it wider). justify / auto-margin remaining space uses the predicted
+    // backfill size so the first pass places children in their final state, avoiding a
+    // "place by stretch width -> reposition after backfill" flip-flop that marks children dirty.
+    // The prediction depends only on the intrinsic estimate; deviations caused by text wrapping etc. are
+    // corrected by repositionMainAxis after backfill.
     const justify_main_available = if (main_is_fit and flex_total == 0 and needs_precise_remaining) blk: {
         const pad_main = if (is_row) style.padding.horizontal() else style.padding.vertical();
         const mm = if (is_row)
@@ -1813,14 +1875,14 @@ fn layoutChildren(parent: *Node, available: Size, ctx: LayoutContext) void {
     else
         0;
 
-    // Justify: 计算间距和起始偏移
+    // justify: compute spacing and start offset
     const pad_start: f32 = if (is_row) style.padding.left else style.padding.top;
 
     var justify_offset: f32 = 0;
     var justify_gap: f32 = style.gap;
 
     if (flex_total > 0 or main_auto_margin_count > 0) {
-        // 有 flex 子节点时，justify 不生效
+        // when flex children exist, justify doesn't apply
     } else if (is_space_mode) {
         switch (style.justify) {
             .space_between => {
@@ -1855,7 +1917,7 @@ fn layoutChildren(parent: *Node, available: Size, ctx: LayoutContext) void {
             collapseDisplayNone(child);
             continue;
         }
-        // absolute 子节点单独处理
+        // absolute children handled separately
         if (child.style.position == .absolute) {
             layoutAbsoluteChild(parent, child, ctx);
             continue;
@@ -1875,17 +1937,21 @@ fn layoutChildren(parent: *Node, available: Size, ctx: LayoutContext) void {
         var child_width: f32 = undefined;
         var child_height: f32 = undefined;
 
-        // 确定交叉轴对齐（align_self 优先于 align_items；no_cross_stretch 只降级继承的 stretch）
+        // determine cross-axis alignment (align_self priority over align_items; no_cross_stretch
+        // only downgrades inherited stretch)
         const cross_align = resolveCrossAlign(child, style.align_items);
 
-        // 获取当前子节点的 shrink delta
+        // get current child's shrink delta
         const cur_shrink_delta = if (shrink_idx < shrink_deltas.len) shrink_deltas[shrink_idx] else 0;
         shrink_idx += 1;
 
-        // 主轴/交叉轴各算一次。此前这里是一段逐字镜像的 if (is_row) / else
-        // 两边逻辑完全相同，只是 width↔height 互换，改一边忘另一边就是
-        // 一个只在 column 布局下复现的 bug。抽成按轴取参数的两个辅助函数后，
-        // 规则只有一份。
+        // main axis / cross axis each computed once. previously this was a block of
+        // character-for-character mirrored
+        // if (is_row) / else with identical logic on both sides, width<->height swapped, changing
+        // one side
+        // forgetting the other caused bug only in column layout. extract helper functions taking
+        // params by axis,
+        // rule exists in one place only.
         if (is_row) {
             child_width = resolveMainAxisSize(child, true, available, cur_shrink_delta, flex_unit);
             child_height = resolveCrossAxisSize(child, true, available, cross_align);
@@ -1894,32 +1960,37 @@ fn layoutChildren(parent: *Node, available: Size, ctx: LayoutContext) void {
             child_width = resolveCrossAxisSize(child, false, available, cross_align);
         }
 
-        // 独立 min/max 约束 clamp (CSS min-width/max-width/min-height/max-height)
-        // fit 还要带上 sizing 自带的 fit{.min,.max}（effectiveMinMax 的统一口径）：只看 ext
-        // 时 fit{.max=N} 要到子节点排完后的回填才生效，子节点是按未夹住的尺寸排的,
-        // 溢出算不出来、flex_shrink 不触发，px 兄弟被推出容器。grow 的 mm 另有语义，不动。
-        // （effectiveMinMax 对 px/percent 就是 ext；grow 用 px 占位退回 ext 口径）
+        // Independent min/max constraint clamp (CSS min-width/max-width/min-height/max-height).
+        // fit also includes sizing's own fit{.min,.max} (effectiveMinMax is the uniform basis):
+        // looking
+        // only at ext fails because fit{.max=N} takes effect only after children backfill; children
+        // are
+        // placed at unboxed size, overflow cannot be computed, flex_shrink never triggers and px
+        // siblings get pushed out.
+        // grow's mm has different semantics, unchanged.
+        // (effectiveMinMax for px/percent is just ext; grow uses a px placeholder and reverts to
+        // ext)
         const mm_w = effectiveMinMax(if (child.style.width == .grow) Sizing{ .px = 0 } else child.style.width, child, true);
         const mm_h = effectiveMinMax(if (child.style.height == .grow) Sizing{ .px = 0 } else child.style.height, child, false);
         child_width = std.math.clamp(child_width, mm_w.min, mm_w.max);
         child_height = std.math.clamp(child_height, mm_h.min, mm_h.max);
 
-        // aspect_ratio 约束：宽度已知后推算高度（如图片节点）
+        // aspect_ratio constraint: infer height from definite width (e.g. image node)
         if (child.style.aspect_ratio() > 0 and child_width > 0) {
             const ar = child.style.aspect_ratio();
-            // 只在 height 不是固定 px 时生效（px 高度优先）
+            // only applies when height not fixed px (px height priority)
             if (child.style.height != .px) {
                 child_height = child_width / ar;
             }
         }
 
-        // 文本折行: 确定宽度后计算断行
+        // text wrapping: compute line breaks after width fixed
         if (computeWrapTextLayoutForWidth(child, child_width)) |wrapped_h| {
-            // fit height: 用折行后的总高度
+            // fit height: use post-wrap total height
             if (child.style.height == .fit) child_height = wrapped_h;
         }
 
-        // 位置（先记录旧值，用于后续检测是否需要标脏）
+        // position (record old value first, for later marking dirty if changed)
         const old_child_x = child.rectFromWorldOrFallback().x;
         const old_child_y = child.rectFromWorldOrFallback().y;
         if (is_row) {
@@ -1956,7 +2027,7 @@ fn layoutChildren(parent: *Node, available: Size, ctx: LayoutContext) void {
             cursor += child_height + resolved_main_margins.start + resolved_main_margins.end + justify_gap;
         }
 
-        // 尺寸或位置变化时标脏，确保子节点递归重新布局
+        // mark dirty on size or position change, ensure children recurse relayout
         if (child.rectFromWorldOrFallback().w != child_width or child.rectFromWorldOrFallback().h != child_height or
             child.rectFromWorldOrFallback().x != old_child_x or child.rectFromWorldOrFallback().y != old_child_y)
         {
@@ -1965,15 +2036,17 @@ fn layoutChildren(parent: *Node, available: Size, ctx: LayoutContext) void {
         child.setLayoutW(child_width);
         child.setLayoutH(child_height);
 
-        // 被 flex_shrink 压过的可收缩 fit 项：主轴尺寸由这里定死，告诉它自己的回填别撑回去
+        // shrinkable fit item pushed by flex_shrink: main axis size locked here, tell backfill not
+        // to stretch back
         var child_ctx = ctx;
         const main_frozen = cur_shrink_delta > 0 and isShrinkableFit(child, is_row);
         child_ctx.frozen_node = if (main_frozen) child else null;
         child_ctx.frozen_axis_is_width = is_row;
         layoutNode(child, Size.init(child_width, child_height), child_ctx);
 
-        // 文本折行回填修正: layoutNode 内部可能因子树含 wrap 文本而回填了 child 的尺寸,
-        // 此时 cursor 需要按实际尺寸差值补偿，否则后续兄弟节点位置错误。
+        // text wrap backfill correction: layoutNode internally may backfill child size due to
+        // wrapped text in subtree,
+        // cursor needs compensate by actual size delta, else later sibling positions wrong.
         if (is_row) {
             const actual_w = child.rectFromWorldOrFallback().w;
             if (actual_w != child_width) {
@@ -1987,19 +2060,44 @@ fn layoutChildren(parent: *Node, available: Size, ctx: LayoutContext) void {
         }
     }
 
-    // 文本折行后回填: 父容器 fit 尺寸需要根据子节点实际尺寸更新
-    // （文本折行在子节点 layoutNode 中才计算，calcIntrinsicSize 阶段 text_layout 还是 null）
+    // Text wrap backfill: the parent's fit size must be updated from the child's actual size
+    // (text wrap is computed inside child layoutNode; text_layout is still null during
+    // calcIntrinsicSize).
     //
-    // 原 fitResizeAfterLayout 函数已 inline 至此处。
-    // 真正的"消除回填"需要 layoutNode 主签名换 LayoutInput + Constraint 向下传递，
-    // 那是 layoutNode 完整重写工作量；当前 inline 仅为 v0.4-P1 deletion gate
-    // 让 fitResizeAfterLayout 符号 grep 不到。等价行为完全保留。
+    // True "backfill elimination" needs layoutNode to take LayoutInput + Constraint passed down,
+    // which is a full layoutNode rewrite; this inline version preserves the old
+    // fitResizeAfterLayout behavior exactly.
     fit_resize_block: {
         const pstyle_fit = parent.style;
-        const main_fit = if (is_row) pstyle_fit.width == .fit else pstyle_fit.height == .fit;
-        const cross_fit = if (is_row) pstyle_fit.height == .fit else pstyle_fit.width == .fit;
+        // when grow-axis ancestor on same axis is fit, grow has no allocable remaining, final size
+        // is content size:
+        // backfill by child actual size too—but only grow, never shrink (see w_grow_only below).
+        // else fit > grow > ... > wrapped-text chain: wrap deepens inner layer, grow stops at
+        // pre-wrap single-line height,
+        // fit ancestor sums it—whole chain undersized (GlassBox root fit -> surface grow -> content
+        // fit case,
+        // wrapped body overflows glass lower edge). ancestor has fixed size don't touch: grow
+        // should allocate by assigned space
+        // (scroll areas depend on this).
+        const gp_w_fit = if (parent.parent) |gp| gp.style.width == .fit else false;
+        const gp_h_fit = if (parent.parent) |gp| gp.style.height == .fit else false;
+        const w_fit = pstyle_fit.width == .fit or (pstyle_fit.width == .grow and gp_w_fit);
+        const h_fit = pstyle_fit.height == .fit or (pstyle_fit.height == .grow and gp_h_fit);
+        const main_fit = if (is_row) w_fit else h_fit;
+        const cross_fit = if (is_row) h_fit else w_fit;
+        // grow axis grow-only: cross-axis stretched grow node (panel in fit row / divider) backfill
+        // by self content shrinks first,
+        // this function's final alignment pass places children by shrunken size (center offset
+        // becomes 0);
+        // fit ancestor re-stretches it but won't re-layout children -> content aligned edge
+        // (storybook GlassBox Materials
+        // one row left-shifted 24 pt, tested).
+        const w_grow_only = pstyle_fit.width == .grow;
+        const h_grow_only = pstyle_fit.height == .grow;
+        const cur_w = parent.rectFromWorldOrFallback().w;
+        const cur_h = parent.rectFromWorldOrFallback().h;
         if (!main_fit and !cross_fit) break :fit_resize_block;
-        // 父节点 flex_shrink 定死的那一轴不回填（见 LayoutContext.frozen_node）
+        // parent flex_shrink locked this axis not backfill (see LayoutContext.frozen_node)
         const frozen_here = ctx.frozen_node == parent;
         const skip_w = frozen_here and ctx.frozen_axis_is_width;
         const skip_h = frozen_here and !ctx.frozen_axis_is_width;
@@ -2021,23 +2119,28 @@ fn layoutChildren(parent: *Node, available: Size, ctx: LayoutContext) void {
             const new_main = actual_main + (if (is_row) pstyle_fit.padding.horizontal() else pstyle_fit.padding.vertical());
             if (is_row) {
                 const mm = effectiveMinMax(pstyle_fit.width, parent, true);
-                if (!skip_w) parent.setLayoutW(std.math.clamp(new_main, mm.min, mm.max));
+                const v = std.math.clamp(new_main, mm.min, mm.max);
+                if (!skip_w) parent.setLayoutW(if (w_grow_only) @max(cur_w, v) else v);
             } else {
                 const mm = effectiveMinMax(pstyle_fit.height, parent, false);
-                if (!skip_h) parent.setLayoutH(std.math.clamp(new_main, mm.min, mm.max));
+                const v = std.math.clamp(new_main, mm.min, mm.max);
+                if (!skip_h) parent.setLayoutH(if (h_grow_only) @max(cur_h, v) else v);
             }
         }
         if (cross_fit) {
             const new_cross = actual_cross + (if (is_row) pstyle_fit.padding.vertical() else pstyle_fit.padding.horizontal());
             if (is_row) {
                 const mm = effectiveMinMax(pstyle_fit.height, parent, false);
-                if (!skip_h) parent.setLayoutH(std.math.clamp(new_cross, mm.min, mm.max));
+                const v = std.math.clamp(new_cross, mm.min, mm.max);
+                if (!skip_h) parent.setLayoutH(if (h_grow_only) @max(cur_h, v) else v);
             } else {
                 const mm = effectiveMinMax(pstyle_fit.width, parent, true);
-                if (!skip_w) parent.setLayoutW(std.math.clamp(new_cross, mm.min, mm.max));
+                const v = std.math.clamp(new_cross, mm.min, mm.max);
+                if (!skip_w) parent.setLayoutW(if (w_grow_only) @max(cur_w, v) else v);
             }
 
-            // 回填修正：parent cross 尺寸增长后，cross axis 上 grow 的子节点需要撑满新的空间
+            // backfill correction: after parent cross size growth, grow children cross axis need
+            // re-stretch to new space
             const new_cross_avail = if (is_row)
                 parent.rectFromWorldOrFallback().h - pstyle_fit.padding.vertical()
             else
@@ -2058,13 +2161,16 @@ fn layoutChildren(parent: *Node, available: Size, ctx: LayoutContext) void {
         }
     }
 
-    // 主轴终轮定位：fit 回填改了 parent 主轴尺寸时（典型：fit 宽 row 被祖父 column
-    // 的 stretch 先拉满、按拉伸宽算了 justify 偏移，回填又缩回 intrinsic 宽），
-    // 上面按旧 main_available 算的 justify/auto-margin 偏移已失效，内容会漂出框。
-    // 按最终尺寸 + 子节点实际尺寸重跑主轴定位。子节点坐标是 parent-relative，
-    // 平移不影响其子树布局，故无需递归重排（O(children)）。
-    // flex_total > 0 时 justify/auto-margin 不生效、位置从 pad_start 顺排，
-    // 与主轴尺寸无关，无需重排。只有 main-fit 的回填会改主轴尺寸。
+    // main axis final positioning: when fit backfill changed parent main size (typical: fit-width
+    // row ancestor-stretched
+    // by column then justify offset calculated by stretch width, backfill shrinks to intrinsic
+    // width),
+    // justify/auto-margin offset from old main_available now invalid, content drifts out frame.
+    // rerun main-axis positioning by final size + child actual size. child coords are
+    // parent-relative,
+    // translate doesn't affect subtree layout, no recursive relayout needed (O(children)).
+    // when flex_total > 0 justify/auto-margin ineffective, position from pad_start in order,
+    // independent of main size, no relayout. only main-fit backfill changes main size.
     if (main_is_fit and flex_total == 0) {
         const final_main_available = if (is_row)
             parent.rectFromWorldOrFallback().w - style.padding.horizontal()
@@ -2098,9 +2204,11 @@ fn layoutChildren(parent: *Node, available: Size, ctx: LayoutContext) void {
             .end => extra,
             else => 0,
         };
-        // 同 batchReverseChildren：改了位置就要标脏。这个 pass 用最终尺寸
-        // 重新对齐，结果通常与摆放循环的预对齐一致（所以多数情况不会触发），
-        // 但 wrap / fit 回填改变交叉轴尺寸时会真的挪动子节点。
+        // same as batchReverseChildren: position change must mark dirty. this pass re-aligns by
+        // final size,
+        // usually matches pre-layout align (most cases won't trigger), but wrap / fit backfill
+        // changing
+        // cross size really moves children.
         const new_cross = if (is_row)
             style.padding.top + resolved.start + offset
         else
@@ -2116,7 +2224,7 @@ fn layoutChildren(parent: *Node, available: Size, ctx: LayoutContext) void {
         }
     }
 
-    // Reverse: 镜像翻转子节点在主轴上的位置（相对坐标）
+    // reverse: mirror-flip child position on main axis (relative coords)
     if (style.direction.isReverse()) {
         const main_start = if (is_row) style.padding.left else style.padding.top;
         const main_end = if (is_row) parent.rectFromWorldOrFallback().w - style.padding.right else parent.rectFromWorldOrFallback().h - style.padding.bottom;
@@ -2129,9 +2237,10 @@ fn layoutChildren(parent: *Node, available: Size, ctx: LayoutContext) void {
     }
 }
 
-/// fit 回填后的主轴终轮定位（见 layoutChildren 调用点）。只在 parent 主轴为 fit、
-/// 无 grow 子节点时调用，因此 space_* 不生效（is_space_mode 要求主轴非 fit），
-/// 与首轮一致按 start 处理。使用子节点实际尺寸（已含折行回填）。
+/// main axis final positioning after fit backfill (see layoutChildren call site). only call when
+/// parent main axis fit,
+/// no grow children, so space_* ineffective (is_space_mode requires main axis non-fit),
+/// handle as start like first pass. use child actual sizes (includes wrap backfill).
 fn repositionMainAxis(parent: *Node, is_row: bool, final_main_available: f32, main_auto_margin_count: usize) void {
     const style = parent.style;
     var used: f32 = 0;
@@ -2190,7 +2299,7 @@ fn repositionMainAxis(parent: *Node, is_row: bool, final_main_available: f32, ma
 
 const GridConfig = types.GridConfig;
 
-/// 栈上放置记录
+/// stack placement record
 const Placement = struct {
     col: u8, // 0-based column index
     row: u8, // 0-based row index
@@ -2198,7 +2307,7 @@ const Placement = struct {
     row_span: u8,
 };
 
-/// Grid 布局算法
+/// grid layout algorithm
 fn layoutChildrenGrid(parent: *Node, available: Size, ctx: LayoutContext) void {
     const gc = parent.style.grid() orelse return;
     const children = parent.children.items;
@@ -2213,17 +2322,17 @@ fn layoutChildrenGrid(parent: *Node, available: Size, ctx: LayoutContext) void {
 
     if (col_count == 0) return;
 
-    // Phase A: Auto-placement（row-major）
-    // Occupation bitmap: [max_rows][MAX_TRACKS] bool
-    var occupied: [max_rows][GridConfig.MAX_TRACKS]bool = [_][GridConfig.MAX_TRACKS]bool{[_]bool{false} ** GridConfig.MAX_TRACKS} ** max_rows;
-    // 快速路径: 子节点数 <= 512 用栈上数组；否则用 frame_allocator 动态分配
+    // phase A: auto-placement (row-major)
+    // occupation bitmap: [max_rows][MAX_TRACKS] bool
+    var occupied: [max_rows][GridConfig.MAX_TRACKS]bool = @splat(@splat(false));
+    // fast path: children <= 512 use stack array; else allocate from frame_allocator
     var placements_stack: [512]Placement = undefined;
     const child_count = children.len;
     const placements: []Placement = if (child_count <= 512)
         placements_stack[0..child_count]
     else blk: {
         break :blk ctx.frame_allocator.alloc(Placement, child_count) catch {
-            // 降级：整个 grid 不排版（子节点保持上一帧几何）。
+            // degrade: the whole grid is not laid out (children keep the previous frame's geometry).
             layout_alloc_failure_hits +|= 1;
             std.log.warn("[grid] placements alloc failed (child_count={d}), grid layout skipped", .{child_count});
             return;
@@ -2231,12 +2340,13 @@ fn layoutChildrenGrid(parent: *Node, available: Size, ctx: LayoutContext) void {
     };
     var actual_row_count: usize = explicit_row_count;
 
-    // Pass 1: 放置有显式位置的子节点
+    // pass 1: place explicitly-positioned children
     for (children, 0..) |child, i| {
         if (i >= placements.len) break;
-        // absolute / display:none 子节点不参与 Grid 布局（与 Flexbox 一致）
+        // absolute / display:none children don't participate in grid layout (consistent with
+        // flexbox)
         if (isOutOfFlow(child)) {
-            placements[i] = .{ .col = 0, .row = 0, .col_span = 0, .row_span = 0 }; // 标记跳过
+            placements[i] = .{ .col = 0, .row = 0, .col_span = 0, .row_span = 0 }; // mark skipped
             continue;
         }
         if (child.style.grid_placement()) |gp| {
@@ -2261,7 +2371,7 @@ fn layoutChildrenGrid(parent: *Node, available: Size, ctx: LayoutContext) void {
                 markOccupied(&occupied, col, row, gp.col_span, gp.row_span, col_count, max_rows);
                 actual_row_count = @max(actual_row_count, @as(usize, row) + gp.row_span);
             } else {
-                // 部分显式，稍后 auto-place
+                // partially explicit, auto-place later
                 placements[i] = .{ .col = 0, .row = 0, .col_span = gp.col_span, .row_span = gp.row_span };
             }
         } else {
@@ -2269,27 +2379,27 @@ fn layoutChildrenGrid(parent: *Node, available: Size, ctx: LayoutContext) void {
         }
     }
 
-    // Pass 2: row-major auto-placement (用 usize 避免 u8 溢出)
+    // pass 2: row-major auto-placement (use usize to avoid u8 overflow)
     var auto_row: usize = 0;
     var auto_col: usize = 0;
     for (children, 0..) |child, i| {
         if (i >= placements.len) break;
-        // 跳过 absolute 子节点
+        // skip absolute children
         if (isOutOfFlow(child)) continue;
         const gp = child.style.grid_placement();
-        // 跳过已显式定位的
+        // skip already explicitly positioned
         if (gp != null and gp.?.col_start > 0 and gp.?.row_start > 0) continue;
 
         const cspan: usize = @intCast(placements[i].col_span);
         const rspan: usize = @intCast(placements[i].row_span);
 
-        // span 超出列数时无法放置，标记跳过（col_span=0 与 absolute 一致）
+        // span exceeds column count can't place, mark skipped (col_span=0 same as absolute)
         if (cspan > col_count or rspan > max_rows) {
             placements[i] = .{ .col = 0, .row = 0, .col_span = 0, .row_span = 0 };
             continue;
         }
 
-        // 寻找第一个可放置的位置
+        // find first placeable position
         while (auto_row + rspan <= max_rows) {
             if (auto_col + cspan <= col_count and !isOccupiedRegion(&occupied, @intCast(auto_col), @intCast(auto_row), @intCast(cspan), @intCast(rspan), col_count, max_rows)) {
                 break;
@@ -2306,7 +2416,7 @@ fn layoutChildrenGrid(parent: *Node, available: Size, ctx: LayoutContext) void {
         markOccupied(&occupied, @intCast(auto_col), @intCast(auto_row), @intCast(cspan), @intCast(rspan), col_count, max_rows);
         actual_row_count = @max(actual_row_count, auto_row + rspan);
 
-        // 前进到下一个位置
+        // advance to next position
         auto_col += cspan;
         if (auto_col >= col_count) {
             auto_col = 0;
@@ -2315,13 +2425,13 @@ fn layoutChildrenGrid(parent: *Node, available: Size, ctx: LayoutContext) void {
     }
 
     // Phase B: Track sizing
-    var col_sizes: [GridConfig.MAX_TRACKS]f32 = [_]f32{0} ** GridConfig.MAX_TRACKS;
-    var row_sizes: [64]f32 = [_]f32{0} ** 64;
+    var col_sizes: [GridConfig.MAX_TRACKS]f32 = @as([GridConfig.MAX_TRACKS]f32, @splat(0));
+    var row_sizes: [64]f32 = @as([64]f32, @splat(0));
 
-    // B1: 固定 px 和 auto
-    // 注意: auto track sizing 只考虑 span=1 的子节点。
-    // multi-span 子节点对 auto track 的贡献需要 CSS Grid Level 1 的
-    // "剩余空间分配"算法（复杂度较高），当前未实现。
+    // B1: fixed px and auto
+    // note: auto track sizing only considers span=1 children.
+    // multi-span children contribution to auto track needs CSS Grid Level 1
+    // "remaining space allocation" algorithm (complex), not yet implemented.
     var fixed_col_total: f32 = 0;
     var fr_col_total: f32 = 0;
     for (0..col_count) |ci| {
@@ -2331,7 +2441,7 @@ fn layoutChildrenGrid(parent: *Node, available: Size, ctx: LayoutContext) void {
                 fixed_col_total += v;
             },
             .auto => {
-                // 取该列所有 span=1 子节点的 intrinsic 最大值
+                // take max intrinsic of all span=1 children in this column
                 var max_w: f32 = 0;
                 for (children, 0..) |child, idx| {
                     if (idx >= placements.len) break;
@@ -2354,7 +2464,7 @@ fn layoutChildrenGrid(parent: *Node, available: Size, ctx: LayoutContext) void {
         }
     }
 
-    // fr 列: 分配剩余空间
+    // fr columns: allocate remaining space
     if (fr_col_total > 0) {
         const col_gap_total = if (col_count > 1) @as(f32, @floatFromInt(col_count - 1)) * gc.column_gap else 0;
         const remaining_w = @max(0, available.width - fixed_col_total - col_gap_total);
@@ -2390,7 +2500,7 @@ fn layoutChildrenGrid(parent: *Node, available: Size, ctx: LayoutContext) void {
                 .fr => |f| fr_row_total += f,
             }
         } else {
-            // 隐式行: auto sizing
+            // implicit rows: auto sizing
             var max_h: f32 = 0;
             for (children, 0..) |child, idx| {
                 if (idx >= 512) break;
@@ -2411,7 +2521,7 @@ fn layoutChildrenGrid(parent: *Node, available: Size, ctx: LayoutContext) void {
         }
     }
 
-    // fr 行: 分配剩余空间
+    // fr rows: allocate remaining space
     if (fr_row_total > 0) {
         const row_gap_total = if (row_count_capped > 1) @as(f32, @floatFromInt(row_count_capped - 1)) * gc.row_gap else 0;
         const remaining_h = @max(0, available.height - fixed_row_total - row_gap_total);
@@ -2422,20 +2532,20 @@ fn layoutChildrenGrid(parent: *Node, available: Size, ctx: LayoutContext) void {
         }
     }
 
-    // Phase C: 预计算 track offsets
-    // col_offsets[i] = 第 i 列的起始 x（相对于 content 区域左边）
-    // 最后一列之后不再需要 gap，但 offset 数组只用 [0..col_count) 作为起始位置
-    var col_offsets: [GridConfig.MAX_TRACKS + 1]f32 = [_]f32{0} ** (GridConfig.MAX_TRACKS + 1);
+    // phase C: precompute track offsets
+    // col_offsets[i] = starting x of column i (relative to content left edge)
+    // after last column no more gap needed, but offset array uses [0..col_count) as start positions
+    var col_offsets: [GridConfig.MAX_TRACKS + 1]f32 = @as([(GridConfig.MAX_TRACKS + 1)]f32, @splat(0));
     for (0..col_count) |ci| {
         col_offsets[ci + 1] = col_offsets[ci] + col_sizes[ci] + gc.column_gap;
     }
 
-    var row_offsets: [65]f32 = [_]f32{0} ** 65;
+    var row_offsets: [65]f32 = @as([65]f32, @splat(0));
     for (0..row_count_capped) |ri| {
         row_offsets[ri + 1] = row_offsets[ri] + row_sizes[ri] + gc.row_gap;
     }
 
-    // Phase C: 子节点定位
+    // phase C: child positioning
     const pad_left = parent.style.padding.left;
     const pad_top = parent.style.padding.top;
 
@@ -2446,25 +2556,25 @@ fn layoutChildrenGrid(parent: *Node, available: Size, ctx: LayoutContext) void {
             collapseDisplayNone(child);
             continue;
         }
-        // absolute 子节点：与 Flexbox 一致，不参与 Grid 定位
+        // absolute children: same as flexbox, not participate in grid positioning
         if (child.style.position == .absolute) {
             layoutAbsoluteChild(parent, child, ctx);
             continue;
         }
 
         const p = placements[i];
-        // col_span == 0 表示被跳过的子节点（span 超出列数等）
+        // col_span == 0 marks skipped children (span exceeded columns etc)
         if (p.col_span == 0) continue;
         const c: usize = @intCast(p.col);
         const r: usize = @intCast(p.row);
         const c_end: usize = @min(c + p.col_span, col_count);
         const r_end: usize = @min(r + p.row_span, row_count_capped);
 
-        // 计算 cell 区域（含 span）
+        // compute cell area (includes span)
         const cell_x = col_offsets[c];
         const cell_y = row_offsets[r];
-        // cell 尺寸 = 最后一个 span track 的末端 - 起始 offset
-        // 对于 multi-span，需要包含中间的 gap
+        // cell size = last spanned track's end - start offset
+        // for multi-span, includes gaps between
         var cell_w: f32 = 0;
         for (c..c_end) |ci| {
             cell_w += col_sizes[ci];
@@ -2476,11 +2586,11 @@ fn layoutChildrenGrid(parent: *Node, available: Size, ctx: LayoutContext) void {
             if (ri > r) cell_h += gc.row_gap;
         }
 
-        // 子节点尺寸 + min/max clamp
+        // child size + min/max clamp
         const child_w = std.math.clamp(resolveGridChildSize(child, true, cell_w, cell_h), child.style.min_width(), child.style.max_width());
         const child_h = std.math.clamp(resolveGridChildSize(child, false, cell_h, cell_w), child.style.min_height(), child.style.max_height());
 
-        // 对齐（复用 justify/align_items）
+        // alignment (reuse justify/align_items)
         const h_align = parent.style.justify;
         const v_align = resolveCrossAlign(child, parent.style.align_items);
 
@@ -2530,10 +2640,10 @@ fn layoutChildrenGrid(parent: *Node, available: Size, ctx: LayoutContext) void {
     }
 }
 
-/// 解析 Grid 子节点在某个轴上的尺寸
-/// 子节点交叉轴有效对齐：显式 align_self 优先；否则继承父 align_items，
-/// 但 `no_cross_stretch` 子节点把继承来的 .stretch 降级为 .start（保持 intrinsic
-/// 交叉尺寸），父显式 .start/.center/.end/.baseline 原样生效。
+/// parse grid child's size on an axis
+/// child's cross-axis valid alignment: explicit align_self priority;
+/// else inherit parent align_items, but `no_cross_stretch` downgrades inherited .stretch to .start
+/// (keep intrinsic cross size), parent explicit .start/.center/.end/.baseline pass through as-is.
 pub fn resolveCrossAlign(child: *const Node, parent_align_items: AlignItems) AlignItems {
     if (child.style.align_self()) |explicit| return explicit;
     if (parent_align_items == .stretch and child.style.no_cross_stretch()) return .start;
@@ -2626,7 +2736,7 @@ fn isAutoRowTrack(gc: *const GridConfig, row_index: usize) bool {
     return gc.rows[row_index] == .auto;
 }
 
-/// 标记 occupation 位图
+/// mark occupation bitmap
 fn markOccupied(
     occupied: *[64][GridConfig.MAX_TRACKS]bool,
     col: u8,
@@ -2645,7 +2755,7 @@ fn markOccupied(
     }
 }
 
-/// 检查区域是否被占用
+/// check if area occupied
 fn isOccupiedRegion(
     occupied: *const [64][GridConfig.MAX_TRACKS]bool,
     col: u8,
@@ -2748,7 +2858,7 @@ test "measureNode intrinsic width uses span-aware text width" {
         .id = 1,
         .tag = .box,
         .style = .{},
-        .children = .{},
+        .children = .empty,
     };
     defer node.children.deinit(testing.allocator);
 
@@ -2802,7 +2912,7 @@ test "measureNode bounds application-provided tree depth" {
             // keeps this a linear depth test instead of exercising the
             // intentionally independent width/height measurement passes.
             .style = .{ .width = .{ .px = 1 } },
-            .children = .{},
+            .children = .empty,
         };
         initialized += 1;
     }
@@ -2816,4 +2926,27 @@ test "measureNode bounds application-provided tree depth" {
     try testing.expectEqual(@as(usize, 0), g_layout_recursion_depth);
     try testing.expect(std.math.isFinite(measured.width));
     try testing.expect(std.math.isFinite(measured.height));
+}
+
+test "managed font hooks clear only the active Cx owner" {
+    const Bridge = struct {
+        fn measure(_: *anyopaque, _: []const u8, _: f32, _: u16, _: bool, _: bool, _: u16, _: bool, _: f32) ?f32 {
+            return 42;
+        }
+    };
+    var first: u8 = 0;
+    var second: u8 = 0;
+    var shared_selector: u8 = 0;
+    defer setDrawnTextMeasure(null, null);
+    defer setShapeFontResolver(null, null);
+    setContextFontHooks(&first, null, Bridge.measure, &shared_selector);
+    setContextFontHooks(&second, null, Bridge.measure, &shared_selector);
+    clearContextFontHooks(&first);
+    try std.testing.expectEqual(@as(?f32, 42), shapeViaPipeline(null, null, "sample", 16, 400, false, false, 0, false, 0));
+    clearContextFontHooks(&second);
+    try std.testing.expectEqual(@as(?f32, null), shapeViaPipeline(null, null, "sample", 16, 400, false, false, 0, false, 0));
+    setContextFontHooks(&first, null, Bridge.measure, &shared_selector);
+    setDrawnTextMeasure(Bridge.measure, &shared_selector); // External owner takes over.
+    clearContextFontHooks(&first);
+    try std.testing.expectEqual(@as(?f32, 42), shapeViaPipeline(null, null, "sample", 16, 400, false, false, 0, false, 0));
 }

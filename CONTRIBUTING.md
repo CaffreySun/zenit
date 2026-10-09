@@ -9,7 +9,7 @@ applications; it is pre-1.0 and the public API is still moving.
   The Linux/Windows backends in `src/system_sdk/` are stubs: they compile, but
   they do not run an app. A cross-platform compile check runs in CI so they
   cannot silently rot.
-- **Zig**: `0.15.2` exactly, as declared in `build.zig.zon`. CI installs the
+- **Zig**: `0.17.0` exactly, as declared in `build.zig.zon`. CI installs the
   same version. If `zig version` disagrees, fix that first, since most confusing
   build errors come from version drift.
 - **Xcode Command Line Tools**: `xcode-select --install`, for the macOS frameworks.
@@ -23,6 +23,22 @@ zig build hello-button && open "zig-out/Hello Button.app"
 
 `zig build` with no arguments intentionally does nothing; there is no default
 install step. Use a named step (`zig build -l` lists them all).
+
+For editor support, `zig build dev-tools` installs `zig-out/bin/yix-lsp` and
+`zig-out/bin/zenit-zls`. `zig build yix-lsp` also installs both, while
+`zig build zls` installs just `zenit-zls`. Use `.exe` on Windows. The YIX
+extension finds the workspace binaries automatically; explicit `yix.zls.path`
+and an existing `zig.zls.path` take priority. For ordinary Zig files, configure
+the editor's ZLS executable to the absolute path of `zig-out/bin/zenit-zls`
+and use Zig 0.17.0.
+
+The source in `vendor/zls` is pinned to upstream master
+`eab2be0fd74443a27662da809b771c4ad0d2afcf` plus PR #3270 commit
+`9b57f17367e2a11ddb6af0efcbe992c82709d165` and local compatibility fixes;
+no separate checkout is needed. See [`vendor/zls/ZIG017.md`](vendor/zls/ZIG017.md)
+for provenance and remaining protocol limits. Libraries whose exported modules
+have no compile/check/test step must expose those modules through a normal
+check step for Zig 0.17 build graph discovery.
 
 ## The one thing to read first
 

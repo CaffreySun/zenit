@@ -1,12 +1,13 @@
-//! FileUpload 样式层，wrapper/drop zone/文件行/移除按钮样式与 drop 悬停取色（zenit-styling-revamp）。
+//! FileUpload style layer, wrapper / drop zone / file row / remove button styles and drop hover
+//! coloring (zenit-styling-revamp).
 const core = @import("../../core.zig");
 const theme = core.theme;
 const Color = core.Color;
 const Padding = core.Padding;
 
-// ========== 具名样式函数（样式层） ==========
-// 迁移自 mountFileUpload/addFile/setDropHover 的内联样式与颜色决策；
-// 数值原样保留（zenit-styling-revamp）。
+// ========== Named style functions (style layer) ==========
+// Migrated from mountFileUpload / addFile / setDropHover inline styles and color decisions;
+// numeric values preserved as-is (zenit-styling-revamp).
 
 pub fn wrapperStyle(w: f32) core.BoxStyle {
     return .{
@@ -31,16 +32,16 @@ pub fn dropZoneStyle(t: *const theme.ThemeTokens) core.BoxStyle {
     };
 }
 
-/// drop 悬停高亮的两态取色（setDropHover 消费）
+/// drop hover highlight two-state coloring (consumed by setDropHover)
 pub fn dropZoneColors(hover_active: bool, t: *const theme.ThemeTokens) struct { bg: Color, border: Color } {
     return if (hover_active)
-        .{ .bg = t.color.bg_hover, .border = t.color.accent }
+        .{ .bg = t.tokens.color.bg_hover, .border = t.tokens.color.accent }
     else
-        .{ .bg = t.color.bg_secondary, .border = t.color.border };
+        .{ .bg = t.tokens.color.bg_secondary, .border = t.tokens.color.border };
 }
 
-pub fn hintTextStyle(t: *const theme.ThemeTokens) core.TextProps {
-    return .{ .content = "", .color = t.color.fg_secondary, .font_size = 13 };
+pub fn hintTextStyle(t: *const theme.ThemeTokens) core.TextStyle {
+    return .{ .color = t.tokens.color.fg_secondary, .font_size = 13 };
 }
 
 pub fn listStyle(_: *const theme.ThemeTokens) core.BoxStyle {
@@ -60,13 +61,13 @@ pub fn fileRowStyle(t: *const theme.ThemeTokens) core.BoxStyle {
         .align_items = .center,
         .gap = 8,
         .padding = Padding.symmetric(0, 8),
-        .background = t.color.bg_secondary,
+        .background = t.tokens.color.bg_secondary,
         .border = .{ .radius = 4 },
     };
 }
 
-pub fn fileNameTextStyle(t: *const theme.ThemeTokens) core.TextProps {
-    return .{ .content = "", .color = t.color.fg_primary, .font_size = 13 };
+pub fn fileNameTextStyle(t: *const theme.ThemeTokens) core.TextStyle {
+    return .{ .color = t.tokens.color.fg_primary, .font_size = 13 };
 }
 
 pub fn removeBtnStyle(_: *const theme.ThemeTokens) core.BoxStyle {
@@ -78,6 +79,6 @@ pub fn removeBtnStyle(_: *const theme.ThemeTokens) core.BoxStyle {
     };
 }
 
-pub fn removeGlyphTextStyle(t: *const theme.ThemeTokens) core.TextProps {
-    return .{ .content = "", .color = t.color.fg_secondary, .font_size = 12 };
+pub fn removeGlyphTextStyle(t: *const theme.ThemeTokens) core.TextStyle {
+    return .{ .color = t.tokens.color.fg_secondary, .font_size = 12 };
 }

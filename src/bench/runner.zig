@@ -1,26 +1,26 @@
-//! Bench runner, Phase 0 perf 基线建立工具
+//! Bench runner, perf baseline tool.
 //!
-//! 设计目标：
-//! - 简单可重复：黑箱时间测量 + warmup + 多次 sample 取中位数
-//! - 输出双格式：人读 stdout 表格 + 机读 JSON（供 CI diff）
-//! - 不依赖外部 crate；纯 std
-//! - 每个 bench 注册一个名字 + setup + body；runner 统一执行
+//! Design goals:
+//! - Simple and repeatable: black-box timing + warmup + median of multiple samples
+//! - Dual output: human stdout table + machine JSON (for CI diff)
+//! - No external crates; pure std
+//! - Each bench registers name + setup + body; the runner executes them uniformly
 //!
-//! 用法：在 src/bench/main.zig 注册 cases，build.zig 加 bench step：
-//!     zig build bench               # 跑所有
-//!     zig build bench -- name=...   # 过滤
-//!     zig build bench -- json=path  # 输出 JSON
+//! Usage: register cases in src/bench/main.zig, add a bench step in build.zig:
+//!     zig build bench               # run all
+//!     zig build bench -- name=...   # filter
+//!     zig build bench -- json=path  # output JSON
 
 const std = @import("std");
 
 pub const BenchOptions = struct {
-    /// warmup 迭代次数（不计入测量）
+    /// Warmup iterations (not measured).
     warmup_iters: u32 = 5,
-    /// 测量 sample 数（取中位数 + p95）
+    /// Measurement samples (median + p95).
     sample_iters: u32 = 50,
-    /// 每次 sample 内部循环次数（小操作摊销噪声）。0 = 自适应。
+    /// Inner loop iterations per sample (amortize small-op noise). 0 = adaptive.
     inner_iters: u32 = 0,
-    /// 单 case 总时间软上限（ns），超时提前退出，避免一个慢 case 卡死 CI
+    /// Single case total time soft limit (ns), timeout early exit, prevent slow case hanging CI.
     soft_budget_ns: u64 = 5 * std.time.ns_per_s,
 };
 
@@ -38,21 +38,21 @@ pub const BenchFn = *const fn (allocator: std.mem.Allocator, ctx: *BenchCtx) any
 
 pub const BenchCase = struct {
     name: []const u8,
-    setup: ?*const fn (allocator: std.mem.Allocator) anyerror!*anyopaque = null,
+    setup: ?*const fn (allocator: std.mem.Allocator, io: std.Io) anyerror!*anyopaque = null,
     teardown: ?*const fn (allocator: std.mem.Allocator, state: *anyopaque) void = null,
     body: BenchFn,
     opts: BenchOptions = .{},
 };
 
-/// 运行时上下文，body 可读 setup 输出 + 控制内层循环。
+/// Runtime context, body can read setup output + control inner loop.
 pub const BenchCtx = struct {
     state: ?*anyopaque,
     iter_index: u32,
 
-    /// 防 LLVM 把 body 计算结果整体 dead-code-eliminate
+    /// Prevent LLVM dead-code-eliminating body result.
     pub fn blackbox(self: *BenchCtx, value: anytype) void {
         _ = self;
-        // 强制写入 volatile sink；LLVM 不能优化掉
+        // Force volatile sink write; LLVM can't optimize away.
         const T = @TypeOf(value);
         std.mem.doNotOptimizeAway(@as(T, value));
     }
@@ -60,12 +60,13 @@ pub const BenchCtx = struct {
 
 pub fn run(
     allocator: std.mem.Allocator,
+    io: std.Io,
     cases: []const BenchCase,
     filter: ?[]const u8,
-    json_out: ?std.fs.File,
+    json_out: ?std.Io.File,
 ) !void {
     var stdout_buffer: [4096]u8 = undefined;
-    var stdout_w = std.fs.File.stdout().writer(&stdout_buffer);
+    var stdout_w = std.Io.File.stdout().writerStreaming(io, &stdout_buffer);
     const w = &stdout_w.interface;
 
     try w.print("\n{s:<48} {s:>14} {s:>14} {s:>14}\n", .{ "name", "median ns/it", "p95 ns/it", "min ns/it" });
@@ -79,7 +80,7 @@ pub fn run(
         if (filter) |f| {
             if (std.mem.indexOf(u8, case.name, f) == null) continue;
         }
-        const r = runCase(allocator, case) catch |err| {
+        const r = runCase(allocator, io, case) catch |err| {
             try w.print("{s:<48} ERROR: {s}\n", .{ case.name, @errorName(err) });
             try w.flush();
             continue;
@@ -98,19 +99,19 @@ pub fn run(
 
     if (json_out) |f| {
         var json_buffer: [4096]u8 = undefined;
-        var json_w = f.writer(&json_buffer);
+        var json_w = f.writerStreaming(io, &json_buffer);
         const jw = &json_w.interface;
-        // 溯源信息：baseline 只有裸数字时，门禁红了没人判断得了是代码退化
-        // 还是换了机器/负载，实测 src/bench/baselines/main.json 就因为
-        // 没记 commit 而烂红了一个多月。ZENIT_BENCH_COMMIT 由 CI / 刷新脚本
-        // 注入；本地手跑时缺省 "unknown"，不影响比较，只影响可追溯性。
-        const commit = std.process.getEnvVarOwned(allocator, "ZENIT_BENCH_COMMIT") catch null;
+        // Traceability: baseline with bare numbers, can't judge if gate failed from code regression
+        // or machine/load change. src/bench/baselines/main.json went red for 1+ months from missing
+        // commit. ZENIT_BENCH_COMMIT injected by CI / refresh script; local run defaults "unknown",
+        // doesn't affect comparison, only traceability.
+        const commit = @import("zenit_environment").getOwned(allocator, "ZENIT_BENCH_COMMIT") catch null;
         defer if (commit) |c| allocator.free(c);
-        const host = std.process.getEnvVarOwned(allocator, "ZENIT_BENCH_HOST") catch null;
+        const host = @import("zenit_environment").getOwned(allocator, "ZENIT_BENCH_HOST") catch null;
         defer if (host) |h| allocator.free(h);
         try jw.print(
             "{{\n  \"commit\": \"{s}\",\n  \"host\": \"{s}\",\n  \"unix_time\": {d},\n  \"results\": [\n",
-            .{ commit orelse "unknown", host orelse "unknown", std.time.timestamp() },
+            .{ commit orelse "unknown", host orelse "unknown", std.Io.Clock.real.now(io).toSeconds() },
         );
         for (results.items, 0..) |r, i| {
             try jw.print(
@@ -123,15 +124,15 @@ pub fn run(
     }
 }
 
-fn runCase(allocator: std.mem.Allocator, case: BenchCase) !BenchResult {
-    const state: ?*anyopaque = if (case.setup) |s| try s(allocator) else null;
+fn runCase(allocator: std.mem.Allocator, io: std.Io, case: BenchCase) !BenchResult {
+    const state: ?*anyopaque = if (case.setup) |s| try s(allocator, io) else null;
     defer if (case.teardown) |t| {
         if (state) |st| t(allocator, st);
     };
 
     var inner = case.opts.inner_iters;
     if (inner == 0) {
-        inner = try calibrateInner(allocator, case, state);
+        inner = try calibrateInner(allocator, io, case, state);
     }
 
     // Warmup
@@ -148,20 +149,20 @@ fn runCase(allocator: std.mem.Allocator, case: BenchCase) !BenchResult {
     // Sample
     const samples = try allocator.alloc(f64, case.opts.sample_iters);
     defer allocator.free(samples);
-    const t_start = std.time.nanoTimestamp();
+    const t_start = std.Io.Clock.awake.now(io).toNanoseconds();
     var s_i: u32 = 0;
     while (s_i < case.opts.sample_iters) : (s_i += 1) {
-        const t0 = std.time.nanoTimestamp();
+        const t0 = std.Io.Clock.awake.now(io).toNanoseconds();
         var k: u32 = 0;
         while (k < inner) : (k += 1) {
             ctx.iter_index = s_i * inner + k;
             try case.body(allocator, &ctx);
         }
-        const t1 = std.time.nanoTimestamp();
+        const t1 = std.Io.Clock.awake.now(io).toNanoseconds();
         const elapsed: f64 = @floatFromInt(t1 - t0);
         samples[s_i] = elapsed / @as(f64, @floatFromInt(inner));
 
-        // 软预算超限提前退出
+        // Soft budget overrun early exit.
         if (@as(u64, @intCast(t1 - t_start)) > case.opts.soft_budget_ns) {
             break;
         }
@@ -189,17 +190,18 @@ fn runCase(allocator: std.mem.Allocator, case: BenchCase) !BenchResult {
     };
 }
 
-/// 自适应内部迭代数：让单 sample 至少 ~50µs，避免计时器抖动主导
-fn calibrateInner(allocator: std.mem.Allocator, case: BenchCase, state: ?*anyopaque) !u32 {
+/// Adaptive inner iteration count: make each sample take at least ~50us so timer jitter does not
+/// dominate.
+fn calibrateInner(allocator: std.mem.Allocator, io: std.Io, case: BenchCase, state: ?*anyopaque) !u32 {
     var inner: u32 = 1;
     while (inner < 1_000_000) : (inner *= 2) {
         var ctx = BenchCtx{ .state = state, .iter_index = 0 };
-        const t0 = std.time.nanoTimestamp();
+        const t0 = std.Io.Clock.awake.now(io).toNanoseconds();
         var j: u32 = 0;
         while (j < inner) : (j += 1) {
             try case.body(allocator, &ctx);
         }
-        const t1 = std.time.nanoTimestamp();
+        const t1 = std.Io.Clock.awake.now(io).toNanoseconds();
         const elapsed: u64 = @intCast(t1 - t0);
         if (elapsed >= 50_000) return inner;
     }

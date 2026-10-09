@@ -1,55 +1,56 @@
-//! Phase 0, LocalClock / Global / EditTimestamp
+//! LocalClock / Global / EditTimestamp
 //!
-//! 对齐 Zed `crates/clock/src/clock.rs` 的 `Lamport` + `Global` 概念。
-//! 非 CRDT 场景下我们只需要一个严格单调递增的 tick 作为版本键。
+//! Aligns with Zed `crates/clock/src/clock.rs` `Lamport` + `Global` concepts. Non-CRDT scenarios
+//! only need one strictly monotonic tick as version key.
 //!
-//! 不变式：
-//!   - `tick` 严格单调递增
-//!   - 所有 snapshot 携带自己的 tick
-//!   - 所有 "edits_since(version)" 查询以 tick 为基准
+//! Invariants:
+//!   - `tick` strictly monotonic
+//!   - all snapshots carry their own tick
+//!   - all 'edits_since(version)' queries use tick as baseline
 //!
-//! Zed 参考：
-//!   - `crates/text/src/text.rs:829-831` `Buffer::version()` 返回 `clock::Global`
-//!   - `crates/language/src/syntax_map.rs:329-446` `SyntaxSnapshot::interpolate` 基于
-//!     `text.anchored_edits_since(interpolated_version)` 查询
+//! Zed reference:
+//!   - `crates/text/src/text.rs:829-831` `Buffer::version()` returns `clock::Global`
+//!   - `crates/language/src/syntax_map.rs:329-446` `SyntaxSnapshot::interpolate` based on
+//!     `text.anchored_edits_since(interpolated_version)` query
 
 const std = @import("std");
 
-/// 单调递增的本地逻辑时钟。
+/// Monotonically-increasing local logical clock.
 ///
-/// 每次编辑 `next()` 得到一个新的 tick，作为 `EditTimestamp`。
-/// `observe(other)` 让本地 clock 追赶到某个外部 tick 之后（用于 snapshot 恢复、
-/// merge 后台 parse 结果等场景）。
+/// Each edit calls `next()` to get a new tick, used as `EditTimestamp`. `observe(other)` makes
+/// local clock catch up past some external tick (for snapshot restore, merge background parse
+/// result etc.).
 pub const LocalClock = struct {
     tick: u64 = 0,
 
-    /// 产生下一个严格大于当前的 tick。
+    /// Produce next tick strictly greater than current.
     pub fn next(self: *LocalClock) u64 {
         self.tick += 1;
         return self.tick;
     }
 
-    /// 让本地 tick 至少追赶到 `other`（若更大）。
+    /// Let local tick at least catch up to `other` (if larger).
     pub fn observe(self: *LocalClock, other: u64) void {
         if (other > self.tick) self.tick = other;
     }
 
-    /// 比较两个版本的顺序。
+    /// Compare order of two versions.
     pub fn cmp(a: LocalClock, b: LocalClock) std.math.Order {
         return std.math.order(a.tick, b.tick);
     }
 
-    /// 返回当前 tick 的值快照（用于只读比较）。
+    /// Return snapshot of current tick value (for read-only comparison).
     pub fn value(self: LocalClock) u64 {
         return self.tick;
     }
 };
 
-/// Zed 的 `clock::Global` 是 Lamport 向量时钟；我们单机场景下它就是 `LocalClock`。
-/// 保留 `Global` 名字让 `Buffer`/`BufferSnapshot`/`SyntaxSnapshot` 等下游用统一签名。
+/// Zed's `clock::Global` is Lamport vector clock; single-machine scenario it's just `LocalClock`.
+/// Keep `Global` name so `Buffer`/`BufferSnapshot`/`SyntaxSnapshot` etc. downstream use unified
+/// signature.
 pub const Global = LocalClock;
 
-/// 单次编辑的时间戳。对齐 Zed `clock::Lamport`，但非 CRDT 场景下只是一个 u64。
+/// Timestamp of single edit. Align with Zed `clock::Lamport`, but non-CRDT scenario just u64.
 pub const EditTimestamp = u64;
 
 // ============================================================================

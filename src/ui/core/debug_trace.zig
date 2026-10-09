@@ -1,7 +1,6 @@
-/// debug_trace, DevTools 渲染原因追踪与事件传播追踪
-///
-/// 零成本设计：DevTools 关闭时仅一个 null check（file-scope 全局指针）。
-/// 数据存储在 DebugTraceStore 中，按需堆分配，环形缓冲区复用。
+/// debug_trace, DevTools render reason and event propagation tracing. Zero-cost
+/// design: one null check when DevTools closed (file-scope global pointer). Data
+/// in DebugTraceStore, heap-alloc on-demand, ring buffer reuse.
 
 // === Render Reason ===
 
@@ -128,13 +127,13 @@ pub const DebugTraceStore = struct {
         if (self.event_count < RING_SIZE) self.event_count += 1;
     }
 
-    /// 查询指定节点的渲染记录（最近的，最新在前）
+    /// Query render records for node (recent, newest first)
     pub fn getRenderForNode(self: *const DebugTraceStore, node_id: u32, out: []RenderReasonRecord) u32 {
         var count: u32 = 0;
         if (self.render_count == 0) return 0;
         var i: u32 = 0;
         while (i < self.render_count and count < out.len) : (i += 1) {
-            // 从最新到最旧遍历
+            // Traverse newest to oldest
             const idx = (self.render_write -% 1 -% i) % RING_SIZE;
             if (self.render_records[idx].node_id == node_id) {
                 out[count] = self.render_records[idx];
@@ -144,7 +143,7 @@ pub const DebugTraceStore = struct {
         return count;
     }
 
-    /// 获取最近的事件记录（最新在前）
+    /// Get recent event records (newest first)
     pub fn getRecentEvents(self: *const DebugTraceStore, out: []EventTraceRecord) u32 {
         var count: u32 = 0;
         if (self.event_count == 0) return 0;
@@ -165,8 +164,9 @@ pub const DebugTraceStore = struct {
     }
 };
 
-// === 全局回调（零成本守卫）===
-// file-scope 变量，Node 通过它记录 render reason，无需反向引用 Cx
+// === Global callback (zero-cost guard) ===
+// file-scope variable, Node records render reason through it, no reverse ref to
+// Cx
 
 var trace_store_ptr: ?*DebugTraceStore = null;
 var trace_frame: u64 = 0;

@@ -1,12 +1,12 @@
-/// ScrollArea 调试日志
+/// ScrollArea debug log
 ///
-/// 调试专用日志开关（默认关闭，设置环境变量 ZENIT_SCROLL_DEBUG=1 可开启）
+/// Debug-only log flag (disabled by default, set ZENIT_SCROLL_DEBUG=1 to enable)
 const std = @import("std");
 
 var debug_scroll_log_cached: ?bool = null;
-var log_base_time: ?std.time.Instant = null;
-var log_last_time: ?std.time.Instant = null;
-var log_last_emit_time: ?std.time.Instant = null;
+var log_base_time: ?@import("zenit_time").Instant = null;
+var log_last_time: ?@import("zenit_time").Instant = null;
+var log_last_emit_time: ?@import("zenit_time").Instant = null;
 var min_interval_ns_cache: ?u64 = null;
 
 pub fn scrollDebugEnabled() bool {
@@ -51,7 +51,8 @@ fn minIntervalNs() u64 {
 
 pub fn logScroll(comptime fmt: []const u8, args: anytype) void {
     if (!scrollDebugEnabled()) return;
-    const now = std.time.Instant.now() catch return;
+    const io = @import("../../core.zig").render_engine.current_frame_io orelse return;
+    const now = @import("zenit_time").Instant.now(io) catch return;
     if (log_last_emit_time) |last_emit| {
         const since_emit_ns = now.since(last_emit);
         const min_interval = minIntervalNs();

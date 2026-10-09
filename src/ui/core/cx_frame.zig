@@ -1,8 +1,8 @@
-//! Cx 帧节奏：墙钟派生的帧时钟（advanceFrameClock）、layout 入口、
-//! idle 停帧门控（wantsFrame / hasPendingSceneWork / nextWakeDelayNs）
-//! 与 deferred 任务预算。
+//! Cx frame pacing: wall-time-derived frame clock (advanceFrameClock), layout entry, idle frame
+//! gating (wantsFrame / hasPendingSceneWork / nextWakeDelayNs) and deferred task budget.
 
 const std = @import("std");
+const a11y_preferences = @import("../a11y/preferences.zig");
 const core = @import("../core.zig");
 const Cx = core.Cx;
 const PartialInteractionRoots = cx_runtime_index.PartialInteractionRoots;
@@ -21,19 +21,24 @@ const layout_engine = core.layout_engine;
 const renderDirtyDebugEnabled = debug_env.renderDirtyDebugEnabled;
 const wantsFrameDebugEnabled = debug_env.wantsFrameDebugEnabled;
 
+/// delta frame interval cap (seconds), see advanceFrameClock.
+pub const max_frame_dt_seconds: f32 = 1.0;
+
 pub fn advanceFrameClock(self: *Cx) void {
-    const now = std.time.Instant.now() catch return;
-    // 始终更新 last_frame_instant（即便 idle 帧也要记当前时刻），让下一个
-    // 活跃帧的 dt 从"现在"算起，而不是把整段 idle 时长一次性灌进动画。
+    const now = @import("zenit_time").Instant.now(self.io) catch return;
+    // always update last_frame_instant (even idle frames record current time), so next active
+    // frame's dt starts from 'now', not dumping entire idle duration into animation.
     defer self.last_frame_instant = now;
 
-    // 逻辑时钟原点：首次调用时锚定（含 idle 首帧，保证 epoch 一定早于任何 active 帧）。
+    // logic clock origin: anchored on first call (includes idle first frame, ensures epoch always
+    // before any active frame).
     if (self.clock_epoch == null) self.clock_epoch = now;
 
-    // Idle 帧不推进逻辑时钟：根全 clean + 无浮层入/出场动画 + 无显式重绘请求
-    // -> frame_time_ms 冻结 -> render() 的 time_unchanged 零脏帧快速路径保持成立
-    // （否则每帧时钟都变，永远走全量 render，且 e2e query 在空闲态读到的帧不稳定）。
-    // 任一活跃信号都会让时钟前进，驱动 overlay/Spring 等绝对时间戳动画。
+    // idle frame doesn't advance logic clock: root fully clean + no overlay in/out animations + no
+    // explicit redraw -> frame_time_ms frozen -> render()'s time_unchanged zero-dirty fast path
+    // stays valid (else clock changes every frame, always full render, e2e query on idle gives
+    // unstable frame). any active signal advances clock, drives overlay/Spring etc
+    // absolute-timestamp animations.
     const idle = if (self.root) |r|
         cx_render.isTreeFullyClean(r) and
             !self.overlay_stack.hasActiveAnimations() and
@@ -41,38 +46,65 @@ pub fn advanceFrameClock(self: *Cx) void {
     else
         true;
     if (idle) {
-        // idle 期间真实时间照走，但逻辑时钟必须冻结。把这段时长记进暂停偏移，
-        // 否则下一个 active 帧会把整段 idle 一次性灌进动画（浮层瞬间跳到终态）。
+        // Locked test clock with budget left but nothing animating: the granted
+        // time still elapses (timers come due), in one step.
+        if (self.test_frame_step_ms != null) if (self.test_clock_budget_ms) |*budget| if (budget.* > 0) {
+            self.frame_time_ms += budget.*;
+            budget.* = 0;
+        };
+        // during idle real time flows, logic clock must freeze. record this duration in pause
+        // offset, else next active frame dumps entire idle into animation (overlay instant jump to
+        // end).
         if (self.last_frame_instant) |prev| self.clock_paused_ns += now.since(prev);
+        self.frame_clock_was_idle = true;
         return;
     }
+    // first frame waking from idle: since last tick is host blocking/waiting idle time, no
+    // incremental animation running, can't dump as frame interval (else animation just started by
+    // event skips far ahead). advance by nominal one frame.
+    const resumed_from_idle = self.frame_clock_was_idle;
+    self.frame_clock_was_idle = false;
 
-    // 边沿消费：显式重绘请求驱动了本帧的时钟推进，到此即被消费。
-    // 帧内活跃信号（动画 tick / overlay tick / deferred work / 事件）
-    // 会重新置 true 驱动下一帧；帧末仍为 false = 可进入 idle 停帧。
-    // 注意消费点必须在 idle 判定**之后**，在帧循环里提前清会把
-    // 本次唤醒的时钟冻住（时间驱动的 overlay 入场动画会永远停在 0）。
+    // edge-triggered consume: explicit redraw request drove this frame's clock advance, consumed
+    // here. frame-active signals (anim tick / overlay tick / deferred work / events) re-set true
+    // driving next frame; end of frame still false = can enter idle gating. note consume point must
+    // be AFTER idle check, clearing early in frame loop freezes time this wake (time-driven overlay
+    // entrance freezes at 0).
     self.needs_redraw = false;
+
+    if (self.test_frame_step_ms) |step| {
+        var taken = step;
+        if (self.test_clock_budget_ms) |*budget| {
+            taken = @floatCast(@min(@as(f64, step), budget.*));
+            budget.* -= taken;
+        }
+        self.frame_dt_ms = taken;
+        self.frame_dt_seconds = taken / 1000;
+        self.frame_time_ms += taken;
+        return;
+    }
 
     if (self.last_frame_instant) |prev| {
         const dt_ns = now.since(prev);
         const dt_s = @as(f32, @floatFromInt(dt_ns)) / 1_000_000_000.0;
-        // 增量 dt 仍钳到 [~0, 0.1s]：Spring 等物理积分器需要有界步长才稳定，
-        // 一个超大 dt 会让弹簧数值发散。这个 clamp 只服务增量消费者,
-        // 绝对时钟另算（见下），否则慢帧会被永久削短。
-        self.frame_dt_seconds = std.math.clamp(dt_s, 0.0, 0.1);
+        // delta dt uses real frame interval: all consumers exact on any step (spring critical
+        // damping analytical, material exponential, rest by absolute time or countdown), clamping
+        // to 0.1s only slows low-fps animations by 0.1/interval (software raster 2fps -> 1/5
+        // speed). 1s cap only prevents anomalous stall; idle clock already frozen, doesn't
+        // accumulate.
+        self.frame_dt_seconds = if (resumed_from_idle) @min(dt_s, 1.0 / 60.0) else std.math.clamp(dt_s, 0.0, max_frame_dt_seconds);
         self.frame_dt_ms = self.frame_dt_seconds * 1000.0;
     } else {
-        // 首帧：无前一拍，给一个标称 60fps dt。
+        // first frame: no previous, give nominal 60fps dt.
         self.frame_dt_seconds = 1.0 / 60.0;
         self.frame_dt_ms = 1000.0 / 60.0;
     }
 
-    // 绝对时钟从 epoch 派生，扣除累计 idle 暂停。**不经 clamp**：tween/keyframe
-    // 按 (now_ms - start_time_ms) 算进度，任何削短都会让动画慢放且永不追回。
+    // absolute clock derived from epoch, subtract cumulative idle pause. **no clamping**:
+    // tween/keyframe progress by (now_ms - start_time_ms), any shortening slows animation forever.
     const since_epoch_ns = now.since(self.clock_epoch.?);
     const live_ns = since_epoch_ns -| self.clock_paused_ns;
-    self.frame_time_ms = @as(f64, @floatFromInt(live_ns)) / std.time.ns_per_ms;
+    self.frame_time_ms = self.clock_time_offset_ms + @as(f64, @floatFromInt(live_ns)) / std.time.ns_per_ms;
 }
 
 pub fn layout(self: *Cx) void {
@@ -90,7 +122,7 @@ pub fn layout(self: *Cx) void {
             self.syncLayoutToTable(r);
         }
         if (had_dirty or had_interaction_dirty) {
-            // OOM 不吞：见 rebuildRuntimeIndexesIfCurrentRootDirty 的说明。
+            // OOM not swallowed: see rebuildRuntimeIndexesIfCurrentRootDirty note.
             if (r.frame_state.state_bits.dirty.runtime.subtree_dirty) {
                 cx_runtime_index.rebuildRuntimeIndexes(self) catch @panic("OOM: rebuildRuntimeIndexes (frame end)");
             } else if (r.frame_state.state_bits.dirty.pipeline.subtree_order) {
@@ -127,7 +159,7 @@ pub fn hasPendingWork(self: *const Cx) bool {
     return self.deferred_scheduler.hasPendingWork();
 }
 
-// ---- 计时器（Cx.setTimer / clearTimer / fireDueTimers 的实现）----
+// ---- timers (Cx.setTimer / clearTimer / fireDueTimers impl) ----
 
 const Timer = Cx.Timer;
 
@@ -170,30 +202,50 @@ fn nextTimerDelayNs(self: *const Cx) ?u64 {
 }
 
 pub fn fireDueTimers(self: *Cx) void {
+    // nested call in callback: don't re-enter. re-entering treats 0-delay timer set in callback as
+    // 'due on entry' and fires in callback stack; remaining timers from outer loop ok. note:
+    // callback may set 0-delay timer, don't double-fire it in this round.
+    if (self.firing_timers) return;
     if (self.timers.items.len == 0) return;
+    self.firing_timers = true;
+    defer self.firing_timers = false;
     const now = currentDeferredTimeNs(self);
-    var fired: [16]Timer = undefined;
+    // on entry only snapshot due timer ids (this round only fires these, newly-set timers deferred
+    // to next round), fetch from table before firing: earlier callback in round may clearTimer
+    // timers already due (typical: callback unmounts component, cleanup clears component's timers
+    // and frees context). if snapshotted and removed wholesale then called, clearTimer finds
+    // nothing, cleared callback still runs with freed context. clearTimer contract is 'no callback
+    // after', must hold this round.
+    var due_ids: [16]u64 = undefined;
     var n: usize = 0;
-    var i: usize = 0;
-    while (i < self.timers.items.len and n < fired.len) {
-        const t = self.timers.items[i];
+    for (self.timers.items) |t| {
+        if (n == due_ids.len) break;
         if (t.due_ns <= now) {
-            fired[n] = t;
+            due_ids[n] = t.id;
             n += 1;
-            _ = self.timers.swapRemove(i);
-            continue;
         }
-        i += 1;
     }
-    for (fired[0..n]) |t| t.callback(t.context);
-    if (n > 0) self.needs_redraw = true;
+    var fired: usize = 0;
+    for (due_ids[0..n]) |id| {
+        const t = takeTimer(self, id) orelse continue;
+        fired += 1;
+        t.callback(t.context);
+    }
+    if (fired > 0) self.needs_redraw = true;
+}
+
+fn takeTimer(self: *Cx, id: u64) ?Timer {
+    for (self.timers.items, 0..) |t, i| {
+        if (t.id == id) return self.timers.swapRemove(i);
+    }
+    return null;
 }
 
 pub fn nextWakeDelayNs(self: *const Cx) ?u64 {
     var best: ?u64 = nextTimerDelayNs(self);
     if (self.next_redraw_scheduled_at) |scheduled_at| {
         if (self.next_redraw_delay_ns) |delay_ns| {
-            const now = std.time.Instant.now() catch return 0;
+            const now = @import("zenit_time").Instant.now(self.io) catch return 0;
             const elapsed = switch (now.order(scheduled_at)) {
                 .lt => 0,
                 .eq, .gt => now.since(scheduled_at),
@@ -211,15 +263,26 @@ pub fn nextWakeDelayNs(self: *const Cx) ?u64 {
 
 pub fn wantsFrame(self: *Cx) bool {
     _ = self.processScheduledRedraw();
-    if (wantsFrameDebugEnabled()) return wantsFrameDiagnosed(self);
-    return self.needs_redraw or
+    if (self.test_force_frames) {
+        if (self.root) |root| root.markSubtreeDirty();
+        self.needs_redraw = true;
+        return true;
+    }
+    const budget_left = self.test_frame_step_ms != null and (self.test_clock_budget_ms orelse 0) > 0;
+    const wants = if (wantsFrameDebugEnabled()) wantsFrameDiagnosed(self) or budget_left else budget_left or self.needs_redraw or
+        self.a11y_prefs_version != a11y_preferences.version() or
         hasDueTimer(self) or
         self.hasReadyWork() or
         self.hasPendingSceneWork();
+    // host gets false, skips entire frame and blocks waiting, won't call advanceFrameClock again,
+    // its idle branch unreachable at runtime. record 'entered idle' here, so next active frame's dt
+    // doesn't dump blocking wait into just-event-started incremental animation.
+    if (!wants) self.frame_clock_was_idle = true;
+    return wants;
 }
 
-/// ZENIT_DEBUG_WANTS_FRAME=1：逐条打印 wantsFrame 的子条件，定位
-/// "静止画布却每帧想渲染"时到底是哪一条持续为真。只在 env 开启时走。
+/// ZENIT_DEBUG_WANTS_FRAME=1: print wantsFrame subconditions line-by-line, locate which keeps true
+/// when 'static canvas yet wants render every frame'. only when env enabled.
 fn wantsFrameDiagnosed(self: *Cx) bool {
     const needs = self.needs_redraw or hasDueTimer(self);
     const ready = self.hasReadyWork();
@@ -333,7 +396,7 @@ pub fn drainDeferredWork(self: *Cx, budget_us: u32) DrainDeferredResult {
 }
 
 fn currentDeferredTimeNs(self: *const Cx) u64 {
-    const now = std.time.Instant.now() catch return 0;
+    const now = @import("zenit_time").Instant.now(self.io) catch return 0;
     return switch (now.order(self.deferred_epoch)) {
         .lt => 0,
         .eq, .gt => now.since(self.deferred_epoch),

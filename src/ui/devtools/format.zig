@@ -1,17 +1,12 @@
-//! DevTools 的格式化工具，从 devtools.zig 析出。
+//! DevTools formatting utilities.
 //!
-//! 八个纯函数：把布局值（Sizing / Padding / Margin / f32）和可能非法的字节
-//! 串格式化成面板上显示的短文本。只依赖 std 与 core 的值类型，不碰面板状态、
-//! 选中项、节点树，夹在 4600 行的 devtools.zig 里纯属历史堆积。
+//! Eight pure functions: format layout values (Sizing/Padding/Margin/f32) and possibly-invalid
+//! byte strings into short panel display text. Depend only on std/core value types, not panel
+//! state/selection/tree, so they are unit-testable directly (e.g. what displays for width=fit,
+//! whether truncation breaks multibyte chars).
 //!
-//! 析出后这些格式化规则可以直接单测：此前要验证「宽度为 fit 时显示什么」
-//! 「截断时会不会切断多字节字符」只能打开 DevTools 面板用眼睛看。
-//!
-//! UTF-8 判定统一走 `text_core.utf8`（2026-09-22）：此前这里有一份 100 行
-//! 手写的 UTF-8 状态机（utf8SeqLen / isValidUtf8Seq / isValidUtf8）。穷举
-//! 比对过，1~3 字节全量、4 字节抽样，与 std 零差异，也就是说那 100 行只是
-//! 把 std 重写了一遍，overlong / surrogate / >U+10FFFF 边界全靠手写维护。
-//! 现已删除，语义不变。
+//! UTF-8 validity is delegated to `text_core.utf8` (exhaustively checked equal to std for 1-3 byte
+//! sequences, sampled for 4 byte).
 
 const std = @import("std");
 const core = @import("../core.zig");
@@ -19,7 +14,7 @@ const utf8 = @import("text_core").utf8;
 const Sizing = core.Sizing;
 const Padding = core.Padding;
 
-// ========== 格式化工具 ==========
+// ===== Formatting utilities =====
 
 pub fn truncate(alloc: std.mem.Allocator, src: []const u8, max_len: usize) []const u8 {
     if (max_len == 0) return src[0..0];
@@ -71,7 +66,8 @@ pub fn truncate(alloc: std.mem.Allocator, src: []const u8, max_len: usize) []con
     return out[0..out_i];
 }
 
-/// 整串是否是合法 UTF-8。转发给 text_core.utf8，保留本名以免调用点改动。
+/// Whether entire string is valid UTF-8. Forwarded to text_core.utf8; keep this name to avoid call
+/// site changes.
 pub fn isValidUtf8(src: []const u8) bool {
     return utf8.isValid(src);
 }
@@ -136,9 +132,9 @@ pub fn fmtMargin(buf: *[64]u8, m: core.Margin) []const u8 {
     return std.fmt.bufPrint(buf, "{s} {s} {s} {s}", .{ top, right, bottom, left }) catch "margin";
 }
 
-// ── 测试 ───────────────────────────────────────────────────────────────
+// ── Tests ─────────────────────────────────────────────────────────────
 //
-// 这些规则此前只能靠打开 DevTools 面板用眼睛看。
+// These rules were previously only verifiable by opening DevTools panel visually.
 
 test "fmtFloat: 特殊值走短路分支而不是打印成数字" {
     var buf: [12]u8 = undefined;
@@ -150,10 +146,10 @@ test "fmtFloat: 特殊值走短路分支而不是打印成数字" {
 
 test "fmtFloat: 极大极小走科学计数法，常规值走定点" {
     var buf: [12]u8 = undefined;
-    // < 0.1 与 >= 1e9 用科学计数法（面板列宽有限）
+    // < 0.1 and >= 1e9 use scientific notation (panel column width limited)
     try std.testing.expect(std.mem.indexOfScalar(u8, fmtFloat(&buf, 0.001), 'e') != null);
     try std.testing.expect(std.mem.indexOfScalar(u8, fmtFloat(&buf, 2e9), 'e') != null);
-    // 常规区间不该出现 e
+    // Regular range shouldn't have 'e'
     try std.testing.expect(std.mem.indexOfScalar(u8, fmtFloat(&buf, 42.5), 'e') == null);
 }
 
@@ -174,9 +170,9 @@ test "isValidUtf8: 合法与非法输入" {
     try std.testing.expect(isValidUtf8("hello"));
     try std.testing.expect(isValidUtf8("中文"));
     try std.testing.expect(isValidUtf8(""));
-    // 截断的多字节序列
+    // Truncated multibyte sequence
     try std.testing.expect(!isValidUtf8("\xE4\xB8"));
-    // 孤立 continuation 字节
+    // Orphan continuation byte
     try std.testing.expect(!isValidUtf8("\x80"));
 }
 
@@ -186,7 +182,7 @@ test "truncate: 合法且不超长时零拷贝原样返回" {
     defer arena.deinit();
     const out = truncate(arena.allocator(), src, 32);
     try std.testing.expectEqualStrings(src, out);
-    // 未分配 ⇒ 返回的就是入参切片本身
+    // No allocation -> return input slice itself
     try std.testing.expect(out.ptr == src.ptr);
 }
 
@@ -198,16 +194,16 @@ test "truncate: max_len 为 0 时返回空而不是越界" {
 }
 
 test "truncate: 超长时不切断多字节字符" {
-    // ⚠ truncate 按 max_len 分配但返回**更短**的切片（省略号之后就截断），
-    //   所以返回值不能直接 free，它不是分配的那一块的完整长度。生产调用点
-    //   走的是 frame_arena（整帧一次性回收），这里用 arena 复刻同一语义。
+    // Warning: truncate allocates to max_len but returns **shorter** slice (ellipsis then cut),
+    //   so return can't be freed directly; it's not the full allocated block. Production calls
+    //   use frame_arena (one-time per-frame recovery); here we replicate with arena semantics.
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    // 6 个中文字符（18 字节），截到 10 字节
+    // 6 multibyte characters (18 bytes), truncate to 10 bytes
     const src = "中文中文中文";
     const out = truncate(arena.allocator(), src, 10);
-    // 产出必须仍是合法 UTF-8，不能切在字符中间
+    // Output must still be valid UTF-8, can't cut in middle of character
     try std.testing.expect(isValidUtf8(out));
     try std.testing.expect(out.len <= 10);
 }

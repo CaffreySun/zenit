@@ -1,16 +1,16 @@
 /**
- * e2e/pencil_export.ts, .pen -> PNG 导出 adapter（design_source）
+ * e2e/pencil_export.ts: .pen -> PNG export adapter (design_source)
  *
- * 通过 Pencil MCP（stdio JSON-RPC 2.0）调 `export_nodes`，把 .pen 的某个节点导出成
- * PNG，作为 scenario 里 `expect.design.reference` 的来源。对应
- * docs/internal/UI_AUTOMATION_PLAN.md §4.4 / §6。
+ * Calls `export_nodes` via Pencil MCP (stdio JSON-RPC 2.0) to export a .pen node as
+ * PNG for use as `expect.design.reference` source in scenarios. Corresponds to
+ * docs/internal/UI_AUTOMATION_PLAN.md section 4.4 / section 6.
  *
- * 用法:
+ * Usage:
  *   bun e2e/pencil_export.ts <filePath> <nodeId> <outputDir> [--scale 2]
  *   bun e2e/pencil_export.ts --self-test
  *
- * 依赖：Pencil 桌面端在跑，且 MCP server 可用（默认路径在 Pen.app 内）。
- * 产物命名：<outputDir>/<nodeId>.png（与 export_nodes 约定一致）。
+ * Dependencies: Pencil desktop app running; MCP server available (default path is inside Pen.app).
+ * Output naming: <outputDir>/<nodeId>.png (matches export_nodes convention).
  */
 
 import { spawn } from "node:child_process";
@@ -19,7 +19,7 @@ import { existsSync, mkdirSync } from "node:fs";
 
 const DEFAULT_PENCIL_MCP = "/Applications/Pen.app/Contents/Resources/app.asar.unpacked/out/mcp-server-darwin-arm64";
 
-// ── MCP stdio 客户端（newline-delimited JSON-RPC 2.0）──
+// -- MCP stdio client (newline-delimited JSON-RPC 2.0) --
 
 interface McpClient {
   request(method: string, params?: unknown): Promise<any>;
@@ -35,7 +35,7 @@ function spawnMcpClient(command: string, args: string[]): McpClient {
   rl.on("line", (line) => {
     let msg: any;
     try { msg = JSON.parse(line); } catch { return; }
-    if (msg.id === undefined) return; // 通知（无 id）忽略
+    if (msg.id === undefined) return; // Ignore notifications (no id)
     const p = pending.get(msg.id);
     if (!p) return;
     pending.delete(msg.id);
@@ -97,7 +97,7 @@ export async function exportNodes(
   }
 }
 
-/** 尽力从 MCP 返回里抽取 .png 路径（不假设 result 结构，递归扫，正则抽 path-like token）。 */
+/** Best-effort extract .png path from MCP result (don't assume result structure, recursive scan, regex extract path-like tokens). */
 function extractPngPaths(result: unknown): string[] {
   const paths: string[] = [];
   const walk = (n: any) => {
@@ -112,7 +112,7 @@ function extractPngPaths(result: unknown): string[] {
   return [...new Set(paths)];
 }
 
-// ── self-test（用 mock echo server 验证 JSON-RPC 往返 + 路径抽取）──
+// -- self-test (verify JSON-RPC round-trip + path extraction with mock echo server) --
 
 const MOCK_SERVER = `
 process.stdin.on("data", (chunk) => {
@@ -130,7 +130,7 @@ process.stdin.on("data", (chunk) => {
 
 async function selfTest(): Promise<void> {
   const proc = spawn("bun", ["-e", MOCK_SERVER], { stdio: ["pipe", "pipe", "inherit"] });
-  // 直接复用 spawnMcpClient 走同一条 stdio 通路（注入 mock server 进程）
+  // Reuse spawnMcpClient through same stdio path (inject mock server process)
   const rl = createInterface({ input: proc.stdout });
   let nextId = 1;
   const pending = new Map<number, any>();

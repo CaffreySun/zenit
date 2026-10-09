@@ -5,29 +5,180 @@ const SignalBase = @import("signal_base.zig").SignalBase;
 const SignalOwner = @import("owner.zig").SignalOwner;
 const Scope = @import("scope.zig").Scope;
 const eqlValue = @import("eq.zig").eqlValue;
+const graph_mod = @import("graph.zig");
 
-/// Signal(T): 泛型响应式数据源
+const debug_checks = SignalOwner.debug_checks;
+const alive_sentinel: u32 = 0x5161_A11E;
+const dead_sentinel: u32 = 0x5161_DEAD;
+const debug_writer_slots = 8;
+
+/// Reactive type marker: `Signal` / `Memo` / `Derived` declare `pub const zenit_reactive`.
+/// props normalize (`props.zig`) checks only this marker, no duck type.
+pub const ReactiveKind = enum { signal, memo, derived };
+
+/// Owned text signal storage (`scope.createText`). Double-buffer: write target non-current
+/// chunk, safe for `set(transform(get()))`. Slice lifetime contract: see `Signal([]const u8)
+/// .get` comment. Owned slice double-buffer (`scope.createText` / `scope.createList`): set
+/// copy into non-current then switch, so prior slice valid after next write. Shallow copy elements.
+pub fn SliceStore(comptime E: type) type {
+    // String list owns bytes together: element slices point to this store's byte buffer (same
+    // double-buffer as element array)
+    const deep = E == []const u8;
+    return struct {
+        allocator: Allocator,
+        bufs: [2][]E = .{ &.{}, &.{} },
+        bytes: if (deep) [2][]u8 else void = if (deep) .{ &.{}, &.{} } else {},
+        active: u1 = 0,
+
+        const Self = @This();
+
+        /// Copy `content` into non-current and switch. Two-phase: new ready before switch, fail
+        /// returns false, current unchanged, no leak.
+        pub fn store(self: *Self, content: []const E) bool {
+            const target: u1 = self.active ^ 1;
+            if (debug_checks and content.len > 0 and self.bufs[target].len > 0) {
+                const buf = self.bufs[target];
+                const lo = @intFromPtr(buf.ptr);
+                const hi = lo + buf.len * @sizeOf(E);
+                const p = @intFromPtr(content.ptr);
+                std.debug.assert(p + content.len * @sizeOf(E) <= lo or p >= hi); // Contract: caller must not hold prior-prior slice
+            }
+            if (!self.fill(target, content)) return false;
+            self.active = target;
+            return true;
+        }
+
+        /// Write to `target` buffer (no switch). Fail returns false, target invalid.
+        pub fn fill(self: *Self, target: u1, content: []const E) bool {
+            if (deep) {
+                var total: usize = 0;
+                for (content) |str| {
+                    total += str.len;
+                    if (debug_checks and str.len > 0 and self.bytes[target].len > 0) {
+                        // Contract same: strings can't point prior-prior byte buffer (expand frees
+                        // it, no expand
+                        // overlaps write target)
+                        const lo = @intFromPtr(self.bytes[target].ptr);
+                        const hi = lo + self.bytes[target].len;
+                        const p = @intFromPtr(str.ptr);
+                        std.debug.assert(p + str.len <= lo or p >= hi);
+                    }
+                }
+                if (self.bytes[target].len < total) {
+                    const cap = @max(total, self.bytes[target].len * 2, 64);
+                    const fresh = self.allocator.alloc(u8, cap) catch return false;
+                    self.allocator.free(self.bytes[target]);
+                    self.bytes[target] = fresh;
+                }
+            }
+            var buf = self.bufs[target];
+            if (buf.len < content.len) {
+                const cap = @max(content.len, buf.len * 2, 16);
+                const fresh = self.allocator.alloc(E, cap) catch return false;
+                self.allocator.free(buf);
+                buf = fresh;
+                self.bufs[target] = buf;
+            }
+            if (deep) {
+                var off: usize = 0;
+                for (content, 0..) |str, k| {
+                    const dst = self.bytes[target][off .. off + str.len];
+                    @memcpy(dst, str);
+                    buf[k] = dst;
+                    off += str.len;
+                }
+            } else {
+                @memcpy(buf[0..content.len], content);
+            }
+            return true;
+        }
+
+        pub fn current(self: *const Self, len: usize) []const E {
+            return self.bufs[self.active][0..len];
+        }
+
+        pub fn deinit(self: *Self) void {
+            self.allocator.free(self.bufs[0]);
+            self.allocator.free(self.bufs[1]);
+            if (deep) {
+                self.allocator.free(self.bytes[0]);
+                self.allocator.free(self.bytes[1]);
+            }
+        }
+    };
+}
+
+/// Owned text storage
+pub const TextStore = SliceStore(u8);
+
+/// `T` = `[]const E` -> `E`, else void (no owned storage)
+pub fn SliceElem(comptime T: type) type {
+    const info = @typeInfo(T);
+    if (info == .pointer and info.pointer.size == .slice and info.pointer.attrs.@"const" and info.pointer.sentinel_ptr == null) return info.pointer.child;
+    return void;
+}
+
+/// Signal(T): generic reactive data source
 ///
-/// 用法:
+/// Usage:
 /// ```zig
 /// var owner = try SignalOwner.init(allocator);
 /// defer owner.deinit();
 ///
 /// const count = try owner.createSignal(i32, 0);
-/// count.set(42);        // 触发订阅者
-/// const val = count.get(); // 自动注册依赖
+/// count.set(42);        // notify subscribers
+/// const val = count.get(); // auto-register dependency
 /// ```
 pub fn Signal(comptime T: type) type {
     return struct {
         base: SignalBase,
         value: T,
         owner: *SignalOwner,
+        /// Only `scope.createText` / `scope.createList` slices non-empty: value in signal's own
+        /// double-buffer (owned).
+        slice_store: if (has_store) ?*SliceStore(SliceElem(T)) else void = if (has_store) null else {},
+        debug: Debug = .{},
 
         const Self = @This();
+        pub const Value = T;
+        pub const zenit_reactive: ReactiveKind = .signal;
+        const has_store = SliceElem(T) != void;
 
-        /// 创建 Signal (内部使用)
-        ///
-        /// 应该通过 SignalOwner.createSignal() 创建
+        /// Debug diagnostic state (docs/SIGNAL_API_DESIGN.md section 4.11); Release empty struct.
+        pub const Debug = if (debug_checks) struct {
+            alive: u32 = alive_sentinel,
+            /// Owning scope (owner arena path = null); borrow check use.
+            scope: ?*Scope = null,
+            writers: [debug_writer_slots]usize = @as([debug_writer_slots]usize, @splat(0)),
+            writer_next: u8 = 0,
+        } else struct {};
+
+        inline fn checkAlive(self: *const Self) void {
+            if (debug_checks) {
+                if (self.debug.alive != alive_sentinel) {
+                    std.debug.panic("Signal({s}) used after its scope was disposed", .{@typeName(T)});
+                }
+            }
+        }
+
+        /// Owning scope; owner arena path or Release build = null.
+        pub fn debugScope(self: *const Self) ?*Scope {
+            return if (debug_checks) self.debug.scope else null;
+        }
+
+        /// Most recent writer return address (new to old, 0 = empty slot). Release empty.
+        pub fn debugRecentWriters(self: *const Self) [debug_writer_slots]usize {
+            if (!debug_checks) return @as([debug_writer_slots]usize, @splat(0));
+            var out: [debug_writer_slots]usize = undefined;
+            for (0..debug_writer_slots) |i| {
+                const idx = (@as(usize, self.debug.writer_next) + debug_writer_slots - 1 - i) % debug_writer_slots;
+                out[i] = self.debug.writers[idx];
+            }
+            return out;
+        }
+
+        /// owner path low-level: allocate in owner arena, freed with owner, no manual free.
+        /// App/component code uses `scope.createSignal` (freed with scope).
         pub fn create(owner: *SignalOwner, initial: T) !*Self {
             owner.assertThread();
             const signal = try owner.allocator().create(Self);
@@ -37,19 +188,19 @@ pub fn Signal(comptime T: type) type {
                 .owner = owner,
             };
 
-            // 注册到 owner
+            // Register to owner
             try owner.registerSignal(&signal.base);
 
-            // 同步在 graph 注册一个 NodeId
+            // Sync register NodeId to graph
             const gid = try owner.graph.createSignal();
             signal.base.graph_node_raw = @bitCast(gid);
 
             return signal;
         }
 
-        /// 在 Scope 中创建 Signal（保留模式路径）
+        /// Create Signal in Scope (retain mode path)
         ///
-        /// 使用 scope.allocator 分配，注册到 scope（不是 Arena）
+        /// Use scope.allocator, register to scope (not Arena)
         pub fn createInScope(scope: *Scope, initial: T) !*Self {
             scope.owner.assertThread();
             const signal = try scope.allocator.create(Self);
@@ -59,7 +210,8 @@ pub fn Signal(comptime T: type) type {
                 .value = initial,
                 .owner = scope.owner,
             };
-            // Scope 路径：subscribers 列表也用 scope.allocator
+            if (debug_checks) signal.debug.scope = scope;
+            // Scope path: subscribers list also scope.allocator
             signal.base.scope_allocator = scope.allocator;
 
             const gid = try scope.owner.graph.createSignal();
@@ -71,44 +223,57 @@ pub fn Signal(comptime T: type) type {
             return signal;
         }
 
-        /// 虚函数表（Arena 路径，旧代码兼容）
+        /// Vtable (owner arena path, freed with owner)
         const vtable = SignalBase.VTable{
             .cleanup = cleanupImpl,
         };
 
-        /// 虚函数表（Scope 路径，支持单独释放）
+        /// Vtable (Scope path, single free support)
         const scope_vtable = SignalBase.VTable{
             .cleanup = cleanupImpl,
             .destroy = destroyImpl,
         };
 
         fn cleanupImpl(base: *SignalBase) void {
-            // Arena allocator 会自动释放所有内存
+            // Arena allocator auto-frees all
             _ = base;
         }
 
         fn destroyImpl(base: *SignalBase, allocator: Allocator) void {
             const self: *Self = @fieldParentPtr("base", base);
-            // subscribers 字段已删除；graph.destroyNode 处理边
+            // subscribers field deleted; graph.destroyNode handles edges
+            if (has_store) {
+                if (self.slice_store) |ts| {
+                    ts.deinit();
+                    allocator.destroy(ts);
+                }
+            }
+            if (debug_checks) self.debug.alive = dead_sentinel;
             allocator.destroy(self);
         }
 
-        /// 读取值并自动注册依赖
+        /// Read value + auto-register dependency
         ///
-        /// 单轨追踪，graph.tracking_stack 是唯一依赖源。
-        /// 旧 EffectBase.dependencies + SignalBase.subscribers 已废弃（v0.3-P4/P5 删字段）。
-        /// untrack 跳过"发起 untrack 的当前 Effect"的追踪。
+        /// Single-track tracking: graph.tracking_stack is the only dependency source.
+        /// `owner.untrack`
+        /// inside (null sentinel reader on stack top) doesn't log a dependency.
+        ///
+        /// Owned slice (`scope.createText` / `createList`): the returned slice is valid only for
+        /// the
+        /// current sync call (handler/effect/memo compute until return) and while no signal
+        /// re-write
+        /// happens. After a write don't reuse it: double-buffering makes `set(transform(get()))`
+        /// safe, but a
+        /// second write makes the prior slice alias new content (silent wrong value). To keep
+        /// across
+        /// calls, use dupe/getInto.
         pub fn get(self: *Self) T {
+            self.checkAlive();
             self.owner.assertThread();
+            if (debug_checks) self.owner.noteTrackedRead("Signal");
 
-            // 检查 untrack：只跳过当前 effect 的追踪，不影响嵌套 effect/memo
-            const untrack_active = !self.owner.is_tracking;
-            const should_skip_for_current = untrack_active and
-                self.owner.current_effect != null and
-                self.owner.untracked_effect == self.owner.current_effect;
-
-            if (!should_skip_for_current and self.base.graph_node_raw != 0xFFFFFFFF) {
-                const gid: @import("graph.zig").NodeId = @bitCast(self.base.graph_node_raw);
+            if (self.base.graph_node_raw != 0xFFFFFFFF) {
+                const gid: graph_mod.NodeId = @bitCast(self.base.graph_node_raw);
                 self.owner.graph.trackRead(gid) catch |err| {
                     std.log.warn("[reactive.Signal] graph.trackRead failed: {}", .{err});
                 };
@@ -117,32 +282,64 @@ pub fn Signal(comptime T: type) type {
             return self.value;
         }
 
-        /// 读取值但不注册依赖
+        /// Read value no-depend
         pub fn peek(self: *const Self) T {
+            self.checkAlive();
             self.owner.assertThread();
             return self.value;
         }
 
-        /// 设置新值并触发所有订阅者
+        /// Copy current text (cross-call keep). `Signal([]const u8)` only.
+        pub fn dupe(self: *const Self, allocator: Allocator) ![]u8 {
+            comptime if (T != []const u8) @compileError("dupe is only available on Signal([]const u8)");
+            return allocator.dupe(u8, self.peek());
+        }
+
+        /// Copy current text into caller buffer; buffer short = truncate. Return written slice.
+        pub fn getInto(self: *Self, buf: []u8) []u8 {
+            comptime if (T != []const u8) @compileError("getInto is only available on Signal([]const u8)");
+            const v = self.get();
+            const n = @min(v.len, buf.len);
+            @memcpy(buf[0..n], v[0..n]);
+            return buf[0..n];
+        }
+
+        /// Set new value + notify all subscribers
         pub fn set(self: *Self, new_value: T) void {
+            self.checkAlive();
             self.owner.assertThread();
-            // 值未变化则跳过。eqlValue 替代 std.meta.eql 修复了三个 bug：
-            // - []const u8 比内容而非 (ptr, len)
-            // - NaN bytewise 同视作相等（避免永远 dirty）
-            // - struct 含切片字段递归正确比较
+            // Skip unchanged. eqlValue replaces std.meta.eql fixes three bugs: []const u8
+            // compares content not (ptr, len), NaN bytewise same = no forever dirty, struct with
+            // slice
+            // fields recurse correctly.
             if (eqlValue(T, self.value, new_value)) return;
 
-            self.value = new_value;
+            if (has_store) {
+                if (self.slice_store) |ts| {
+                    if (!ts.store(new_value)) {
+                        // Two-phase commit: fail = value unchanged (design section 4.8).
+                        if (debug_checks) self.owner.debug.text_store_failures += 1;
+                        std.log.warn("[reactive.Signal] owned slice store allocation failed; value unchanged", .{});
+                        return;
+                    }
+                    self.value = ts.current(new_value.len);
+                } else {
+                    self.value = new_value;
+                }
+            } else {
+                self.value = new_value;
+            }
 
-            // 切到 graph 主路径。
-            // graph.markSignalWritten 内部：
+            if (debug_checks) self.recordWrite(@returnAddress());
+
+            // Writes go through the graph. graph.markSignalWritten internally:
             //   1. signal.version++
-            //   2. observers 标 dirty（effect 入 pending_effects）
-            //   3. batch_depth == 0 时 drainPendingEffects（按拓扑深度排序运行）
-            //   4. drain 时调每个 effect 的 graphRecomputeCb -> EffectBase.runWithTracking
+            //   2. observers mark dirty (effect -> pending_effects)
+            //   3. batch_depth == 0 runs drainPendingEffects (topo-sort run)
+            //   4. drain calls effect graphRecomputeCb -> EffectBase.runWithTracking
             //
-            // 旧 push DFS 路径（self.base.notifyAll）已删除，graph 路径覆盖所有调度
-            // 行为且具有：拓扑序、无 16 上限、diamond glitch freedom。
+            // The graph path covers all dispatch in topo order, with no 16 limit and diamond-glitch
+            // freedom.
             if (self.base.graph_node_raw != 0xFFFFFFFF) {
                 const gid: @import("graph.zig").NodeId = @bitCast(self.base.graph_node_raw);
                 self.owner.graph.markSignalWritten(gid) catch |err| {
@@ -151,14 +348,46 @@ pub fn Signal(comptime T: type) type {
             }
         }
 
-        /// 使用函数更新值
+        /// Swap to content-equal but bottom memory different, don't notify (read unchanged).
+        /// Borrow slice data source: caller swapped new array, old freed later, signal can't keep
+        /// pointing old (list line in-place update). Owned (write copies) owns copy, noop.
+        pub fn replaceSameContent(self: *Self, new_value: T) void {
+            self.checkAlive();
+            self.owner.assertThread();
+            std.debug.assert(eqlValue(T, self.value, new_value));
+            if (has_store) {
+                if (self.slice_store != null) return;
+            }
+            self.value = new_value;
+        }
+
+        fn recordWrite(self: *Self, ret_addr: usize) void {
+            self.owner.debug.signal_writes += 1;
+            self.debug.writers[self.debug.writer_next] = ret_addr;
+            self.debug.writer_next = @intCast((@as(usize, self.debug.writer_next) + 1) % debug_writer_slots);
+            if (self.base.graph_node_raw != 0xFFFFFFFF) {
+                const gid: graph_mod.NodeId = @bitCast(self.base.graph_node_raw);
+                if (self.owner.graph.currentReaderReads(gid)) {
+                    // Pain point 4: effect state sync. Switch to memo/scope.linked.
+                    self.owner.debug.self_write_warnings += 1;
+                    std.log.warn("[reactive] an effect/memo wrote Signal({s}) that it also read; use a memo or scope.linked instead", .{@typeName(T)});
+                }
+            }
+        }
+
+        /// Update value via function
         pub fn update(self: *Self, comptime updateFn: fn (T) T) void {
             self.set(updateFn(self.value));
+        }
+
+        /// Update with context: `sig.updateWith(ctx, comptime f)`, `f(ctx, old) T`.
+        pub fn updateWith(self: *Self, ctx: anytype, comptime updateFn: anytype) void {
+            self.set(updateFn(ctx, self.peek()));
         }
     };
 }
 
-// ===== 测试 =====
+// ===== Tests =====
 
 test "Signal: basic get/set" {
     var owner = try SignalOwner.init(std.testing.allocator);
@@ -178,7 +407,7 @@ test "Signal: peek doesn't track" {
 
     const count = try Signal(i32).create(owner, 0);
 
-    // peek 不应该触发依赖追踪
+    // peek shouldn't trigger dependency tracking
     _ = count.peek();
 
     try std.testing.expectEqual(@as(i32, 0), count.peek());
@@ -207,7 +436,7 @@ test "Signal: skip notification if value unchanged" {
 
     var notify_count: u32 = 0;
 
-    // 模拟订阅
+    // Simulate subscription
     const MockEffect = struct {
         var counter: *u32 = undefined;
 
@@ -218,11 +447,11 @@ test "Signal: skip notification if value unchanged" {
 
     MockEffect.counter = &notify_count;
 
-    // 设置相同的值不应该触发通知
+    // Set same value shouldn't notify
     count.set(42);
     try std.testing.expectEqual(@as(u32, 0), notify_count);
 
-    // 设置不同的值应该触发通知
+    // Set different value should notify
     count.set(100);
-    // 注意: 这里实际不会通知,因为没有真正的订阅者
+    // Note: doesn't actually notify here (no real subscriber)
 }

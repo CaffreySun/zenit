@@ -342,7 +342,7 @@ fn resolveOwned(
     const matching_stack = try allocator.alloc(u32, count);
     defer allocator.free(matching_stack);
 
-    var paragraph_list: std.ArrayListUnmanaged(ParagraphRange) = .{};
+    var paragraph_list: std.ArrayListUnmanaged(ParagraphRange) = .empty;
     defer paragraph_list.deinit(allocator);
     var paragraph_start: usize = 0;
     for (original_types, 0..) |kind, index| {
@@ -610,7 +610,7 @@ fn resolveParagraph(
     defer allocator.free(explicit_levels);
 
     const LevelRun = struct { start: usize, end: usize, level: u8 };
-    var run_list: std.ArrayListUnmanaged(LevelRun) = .{};
+    var run_list: std.ArrayListUnmanaged(LevelRun) = .empty;
     defer run_list.deinit(allocator);
     var run_start: usize = 0;
     var run_level = levels[visible[0]];
@@ -646,7 +646,7 @@ fn resolveParagraph(
         incoming[target] = true;
     }
 
-    var sequence: std.ArrayListUnmanaged(u32) = .{};
+    var sequence: std.ArrayListUnmanaged(u32) = .empty;
     defer sequence.deinit(allocator);
     for (run_list.items, 0..) |_, first_run| {
         if (incoming[first_run]) continue;
@@ -844,7 +844,7 @@ fn resolveBrackets(
 ) !void {
     var stack: [63]BracketStackEntry = undefined;
     var stack_len: usize = 0;
-    var pairs: std.ArrayListUnmanaged(BracketPair) = .{};
+    var pairs: std.ArrayListUnmanaged(BracketPair) = .empty;
     defer pairs.deinit(allocator);
     var overflowed = false;
 
@@ -1090,7 +1090,7 @@ test "numbers and common separators remain a level-two LTR run in RTL" {
 
 test "explicit depth overflow is deterministic and bounded" {
     const depth = 140;
-    var bytes: std.ArrayListUnmanaged(u8) = .{};
+    var bytes: std.ArrayListUnmanaged(u8) = .empty;
     defer bytes.deinit(testing.allocator);
     for (0..depth) |_| try bytes.appendSlice(testing.allocator, "\u{202B}");
     try bytes.append(testing.allocator, 'a');
@@ -1128,7 +1128,7 @@ test "invalid UTF-8 fails closed and long RTL input stays linear" {
 
 test "splitRuns preserves UTF-8 byte ranges and resolved numeric direction" {
     const text = "abc \u{05D0} 12";
-    var runs: std.ArrayListUnmanaged(Run) = .{};
+    var runs: std.ArrayListUnmanaged(Run) = .empty;
     defer runs.deinit(testing.allocator);
     try splitRuns(text, .ltr, &runs, testing.allocator);
     try testing.expect(runs.items.len >= 3);
@@ -1140,7 +1140,7 @@ test "splitRuns preserves UTF-8 byte ranges and resolved numeric direction" {
 
 test "splitRuns never merges adjacent paragraphs" {
     const text = "a\nb";
-    var runs: std.ArrayListUnmanaged(Run) = .{};
+    var runs: std.ArrayListUnmanaged(Run) = .empty;
     defer runs.deinit(testing.allocator);
     try splitRuns(text, .ltr, &runs, testing.allocator);
     try testing.expectEqual(@as(usize, 2), runs.items.len);

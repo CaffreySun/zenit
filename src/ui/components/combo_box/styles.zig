@@ -1,16 +1,15 @@
-/// ComboBox，样式层
-///
-/// 具名样式函数与共享几何常量；业务逻辑/State/portal 挂载在 mod.zig。
+/// ComboBox, styling layer. Named style functions and shared geometry
+/// constants; logic / State / portal mounted in mod.zig.
 const core = @import("../../core.zig");
 const theme = core.theme;
 
-/// Pvnqs / Select option: 14px 文本 + 8px 上下内边距。
-/// 面板滚动几何（ComboBoxState.item_h）与行样式共用。
+/// Pvnqs / Select option: 14px text + 8px top/bottom padding. Panel scroll
+/// geometry (ComboBoxState.item_h) shared with row style.
 pub const combo_item_height: f32 = 36;
 
-/// Pvnqs / Select panel chrome。
+/// Pvnqs / Select panel chrome.
 pub fn comboPanelRadius(t: *const theme.ThemeTokens) f32 {
-    return t.radius.xl;
+    return t.tokens.radius.xl;
 }
 
 pub fn comboPanelStyle(t: *const theme.ThemeTokens) core.BoxStyle {
@@ -19,8 +18,8 @@ pub fn comboPanelStyle(t: *const theme.ThemeTokens) core.BoxStyle {
         .direction = .column,
         .gap = 2,
         .padding = core.Padding.all(4),
-        .background = t.color.bg_primary,
-        .border = .{ .width = 1, .color = t.color.border, .radius = radius },
+        .background = t.tokens.color.bg_primary,
+        .border = .{ .width = 1, .color = t.tokens.color.border, .radius = radius },
         .corner_radius = radius,
         .shadow = .{
             .color = core.Color.rgba(0, 0, 0, 18),
@@ -40,35 +39,33 @@ pub fn comboItemStyle(t: *const theme.ThemeTokens) core.BoxStyle {
         .justify = .space_between,
         .align_items = .center,
         .overflow_hidden = true,
-        .corner_radius = t.radius.lg,
+        .corner_radius = t.tokens.radius.lg,
     };
 }
 
-/// 空态行，与 option 行同款几何但初始收起（height 0）
+/// Empty row: same geometry as option row but initially collapsed (height 0)
 pub fn comboEmptyStyle(t: *const theme.ThemeTokens) core.BoxStyle {
     var s = comboItemStyle(t);
     s.justify = .center;
-    s.display = .none; // 默认收起；applyFilter 按匹配数切换
+    s.display = .none; // Default collapsed; applyFilter toggles by match count
     return s;
 }
 
-pub fn comboItemTextStyle(disabled: bool, t: *const theme.ThemeTokens) core.TextProps {
+pub fn comboItemTextStyle(disabled: bool, t: *const theme.ThemeTokens) core.TextStyle {
     return .{
-        .content = "",
-        .color = if (disabled) t.color.fg_disabled else t.color.fg_primary,
+        .color = if (disabled) t.tokens.color.fg_disabled else t.tokens.color.fg_primary,
         .font_size = 14,
     };
 }
 
-pub fn comboEmptyTextStyle(t: *const theme.ThemeTokens) core.TextProps {
+pub fn comboEmptyTextStyle(t: *const theme.ThemeTokens) core.TextStyle {
     return .{
-        .content = "No results found",
-        .color = t.color.fg_tertiary,
+        .color = t.tokens.color.fg_tertiary,
         .font_size = 14,
     };
 }
 
-/// 键盘/hover 高亮行背景，运行时由 highlight 逻辑驱动
+/// Keyboard/hover highlight row bg, driven by highlight logic at runtime
 pub fn comboHighlightBg(t: *const theme.ThemeTokens) core.Color {
-    return t.color.list_hover_bg;
+    return t.tokens.color.list_hover_bg;
 }

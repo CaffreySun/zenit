@@ -1,5 +1,6 @@
-//! Markdown 样式层，全部由 MarkdownOptions 参数化（markdown 刻意不依赖 theme，
-//! 颜色/字号从 opts 注入）。mod.zig 的 emitter 只消费这些函数。
+//! Markdown style layer, all parameterized by MarkdownOptions (markdown intentionally independent
+//! of theme,
+//! colors / sizes injected from opts). mod.zig's emitter only consumes these functions.
 const core = @import("../../core.zig");
 const Padding = core.Padding;
 const TextSpan = core.TextSpan;
@@ -35,9 +36,8 @@ pub fn mdCodeBlockStyle(opts: MarkdownOptions) core.BoxStyle {
     };
 }
 
-pub fn mdCodeLineText(opts: MarkdownOptions) core.TextProps {
+pub fn mdCodeLineText(opts: MarkdownOptions) core.TextStyle {
     return .{
-        .content = "",
         .font_size = opts.code_font_size,
         .color = opts.code_color,
         .font_weight = 450,
@@ -85,16 +85,15 @@ pub fn mdListRowStyle() core.BoxStyle {
     };
 }
 
-pub fn mdListMarkerText(opts: MarkdownOptions) core.TextProps {
+pub fn mdListMarkerText(opts: MarkdownOptions) core.TextStyle {
     return .{
-        .content = "",
         .font_size = opts.base_font_size,
         .color = opts.text_color,
         .line_height = opts.line_height,
     };
 }
 
-// ── inline span 样式（`code` / [alt] 图像 chip / [text](url) 链接） ──
+// ── inline span styles (code / [alt] image chip / [text](url) link) ──
 
 pub fn mdCodeSpanStyle(opts: MarkdownOptions) TextSpan {
     return .{

@@ -1,6 +1,7 @@
-//! Cx 集成单测：帧时钟 / 节点释放与 scope / World SoA 镜像 / 主题切换 /
-//! textFmt / 输入命令 / 文本塑形度量等。从 core.zig 析出；由 core.zig 末尾
-//! 的 test 块显式 import，避免成为孤儿测试。
+//! Cx integration unit tests: frame clock / node release and scope / World
+//! SoA mirror / theme toggle / textFmt / input commands / text shaping
+//! measure etc. Factored out from core.zig; explicitly imported by core.zig
+//! end test block, avoids orphan tests.
 
 const std = @import("std");
 const core = @import("../core.zig");
@@ -34,22 +35,18 @@ const theme = core.theme;
 const transition = core.transition;
 const world = core.world;
 
-/// 把 last_frame_instant 往回拨 delta_ns，伪造一个"上一帧发生在 delta_ns 之前"的慢帧。
+/// Backdate last_frame_instant by delta_ns, fake a "previous frame happened
+/// delta_ns ago" slow frame.
 fn backdateLastFrame(cx: *Cx, delta_ns: u64) !void {
-    var t = try std.time.Instant.now();
-    t.timestamp.nsec -= @intCast(delta_ns % std.time.ns_per_s);
-    if (t.timestamp.nsec < 0) {
-        t.timestamp.nsec += std.time.ns_per_s;
-        t.timestamp.sec -= 1;
-    }
-    t.timestamp.sec -= @intCast(delta_ns / std.time.ns_per_s);
+    var t = try @import("zenit_time").Instant.now(std.testing.io);
+    t.timestamp -= delta_ns;
     cx.last_frame_instant = t;
 }
 
 test "frame clock stays wall-clock accurate when frames exceed the dt clamp" {
     const testing = std.testing;
 
-    var cx = try Cx.init(testing.allocator);
+    var cx = try Cx.init(testing.allocator, std.testing.io);
     defer cx.deinit();
 
     const root = try Node.create(testing.allocator, cx.nextId(), .box, .{});
@@ -59,35 +56,97 @@ test "frame clock stays wall-clock accurate when frames exceed the dt clamp" {
         cx.root = null;
     }
 
-    // 模拟 4fps 重负载：每帧 250ms，远超 0.1s 的增量 clamp。
+    // Simulate 4fps heavy load: 250ms per frame, far exceeds 0.1s increment
+    // clamp.
     const slow_frame_ns: u64 = 250 * std.time.ns_per_ms;
     const frames: u64 = 20;
 
-    // epoch 也往回拨满整段时长，让 now-epoch 覆盖全部 20 帧的真实时间。
-    var epoch = try std.time.Instant.now();
-    epoch.timestamp.sec -= @intCast(frames * slow_frame_ns / std.time.ns_per_s);
+    // Backdate epoch by full span, make now-epoch cover all 20 frames' real
+    // time.
+    var epoch = try @import("zenit_time").Instant.now(std.testing.io);
+    epoch.timestamp -= @intCast(frames * slow_frame_ns);
     cx.clock_epoch = epoch;
 
     var i: u64 = 0;
     while (i < frames) : (i += 1) {
-        cx.needs_redraw = true; // 保证走活跃路径而非 idle 早退
+        cx.needs_redraw = true; // Ensure active path rather than idle early-exit.
         try backdateLastFrame(cx, slow_frame_ns);
         cx.advanceFrameClock();
     }
 
-    // 回归断言：逻辑时钟必须跟得上真实经过时间。
-    // 修复前这里是 2000ms（40% 速度），亏空 3000ms 且永不追回。
+    // Regression: logic clock must keep pace with real elapsed time. Before
+    // fix this was 2000ms (40% speed), shortfall 3000ms never recovered.
     const real_elapsed_ms: f64 = @floatFromInt(frames * slow_frame_ns / std.time.ns_per_ms);
     try testing.expect(cx.frame_time_ms > real_elapsed_ms * 0.95);
 
-    // 增量 dt 仍必须被钳住，Spring 积分器依赖有界步长。
-    try testing.expect(cx.frame_dt_seconds <= 0.1);
+    // Increment dt must also be real frame interval: clamp to 0.1s makes
+    // increment animation 40% slow at 4fps.
+    try testing.expectApproxEqAbs(@as(f32, 0.25), cx.frame_dt_seconds, 0.01);
+
+    // Wake from idle: blocking wait since last tick isn't animation time,
+    // first frame advances one nominal frame.
+    cx.frame_clock_was_idle = true;
+    cx.needs_redraw = true;
+    try backdateLastFrame(cx, 300 * std.time.ns_per_ms);
+    cx.advanceFrameClock();
+    try testing.expect(cx.frame_dt_seconds <= 1.0 / 60.0 + 1e-6);
+    // Subsequent active frames restore real frame interval.
+    cx.needs_redraw = true;
+    try backdateLastFrame(cx, slow_frame_ns);
+    cx.advanceFrameClock();
+    try testing.expectApproxEqAbs(@as(f32, 0.25), cx.frame_dt_seconds, 0.01);
+}
+
+test "frame clock treats a host-skipped idle gap as idle, not as one long frame" {
+    const testing = std.testing;
+
+    var cx = try Cx.init(testing.allocator, std.testing.io);
+    defer cx.deinit();
+
+    const root = try Node.create(testing.allocator, cx.nextId(), .box, .{});
+    cx.root = root;
+    defer {
+        cx.freeNode(root);
+        cx.root = null;
+    }
+
+    cx.needs_redraw = true;
+    try backdateLastFrame(cx, 16 * std.time.ns_per_ms);
+    cx.advanceFrameClock();
+
+    // After-frame tree clean (dirty defaults true, zeroed per-bit).
+    const dirty = &root.frame_state.state_bits.dirty;
+    dirty.core.layout = false;
+    dirty.core.subtree_layout = false;
+    dirty.core.render = false;
+    dirty.core.subtree_render = false;
+    dirty.pipeline.composite = false;
+    dirty.pipeline.subtree_composite = false;
+    dirty.pipeline.order = false;
+    dirty.pipeline.subtree_order = false;
+    dirty.pipeline.interaction = false;
+    dirty.pipeline.subtree_interaction = false;
+    dirty.runtime.dirty = false;
+    dirty.runtime.subtree_dirty = false;
+    cx.a11y_prefs_version = @import("../a11y/preferences.zig").version();
+
+    // True host (Mac/Windows runtime) when wantsFrame() false skips whole
+    // frame, blocks waiting, doesn't call advanceFrameClock; idle branch never
+    // runs.
+    try testing.expect(!cx.wantsFrame());
+    try backdateLastFrame(cx, 700 * std.time.ns_per_ms);
+
+    // Event wake: this frame just-started animation from event can't eat 700ms
+    // blocking wait.
+    cx.needs_redraw = true;
+    cx.advanceFrameClock();
+    try testing.expect(cx.frame_dt_seconds <= 1.0 / 60.0 + 1e-6);
 }
 
 test "frame clock freezes across idle frames and resumes without a time jump" {
     const testing = std.testing;
 
-    var cx = try Cx.init(testing.allocator);
+    var cx = try Cx.init(testing.allocator, std.testing.io);
     defer cx.deinit();
 
     const root = try Node.create(testing.allocator, cx.nextId(), .box, .{});
@@ -97,15 +156,16 @@ test "frame clock freezes across idle frames and resumes without a time jump" {
         cx.root = null;
     }
 
-    // 先跑一个 active 帧建立基线。
+    // Run one active frame first to establish baseline.
     cx.needs_redraw = true;
     try backdateLastFrame(cx, 16 * std.time.ns_per_ms);
     cx.advanceFrameClock();
     const before_idle = cx.frame_time_ms;
 
-    // 一段很长的 idle：树全 clean + 无浮层动画 + 无 needs_redraw。
-    // 注意 dirty 位默认值是 true（见 node.zig:545），`= .{}` 会把树置脏而非置净，
-    // 必须逐位清零，否则本用例会走 active 路径、静默失去对 idle 冻结的覆盖。
+    // Long idle: tree all clean + no overlay animation + no needs_redraw. Note
+    // dirty defaults true (node.zig:545), `= {}` sets tree dirty not clean, must
+    // zero per-bit, else this case walks active path, silently loses idle freeze
+    // coverage.
     const dirty = &root.frame_state.state_bits.dirty;
     dirty.core.layout = false;
     dirty.core.subtree_layout = false;
@@ -115,21 +175,24 @@ test "frame clock freezes across idle frames and resumes without a time jump" {
     dirty.pipeline.subtree_composite = false;
     try testing.expect(cx_render.isTreeFullyClean(root));
 
-    // 用 backdate 伪造"这一帧距上一帧过了 1s"，但同时把 epoch 也往前推同样的量，
-    // 模拟真实世界里 idle 期间墙钟确实在走。若 idle 分支不累计 clock_paused_ns，
-    // 恢复后的 frame_time_ms 会把整段 idle 一次性算进去 -> 下面的 resume 断言炸。
+    // Fake "this frame 1s since last" by backdate, meanwhile backdate epoch
+    // same amount, simulate real idle walltime passed. If idle branch doesn't
+    // cumulate clock_paused_ns, resume frame_time_ms adds whole idle at once ->
+    // next resume assert fails.
     const idle_span_ns: u64 = 1 * std.time.ns_per_s;
     var i: usize = 0;
     while (i < 5) : (i += 1) {
         cx.needs_redraw = false;
         try backdateLastFrame(cx, idle_span_ns);
-        cx.clock_epoch.?.timestamp.sec -= @intCast(idle_span_ns / std.time.ns_per_s);
+        cx.clock_epoch.?.timestamp -= idle_span_ns;
         cx.advanceFrameClock();
-        // idle 期间逻辑时钟必须冻结（零脏帧快速路径依赖 time_unchanged）。
+        // Logic clock must freeze during idle (zero-dirty fast-path depends on
+        // time_unchanged).
         try testing.expectEqual(before_idle, cx.frame_time_ms);
     }
 
-    // 恢复 active：这 5 秒 idle 不能一次性灌进动画（否则浮层瞬间跳到终态）。
+    // Resume active: this 5s idle can't pour into animation once (else overlay
+    // jumps to end state).
     cx.needs_redraw = true;
     try backdateLastFrame(cx, 16 * std.time.ns_per_ms);
     cx.advanceFrameClock();
@@ -141,7 +204,7 @@ test "frame clock freezes across idle frames and resumes without a time jump" {
 test "freeNode disposes attached node scope" {
     const testing = std.testing;
 
-    var cx = try Cx.init(testing.allocator);
+    var cx = try Cx.init(testing.allocator, std.testing.io);
     defer cx.deinit();
 
     const node = try Node.create(testing.allocator, cx.nextId(), .box, .{});
@@ -167,7 +230,7 @@ test "freeNode disposes attached node scope" {
 test "freeDetachedNodeAfterScopeDispose clears stale child scope pointers" {
     const testing = std.testing;
 
-    var cx = try Cx.init(testing.allocator);
+    var cx = try Cx.init(testing.allocator, std.testing.io);
     defer cx.deinit();
 
     const parent_scope = try Scope.init(testing.allocator, null, cx.owner);
@@ -228,7 +291,7 @@ test "freeDetachedNodeAfterScopeDispose clears stale child scope pointers" {
 test "clearNodeScopes invalidates scope binding before node free" {
     const testing = std.testing;
 
-    var cx = try Cx.init(testing.allocator);
+    var cx = try Cx.init(testing.allocator, std.testing.io);
     defer cx.deinit();
 
     const parent_scope = try Scope.init(testing.allocator, null, cx.owner);
@@ -249,7 +312,7 @@ test "clearNodeScopes invalidates scope binding before node free" {
 test "freeNode releases zero-length owned text content" {
     const testing = std.testing;
 
-    var cx = try Cx.init(testing.allocator);
+    var cx = try Cx.init(testing.allocator, std.testing.io);
     defer cx.deinit();
 
     const node = try Node.create(testing.allocator, cx.nextId(), .box, .{});
@@ -264,7 +327,7 @@ test "freeNode releases zero-length owned text content" {
 test "text builder mirrors content into World.content" {
     const testing = std.testing;
 
-    var cx = try Cx.init(testing.allocator);
+    var cx = try Cx.init(testing.allocator, std.testing.io);
     defer cx.deinit();
 
     const node = try builders.text(cx, "hello", .{});
@@ -275,14 +338,14 @@ test "text builder mirrors content into World.content" {
     const mirrored = cx.world.content.getText(eid).?;
     try testing.expectEqualSlices(u8, "hello", mirrored.content);
 
-    // In-place 字段仍是 source of truth (stage 1 双写期)
+    // In-place field still source of truth (stage 1 dual-write period).
     try testing.expectEqualSlices(u8, "hello", node.getText().?.content);
 }
 
 test "image builder mirrors texture_id into World.content" {
     const testing = std.testing;
 
-    var cx = try Cx.init(testing.allocator);
+    var cx = try Cx.init(testing.allocator, std.testing.io);
     defer cx.deinit();
 
     const node = try builders.image(cx, 42, .{ .width = .{ .px = 10 }, .height = .{ .px = 10 } });
@@ -296,7 +359,7 @@ test "image builder mirrors texture_id into World.content" {
 test "setBackground mirrors into World.paint_state" {
     const testing = std.testing;
 
-    var cx = try Cx.init(testing.allocator);
+    var cx = try Cx.init(testing.allocator, std.testing.io);
     defer cx.deinit();
 
     const node = try builders.box(cx, .{}, .{});
@@ -316,7 +379,7 @@ test "setBackground mirrors into World.paint_state" {
 test "setOpacity mirrors into World.paint_state" {
     const testing = std.testing;
 
-    var cx = try Cx.init(testing.allocator);
+    var cx = try Cx.init(testing.allocator, std.testing.io);
     defer cx.deinit();
 
     const node = try builders.box(cx, .{}, .{});
@@ -333,27 +396,27 @@ test "setOpacity mirrors into World.paint_state" {
 test "setBackgroundRaw mirrors World but skips dirty/transition" {
     const testing = std.testing;
 
-    var cx = try Cx.init(testing.allocator);
+    var cx = try Cx.init(testing.allocator, std.testing.io);
     defer cx.deinit();
 
     const node = try builders.box(cx, .{}, .{});
     defer cx.freeNode(node);
     try testing.expect(node.element_id_raw != 0xFFFFFFFF);
 
-    // 给 node 配 background transition：setBackground 会走插值分支，
-    // setBackgroundRaw 必须**绕过**它直接落值。
+    // Configure node background transition: setBackground walks interpolation
+    // branch, setBackgroundRaw must **bypass** it, write directly.
     node.enableImplicitAnimation(cx.allocator, &.{.background}, .{ .duration_ms = 200 });
 
     const blue = Color.rgba(0, 0, 255, 255);
     node.setBackgroundRaw(blue);
 
-    // 1. in-place 字段直接落值（非插值起点）
+    // 1. In-place field write directly (non-interpolation starting point).
     try testing.expectEqual(@as(u8, 255), node.getBackground().b);
-    // 2. 镜像到 World.paint_state
+    // 2. Mirror to World.paint_state.
     const eid = world.ElementId.fromRaw(node.element_id_raw);
     const mirrored = cx.world.paint_state.get(eid).?;
     try testing.expectEqual(@as(u8, 255), mirrored.background.b);
-    // 3. 未激活 transition slot（Raw 绕过插值）
+    // 3. Transition slot not activated (Raw bypasses interpolation).
     if (node.frame_state.frame_local.runtime.transitions) |slots| {
         if (slots.find(.background)) |slot| {
             try testing.expect(!slot.active);
@@ -364,7 +427,7 @@ test "setBackgroundRaw mirrors World but skips dirty/transition" {
 test "setOpacityRaw mirrors World, no transition activation" {
     const testing = std.testing;
 
-    var cx = try Cx.init(testing.allocator);
+    var cx = try Cx.init(testing.allocator, std.testing.io);
     defer cx.deinit();
 
     const node = try builders.box(cx, .{}, .{});
@@ -388,7 +451,7 @@ test "setOpacityRaw mirrors World, no transition activation" {
 test "setLayoutOutput/getLayoutOutput 走 World (无 in-place 字段)" {
     const testing = std.testing;
 
-    var cx = try Cx.init(testing.allocator);
+    var cx = try Cx.init(testing.allocator, std.testing.io);
     defer cx.deinit();
 
     const node = try builders.box(cx, .{}, .{});
@@ -400,7 +463,7 @@ test "setLayoutOutput/getLayoutOutput 走 World (无 in-place 字段)" {
     lo.vector.stroke.width = 2.5;
     node.setLayoutOutput(lo);
 
-    // getLayoutOutput 走 World read callback（World 是 source of truth）
+    // getLayoutOutput walks World read callback (World is source of truth).
     try testing.expectEqual(@as(f32, 30), node.getLayoutOutput().artifacts.children_bbox.?.w);
     try testing.expectEqual(@as(f32, 2.5), node.getLayoutOutput().vector.stroke.width);
 
@@ -412,27 +475,28 @@ test "setLayoutOutput/getLayoutOutput 走 World (无 in-place 字段)" {
 test "layoutOutputPtr 原地改子字段直写 World" {
     const testing = std.testing;
 
-    var cx = try Cx.init(testing.allocator);
+    var cx = try Cx.init(testing.allocator, std.testing.io);
     defer cx.deinit();
 
     const node = try builders.box(cx, .{}, .{});
     defer cx.freeNode(node);
 
-    // owner/layout_engine 路径用 layoutOutputPtr 拿 World slot 稳定地址原地改
+    // owner/layout_engine path uses layoutOutputPtr get stable World slot
+    // address, mutate in-place.
     const lo = node.layoutOutputPtr().?;
     lo.artifacts.children_bbox = .{ .x = 0, .y = 0, .w = 77, .h = 0 };
 
-    // 无 in-place 字段；getLayoutOutput 读 World 应见到改动
+    // No in-place fields; getLayoutOutput reads World should see changes.
     try testing.expectEqual(@as(f32, 77), node.getLayoutOutput().artifacts.children_bbox.?.w);
 }
 
 test "主题运行时切换 (dark / light / high_contrast)" {
     const testing = std.testing;
 
-    var cx = try Cx.init(testing.allocator);
+    var cx = try Cx.init(testing.allocator, std.testing.io);
     defer cx.deinit();
 
-    // 初始为 dark
+    // Initially dark.
     try testing.expectEqualStrings("dark", cx.tokens.name);
 
     cx.setTheme(&theme.light);
@@ -441,18 +505,18 @@ test "主题运行时切换 (dark / light / high_contrast)" {
 
     cx.setTheme(&theme.high_contrast);
     try testing.expectEqualStrings("high_contrast", cx.tokens.name);
-    // high_contrast 纯黑底
-    try testing.expectEqual(@as(u8, 0), cx.tokens.color.bg_base.r);
-    try testing.expectEqual(@as(u8, 0), cx.tokens.color.bg_base.g);
-    try testing.expectEqual(@as(u8, 0), cx.tokens.color.bg_base.b);
-    // 纯白前景
-    try testing.expectEqual(@as(u8, 255), cx.tokens.color.fg_primary.r);
+    // high_contrast pure black background.
+    try testing.expectEqual(@as(u8, 0), cx.tokens.tokens.color.bg_base.r);
+    try testing.expectEqual(@as(u8, 0), cx.tokens.tokens.color.bg_base.g);
+    try testing.expectEqual(@as(u8, 0), cx.tokens.tokens.color.bg_base.b);
+    // Pure white foreground.
+    try testing.expectEqual(@as(u8, 255), cx.tokens.tokens.color.fg_primary.r);
 }
 
 test "setTheme 触发 before_render hook + theme_version 自增" {
     const testing = std.testing;
 
-    var cx = try Cx.init(testing.allocator);
+    var cx = try Cx.init(testing.allocator, std.testing.io);
     defer cx.deinit();
 
     const Probe = struct {
@@ -485,14 +549,14 @@ test "setTheme 触发 before_render hook + theme_version 自增" {
 test "theme Signal 化: themeSignal 惰性创建 + setTheme 驱动 set" {
     const testing = std.testing;
 
-    var cx = try Cx.init(testing.allocator);
+    var cx = try Cx.init(testing.allocator, std.testing.io);
     defer cx.deinit();
 
     const scope = try Scope.init(testing.allocator, null, cx.owner);
     defer scope.dispose();
 
     const sig = try cx.themeSignal(scope);
-    // 重复调用返回同一 Signal
+    // Repeated calls return same Signal.
     try testing.expectEqual(sig, try cx.themeSignal(scope));
     try testing.expectEqualStrings("dark", sig.get().name);
 
@@ -500,62 +564,60 @@ test "theme Signal 化: themeSignal 惰性创建 + setTheme 驱动 set" {
     try testing.expectEqualStrings("light", sig.get().name);
 }
 
-// 续接记录「待继续的工作」第 4 条点名的风险，做出故障复现：
-// **Cx.theme_signal 缓存了一个归属于「第一个调用者的 Scope」的 Signal，
-// 而 Scope 销毁时没有任何解绑**，于是缓存指向已释放内存。
-//
-// 真实触发路径：主题信号是全局的，但第一个订阅它的往往是某个**组件/面板**
-// 的 scope（比如一个弹层）。那个面板一关（scope.dispose），Cx 上的缓存就悬垂；
-// 下一个调用 themeSignal 的人拿到的是野指针，setTheme 会往里写。
+// Reproduces a failure: **Cx.theme_signal caches a Signal owned by the "first caller's
+// Scope", and the Scope is destroyed with no unbind**, so the cache points to freed memory.
+// The theme signal is global, but the first subscriber is often a component/panel scope
+// (e.g., popover). When that panel closes (scope.dispose) the cache on Cx dangles; the
+// next themeSignal caller gets a wild pointer and setTheme writes through it.
 test "themeSignal 的缓存必须随创建它的 Scope 一起失效（故障复现）" {
     const testing = std.testing;
 
-    var cx = try Cx.init(testing.allocator);
+    var cx = try Cx.init(testing.allocator, std.testing.io);
     defer cx.deinit();
 
-    // 长命 scope：代表窗口根。
+    // Long-lived scope: represents window root.
     const root_scope = try Scope.init(testing.allocator, null, cx.owner);
     defer root_scope.dispose();
 
     {
-        // 短命 scope：代表一个弹层/面板，它碰巧是第一个订阅主题的。
+        // Short-lived scope: represents popover/panel, happens first to subscribe
+        // theme.
         const panel_scope = try Scope.init(testing.allocator, null, cx.owner);
         const sig = try cx.themeSignal(panel_scope);
         try testing.expectEqualStrings("dark", sig.get().name);
         panel_scope.dispose();
     }
 
-    // 面板关掉之后：缓存必须已经失效，themeSignal 应当在 root_scope 上重建。
-    // 修复前这里返回的是已释放的 Signal，get()/setTheme 都是 UAF。
+    // After panel closes: cache must invalidate, themeSignal should rebuild on
+    // root_scope. Before fix returned freed Signal, get()/setTheme both UAF.
     const sig2 = try cx.themeSignal(root_scope);
     try testing.expectEqualStrings("dark", sig2.get().name);
     cx.setTheme(&theme.light);
     try testing.expectEqualStrings("light", sig2.get().name);
 }
 
-// 交叉审查（glm-5.3）指出的**瞬态窗口**，实测确认存在并已修：
-// disposeNow 的顺序是 1 子 scope -> 2 cleanups -> 3 effects -> 4 销毁 signals
-// -> 5 resources。解绑若登记成 **resource**（第 5 步），就发生在 Signal
-// 已被释放**之后**，而第 3/4 步跑的是用户回调，任何一个再调 themeSignal
-// 都会命中还没清的缓存拿到野指针。所以解绑必须登记成 **cleanup**（第 2 步）。
-//
-// 本测试在 cleanup 里回调 themeSignal 来钉住这个顺序：拿到的必须是一个
-// **活的**（新建在别的 scope 上的）Signal，而不是正在被销毁的那个。
+// There is a **transient window**: disposeNow order is 1 child scope -> 2 cleanups ->
+// 3 effects -> 4 destroy signals -> 5 resources. If unbind were registered as a resource
+// (step 5) it would run after the Signal is freed (step 4), and steps 3/4 run user
+// callbacks, so any themeSignal call hits the uncleaned cache and gets a wild pointer.
+// So unbind must register as cleanup (step 2). This test calls themeSignal in a cleanup to
+// pin this order: it must get a live (rebuilt on another scope) Signal, not one being
+// destroyed.
 test "dispose 期间回调里再取 themeSignal 不得拿到野指针" {
     const testing = std.testing;
 
-    var cx = try Cx.init(testing.allocator);
+    var cx = try Cx.init(testing.allocator, std.testing.io);
     defer cx.deinit();
 
     const root_scope = try Scope.init(testing.allocator, null, cx.owner);
     defer root_scope.dispose();
 
-    // 探针登记成 **resource**：resources 在第 5 步跑，也就是 signals 已经
-    // 在第 4 步被销毁**之后**。逆序执行 ⇒ 后登记的先跑，所以这个探针一定
-    // 排在 themeSignal 自己登记的解绑之前，正是最坏情况。
-    // 解绑若也登记成 resource（错误写法），此刻缓存还指着已释放的 Signal，
-    // 探针的 get() 就是 UAF；解绑登记成 cleanup（正确写法，第 2 步）则缓存
-    // 早已清空，探针会在 root_scope 上重建一个活的。
+    // Probe registered as resource: resources run at step 5, signals are destroyed at
+    // step 4 already. Reverse execution => later registration runs first, so the probe
+    // ranks before themeSignal's own unbind registration, exactly the worst case. If unbind were
+    // also a resource (bug), the cache would still point at the freed Signal and the probe's
+    // get() is a UAF; with unbind registered as cleanup (correct, step 2) the cache is already
+    // cleared and the probe rebuilds live on root_scope.
     const Probe = struct {
         cx: *Cx,
         root: *Scope,
@@ -576,26 +638,26 @@ test "dispose 期间回调里再取 themeSignal 不得拿到野指针" {
         panel_scope.dispose();
     }
 
-    // 探针拿到的必须是活 Signal 的内容，不是野指针读出的垃圾。
+    // Probe must get live Signal content, not wild pointer garbage.
     try testing.expectEqualStrings("dark", probe.name);
 }
 
 test "boxStyled/textStyled: setTheme 重放具名样式函数（含 paint_state 背景路径）" {
     const testing = std.testing;
 
-    var cx = try Cx.init(testing.allocator);
+    var cx = try Cx.init(testing.allocator, std.testing.io);
     defer cx.deinit();
 
     const S = struct {
         fn card(t: *const theme.ThemeTokens) core_types.BoxStyle {
             return .{
-                .background = t.color.bg_primary,
-                .padding = core_types.Padding.all(t.space._4),
-                .text_color = t.color.fg_primary,
+                .background = t.tokens.color.bg_primary,
+                .padding = core_types.Padding.all(t.tokens.space.space400),
+                .text_color = t.tokens.color.fg_primary,
             };
         }
         fn label(t: *const theme.ThemeTokens) builders.TextStyle {
-            return .{ .color = t.color.fg_primary, .font_size = t.font_size.md };
+            return .{ .color = t.tokens.color.fg_primary, .font_size = t.tokens.font_size.md };
         }
     };
 
@@ -604,8 +666,9 @@ test "boxStyled/textStyled: setTheme 重放具名样式函数（含 paint_state 
     const label_node = try builders.textStyled(cx, S.label, "hello");
     try root.appendChild(testing.allocator, label_node);
 
-    // DevTools 精确来源：具名样式字段指向原始 style fn；函数未声明的字段
-    // 不冒充有来源。TextStyle 的三个可追踪字段同样挂在 label fn 上。
+    // DevTools precise origin: named style field points original style fn;
+    // undeclared field doesn't claim source. TextStyle three trackable fields
+    // same hang on label fn.
     const card_addr = @intFromPtr(&S.card);
     try testing.expectEqual(card_addr, root.styleOrigin(.background).?.address);
     try testing.expectEqual(world.StyleOriginKind.styled, root.styleOrigin(.padding).?.kind);
@@ -617,24 +680,26 @@ test "boxStyled/textStyled: setTheme 重放具名样式函数（含 paint_state 
     try testing.expectEqual(world.StyleOriginKind.set_style, translate_origin.kind);
     try testing.expect(translate_origin.address != 0);
 
-    // mount 时即应用 dark 值（background 走 paint_state，不在 Style 里）
-    try testing.expectEqual(theme.dark.color.bg_primary, root.getBackground());
-    try testing.expectEqual(theme.dark.color.fg_primary, label_node.getText().?.color);
-    // on_theme 不是 before_render hook：不毒化 promoted cache 资格
+    // Apply dark value on mount (background walks paint_state, not in Style).
+    try testing.expectEqual(theme.dark.tokens.color.bg_primary, root.getBackground());
+    try testing.expectEqual(theme.dark.tokens.color.fg_primary, label_node.getText().?.color);
+    // on_theme not before_render hook: doesn't poison promoted cache
+    // eligibility.
     try testing.expect(!root.hasBeforeRenderHooks());
     try testing.expect(!label_node.hasBeforeRenderHooks());
 
     cx.setTheme(&theme.light);
 
-    // 背景色必须跟随（历史坑：只 applyTo 的话 background 恰恰不更新）
-    try testing.expectEqual(theme.light.color.bg_primary, root.getBackground());
-    try testing.expectEqual(theme.light.color.fg_primary, label_node.getText().?.color);
-    try testing.expectEqual(theme.light.color.fg_primary, root.style.ext.?.text_color.?);
-    // 布局脏已标（样式函数可能输出布局字段）
+    // Background must follow (history pit: applyTo alone background doesn't
+    // update).
+    try testing.expectEqual(theme.light.tokens.color.bg_primary, root.getBackground());
+    try testing.expectEqual(theme.light.tokens.color.fg_primary, label_node.getText().?.color);
+    try testing.expectEqual(theme.light.tokens.color.fg_primary, root.style.ext.?.text_color.?);
+    // Layout dirty marked (style fn might output layout fields).
     try testing.expect(root.frame_state.state_bits.dirty.core.layout);
 
-    // 普通 box 不受影响：无 on_theme、无任何 hook
-    const plain = try builders.box(cx, .{ .background = theme.dark.color.bg_secondary }, .{});
+    // Regular box unaffected: no on_theme, no hook.
+    const plain = try builders.box(cx, .{ .background = theme.dark.tokens.color.bg_secondary }, .{});
     try root.appendChild(testing.allocator, plain);
     try testing.expect(plain.meta.per_frame.hooks.on_theme == null);
 }
@@ -642,12 +707,12 @@ test "boxStyled/textStyled: setTheme 重放具名样式函数（含 paint_state 
 test "invalidateSubtreeHookState 摘除 on_theme hook" {
     const testing = std.testing;
 
-    var cx = try Cx.init(testing.allocator);
+    var cx = try Cx.init(testing.allocator, std.testing.io);
     defer cx.deinit();
 
     const S = struct {
         fn card(t: *const theme.ThemeTokens) core_types.BoxStyle {
-            return .{ .background = t.color.bg_primary };
+            return .{ .background = t.tokens.color.bg_primary };
         }
     };
 
@@ -660,7 +725,7 @@ test "invalidateSubtreeHookState 摘除 on_theme hook" {
 }
 
 test "textFmt updates content when a source signal changes" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     const scope = try Scope.init(std.testing.allocator, null, cx.owner);
     defer scope.dispose();
@@ -675,13 +740,13 @@ test "textFmt updates content when a source signal changes" {
 }
 
 test "textFmt long content falls back to heap without truncation" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     const scope = try Scope.init(std.testing.allocator, null, cx.owner);
     defer scope.dispose();
 
     const n = try scope.createSignal(u64, 7);
-    const label = try textFmt(cx, scope, "x" ** 70 ++ "{d}", .{n}, .{});
+    const label = try textFmt(cx, scope, (@as([("x").len * (70)]u8, @bitCast(@as([70][("x").len]u8, @splat(("x").*)))) ++ "") ++ "{d}", .{n}, .{});
     cx.root = label;
 
     try std.testing.expect(label.getText().?.content.len == 71);
@@ -690,10 +755,11 @@ test "textFmt long content falls back to heap without truncation" {
 }
 
 test "Cx.handleDrag: source-completion kind(4) 与未知 kind 不 panic" {
-    // 回归锁：kind=4 是 beginDrag 的完成回执（system_sdk 层文档），此前
-    // 直接 @enumFromInt 进 DragEvent.Kind(0..3)，任何拖出会话松手即
-    // "invalid enum value" panic。真机脚本 verify_interop_probe.sh 逮到。
-    var cx = try Cx.init(std.testing.allocator);
+    // Regression lock: kind=4 is beginDrag completion receipt (system_sdk
+    // layer docs), before direct @enumFromInt into DragEvent.Kind(0..3), any drag
+    // session release "invalid enum value" panic. Real device script verify_interop_probe.sh
+    // caught.
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
 
     cx.handleDrag(10, 10, 4, "");
@@ -702,10 +768,11 @@ test "Cx.handleDrag: source-completion kind(4) 与未知 kind 不 panic" {
 }
 
 test "Cx.handleCommand: 无焦点时全树回退找 action context（wrapper root 不再吞菜单命令）" {
-    // 回归锁：cx.root 是 App 的内部 wrapper，dispatchAction 从焦点向上走，
-    // 用户 mount root 上绑的 context 永远走不到，真菜单点击静默丢失
-    // （verify_menu.sh 逮到）。修复 = ignored 时全树找第一个匹配节点。
-    var cx = try Cx.init(std.testing.allocator);
+    // Regression lock: cx.root is App's internal wrapper,
+    // dispatchAction walks up from focus, user mount on root binds context never
+    // reaches, true menu click silent loss (verify_menu.sh caught). Fix = ignored
+    // when find first match node whole tree.
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
 
     const wrapper = try Node.create(std.testing.allocator, cx.nextId(), .box, .{});
@@ -743,7 +810,7 @@ test "Cx.handler requires existing state" {
         }
     };
 
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
 
     try std.testing.expectError(error.StateNotFound, cx.handler(CounterState, 1, CounterState.increment));
@@ -758,7 +825,7 @@ test "Cx.handler binds to explicit state" {
         }
     };
 
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
 
     const state = try cx.state(CounterState, 7, .{});
@@ -770,28 +837,26 @@ test "Cx.handler binds to explicit state" {
 }
 
 test "光标测量：shape 钩子装与不装必须同宽（ASCII / ASCII+emoji / CJK）" {
-    // == 这个测试钉的是什么 ==
-    // measureTextWidthWithSpans **不是参数的纯函数**：measureProportional
-    // 先试 GlyphRun shape 钩子，NaN 才回落到 measure_ctx_fn / measure_fn。
-    // 于是同一段文本、同一组参数，会因为「当前有没有装钩子」得到两个答案：
-    //   - 布局与绘制：不装钩子 -> measure_ctx_fn 那条（App 的 FontSelector）
-    //   - 光标/选区/命中：computeCursorPos 装钩子 -> shape 管线解析的字体
-    // 两条路只要选出不同的 Font，光标就系统性地偏离字形边缘。实测
-    // 下游编辑器上 "ssdf x😊" 差 1.442px（57.906 vs 59.348），行尾光标短在
-    // 字形右缘里侧；**纯英文行同样错**，emoji 只是让缺口更显眼。
-    //
-    // 修复方式是给 shape 管线装 setShapeFontResolver，让它与测量端拿到
-    // 同一个 *Font。本测试模拟那个装配，并断言两条路等宽。
-    // 判据故意**不写死像素值**（随系统字体版本漂移会变脆），而是断言
-    // 「两条路必须相等」，这正是 bug 的形状，也是修复要维持的不变式。
-    var cx = try Cx.init(std.testing.allocator);
+    // == What this test pins ==. measureTextWidthWithSpans is **not a pure function of its
+    // parameters**: measureProportional first tries the GlyphRun shape hook, NaN falls back to
+    // measure_ctx_fn / measure_fn. So the same text and params give two answers depending on
+    // whether the hook is installed: - layout+draw: no hook -> measure_ctx_fn branch (App's
+    // FontSelector) - cursor/selection/hit: computeCursorPos installs hook -> shape pipeline
+    // font. If the two paths pick different Fonts, the cursor drifts systematically from glyph
+    // edges (even pure ASCII; emoji just makes the gap visible).
+    // Fix: rig the shape pipeline with setShapeFontResolver so it and the measure end grab the
+    // same *Font. This test simulates that wiring and asserts both paths give equal width.
+    // It intentionally **doesn't hardcode pixel values** (drift per OS font version); "two paths
+    // must equal" is the bug shape and the invariant to maintain.
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
-    var fonts = try FontSystem.init(std.testing.allocator);
+    var fonts = try FontSystem.init(std.testing.allocator, @import("std").testing.io);
     defer fonts.deinit();
     cx.text.setFontSystem(&fonts);
     defer cx.text.clearFontSystem();
 
-    // 一个具体字体同时供给两条路，相当于 App.setFontSelector 的最小模型。
+    // One concrete font feeds both paths, equivalent to App.setFontSelector
+    // minimal model.
     const base = try fonts.findFont(.{ .family = "Helvetica Neue", .size = 14 });
     defer base.deinit();
 
@@ -819,36 +884,38 @@ test "光标测量：shape 钩子装与不装必须同宽（ASCII / ASCII+emoji 
 
     const tl = text_layout;
     const cases = [_][]const u8{
-        "ssdf x", // 纯 ASCII —— 用户明确报告英文也偏，必须覆盖
-        "ssdf x\u{1F60A}", // ASCII + emoji（最初的复现串）
-        "\u{4E2D}\u{6587}\u{6D4B}\u{8BD5}", // CJK 走 fallback 字体，另一条解析分支
-        "abc\u{4E2D}d\u{1F60A}e", // 三种混排：同一行里跨越三条字体解析路径
+        "ssdf x", // Pure ASCII -- user explicitly reported English is also off, must cover.
+        "ssdf x\u{1F60A}", // ASCII + emoji (original reproduce string).
+        "\u{4E2D}\u{6587}\u{6D4B}\u{8BD5}", // CJK walks fallback font, another parsing branch.
+        "abc\u{4E2D}d\u{1F60A}e", // Three mixed: cross three font parse paths in one line.
     };
 
     for (cases) |content| {
         const end: u32 = @intCast(content.len);
-        // 不装钩子（布局/绘制这条路）
+        // No hook (layout/draw path).
         const no_hook = tl.measureTextWidthWithSpans(content, 0, end, 14, 450, false, false, &.{});
-        // 装钩子（光标/选区这条路）
+        // Hook installed (cursor/selection path).
         var guard = cx.text.beginExternalTextMeasure();
         const with_hook = tl.measureTextWidthWithSpans(content, 0, end, 14, 450, false, false, &.{});
         guard.end();
 
         try std.testing.expect(no_hook > 0);
         try std.testing.expect(with_hook > 0);
-        // 亚像素级一致。0.01 只是容忍 f32 累加噪声；
-        // 真出 bug 时差的是整像素级（实测 1.442 / 3.783）。
+        // Subpixel-level agreement. 0.01 just tolerate f32 cumulative noise;
+        // real bug when delta integer-pixel (measured 1.442 / 3.783).
         try std.testing.expectApproxEqAbs(no_hook, with_hook, 0.01);
     }
 }
 
 test "光标测量：前缀宽度沿整行单调且末项等于整串" {
-    // 配套锚点：上一个保证「两条路同宽」，这个保证「前缀累加 == 整串」。
-    // computeCursorPos 按 [0, col) 前缀定位光标，所以前缀序列必须单调不减、
-    // 且最后一项等于整串宽度，行尾光标正是靠这条等式落在文本右缘。
-    var cx = try Cx.init(std.testing.allocator);
+    // Companion anchor: previous ensures "two paths same width", this ensures
+    // "prefix cumulative == full string". computeCursorPos positions cursor by
+    // [0, col) prefix, so prefix sequence must monotone non-decreasing, last item
+    // equals full string width, line-end cursor lands text right edge by this
+    // equation.
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
-    var fonts = try FontSystem.init(std.testing.allocator);
+    var fonts = try FontSystem.init(std.testing.allocator, @import("std").testing.io);
     defer fonts.deinit();
     cx.text.setFontSystem(&fonts);
     defer cx.text.clearFontSystem();
@@ -862,7 +929,7 @@ test "光标测量：前缀宽度沿整行单调且末项等于整串" {
         var prev: f32 = 0;
         var i: u32 = 1;
         while (i <= content.len) : (i += 1) {
-            // 只在 UTF-8 字符边界取前缀（把 emoji 从中间切开没有意义）
+            // Prefix only at UTF-8 boundaries (slicing emoji mid-cluster meaningless).
             if (i < content.len and (content[i] & 0xC0) == 0x80) continue;
             const w = tl.measureTextWidthWithSpans(content, 0, i, 14, 450, false, false, &.{});
             try std.testing.expect(w >= prev - 0.001);
@@ -873,9 +940,9 @@ test "光标测量：前缀宽度沿整行单调且末项等于整串" {
 }
 
 test "shapeVisualLine extracts CoreText grapheme and mixed-bidi caret geometry" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
-    var fonts = try FontSystem.init(std.testing.allocator);
+    var fonts = try FontSystem.init(std.testing.allocator, @import("std").testing.io);
     defer fonts.deinit();
     cx.text.setFontSystem(&fonts);
     defer cx.text.clearFontSystem();
@@ -917,9 +984,9 @@ test "shapeVisualLine extracts CoreText grapheme and mixed-bidi caret geometry" 
 }
 
 test "shapeVisualLine paragraph base direction follows UAX 9 outside isolates" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
-    var fonts = try FontSystem.init(std.testing.allocator);
+    var fonts = try FontSystem.init(std.testing.allocator, @import("std").testing.io);
     defer fonts.deinit();
     cx.text.setFontSystem(&fonts);
     defer cx.text.clearFontSystem();
@@ -938,19 +1005,21 @@ test "shapeVisualLine paragraph base direction follows UAX 9 outside isolates" {
     try std.testing.expectEqual(text_core_module.text_coordinates.Direction.rtl, rtl_line.value.base_direction);
 }
 
-// 下游回归合同锁：measureTextWidth 必须与 GlyphRun 管线（渲染/光标/选区
-// 用的 shapeText "system"）同源。两条度量路径并存却无交叉一致性测试，
-// 是拉丁 ~1.5% 漂移能存活到下游的结构性原因，此测试红 = 管线再度分裂。
+// Contract lock: measureTextWidth must be same-origin as the GlyphRun pipeline
+// (render/cursor/selection use shapeText "system"). Two measure paths coexisting with no
+// cross-consistency test is the structural reason ~1.5% Latin drift survived; red here =
+// the pipeline split again.
 test "measureTextWidth 与 shapeText 跨管线一致（下游回归）" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
-    var fonts = try FontSystem.init(std.testing.allocator);
+    var fonts = try FontSystem.init(std.testing.allocator, @import("std").testing.io);
     defer fonts.deinit();
     cx.text.setFontSystem(&fonts);
     defer cx.text.clearFontSystem();
 
-    // 覆盖当年的分歧画像：长拉丁（差最大）、短拉丁、数字（巧合相等）、
-    // CJK（本就一致）、混排、CJK+SMP emoji（cascade 分歧用例）。
+    // Cover disparity picture back then: long Latin (max diff), short Latin,
+    // digits (coincide), CJK (consistent), mixed, CJK+SMP emoji (cascade
+    // disparity case).
     const corpus = [_][]const u8{
         "The quick brown fox jumps over the lazy dog wonderful",
         "df",
@@ -968,13 +1037,14 @@ test "measureTextWidth 与 shapeText 跨管线一致（下游回归）" {
     }
 }
 
-// #36 审查回归锁：emoji 强制字体必须按 ZWJ 序列整体覆盖。逐码点覆盖会把
-// BMP 的 ZWJ 留在基字体 run 里、CTLine 不跨 run 结扎，👨‍👩‍👧 曾从单字形
-// 21px 碎成三个人形 63px（度量/渲染/caret 三路同坏，全套测试当时全绿）。
+// Emoji must force-font cover ZWJ sequences whole. Per-codepoint cover leaves BMP ZWJ in
+// the base font run, and CTLine can't knit across runs: a ZWJ family emoji fragments from a
+// single 21px glyph into three person shapes at 63px (measure/render/caret all equally
+// broken, so the rest of the suite stays green).
 test "ZWJ emoji 序列塑形不碎裂（#36 审查回归）" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
-    var fonts = try FontSystem.init(std.testing.allocator);
+    var fonts = try FontSystem.init(std.testing.allocator, @import("std").testing.io);
     defer fonts.deinit();
     cx.text.setFontSystem(&fonts);
     defer cx.text.clearFontSystem();
@@ -987,24 +1057,25 @@ test "ZWJ emoji 序列塑形不碎裂（#36 审查回归）" {
     }.of;
 
     const one_person = try adv(cx, "\u{1F468}");
-    // 家庭序列（👨 ZWJ 👩 ZWJ 👧）= 单字形，宽度 ≈ 单成员
+    // Family sequence (👨 ZWJ 👩 ZWJ 👧) = single glyph, width ≈ single
+    // member.
     try std.testing.expectApproxEqAbs(one_person, try adv(cx, "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}"), 0.5);
-    // ❤️‍🔥（BMP 成员 2764+VS16 起头的 ZWJ 序列）= 单字形
+    // ❤️‍🔥 (BMP member 2764+VS16 ZWJ sequence) = single glyph.
     try std.testing.expectApproxEqAbs(try adv(cx, "\u{1F525}"), try adv(cx, "\u{2764}\u{FE0F}\u{200D}\u{1F525}"), 0.5);
-    // 肤色修饰与旗帜（无 ZWJ 的多码点簇）也必须保持单字形
+    // Skin tone modifier and flags (multi-codepoint clusters sans ZWJ) also
+    // keep single glyph.
     try std.testing.expectApproxEqAbs(try adv(cx, "\u{1F44B}"), try adv(cx, "\u{1F44B}\u{1F3FB}"), 0.5);
     try std.testing.expectApproxEqAbs(one_person, try adv(cx, "\u{1F1FA}\u{1F1F8}"), 0.5);
 }
 
-// #36 根因 4 锁：CoreText cascade 是 run 上下文相关的，🈶 (U+1F236) 孤立
-// 塑形走 Apple Color Emoji (~1.33em)，跟在 CJK run 后曾被 PingFang 接走
-// (1em)。强制 emoji 字体后 advance 必须与上下文无关（CJK 无跨字距，
-// 整串宽度 = 各段之和才成立；渲染端 per-codepoint 分段与度量端整串
-// CTLine 的一致性正建立在这条性质上）。
+// CoreText cascade is context-dependent: U+1F236 isolated uses Apple Color Emoji (~1.33em),
+// but after a CJK run gets picked by PingFang (1em). Force emoji font so advance is
+// context-independent (CJK has no cross-char kerning, so whole width = sum of parts holds;
+// render per-codepoint segment vs measure whole CTLine consistency depends on this property).
 test "SMP emoji advance 与 run 上下文无关（下游回归）" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
-    var fonts = try FontSystem.init(std.testing.allocator);
+    var fonts = try FontSystem.init(std.testing.allocator, @import("std").testing.io);
     defer fonts.deinit();
     cx.text.setFontSystem(&fonts);
     defer cx.text.clearFontSystem();
@@ -1019,37 +1090,36 @@ test "SMP emoji advance 与 run 上下文无关（下游回归）" {
     const cjk = try adv(cx, "工有");
     const yo = try adv(cx, "\u{1F236}");
     try std.testing.expectApproxEqAbs(cjk + yo, try adv(cx, "工有\u{1F236}"), 0.05);
-    // 孤立 🈶 必须是 emoji 呈现（~1.33em），不是 PingFang 的 1em
+    // Isolated 🈶 must emoji render (~1.33em), not PingFang 1em.
     try std.testing.expect(yo > 16.5);
 }
 
-// 光标 x 与选区宽度对宽字形/多码点簇必须等于真实 shaping 度量。
-//
-// 每个 caret stop 的 x 必须精确等于该前缀的 shaping 宽度（不是码点数×常量、
-// 不是 UTF-16 code unit 数推出来的估算）；选中单个字形时 selectionRects 的
-// 宽度必须等于该字形的 advance（= 前缀差）。emoji 曾表现为“光标停在左边、
-// 选区只盖左半边”，即宽度被算成实际的约一半。
+// Caret x and selection width for wide glyph/multi-codepoint must equal
+// true shaping measure. Each caret stop x must exactly match that prefix's shaping
+// width (not codepoint*constant, not a UTF-16-unit estimate); selection
+// middle glyph selectionRects width must equal that glyph advance (= prefix
+// diff). Failure shape: caret left, selection only left half (width halved).
 test "caret x 与选区宽度 = 真实 shaping 度量（emoji/CJK/组合/ZWJ）" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
-    var fonts = try FontSystem.init(std.testing.allocator);
+    var fonts = try FontSystem.init(std.testing.allocator, @import("std").testing.io);
     defer fonts.deinit();
     cx.text.setFontSystem(&fonts);
     defer cx.text.clearFontSystem();
 
     const cases = [_][]const u8{
-        "a\u{1F60A}b", // 单码点 SMP emoji（代理对）
-        "a\u{4E2D}\u{6587}b", // CJK 全角
-        "a\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}b", // ZWJ 家庭
-        "ae\u{0301}b", // 组合音标
-        "a\u{2764}\u{FE0F}b", // BMP + VS16 变体选择符
-        "a\u{1F44B}\u{1F3FB}b", // 肤色修饰
+        "a\u{1F60A}b", // Single-codepoint SMP emoji (surrogate pair).
+        "a\u{4E2D}\u{6587}b", // CJK full-width.
+        "a\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}b", // ZWJ family.
+        "ae\u{0301}b", // Combining diacritic.
+        "a\u{2764}\u{FE0F}b", // BMP + VS16 variant selector.
+        "a\u{1F44B}\u{1F3FB}b", // Skin tone modifier.
     };
     const font_size: f32 = 24;
     for (cases) |s| {
         const line = try cx.text.visualLine(.{ .text = s, .font_family = "system", .font_size = font_size });
 
-        // 1) 每个 caret stop 的 x == 该前缀的真实 shaping 宽度
+        // 1) Each caret stop x == that prefix true shaping width.
         for (line.caret_stops) |stop| {
             const byte = stop.position.byte.value;
             try std.testing.expect(text_core_module.text_coordinates.isGraphemeBoundary(s, byte));
@@ -1057,7 +1127,8 @@ test "caret x 与选区宽度 = 真实 shaping 度量（emoji/CJK/组合/ZWJ）"
             try std.testing.expectApproxEqAbs(prefix, stop.x.value, 0.05);
         }
 
-        // 2) 选中中间那个字形（去掉首尾 'a'/'b'）：选区宽度 == 该字形 advance
+        // 2) Select middle glyph (drop first/last 'a'/'b'): selection width ==
+        // that glyph advance.
         const glyph_start: usize = 1;
         const glyph_end: usize = s.len - 1;
         var storage: [8]text_core_module.text_coordinates.SelectionRect = undefined;
@@ -1071,22 +1142,24 @@ test "caret x 与选区宽度 = 真实 shaping 度量（emoji/CJK/组合/ZWJ）"
         const x1 = cx.text.measureTextWidth(s[0..glyph_end], font_size, 400, false);
         try std.testing.expectApproxEqAbs(x0, rects[0].x, 0.05);
         try std.testing.expectApproxEqAbs(x1 - x0, rects[0].width, 0.05);
-        // 宽字形不能退化成半宽：中间字形至少要有可见宽度
+        // Wide glyph can't degrade half-width: middle glyph at least visible
+        // width.
         try std.testing.expect(rects[0].width > 1.0);
     }
 }
 
-// 点击命中回归：点到字形正中，光标必须落到该字形的某个边界（不得落进簇内部），
-// 且点到字形右半边应吸附到右边界，emoji 光标停左边的对称面。
+// Click-hit regression: click glyph center, cursor must land some glyph
+// boundary (not inside cluster), click glyph right-half snap right boundary,
+// emoji caret stops left (symmetric side).
 test "点击命中在宽字形上吸附到字形边界（emoji/CJK/ZWJ）" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
-    var fonts = try FontSystem.init(std.testing.allocator);
+    var fonts = try FontSystem.init(std.testing.allocator, @import("std").testing.io);
     defer fonts.deinit();
     cx.text.setFontSystem(&fonts);
     defer cx.text.clearFontSystem();
 
-    // 每例中间恰好一个字形（点击吸附的目标必须唯一）
+    // Each example exactly one middle glyph (click snap target unique).
     const cases = [_][]const u8{
         "a\u{1F60A}b",
         "a\u{4E2D}b",
@@ -1101,32 +1174,34 @@ test "点击命中在宽字形上吸附到字形边界（emoji/CJK/ZWJ）" {
         const x0 = cx.text.measureTextWidth(s[0..glyph_start], font_size, 400, false);
         const x1 = cx.text.measureTextWidth(s[0..glyph_end], font_size, 400, false);
 
-        // 点右侧 75% 处 -> 吸附到字形右边界
+        // Click 75% right -> snap glyph right boundary.
         const right = line.xToPosition(.{ .value = x0 + (x1 - x0) * 0.75 });
         try std.testing.expect(text_core_module.text_coordinates.isGraphemeBoundary(s, right.byte.value));
         try std.testing.expectEqual(glyph_end, right.byte.value);
 
-        // 点左侧 25% 处 -> 吸附到字形左边界
+        // Click 25% left -> snap glyph left boundary.
         const left = line.xToPosition(.{ .value = x0 + (x1 - x0) * 0.25 });
         try std.testing.expect(text_core_module.text_coordinates.isGraphemeBoundary(s, left.byte.value));
         try std.testing.expectEqual(glyph_start, left.byte.value);
     }
 }
 
-// 下游应用实测回归：按字节切的前缀落在 3 字节 CJK 中间（"asfd🎩"+半截一 =
-// 9B 非法 UTF-8）时，CoreText NSString 构造失败，shape 层报
-// TextShapingFailed、FontSelector 桥静默返 0.0f，measureTextWidth 最终
-// 吐出精确 0.00 塌掉提交 bbox。修复：入口先裁到最长合法 UTF-8 前缀。
+// A byte-index prefix can fall inside a 3-byte CJK char (e.g. "asfd" + emoji + half = 9B
+// invalid UTF-8). CoreText NSString construction then fails, the shape layer reports
+// TextShapingFailed, the FontSelector bridge silently returns 0.0f, and measureTextWidth
+// ends up exactly 0.00, collapsing the bbox. Fix: entry first trims to the longest legal
+// UTF-8 prefix.
 test "measureTextWidth 对截断 UTF-8（半个 CJK）不塌成 0" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
-    var fonts = try FontSystem.init(std.testing.allocator);
+    var fonts = try FontSystem.init(std.testing.allocator, @import("std").testing.io);
     defer fonts.deinit();
     cx.text.setFontSystem(&fonts);
     defer cx.text.clearFontSystem();
 
-    // 模拟 app 侧 FontSelector 桥：对非法 UTF-8 返 0（nil NSString 路径）。
-    // 修复前截断串走到这条腿 -> 精确 0.00；修复后 shapeText 先成功，不会到这。
+    // Simulate app-side FontSelector bridge: return 0 for invalid UTF-8 (nil
+    // NSString path). Before fix truncated string hits this leg -> exact 0.00;
+    // after fix shapeText succeeds first, never reaches here.
     const Bridge = struct {
         fn zeroOnInvalid(_: *anyopaque, ptr: [*]const u8, len: usize, _: f32, _: u16, _: bool) f32 {
             return if (std.unicode.utf8ValidateSlice(ptr[0..len])) 999 else 0;
@@ -1137,34 +1212,33 @@ test "measureTextWidth 对截断 UTF-8（半个 CJK）不塌成 0" {
     cx.text.measure_ctx = @ptrCast(&dummy);
 
     const valid = "asfd\u{1F3A9}";
-    const trunc = "asfd\u{1F3A9}\xe4"; // 9B：valid + 一 的首字节，非法 UTF-8
+    const trunc = "asfd\u{1F3A9}\xe4"; // 9B: valid + first byte of one, invalid UTF-8.
     try std.testing.expect(!std.unicode.utf8ValidateSlice(trunc));
 
     const w_valid = cx.text.measureTextWidth(valid, 16, 400, false);
     const w_trunc = cx.text.measureTextWidth(trunc, 16, 400, false);
     try std.testing.expect(w_valid > 0);
-    // 截断串按最长合法前缀测量 = valid 的宽度（不再是 0，也不是桥的 999）
+    // Truncated string by longest legal prefix measure = valid width (no
+    // longer 0, not bridge 999).
     try std.testing.expectApproxEqAbs(w_valid, w_trunc, 0.01);
 
-    // 前缀整体非法（首字节即 continuation）时无前缀可裁，仍返 0
+    // Prefix all invalid (first byte continuation) no prefix to trim, still
+    // return 0.
     try std.testing.expectEqual(@as(f32, 0), cx.text.measureTextWidth("\x80\x80", 16, 400, false));
 }
 
 test "shapeText 的缓存必须按 font_family 分桶（字体选择器预览的前置条件）" {
-    // == bug 形状 ==
-    // shapingKey 原先把 font_id 恒写 0、且不把 family 计入 text_hash。
-    // 于是同一段文本换个 family 再 shape，会命中**上一个 family** 的缓存条目，
-    // 拿回上一个字体的字形与宽度。
-    //
-    // 平时看不出来，因为全部生产调用点都传字面量 "system"（唯一 family，
-    // 永远自洽）。但字体选择器的预览列表要用不同 family 画同一个字符串
-    // （比如都画 "Aa"），这个 bug 会让第 2 行起全部退化成第 1 行的字体。
-    //
-    // 判据不写死像素（随系统字体版本漂移会脆），而是断言
-    // 「两个差异极大的字体不能量出同一个宽度」，这正是 bug 的形状。
-    var cx = try Cx.init(std.testing.allocator);
+    // == bug shape == shapingKey used to always write font_id=0 and didn't put
+    // family into text_hash, so the same text with a different family re-shape hits the
+    // **previous family's** cache entry and returns the wrong glyphs+width. Hidden normally,
+    // since all prod call-sites pass literal "system" (sole family). But a font selector
+    // preview list draws the same string (e.g., "Aa") in different families, so line 2+
+    // degraded to line 1's font.
+    // Doesn't hardcode pixels (drift per OS font version); asserts "two very different fonts
+    // can't measure the same width", which is the bug shape.
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
-    var fonts = try FontSystem.init(std.testing.allocator);
+    var fonts = try FontSystem.init(std.testing.allocator, @import("std").testing.io);
     defer fonts.deinit();
     cx.text.setFontSystem(&fonts);
     defer cx.text.clearFontSystem();
@@ -1175,7 +1249,7 @@ test "shapeText 的缓存必须按 font_family 分桶（字体选择器预览的
         .font_family = "Helvetica Neue",
         .font_size = 16,
     });
-    // Zapfino 是花体，同样字符串宽得多；两者不可能同宽。
+    // Zapfino is calligraphy, same string much wider; both can't same-width.
     const zapf = try cx.text.shapeText(.{
         .text = probe,
         .font_family = "Zapfino",
@@ -1186,7 +1260,8 @@ test "shapeText 的缓存必须按 font_family 分桶（字体选择器预览的
     try std.testing.expect(zapf.total_advance > 0);
     try std.testing.expect(helv.total_advance != zapf.total_advance);
 
-    // 反向再取一次：缓存命中路径也必须分桶（不能第二次取又串回去）。
+    // Reverse fetch again: cache-hit path also must bucket-separate (can't
+    // second fetch slip back).
     const helv2 = try cx.text.shapeText(.{
         .text = probe,
         .font_family = "Helvetica Neue",
@@ -1196,12 +1271,13 @@ test "shapeText 的缓存必须按 font_family 分桶（字体选择器预览的
 }
 
 test "生存哨兵：新建节点是 ALIVE" {
-    // 哨兵的负向验证不能在测试里做「释放后再读」，那本身就是 UAF，GPA 会先报。
-    // 真正的负向复现方式记录在这里：把 freeNodeNow 入口的哨兵检查注释掉，
-    // 再对同一节点调用两次 freeNode，Debug 下第二次会走进已被 0xaa 覆写的
-    // `freeing`（读出 true）从而静默 early-return，那正是这个哨兵要消灭的
-    // 「无声 no-op」。有哨兵时第二次会当场 panic。
-    const ctx = try Cx.init(std.testing.allocator);
+    // A sentinel negative check can't "use-after-free read" in a test, that is UAF
+    // itself and GPA reports first. Manual negative repro: comment
+    // out the sentinel check at freeNodeNow entry, call freeNode twice on the same node;
+    // in Debug the second call reads the 0xaa-overwritten `freeing` (true) and silently
+    // early-returns, exactly what the sentinel eliminates. With the sentinel the second call
+    // panics.
+    const ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     const n = try builders.box(ctx, .{ .width = .{ .px = 10 } }, .{});
     try std.testing.expect(n.alive_sentinel == core_node.ALIVE_SENTINEL);
@@ -1209,15 +1285,17 @@ test "生存哨兵：新建节点是 ALIVE" {
 }
 
 test "ensurePopoverPortalRoot: 构建中途 OOM 回滚回收 ElementTable slot" {
-    // errdefer 原为 portal.destroy：Node.destroy 不调 world.destroyElement，
-    // 每次失败漏一个 element slot（及镜像表残留行）。逐分配点注入失败。
+    // errdefer original portal.destroy: Node.destroy doesn't call
+    // world.destroyElement, each failure leaks element slot (and mirror-table
+    // row). Inject failures each alloc point.
     var fa = std.testing.FailingAllocator.init(std.testing.allocator, .{});
-    const ctx = try Cx.init(fa.allocator());
+    const ctx = try Cx.init(fa.allocator(), std.testing.io);
     defer ctx.deinit();
     const root_node = try builders.box(ctx, .{ .width = .{ .px = 100 }, .height = .{ .px = 100 } }, .{});
     ctx.root = root_node;
-    // 预热：World 元素表 / 样式来源表等是摊还扩容，首次 box 比之后多分配。
-    // 不预热的话 k 递增的同时 box 所需分配数递减，恰好跳过"box 之后"的失败点。
+    // Preheat: World element table / style source table etc. amortized
+    // expand, first box more alloc than after. Without preheat k increments
+    // while box needs decrement, handily skips "after box" failure point.
     ctx.freeNode(try builders.box(ctx, .{ .position = .absolute }, .{}));
 
     var saw_failure_after_box = false;
@@ -1243,7 +1321,7 @@ test "ensurePopoverPortalRoot: 构建中途 OOM 回滚回收 ElementTable slot" 
 }
 
 test "NodeRegistry: 节点释放后 generations 不再只增不减" {
-    const ctx = try Cx.init(std.testing.allocator);
+    const ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     const root_node = try builders.box(ctx, .{ .width = .{ .px = 100 }, .height = .{ .px = 100 } }, .{});
     ctx.root = root_node;
@@ -1258,9 +1336,243 @@ test "NodeRegistry: 节点释放后 generations 不再只增不减" {
         try std.testing.expectEqual(n, ctx.node_registry.resolve(h, null).?);
         ctx.detachChild(root_node, n);
         ctx.freeNode(n);
-        // 释放后旧 handle 必须解析失败、身份失效
+        // After-free old handle must fail parse, identity invalid.
         try std.testing.expect(ctx.node_registry.resolve(h, null) == null);
     }
     try ctx.node_registry.rebuild(ctx.root);
     try std.testing.expect(ctx.node_registry.generations.count() <= baseline + 1);
+}
+
+/// Observer: effect reads a, b two signals, tally runs, record ever see
+/// half-updated a != b state. Common to next two host entry batch-test.
+const PairProbe = struct {
+    a: *Signal(u32),
+    b: *Signal(u32),
+    runs: u32 = 0,
+    saw_torn: bool = false,
+
+    fn writeBoth(ctx: ?*anyopaque) void {
+        const self: *PairProbe = @ptrCast(@alignCast(ctx.?));
+        const next = self.a.peek() + 1;
+        self.a.set(next);
+        self.b.set(next);
+    }
+
+    fn writeBothHandler(ctx: *anyopaque) void {
+        writeBoth(ctx);
+    }
+
+    fn install(self: *PairProbe, scope: *Scope) !void {
+        try scope.createEffect(self, struct {
+            fn run(p: *PairProbe) void {
+                if (p.a.get() != p.b.get()) p.saw_torn = true;
+                p.runs += 1;
+            }
+        }.run);
+    }
+};
+
+test "host-entry batch: 事件 handler 连续写多个 signal：effect 只跑一次且看不到半更新状态" {
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    cx.setViewport(400, 300);
+    const scope = try Scope.init(std.testing.allocator, null, cx.owner);
+    defer scope.dispose();
+
+    var probe = PairProbe{
+        .a = try scope.createSignal(u32, 0),
+        .b = try scope.createSignal(u32, 0),
+    };
+    try probe.install(scope);
+    try std.testing.expectEqual(@as(u32, 1), probe.runs);
+
+    const btn = core.clickable(
+        try core.box(cx, .{ .width = .{ .px = 100 }, .height = .{ .px = 40 } }, .{}),
+        Cx.simpleHandler(PairProbe.writeBothHandler, &probe),
+    );
+    cx.root = btn;
+    cx.layout();
+    cx.handleClick(50, 20);
+
+    try std.testing.expectEqual(@as(u32, 1), probe.a.peek());
+    try std.testing.expectEqual(@as(u32, 2), probe.runs);
+    try std.testing.expect(!probe.saw_torn);
+}
+
+test "host-entry batch: 定时器回调连续写多个 signal：effect 只跑一次且看不到半更新状态" {
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    const scope = try Scope.init(std.testing.allocator, null, cx.owner);
+    defer scope.dispose();
+
+    var probe = PairProbe{
+        .a = try scope.createSignal(u32, 0),
+        .b = try scope.createSignal(u32, 0),
+    };
+    try probe.install(scope);
+
+    _ = try cx.setTimer(0, PairProbe.writeBoth, &probe);
+    cx.fireDueTimers();
+
+    try std.testing.expectEqual(@as(u32, 1), probe.a.peek());
+    try std.testing.expectEqual(@as(u32, 2), probe.runs);
+    try std.testing.expect(!probe.saw_torn);
+}
+
+test "cx.on infers the payload: fn(*S) gives HandlerRef, fn(*S, T) gives Handler(T)" {
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    const S = struct {
+        clicks: u32 = 0,
+        volume: f32 = 0,
+        fn click(s: *@This()) void {
+            s.clicks += 1;
+        }
+        fn setVolume(s: *@This(), v: f32) void {
+            s.volume = v;
+        }
+    };
+    const st = try cx.bindState(S, .{});
+    const click = cx.on(S, st, S.click);
+    const set_volume = cx.on(S, st, S.setVolume);
+    comptime std.debug.assert(@TypeOf(click) == core.HandlerRef);
+    comptime std.debug.assert(@TypeOf(set_volume) == core.Handler(f32));
+    // Function pointers (callers often pass method as param) also can infer.
+    const click_ptr: *const fn (*S) void = S.click;
+    const vol_ptr: *const fn (*S, f32) void = S.setVolume;
+    comptime std.debug.assert(@TypeOf(cx.on(S, st, click_ptr)) == core.HandlerRef);
+    comptime std.debug.assert(@TypeOf(cx.on(S, st, vol_ptr)) == core.Handler(f32));
+    click.invoke();
+    set_volume.call(0.5);
+    try std.testing.expectEqual(@as(u32, 1), st.clicks);
+    try std.testing.expectEqual(@as(f32, 0.5), st.volume);
+}
+
+test "textFmt accepts derived values, memos and static values" {
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    const scope = try Scope.init(std.testing.allocator, null, cx.owner);
+    defer scope.dispose();
+
+    const last = try scope.createSignal(?bool, null);
+    const word = @import("../reactive.zig").map(last, struct {
+        fn f(v: ?bool) []const u8 {
+            return if (v) |c| (if (c) "checked" else "unchecked") else "(none)";
+        }
+    }.f);
+    const label = try textFmt(cx, scope, "{s} changed → {s}", .{ "box", word }, .{});
+    cx.root = label;
+    try std.testing.expectEqualStrings("box changed → (none)", label.getText().?.content);
+    last.set(true);
+    try std.testing.expectEqualStrings("box changed → checked", label.getText().?.content);
+}
+
+test "host entries bind this Cx's animation clock (multi-window: the clock is global)" {
+    const render_engine = @import("render_engine/mod.zig");
+    var a = try Cx.init(std.testing.allocator, std.testing.io);
+    defer a.deinit();
+    var b = try Cx.init(std.testing.allocator, std.testing.io);
+    defer b.deinit();
+    // Window A last frame-out: global clock stop at A's time.
+    a.frame_time_ms = 50_000;
+    a.bindFrameClock();
+    try std.testing.expectEqual(@as(f64, 50_000), render_engine.current_frame_time_ms);
+
+    const Probe = struct {
+        var seen: f64 = -1;
+        fn cb(_: ?*anyopaque) void {
+            seen = render_engine.current_frame_time_ms;
+        }
+    };
+    Probe.seen = -1;
+    // Window B (frame clock 1234) timer callback spawn animation must use B's
+    // clock.
+    b.frame_time_ms = 1234;
+    _ = try b.setTimer(0, Probe.cb, null);
+    b.fireDueTimers();
+    try std.testing.expectEqual(@as(f64, 1234), Probe.seen);
+
+    // Entry return restore pre-entry clock (here A's), don't leave B's clock
+    // for after-code.
+    try std.testing.expectEqual(@as(f64, 50_000), render_engine.current_frame_time_ms);
+    b.handleKeyDown(.space, .{});
+    try std.testing.expectEqual(@as(f64, 50_000), render_engine.current_frame_time_ms);
+}
+
+test "nested host entries across windows: the outer window gets its clock back" {
+    const render_engine = @import("render_engine/mod.zig");
+    var a = try Cx.init(std.testing.allocator, std.testing.io);
+    defer a.deinit();
+    var b = try Cx.init(std.testing.allocator, std.testing.io);
+    defer b.deinit();
+    a.frame_time_ms = 1234;
+    b.frame_time_ms = 50_000;
+
+    // Window A timer callback sync-drive window B (e.g., forward input to
+    // other window), then spawn animation in A.
+    const Probe = struct {
+        var other: *Cx = undefined;
+        var inside_b: f64 = -1;
+        var after_b: f64 = -1;
+        fn cb(_: ?*anyopaque) void {
+            const Inner = struct {
+                fn cb(_: ?*anyopaque) void {
+                    inside_b = render_engine.current_frame_time_ms;
+                }
+            };
+            _ = other.setTimer(0, Inner.cb, null) catch return;
+            other.fireDueTimers();
+            after_b = render_engine.current_frame_time_ms;
+        }
+    };
+    Probe.other = b;
+    Probe.inside_b = -1;
+    Probe.after_b = -1;
+    _ = try a.setTimer(0, Probe.cb, null);
+    a.fireDueTimers();
+    try std.testing.expectEqual(@as(f64, 50_000), Probe.inside_b);
+    try std.testing.expectEqual(@as(f64, 1234), Probe.after_b);
+}
+
+test "transition setters: writing the current value never starts a transition" {
+    const recipe_mod = @import("../recipe.zig");
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    const n = try builders.box(cx, .{ .width = .{ .px = 10 }, .height = .{ .px = 10 }, .background = Color.hex(0x336699) }, .{});
+    defer cx.freeNode(n);
+    n.setOpacityRaw(1);
+    n.applyTransition(cx.allocator, &comptime recipe_mod.transition("background 150ms ease-out, border-color 150ms ease-out, opacity 150ms ease-out"));
+    // Slot just built (to_* still default): write same value as current is
+    // no-op.
+    n.setBackground(Color.hex(0x336699));
+    n.setBorderColor(n.style.border.color);
+    n.setOpacity(1);
+    try std.testing.expect(!n.frame_state.frame_local.runtime.transitions.?.any_active);
+    // True change triggers startup.
+    n.setOpacity(0);
+    try std.testing.expect(n.frame_state.frame_local.runtime.transitions.?.any_active);
+}
+
+test "theme replay skips an independent root destroyed by an earlier hook" {
+    const cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    const root = try core.box(cx, .{}, .{});
+    defer cx.freeNode(root);
+    cx.root = root;
+    defer cx.root = null;
+    const overlay = try core.box(cx, .{}, .{});
+    const handle = try cx.overlay_stack.push(.{ .kind = .non_modal, .enter_transition = .none });
+    defer cx.overlay_stack.removePermanently(handle);
+    cx.overlay_stack.bindContentNode(cx.allocator, handle, overlay);
+    const Probe = struct {
+        var context: *Cx = undefined;
+        var victim: *Node = undefined;
+        fn hook(_: *Node, _: *const theme.Values, _: Allocator) void {
+            context.destroyDetached(victim);
+        }
+    };
+    Probe.context = cx;
+    Probe.victim = overlay;
+    root.meta.per_frame.hooks.on_theme = Probe.hook;
+    cx.setTheme(&theme.modes.light);
 }

@@ -1,41 +1,39 @@
-//! Select Headless, Radix-style 解耦组件 (v0.7 已 GA)
+//! Select Headless, Radix-style decoupled component
 //!
-//! 旧 `components/select.zig` (monolithic + MAX_OPTIONS=64 硬上限) 已删除；
-//! 此目录是唯一 Select 实现。
+//! This directory is the sole Select implementation.
 //!
-//! v0.7 退出状态:
-//! - §2.1 ✅ slot 化 (render_trigger / render_item) + SelectSlotRecipe 接入 recipe.zig
-//! - §2.2 ✅ virtualize=true 接 VirtualList，1k+ options 不爆 Node
-//! - 控制流: ControlledProp(T) 锁定 controlled/uncontrolled 二元模式
-//! - 键盘: typeahead / 方向键 / PageUp/PageDown / Home/End / Esc / Enter 内置
+//! Features:
+//! - Slot-based (render_trigger/render_item) + SelectSlotRecipe in recipe.zig
+//! - virtualize=true connects VirtualList, 1k+ options without Node explosion
+//! - Data flow: value/open are Model, options/disabled are Source (interaction only suggests)
+//! - Keyboard: typeahead/arrow keys/PageUp/PageDown/Home/End/Esc/Enter built-in
 //!
-//! 文件拆分:
-//! - `state_machine.zig`: 纯逻辑 (Option / SelectState / step / Action / commit)；
-//!   不依赖 core / reactive，bench facade 直接 import
-//! - `mount.zig`: 渲染挂载层 (mountSelectHeadless / VirtualList path / slot ctx /
-//!   SelectSlotRecipe 默认 base style)
-//! - `mod.zig` (此文件): 聚合 re-export，主路径单点入口
+//! File split:
+//! - `state_machine.zig`: pure logic (Option/SelectState/step/Action/commit); no core/reactive
+//!   dependency, bench facade direct import
+//! - `mount.zig`: render mount layer (SelectHeadless/VirtualList path/slot ctx/SelectSlotRecipe
+//!   default base style)
+//! - `mod.zig` (this file): aggregate re-export, single entry point
 //!
-//! 设计参照: Radix UI Select / shadcn Select / Panda CSS sva slot recipe.
+//! Design reference: Radix UI Select / shadcn Select / Panda CSS sva slot recipe.
 
 const sm = @import("state_machine.zig");
 
 // pure-logic re-exports (state machine)
-pub const ControlledProp = sm.ControlledProp;
 pub const Option = sm.Option;
 pub const OpenState = sm.OpenState;
-pub const SelectProps = sm.SelectProps;
 pub const SelectState = sm.SelectState;
 pub const Action = sm.Action;
 pub const step = sm.step;
 pub const commitSelection = sm.commitSelection;
 
-/// select_headless 主挂渲染入口（mount.zig）。
-/// 用 Popover + default item list 把 state machine 真挂到 *Node 树。
+/// select_headless main render entry point (mount.zig). Uses Popover + default item list to mount
+/// state machine to *Node tree.
 pub const mount = @import("mount.zig");
-pub const mountSelectHeadless = mount.mountSelectHeadless;
+pub const SelectHeadless = mount.SelectHeadless;
 pub const MountProps = mount.MountProps;
-pub const SelectHeadlessMount = mount.SelectHeadlessMount;
+pub const SelectHeadlessResult = mount.SelectHeadlessResult;
+pub const stateOf = mount.stateOf;
 
 // slot / recipe / variant re-export
 pub const SelectSlotRecipe = mount.SelectSlotRecipe;
@@ -44,8 +42,8 @@ pub const SelectSize = mount.SelectSize;
 pub const TriggerSlotCtx = mount.TriggerSlotCtx;
 pub const ItemSlotCtx = mount.ItemSlotCtx;
 
-// mount.zig / state_machine.zig 的 test 此前没有任何 test 块引用，
-// test-ui 从未收集过它们（含 mount.zig 里 3 个既有测试），显式挂上。
+// mount.zig/state_machine.zig tests were never referenced by any test block, never collected by
+// test-ui (includes 3 existing tests in mount.zig). Explicitly attached.
 test {
     _ = mount;
     _ = sm;

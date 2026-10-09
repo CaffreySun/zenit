@@ -1,17 +1,17 @@
-/// Widget State - 组件状态管理
+/// Widget State - component state management
 ///
-/// 允许组件维持跨帧状态。每个组件通过唯一 ID
-/// 存储和检索状态。
+/// Allows component to maintain cross-frame state. Each component via unique ID
+/// stores and retrieves state.
 ///
-/// 使用方式:
-/// 1. 在组件 build() 中通过 StateStore.getOrCreate() 获取状态
-/// 2. 状态在帧之间保持不变
-/// 3. 通过事件处理器修改状态
-/// 4. 状态变化标记脏位, 触发重新渲染
+/// Usage:
+/// 1. Get state in component build() via StateStore.getOrCreate()
+/// 2. State persists between frames
+/// 3. Modify state via event handlers
+/// 4. State change marks dirty, trigger rerender
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-/// 编译期检测类型是否有 pub fn deinit(*T) void
+/// Compile-time detect if type has pub fn deinit(*T) void
 fn hasDeinit(comptime T: type) bool {
     return switch (@typeInfo(T)) {
         .@"struct", .@"union", .@"enum" => @hasDecl(T, "deinit"),
@@ -19,14 +19,14 @@ fn hasDeinit(comptime T: type) bool {
     };
 }
 
-/// 通过函数指针地址获取类型唯一 ID (比 @typeName 字符串比较更快)
+/// Get unique type ID via function pointer address (faster than @typeName string compare)
 fn typeIdPtr(comptime T: type) *const anyopaque {
     return @ptrCast(&struct {
         fn f(_: *T) void {}
     }.f);
 }
 
-/// 类型擦除的状态条目
+/// Type-erased state entry
 const StateEntry = struct {
     ptr: *anyopaque,
     destroy_fn: *const fn (*anyopaque, Allocator) void,
@@ -35,7 +35,7 @@ const StateEntry = struct {
     debug_fn: *const fn (*anyopaque, []u8) []const u8,
 };
 
-/// 状态存储 - 管理所有组件状态
+/// State storage - manage all component state
 pub const StateStore = struct {
     allocator: Allocator,
     states: std.AutoHashMap(u64, StateEntry),
@@ -55,7 +55,7 @@ pub const StateStore = struct {
         self.states.deinit();
     }
 
-    /// 获取或创建类型化状态
+    /// Get or create typed state
     pub fn getOrCreate(self: *StateStore, comptime T: type, id: u64, initial: T) !*T {
         const tid = typeIdPtr(T);
         if (self.states.get(id)) |entry| {
@@ -70,12 +70,14 @@ pub const StateStore = struct {
             _ = self.states.remove(id);
         }
 
-        // 创建新状态
+        // Create new state
         const state = try self.allocator.create(T);
-        // put 失败时刚建的 state 无人持有（devtools mountPanel sweep 第 1 个注入点就漏）。
-        // 契约：initial 必须是**不持有资源**的裸结构（全仓 7 个调用点都是 `T{}` / `.{}` 零值，
-        // 已逐一核过），这里只 destroy 不 deinit：对未 init 的结构调 deinit 是 UB，而持有资源的
-        // initial 在这条稀有路径上会漏掉内部资源。谁要传带资源的 initial，先改这里。
+        // put fails -> the newly-built state is orphaned.
+        // Contract: initial must be a **no-resource bare struct** (all 7 call sites pass `T{}` /
+        // `.{}`);
+        // only destroy, not deinit, is called here: deinit on an uninitialized struct is UB, and a
+        // resource-holding initial on this rare path would leak internals.
+        // Anyone passing a resource-holding initial must fix this first.
         errdefer self.allocator.destroy(state);
         state.* = initial;
 
@@ -84,7 +86,7 @@ pub const StateStore = struct {
             .destroy_fn = struct {
                 fn destroy(ptr: *anyopaque, alloc: Allocator) void {
                     const typed: *T = @ptrCast(@alignCast(ptr));
-                    // 如果类型有 deinit 方法，先调用清理内部资源
+                    // If type has deinit, call first to clean internal resources
                     if (comptime hasDeinit(T)) {
                         typed.deinit();
                     }
@@ -104,7 +106,7 @@ pub const StateStore = struct {
         return state;
     }
 
-    /// 获取已存在的状态 (如果不存在返回 null)
+    /// Get existing state (return null if not found)
     pub fn get(self: *StateStore, comptime T: type, id: u64) ?*T {
         if (self.states.get(id)) |entry| {
             if (entry.type_id != typeIdPtr(T)) {
@@ -119,27 +121,28 @@ pub const StateStore = struct {
         return null;
     }
 
-    /// 删除状态
+    /// Delete state
     pub fn remove(self: *StateStore, id: u64) void {
         if (self.states.fetchRemove(id)) |kv| {
             kv.value.destroy_fn(kv.value.ptr, self.allocator);
         }
     }
 
-    /// 状态数量
+    /// State count
     pub fn count(self: *StateStore) usize {
         return self.states.count();
     }
 
-    /// 按状态指针白名单生成调试状态列表（只格式化命中的状态，避免全量开销）
+    /// Generate debug state list by state pointer whitelist (format only matched state, avoid full
+    /// cost)
     pub fn debugEntriesByPtrs(self: *StateStore, allocator: Allocator, ptrs: []const *anyopaque) []DebugStateEntry {
         if (ptrs.len == 0) return &[_]DebugStateEntry{};
 
         var ptr_set = std.AutoHashMap(usize, void).init(allocator);
         defer ptr_set.deinit();
-        // 刻意吞错：本函数只服务 devtools 状态面板（唯一调用方
-        // devtools.zig:1981）。OOM 时少几行调试输出是安全降级，
-        // 不影响任何产品正确性路径。
+        // Intentionally swallow error: this only serves devtools state panel (sole call site
+        // devtools.zig:1981). OOM -> fewer debug lines is safe degradation,
+        // doesn't affect any production correctness path.
         for (ptrs) |ptr| {
             _ = ptr_set.put(@intFromPtr(ptr), {}) catch {};
         }
@@ -164,12 +167,12 @@ pub const StateStore = struct {
     }
 };
 
-/// DevTools 调试用结构
+/// DevTools debug struct
 pub const DebugStateEntry = struct {
     id: u64,
     ptr: *anyopaque,
     type_name: []const u8,
-    value: [256]u8 = [_]u8{0} ** 256,
+    value: [256]u8 = @as([256]u8, @splat(0)),
     value_len: u16 = 0,
 
     pub fn valueSlice(self: *const DebugStateEntry) []const u8 {
@@ -206,10 +209,12 @@ fn formatValue(comptime T: type, value: T, writer: anytype, depth: u8) !void {
             try writer.print("{}", .{value});
         },
         .@"enum" => |info| {
-            // 空枚举（`enum(u64) { _ }` opaque id 惯用法）没有 tag 名，@tagName 会编译失败；
-            // 非穷举枚举的值也可能落在具名 tag 之外。两种情况都退回打印整数值。
-            if (info.fields.len == 0 or !info.is_exhaustive) {
-                try writer.print("{d}", .{@intFromEnum(value)});
+            // Empty enum (`enum(u64) { _ }` opaque id idiom) has no tag names, @tagName
+            // compile-fails;
+            // non-exhaustive enum values also fall outside named tags. Both cases fallback to print
+            // int value.
+            if (info.field_names.len == 0 or info.mode == .nonexhaustive) {
+                try writer.print("{d}", .{@backingInt(value)});
             } else {
                 try writer.print("{s}", .{@tagName(value)});
             }
@@ -247,9 +252,9 @@ fn formatValue(comptime T: type, value: T, writer: anytype, depth: u8) !void {
         .array => {
             try writer.print("[{d}]", .{value.len});
         },
-        .@"struct" => |info| {
+        .@"struct" => {
             try writer.writeAll("{");
-            inline for (info.fields, 0..) |field, i| {
+            inline for (@import("zenit_reflection").fields(T), 0..) |field, i| {
                 if (i > 0) try writer.writeAll(", ");
                 try writer.writeAll(field.name);
                 try writer.writeAll("=");
@@ -310,7 +315,7 @@ fn writeEscapedAsciiUtf8(writer: anytype, s: []const u8) !void {
     }
 }
 
-/// 生成组件状态 ID (基于组件类型名 + 实例索引)
+/// Generate component state ID (based on component type name + instance index)
 pub fn stateId(comptime component_name: []const u8, instance: u32) u64 {
     var hash: u64 = 0;
     for (component_name) |c| {
@@ -319,7 +324,7 @@ pub fn stateId(comptime component_name: []const u8, instance: u32) u64 {
     return hash *% 0x100000000 +% instance;
 }
 
-// ========== 测试 ==========
+// ===== Tests =====
 
 test "StateStore: init/deinit" {
     var store = StateStore.init(std.testing.allocator);
@@ -340,16 +345,16 @@ test "StateStore: getOrCreate" {
     const state = try store.getOrCreate(CounterState, 1, .{ .value = 0, .clicked = false });
     try std.testing.expectEqual(@as(i32, 0), state.value);
 
-    // 修改状态
+    // Modify state
     state.value = 42;
     state.clicked = true;
 
-    // 再次获取, 应该得到同一个状态
+    // Get again, should get same state
     const state2 = try store.getOrCreate(CounterState, 1, .{ .value = 0, .clicked = false });
     try std.testing.expectEqual(@as(i32, 42), state2.value);
     try std.testing.expect(state2.clicked);
 
-    // 指针相同
+    // Pointer identical
     try std.testing.expect(state == state2);
 }
 
@@ -440,7 +445,7 @@ test "StateStore: getOrCreate replaces mismatched type for same id" {
 
 test "debugFormatSafe: empty enum (opaque id) prints integer value" {
     const ObjectId = enum(u64) { _ };
-    const S = struct { id: ObjectId = @enumFromInt(42) };
+    const S = struct { id: ObjectId = @fromBackingInt(@intCast(42)) };
     var buf: [128]u8 = undefined;
     const out = debugFormatSafe(S, &buf, .{});
     try std.testing.expect(std.mem.indexOf(u8, out, "42") != null);

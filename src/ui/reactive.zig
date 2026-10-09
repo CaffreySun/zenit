@@ -2,9 +2,10 @@
 // Phase 1: Owner-based Reactive System (Zig-optimized)
 
 pub const SignalOwner = @import("reactive/owner.zig").SignalOwner;
-/// 延迟销毁队列的入口类型导出给消费方，"节点还在队列里、它借用的资源不能立刻释放"
-/// 的场景（Global Find EditorPool 在 reactive 回调里被销毁）需要把资源的释放排进**同一条**队列
-///（FIFO：节点先、资源后）。Entry 的存储归资源自己，直到回调跑完或 cancel。
+/// Deferred-destroy queue entry type export to consumer, 'node still in queue, borrowed resource
+/// can't free immediate' scene (Global Find EditorPool destroy in reactive callback) need put
+/// resource free into **same queue** (FIFO: node first, resource after). Entry storage resource
+/// own, till callback done or cancel.
 pub const DeferredDisposal = @import("reactive/deferred_disposal.zig").Entry;
 pub const Signal = @import("reactive/signal.zig").Signal;
 pub const createEffect = @import("reactive/effect.zig").createEffect;
@@ -14,15 +15,41 @@ pub const Scope = @import("reactive/scope.zig").Scope;
 pub const Context = @import("reactive/context.zig").Context;
 pub const StoreOf = @import("reactive/store.zig").StoreOf;
 
-// 内部类型 (供高级用户使用)
+// Signal-first component API (docs/SIGNAL_API_DESIGN.md)
+const source_mod = @import("reactive/source.zig");
+pub const Source = source_mod.Source;
+pub const Model = source_mod.Model;
+pub const Split = source_mod.Split;
+pub const Derived = source_mod.Derived;
+pub const Callback = source_mod.Callback;
+pub const Bound = source_mod.Bound;
+pub const ReactiveKind = @import("reactive/signal.zig").ReactiveKind;
+pub const derive = source_mod.derive;
+pub const not = source_mod.not;
+pub const eq = source_mod.eq;
+pub const map = source_mod.map;
+pub const map2 = source_mod.map2;
+pub const field = source_mod.field;
+pub const split = source_mod.split;
+pub const toSource = source_mod.toSource;
+pub const SourceValueOf = source_mod.SourceValueOf;
+pub const resolveModel = source_mod.resolveModel;
+pub const resolveTextModel = source_mod.resolveTextModel;
+pub const resolveListModel = source_mod.resolveListModel;
+pub const resolveModelFor = source_mod.resolveModelFor;
+pub const checkBorrow = source_mod.checkBorrow;
+pub const assumeOutlives = source_mod.assumeOutlives;
+pub const props = @import("reactive/props.zig");
+
+// Internal types (supply advanced user)
 pub const SignalBase = @import("reactive/signal_base.zig").SignalBase;
 pub const EffectBase = @import("reactive/effect_base.zig").EffectBase;
 pub const BatchContext = @import("reactive/batch.zig").BatchContext;
 
-// Phase 1: 公开类型分发的 eq 工具，组件层可用同一份语义做 prop diff
+// Phase 1: public-type-dispatch eq tool, component layer can use same semantic for prop diff
 pub const eqlValue = @import("reactive/eq.zig").eqlValue;
 
-// 确保所有子模块测试被包含
+// Ensure all submodule tests included
 test {
     _ = @import("reactive/scope.zig");
     _ = @import("reactive/signal.zig");
@@ -35,9 +62,11 @@ test {
     _ = @import("reactive/effect_base.zig");
     _ = @import("reactive/eq.zig");
     _ = @import("reactive/graph.zig");
+    _ = @import("reactive/source.zig");
+    _ = @import("reactive/props.zig");
 }
 
-// ===== 快速上手示例 =====
+// ===== Quickstart example =====
 
 const std = @import("std");
 
@@ -45,14 +74,14 @@ test "Reactive System: complete example" {
     var owner = try SignalOwner.init(std.testing.allocator);
     defer owner.deinit();
 
-    // 创建 Signal
+    // Create Signal
     const count = try Signal(i32).create(owner, 0);
     const name = try Signal([]const u8).create(owner, "World");
 
     var output_buffer: [100]u8 = undefined;
     var output_len: usize = 0;
 
-    // 创建 Effect (自动追踪依赖)
+    // Create Effect (auto track dependency)
     try createEffect(owner, .{
         .count = count,
         .name = name,
@@ -69,10 +98,10 @@ test "Reactive System: complete example" {
         }
     }.render);
 
-    // 验证初始渲染
+    // Verify initial render
     try std.testing.expectEqualStrings("Hello World, Count: 0", output_buffer[0..output_len]);
 
-    // 单次更新
+    // Single update
     count.set(5);
     try std.testing.expectEqualStrings("Hello World, Count: 5", output_buffer[0..output_len]);
 
@@ -103,12 +132,12 @@ test "Reactive System: batch updates" {
 
     try std.testing.expectEqual(@as(i32, 1), effect_run_count);
 
-    // 不使用 batch: 两次更新 = 两次 Effect 运行
+    // No batch: two update = two Effect run
     a.set(1);
     b.set(1);
     try std.testing.expectEqual(@as(i32, 3), effect_run_count);
 
-    // 使用 batch: 两次更新 = 一次 Effect 运行
+    // With batch: two update = one Effect run
     try owner.batch(struct {
         fn update(ctx: anytype) void {
             ctx.a.set(2);
@@ -116,7 +145,7 @@ test "Reactive System: batch updates" {
         }
     }.update, .{ .a = a, .b = b });
 
-    try std.testing.expectEqual(@as(i32, 4), effect_run_count); // 只增加 1 次
+    try std.testing.expectEqual(@as(i32, 4), effect_run_count); // only increase 1 time
 }
 
 test "Reactive System: peek doesn't track" {
@@ -134,8 +163,8 @@ test "Reactive System: peek doesn't track" {
         .counter = &effect_run_count,
     }, struct {
         fn run(ctx: anytype) void {
-            _ = ctx.tracked.get(); // 追踪
-            _ = ctx.untracked.peek(); // 不追踪
+            _ = ctx.tracked.get(); // track
+            _ = ctx.untracked.peek(); // no track
             ctx.counter.* += 1;
         }
     }.run);
@@ -143,21 +172,21 @@ test "Reactive System: peek doesn't track" {
     try std.testing.expectEqual(@as(i32, 1), effect_run_count);
 
     tracked.set(1);
-    try std.testing.expectEqual(@as(i32, 2), effect_run_count); // Effect 重新运行
+    try std.testing.expectEqual(@as(i32, 2), effect_run_count); // Effect re-run
 
     untracked.set(200);
-    try std.testing.expectEqual(@as(i32, 2), effect_run_count); // Effect 不运行
+    try std.testing.expectEqual(@as(i32, 2), effect_run_count); // Effect no run
 }
 
-// Phase 1: facade-level diamond glitch freedom
+// Facade-level diamond glitch freedom.
 //
 //      A (signal)
 //     / \
-//    B   C   <-- 都是 Memo，依赖 A
+//    B   C   <-- both Memos, depend on A
 //    \ /
 //     D (effect)
 //
-// 写 A 时 D 必须看到 B/C 都已根据新 A 重算的值（无中间陈旧状态）。
+// Writing A: D must see B/C already recomputed with the new A (no intermediate stale state).
 test "Reactive System: diamond glitch freedom (Memo + Effect)" {
     var owner = try SignalOwner.init(std.testing.allocator);
     defer owner.deinit();
@@ -192,21 +221,21 @@ test "Reactive System: diamond glitch freedom (Memo + Effect)" {
         }
     }.run);
 
-    // 初次：a=1 -> b=10, c=101
+    // Initial: a=1 -> b=10, c=101
     try std.testing.expectEqual(@as(i32, 10), observed.b);
     try std.testing.expectEqual(@as(i32, 101), observed.c);
     try std.testing.expectEqual(@as(u32, 1), observed.run);
 
-    // 写 a=5 -> 必须最终 b=50, c=105，且没有任何"中间观察值"
+    // Write a=5 -> must finally b=50, c=105, no 'intermediate observation value'
     a.set(5);
     try std.testing.expectEqual(@as(i32, 50), observed.b);
     try std.testing.expectEqual(@as(i32, 105), observed.c);
-    // run 计数取决于 push 模型：可能 2 或 3 次（b 重算->push、c 重算->push 或合并）
-    // 但最终值必须一致。这里允许 1-3 次重跑，关键是值一致。
+    // run count depend on push model: maybe 2 or 3 (b recompute->push, c recompute->push
+    // or merge), but final value must match. Allow 1-3 run here, key is value match.
     try std.testing.expect(observed.run >= 2);
 }
 
-// Phase 1: 验证 eqlValue 修复了 std.meta.eql 的 slice ptr-equality bug
+// Phase 1: verify eqlValue fix std.meta.eql slice ptr-equality bug
 test "Reactive System: signal []const u8 same content different ptr does not renotify" {
     var owner = try SignalOwner.init(std.testing.allocator);
     defer owner.deinit();
@@ -225,18 +254,18 @@ test "Reactive System: signal []const u8 same content different ptr does not ren
     }.run);
     try std.testing.expectEqual(@as(u32, 1), run_count);
 
-    // 同内容、不同 buffer：std.meta.eql 会判 != 触发；eqlValue 应判 = 跳过
+    // same content, diff buffer: std.meta.eql judge != trigger; eqlValue judge = skip
     try std.testing.expect(buf1[0..].ptr != buf2[0..].ptr);
     s.set(&buf2);
     try std.testing.expectEqual(@as(u32, 1), run_count);
 
-    // 不同内容应触发
+    // diff content should trigger
     var buf3: [5]u8 = .{ 'w', 'o', 'r', 'l', 'd' };
     s.set(&buf3);
     try std.testing.expectEqual(@as(u32, 2), run_count);
 }
 
-// Phase 1: 验证 NaN 在 signal set 中不再触发 renotify storm
+// Phase 1: verify NaN in signal set no longer trigger renotify storm
 test "Reactive System: signal f32 NaN does not renotify" {
     var owner = try SignalOwner.init(std.testing.allocator);
     defer owner.deinit();
@@ -253,35 +282,36 @@ test "Reactive System: signal f32 NaN does not renotify" {
     }.run);
     try std.testing.expectEqual(@as(u32, 1), run_count);
 
-    // 再写 NaN 不应触发（eqlValue 判等）
+    // write NaN again no trigger (eqlValue judge equal)
     s.set(nan);
     try std.testing.expectEqual(@as(u32, 1), run_count);
 
-    // 写真值触发
+    // write real value trigger
     s.set(1.0);
     try std.testing.expectEqual(@as(u32, 2), run_count);
 }
 
-// cross-scope cleanup adversarial test，在删除双轨保护前 land。
+// Cross-scope cleanup adversarial test.
 //
-// 场景：owner-arena managed signal × scope-managed effect。
-// scope.dispose 后，signal 仍存活；signal.set 应当：
-//   (a) 不调到已销毁的 effect（曾经的 use-after-free 风险）
-//   (b) 不引发任何 panic / 内存读越界
+// Scene: owner-arena managed signal x scope-managed effect. After scope.dispose the signal
+// is still alive; signal.set must:
+//   (a) not call the already-destroyed effect (use-after-free risk)
+//   (b) not panic or read out of bounds
 //
-// v0.2-P1 双轨保护下：scope.dispose 调 graph.destroyNode 注销 effect node；
-// signal 写时 graph.markSignalWritten 不会找到 dirty observer。
-// 但 signal_base.subscribers 列表里旧 effect ptr 还在；旧 push DFS 路径若仍走
-// 会触发 UAF。当前 set 已切到 graph 路径不走 push，但 subscribers 列表本身
-// 也通过 scope.dispose:120 清理。这条 test 保证未来 v0.3 拆双轨时仍正确。
+// scope.dispose calls graph.destroyNode, which unregisters the effect node, so
+// graph.markSignalWritten
+// finds no dirty observer. But signal_base.subscribers may still hold the old effect ptr; a
+// push-DFS path that walked it would hit UAF. set now takes the graph path and does not walk
+// push, and the subscribers list itself is cleaned via scope.dispose:120. This test keeps
+// the invariant if the double-rail protection is later torn down.
 test "Reactive System: cross-scope cleanup — owner signal + scope effect" {
     var owner = try SignalOwner.init(std.testing.allocator);
     defer owner.deinit();
 
-    // owner-arena 创建 signal（跨 scope 存活）
+    // owner-arena create signal (cross-scope alive)
     const counter = try Signal(i32).create(owner, 0);
 
-    // 创建 scope，scope 内 effect 订阅 owner-arena signal
+    // create scope, scope-inside effect subscribe owner-arena signal
     var scope = try @import("reactive/scope.zig").Scope.init(owner.parent_allocator, null, owner);
     var effect_run_count: u32 = 0;
 
@@ -296,21 +326,21 @@ test "Reactive System: cross-scope cleanup — owner signal + scope effect" {
     }.run);
     try std.testing.expectEqual(@as(u32, 1), effect_run_count);
 
-    // 触发：scope-effect 应该 run
+    // trigger: scope-effect should run
     counter.set(1);
     try std.testing.expectEqual(@as(u32, 2), effect_run_count);
 
-    // 销毁 scope, effect 应当被 dispose；signal 仍存活
+    // destroy scope, effect should dispose; signal still alive
     scope.dispose();
 
-    // 关键断言：dispose 后 signal.set 必须**不**触发已销毁的 effect。
-    // 若 v0.3 拆双轨过程中 graph.destroyNode 没有正确从 signal.observers 摘除，
-    // 这里会 panic / segfault / 触发 effect 调到悬垂 ctx 让 run_count 改变。
+    // Key assert: after dispose signal.set must **not** trigger already-destroyed effect.
+    // If v0.3 tear double-rail middle graph.destroyNode not correct prune from signal.observers,
+    // here panic/segfault/trigger effect call stale ctx make run_count change.
     counter.set(2);
     counter.set(3);
-    try std.testing.expectEqual(@as(u32, 2), effect_run_count); // 不变
+    try std.testing.expectEqual(@as(u32, 2), effect_run_count); // no change
 
-    // signal 自己仍可以正常被新 scope 订阅
+    // signal self still can normal subscribe by new scope
     const new_scope = try @import("reactive/scope.zig").Scope.init(owner.parent_allocator, null, owner);
     defer new_scope.dispose();
     var new_run_count: u32 = 0;
@@ -327,14 +357,14 @@ test "Reactive System: cross-scope cleanup — owner signal + scope effect" {
 
     counter.set(4);
     try std.testing.expectEqual(@as(u32, 2), new_run_count);
-    try std.testing.expectEqual(@as(u32, 2), effect_run_count); // 老 effect 仍不变
+    try std.testing.expectEqual(@as(u32, 2), effect_run_count); // old effect still no change
 }
 
-// signal owner.deinit 后无残留 graph node leak
+// signal owner.deinit after no leftover graph node leak
 test "Reactive System: owner.deinit cleans up graph nodes" {
     var owner = try SignalOwner.init(std.testing.allocator);
 
-    // 创建 100 个 signal + 50 个 effect
+    // create 100 signal + 50 effect
     var signals: [100]*Signal(i32) = undefined;
     for (&signals) |*slot| {
         slot.* = try Signal(i32).create(owner, 0);
@@ -348,22 +378,22 @@ test "Reactive System: owner.deinit cleans up graph nodes" {
         }.run);
     }
 
-    // graph node 数量：100 signal + 50 effect = 150
+    // graph node count: 100 signal + 50 effect = 150
     try std.testing.expectEqual(@as(usize, 150), owner.graph.nodeCount());
 
     owner.deinit();
-    // owner 已 deinit；graph 也跟着销毁，本测试主要验证不 leak
-    // （由 testing.allocator 在 test 末尾报告 leak 检出）
+    // owner already deinit; graph also destroy, this test mainly verify no leak
+    // (testing.allocator at test end report leak found)
 }
 
-// 回归：memo 的 compute 在 updateIfNecessary 递归中创建 reactive 节点，
-// 会让 graph.nodes（ArrayListUnmanaged）realloc。修复前 updateIfNecessary
-// 把 `*GraphNode` 缓存跨递归使用，realloc 后通过已释放内存读
-// n.seen_versions.items -> segfault（graph.zig:468）。
+// Regression: memo compute in updateIfNecessary recursion create reactive node,
+// let graph.nodes (ArrayListUnmanaged) realloc. Pre-fix updateIfNecessary
+// cache `*GraphNode` cross-recursion use, realloc after deref freed memory
+// n.seen_versions.items -> segfault (graph.zig:468).
 //
-// 触发形状必须是**两级 memo 链**：memoB 依赖 memoA 才会进入 .check 分支
-// 并递归 updateIfNecessary(memoA)，进而在递归内跑 memoA 的 compute。
-// 单级 memo 走 .dirty 直接 recomputeNode，碰不到这条路径。
+// Trigger shape must be **two-tier memo chain**: memoB depend memoA enter .check branch
+// and recursion updateIfNecessary(memoA), thus run memoA compute inside recursion.
+// Single memo walk .dirty direct recomputeNode, can't hit path.
 test "regression: memo compute allocating reactive nodes must not dangle updateIfNecessary" {
     const owner_mod_ = @import("reactive/owner.zig");
     const owner = try owner_mod_.SignalOwner.init(std.testing.allocator);
@@ -378,7 +408,7 @@ test "regression: memo compute allocating reactive nodes must not dangle updateI
         s: *Signal(u32),
         fn compute(self: *@This()) u32 {
             const v = self.s.get();
-            // compute 内创建新 reactive 节点 -> nodes.append -> realloc
+            // compute inside create new reactive node -> nodes.append -> realloc
             const tmp = self.sc.createSignal(u32, v) catch return v;
             return tmp.get();
         }
@@ -403,7 +433,7 @@ test "regression: memo compute allocating reactive nodes must not dangle updateI
         _ = memo_b.get();
     }
 
-    // 能跑到这里即证明没有悬垂解引用；顺带断言值仍然正确传播。
+    // able run here prove no dangling deref; side verify value still propagate correct.
     src.set(4242);
     try std.testing.expectEqual(@as(u32, 4243), memo_b.get());
 }

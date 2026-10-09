@@ -1,6 +1,6 @@
-/// 帧级 Timeline Profiler，记录最近 128 帧各阶段耗时
+/// Frame-level Timeline Profiler that records phase timing for the last 128 frames
 ///
-/// 用法:
+/// Usage:
 /// ```zig
 /// profiler.beginFrame();
 /// profiler.markPhase(.layout);
@@ -13,7 +13,7 @@
 /// ```
 const std = @import("std");
 
-/// 帧渲染各阶段
+/// Frame rendering phases
 pub const Phase = enum(u8) {
     layout = 0,
     before_render = 1,
@@ -21,96 +21,97 @@ pub const Phase = enum(u8) {
     encode = 3,
     flush = 4,
     deferred = 5,
-    idle = 6, // 帧间空闲（非渲染时间）
+    idle = 6, // inter-frame idle (non-rendering time)
 };
 
-/// 单帧时间线
+/// Single frame timeline
 pub const FrameTimeline = struct {
-    /// 各阶段耗时（微秒）
-    phase_us: [7]u64 = [_]u64{0} ** 7,
-    /// 整帧耗时（微秒）
+    /// Duration of each phase (microseconds)
+    phase_us: [7]u64 = @as([7]u64, @splat(0)),
+    /// Total frame duration (microseconds)
     total_us: u64 = 0,
-    /// 帧序号
+    /// Frame number
     frame_number: u64 = 0,
 };
 
 /// Timeline Profiler
 pub const TimelineProfiler = struct {
-    /// 环形缓冲区（最近 128 帧）
-    ring_buffer: [ring_size]FrameTimeline = [_]FrameTimeline{.{}} ** ring_size,
-    /// 写入位置
+    io: std.Io,
+    /// Ring buffer (last 128 frames)
+    ring_buffer: [ring_size]FrameTimeline = @as([ring_size]FrameTimeline, @splat(.{})),
+    /// Write position
     write_pos: u7 = 0,
-    /// 已记录的帧数
+    /// Number of recorded frames
     frame_count: u64 = 0,
-    /// 是否启用
+    /// Enabled
     enabled: bool = false,
 
-    /// 当前帧的计时状态
-    frame_start: ?std.time.Instant = null,
+    /// Timing state for current frame
+    frame_start: ?@import("zenit_time").Instant = null,
     current_phase: ?Phase = null,
-    phase_start: ?std.time.Instant = null,
+    phase_start: ?@import("zenit_time").Instant = null,
     current_frame: FrameTimeline = .{},
 
     const ring_size = 128;
 
-    /// 开始新帧计时
+    /// Start timing new frame
     pub fn beginFrame(self: *TimelineProfiler) void {
         if (!self.enabled) return;
-        self.frame_start = std.time.Instant.now() catch null;
+        self.frame_start = @import("zenit_time").Instant.now(self.io) catch null;
         self.current_frame = .{ .frame_number = self.frame_count };
         self.current_phase = null;
         self.phase_start = null;
     }
 
-    /// 标记进入新阶段（自动结束上一阶段的计时）
+    /// Mark entering new phase (auto-end previous phase timing)
     pub fn markPhase(self: *TimelineProfiler, phase: Phase) void {
         if (!self.enabled) return;
-        const now = std.time.Instant.now() catch return;
+        const now = @import("zenit_time").Instant.now(self.io) catch return;
 
-        // 结束上一阶段
+        // End previous phase
         if (self.current_phase) |prev_phase| {
             if (self.phase_start) |start| {
                 const elapsed_ns = now.since(start);
-                self.current_frame.phase_us[@intFromEnum(prev_phase)] = elapsed_ns / 1000;
+                self.current_frame.phase_us[@backingInt(prev_phase)] = elapsed_ns / 1000;
             }
         }
 
-        // 开始新阶段
+        // Start new phase
         self.current_phase = phase;
         self.phase_start = now;
     }
 
-    /// 结束当前帧计时，写入环形缓冲区
+    /// End current frame timing, write to ring buffer
     pub fn endFrame(self: *TimelineProfiler) void {
         if (!self.enabled) return;
-        const now = std.time.Instant.now() catch return;
+        const now = @import("zenit_time").Instant.now(self.io) catch return;
 
-        // 结束最后一个阶段
+        // End last phase
         if (self.current_phase) |prev_phase| {
             if (self.phase_start) |start| {
                 const elapsed_ns = now.since(start);
-                self.current_frame.phase_us[@intFromEnum(prev_phase)] = elapsed_ns / 1000;
+                self.current_frame.phase_us[@backingInt(prev_phase)] = elapsed_ns / 1000;
             }
         }
 
-        // 总帧时间
+        // Total frame time
         if (self.frame_start) |start| {
             self.current_frame.total_us = now.since(start) / 1000;
         }
 
-        // 写入环形缓冲区
+        // Write to ring buffer
         self.ring_buffer[self.write_pos] = self.current_frame;
         self.write_pos +%= 1;
         self.frame_count += 1;
 
-        // 重置
+        // Reset
         self.frame_start = null;
         self.current_phase = null;
     }
 };
 
 test "TimelineProfiler: basic recording" {
-    var profiler = TimelineProfiler{ .enabled = true };
+    var profiler = TimelineProfiler{ .io = std.testing.io, .enabled = true };
 
     profiler.beginFrame();
     profiler.markPhase(.layout);

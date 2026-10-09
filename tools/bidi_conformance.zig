@@ -31,8 +31,8 @@ fn parseOrder(text: []const u8, output: *std.ArrayListUnmanaged(u32), allocator:
 }
 
 fn parseClass(token: []const u8) !bidi.BidiClass {
-    inline for (std.meta.fields(bidi.BidiClass)) |field| {
-        if (std.ascii.eqlIgnoreCase(token, field.name)) return @enumFromInt(field.value);
+    inline for (@import("zenit_reflection").fields(bidi.BidiClass)) |field| {
+        if (std.ascii.eqlIgnoreCase(token, field.name)) return @fromBackingInt(@intCast(field.value));
     }
     return error.UnknownBidiClass;
 }
@@ -68,16 +68,16 @@ fn compareResult(
     }
 }
 
-fn runBidiTest(allocator: std.mem.Allocator, path: []const u8) !usize {
-    const contents = try std.fs.cwd().readFileAlloc(allocator, path, 16 * 1024 * 1024);
+fn runBidiTest(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !usize {
+    const contents = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(16 * 1024 * 1024));
     defer allocator.free(contents);
     if (!std.mem.endsWith(u8, trim(contents), "# EOF")) return error.TruncatedConformanceData;
 
-    var expected_levels: std.ArrayListUnmanaged(ExpectedLevel) = .{};
+    var expected_levels: std.ArrayListUnmanaged(ExpectedLevel) = .empty;
     defer expected_levels.deinit(allocator);
-    var expected_order: std.ArrayListUnmanaged(u32) = .{};
+    var expected_order: std.ArrayListUnmanaged(u32) = .empty;
     defer expected_order.deinit(allocator);
-    var classes: std.ArrayListUnmanaged(bidi.BidiClass) = .{};
+    var classes: std.ArrayListUnmanaged(bidi.BidiClass) = .empty;
     defer classes.deinit(allocator);
 
     var case_count: usize = 0;
@@ -128,16 +128,16 @@ fn runBidiTest(allocator: std.mem.Allocator, path: []const u8) !usize {
     return sequence_count;
 }
 
-fn runBidiCharacterTest(allocator: std.mem.Allocator, path: []const u8) !usize {
-    const contents = try std.fs.cwd().readFileAlloc(allocator, path, 16 * 1024 * 1024);
+fn runBidiCharacterTest(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !usize {
+    const contents = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(16 * 1024 * 1024));
     defer allocator.free(contents);
     if (!std.mem.endsWith(u8, trim(contents), "# EOF")) return error.TruncatedConformanceData;
 
-    var codepoints: std.ArrayListUnmanaged(u21) = .{};
+    var codepoints: std.ArrayListUnmanaged(u21) = .empty;
     defer codepoints.deinit(allocator);
-    var expected_levels: std.ArrayListUnmanaged(ExpectedLevel) = .{};
+    var expected_levels: std.ArrayListUnmanaged(ExpectedLevel) = .empty;
     defer expected_levels.deinit(allocator);
-    var expected_order: std.ArrayListUnmanaged(u32) = .{};
+    var expected_order: std.ArrayListUnmanaged(u32) = .empty;
     defer expected_order.deinit(allocator);
 
     var case_count: usize = 0;
@@ -195,18 +195,17 @@ fn runBidiCharacterTest(allocator: std.mem.Allocator, path: []const u8) !usize {
     return case_count;
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+pub fn main(init: std.process.Init) !void {
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
     if (args.len != 3) {
         std.debug.print("usage: bidi-conformance BidiTest.txt BidiCharacterTest.txt\n", .{});
         return error.InvalidArguments;
     }
-    const class_cases = try runBidiTest(allocator, args[1]);
-    const character_cases = try runBidiCharacterTest(allocator, args[2]);
+    const class_cases = try runBidiTest(allocator, init.io, args[1]);
+    const character_cases = try runBidiCharacterTest(allocator, init.io, args[2]);
     std.debug.print(
         "Unicode {s} bidi conformance: PASS (BidiTest={d} sequences/770241 evaluations, BidiCharacterTest={d})\n",
         .{ bidi.unicode_version, class_cases, character_cases },

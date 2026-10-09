@@ -1,12 +1,11 @@
-//! display_list_lowering 的 PT-BRACKET 文本调试子系统。
+//! PT-BRACKET text debug subsystem for display_list_lowering.
 //!
-//! 由 `ZENIT_TEXT_BRACKET_DEBUG` env 启用；可选 `ZENIT_TEXT_BRACKET_NODE` 限定到
-//! 某个 node id。lowering 路径每段 1-char text 命中时打印 origin / clip / effect /
-//! 文字内容，给 PT-glitch 重现用。
+//! Enabled by ZENIT_TEXT_BRACKET_DEBUG env var; optionally ZENIT_TEXT_BRACKET_NODE limits to
+//! a node id. The lowering path prints origin / clip / effect / text content on each 1-char
+//! text match, for PT-glitch reproduction.
 //!
-//! 从 display_list_lowering.zig (旧名 display_list_replay.zig) 拆出（v0.5 §5
-//! GpuDraw epic B-3 子项），让主文件聚焦 lowering 核心；env 解析 + dedup 状态机
-//! 本就独立，无 lowering 业务耦合。
+//! Split out of display_list_lowering.zig so that file focuses on lowering core; env parsing
+//! + dedup state machine is independent with no lowering business coupling.
 
 const std = @import("std");
 

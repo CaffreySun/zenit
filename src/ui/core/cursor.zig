@@ -31,7 +31,7 @@ pub const Lease = struct {
 };
 
 pub const State = struct {
-    leases: std.ArrayListUnmanaged(Lease) = .{},
+    leases: std.ArrayListUnmanaged(Lease) = .empty,
     next_token: u64 = 0,
     controller: u64 = 0,
     pointer_valid: bool = false,

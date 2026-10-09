@@ -1,6 +1,6 @@
-//! Cx 帧管线：render()（before-render tick -> layout -> after-layout hooks ->
-//! 运行时索引 -> layerize -> display list）、编码器 paint table 降级、
-//! redraw 调度，以及命中测试前的场景保鲜（ensureHitTestSceneFresh）。
+//! Cx frame pipeline: render() (before-render tick -> layout -> after-layout hooks ->
+//! runtime indexing -> layerize -> display list), encoder paint table downgrade,
+//! redraw dispatch, and scene-fresh before hit-test (ensureHitTestSceneFresh).
 
 const std = @import("std");
 const core = @import("../core.zig");
@@ -31,34 +31,43 @@ const render_engine = core.render_engine;
 const text = core.text;
 
 pub fn render(self: *Cx) []const display_list_mod.DisplayItem {
-    // 计时器回调先跑：它们标脏的节点要赶上本帧（不能被零脏帧路径跳过）。
+    // system a11y pref change (reduce motion / lower transparency): whole tree invalidate must
+    // ahead of zero-dirty fast-path.
+    self.syncA11yPreferences();
+    // timer callbacks run first: nodes they mark dirty must catch this frame (not skip zero-dirty
+    // path).
     self.fireDueTimers();
-    // overlay 退场完成后把焦点还给触发它的控件。
-    // ⚠ 必须在**零脏帧 fast-path 之前**：关闭 overlay 后常常正好是零脏帧，
-    // 放在后面会被 early-return 跳过，焦点永远恢复不了。
+    // overlay exit done restore focus to control opened it.
+    // WARNING: **ahead of zero-dirty fast-path**: after close overlay often exactly zero-dirty,
+    // place after it'd early-return skip, focus never restore.
     cx_node_lifetime.drainOverlayFocusRestore(self);
 
-    // 零脏帧快速路径，根 fully-clean 且上一帧 cache 有效时直接返回缓存。
-    // 矩阵 #1：10k 节点零脏帧 < 0.5ms 的关键 skip。
-    // 安全条件：根节点 layout/render/composite/subtree_* 全 clean + overlay_stack 无动画
-    // + inspector 关闭。markDirty 路径会冒泡到根，所以 root 全 clean 蕴含整树 clean。
+    // zero-dirty fast-path: root fully-clean + prior frame cache valid return cache.
+    // perf #1 matrix: 10k-node zero-dirty < 0.5ms key skip.
+    // safety: root layout/render/composite/subtree_* all clean + overlay_stack no-animation
+    // + inspector off. markDirty bubbles to root, so root all-clean implies tree clean.
     if (self.root) |r| {
         const time_unchanged = self.frame_time_ms == self.last_render_frame_time_ms;
         if (self.last_render_valid and
             time_unchanged and
-            // 批量矩形层每帧由宿主重新提交，zenit 不做跨帧 diff，
-            // 无从判断内容是否变化 ⇒ 默认保守重画（见 setBulkQuads）。
-            // 但宿主可以用 setBulkQuadsVersioned 自证"这批和上一帧一样"，
-            // 那样静止画面就能回到零脏帧，两万 quad 的画布上这条决定了
-            // 每帧是 21.6ms 还是 ~0。
+            // The bulk rect layer is resubmitted every frame by the host and zenit does no
+            // cross-frame diff,
+            // so it cannot detect content changes -> conservative redraw by default (see
+            // setBulkQuads).
+            // A host that can prove "same batch as last frame" via setBulkQuadsVersioned lets a
+            // static
+            // picture return to zero-dirty; for a 20k-quad canvas this is 21.6ms vs ~0 per frame.
             (self.bulk_quads.items.len == 0 or self.bulk_quads_unchanged) and
             isTreeFullyClean(r) and
             !self.overlay_stack.hasActiveAnimations() and
-            // 自动化虚拟指针是**画在真实呈现目标里**的（截图/录屏要看得见），
-            // 但它不进 Node 树 ⇒ 移动指针时整棵树仍然 fully-clean。少了这
-            // 一条，纯 mouse_move（不改任何节点）会走零脏帧 early-return，
-            // overlay 那段代码根本执行不到，表现为"harness 里虚拟鼠标
-            // 永远画不出来"。可见即参与判据；不可见时该路径零成本。
+            // The automated virtual pointer is **drawn in the real render target**
+            // (screenshots/recordings
+            // show it) but has no Node tree, so moving it leaves the whole tree clean. Without
+            // this, a pure
+            // mouse_move (no node change) takes the zero-dirty early return and overlay code never
+            // runs,
+            // so the harness virtual mouse never draws. Visible = counted as dirty; invisible =
+            // zero cost.
             !self.virtual_cursor.visible and
             !self.inspector.enabled and
             !self.inspector.debug_paint.anyActive())
@@ -67,23 +76,23 @@ pub fn render(self: *Cx) []const display_list_mod.DisplayItem {
             return self.display_list.items.items;
         }
     }
-    // 重置帧 arena，释放上一帧的所有临时分配
+    // reset frame arena, free all prior-frame temp alloc
     _ = self.frame_arena.reset(.retain_capacity);
     self.perf.resetFrame();
-    // gesture_arena tick, long_press 等时间相关识别器靠这个推进。
-    // 必须在 render pass 前调；否则 long_press began 在本帧 emit 后才 dispatch
-    // 渲染（多 1 帧延迟，用户感觉滞后）。
-    self.gesture_arena.tick(std.time.nanoTimestamp());
-    // 推进 ShapingCache epoch；上一帧未触达的 entry 在配置阈值
-    // 帧后被驱逐。GlyphRun pipeline 接管旧 measure 路径后是 text 测量
-    // 唯一缓存层。
+    // gesture_arena tick, long_press time-related recognizer advance by this.
+    // must call before render pass; else long_press began emit then dispatch
+    // render (one-frame extra delay, user feel lag).
+    self.gesture_arena.tick(@import("zenit_time").nanoTimestamp(self.io));
+    // advance ShapingCache epoch; prior-frame unreached entry driven out at config threshold
+    // frames. GlyphRun pipeline inherit old measure path so text measure
+    // single cache layer.
     self.text.beginFrame();
     self.lowering.main_paint.clearRetainingCapacity();
     if (self.root) |r| {
-        // OverlayStack: 统一 outside-click 处理（在 has_new_mouse_down 被清除前）
-        // mouseDown 与 render 之间，虚拟列表/条件渲染可能已释放命中节点。
-        // 裸指针只保留作同步事件期兼容；跨帧消费必须重新解析带代次的
-        // handle，避免 OverlayStack.isDescendantOf 沿悬空 parent 链读取。
+        // OverlayStack: unified outside-click handle (before has_new_mouse_down cleared)
+        // mouseDown + render between virtual list / condition render may freed hit node.
+        // bare pointer kept for sync-event compat only; cross-frame consume must re-parse
+        // handle with generation, avoid OverlayStack.isDescendantOf dangling parent chain.
         const outside_click_target = self.node_registry.resolve(self.last_mouse_down_handle, &self.perf);
         self.last_mouse_down_target = outside_click_target;
         if (outside_click_target == null) self.last_mouse_down_handle = null;
@@ -96,7 +105,7 @@ pub fn render(self: *Cx) []const display_list_mod.DisplayItem {
         tick_mod.g_slow_hook_name_len = 0;
         tick_mod.g_debug_frame = self.frame_count;
         tick_mod.g_debug_dirty_hooks = 0;
-        var bt = std.time.Timer.start() catch undefined;
+        var bt = @import("zenit_time").Timer.start(self.io) catch undefined;
         ensureBeforeRenderTicked(self);
         self.perf.before_render_us = bt.read() / 1000;
         self.perf.tick_nodes = tick_mod.g_tick_node_count;
@@ -106,18 +115,18 @@ pub fn render(self: *Cx) []const display_list_mod.DisplayItem {
         const sn_max = @min(sn_len, self.perf.slow_hook_name.len);
         @memcpy(self.perf.slow_hook_name[0..sn_max], tick_mod.g_slow_hook_name[0..sn_max]);
         self.perf.slow_hook_name_len = sn_max;
-        // DEBUG: 每 300 帧打印 render_dirty 节点
+        // DEBUG: print render_dirty nodes every 300 frames
         if (renderDirtyDebugEnabled() and self.frame_count % 300 == 1) {
             cx_frame.debugPrintRenderDirtyNodes(self, r);
         }
-        // on_before_render 已消费 has_new_mouse_down，清除
+        // on_before_render consumed has_new_mouse_down, clear
         self.has_new_mouse_down = false;
 
-        // OverlayStack: 先更新锚点几何，再在布局完成后推进动画时间。
+        // OverlayStack: update anchor geometry first, after layout done advance animation time.
         self.overlay_stack.updateAnchors(self.viewport.width, self.viewport.height);
 
-        // Pass 1.5: 增量布局
-        var inner_timer = std.time.Timer.start() catch undefined;
+        // Pass 1.5: incremental layout
+        var inner_timer = @import("zenit_time").Timer.start(self.io) catch undefined;
         if (r.frame_state.state_bits.dirty.core.layout or r.frame_state.state_bits.dirty.core.subtree_layout) {
             layout_engine.layoutNode(r, self.viewport, LayoutContext{ .frame_allocator = self.frame_arena.allocator(), .shaping_cache = &self.text.shaping_cache, .font_system = self.text.font_system });
             self.syncLayoutToTable(r);
@@ -129,7 +138,7 @@ pub fn render(self: *Cx) []const display_list_mod.DisplayItem {
             self.needs_redraw = true;
         }
 
-        // Pass 2: 渲染命令生成
+        // Pass 2: render command generation
         var render_ctx = render_engine.RenderContext{
             .lowering_buffer = &self.lowering._dead_main,
             .lowering_buffer_paint = &self.lowering.main_paint,
@@ -144,9 +153,11 @@ pub fn render(self: *Cx) []const display_list_mod.DisplayItem {
             .viewport = self.viewport,
             .perf = &self.perf,
             .external_clip_rects = &self.external_clip_rects,
-            // 把 GlyphRun pipeline 资源传到 render engine
+            // transport GlyphRun pipeline resource to render engine
             .shaping_cache = &self.text.shaping_cache,
             .font_system = self.text.font_system,
+            .measure_font_context = self.text.font_resolve_ctx,
+            .measure_font_fn = self.text.font_props_measure_fn,
             .visual_line_context = self,
             .visual_line_fn = &renderVisualLine,
         };
@@ -156,32 +167,33 @@ pub fn render(self: *Cx) []const display_list_mod.DisplayItem {
         };
         self.perf.render_node_us = (inner_timer.read() - render_node_start) / 1000;
 
-        // 批量矩形层：绝对视口坐标 ⇒ 用 identity transform（id 0）。
-        // 层级/裁剪取决于宿主指定的 anchor（见 setBulkQuads）：挂靠时
-        // 插入到 anchor 子树区间末尾并带上它的 clip_id。
+        // bulk rect layer: absolute viewport coords => use identity transform (id 0).
+        // hierarchy/clip by host anchor (see setBulkQuads): insert to anchor subtree end
+        // bring its clip_id.
         cx_bulk_quads.appendBulkQuads(self) catch |err| {
             std.debug.print("[ui] bulk quad append error: {}\n", .{err});
         };
 
-        // Stage B R3f: derive + inspector overlay 仍在 cx.render() 末尾跑 (兼容
-        // 测试期望 cx.lowering.main 在 cx.render() 后立即可读)。lowerForEncoder
-        // 提供给 encoder 调，**幂等**，已填好就直接 return，不重复 derive。
+        // Stage B R3f: derive + inspector overlay still run at cx.render() end (compat
+        // test expect cx.lowering.main readable immediately after cx.render()). lowerForEncoder
+        // for encoder call, **idempotent**, filled return directly, no repeat derive.
         self.lowering._dead_main.clearRetainingCapacity();
         self.lowering.main_paint.clearRetainingCapacity();
         const lowering_mod = @import("render_engine/display_list_lowering.zig");
-        // 正确性路径：main_paint 刚被 clearRetainingCapacity，这里是把整帧的
-        // display item 重新 lower 进去。中途 OOM 会留下**截断的** paint 列表
-        // （begin/end 层不配对、后半棵树整个不画），而 render() 返回的就是它
-        // 画面静默错乱而非干净失败。
-        if (std.posix.getenv("ZENIT_DEBUG_DLIST") != null) {
+        // correctness path: main_paint just clearRetainingCapacity, here whole-frame
+        // display item re-lower in. OOM leave **truncated** paint list
+        // (begin/end layer mismatched, second-half tree no-draw), render() return is it
+        // screen silently broken not clean fail.
+        if (@import("zenit_environment").has("ZENIT_DEBUG_DLIST")) {
             std.debug.print("[dlist] ── frame {d} items={d} ──\n", .{ self.scene_runtime.frame_epoch, self.display_list.items.items.len });
             for (self.display_list.items.items, 0..) |it, di| {
                 const h = it.header();
                 switch (it) {
                     .text_run => |t| std.debug.print("[dlist] {d}: text node={d} eff={d} clip={d} \"{s}\"\n", .{ di, h.node_id, h.effect_id, h.clip_id, t.content[0..@min(t.content.len, 12)] }),
                     .fill_rect => |fr| std.debug.print("[dlist] {d}: rect node={d} eff={d} clip={d} ({d:.0},{d:.0},{d:.0}x{d:.0}) r={d:.3} a={d}\n", .{ di, h.node_id, h.effect_id, h.clip_id, fr.x, fr.y, fr.w, fr.h, fr.radius[0], fr.color.a }),
-                    // 描边宽度/圆角是"内容属性等比缩放"回归验证的观测点
-                    // （下游应用：描边与圆角必须 == 世界值 × scale）。
+                    // stroke-width / corner-radius "content property scale" regression validate
+                    // observation point
+                    // (downstream app: stroke + corner == world * scale).
                     .stroke_rect => |sr| std.debug.print("[dlist] {d}: stroke node={d} eff={d} clip={d} ({d:.1},{d:.1},{d:.1}x{d:.1}) w={d:.3} r={d:.3}\n", .{ di, h.node_id, h.effect_id, h.clip_id, sr.x, sr.y, sr.w, sr.h, sr.width, sr.radius[0] }),
                     .border_side => |bs| std.debug.print("[dlist] {d}: border node={d} eff={d} clip={d} ({d:.1},{d:.1},{d:.1}x{d:.1}) w={d:.3} r={d:.3}\n", .{ di, h.node_id, h.effect_id, h.clip_id, bs.x, bs.y, bs.w, bs.h, bs.width, bs.radius[0] }),
                     else => std.debug.print("[dlist] {d}: {s} node={d} eff={d} clip={d}\n", .{ di, @tagName(it), h.node_id, h.effect_id, h.clip_id }),
@@ -195,11 +207,11 @@ pub fn render(self: *Cx) []const display_list_mod.DisplayItem {
         const lower_start = inner_timer.read();
         lowering_mod.appendAllDisplayItemsToRenderList(&render_ctx) catch @panic("OOM: lower display list into main render list");
         self.perf.phase_prebuild_us = (inner_timer.read() - lower_start) / 1000;
-        if (std.posix.getenv("ZENIT_DEBUG_SURFDUMP") != null) {
+        if (@import("zenit_environment").has("ZENIT_DEBUG_SURFDUMP")) {
             var in_surf: bool = false;
             var counts: [64]u32 = @splat(0);
             for (self.lowering.main_paint.items) |it| {
-                const k = @intFromEnum(it.kind);
+                const k = @backingInt(it.kind);
                 if (it.kind == .control and it.control_kind == .begin_opacity_layer) {
                     in_surf = true;
                     std.debug.print("[surfdump] f={d} BEGIN op={d:.2}\n", .{ self.scene_runtime.frame_epoch, it.opacity });
@@ -207,7 +219,7 @@ pub fn render(self: *Cx) []const display_list_mod.DisplayItem {
                     in_surf = false;
                     std.debug.print("[surfdump] f={d} END counts:", .{self.scene_runtime.frame_epoch});
                     for (counts, 0..) |c, ki| {
-                        if (c > 0) std.debug.print(" {s}={d}", .{ @tagName(@as(@TypeOf(it.kind), @enumFromInt(ki))), c });
+                        if (c > 0) std.debug.print(" {s}={d}", .{ @tagName(@as(@TypeOf(it.kind), @fromBackingInt(@intCast(ki)))), c });
                     }
                     std.debug.print("\n", .{});
                     counts = @splat(0);
@@ -220,29 +232,28 @@ pub fn render(self: *Cx) []const display_list_mod.DisplayItem {
                 }
             }
         }
-        // v0.5-P3 Stage 4-1+: render 末尾再做一次 layout sync，捕获 before_render 钩子
-        // 内（如 ScrollArea scrollbar）直接改写 node.rect 的散装路径。这是补丁式修复,
-        // 真正解法是给 scrollbar/modal 等改 rect 的位置直接调 cx.syncNodeRect(node)。
-        // Timed together as `phase_sync_us`: these four shadow-sync passes
-        // each walk the node tree at the end of every frame. They were
-        // untimed, so their cost showed up only as the gap between
-        // render_node_us and render_us.
+        // v0.5-P3 Stage 4-1+: render end do one more layout sync, capture before_render hook (like
+        // ScrollArea scrollbar directly
+        // rewrite node.rect loose path). This is patch-style fix, real solution is give
+        // scrollbar/modal etc direct cx.syncNodeRect(node) call.
+        // Timed together as `phase_sync_us`: these four shadow-sync passes each walk node tree at
+        // every frame end. They were untimed, cost
+        // showed only as gap between render_node_us and render_us.
         const sync_start = inner_timer.read();
         self.syncLayoutToTable(r);
-        // shadow-sync paint props 到 PaintTable
+        // shadow-sync paint props to PaintTable
         self.syncPaintToTable(r);
-        // shadow-sync interaction 到 InteractionTable
+        // shadow-sync interaction to InteractionTable
         self.syncInteractionToTable(r);
-        // 把 Node 树 a11y 元数据投影到 AccessibilityTree。下一步
-        // (§2.1 ObjC bridge) cx.render() 末尾 a11y_router.flushToBridge 把
-        // dirty 队列推到 macOS NSAccessibility。
+        // Project Node tree a11y metadata to AccessibilityTree. Next step (sec 2.1 ObjC bridge):
+        // cx.render() end calls a11y_router.flushToBridge to post dirty queue to macOS
+        // NSAccessibility.
         self.syncA11yTreeFromInteractions(r);
         self.perf.phase_sync_us = (inner_timer.read() - sync_start) / 1000;
-        // 整树 invariant 在 debug build 校验。
-        // 降频为每 64 帧一次采样：这是纯诊断走树（自身注释即承认是 debug
-        // 膨胀源），每帧跑把 Debug 帧税抬高 ~5ms 而 shadow-sync 类回归
-        // 是持续性的，采样 64 帧内必然命中。ZENIT_LAYOUT_INTEGRITY=1
-        // 恢复逐帧校验（排查 sync 时序类问题时用）。
+        // Debug build validates whole-tree invariants. Downsampled to every 64 frames to avoid
+        // ~5ms debug tax per frame; regressions like shadow-sync are continuous and hit within
+        // 64 frames. ZENIT_LAYOUT_INTEGRITY=1 restores per-frame validation (for sync timing
+        // issues).
         const integrity_start = inner_timer.read();
         if (std.debug.runtime_safety) {
             const every_frame = layoutIntegrityEveryFrameEnabled();
@@ -258,15 +269,29 @@ pub fn render(self: *Cx) []const display_list_mod.DisplayItem {
         // worth seeing separately rather than blaming the paint pass.
         self.perf.phase_retained_us = (inner_timer.read() - integrity_start) / 1000;
     }
+    // Self-check paint invariants of scene content (before inspector/automation cursor overlays;
+    // see core/paint_invariants.zig)
+    if (self.paint_invariant_check) {
+        const r = core.paint_invariants.duplicateFills(self.frame_arena.allocator(), self.display_list.items.items) catch |err| blk: {
+            std.log.warn("paint invariant check skipped this frame: {s}", .{@errorName(err)});
+            break :blk core.paint_invariants.Result{};
+        };
+        if (r.duplicates != 0) {
+            self.paint_duplicate_fills += r.duplicates;
+            self.paint_duplicate_node = r.first_node;
+            std.log.warn("paint invariant: node {d} emitted an identical fill_rect / stroke_rect twice in frame {d} (cache replay double emission?)", .{ r.first_node, self.frame_count });
+        }
+    }
     self.inspector.renderOverlay(self);
-    // 最后一层：自动化 cursor 必须进入真实呈现目标，截图/录屏才看得见。
-    // 它在 inspector 后绘制，且完全不进入 Node / hit-test 树。
+    // Final layer: automation cursor must enter real render target to appear in
+    // screenshots/recording.
+    // Drawn after inspector, not in Node/hit-test tree.
     if (self.virtual_cursor.renderOverlay(self, self.frame_time_ms)) {
         self.needs_redraw = true;
     }
 
-    // 零脏 skip 路径直接返回 self.display_list.items.items。
-    // display_list 是真源、跨帧稳定（仅在 paint pass 入口被 clear），无需快照。
+    // Zero-dirty fast path returns self.display_list.items.items. display_list is source of truth,
+    // frame-stable (cleared only at paint pass start), no snapshot needed.
     self.last_render_valid = true;
     self.last_render_frame_time_ms = self.frame_time_ms;
     return self.display_list.items.items;
@@ -276,9 +301,8 @@ pub fn lowerForEncoderPaintTable(self: *Cx) []const paint_table.DisplayItem {
     return self.lowering.main_paint.items;
 }
 
-/// 检查整棵树是否 fully clean。markDirty 路径冒泡到根，所以
-/// root 的 layout/render/composite/subtree_* 全 clean 蕴含整树 clean。
-/// 这是 O(1) 检查。
+/// Check if entire tree is clean. markDirty bubbles to root, so all of root's
+/// layout/render/composite/subtree_* being clean implies whole tree clean. O(1) check.
 pub fn isTreeFullyClean(root: *Node) bool {
     return !root.frame_state.state_bits.dirty.core.layout and
         !root.frame_state.state_bits.dirty.core.subtree_layout and
@@ -289,7 +313,7 @@ pub fn isTreeFullyClean(root: *Node) bool {
 }
 
 pub fn scheduleRedrawAfterNs(self: *Cx, delay_ns: u64) void {
-    const now = std.time.Instant.now() catch return;
+    const now = @import("zenit_time").Instant.now(self.io) catch return;
     if (self.next_redraw_scheduled_at) |scheduled_at| {
         if (self.next_redraw_delay_ns) |current_delay| {
             const elapsed = now.since(scheduled_at);
@@ -304,7 +328,7 @@ pub fn scheduleRedrawAfterNs(self: *Cx, delay_ns: u64) void {
 pub fn processScheduledRedraw(self: *Cx) bool {
     const scheduled_at = self.next_redraw_scheduled_at orelse return false;
     const delay_ns = self.next_redraw_delay_ns orelse return false;
-    const now = std.time.Instant.now() catch return false;
+    const now = @import("zenit_time").Instant.now(self.io) catch return false;
     if (now.since(scheduled_at) < delay_ns) return false;
     self.next_redraw_scheduled_at = null;
     self.next_redraw_delay_ns = null;
@@ -312,8 +336,8 @@ pub fn processScheduledRedraw(self: *Cx) bool {
     return true;
 }
 
-/// 事件处理前强制更新 interaction index。
-/// 不受 before_render_frame 缓存限制（空闲帧 frame_count 不递增时也能执行）。
+/// Force-update interaction index before event handling. Not gated by before_render_frame
+/// cache (runs even when idle frame does not increment frame_count).
 pub fn ensureHitTestSceneFresh(self: *Cx) void {
     if (self.tick_depth > 0 or self.draining_deferred_frees) return;
     _ = self.processScheduledRedraw();
@@ -336,20 +360,24 @@ pub fn forceTickAndRebuildForHitTest(self: *Cx) void {
         layout_engine.layoutNode(r, self.viewport, LayoutContext{ .frame_allocator = self.frame_arena.allocator(), .shaping_cache = &self.text.shaping_cache, .font_system = self.text.font_system });
         self.syncLayoutToTable(r);
     }
-    // Hit-test freshness must not consume animation time. This path can run
-    // multiple times within one visual frame during mouse down/up/move, and
-    // advancing dt here causes popovers/selects/pickers to skip opening
-    // frames before the next actual render.
-    // 绝对时间戳需要和当前逻辑帧同步，否则"动画已经推进、但还没 render"的 hitTest
-    // 会继续使用上一帧时间，导致命中区域滞后于可见位置。
+    // Hit-test freshness must not consume animation time. This path can run multiple times
+    // within one visual frame during mouse down/up/move, and advancing dt causes
+    // popovers/selects/pickers
+    // to skip opening frames. Absolute timestamp must sync with current logic frame, else
+    // animations
+    // advance but render stalls, causing hit test to use old frame time and lag visible position.
     render_engine.setFrameClock(.{
+        .io = self.io,
         .time_ms = self.frame_time_ms,
         .dt_ms = 0,
         .dt_seconds = 0,
     });
-    // 同 render 路径：遍历期间 freeNode 延后（见 freeNode 注释）。
+    // Same as render path: freeNode deferred during traversal (see freeNode comment).
     self.tick_depth += 1;
+    self.owner.beginBatch();
     self.last_tick_animations_active = render_engine.tickBeforeRender(r, 0, 0, viewport_clip, self.allocator, 0);
+    // Batch before tick_depth returns to zero; freeNode in effects still deferred.
+    self.owner.endBatch();
     self.tick_depth -= 1;
     // Handles make the collection itself memory-safe. Resetting after a
     // structural mutation also prevents pre-hook ancestry decisions from
@@ -374,7 +402,7 @@ pub fn forceTickAndRebuildForHitTest(self: *Cx) void {
     }
     const has_layout_dirty = had_initial_layout_dirty or had_post_tick_layout_dirty;
     const has_interaction_dirty = had_initial_interaction_dirty or had_post_tick_interaction_dirty;
-    // OOM 不吞：见 rebuildRuntimeIndexesIfCurrentRootDirty 的说明。
+    // OOM not swallowed (see rebuildRuntimeIndexesIfCurrentRootDirty).
     if (current_root.frame_state.state_bits.dirty.runtime.subtree_dirty) {
         if (hitSceneDebugEnabled()) std.debug.print("[hit-scene] rebuild=runtime\n", .{});
         cx_runtime_index.rebuildRuntimeIndexes(self) catch @panic("OOM: rebuildRuntimeIndexes (hit-test scene refresh)");
@@ -406,7 +434,7 @@ pub fn removeAfterLayoutHook(self: *Cx, ctx: *anyopaque) void {
     }
 }
 
-/// 回调 -> （脏则）布局，循环到没有回调请求再布局或达到轮数上限。
+/// Callback -> (if dirty) layout, loop until no callback requests or iteration limit hit.
 fn runAfterLayoutHooks(self: *Cx, partial: *PartialInteractionRoots) AfterLayoutOutcome {
     var out = AfterLayoutOutcome{};
     if (self.after_layout_hooks.items.len == 0) return out;
@@ -414,8 +442,9 @@ fn runAfterLayoutHooks(self: *Cx, partial: *PartialInteractionRoots) AfterLayout
     while (round < max_after_layout_rounds) : (round += 1) {
         const last_round = round + 1 == max_after_layout_rounds;
         var again = false;
-        // 与 before_render 同一套门控：回调里的 freeNode 延后到本轮结束。
+        // Same gate as before_render: freeNode in callbacks deferred until end of round.
         self.tick_depth += 1;
+        self.owner.beginBatch();
         const saved_cursor = self.after_layout_cursor;
         self.after_layout_cursor = 0;
         while (self.after_layout_cursor.? < self.after_layout_hooks.items.len) {
@@ -424,6 +453,7 @@ fn runAfterLayoutHooks(self: *Cx, partial: *PartialInteractionRoots) AfterLayout
             if (h.run(h.ctx, round, last_round) == .needs_layout) again = true;
         }
         self.after_layout_cursor = saved_cursor;
+        self.owner.endBatch();
         self.tick_depth -= 1;
         if (self.deferred_free_nodes.len > 0) partial.* = .{};
         cx_node_lifetime.drainDeferredFrees(self);
@@ -455,32 +485,41 @@ fn ensureBeforeRenderTicked(self: *Cx) void {
         const root_handle = self.node_registry.handleFor(r);
         self.perf.tick_before_render_count += 1;
         std.debug.assert(self.perf.tick_before_render_count <= 1);
-        // 先做一轮 layout，让 on_before_render / overlay enter tick 读取到当前帧真实 rect。
-        // 这对依赖内容尺寸定位的浮层很关键，否则打开首帧只能看到上一拍的 0x0 / 旧几何。
+        // First layout pass lets on_before_render / overlay enter tick read real rect of current
+        // frame.
+        // Critical for layers positioned by content size; otherwise first open shows old 0x0 /
+        // stale geometry.
         const had_initial_layout_dirty = r.frame_state.state_bits.dirty.core.layout or r.frame_state.state_bits.dirty.core.subtree_layout;
         const had_initial_interaction_dirty = r.frame_state.state_bits.dirty.pipeline.subtree_interaction or cx_runtime_index.subtreeHasLooseInteractionDirty(r);
         var partial_interaction_roots = PartialInteractionRoots{};
         if ((had_initial_layout_dirty or had_initial_interaction_dirty) and !r.frame_state.state_bits.dirty.runtime.subtree_dirty and !r.frame_state.state_bits.dirty.pipeline.subtree_order) {
             cx_runtime_index.collectPartialInteractionRootsWithFallback(self, r, &partial_interaction_roots);
         }
-        // 这四个归因点曾被删成"写但 0 read"，于是 before_render 整段成了黑盒：
-        // 实测它每帧恒定 4.7ms（571 节点），不拆开就只能靠猜。恢复写入。
-        var br_timer = std.time.Timer.start() catch undefined;
+        // These four attribution points were deleted as write-but-zero-read, making before_render
+        // a black box measured at 4.7ms constant (571 nodes) with no way to drill down. Restored.
+        var br_timer = @import("zenit_time").Timer.start(self.io) catch undefined;
         if (had_initial_layout_dirty) {
             layout_engine.layoutNode(r, self.viewport, LayoutContext{ .frame_allocator = self.frame_arena.allocator(), .shaping_cache = &self.text.shaping_cache, .font_system = self.text.font_system });
             self.syncLayoutToTable(r);
         }
         self.perf.br_initial_layout_us = br_timer.lap() / 1000;
         const viewport_clip = ComputedRect.init(0, 0, self.viewport.width, self.viewport.height);
-        // 设置全局帧时间供 on_before_render hooks 和动画系统读取（单线程安全，此处是唯一入口）
+        // Set global frame time for on_before_render hooks and animation system (single-threaded
+        // safe, sole entry point).
         render_engine.setFrameClock(.{
+            .io = self.io,
             .time_ms = self.frame_time_ms,
             .dt_ms = self.frame_dt_ms,
             .dt_seconds = self.frame_dt_seconds,
+            .reduced_motion = self.reduced_motion or self.renderer_reduced_motion,
         });
-        // tick_depth 门控：遍历期间 freeNode 一律延后（见 freeNode 注释）。
+        // tick_depth gate: freeNode always deferred during traversal (see freeNode comment).
         self.tick_depth += 1;
+        // Signal writes during animation tick batched until tick end; batch collected before
+        // tick_depth returns to zero, effects' freeNode still deferred.
+        self.owner.beginBatch();
         const tick_active = render_engine.tickBeforeRender(r, 0, 0, viewport_clip, self.allocator, self.frame_dt_seconds * 1000.0);
+        self.owner.endBatch();
         self.tick_depth -= 1;
         self.perf.br_tick_us = br_timer.lap() / 1000;
         // See forceTickAndRebuildForHitTest: discard pre-hook ancestry
@@ -493,7 +532,7 @@ fn ensureBeforeRenderTicked(self: *Cx) void {
                 layout_engine.layoutNode(current_root, self.viewport, LayoutContext{ .frame_allocator = self.frame_arena.allocator(), .shaping_cache = &self.text.shaping_cache, .font_system = self.text.font_system });
                 self.syncLayoutToTable(current_root);
             }
-            // 索引随后整体重建，不需要局部命中根。
+            // Index rebuilt afterwards, no need for local hit root.
             var ignored_partial = PartialInteractionRoots{};
             _ = runAfterLayoutHooks(self, &ignored_partial);
             cx_runtime_index.fullRebuildRuntimeIndexes(self, self.root orelse current_root) catch @panic("OOM: root changed during before-render tick");
@@ -505,10 +544,12 @@ fn ensureBeforeRenderTicked(self: *Cx) void {
         if (tick_active) {
             self.needs_redraw = true;
         }
-        // on_before_render hooks 可能标脏 layout（修改 translate/rect）和 interaction。
-        // 必须先完成 layout 再重建 interaction index，否则 hitTest 的 world position 基于旧 rect。
-        // 注意：has_layout_dirty 必须在 layout 之前读取，因为 layout 会清除 dirty 标记。
-        // 如果这帧做了 layout，interaction index 也必须更新（子节点的绝对位置变了）。
+        // on_before_render hooks may mark layout (translate/rect) and interaction dirty. Must
+        // complete layout before rebuilding interaction index, else hitTest world position stale.
+        // Note:
+        // has_layout_dirty must read before layout (layout clears dirty flags). If layout runs this
+        // frame,
+        // interaction index must update (children's absolute positions changed).
         const had_post_tick_layout_dirty = current_root.frame_state.state_bits.dirty.core.layout or current_root.frame_state.state_bits.dirty.core.subtree_layout;
         const had_post_tick_interaction_dirty = current_root.frame_state.state_bits.dirty.pipeline.subtree_interaction or cx_runtime_index.subtreeHasLooseInteractionDirty(current_root);
         if ((had_post_tick_layout_dirty or had_post_tick_interaction_dirty) and !current_root.frame_state.state_bits.dirty.runtime.subtree_dirty and !current_root.frame_state.state_bits.dirty.pipeline.subtree_order) {
@@ -522,7 +563,7 @@ fn ensureBeforeRenderTicked(self: *Cx) void {
         const after_layout = runAfterLayoutHooks(self, &partial_interaction_roots);
         const has_layout_dirty = had_initial_layout_dirty or had_post_tick_layout_dirty or after_layout.ran_layout;
         const has_interaction_dirty = had_initial_interaction_dirty or had_post_tick_interaction_dirty or after_layout.interaction_dirty;
-        // OOM 不吞：见 rebuildRuntimeIndexesIfCurrentRootDirty 的说明。
+        // OOM not swallowed (see rebuildRuntimeIndexesIfCurrentRootDirty).
         if (current_root.frame_state.state_bits.dirty.runtime.subtree_dirty) {
             cx_runtime_index.rebuildRuntimeIndexes(self) catch @panic("OOM: rebuildRuntimeIndexes (before-render tick)");
         } else if (current_root.frame_state.state_bits.dirty.pipeline.subtree_order) {
@@ -536,7 +577,7 @@ fn ensureBeforeRenderTicked(self: *Cx) void {
     self.before_render_time_ms = self.frame_time_ms;
 }
 
-fn renderVisualLine(context: *anyopaque, content: []const u8, font_size: f32, font_weight: u16, italic: bool) ?text_core_module.VisualLine {
+fn renderVisualLine(context: *anyopaque, content: []const u8, font_size: f32, font_weight: u16, italic: bool, family: u16, mono: bool, symbols: bool) ?text_core_module.VisualLine {
     const self: *Cx = @ptrCast(@alignCast(context));
     return self.text.visualLine(.{
         .text = content,
@@ -544,5 +585,8 @@ fn renderVisualLine(context: *anyopaque, content: []const u8, font_size: f32, fo
         .font_size = font_size,
         .font_weight = font_weight,
         .use_italic = italic,
+        .font_family_id = family,
+        .use_monospace = mono,
+        .use_symbols = symbols,
     }) catch null;
 }

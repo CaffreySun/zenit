@@ -1,16 +1,15 @@
-//! Stage B-1: GpuDraw shadow encoding
+//! GpuDraw shadow encoding (Stage B-1).
 //!
-//! 在 paint pass 末尾跑一遍 display_list -> GpuDraw 的 lowering，与主路径产物
-//! 做 trivial 结构等价断言。debug build only。
+//! At paint pass end, run display_list -> GpuDraw lowering once and assert trivial structural
+//! equivalence with the main path product. Debug build only.
 //!
-//! 目标：在不改主路径的前提下，验证 display_item_encode 在真场景下不丢信息，
-//! 为后续 Stage B-2/B-3 把 GpuDraw 真正接入主路径铺路。
+//! Goal: without changing the main path, verify display_item_encode loses no info in real scenes,
+//! paving the way for Stage B-2/B-3 to land GpuDraw in the main path.
 //!
-//! 当前断言粒度：drawable command count 等价（push_clip/pop_clip/begin_*_layer
-//! 等控制流不算 drawable，会被 lowering 跳过，它们在 GpuDraw 层会变成 scissor
-//! 或 blend mode 字段，需要状态机重建，本阶段不做）。
-//!
-//! 后续阶段会逐步加深断言（pipeline id 序列、texture handle 一致、batch run 长度等）。
+//! Current assertion granularity: drawable command count (push_clip/pop_clip/begin_*_layer etc.
+//! are control flow, skipped by lowering and become scissor/blend mode in GpuDraw; that needs
+//! state machine rebuild, deferred). Later stages will deepen assertions (pipeline id sequence,
+//! texture handle match, batch run length, etc.).
 
 const std = @import("std");
 const display_list_mod = @import("../display_list.zig");
@@ -23,12 +22,10 @@ pub const PaintItem = paint_table_mod.DisplayItem;
 pub const PaintItemKind = paint_table_mod.DisplayItemKind;
 pub const GpuDraw = gpu_draw_mod.GpuDraw;
 
-/// 把主路径 display_list 的 union DisplayItem 降级为 paint_table 的简化 struct，
-/// 给 display_item_encode.encodeStream 消费。
-///
-/// 输出现在带 geom (x/y/w/h) + color + radii，让
-/// shadow 路径与 cx.syncPaintToTable 写入的 PaintTable 数据**逐字段等价**，
-/// 为后续 encoder 切到 paint_table.DisplayItem 真接管做内容验证基础。
+/// Downgrade display_list's union DisplayItem to paint_table's simplified struct for
+/// display_item_encode.encodeStream. Output now carries geom (x/y/w/h) + color + radii so
+/// shadow path and cx.syncPaintToTable writes to PaintTable are **field-wise identical**,
+/// basis for content validation when encoder switches to paint_table.DisplayItem.
 pub fn lowerDisplayItem(item: DisplayItem) PaintItem {
     const kind: PaintItemKind = switch (item) {
         .fill_rect, .stroke_rect, .border_side, .border_per_side, .outline_rect, .noise_rect => .rect,
@@ -39,14 +36,14 @@ pub fn lowerDisplayItem(item: DisplayItem) PaintItem {
         .gradient_rect, .multi_gradient_rect => .gradient,
         .push_clip, .pop_clip, .begin_opacity_layer, .end_opacity_layer, .begin_blur_layer, .end_blur_layer, .begin_rounded_clip, .end_rounded_clip => .control,
     };
-    // resource_handle 仅 text/image/icon 有意义；其余 0
+    // resource_handle only meaningful for text/image/icon; rest 0
     const resource: u64 = switch (item) {
         .text_run => |t| t.blob_id,
         .image_quad => |i| i.texture_id,
         .icon_rep => |i| i.icon_id,
         else => 0,
     };
-    // geom + color + radii + local_bounds: rect-family kind 提取完整几何/颜色信息
+    // geom + color + radii + local_bounds: rect-family kind extracts full geometry/color
     var out: PaintItem = .{ .kind = kind, .resource_handle = resource };
     switch (item) {
         .fill_rect => |r| {
@@ -89,7 +86,9 @@ pub fn lowerDisplayItem(item: DisplayItem) PaintItem {
             out.local_bounds = .{ .min_x = s.x, .min_y = s.y, .max_x = s.x + s.w, .max_y = s.y + s.h };
             out.geom = .{ .x = s.x, .y = s.y, .w = s.w, .h = s.h };
             out.color = .{ .r = s.color.r, .g = s.color.g, .b = s.color.b, .a = s.color.a };
-            // radius 必须透传，否则外阴影恒为直角矩形（圆角节点四角露出矩形切块）
+            // radius must pass through, else shadow always right-angle rectangle (rounded node
+            // shows
+            // rectangular chunks at corners)
             out.radii = .{ .tl = s.radius[0], .tr = s.radius[1], .br = s.radius[2], .bl = s.radius[3] };
             out.shadow_blur = s.blur;
             out.shadow_offset_x = s.offset_x;
@@ -107,15 +106,16 @@ pub fn lowerDisplayItem(item: DisplayItem) PaintItem {
             if (t.use_italic_font) flags |= paint_table_mod.TextFontFlag.italic;
             if (t.use_monospace_font) flags |= paint_table_mod.TextFontFlag.monospace;
             if (t.use_symbols_font) flags |= paint_table_mod.TextFontFlag.symbols;
+            if (!t.font_smoothing) flags |= paint_table_mod.TextFontFlag.no_smoothing;
             out.text_font_flags = flags;
             out.text_monospace_char_width = t.monospace_char_width;
             out.text_blob_byte_start = t.blob_byte_start;
             out.text_blob_byte_end = t.blob_byte_end;
             out.text_content = t.content;
             out.text_spans = t.spans;
-            // 三态原样过线（exhaustive：新增策略必须显式选 wire 值）。
-            // 曾在此折叠成 0/1，encoder 因此永远拿不到 surface_cached，那是
-            // "policy 名称不保证 cached 语义" 的源头，勿回退。
+            // Three-state pass as-is (exhaustive: new strategy must explicitly pick wire value).
+            // Was collapsed to 0/1 here, encoder never got surface_cached; source of
+            // "policy name does not guarantee cached semantics". Don't revert.
             out.text_raster_policy = switch (t.raster_policy) {
                 .static_crisp => 0,
                 .animated_stable => 1,
@@ -139,16 +139,18 @@ pub fn lowerDisplayItem(item: DisplayItem) PaintItem {
             out.icon_tint = .{ .r = ic.tint.r, .g = ic.tint.g, .b = ic.tint.b, .a = ic.tint.a };
             out.icon_corner_clip_radius = ic.corner_clip_radius;
             out.icon_rep_size = ic.rep_size;
+            out.icon_snap = ic.snap;
             out.rotate = ic.rotate;
-            // icon_rep_ptr 由 cx.lowerForEncoderPaintTable 从 source ArrayList 索引取地址
-            // (capture-by-value 的 ic 是栈临时，&ic.rep 会失效)
+            // icon_rep_ptr from cx.lowerForEncoderPaintTable indexes from source ArrayList
+            // (captured ic is
+            // stack temporary, &ic.rep becomes invalid)
         },
         .multi_gradient_rect => |mg| {
             out.local_bounds = .{ .min_x = mg.x, .min_y = mg.y, .max_x = mg.x + mg.w, .max_y = mg.y + mg.h };
             out.geom = .{ .x = mg.x, .y = mg.y, .w = mg.w, .h = mg.h };
             out.radii = .{ .tl = mg.radius[0], .tr = mg.radius[1], .br = mg.radius[2], .bl = mg.radius[3] };
-            out.gradient_direction = @intFromEnum(mg.direction);
-            out.gradient_extend_mode = @intFromEnum(mg.extend_mode);
+            out.gradient_direction = @backingInt(mg.direction);
+            out.gradient_extend_mode = @backingInt(mg.extend_mode);
             out.gradient_radial_center_x = mg.radial_center_x;
             out.gradient_radial_center_y = mg.radial_center_y;
             out.gradient_radial_radius_x = mg.radial_radius_x;
@@ -170,11 +172,12 @@ pub fn lowerDisplayItem(item: DisplayItem) PaintItem {
             out.color = .{ .r = fp.color.r, .g = fp.color.g, .b = fp.color.b, .a = fp.color.a };
             out.geom = .{ .x = fp.offset_x, .y = fp.offset_y, .w = 0, .h = 0 };
             out.image_opacity = fp.opacity;
-            // fp.geometry 已是 *const PathGeometry，指向 scene runtime 持有的稳定堆对象
-            // (不是栈值地址)，安全直接复制
+            // fp.geometry already *const PathGeometry pointing to stable heap object held by scene
+            // runtime (not stack value), safe to copy directly
             out.path_geometry_ptr = fp.geometry;
-            // 渐变复用 PaintItem 上既有的 mg_* 槽位（与 multi_gradient_rect
-            // 同一套），encoder 侧统一读这些字段。
+            // gradient reuses existing mg_* slots on PaintItem (same as multi_gradient_rect),
+            // encoder
+            // reads these fields uniformly.
             out.gradient_direction = fp.gradient_direction;
             out.mg_stop_count = fp.gradient_stop_count;
             for (0..@min(@as(usize, fp.gradient_stop_count), 16)) |i| {
@@ -195,7 +198,7 @@ pub fn lowerDisplayItem(item: DisplayItem) PaintItem {
             out.geom = .{ .x = sp.offset_x, .y = sp.offset_y, .w = 0, .h = 0 };
             out.image_opacity = sp.opacity;
             out.stroke_width = sp.width;
-            out.path_line_join = @intFromEnum(sp.line_join);
+            out.path_line_join = @backingInt(sp.line_join);
             out.path_geometry_ptr = sp.geometry;
         },
         .gradient_rect => |g| {
@@ -204,8 +207,8 @@ pub fn lowerDisplayItem(item: DisplayItem) PaintItem {
             out.color = .{ .r = g.from.r, .g = g.from.g, .b = g.from.b, .a = g.from.a };
             out.gradient_to_color = .{ .r = g.to.r, .g = g.to.g, .b = g.to.b, .a = g.to.a };
             out.radii = .{ .tl = g.radius[0], .tr = g.radius[1], .br = g.radius[2], .bl = g.radius[3] };
-            out.gradient_direction = @intFromEnum(g.direction);
-            out.gradient_extend_mode = @intFromEnum(g.extend_mode);
+            out.gradient_direction = @backingInt(g.direction);
+            out.gradient_extend_mode = @backingInt(g.extend_mode);
             out.gradient_radial_center_x = g.radial_center_x;
             out.gradient_radial_center_y = g.radial_center_y;
             out.gradient_conic_start_angle = g.conic_start_angle;
@@ -246,7 +249,7 @@ pub fn lowerDisplayItem(item: DisplayItem) PaintItem {
             out.shadow2_offset_y = sd.shadow2_offset_y;
         },
         .arc => |ar| {
-            // arc 几何无 rect bounds，用 (cx-r, cy-r, 2r, 2r) 作 conservative AABB
+            // arc geometry has no rect bounds, use (cx-r, cy-r, 2r, 2r) as conservative AABB
             const r = ar.outer_radius;
             out.local_bounds = .{ .min_x = ar.cx - r, .min_y = ar.cy - r, .max_x = ar.cx + r, .max_y = ar.cy + r };
             out.geom = .{ .x = ar.cx, .y = ar.cy, .w = 0, .h = 0 };
@@ -256,15 +259,17 @@ pub fn lowerDisplayItem(item: DisplayItem) PaintItem {
             out.arc_start_angle = ar.start_angle;
             out.arc_end_angle = ar.end_angle;
         },
-        // B-7-C: 8 control kinds, kind = .control + control_kind 区分 token
+        // B-7-C: 8 control kinds, kind = .control + control_kind distinguishes token
         .push_clip => |pc| {
             out.geom = .{ .x = pc.x, .y = pc.y, .w = pc.w, .h = pc.h };
             out.radii = .{ .tl = pc.radius, .tr = pc.radius, .br = pc.radius, .bl = pc.radius };
             out.control_kind = .push_clip;
-            out.clip_shape_kind = @intFromEnum(pc.shape_kind);
-            // polygon shape 字段通过 cx.lowerForEncoderPaintTable 在 frame_arena
-            // 里 alloc paint_table.ClipPolygonMirror 副本写 extra_ptr (B-7 主路径切换)。
-            // 这里 lowerDisplayItem 是无状态 fn 不分配；shadow path 暂不读 polygon。
+            out.clip_shape_kind = @backingInt(pc.shape_kind);
+            // polygon shape field via cx.lowerForEncoderPaintTable allocs
+            // paint_table.ClipPolygonMirror
+            // copy in frame_arena, writes extra_ptr (B-7 main path switch). Here lowerDisplayItem
+            // is stateless
+            // fn, no alloc; shadow path does not read polygon yet.
         },
         .pop_clip => {
             out.control_kind = .pop_clip;
@@ -284,7 +289,8 @@ pub fn lowerDisplayItem(item: DisplayItem) PaintItem {
                 bo.draw_transform.c,  bo.draw_transform.d,
                 bo.draw_transform.tx, bo.draw_transform.ty,
             };
-            out.blend_mode = @intFromEnum(bo.blend_mode);
+            out.blend_mode = @backingInt(bo.blend_mode);
+            out.warp = bo.warp;
             out.surface_stable_id = bo.surface_stable_id;
             out.surface_content_version = bo.surface_content_version;
             out.control_kind = .begin_opacity_layer;
@@ -295,7 +301,10 @@ pub fn lowerDisplayItem(item: DisplayItem) PaintItem {
         .begin_blur_layer => |bb| {
             out.glass_owner_id = bb.owner_node;
             out.geom = .{ .x = bb.x, .y = bb.y, .w = bb.w, .h = bb.h };
-            out.radii = .{ .tl = bb.corner_radius, .tr = bb.corner_radius, .br = bb.corner_radius, .bl = bb.corner_radius };
+            out.radii = if (bb.corner_radii[0] >= 0)
+                .{ .tl = bb.corner_radii[0], .tr = bb.corner_radii[1], .br = bb.corner_radii[2], .bl = bb.corner_radii[3] }
+            else
+                .{ .tl = bb.corner_radius, .tr = bb.corner_radius, .br = bb.corner_radius, .bl = bb.corner_radius };
             out.rotate = bb.rotate;
             out.draw_x = bb.draw_x;
             out.draw_y = bb.draw_y;
@@ -308,9 +317,10 @@ pub fn lowerDisplayItem(item: DisplayItem) PaintItem {
                 bb.draw_transform.tx, bb.draw_transform.ty,
             };
             out.control_kind = .begin_blur_layer;
-            // glass: ResolvedGlassParams 通过 cx.lowerForEncoderPaintTable 在 frame_arena
-            // 里 alloc paint_table.GlassParamsMirror 副本写 extra_ptr (B-7 主路径切换)。
-            // lowerDisplayItem 是无状态 fn 不分配。
+            // glass: ResolvedGlassParams via cx.lowerForEncoderPaintTable allocs
+            // paint_table.GlassParamsMirror copy in frame_arena, writes extra_ptr (B-7 main path
+            // switch).
+            // lowerDisplayItem stateless, no alloc.
         },
         .end_blur_layer => {
             out.control_kind = .end_blur_layer;
@@ -339,31 +349,30 @@ pub fn lowerDisplayItem(item: DisplayItem) PaintItem {
 }
 
 pub const ShadowResult = struct {
-    /// display_list 总条目数
+    /// display_list total items
     display_item_count: usize,
-    /// lowering_buffer 中 drawable commands 数（控制流不计）
+    /// drawable commands in lowering_buffer (control flow not counted)
     drawable_command_count: usize,
-    /// 按 instance batching 后的 GpuDraw 数（≤ display_item_count）
+    /// GpuDraw count after instance batching (<= display_item_count)
     gpu_draw_count: usize,
-    /// 等价性：display_item_count == drawable_command_count（lowering 是 1:1）
+    /// Equivalence: display_item_count == drawable_command_count (lowering is 1:1)
     counts_match: bool,
-    /// pipeline 序列等价：display_list lowering 后的 pipeline id 序列
-    /// 与 caller 提供的 drawable command pipeline id 序列内容完全相同。
-    /// 仅当 counts_match 且 caller 传入序列时计算；否则 false。
+    /// pipeline sequence equivalence: display_list lowering pipeline id sequence matches caller's
+    /// drawable command pipeline id sequence exactly. Computed only when counts_match and caller
+    /// supplies sequence; else false.
     pipelines_match: bool,
-    /// 最长可合并 batch run（同 pipeline + 同 blend + 同 texture 连续段）
+    /// longest mergeable batch run (same pipeline + same blend + same texture consecutive span)
     max_batch_run: u32,
-    /// 字段值等价检查，paint_table.DisplayItem 的
-    /// geom (x/y/w/h) 转回与 display_list 的 fill_rect (x/y/w/h) 字段相同。
-    /// 失败 = lowerDisplayItem 字段映射 bug (未来 rename / 类型变更 catch)。
-    /// 0 = 全部通过；> 0 = 该数量 fill_rect lowering 字段值不一致。
+    /// field value equivalence check: paint_table.DisplayItem geom (x/y/w/h) matches
+    /// display_list fill_rect (x/y/w/h) field. Fail = lowerDisplayItem field mapping bug
+    /// (future rename / type change catch). 0 = all pass; > 0 = count of fill_rect lowering
+    /// field mismatch.
     field_value_mismatches: u32,
 };
 
-/// 主入口：从 display_list 跑 lowering + encode，返回结构等价信息。
-/// 调用方负责 out_draws 容量 ≥ display_items.len。
-/// expected_pipelines（可选）：drawable command 的 pipeline id 序列；
-/// 提供时计算 pipelines_match 字段。
+/// main entry: lowering + encode from display_list, return structural equivalence info.
+/// caller responsible for out_draws capacity >= display_items.len. expected_pipelines (optional):
+/// drawable command pipeline id sequence; when provided, compute pipelines_match field.
 pub fn encodeShadow(
     display_items: []const DisplayItem,
     drawable_render_commands: usize,
@@ -384,8 +393,8 @@ pub fn encodeShadow(
     }
     std.debug.assert(out_draws.len >= n);
 
-    // 字段值等价 self-check
-    // paint_table.DisplayItem.geom 应与 display_list 各 kind 的 (x,y,w,h) 字段一致。
+    // field equivalence self-check: paint_table.DisplayItem.geom should match display_list
+    // each kind's (x,y,w,h) field.
     var field_mismatches: u32 = 0;
     for (display_items) |it| {
         const lowered = lowerDisplayItem(it);
@@ -412,7 +421,7 @@ pub fn encodeShadow(
         }
     }
 
-    // Lower 全部 items
+    // Lower all items
     var lowered_buf: [256]PaintItem = undefined;
     var total_draws: usize = 0;
     var max_run: u32 = 0;
@@ -423,7 +432,8 @@ pub fn encodeShadow(
         total_draws = display_item_encode.encodeStream(lowered_buf[0..n], 0, out_draws);
         max_run = display_item_encode.maxBatchableRun(lowered_buf[0..n], 0);
     } else {
-        // 大于 stack buffer 时分段处理（不合并跨段 batch，仅起步阶段保守做法）
+        // When > stack buffer, process in segments (don't merge cross-segment batches, conservative
+        // early approach)
         var i: usize = 0;
         while (i < n) {
             const chunk = @min(lowered_buf.len, n - i);
@@ -476,8 +486,8 @@ fn dummyHeader() display_list_mod.ItemHeader {
 }
 
 test "lowerDisplayItem: 渐变的 shape 透传（椭圆的渐变不能铺满包围盒）" {
-    // 渐变走的是 .gradient kind，与 fill_rect 是两条独立的 lowering 分支。
-    // shape 漏传 ⇒ 椭圆/正圆的渐变画成一个铺满 bbox 的渐变方块。
+    // gradient uses .gradient kind, separate lowering branch from fill_rect. shape omitted =>
+    // ellipse/circle gradient drawn as gradient-fill bbox.
     var mg: DisplayItem = .{ .multi_gradient_rect = .{
         .header = dummyHeader(),
         .x = 0,
@@ -505,8 +515,8 @@ test "lowerDisplayItem: 渐变的 shape 透传（椭圆的渐变不能铺满包�
 }
 
 test "lowerDisplayItem: fill_rect/stroke_rect 的 shape 透传（椭圆不能退回矩形）" {
-    // shape 漏传 = 椭圆静默画成圆角矩形（宽高比大时是"胶囊"），而层数/几何
-    // 断言全都正常，这条断言的就是那个静默失效点。
+    // shape omitted = ellipse silently drawn as rounded_rect ("capsule" when aspect ratio large),
+    // while layer/geometry assertions all pass; this assertion targets that silent-fail point.
     const fill: DisplayItem = .{ .fill_rect = .{
         .header = dummyHeader(),
         .x = 0,
@@ -530,7 +540,7 @@ test "lowerDisplayItem: fill_rect/stroke_rect 的 shape 透传（椭圆不能退
     } };
     try testing.expectEqual(@as(u8, 1), lowerDisplayItem(stroke).shape_kind);
 
-    // 默认必须是 0（rounded_rect），不写 shape 的既有调用方行为不变
+    // default must be 0 (rounded_rect), existing callers not writing shape unchanged
     const plain: DisplayItem = .{ .fill_rect = .{
         .header = dummyHeader(),
         .x = 0,
@@ -566,7 +576,7 @@ test "lowerDisplayItem: fill_rect 字段无损 (geom + color + radii)" {
         .radius = .{ 4, 8, 16, 0 },
     } };
     const lowered = lowerDisplayItem(item);
-    // 验证 lowering 字段无损，真接管时无信息丢失。
+    // verify lowerDisplayItem lossless, true takeover has no info loss
     try testing.expectEqual(@as(f32, 12.5), lowered.geom.x);
     try testing.expectEqual(@as(f32, 7.25), lowered.geom.y);
     try testing.expectEqual(@as(f32, 100), lowered.geom.w);
@@ -597,7 +607,7 @@ test "lowerDisplayItem: shadow_rect 字段无损 (geom + color + blur + offset)"
     try testing.expectEqual(PaintItemKind.shadow, lowered.kind);
     try testing.expectEqual(@as(f32, 100), lowered.geom.w);
     try testing.expectEqual(@as(u8, 128), lowered.color.a);
-    // B-5+ 扩展字段无损
+    // B-5+ extended fields lossless
     try testing.expectEqual(@as(f32, 12), lowered.shadow_blur);
     try testing.expectEqual(@as(f32, 2), lowered.shadow_offset_x);
     try testing.expectEqual(@as(f32, 4), lowered.shadow_offset_y);
@@ -741,8 +751,8 @@ test "lowerDisplayItem: push_clip rect → control kind + clip_shape_kind=0" {
     try testing.expectEqual(@as(u8, 0), lowered.clip_shape_kind);
     try testing.expectApproxEqAbs(@as(f32, 10), lowered.geom.x, 0.001);
     try testing.expectApproxEqAbs(@as(f32, 8), lowered.radii.tl, 0.001);
-    // rect shape clip_polygon_ptr 由 cx.lowerForEncoderPaintTable 在 source ArrayList
-    // 取地址写入 (lowerDisplayItem 这层不设)，所以 unit test 期望 null
+    // rect shape clip_polygon_ptr from cx.lowerForEncoderPaintTable indexes source ArrayList
+    // (lowerDisplayItem layer does not set), unit test expects null
     try testing.expect(lowered.clip_polygon_ptr == null);
 }
 
@@ -762,7 +772,7 @@ test "lowerDisplayItem: push_clip polygon → control_kind/clip_shape_kind 标�
     const lowered = lowerDisplayItem(item);
     try testing.expectEqual(paint_table_mod.ControlKind.push_clip, lowered.control_kind);
     try testing.expectEqual(@as(u8, 3), lowered.clip_shape_kind);
-    // clip_polygon_ptr 不在 lowerDisplayItem 阶段写，由 cx.lowerForEncoderPaintTable 写
+    // clip_polygon_ptr not set at lowerDisplayItem stage, written by cx.lowerForEncoderPaintTable
 }
 
 test "lowerDisplayItem: pop_clip / end_*_layer / end_rounded_clip → control_kind only" {
@@ -795,14 +805,16 @@ test "lowerDisplayItem: begin_opacity_layer 字段无损 (geom + opacity + draw_
         .use_draw_transform = true,
         .draw_transform = types_mod.Transform2D{ .a = 1.5, .b = 0, .c = 0, .d = 1.5, .tx = 5, .ty = 6 },
         .blend_mode = .multiply,
+        .warp = .{ 6, 2, 4, 14 },
     } };
     const lowered = lowerDisplayItem(item);
     try testing.expectEqual(paint_table_mod.ControlKind.begin_opacity_layer, lowered.control_kind);
+    try testing.expectEqual([4]f32{ 6, 2, 4, 14 }, lowered.warp);
     try testing.expectApproxEqAbs(@as(f32, 0.5), lowered.opacity, 0.001);
     try testing.expectApproxEqAbs(@as(f32, 1.5), lowered.draw_transform[0], 0.001);
     try testing.expectApproxEqAbs(@as(f32, 5), lowered.draw_transform[4], 0.001);
     try testing.expect(lowered.use_draw_transform);
-    // multiply 在 BlendMode 中的位置 (查 types.zig:611) = 1
+    // multiply position in BlendMode (see types.zig:611) = 1
     try testing.expect(lowered.blend_mode != 0);
 }
 
@@ -818,7 +830,22 @@ test "lowerDisplayItem: begin_blur_layer extra_ptr 透传 source variant" {
     const lowered = lowerDisplayItem(item);
     try testing.expectEqual(paint_table_mod.ControlKind.begin_blur_layer, lowered.control_kind);
     try testing.expectApproxEqAbs(@as(f32, 12), lowered.radii.tl, 0.001);
-    // glass_ptr 由 cx.lowerForEncoderPaintTable 写入 (lowerDisplayItem 不设)
+    // glass_ptr written by cx.lowerForEncoderPaintTable (lowerDisplayItem does not set)
+}
+
+test "lowerDisplayItem: begin_blur_layer 四角半径逐角透传（同心圆角玻璃）" {
+    const item: DisplayItem = .{ .begin_blur_layer = .{
+        .header = dummyHeader(),
+        .x = 0,
+        .y = 0,
+        .w = 60,
+        .h = 60,
+        .corner_radius = 12,
+        .corner_radii = .{ 12, 0, 0, 0 },
+    } };
+    const lowered = lowerDisplayItem(item);
+    try testing.expectApproxEqAbs(@as(f32, 12), lowered.radii.tl, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 0), lowered.radii.bl, 0.001);
 }
 
 test "lowerDisplayItem: begin_rounded_clip 字段无损 (geom + radius + draw fields)" {
@@ -888,10 +915,10 @@ test "lowerDisplayItem: shadow_dual_rect 字段无损 (fill + shadow1 + shadow2)
     const lowered = lowerDisplayItem(item);
     try testing.expectEqual(PaintItemKind.shadow, lowered.kind);
     try testing.expectEqual(@as(u8, 250), lowered.color.r);
-    // shadow1 占 secondary 槽
+    // shadow1 uses secondary slot
     try testing.expectEqual(@as(u8, 64), lowered.shadow_secondary_color.a);
     try testing.expectApproxEqAbs(@as(f32, 4), lowered.shadow_blur, 0.001);
-    // shadow2 独立槽
+    // shadow2 separate slot
     try testing.expectEqual(@as(u8, 32), lowered.shadow2_color.a);
     try testing.expectApproxEqAbs(@as(f32, 12), lowered.shadow2_blur, 0.001);
     try testing.expectApproxEqAbs(@as(f32, 4), lowered.shadow2_offset_y, 0.001);
@@ -917,7 +944,7 @@ test "lowerDisplayItem: arc 字段无损 (center + radius + stroke + angle)" {
     try testing.expectApproxEqAbs(@as(f32, 2), lowered.stroke_width, 0.001);
     try testing.expectApproxEqAbs(@as(f32, std.math.pi), lowered.arc_end_angle, 0.001);
     try testing.expectEqual(@as(u8, 200), lowered.color.r);
-    // local_bounds 是 (cx-r, cy-r, 2r, 2r) AABB
+    // local_bounds is (cx-r, cy-r, 2r, 2r) AABB
     try testing.expectApproxEqAbs(@as(f32, 30), lowered.local_bounds.min_x, 0.001);
     try testing.expectApproxEqAbs(@as(f32, 80), lowered.local_bounds.max_y, 0.001);
 }
@@ -979,7 +1006,7 @@ test "lowerDisplayItem: icon_rep → image kind, extra_ptr 透传 *const Rep" {
     try testing.expectEqual(@as(u8, 200), lowered.icon_tint.r);
     try testing.expectApproxEqAbs(@as(f32, 4), lowered.icon_corner_clip_radius, 0.001);
     try testing.expectApproxEqAbs(@as(f32, 0.8), lowered.image_opacity, 0.001);
-    // icon_rep_ptr 由 cx.lowerForEncoderPaintTable 写入 (lowerDisplayItem 不设)
+    // icon_rep_ptr written by cx.lowerForEncoderPaintTable (lowerDisplayItem does not set)
 }
 
 test "lowerDisplayItem: fill_path / stroke_path → path kind, extra_ptr 透传 *const PathGeometry" {
@@ -1065,7 +1092,7 @@ test "encodeShadow: field_value_mismatches == 0 for fill_rect/text/image mix" {
     };
     var out: [4]GpuDraw = undefined;
     const r = encodeShadow(&items, 4, &out, null);
-    // field 等价 = 0, lowerDisplayItem 字段映射无误
+    // field equivalence = 0, lowerDisplayItem field mapping correct
     try testing.expectEqual(@as(u32, 0), r.field_value_mismatches);
 }
 
@@ -1100,7 +1127,7 @@ test "encodeShadow: pipelines_match when pipeline sequence matches" {
         .{ .image_quad = .{ .header = dummyHeader(), .x = 0, .y = 0, .w = 10, .h = 10, .texture_id = 1 } },
     };
     var out: [3]GpuDraw = undefined;
-    // 期望序列：rect(1), text(2), image(3)，与 pipelineForKind 一致
+    // expected sequence: rect(1), text(2), image(3), matches pipelineForKind
     const expected = [_]display_item_encode.PipelineId{ 1, 2, 3 };
     const r = encodeShadow(&items, 3, &out, &expected);
     try testing.expect(r.counts_match);
@@ -1112,7 +1139,7 @@ test "encodeShadow: pipelines_match false when sequence diverges" {
         .{ .fill_rect = .{ .header = dummyHeader(), .x = 0, .y = 0, .w = 10, .h = 10, .color = Color.WHITE } },
     };
     var out: [1]GpuDraw = undefined;
-    // 期望 text(2) 但实际是 rect(1)
+    // expected text(2) but got rect(1)
     const expected = [_]display_item_encode.PipelineId{2};
     const r = encodeShadow(&items, 1, &out, &expected);
     try testing.expect(r.counts_match);
@@ -1129,5 +1156,5 @@ test "encodeShadow: max_batch_run reflects longest same-kind run" {
     };
     var out: [5]GpuDraw = undefined;
     const r = encodeShadow(&items, 5, &out, null);
-    try testing.expectEqual(@as(u32, 3), r.max_batch_run); // 3 text_run 连续段
+    try testing.expectEqual(@as(u32, 3), r.max_batch_run); // 3 text_run consecutive segments
 }

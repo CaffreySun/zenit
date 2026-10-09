@@ -4,21 +4,11 @@ const ui = @import("ui");
 const zenit_app = @import("zenit_app");
 
 const MultiWindowApp = zenit_app.MultiWindowApp;
+const Target = @import("_view.yix.zig").Target;
 var g_target_cx: ?*ui.Cx = null;
 
 fn mountTarget(cx: *ui.Cx, scope: *ui.Scope) anyerror!*ui.Node {
-    _ = scope;
-    return ui.box(cx, .{
-        .width = .fill(),
-        .height = .fill(),
-        .direction = .column,
-        .padding = ui.Padding.all(32),
-        .background = cx.tokens.color.bg_primary,
-    }, .{try ui.text(cx, "Console probe target", .{
-        .font_size = ui.arb.px(22),
-        .font_weight = 600,
-        .color = cx.tokens.color.fg_primary,
-    })});
+    return ui.view.render(scope, cx, Target(.{}));
 }
 
 fn mountDevTools(cx: *ui.Cx, scope: *ui.Scope) anyerror!*ui.Node {
@@ -75,12 +65,12 @@ fn runSmoke(application: *MultiWindowApp, target: *zenit_app.App, devtools: *zen
     });
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+pub fn main(init: std.process.Init) !void {
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
     const smoke_frames: ?u64 = blk: {
-        const raw = std.posix.getenv("ZENIT_SMOKE_FRAMES") orelse break :blk null;
+        const raw = @import("zenit_environment").getBorrowed("ZENIT_SMOKE_FRAMES") orelse break :blk null;
         break :blk std.fmt.parseInt(u64, raw, 10) catch null;
     };
 
@@ -89,6 +79,7 @@ pub fn main() !void {
     const frame_pacing: zenit_app.runtime.FramePacing = if (smoke_frames != null) .poll else .display_link;
 
     const target = try application.createWindowWith(.{
+        .io = init.io,
         .window = .{ .width = 620, .height = 420, .title = "Console Target" },
         .frame_pacing = frame_pacing,
         .idle_skip_frames = true,
@@ -102,6 +93,7 @@ pub fn main() !void {
     target.cx.console().writeAt(.err, @src(), "save failed: PermissionDenied", .{});
 
     const devtools = try application.createWindowWith(.{
+        .io = init.io,
         .window = .{ .width = 940, .height = 620, .title = "Console DevTools" },
         .frame_pacing = frame_pacing,
         .idle_skip_frames = true,

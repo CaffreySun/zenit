@@ -1,42 +1,42 @@
-//! GpuDraw IR, Phase 5 GPU encoder 输出格式
+//! GpuDraw IR: GPU encoder output format.
 //!
-//! 当前 zenit 渲染流水线：
-//!   DisplayItem (paint pass 唯一 IR) -> GpuDraw -> GPU command buffer
+//! Rendering pipeline:
+//!   DisplayItem (paint pass only IR) -> GpuDraw -> GPU command buffer
 //!
-//! GpuDraw 是渲染流水线的最后 CPU IR：包含一个 GPU draw 所需的全部状态引用。
-//! 故意做成 packed/紧凑结构以利于 batcher 合并相邻 draw。
+//! GpuDraw is the final CPU IR: all state refs needed for one GPU draw. Intentionally
+//! packed/compact to help the batcher merge adjacent draws.
 //!
-//! 设计参照：
+//! Design reference:
 //! - Skia DisplayList -> backend draw call
 //! - Impeller Entity -> GPU command
-//! - WebRender Primitives -> Renderer batches
+//! - WebRender Primitives -> renderer batches
 //!
-//! 历史债避免：
-//! - **不**让 GpuDraw 持任何 owned 资源指针，所有 GPU 资源走 ResourcePool
-//!   handle (u64)；GpuDraw 只引用 handle index
-//! - **不**在 GpuDraw 内嵌 GPU API 状态对象（pipeline state object 等）；走
-//!   小整型 id，由 backend table 解析
-//! - **不**让 GpuDraw 跨帧持久，每帧重新生成 draw stream（layer_tree 跨帧
-//!   持久但 GpuDraw stream 是 frame-transient）
+//! Pitfalls:
+//! - **do not** let GpuDraw hold owned resource pointers; GPU resources go via
+//!   ResourcePool handles (u64); GpuDraw references the handle index only
+//! - **do not** embed GPU API state objects (pipeline state object etc.); use a
+//!   small integer id, the backend table resolves it
+//! - **do not** persist GpuDraw cross-frame; the draw stream is regenerated each frame
+//!   (layer_tree persists cross-frame, the GpuDraw stream is frame-transient)
 
 const std = @import("std");
 const testing = std.testing;
 
-/// 渲染管线类型 id（pipeline state object 编号；后端通过 table 解析）。
-/// 0 = 无效；1.. = 有效 pipeline。
+/// render pipeline type id (pipeline state object number; backend resolves via table). 0 = invalid;
+/// 1.. = valid pipeline.
 pub const PipelineId = u16;
 
-/// GPU 资源 handle（来自 ResourcePool；u32 截取 ResourceHandle 低位即可）。
-/// MAX = 无引用。
+/// GPU resource handle (from ResourcePool; u32 extract low bits of ResourceHandle). MAX = no
+/// reference.
 pub const GpuRangeHandle = u32;
 
-/// Buffer 范围引用（vbo / ibo / uniform）
+/// buffer range reference (vbo / ibo / uniform)
 pub const BufferRange = packed struct(u64) {
-    /// 资源 handle（来自 ResourcePool；low u24）
+    /// resource handle (from ResourcePool; low u24)
     handle: u24,
-    /// 起始 offset（in elements）
+    /// start offset (in elements)
     offset: u20 = 0,
-    /// 元素数量
+    /// element count
     count: u20 = 0,
 
     pub const NONE: BufferRange = .{ .handle = 0xFFFFFF };
@@ -46,7 +46,7 @@ pub const BufferRange = packed struct(u64) {
     }
 };
 
-/// 混合模式（GPU pipeline 状态的一部分；分离出来便于 batcher 决定是否合并）
+/// blend mode (part of GPU pipeline state; separated for batcher to decide whether to merge)
 pub const BlendMode = enum(u8) {
     none,
     alpha,
@@ -57,42 +57,41 @@ pub const BlendMode = enum(u8) {
     pre_alpha,
 };
 
-/// Scissor rect id（0 = 无 scissor；> 0 引用 frame scissor table）
+/// scissor rect id (0 = no scissor; > 0 references frame scissor table)
 pub const ScissorId = u16;
 
-/// LayerId（与 layer_tree.LayerId 同概念，u32 packed；用 u32 raw 避免循环 import）
+/// LayerId (same concept as layer_tree.LayerId, u32 packed; use u32 raw to avoid circular import)
 pub const LayerIdRaw = u32;
 
-/// 单个 GPU draw 调用的完整状态。
-/// **64 字节对齐** 让 batcher 顺序扫描时 cache-line 友好（一个 draw = 1 个 cache line）。
+/// complete state for single GPU draw call. **64-byte aligned** for cache-line friendly sequential
+/// scan by batcher (one draw = 1 cache line).
 pub const GpuDraw = extern struct {
-    /// 渲染管线（决定 shader + 顶点格式）
+    /// render pipeline (determines shader + vertex format)
     pipeline: PipelineId = 0,
     /// scissor rect id
     scissor: ScissorId = 0,
-    /// 混合模式
+    /// blend mode
     blend: BlendMode = .none,
-    /// 是否 instanced draw
+    /// is instanced draw
     instanced: bool = false,
     _pad0: [2]u8 = .{ 0, 0 },
-    /// 该 draw 所在的 layer
+    /// layer containing this draw
     layer_id_raw: LayerIdRaw = 0,
-    /// 顶点 buffer 范围
+    /// vertex buffer range
     vbo: BufferRange = BufferRange.NONE,
-    /// 索引 buffer 范围（NONE = non-indexed draw）
+    /// index buffer range (NONE = non-indexed draw)
     ibo: BufferRange = BufferRange.NONE,
-    /// uniform buffer 范围
+    /// uniform buffer range
     uniforms: BufferRange = BufferRange.NONE,
-    /// 主 texture handle（NONE = 无）
+    /// primary texture handle (NONE = none)
     texture0: GpuRangeHandle = 0xFFFFFFFF,
-    /// 副 texture handle（NONE = 无）
+    /// secondary texture handle (NONE = none)
     texture1: GpuRangeHandle = 0xFFFFFFFF,
-    /// instance count（instanced draw 用）
+    /// instance count (for instanced draw)
     instance_count: u32 = 1,
 
-    /// 判断两个 draw 是否可以合并到同一 batch
-    /// 条件：相同 pipeline + blend + scissor + 同 layer + 都未 instanced
-    /// + 无 texture 或同 texture（简化条件）
+    /// determine if two draws can merge into same batch. Condition: same pipeline + blend + scissor
+    /// + same layer + both non-instanced + no texture or same texture (simplified condition)
     pub fn canBatchWith(a: GpuDraw, b: GpuDraw) bool {
         if (a.pipeline != b.pipeline) return false;
         if (a.blend != b.blend) return false;

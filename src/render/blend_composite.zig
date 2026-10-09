@@ -1,27 +1,25 @@
-/// Blend Composite，非 normal 混合模式的离屏图层合成
+/// Blend Composite: offscreen layer composite for non-normal blend modes.
 ///
-/// 2026-07-30 接线。此前 blend_mode 的管线状态是"两头都断"：
-/// - 生产端：没有任何公共 API 能设出非 normal（本次在 StyleExt 补 blend_mode）；
-/// - 消费端：OffscreenLayer.blend_mode 存了但从未被读取，endOpacityLayer 的
-///   image pipeline 合成只有单一 SrcOver blend state, multiply/screen 等
-///   全部静默退化成 normal。
-/// 下游编辑器（source of truth）同样停在"shader 写了但没接线"，它的
-/// shaders/composite.metal 是孤儿文件，本模块的混合函数从它移植。
+/// Non-normal blend reads dst: fixed-function blend factors only approximate
+/// multiply/screen, and overlay/soft_light are inexpressible. So this uses the W3C
+/// generic path:
+///  1. After the offscreen pass, before the restore pass reopens, blit the whole
+///     restore target (dst copy, temp texture borrowed from the pool);
+///  2. In the restore pass draw a fullscreen triangle: fragment unpremul -> B(Cd,Cs)
+///     -> SrcOver composite -> premul for pixels in rect; outside rect passes dst
+///     through unchanged; pipeline has no blend state (replace).
 ///
-/// 方案：非 normal 混合需要读 dst（固定功能 blend factor 只能表达 multiply/
-/// screen 的近似，overlay/soft_light 等根本表达不了），走 W3C 通用路径：
-///   1. 离屏内容 pass 结束后、恢复 pass 重开前，把整个恢复目标 blit 一份
-///      副本（dst copy，从池借临时纹理）；
-///   2. 恢复 pass 里画一个全屏三角形：fragment 对 rect 内的像素做
-///      unpremul -> B(Cd,Cs) -> SrcOver 复合 -> premul，rect 外原样回写 dst
-///      （等价 passthrough，不改变像素）；pipeline 无 blend state（replace）。
+/// The composite rect can be an arbitrary affine (rotate / draw_transform): the
+/// fragment uses the inverse matrix to map target pixels to layer-local physical px,
+/// then does the rect test, UV and rounded clip mask; a non-invertible (degenerate)
+/// matrix falls back to normal composite.
 ///
-/// 已知边界（v1，均回退 normal 合成而不是出错）：
-/// - use_draw_transform / rotate ≠ 0：合成矩形非轴对齐，全屏 UV 映射不成立；
-/// - GPU retained 缓存对非 normal blend 直接 decline（每帧重画），混合结果
-///   依赖 dst，缓存 src 内容虽仍成立，但为省 pass 切换复杂度 v1 不做。
-/// - 混合计算在采样后的线性空间进行（bgra8_unorm_srgb 采样自动去 sRGB），
-///   与 CSS 规范的非线性空间略有色差，与下游编辑器参考实现一致，不单独校正。
+/// Known boundaries (all fall back to normal composite, not error):
+/// - The GPU retained cache declines non-normal blend outright (redraw every frame):
+///   the result depends on dst, and this avoids pass-switch complexity;
+/// - Blending is computed on sRGB-encoded values (non-_sRGB texture, samples are
+///   encoded; matches CSS / Core Graphics, see docs/SRGB_BLENDING_PLAN.md); slight
+///   hue difference from the CSS spec's nonlinear space.
 const std = @import("std");
 const gpu = @import("gpu");
 const offscreen_texture = @import("offscreen_texture.zig");
@@ -29,29 +27,99 @@ const offscreen_texture = @import("offscreen_texture.zig");
 pub var blend_pipeline_compile_count: u64 = 0;
 
 comptime {
-    // setFragmentBytes 上限 4 KiB（Metal 规范）。
+    // setFragmentBytes limit 4 KiB (Metal spec).
     std.debug.assert(@sizeOf(BlendUniforms) <= 4096);
 }
 
 pub const BlendUniforms = extern struct {
-    /// 恢复目标物理像素尺寸（fragcoord -> uv 用）
+    /// Restore target physical pixel size (fragcoord -> uv).
     target_size: [2]f32,
-    /// 图层矩形在目标上的物理像素 origin/size
-    rect_origin: [2]f32,
+    /// Layer rect in **layer-local** space physical pixel size (quad w*h * scale).
     rect_size: [2]f32,
-    /// src 纹理 UV 缩放（used/alloc，64px 桶分配的裁剪）
+    /// src texture UV scale (used/alloc, 64px bucket allocation crop).
     src_uv_scale: [2]f32,
-    /// x = opacity, y = blend_mode（as float）, z = corner_radius(物理px), w 备用
+    /// Target physical pixel -> layer-local physical pixel: local = inv . pixel +
+    /// inv_offset.
+    inv_offset: [2]f32,
+    /// 2x2 of above (a, b, c, d: local.x = a*px + c*py + ..., local.y = b*px +
+    /// d*py + ...).
+    inv: [4]f32,
+    /// x = opacity, y = blend_mode (as float), z = corner_radius (layer-local
+    /// physical px), w reserved.
     params: [4]f32,
+    /// Composite rect clip (target physical px; w < 0 = none), same as other
+    /// pipelines' rect_clip.
+    clip_rect: [4]f32,
+    /// Shape clip: x = kind (0 none / 1 rounded rect / 2 ellipse), y = corner_radius
+    /// (target physical px); rect z,w reuse clip_shape_rect.
+    clip_shape: [4]f32,
+    clip_shape_rect: [4]f32,
+    /// Lens warp (physical px): x = shift across the rounded ends, y = across the long edges
+    /// (+ = toward the centre), z = fade start inset, w = fade width; x = y = 0 -> none.
+    warp: [4]f32,
+    /// xy = src texture UV of the quad's origin (a rounded layer composites its own rect out of
+    /// its grid-aligned texture, opacity_layer.compositeQuad); zw unused.
+    src_uv_origin: [4]f32,
 };
 
 comptime {
-    std.debug.assert(@sizeOf(BlendUniforms) == 48);
+    std.debug.assert(@sizeOf(BlendUniforms) == 144);
 }
 
-const blend_shader_source: []const u8 = @embedFile("shaders/composite.metal");
+/// Clips active at composite time, all in target physical pixels.
+pub const CompositeClips = struct {
+    rect: [4]f32 = .{ 0, 0, -1, -1 },
+    shape_kind: u32 = 0,
+    shape_rect: [4]f32 = .{ 0, 0, 0, 0 },
+    shape_radius: f32 = 0,
+};
 
-/// lazy 编译 blend composite pipeline（模式同 backdrop_blur.ensureBlurPipeline）。
+/// Inverse map target pixel to layer-local pixel. `affine` = (a, b, c, d, tx,
+/// ty) logical units; map layer-local (x, y) in [0,w]x[0,h] to target:
+/// (a*x + c*y + tx, b*x + d*y + ty); target physical px = logical * scale. Degenerate
+/// (non-invertible) returns null.
+pub const InverseMap = struct { inv: [4]f32, inv_offset: [2]f32 };
+pub fn inverseLayerMap(affine: [6]f32, scale: f32) ?InverseMap {
+    const det = affine[0] * affine[3] - affine[1] * affine[2];
+    if (!std.math.isFinite(det) or @abs(det) < 1e-6) return null;
+    for (affine) |v| if (!std.math.isFinite(v)) return null;
+    // A⁻¹ for A = [a c; b d]
+    const ia = affine[3] / det;
+    const ib = -affine[1] / det;
+    const ic = -affine[2] / det;
+    const id = affine[0] / det;
+    // local_px = scale · A⁻¹ · (pixel / scale − t) = A⁻¹ · pixel − scale · A⁻¹ · t
+    return .{
+        .inv = .{ ia, ib, ic, id },
+        .inv_offset = .{ -scale * (ia * affine[4] + ic * affine[5]), -scale * (ib * affine[4] + id * affine[5]) },
+    };
+}
+
+/// Quad (x, y, w, h) rotated by `rotate` about its centre: the affine the
+/// image pipeline draws the normal composite with, so both paths agree.
+pub fn rectRotateAffine(x: f32, y: f32, w: f32, h: f32, rotate: f32) [6]f32 {
+    return @import("image_renderer.zig").ImageRenderer.affineRectRotate(x, y, w, h, rotate);
+}
+
+test "inverseLayerMap maps rotated target pixels back to layer-local pixels" {
+    // 40x20 quad at (10, 10) rotated 90° at scale 2: its local top-left corner
+    // lands at target (10+40, 10-... ) per the image pipeline's affine.
+    const affine = rectRotateAffine(10, 10, 40, 20, std.math.pi / 2.0);
+    const map = inverseLayerMap(affine, 2).?;
+    // Forward-map local (40, 20) (bottom-right corner) and invert it.
+    const tx = (affine[0] * 40 + affine[2] * 20 + affine[4]) * 2;
+    const ty = (affine[1] * 40 + affine[3] * 20 + affine[5]) * 2;
+    const lx = map.inv[0] * tx + map.inv[2] * ty + map.inv_offset[0];
+    const ly = map.inv[1] * tx + map.inv[3] * ty + map.inv_offset[1];
+    try std.testing.expectApproxEqAbs(@as(f32, 80), lx, 1e-3);
+    try std.testing.expectApproxEqAbs(@as(f32, 40), ly, 1e-3);
+    try std.testing.expect(inverseLayerMap(.{ 1, 2, 2, 4, 0, 0 }, 1) == null);
+}
+
+const blend_shader_source: []const u8 = @import("shader_sources.zig").composite;
+
+/// Lazy compile blend composite pipeline (pattern same as
+/// backdrop_blur.ensureBlurPipeline).
 pub fn ensureBlendPipeline(encoder: anytype) bool {
     if (encoder.persistent.blend_pipeline != null) return true;
     if (encoder.persistent.blend_pipeline_failed) return false;
@@ -79,8 +147,8 @@ pub fn ensureBlendPipeline(encoder: anytype) bool {
     encoder.persistent.blend_pipeline = gpu.Backend.createRenderPipeline(device, .{
         .vertex_function = &vtx,
         .fragment_function = &frag,
-        .color_attachment_formats = &[_]gpu.TextureFormat{.bgra8_unorm_srgb},
-        // 无 blend state：shader 输出即最终像素（rect 外 passthrough dst）。
+        .color_attachment_formats = &[_]gpu.TextureFormat{gpu.color_format},
+        // No blend state: shader output is final pixel (rect outside passthrough dst).
         .blend_state = null,
     }) catch {
         encoder.persistent.blend_pipeline_failed = true;
@@ -96,20 +164,27 @@ pub fn ensureBlendPipeline(encoder: anytype) bool {
     return true;
 }
 
-/// 在**当前已打开的 render pass** 里画 blend composite 全屏三角形。
-/// caller 负责：dst_copy 已含恢复目标当前内容、pass attach 的就是恢复目标。
+/// Draw blend composite fullscreen triangle in **currently open render pass**.
+/// Caller responsible: dst_copy contains restore target current content, pass attach
+/// is restore target.
 pub fn drawBlendComposite(
     encoder: anytype,
     src_texture: gpu.Backend.TextureBinding,
     dst_copy: gpu.Backend.TextureBinding,
     target_w: u32,
     target_h: u32,
-    rect_origin_px: [2]f32,
+    map: InverseMap,
     rect_size_px: [2]f32,
+    src_uv_origin: [2]f32,
     src_uv_scale: [2]f32,
     opacity: f32,
     blend_mode_raw: u8,
     corner_radius_px: f32,
+    clips: CompositeClips,
+    warp: [4]f32,
+    /// Inset (physical px) of the true clip rect inside the quad: the rounded mask and the warp's
+    /// contour distance use the rect shrunk by it (a folded rounded clip's layer is padded 2 pt)
+    mask_inset_px: f32,
 ) bool {
     if (encoder.render_pass == null) return false;
     var pipeline = encoder.persistent.blend_pipeline orelse return false;
@@ -119,16 +194,22 @@ pub fn drawBlendComposite(
 
     const uniforms = BlendUniforms{
         .target_size = .{ @floatFromInt(target_w), @floatFromInt(target_h) },
-        .rect_origin = rect_origin_px,
         .rect_size = rect_size_px,
         .src_uv_scale = src_uv_scale,
-        .params = .{ opacity, @floatFromInt(blend_mode_raw), corner_radius_px, 0 },
+        .inv_offset = map.inv_offset,
+        .inv = map.inv,
+        .params = .{ opacity, @floatFromInt(blend_mode_raw), corner_radius_px, mask_inset_px },
+        .clip_rect = clips.rect,
+        .clip_shape = .{ @floatFromInt(clips.shape_kind), clips.shape_radius, 0, 0 },
+        .clip_shape_rect = clips.shape_rect,
+        .warp = warp,
+        .src_uv_origin = .{ src_uv_origin[0], src_uv_origin[1], 0, 0 },
     };
 
     var pass = encoder.render_pass.?;
     pass.setPipeline(&pipeline);
-    // setFragmentBytes：encode 时拷贝，在飞帧不会被下一帧覆写（曾是单个共享
-    // buffer + 每帧偏移归零的 CPU/GPU 竞争）。
+    // setFragmentBytes: copy on encode, in-flight frames not overwritten by next frame
+    // (was single shared buffer + per-frame zero offset CPU/GPU race).
     pass.setFragmentBytes(0, std.mem.asBytes(&uniforms));
     pass.setFragmentTextureBinding(0, src_texture);
     pass.setFragmentTextureBinding(1, dst_copy);

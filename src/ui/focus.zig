@@ -1,10 +1,10 @@
-/// Focus Manager - 焦点管理
+/// Focus Manager
 ///
-/// 管理 UI 节点的焦点状态:
-/// - 跟踪当前焦点节点
-/// - Tab 键导航 (前进/后退)
-/// - 焦点事件 (focus/blur)
-/// - 可聚焦节点注册
+/// Manages UI node focus state:
+/// - Tracks current focused node
+/// - Tab navigation (forward/backward)
+/// - Focus/blur events
+/// - Focusable node registration
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const core = @import("core.zig");
@@ -19,28 +19,27 @@ const event_dispatcher_mod = @import("event_dispatcher.zig");
 const system_sdk = @import("system_sdk");
 const A11yRole = core.A11yRole;
 
-/// Focus Scope 配置
+/// Focus Scope configuration
 pub const FocusScopeConfig = struct {
-    /// 是否为焦点陷阱 (Tab 不能逃出)
+    /// Whether focus trap (Tab cannot escape)
     trap: bool = false,
-    /// 进入 scope 时自动聚焦第一个 focusable 节点
+    /// Auto-focus first focusable node on scope entry
     auto_focus: bool = false,
 };
 
-/// Focus scope 栈深度上限（v0.1-P6 8->64；v0.4 改 ArrayList 完全去限）。
+/// Focus scope stack depth limit.
 ///
-/// **v0.3-P6 决策记录**：当前 64 容量远超任何实际 GUI scope 嵌套深度
-/// （macOS 一般 < 5 层 modal）；ArrayList 化收益 vs callsite 改动比不划算，
-/// 留 v0.4 配合 a11y 焦点 / 键盘焦点彻底分离一起做。
+/// 64 far exceeds any realistic GUI scope nesting depth (macOS typically < 5 modal
+/// layers); an unbounded ArrayList is not worth the callsite refactoring.
 pub const SCOPE_STACK_CAP: usize = 64;
-/// Scoped focus order 缓冲（v0.1-P6 64->512）
+/// Scoped focus order buffer (v0.1-P6: 64->512)
 pub const SCOPED_BUF_CAP: usize = 512;
 
-/// 焦点管理器
+/// Focus manager
 pub const FocusManager = struct {
     allocator: Allocator,
 
-    /// 当前拥有焦点的节点
+    /// Node currently holding focus
     current_focus: ?*Node = null,
     current_focus_handle: ?NodeHandle = null,
 
@@ -49,16 +48,16 @@ pub const FocusManager = struct {
     transition_epoch: u64 = 0,
     transition_depth: usize = 0,
 
-    /// Tab 顺序表 (可聚焦节点列表)
+    /// Tab order table (focusable node list)
     focus_order: std.ArrayList(*Node),
 
-    /// 事件调度器引用 (用于分发 focus/blur 事件冒泡)
+    /// Dispatcher reference (for dispatching focus/blur bubble events)
     dispatcher: ?*event_dispatcher_mod.EventDispatcher = null,
 
-    /// 无障碍桥接
+    /// Accessibility bridge
     a11y_bridge: AccessibilityBridge = .{},
 
-    /// 节点注册表（用于跨帧通过 handle 解析当前焦点）
+    /// Node registry (for resolving current focus via handle across frames)
     registry: ?*NodeRegistry = null,
 
     /// Called after blur/focus handlers and the focus handle update have all
@@ -74,25 +73,25 @@ pub const FocusManager = struct {
     settled_context: ?*anyopaque = null,
     on_focus_settled: ?*const fn (context: *anyopaque) void = null,
 
-    /// Focus Scope 栈 (Phase 6: 8 -> 64；完整 ArrayList 化在 Phase 7 focus 重构时做)
-    scope_stack: [SCOPE_STACK_CAP]?*Node = [_]?*Node{null} ** SCOPE_STACK_CAP,
-    scope_stack_handles: [SCOPE_STACK_CAP]?NodeHandle = [_]?NodeHandle{null} ** SCOPE_STACK_CAP,
+    /// Focus Scope stack (Phase 6: 8->64; full ArrayList migration deferred to Phase 7)
+    scope_stack: [SCOPE_STACK_CAP]?*Node = @as([SCOPE_STACK_CAP]?*Node, @splat(null)),
+    scope_stack_handles: [SCOPE_STACK_CAP]?NodeHandle = @as([SCOPE_STACK_CAP]?NodeHandle, @splat(null)),
     scope_count: u8 = 0,
 
-    /// 焦点记忆 (每层 scope 保存进入前的焦点 ID)
-    scope_memory: [SCOPE_STACK_CAP]?u32 = [_]?u32{null} ** SCOPE_STACK_CAP,
-    scope_memory_handles: [SCOPE_STACK_CAP]?NodeHandle = [_]?NodeHandle{null} ** SCOPE_STACK_CAP,
+    /// Focus memory (per-scope stack saves focus ID before entering)
+    scope_memory: [SCOPE_STACK_CAP]?u32 = @as([SCOPE_STACK_CAP]?u32, @splat(null)),
+    scope_memory_handles: [SCOPE_STACK_CAP]?NodeHandle = @as([SCOPE_STACK_CAP]?NodeHandle, @splat(null)),
 
-    /// Scoped focus order 缓冲区 (Phase 6: 64 -> 512)
+    /// Scoped focus order buffer (Phase 6: 64->512)
     scoped_buf: [SCOPED_BUF_CAP]*Node = undefined,
 
-    /// 最近一次 focus 变化的原因 (用于 :focus-visible 判断)
+    /// Most recent focus change reason (for :focus-visible)
     last_focus_reason: FocusReason = .programmatic,
 
     pub fn init(allocator: Allocator) FocusManager {
         return .{
             .allocator = allocator,
-            .focus_order = .{},
+            .focus_order = .empty,
         };
     }
 
@@ -110,8 +109,8 @@ pub const FocusManager = struct {
         return .{ .id = node.id, .generation = generation };
     }
 
-    /// 设置焦点到指定节点
-    /// 触发 blur(旧节点) 和 focus(新节点) 事件
+    /// Set focus to given node
+    /// Triggers blur (old node) and focus (new node) events
     pub fn setFocus(self: *FocusManager, node: ?*Node) void {
         self.setFocusWithReason(node, .programmatic);
     }
@@ -239,15 +238,15 @@ pub const FocusManager = struct {
         }
     }
 
-    /// 清除焦点
+    /// Clear focus
     pub fn clearFocus(self: *FocusManager) void {
         self.setFocusWithReason(null, .programmatic);
     }
 
-    /// 焦点持有者的回调上下文即将销毁（组件 scope dispose，节点可能还挂在树上）：
-    /// 撤掉焦点但**不调用** blur 回调 / 不派发 blur 事件，那些 handler 读的正是
-    /// 正在释放的状态，且其依赖的子 scope/signal 可能已先一步释放。
-    /// a11y 与原生输入会话照常同步。节点仍留在 focus_order 里。
+    /// Focus holder's callback context about to destroy (component scope dispose, node may
+    /// still be on tree): remove focus without calling blur handler / dispatching blur event,
+    /// as those handlers read state being released, and their dependent subscopes/signals may
+    /// already be freed. a11y and native input session still sync. Node stays in focus_order.
     pub fn abandonFocus(self: *FocusManager, node: *Node) void {
         const owns = self.current_focus == node or
             (if (self.current_focus_handle) |h| h.id == node.id else false);
@@ -260,9 +259,9 @@ pub const FocusManager = struct {
         }
     }
 
-    /// 注册可聚焦节点
+    /// Register focusable node
     pub fn registerFocusable(self: *FocusManager, node: *Node) !void {
-        // 避免重复注册
+        // Avoid duplicate registration
         for (self.focus_order.items) |n| {
             if (n == node) return;
         }
@@ -283,9 +282,10 @@ pub const FocusManager = struct {
 
     pub fn finalizeFocusOrder(self: *FocusManager) void {
         if (self.focus_order.items.len <= 1) return;
-        // 排序键：tab_index（正数升序在前），相同则**真实树序**。只靠稳定排序保持
-        // 插入序是不够的：子树增量重建会把重灌的节点追加到末尾，插入序≠树序，
-        // Tab 顺序随之错乱（子树里的可聚焦节点被挪到最后）。
+        // Sort key: tab_index (positive ascending first), then **actual tree order**. Stable
+        // sort alone preserves insertion order but not tree order: incremental subtree rebuild
+        // appends re-laid nodes to the end, insertion_order != tree_order, Tab order scrambles
+        // (focusable nodes in subtree moved to end).
         std.sort.block(*Node, self.focus_order.items, {}, struct {
             fn lessThan(_: void, a: *Node, b: *Node) bool {
                 const a_idx = effectiveTabOrder(a);
@@ -296,12 +296,12 @@ pub const FocusManager = struct {
         }.lessThan);
     }
 
-    /// 静默移除（节点释放路径用）：不触发 blur 回调，释放期 handler 上下文
-    /// 可能已随 scope 销毁，invoke 即 UAF。只摘链 + 清 current_focus。
+    /// Silent removal (node release path): no blur handler, callback context may be gone
+    /// with scope, invoke is UAF. Just unlink + clear current_focus.
     pub fn unregisterFocusableSilent(self: *FocusManager, node: *Node) void {
-        // 只做指针/句柄比较，绝不能走 getFocused()：teardown 递归释放中
-        // current_focus 可能指向早先已释放的兄弟节点，getFocused 的 cached
-        // 回退分支会解引用它 -> UAF/segfault（下游应用实测必现）。
+        // Pointer/handle comparison only, never call getFocused(): during teardown recursive
+        // free, current_focus may point to freed sibling, getFocused cached fallback dereferences
+        // it -> UAF/segfault (real app proves it).
         if (self.current_focus == node) {
             self.current_focus = null;
             self.current_focus_handle = null;
@@ -319,17 +319,17 @@ pub const FocusManager = struct {
         }
     }
 
-    /// 运行时索引**增量重建**后恢复焦点（core.rebuildDirtyRuntimeSubtrees 专用）：
-    /// 重建只是 registry/focus_order 的摘除+重灌，节点身份未变（同指针同 id，
-    /// 已随 rebuild 重新注册）。不触发 blur/focus 事件，焦点在语义上从未
-    /// 离开过该节点；走 setFocus 会派发一对假 blur/focus，让 input 类组件
-    /// 关掉原生输入闸。
+    /// Recover focus after an incremental runtime-index rebuild (core.rebuildDirtyRuntimeSubtrees
+    /// only): the rebuild only relinks registry/focus_order; node identity is unchanged (same
+    /// pointer, same id, re-registered). No blur/focus events are sent since focus never left
+    /// the node; setFocus would send a false blur/focus pair, prematurely shutting the native
+    /// input gate on input components.
     pub fn restoreFocusAfterSubtreeRebuild(self: *FocusManager, node: *Node) void {
         self.current_focus = node;
         self.current_focus_handle = self.trackedHandleFor(node);
     }
 
-    /// 移除可聚焦节点
+    /// Remove focusable node
     pub fn unregisterFocusable(self: *FocusManager, node: *Node) void {
         for (self.focus_order.items, 0..) |n, i| {
             if (n == node) {
@@ -364,23 +364,24 @@ pub const FocusManager = struct {
         }
     }
 
-    /// 焦点移到下一个可聚焦节点 (Tab)
+    /// Move focus to next focusable node (Tab)
     pub fn focusNext(self: *FocusManager) void {
         self.focusStep(.forward);
     }
 
-    /// 焦点移到上一个可聚焦节点 (Shift+Tab)
+    /// Move focus to previous focusable node (Shift+Tab)
     pub fn focusPrev(self: *FocusManager) void {
         self.focusStep(.backward);
     }
 
-    /// Tab / Shift+Tab：从当前焦点沿 order 前进 / 后退，跳过位于 display:none 子树里的
-    /// 节点（focus_order 在结构变化时收集，display 切换不重收，可见性在遍历时判定）。
+    /// Tab / Shift+Tab: from current focus along order forward / back, skipping nodes in
+    /// display:none subtrees (focus_order collected on struct change, display toggle does
+    /// not recollect, visibility checked during traversal).
     fn focusStep(self: *FocusManager, dir: enum { forward, backward }) void {
         const order = self.scopedFocusOrder();
         if (order.len == 0) return;
 
-        var start: usize = if (dir == .forward) order.len - 1 else 0; // 无当前焦点：从首 / 尾开始
+        var start: usize = if (dir == .forward) order.len - 1 else 0; // No current focus: start from first / end
         if (self.getFocused()) |current| {
             for (order, 0..) |n, i| {
                 if (n == current) {
@@ -399,7 +400,7 @@ pub const FocusManager = struct {
         }
     }
 
-    /// 获取当前焦点节点
+    /// Get current focused node
     pub fn getFocused(self: *FocusManager) ?*Node {
         if (self.registry) |registry| {
             if (registry.resolve(self.current_focus_handle, null)) |resolved| {
@@ -420,16 +421,16 @@ pub const FocusManager = struct {
         return self.current_focus;
     }
 
-    /// 检查节点是否拥有焦点
+    /// Check whether node owns focus
     pub fn isFocused(self: *FocusManager, node: *Node) bool {
         return self.getFocused() == node;
     }
 
-    /// 从节点树自动收集可聚焦节点，按 tab_index 排序
-    /// 排序规则（对齐 HTML tabindex 语义）：
-    /// 1. tab_index > 0 的节点排前面，按 tab_index 升序，相同则按树序
-    /// 2. tab_index == 0 或 null（但 focusable=true）的节点排后面，按树序
-    /// 3. tab_index == -1 的节点不加入 focus_order（仅可通过 click/setFocus 聚焦）
+    /// Auto-collect focusable nodes from the node tree, sorted by tab_index.
+    /// Sort rules (align HTML tabindex semantics):
+    /// 1. tab_index > 0 nodes first, ascending tab_index, ties in tree order
+    /// 2. tab_index == 0 or null (focusable=true) next, tree order
+    /// 3. tab_index == -1 not in focus_order (focus via click/setFocus only)
     pub fn collectFocusableNodes(self: *FocusManager, root: *Node) !void {
         self.clearFocusOrder();
         try self.collectRecursive(root);
@@ -450,7 +451,7 @@ pub const FocusManager = struct {
         }
         self.focus_order.items.len = write_idx;
 
-        var collected = std.ArrayList(*Node){};
+        var collected = @as(std.ArrayList(*Node), .empty);
         defer collected.deinit(self.allocator);
         try collectDefaultOrderRecursive(root, &collected, self.allocator);
 
@@ -475,16 +476,16 @@ pub const FocusManager = struct {
         @memcpy(self.focus_order.items[insert_idx .. insert_idx + collected.items.len], collected.items);
     }
 
-    /// 计算节点的有效排序优先级
-    /// tab_index > 0 -> 直接使用 (1, 2, 3...)
-    /// tab_index == 0 或 null (focusable=true) -> 大数 (保持树序在后面)
+    /// Compute effective sort priority for node
+    /// tab_index > 0 -> direct use (1, 2, 3...)
+    /// tab_index == 0 or null (focusable=true) -> large number (keep tree order later)
     fn effectiveTabOrder(node: *Node) i64 {
         if (node.behavior.interaction.tab_index) |ti| {
             if (ti > 0) return ti;
-            // ti == 0 按树序排在正数之后
+            // ti == 0 sorts after positive per tree order
             return std.math.maxInt(i32);
         }
-        // null (focusable=true) 等同于 0，按树序
+        // null (focusable=true) equals 0, sorts per tree order
         return std.math.maxInt(i32);
     }
 
@@ -508,12 +509,12 @@ pub const FocusManager = struct {
 
     // ---- Focus Scope ----
 
-    /// 推入 Focus Scope (如 Modal 打开时)
-    /// 保存当前焦点到记忆栈，auto_focus 时聚焦 scope 内第一个节点
+    /// Push Focus Scope (e.g., Modal opens)
+    /// Save current focus to memory stack, auto_focus focuses first node in scope
     pub fn pushScope(self: *FocusManager, scope_node: *Node) void {
         if (self.scope_count >= self.scope_stack.len) return;
 
-        // 保存当前焦点 ID 到记忆栈
+        // Save current focus ID to memory stack
         self.scope_memory[self.scope_count] = if (self.getFocused()) |f| f.id else null;
         self.scope_memory_handles[self.scope_count] = self.current_focus_handle;
 
@@ -521,7 +522,7 @@ pub const FocusManager = struct {
         self.scope_stack_handles[self.scope_count] = self.trackedHandleFor(scope_node);
         self.scope_count += 1;
 
-        // auto_focus: 聚焦 scope 内第一个 focusable 节点
+        // auto_focus: focus first focusable node in scope
         if (scope_node.behavior.interaction.focus_scope) |cfg| {
             if (cfg.auto_focus) {
                 const order = self.scopedFocusOrder();
@@ -532,14 +533,14 @@ pub const FocusManager = struct {
         }
     }
 
-    /// 弹出 Focus Scope，恢复之前的焦点
+    /// Pop Focus Scope, restore prior focus
     pub fn popScope(self: *FocusManager) void {
         if (self.scope_count == 0) return;
         self.scope_count -= 1;
         self.scope_stack[self.scope_count] = null;
         self.scope_stack_handles[self.scope_count] = null;
 
-        // 恢复记忆的焦点
+        // Restore remembered focus
         if (self.scope_memory_handles[self.scope_count]) |saved_handle| {
             self.scope_memory_handles[self.scope_count] = null;
             self.scope_memory[self.scope_count] = null;
@@ -558,11 +559,11 @@ pub const FocusManager = struct {
                 }
             }
         }
-        // 保存的节点已不存在，清除焦点
+        // Saved node gone, clear focus
         self.clearFocus();
     }
 
-    /// 获取当前活跃的 scope 节点
+    /// Get current active scope node
     pub fn activeScope(self: *FocusManager) ?*Node {
         if (self.scope_count == 0) return null;
         if (self.registry) |registry| {
@@ -570,23 +571,23 @@ pub const FocusManager = struct {
                 self.scope_stack[self.scope_count - 1] = resolved;
                 return resolved;
             }
-            // 有 registry 却解析失败 = scope 节点已释放；缓存的裸指针此时悬垂，
-            // 不能回退去用它（Tab 会解引用已释放节点）。
+            // Registry exists but resolution fails = scope node freed; cached raw pointer dangling,
+            // cannot fall back to use it (Tab would dereference freed node).
             return null;
         }
         return self.scope_stack[self.scope_count - 1];
     }
 
-    /// 获取当前 scope 内的 focus order
-    /// 如果有 trap scope，只返回 scope 内的 focusable 节点
+    /// Get focus order within current scope
+    /// If trap scope exists, return only focusable nodes within scope
     pub fn scopedFocusOrder(self: *FocusManager) []*Node {
         const scope = self.activeScope() orelse return self.focus_order.items;
 
-        // 检查 scope 是否为 trap
+        // Check whether scope is trap
         const is_trap = if (scope.behavior.interaction.focus_scope) |cfg| cfg.trap else false;
         if (!is_trap) return self.focus_order.items;
 
-        // 过滤出 scope 内的节点
+        // Filter nodes within scope
         var count: usize = 0;
         for (self.focus_order.items) |node| {
             if (count >= self.scoped_buf.len) break;
@@ -632,8 +633,8 @@ fn compareTreeOrder(a: *Node, b: *Node) std.math.Order {
         common += 1;
     }
 
-    // 不在同一棵树（portal 挂在别处的浮层等）：无从比较，交给稳定排序保持原序。
-    // 缺这条时 common == 0 会读 a_path[-1]。
+    // Not in same tree (portal floating layer hangs elsewhere): cannot compare, stable sort
+    // keeps original order. Without this, common == 0 reads a_path[-1].
     if (common == 0) return .eq;
     if (common == a_path.len) return .lt;
     if (common == b_path.len) return .gt;
@@ -657,9 +658,10 @@ fn buildPathToRoot(node: *Node, buf: []*Node) []*Node {
         buf[count] = current.?;
         count += 1;
     }
-    // 防 silent truncation, 128 层是 UI tree 极限上限（DOM 几百层
-    // 算病态），但 silent truncate 会让 compareTreeOrder 错位。debug build 显式
-    // panic，prod build 仍降级返截断 path（保留 v0.5 行为，避免线上崩）。
+    // Guard against silent truncation; 128 levels is UI tree extreme (DOM hundreds is
+    // pathological), but silent truncate breaks compareTreeOrder alignment. Debug build explicit
+    // panic, release build downgrades return truncated path (preserve v0.5 behavior, avoid
+    // production crash).
     if (current != null) {
         if (std.debug.runtime_safety) {
             std.debug.panic("focus.zig: buildPathToRoot exceeded buf.len={d}, tree too deep", .{buf.len});
@@ -669,13 +671,11 @@ fn buildPathToRoot(node: *Node, buf: []*Node) []*Node {
     return buf[0..count];
 }
 
-// ============================================================================
 // Accessibility bridge (was src/ui/accessibility.zig, merged here in v0.5-P6)
-//
-// FocusManager 已持有 a11y_bridge 字段，把 bridge 定义内联到此文件去除独立 file。
-// 完整 a11y_tree 投影 + nsaccessibility_router 路径在 src/ui/a11y/；本 bridge 是
-// 单点 notify 兼容层（macOS NSAccessibility / Linux AT-SPI / Windows UIA 单调用入口）。
-// ============================================================================
+// FocusManager now holds a11y_bridge field; bridge definition inlined to remove separate file.
+// Full a11y_tree projection + nsaccessibility_router path in src/ui/a11y/; this bridge is
+// a single-point notify compatibility layer (macOS NSAccessibility / Linux AT-SPI / Windows UIA
+// single call entry).
 
 pub const AccessibilityBridge = struct {
     enabled: bool = false,
@@ -782,7 +782,7 @@ fn mapA11yRole(role: A11yRole) system_sdk.AccessibilityRole {
         .combobox => .combobox,
         .grid => .grid,
         .gridcell => .gridcell,
-        // 2026-07-31 补齐（与 core.zig 的 mapA11yRoleToTreeRole 同批）
+        // 2026-07-31 supplement (same batch as core.zig mapA11yRoleToTreeRole)
         .tree => .tree,
         .treeitem => .treeitem,
         .row => .row,
@@ -812,10 +812,12 @@ fn mapA11yRole(role: A11yRole) system_sdk.AccessibilityRole {
         .banner => .banner,
         .contentinfo => .contentinfo,
         .generic => .generic,
+        // Old SystemSdk snapshot missing scroll area role, report as group.
+        .scroll_area => .group,
     };
 }
 
-// ========== 测试 ==========
+// ========== Tests ==========
 
 test "FocusManager: init/deinit" {
     var fm = FocusManager.init(std.testing.allocator);
@@ -847,7 +849,7 @@ test "FocusManager: setFocus triggers blur/focus" {
     var fm = FocusManager.init(std.testing.allocator);
     defer fm.deinit();
 
-    var ctx = try core.Cx.init(std.testing.allocator);
+    var ctx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const FocusCtx = struct {
@@ -891,12 +893,12 @@ test "FocusManager: setFocus triggers blur/focus" {
     try root.appendChild(std.testing.allocator, node_b);
     ctx.root = root;
 
-    // 聚焦 A
+    // Focus A
     fm.setFocus(node_a);
     try std.testing.expectEqual(@as(u32, 1), ctx_a.focus_count);
     try std.testing.expectEqual(@as(u32, 0), ctx_a.blur_count);
 
-    // 聚焦 B (A 失焦)
+    // Focus B (A loses focus)
     fm.setFocus(node_b);
     try std.testing.expectEqual(@as(u32, 1), ctx_a.blur_count);
     try std.testing.expectEqual(@as(u32, 1), ctx_b.focus_count);
@@ -906,7 +908,7 @@ test "FocusManager: Tab navigation" {
     var fm = FocusManager.init(std.testing.allocator);
     defer fm.deinit();
 
-    var ctx = try core.Cx.init(std.testing.allocator);
+    var ctx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try core.box(ctx, .{ .width = .{ .px = 200 }, .height = .{ .px = 200 } }, .{});
@@ -923,26 +925,26 @@ test "FocusManager: Tab navigation" {
 
     ctx.root = root;
 
-    // 初始无焦点
+    // Initially no focus
     try std.testing.expectEqual(@as(?*Node, null), fm.current_focus);
 
-    // Tab -> 第一个
+    // Tab -> first
     fm.focusNext();
     try std.testing.expect(fm.current_focus == nodes[0]);
 
-    // Tab -> 第二个
+    // Tab -> second
     fm.focusNext();
     try std.testing.expect(fm.current_focus == nodes[1]);
 
-    // Tab -> 第三个
+    // Tab -> third
     fm.focusNext();
     try std.testing.expect(fm.current_focus == nodes[2]);
 
-    // Tab -> 回到第一个 (循环)
+    // Tab -> first again (loop)
     fm.focusNext();
     try std.testing.expect(fm.current_focus == nodes[0]);
 
-    // Shift+Tab -> 第三个
+    // Shift+Tab -> third
     fm.focusPrev();
     try std.testing.expect(fm.current_focus == nodes[2]);
 }
@@ -951,7 +953,7 @@ test "FocusManager: registerFocusable no duplicates" {
     var fm = FocusManager.init(std.testing.allocator);
     defer fm.deinit();
 
-    var ctx = try core.Cx.init(std.testing.allocator);
+    var ctx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try core.box(ctx, .{ .width = .{ .px = 200 }, .height = .{ .px = 100 } }, .{});
@@ -970,7 +972,7 @@ test "FocusManager: unregisterFocusable" {
     var fm = FocusManager.init(std.testing.allocator);
     defer fm.deinit();
 
-    var ctx = try core.Cx.init(std.testing.allocator);
+    var ctx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try core.box(ctx, .{ .width = .{ .px = 200 }, .height = .{ .px = 100 } }, .{});
@@ -993,7 +995,7 @@ test "FocusManager: collectFocusableNodes uses focusable field" {
     var fm = FocusManager.init(std.testing.allocator);
     defer fm.deinit();
 
-    var ctx = try core.Cx.init(std.testing.allocator);
+    var ctx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try core.box(ctx, .{
@@ -1002,7 +1004,7 @@ test "FocusManager: collectFocusableNodes uses focusable field" {
         .direction = core.Direction.column,
     }, .{});
 
-    // 普通 box (不可聚焦)
+    // Plain box (not focusable)
     const box1 = try core.box(ctx, .{ .width = .{ .px = 100 }, .height = .{ .px = 30 } }, .{});
     try root.appendChild(std.testing.allocator, box1);
 
@@ -1045,7 +1047,7 @@ test "FocusManager: collectFocusableNodes uses focusable field" {
 }
 
 test "Cx: click non-focusable clears focus" {
-    var ctx = try core.Cx.init(std.testing.allocator);
+    var ctx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try core.box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
@@ -1085,7 +1087,7 @@ test "Cx: click non-focusable clears focus" {
 }
 
 test "Cx: click focusable node sets focus" {
-    var ctx = try core.Cx.init(std.testing.allocator);
+    var ctx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try core.box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
@@ -1113,7 +1115,7 @@ test "Cx: click focusable node sets focus" {
 }
 
 test "Cx: click child of focusable finds ancestor" {
-    var ctx = try core.Cx.init(std.testing.allocator);
+    var ctx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try core.box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
@@ -1154,16 +1156,17 @@ test "Cx: click child of focusable finds ancestor" {
 }
 
 // ── pointer_down_focus = .preserve ────────────────────────────────────
-// 场景：一个 focusable 的"编辑器"持有焦点；一个 focusable=false 的按钮挂在两层
-// focusable=false 的容器（toolbar -> group）下。`preserve_on` 决定把 .preserve
-// 设在哪一层（null = 不设，走默认转移）。
+// Scenario: focusable "editor" holds focus; focusable=false button nested in two
+// focusable=false containers (toolbar -> group). `preserve_on` determines which level
+// gets .preserve (null = unset, use default transfer).
 
 const PdfPlacement = enum {
-    /// 按钮在编辑器子树内（编辑器就是按钮最近的 focusable 祖先）。
+    /// Button in editor subtree (editor is button's nearest focusable ancestor).
     inside_editor,
-    /// 按钮在编辑器之外的兄弟子树（悬浮条挂在别处，父链上没有 focusable）。
+    /// Button outside editor sibling subtree (floating toolbar elsewhere, no focusable in
+    /// parent chain).
     sibling_of_editor,
-    /// 按钮在另一个 focusable 面板之内（最近的 focusable 祖先不是编辑器）。
+    /// Button inside different focusable panel (nearest focusable ancestor not editor).
     inside_focusable_panel,
 };
 
@@ -1174,9 +1177,9 @@ const PdfFixture = struct {
     editor: *Node,
     panel: ?*Node,
     button: *Node,
-    /// 按钮中心（窗口坐标）
+    /// Button center (window coords)
     button_xy: [2]f32,
-    /// 编辑器上一个不被其它子节点覆盖的点
+    /// Editor point not covered by other child nodes
     editor_xy: [2]f32,
 };
 
@@ -1216,7 +1219,7 @@ fn buildPdfFixture(ctx: *core.Cx, placement: PdfPlacement, preserve_on: PdfPrese
     var panel: ?*Node = null;
     switch (placement) {
         .inside_editor => {
-            // 编辑器正文区在上（y 0..60），工具条在下（y 60..100）。
+            // Editor content above (y 0..60), toolbar below (y 60..100).
             const body = try pdfBox(ctx, 400, 60);
             try editor.appendChild(a, body);
             try editor.appendChild(a, toolbar);
@@ -1256,9 +1259,9 @@ fn pdfClick(ctx: *core.Cx, xy: [2]f32) void {
     ctx.handleMouseUp(xy[0], xy[1]);
 }
 
-/// 先点编辑器拿到焦点，再点按钮；返回点按钮后的焦点。
+/// Click editor first to gain focus, then button; check focus after button click.
 fn pdfFocusAfterButtonClick(placement: PdfPlacement, preserve_on: PdfPreserveOn) !struct { focus: ?*Node, fx: PdfFixture, ctx: *core.Cx } {
-    const ctx = try core.Cx.init(std.testing.allocator);
+    const ctx = try core.Cx.init(std.testing.allocator, std.testing.io);
     errdefer ctx.deinit();
     const fx = try buildPdfFixture(ctx, placement, preserve_on);
 
@@ -1266,13 +1269,13 @@ fn pdfFocusAfterButtonClick(placement: PdfPlacement, preserve_on: PdfPreserveOn)
     try std.testing.expect(ctx.focus_manager.current_focus == fx.editor);
 
     pdfClick(ctx, fx.button_xy);
-    // 命中确实落在按钮上（否则断言测的是别的节点）。
+    // Hit truly on button (else assertion tests different node).
     try std.testing.expect(ctx.last_mouse_down_target == fx.button);
     return .{ .focus = ctx.focus_manager.current_focus, .fx = fx, .ctx = ctx };
 }
 
 test "Cx: pointer_down_focus defaults to transfer" {
-    const ctx = try core.Cx.init(std.testing.allocator);
+    const ctx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     const n = try core.box(ctx, .{}, .{});
     ctx.root = n;
@@ -1280,7 +1283,8 @@ test "Cx: pointer_down_focus defaults to transfer" {
 }
 
 test "Cx: pointer_down_focus button under focused editor — default and preserve both keep editor" {
-    // 编辑器本身就是最近的 focusable 祖先：默认转移的目标恰好就是当前焦点。
+    // Editor itself is nearest focusable ancestor: default transfer target is current
+    // focus.
     {
         const r = try pdfFocusAfterButtonClick(.inside_editor, .none);
         defer r.ctx.deinit();
@@ -1296,7 +1300,7 @@ test "Cx: pointer_down_focus button under focused editor — default and preserv
 
 test "Cx: pointer_down_focus preserve keeps editor focus when toolbar is outside editor" {
     {
-        // 对照：默认行为，父链上无 focusable -> 清空焦点。
+        // Contrast: default behavior, no focusable in parent chain -> clear focus.
         const r = try pdfFocusAfterButtonClick(.sibling_of_editor, .none);
         defer r.ctx.deinit();
         try std.testing.expectEqual(@as(?*Node, null), r.focus);
@@ -1312,7 +1316,8 @@ test "Cx: pointer_down_focus preserve keeps editor focus when toolbar is outside
 
 test "Cx: pointer_down_focus preserve stops walk before a focusable panel ancestor" {
     {
-        // 对照：默认行为，焦点转给按钮最近的 focusable 祖先（面板）。
+        // Contrast: default behavior, focus goes to button's nearest focusable ancestor
+        // (panel).
         const r = try pdfFocusAfterButtonClick(.inside_focusable_panel, .none);
         defer r.ctx.deinit();
         try std.testing.expect(r.fx.panel != null);
@@ -1332,8 +1337,9 @@ test "Cx: pointer_down_focus preserve on a focusable button wins over its own fo
         try std.testing.expect(r.focus == r.fx.editor);
     }
     {
-        // 按钮自身 focusable + preserve：仍不抢焦点（可 Tab 到，但点击不抢）。
-        const ctx = try core.Cx.init(std.testing.allocator);
+        // Button focusable + preserve: still not focus-grabbing (Tab-able but click does not
+        // grab).
+        const ctx = try core.Cx.init(std.testing.allocator, std.testing.io);
         defer ctx.deinit();
         const fx = try buildPdfFixture(ctx, .sibling_of_editor, .button);
         fx.button.behavior.interaction.focusable = true;
@@ -1346,9 +1352,9 @@ test "Cx: pointer_down_focus preserve on a focusable button wins over its own fo
 }
 
 test "Cx: pointer_down_focus preserve does not block a focusable descendant" {
-    // 工具条设 .preserve，但按钮本身 focusable（如工具条里的内嵌输入框）：
-    // 从命中节点向上先遇到 focusable -> 正常拿焦点。
-    const ctx = try core.Cx.init(std.testing.allocator);
+    // Toolbar sets .preserve, but button focusable (e.g., embedded input in toolbar):
+    // from hit node upward, first focusable -> normal focus grab.
+    const ctx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     const fx = try buildPdfFixture(ctx, .sibling_of_editor, .toolbar);
     fx.button.behavior.interaction.focusable = true;
@@ -1359,7 +1365,7 @@ test "Cx: pointer_down_focus preserve does not block a focusable descendant" {
 }
 
 test "Cx: pointer_down_focus preserve with nothing focused stays unfocused and still dispatches" {
-    const ctx = try core.Cx.init(std.testing.allocator);
+    const ctx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     const fx = try buildPdfFixture(ctx, .sibling_of_editor, .toolbar);
     const Counter = struct {
@@ -1378,7 +1384,7 @@ test "Cx: pointer_down_focus preserve with nothing focused stays unfocused and s
 }
 
 test "Cx: layout auto collects focusable nodes" {
-    var ctx = try core.Cx.init(std.testing.allocator);
+    var ctx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try core.box(ctx, .{
@@ -1413,7 +1419,7 @@ test "FocusScope: push/pop" {
     var fm = FocusManager.init(std.testing.allocator);
     defer fm.deinit();
 
-    var ctx = try core.Cx.init(std.testing.allocator);
+    var ctx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try core.box(ctx, .{ .width = .{ .px = 800 }, .height = .{ .px = 600 } }, .{});
@@ -1465,13 +1471,14 @@ test "FocusScope: scope 节点释放后 activeScope 返回 null 而非悬垂指�
     fm.setRegistry(&registry);
 
     fm.pushScope(modal);
-    // 解析成功会把裸指针缓存进 scope_stack
+    // Successful parse caches raw pointer into scope_stack
     try std.testing.expect(fm.activeScope() == modal);
 
-    // 模拟 scope 节点被释放（freeNode -> noteNodeFreed 摘表项）
+    // Simulate scope node freed (freeNode -> noteNodeFreed unlinks table entry)
     registry.unregisterSubtree(modal);
     try std.testing.expect(fm.activeScope() == null);
-    // Tab 路径（scopedFocusOrder）走无 scope 分支，不解引用悬垂 scope
+    // Tab path (scopedFocusOrder) takes no-scope branch, does not dereference dangling
+    // scope
     try std.testing.expectEqual(fm.focus_order.items.len, fm.scopedFocusOrder().len);
 }
 
@@ -1479,7 +1486,7 @@ test "FocusScope: tab stays within trap" {
     var fm = FocusManager.init(std.testing.allocator);
     defer fm.deinit();
 
-    var ctx = try core.Cx.init(std.testing.allocator);
+    var ctx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try core.box(ctx, .{ .width = .{ .px = 800 }, .height = .{ .px = 600 } }, .{});
@@ -1530,7 +1537,7 @@ test "FocusScope: tab stays within trap" {
 }
 
 test "FocusScope: isDescendantOf" {
-    var ctx = try core.Cx.init(std.testing.allocator);
+    var ctx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try core.box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
@@ -1555,7 +1562,7 @@ test "FocusScope: isDescendantOf" {
 }
 
 test "FocusEvent: blur carries related_node_id" {
-    var ctx = try core.Cx.init(std.testing.allocator);
+    var ctx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try core.box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
@@ -1578,7 +1585,8 @@ test "FocusEvent: blur carries related_node_id" {
     TestCtx.last_focus_related = null;
     TestCtx.last_focus_reason = .programmatic;
 
-    // 必须先 layout 以注册节点到 registry，dispatcher 才能分发事件
+    // Must layout first to register nodes in registry before dispatcher can dispatch
+    // events
     ctx.layout();
 
     // Set on_event to capture FocusEvent details
@@ -1622,7 +1630,7 @@ test "FocusEvent: blur carries related_node_id" {
 }
 
 test "FocusEvent: focus reason click/tab/programmatic" {
-    var ctx = try core.Cx.init(std.testing.allocator);
+    var ctx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try core.box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
@@ -1666,7 +1674,7 @@ test "FocusEvent: focus reason click/tab/programmatic" {
 }
 
 test "FocusEvent: bubbles via dispatch" {
-    var ctx = try core.Cx.init(std.testing.allocator);
+    var ctx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try core.box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
@@ -1702,7 +1710,7 @@ test "FocusEvent: bubbles via dispatch" {
 }
 
 test "Focus memory: restore after popScope" {
-    var ctx = try core.Cx.init(std.testing.allocator);
+    var ctx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try core.box(ctx, .{ .width = .{ .px = 800 }, .height = .{ .px = 600 } }, .{});
@@ -1741,7 +1749,7 @@ test "Focus memory: restore after popScope" {
 }
 
 test "Focus memory: auto_focus on push" {
-    var ctx = try core.Cx.init(std.testing.allocator);
+    var ctx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try core.box(ctx, .{ .width = .{ .px = 800 }, .height = .{ .px = 600 } }, .{});
@@ -1773,30 +1781,30 @@ test "Focus memory: auto_focus on push" {
     ctx.focus_manager.popScope();
 }
 
-// ========== Tab Index 测试 ==========
+// ========== Tab Index Tests ==========
 
 test "tab_index=0 auto focusable via collectFocusableNodes" {
     var fm = FocusManager.init(std.testing.allocator);
     defer fm.deinit();
 
-    var ctx = try core.Cx.init(std.testing.allocator);
+    var ctx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try core.box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
 
-    // tab_index=0 的节点应当自动可聚焦
+    // tab_index=0 node should auto-focus
     const btn = try core.box(ctx, .{ .width = .{ .px = 100 }, .height = .{ .px = 30 } }, .{});
     btn.behavior.interaction.tab_index = 0;
     try root.appendChild(std.testing.allocator, btn);
 
-    // 普通节点（不可聚焦）
+    // Plain node (not focusable)
     const plain = try core.box(ctx, .{ .width = .{ .px = 100 }, .height = .{ .px = 30 } }, .{});
     try root.appendChild(std.testing.allocator, plain);
 
     ctx.root = root;
 
     try fm.collectFocusableNodes(root);
-    // tab_index=0 被收集, plain 不被收集
+    // tab_index=0 collected, plain not collected
     try std.testing.expectEqual(@as(usize, 1), fm.focus_order.items.len);
     try std.testing.expect(fm.focus_order.items[0] == btn);
 }
@@ -1805,17 +1813,17 @@ test "tab_index=-1 excluded from Tab cycle" {
     var fm = FocusManager.init(std.testing.allocator);
     defer fm.deinit();
 
-    var ctx = try core.Cx.init(std.testing.allocator);
+    var ctx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try core.box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
 
-    // tab_index=-1: 可聚焦但不参与 Tab 循环
+    // tab_index=-1: focusable but not in Tab cycle
     const hidden = try core.box(ctx, .{ .width = .{ .px = 100 }, .height = .{ .px = 30 } }, .{});
     hidden.behavior.interaction.tab_index = -1;
     try root.appendChild(std.testing.allocator, hidden);
 
-    // tab_index=0: 正常参与 Tab 循环
+    // tab_index=0: normal Tab cycle participation
     const visible = try core.box(ctx, .{ .width = .{ .px = 100 }, .height = .{ .px = 30 } }, .{});
     visible.behavior.interaction.tab_index = 0;
     try root.appendChild(std.testing.allocator, visible);
@@ -1823,11 +1831,11 @@ test "tab_index=-1 excluded from Tab cycle" {
     ctx.root = root;
 
     try fm.collectFocusableNodes(root);
-    // 只有 visible 在 focus_order 中
+    // Only visible nodes in focus_order
     try std.testing.expectEqual(@as(usize, 1), fm.focus_order.items.len);
     try std.testing.expect(fm.focus_order.items[0] == visible);
 
-    // 但 tab_index=-1 的节点仍可通过 setFocus 聚焦
+    // But tab_index=-1 node still focusable via setFocus
     fm.setFocus(hidden);
     try std.testing.expect(fm.current_focus == hidden);
 }
@@ -1836,12 +1844,13 @@ test "tab_index positive controls Tab order" {
     var fm = FocusManager.init(std.testing.allocator);
     defer fm.deinit();
 
-    var ctx = try core.Cx.init(std.testing.allocator);
+    var ctx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try core.box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
 
-    // 树序: c (tab_index=3), a (tab_index=1), b (tab_index=2), d (focusable, no tab_index)
+    // Tree order: c (tab_index=3), a (tab_index=1), b (tab_index=2), d (focusable, no
+    // tab_index)
     const c = try core.box(ctx, .{ .width = .{ .px = 100 }, .height = .{ .px = 30 } }, .{});
     c.behavior.interaction.tab_index = 3;
     try root.appendChild(std.testing.allocator, c);
@@ -1855,20 +1864,20 @@ test "tab_index positive controls Tab order" {
     try root.appendChild(std.testing.allocator, b);
 
     const d = try core.box(ctx, .{ .width = .{ .px = 100 }, .height = .{ .px = 30 } }, .{});
-    d.behavior.interaction.focusable = true; // no tab_index, 排在正数之后
+    d.behavior.interaction.focusable = true; // no tab_index, sorts after positive
     try root.appendChild(std.testing.allocator, d);
 
     ctx.root = root;
 
     try fm.collectFocusableNodes(root);
-    // 排序: a(1), b(2), c(3), d(树序末)
+    // Sorted: a(1), b(2), c(3), d(tree end)
     try std.testing.expectEqual(@as(usize, 4), fm.focus_order.items.len);
     try std.testing.expect(fm.focus_order.items[0] == a);
     try std.testing.expect(fm.focus_order.items[1] == b);
     try std.testing.expect(fm.focus_order.items[2] == c);
     try std.testing.expect(fm.focus_order.items[3] == d);
 
-    // Tab 导航按排序顺序
+    // Tab navigation follows sort order
     fm.focusNext();
     try std.testing.expect(fm.current_focus == a);
     fm.focusNext();
@@ -1878,11 +1887,11 @@ test "tab_index positive controls Tab order" {
     fm.focusNext();
     try std.testing.expect(fm.current_focus == d);
     fm.focusNext();
-    try std.testing.expect(fm.current_focus == a); // 循环
+    try std.testing.expect(fm.current_focus == a); // Loop
 }
 
 test "Space/Enter triggers click on focusable node" {
-    var ctx = try core.Cx.init(std.testing.allocator);
+    var ctx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try core.box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
@@ -1903,21 +1912,21 @@ test "Space/Enter triggers click on focusable node" {
     ctx.setViewport(400, 300);
     ctx.layout();
 
-    // 聚焦 btn
+    // Focus btn
     ctx.focus_manager.setFocus(btn);
     try std.testing.expect(ctx.focus_manager.current_focus == btn);
 
-    // Space 触发 click
+    // Space triggers click
     ctx.handleKeyDown(.space, .{});
     try std.testing.expectEqual(@as(u32, 1), click_count);
 
-    // Enter 触发 click
+    // Enter triggers click
     ctx.handleKeyDown(.@"return", .{});
     try std.testing.expectEqual(@as(u32, 2), click_count);
 }
 
 test "Space/Enter does not override node key handler" {
-    var ctx = try core.Cx.init(std.testing.allocator);
+    var ctx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try core.box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
@@ -1933,7 +1942,7 @@ test "Space/Enter does not override node key handler" {
             cnt.* += 1;
         }
     }.handler, &click_count);
-    // 节点自身处理 key_down -> 返回 .handled (不是 .ignored)
+    // Node self-handles key_down -> returns .handled (not .ignored)
     input_node.behavior.events.on_event = struct {
         fn handler(event: core.Event, context: ?*anyopaque) events_mod.EventResult {
             switch (event) {
@@ -1955,10 +1964,10 @@ test "Space/Enter does not override node key handler" {
 
     ctx.focus_manager.setFocus(input_node);
 
-    // Enter -> 节点处理了 key_down，不应合成 click
+    // Enter -> node handled key_down, should not synthesize click
     ctx.handleKeyDown(.@"return", .{});
     try std.testing.expectEqual(@as(u32, 1), key_count);
-    try std.testing.expectEqual(@as(u32, 0), click_count); // click 不触发
+    try std.testing.expectEqual(@as(u32, 0), click_count); // click does not trigger
 }
 
 // ========== Accessibility bridge tests ==========
@@ -1975,7 +1984,7 @@ test "AccessibilityBridge: notifyFocusChange smoke" {
     var bridge = AccessibilityBridge{};
     bridge.notifyFocusChange(null);
 
-    var ctx = try core.Cx.init(std.testing.allocator);
+    var ctx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try core.box(ctx, .{ .width = .{ .px = 200 }, .height = .{ .px = 100 } }, .{});
@@ -2037,7 +2046,7 @@ test "AccessibilityBridge: forwards snapshots to SystemSdk" {
     var bridge = AccessibilityBridge{};
     bridge.attachSystemSdk(&sdk, 3);
 
-    var ctx = try core.Cx.init(std.testing.allocator);
+    var ctx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try core.box(ctx, .{ .width = .{ .px = 160 }, .height = .{ .px = 80 } }, .{});
@@ -2066,7 +2075,7 @@ test "AccessibilityBridge: forwards snapshots to SystemSdk" {
 }
 
 test "FocusManager: focus event delivered once" {
-    const cx = try core.Cx.init(std.testing.allocator);
+    const cx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     const node = try core.box(cx, .{}, .{});
     cx.root = node;
@@ -2089,7 +2098,7 @@ test "FocusManager: focus event delivered once" {
 }
 
 test "FocusManager: blur redirect does not recursively blur old owner" {
-    const cx = try core.Cx.init(std.testing.allocator);
+    const cx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     const root = try core.box(cx, .{}, .{});
     cx.root = root;
@@ -2123,7 +2132,7 @@ test "FocusManager: blur redirect does not recursively blur old owner" {
 }
 
 test "FocusManager: mouse focus redirect keeps Cx cache consistent" {
-    const cx = try core.Cx.init(std.testing.allocator);
+    const cx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
     const root = try core.box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
@@ -2156,7 +2165,7 @@ test "FocusManager: mouse focus redirect keeps Cx cache consistent" {
 }
 
 test "FocusManager: mouse focus callback destroys its target" {
-    const cx = try core.Cx.init(std.testing.allocator);
+    const cx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
     const root = try core.box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
@@ -2190,7 +2199,7 @@ test "FocusManager: mouse focus callback destroys its target" {
 test "FocusManager: reentrant blur requests settle once and newest request wins" {
     const Request = enum { clear, restore_old, redirect, redirect_then_destroy };
     for ([_]Request{ .clear, .restore_old, .redirect, .redirect_then_destroy }) |request| {
-        const cx = try core.Cx.init(std.testing.allocator);
+        const cx = try core.Cx.init(std.testing.allocator, std.testing.io);
         defer cx.deinit();
         const root = try core.box(cx, .{}, .{});
         cx.root = root;
@@ -2255,7 +2264,7 @@ test "FocusManager: reentrant blur requests settle once and newest request wins"
 }
 
 test "FocusManager: unregistered mount target receives one focus event" {
-    const cx = try core.Cx.init(std.testing.allocator);
+    const cx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     const node = try core.box(cx, .{}, .{});
     cx.root = node;
@@ -2279,7 +2288,7 @@ test "FocusManager: unregistered mount target receives one focus event" {
 test "FocusManager: keyboard default activation requires its original live focus owner" {
     const Mutation = enum { destroy, redirect };
     for ([_]Mutation{ .destroy, .redirect }) |mutation| {
-        const cx = try core.Cx.init(std.testing.allocator);
+        const cx = try core.Cx.init(std.testing.allocator, std.testing.io);
         defer cx.deinit();
         const root = try core.box(cx, .{}, .{});
         cx.root = root;
@@ -2325,7 +2334,7 @@ test "FocusManager: keyboard default activation requires its original live focus
 test "FocusManager: action callbacks cannot forward keys to a stale focus owner" {
     const Mutation = enum { destroy, redirect };
     for ([_]Mutation{ .destroy, .redirect }) |mutation| {
-        const cx = try core.Cx.init(std.testing.allocator);
+        const cx = try core.Cx.init(std.testing.allocator, std.testing.io);
         defer cx.deinit();
         const root = try core.box(cx, .{}, .{});
         cx.root = root;
@@ -2375,7 +2384,7 @@ test "FocusManager: action callbacks cannot forward keys to a stale focus owner"
 }
 
 test "FocusManager: unregister focus does not remove callback-shifted neighbor" {
-    const cx = try core.Cx.init(std.testing.allocator);
+    const cx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     const root = try core.box(cx, .{}, .{});
     cx.root = root;
@@ -2429,7 +2438,7 @@ test "FocusManager: identity allocation failure preserves the current owner" {
 }
 
 test "FocusManager: settled hook may synchronously redirect again" {
-    const cx = try core.Cx.init(std.testing.allocator);
+    const cx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     const root = try core.box(cx, .{}, .{});
     cx.root = root;

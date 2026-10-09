@@ -1,17 +1,18 @@
 /// Range Hover Registry
 ///
-/// 框架级交互原语：对一个 host Node 注册多个 **content-space 子矩形区域**，
-/// 每区域带 enter/leave 回调 + hover 延迟。典型消费者：
-///   - 文本中的下划线/标注 -> hover 出 detail popup
-///   - 带注解的 canvas / 图表的数据点
-///   - inline hint 额外信息
+/// Framework-level interaction primitive: register multiple content-space child
+/// rectangles on a host Node, each with enter/leave callbacks + hover delay.
+/// Typical consumers:
+///   - Underlines/annotations in text -> hover shows detail popup
+///   - Annotated canvas / chart data points
+///   - Inline hint supplemental info
 ///
-/// 为什么不用 Node 级 hit runtime：
-///   - 目标 region 不是 DOM 节点（例如文本里的 byte range 标注，不是子节点）
-///   - 按帧要求 host 把 byte range -> 屏幕 rect 的映射交给 registry，lazy 查询时求值
-///   - host 滚动/reflow 时不需要重新 register，只要 rects_fn 返回最新坐标
+/// Why not the Node-level hit runtime:
+///   - Target region is not a node (e.g., byte-range annotation in text)
+///   - Per frame, host maps byte range -> screen rect for the registry
+///   - Queries resolve lazily: no re-register on scroll/reflow, rects_fn returns fresh coords
 ///
-/// 用法：
+/// Usage:
 /// ```zig
 /// const registry = try RangeHoverRegistry.attach(cx, host_node);
 /// const id = try registry.register(.{
@@ -20,24 +21,25 @@
 ///     .on_enter = onDiagEnter,
 ///     .on_leave = onDiagLeave,
 /// });
-/// // 取消时：registry.unregister(id); 或 registry.clear();
-/// // 鼠标事件在 host 上投递，registry 的 tickMouseMove(x, y) 查所有 region 并 fire 回调。
+/// // Unregister: registry.unregister(id); or registry.clear();
+/// // On host mouse events, registry.tickMouseMove(x, y) queries regions and fires callbacks.
 /// ```
 ///
-/// 注意：
-///   - 坐标系是 host Node 的 content-local（caller 负责把 global -> local 转换）
-///   - rects_fn 每次 tick 被调用，caller 不需要缓存
-///   - scope cleanup 时 registry 自动释放
+/// Notes:
+///   - Coordinates are host Node content-local (caller transforms global -> local)
+///   - rects_fn is called every tick; caller need not cache
+///   - registry is auto-released on scope cleanup
 const std = @import("std");
 
-/// 最小 forward decl, range_hover 实际只存 `*Node` 做标记用，不调用 Node 的方法。
-/// 让单元测试可脱离整个 UI 栈跑（测 `attach` 以外的所有路径）。
+/// Minimal forward decl; range_hover only stores `*Node` as marker, never calls
+/// Node methods. Lets unit tests run without full UI stack (all paths except
+/// `attach`).
 const Node = opaque {};
 const UIContext = opaque {};
 
 pub const RangeId = u32;
 
-/// Content-local rect（相对 host Node 左上）
+/// Content-local rect (relative to host Node top-left).
 pub const RangeRect = struct {
     x: f32,
     y: f32,
@@ -49,35 +51,36 @@ pub const RangeRect = struct {
     }
 };
 
-/// 一个区域的注册条目
+/// One region's registration entry.
 pub const RangeHoverRegion = struct {
-    /// Supplier: 把 (byte_range 或其它) -> 0..N 个 content-local rects 写进 buf。
-    /// 返回实际写入数量（<= buf.len）。
+    /// Supplier: maps (byte_range or other) to 0..N content-local rects in buf,
+    /// returns actual count (<= buf.len).
     rects_fn: *const fn (ctx: *anyopaque, buf: []RangeRect) usize,
     ctx: *anyopaque,
-    /// 鼠标 hover delay 过后 fire。mx/my 是 content-local 坐标。
+    /// Fire after mouse hover delay. mx/my are content-local coordinates.
     on_enter: *const fn (ctx: *anyopaque, mx: f32, my: f32) void,
-    /// 鼠标离开 region fire（无 delay）。
+    /// Fire when mouse leaves region (no delay).
     on_leave: *const fn (ctx: *anyopaque) void,
-    /// 鼠标停留多少毫秒后 fire on_enter（典型 300-500 ms）
+    /// Delay in milliseconds before firing on_enter (typical 300-500 ms).
     hover_delay_ms: u32 = 300,
 };
 
-/// Registry 本体：一个 host Node 上可挂一个
+/// Registry itself: one per host Node.
 pub const RangeHoverRegistry = struct {
     allocator: std.mem.Allocator,
     host: *Node,
-    /// 注册的区域列表；ID 单调递增，unregister 用 tombstone 方式（entry 置 null）
-    entries: std.ArrayListUnmanaged(?Entry) = .{},
+    /// Registered region list; IDs monotonically increasing; unregister uses
+    /// tombstone method (entry set to null).
+    entries: std.ArrayListUnmanaged(?Entry) = .empty,
     next_id: RangeId = 1,
 
-    /// 当前被 hover 的区域 ID（未达 delay 时也记录）
+    /// Currently hovered region ID (recorded even before delay reached).
     active_id: ?RangeId = null,
-    /// active_id 首次进入该 region 的时间戳（ms）
+    /// Timestamp (ms) when active_id first entered that region.
     active_enter_ms: i64 = 0,
-    /// active_id 的 on_enter 是否已 fire
+    /// Whether active_id's on_enter has fired.
     entered: bool = false,
-    /// 最近一次 mouse 坐标（tickMouseMove 记录）
+    /// Most recent mouse coordinates (from tickMouseMove).
     last_mx: f32 = 0,
     last_my: f32 = 0,
 
@@ -86,11 +89,10 @@ pub const RangeHoverRegistry = struct {
         region: RangeHoverRegion,
     };
 
-    /// 为 host node 挂一个 registry。caller 持有 *RangeHoverRegistry，scope 负责清理。
-    /// 多次 attach 同一个 node 是 caller 的责任（registry 没做 dedup）。
-    ///
-    /// 参数 allocator 必须长于 registry 自身；caller 负责在 scope cleanup 里 destroy()。
-    /// 不让构造函数直接吃 UIContext，这样 registry 可以脱离整个 UI 栈单元测试。
+    /// Attach registry to host node. Caller holds *RangeHoverRegistry; scope handles
+    /// cleanup. Caller's responsibility to avoid multiple attach to same node.
+    /// allocator must outlive registry; caller destroys in scope cleanup. Constructor
+    /// doesn't take UIContext so registry unit-tests without full UI stack.
     pub fn attach(allocator: std.mem.Allocator, host: *Node) !*RangeHoverRegistry {
         const self = try allocator.create(RangeHoverRegistry);
         self.* = .{
@@ -104,7 +106,7 @@ pub const RangeHoverRegistry = struct {
         self.entries.deinit(self.allocator);
     }
 
-    /// 销毁并从 allocator 释放；等同 deinit + destroy。
+    /// Destroy and free from allocator; equivalent to deinit + destroy.
     pub fn destroy(self: *RangeHoverRegistry) void {
         const a = self.allocator;
         self.deinit();
@@ -149,14 +151,14 @@ pub const RangeHoverRegistry = struct {
         self.entered = false;
     }
 
-    /// 每帧 / 鼠标移动时投递（mx/my = host-local 坐标；now_ms = 当前单调时间）。
-    /// registry 自己跑 state machine：hover delay -> on_enter -> on_leave。
+    /// Dispatch per frame / on mouse move (mx/my = host-local coords; now_ms = current
+    /// monotonic time). Registry runs state machine: hover delay -> on_enter -> on_leave.
     pub fn tickMouseMove(self: *RangeHoverRegistry, mx: f32, my: f32, now_ms: i64) void {
         self.last_mx = mx;
         self.last_my = my;
         var buf: [8]RangeRect = undefined;
 
-        // 查当前坐标落到哪个 region
+        // Find which region current coordinates fall into.
         var hit: ?RangeId = null;
         var hit_region: ?RangeHoverRegion = null;
         for (self.entries.items) |entry_opt| {
@@ -174,7 +176,7 @@ pub const RangeHoverRegistry = struct {
 
         if (hit) |new_id| {
             if (self.active_id != new_id) {
-                // 切到新 region：旧的 leave，新的起计时
+                // Switch to new region: leave old, start timer on new.
                 if (self.active_id) |old_id| {
                     if (self.entered) fireLeaveById(self, old_id);
                 }
@@ -182,7 +184,7 @@ pub const RangeHoverRegistry = struct {
                 self.active_enter_ms = now_ms;
                 self.entered = false;
             }
-            // 检查 delay（包括刚切进来的 case, delay=0 时同帧 fire）
+            // Check delay (including just-switched case; fire same frame when delay=0).
             if (!self.entered) {
                 const elapsed = now_ms - self.active_enter_ms;
                 if (elapsed >= @as(i64, @intCast(hit_region.?.hover_delay_ms))) {
@@ -191,7 +193,7 @@ pub const RangeHoverRegistry = struct {
                 }
             }
         } else {
-            // 离开所有 region
+            // Leave all regions.
             if (self.active_id) |old_id| {
                 if (self.entered) fireLeaveById(self, old_id);
                 self.active_id = null;
@@ -200,7 +202,7 @@ pub const RangeHoverRegistry = struct {
         }
     }
 
-    /// 鼠标离开 host Node 时调用，强制 leave 当前 active region
+    /// Called when mouse leaves host Node; force-leave current active region.
     pub fn onMouseLeaveHost(self: *RangeHoverRegistry) void {
         if (self.active_id) |old_id| {
             if (self.entered) fireLeaveById(self, old_id);
@@ -256,7 +258,7 @@ const TestState = struct {
 fn newRegistry() RangeHoverRegistry {
     return .{
         .allocator = testing.allocator,
-        .host = undefined, // 测试里不真 attach 到 Node
+        .host = undefined, // Not really attaching to Node in tests.
     };
 }
 
@@ -273,15 +275,15 @@ test "range_hover: enter fires only after delay elapses" {
         .hover_delay_ms = 100,
     });
 
-    // t=0 进入区域
+    // t=0 enter region.
     registry.tickMouseMove(5, 5, 0);
-    try testing.expectEqual(@as(u32, 0), state.enter_count); // delay 未到
+    try testing.expectEqual(@as(u32, 0), state.enter_count); // Delay not reached.
 
     // t=50 still in region
     registry.tickMouseMove(6, 5, 50);
     try testing.expectEqual(@as(u32, 0), state.enter_count);
 
-    // t=100 delay 到达
+    // t=100 delay reached.
     registry.tickMouseMove(6, 5, 100);
     try testing.expectEqual(@as(u32, 1), state.enter_count);
 }

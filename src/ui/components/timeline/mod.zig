@@ -1,11 +1,11 @@
 /// Timeline Component
 ///
-/// 时间线组件，用于展示事件流程
+/// Timeline component for displaying event flow.
 ///
-/// 特性:
-/// - 垂直布局
-/// - 状态点 + 连接线
-/// - 标题 + 描述 + 时间
+/// Features:
+/// - Vertical layout
+/// - Status dot + connection line
+/// - Title + description + time.
 const std = @import("std");
 const core = @import("../../core.zig");
 const Cx = core.Cx;
@@ -13,12 +13,12 @@ const Node = core.Node;
 const box = core.box;
 const Color = core.Color;
 const theme = core.theme;
-const Scope = @import("../../reactive.zig").Scope;
+const reactive = @import("../../reactive.zig");
+const Scope = reactive.Scope;
 
-// 样式层已析出到 styles.zig
-const styles = @import("styles.zig");
+// View in timeline.yix, styles in styles.yss.
 
-/// 时间线项状态
+/// Timeline item status.
 pub const TimelineStatus = enum {
     completed,
     active,
@@ -26,21 +26,21 @@ pub const TimelineStatus = enum {
 
     pub fn dotColor(self: TimelineStatus, t: *const theme.ThemeTokens) Color {
         return switch (self) {
-            .completed => t.color.success,
-            .active => t.color.accent,
-            .pending => t.color.border,
+            .completed => t.tokens.color.success,
+            .active => t.tokens.color.accent,
+            .pending => t.tokens.color.border,
         };
     }
 
     pub fn lineColor(self: TimelineStatus, t: *const theme.ThemeTokens) Color {
         return switch (self) {
-            .completed => t.color.success,
-            .active, .pending => t.color.border,
+            .completed => t.tokens.color.success,
+            .active, .pending => t.tokens.color.border,
         };
     }
 };
 
-/// 时间线项
+/// Timeline item.
 pub const TimelineItem = struct {
     title: []const u8,
     description: ?[]const u8 = null,
@@ -48,128 +48,14 @@ pub const TimelineItem = struct {
     status: TimelineStatus = .pending,
 };
 
-/// Timeline 属性
-pub const TimelineProps = struct {
-    items: []const TimelineItem = &.{},
-};
+const views = @import("_timeline.yix.zig");
+/// Create Timeline: `W.Timeline(.{ .items = activity })`.
+pub const Timeline = views.Timeline;
+pub const TimelineProps = views.TimelineProps;
+/// One row (Yix component): `W.timeline.TimelineRow(.{ .title = "Deploy", .status = .active })`.
+pub const TimelineRow = views.TimelineRow;
 
-/// 创建 Timeline
-pub fn Timeline(props: TimelineProps) TimelineBuilder {
-    return TimelineBuilder{ .props = props };
-}
-
-pub const TimelineBuilder = struct {
-    props: TimelineProps,
-
-    pub fn items(self: TimelineBuilder, its: []const TimelineItem) TimelineBuilder {
-        var new = self;
-        new.props.items = its;
-        return new;
-    }
-
-    /// 保留模式: mount
-    pub fn mount(self: TimelineBuilder, scope: *Scope, cx: *Cx) !*Node {
-        const my_scope = try scope.childScope();
-        const allocator = cx.allocator;
-        const t = cx.tokens;
-        const p = self.props;
-
-        const container = try box(cx, .{
-            .width = .{ .grow = .{} },
-            .height = .{ .fit = .{} },
-            .direction = .column,
-        }, .{});
-        container.meta.ownership.meta.component_name = "Timeline";
-        // sweep：container 守卫一直武装到 return；行及行内子节点建好即 adopt
-        errdefer cx.freeNode(container);
-        try core.bindScopeToNode(my_scope, container);
-        container.behavior.interaction.a11y = .{ .role = .list, .label = "Timeline" };
-
-        for (p.items, 0..) |item, i| {
-            const is_last = (i == p.items.len - 1);
-
-            const row = try core.adoptChild(cx, allocator, container, try box(cx, .{
-                .width = .{ .grow = .{} },
-                .height = .{ .fit = .{ .min = 48 } },
-                .direction = .row,
-                .gap = 12,
-            }, .{}));
-
-            // 状态全靠圆点颜色表达，AT 用户完全接收不到。显式说出来：
-            // checked=已完成、selected=进行中、disabled=尚未开始。
-            row.behavior.interaction.a11y = .{
-                .role = .listitem,
-                .label = item.title,
-                .description = item.description,
-                .value_text = item.time,
-                .checked = (item.status == .completed),
-                .selected = (item.status == .active),
-                .disabled = (item.status == .pending),
-            };
-
-            // ---- 指示器列 (dot + line) ----
-            const indicator = try core.adoptChild(cx, allocator, row, try box(cx, .{
-                .width = .{ .px = 24 },
-                .height = .{ .grow = .{} },
-                .direction = .column,
-                .align_items = .center,
-            }, .{}));
-
-            // 状态圆点
-            _ = try core.adoptChild(cx, allocator, indicator, try box(cx, styles.dotStyle(item.status, t), .{}));
-
-            // 连接线 (不是最后一项)
-            if (!is_last) {
-                _ = try core.adoptChild(cx, allocator, indicator, try box(cx, styles.connectorStyle(item.status, t), .{}));
-            }
-
-            // ---- 内容列 ----
-            const bottom_pad: f32 = if (is_last) 0 else 16;
-            const content = try core.adoptChild(cx, allocator, row, try box(cx, .{
-                .width = .{ .grow = .{} },
-                .height = .{ .fit = .{} },
-                .direction = .column,
-                .gap = 2,
-            }, .{}));
-            content.style.padding.bottom = bottom_pad;
-
-            // 标题
-            const title_node = try core.adoptChild(cx, allocator, content, try box(cx, .{
-                .width = .{ .fit = .{} },
-                .height = .{ .fit = .{} },
-            }, .{}));
-            var title_txt = styles.titleTextProps(item.status, t);
-            title_txt.content = item.title;
-            title_node.setText(title_txt);
-
-            // 描述
-            if (item.description) |desc| {
-                const desc_node = try core.adoptChild(cx, allocator, content, try box(cx, .{
-                    .width = .{ .fit = .{} },
-                    .height = .{ .fit = .{} },
-                }, .{}));
-                var desc_txt = styles.descTextProps(t);
-                desc_txt.content = desc;
-                desc_node.setText(desc_txt);
-            }
-
-            // 时间
-            if (item.time) |time_text| {
-                const time_node = try core.adoptChild(cx, allocator, content, try box(cx, .{
-                    .width = .{ .fit = .{} },
-                    .height = .{ .fit = .{} },
-                }, .{}));
-                var time_txt = styles.timeTextProps(t);
-                time_txt.content = time_text;
-                time_node.setText(time_txt);
-            }
-        }
-
-        return container;
-    }
-};
-
-// ========== 测试 ==========
+// ========== Tests ==========
 
 const test_items = [_]TimelineItem{
     .{ .title = "Created", .description = "Project initialized", .time = "2024-01-01", .status = .completed },
@@ -179,7 +65,7 @@ const test_items = [_]TimelineItem{
 };
 
 test "Timeline: basic structure" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 500 } }, .{});
@@ -194,12 +80,12 @@ test "Timeline: basic structure" {
 
     try root.appendChild(std.testing.allocator, tl);
 
-    // 4 行
+    // 4 rows.
     try std.testing.expectEqual(@as(usize, 4), tl.children.items.len);
 }
 
 test "Timeline: last item no line" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 500 } }, .{});
@@ -214,7 +100,7 @@ test "Timeline: last item no line" {
 
     try root.appendChild(std.testing.allocator, tl);
 
-    // 最后一行的指示器列只有 dot (1个子节点), 前面的有 dot + line (2个)
+    // Last row's indicator column has only dot; earlier rows have dot + connection line.
     const first_row = tl.children.items[0];
     const first_indicator = first_row.children.items[0];
     try std.testing.expectEqual(@as(usize, 2), first_indicator.children.items.len);
@@ -222,10 +108,15 @@ test "Timeline: last item no line" {
     const last_row = tl.children.items[3];
     const last_indicator = last_row.children.items[0];
     try std.testing.expectEqual(@as(usize, 1), last_indicator.children.items.len);
+    try std.testing.expectEqualStrings("TimelineRow", last_row.meta.ownership.meta.component_name.?);
+    // Status spoken via a11y.
+    try std.testing.expect(first_row.behavior.interaction.a11y.?.checked.?);
+    try std.testing.expect(last_row.behavior.interaction.a11y.?.disabled);
+    try std.testing.expectEqualStrings("2024-01-01", first_row.behavior.interaction.a11y.?.value_text.?);
 }
 
 test "Timeline: single item" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 200 } }, .{});
@@ -246,17 +137,103 @@ test "Timeline: single item" {
     try std.testing.expectEqual(@as(usize, 1), tl.children.items.len);
 }
 
-// styles.zig 的测试收集，这行是必需的，见 docs/STYLING.md
-test {
-    _ = @import("styles.zig");
+test "Timeline: 静态 items 不建 effect / memo（行的条件、a11y、样式一次定型）" {
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
+    const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
+    defer scope.dispose();
+    const before = ctx.owner.graph.countByKind();
+    const tl = try Timeline(.{ .items = &test_items }).mount(scope, ctx);
+    defer ctx.freeNode(tl);
+    const after = ctx.owner.graph.countByKind();
+    try std.testing.expectEqual(before.get(.effect), after.get(.effect));
+    try std.testing.expectEqual(before.get(.memo), after.get(.memo));
 }
 
-// 逐分配点 OOM sweep，见 src/ui/components/oom_sweep.zig
+// Test collection from styles.yss, this line required, see docs/STYLING.md.
+test {
+    _ = @import("_styles.yss.zig");
+}
+
+// Per-allocation OOM sweep, see src/ui/components/oom_sweep.zig.
 test "timeline: mount 在任意分配点失败时不泄漏（sweep）" {
     try @import("../oom_sweep.zig").sweepMount("timeline", struct {
         fn m(scope: *Scope, cx: *Cx) anyerror!?*Node {
             const items = [_]TimelineItem{ .{ .title = "start", .time = "09:00", .status = .completed }, .{ .title = "mid", .description = "desc" }, .{ .title = "end" } };
             return try Timeline(.{ .items = &items }).mount(scope, cx);
+        }
+    }.m);
+}
+
+fn rows(tl: *Node, out: []*Node) usize {
+    var n: usize = 0;
+    for (tl.children.items) |c| {
+        const name = c.meta.ownership.meta.component_name orelse continue;
+        if (!std.mem.eql(u8, name, "TimelineRow")) continue;
+        out[n] = c;
+        n += 1;
+    }
+    return n;
+}
+
+fn hasLine(row: *Node) bool {
+    var n: usize = 0;
+    for (row.children.items[0].children.items) |c| n += @intFromBool(c.tag != .anchor);
+    return n == 2;
+}
+
+test "Timeline: items 来自信号——按行 key 调和，列表变长时原来的最后一行长出连接线（同一节点）" {
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
+    const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
+    defer scope.dispose();
+
+    const feed = try scope.createSignal([]const TimelineItem, test_items[0..2]);
+    const tl = try Timeline(.{ .items = feed }).mount(scope, ctx);
+    defer ctx.freeNode(tl);
+    var buf: [8]*Node = undefined;
+    try std.testing.expectEqual(@as(usize, 2), rows(tl, &buf));
+    const second = buf[1];
+    try std.testing.expect(!hasLine(second));
+    feed.set(&test_items);
+    try std.testing.expectEqual(@as(usize, 4), rows(tl, &buf));
+    try std.testing.expectEqual(second.id, buf[1].id); // Reuse.
+    try std.testing.expect(hasLine(second));
+    try std.testing.expect(second.behavior.interaction.a11y.?.selected);
+    try std.testing.expect(!hasLine(buf[3]));
+}
+
+test "Timeline: 一次更新里只换了字符串地址的行也重建（行不留指向旧字符串的借用）" {
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
+    const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
+    defer scope.dispose();
+    const a = std.testing.allocator;
+    const title = try a.dupe(u8, "Created");
+    defer a.free(title);
+    const copy = try a.dupe(u8, "Created");
+    defer a.free(copy);
+    // Second item content changed (signal notifies); first item content same, string address
+    // changed.
+    const first = [_]TimelineItem{ .{ .title = title }, .{ .title = "Review" } };
+    const moved = [_]TimelineItem{ .{ .title = copy }, .{ .title = "Deploy" } };
+    const feed = try scope.createSignal([]const TimelineItem, &first);
+    const tl = try Timeline(.{ .items = feed }).mount(scope, ctx);
+    defer ctx.freeNode(tl);
+    var buf: [2]*Node = undefined;
+    _ = rows(tl, &buf);
+    const before = buf[0].id;
+    feed.set(&moved);
+    _ = rows(tl, &buf);
+    // Compare id not pointer: rebuilt new node might land in same memory just freed.
+    try std.testing.expect(before != buf[0].id);
+}
+
+test "timeline: 动态 items 的 mount 在任意分配点失败时不泄漏（sweep）" {
+    try @import("../oom_sweep.zig").sweepMount("timeline(dynamic)", struct {
+        fn m(scope: *Scope, cx: *Cx) anyerror!?*Node {
+            const feed = try scope.createSignal([]const TimelineItem, &test_items);
+            return try Timeline(.{ .items = feed }).mount(scope, cx);
         }
     }.m);
 }

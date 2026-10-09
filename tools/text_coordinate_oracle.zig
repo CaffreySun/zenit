@@ -3,8 +3,8 @@
 const std = @import("std");
 const text_core = @import("text_core");
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+pub fn main(init: std.process.Init) !void {
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -12,7 +12,7 @@ pub fn main() !void {
     defer parsed.deinit();
 
     var out_buffer: [4096]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&out_buffer);
+    var stdout_writer = std.Io.File.stdout().writer(init.io, &out_buffer);
     const out = &stdout_writer.interface;
     for (parsed.value.cases) |case| {
         try out.print("{s}\tbytes={d}\tgraphemes=", .{ case.id, case.utf8_bytes });

@@ -1,41 +1,41 @@
 /// Transition
 ///
-/// CSS 风格的过渡动画，自动检测值变化并创建动画
+/// CSS-style transition animation; detects value changes and creates animation.
 ///
-/// 特性:
-/// - 自动过渡: 设置新值时自动开始动画
-/// - 可配置属性: 持续时间、缓动、延迟
-/// - 可中断: 新值到来时平滑过渡到新目标
+/// Features:
+/// - auto-transition: setting a new value auto-starts animation
+/// - configurable: duration, easing, delay
+/// - interruptible: new values transition smoothly to the new target
 const std = @import("std");
 const Easing = @import("easing.zig").Easing;
 const AnimationState = @import("mod.zig").AnimationState;
 
-/// Transition 配置
+/// transition config
 pub const TransitionConfig = struct {
-    /// 持续时间 (ms)
+    /// duration (ms)
     duration_ms: f32 = 200,
-    /// 延迟 (ms)
+    /// delay (ms)
     delay_ms: f32 = 0,
-    /// 缓动函数
+    /// easing function
     easing: Easing = .ease_out_quad,
-    /// 更新回调
+    /// update callback
     on_update: ?*const fn (f32, *anyopaque) void = null,
-    /// 完成回调
+    /// completion callback
     on_complete: ?*const fn (*anyopaque) void = null,
-    /// 回调上下文
+    /// callback context
     context: ?*anyopaque = null,
 };
 
-/// CSS 风格过渡
+/// CSS-style transition
 pub const Transition = struct {
     config: TransitionConfig,
     current_value: f32,
     target_value: f32,
     start_value: f32,
     start_time_ms: f64 = 0,
-    state: AnimationState = .completed, // 初始为完成状态
+    state: AnimationState = .completed, // initial completed state
 
-    /// 创建 Transition
+    /// create transition
     pub fn init(initial_value: f32, config: TransitionConfig) Transition {
         return Transition{
             .config = config,
@@ -45,7 +45,7 @@ pub const Transition = struct {
         };
     }
 
-    /// Builder 风格创建
+    /// builder-style creation
     pub fn create(initial_value: f32) TransitionBuilder {
         return TransitionBuilder{
             .initial = initial_value,
@@ -53,13 +53,13 @@ pub const Transition = struct {
         };
     }
 
-    /// 设置新的目标值 (自动开始过渡)
+    /// set new target value (auto-start transition)
     pub fn setTo(self: *Transition, value: f32, now_ms: f64) void {
-        // 使用相对+绝对混合阈值，避免大值范围下误判为"无变化"
+        // use relative+absolute hybrid threshold to avoid false 'no change' on large value ranges
         const delta = @abs(value - self.target_value);
         const scale = @max(@abs(self.target_value), 1.0);
         if (delta / scale < 1e-5) {
-            return; // 值没有显著变化
+            return; // value didn't change significantly
         }
 
         self.target_value = value;
@@ -68,7 +68,7 @@ pub const Transition = struct {
         self.state = .running;
     }
 
-    /// 立即设置值 (跳过动画)
+    /// set value immediately (skip animation)
     pub fn setImmediate(self: *Transition, value: f32) void {
         self.current_value = value;
         self.target_value = value;
@@ -76,38 +76,38 @@ pub const Transition = struct {
         self.state = .completed;
     }
 
-    /// 更新过渡 (每帧调用，传入绝对时间戳 ms)
+    /// update transition (call each frame, pass absolute timestamp ms)
     pub fn update(self: *Transition, now_ms: f64) void {
         if (self.state != .running) return;
 
         const elapsed = @as(f32, @floatCast(now_ms - self.start_time_ms));
 
-        // 检查延迟
+        // check delay
         if (elapsed < self.config.delay_ms) {
             return;
         }
 
         const active_time = elapsed - self.config.delay_ms;
-        // duration_ms <= 0 时直接完成，避免除零
+        // if duration_ms <= 0 complete immediately, avoid divide-by-zero
         const progress = if (self.config.duration_ms <= 0)
             @as(f32, 1.0)
         else
             std.math.clamp(active_time / self.config.duration_ms, 0.0, 1.0);
 
-        // 应用缓动
+        // apply easing
         const eased = self.config.easing.apply(progress);
 
-        // 插值
+        // interpolate
         self.current_value = self.start_value + (self.target_value - self.start_value) * eased;
 
-        // 调用更新回调
+        // call update callback
         if (self.config.on_update) |callback| {
             if (self.config.context) |ctx| {
                 callback(self.current_value, ctx);
             }
         }
 
-        // 检查完成
+        // check completion
         if (progress >= 1.0) {
             self.current_value = self.target_value;
             self.state = .completed;
@@ -120,17 +120,17 @@ pub const Transition = struct {
         }
     }
 
-    /// 获取当前值
+    /// get current value
     pub fn getValue(self: *const Transition) f32 {
         return self.current_value;
     }
 
-    /// 获取目标值
+    /// get target value
     pub fn getTarget(self: *const Transition) f32 {
         return self.target_value;
     }
 
-    /// 是否正在过渡
+    /// is transitioning
     pub fn isTransitioning(self: *const Transition) bool {
         return self.state == .running;
     }
@@ -178,14 +178,14 @@ pub const TransitionBuilder = struct {
     }
 };
 
-// ========== 测试 ==========
+// ========== tests ==========
 
 test "Transition: no change" {
     var trans = Transition.create(50.0)
         .duration_ms(300)
         .build();
 
-    // 初始状态不应该正在过渡
+    // initial state should not be transitioning
     try std.testing.expect(!trans.isTransitioning());
     try std.testing.expectEqual(@as(f32, 50.0), trans.getValue());
 }
@@ -196,15 +196,15 @@ test "Transition: basic" {
         .easing(.linear)
         .build();
 
-    const t0: f64 = 1000.0; // 起始时间戳
+    const t0: f64 = 1000.0; // start timestamp
     trans.setTo(100.0, t0);
     try std.testing.expect(trans.isTransitioning());
 
-    // 半程 (t0 + 500ms)
+    // midpoint (t0 + 500ms)
     trans.update(t0 + 500.0);
     try std.testing.expectApproxEqAbs(@as(f32, 50.0), trans.getValue(), 0.1);
 
-    // 完成 (t0 + 1000ms)
+    // complete (t0 + 1000ms)
     trans.update(t0 + 1000.0);
     try std.testing.expect(!trans.isTransitioning());
     try std.testing.expectEqual(@as(f32, 100.0), trans.getValue());
@@ -218,16 +218,16 @@ test "Transition: interruption" {
 
     const t0: f64 = 1000.0;
     trans.setTo(100.0, t0);
-    trans.update(t0 + 500.0); // 到达 50
+    trans.update(t0 + 500.0); // reach 50
 
-    // 中途改变目标 (t1 = t0 + 500)
+    // change target mid-transition (t1 = t0 + 500)
     const t1: f64 = t0 + 500.0;
     trans.setTo(0.0, t1);
 
-    // 应该从当前位置 (约50) 开始过渡到 0
+    // should transition from current position (~50) to 0
     try std.testing.expectApproxEqAbs(@as(f32, 50.0), trans.getValue(), 0.1);
 
-    // 完成 (t1 + 1000ms)
+    // complete (t1 + 1000ms)
     trans.update(t1 + 1000.0);
     try std.testing.expectEqual(@as(f32, 0.0), trans.getValue());
 }
@@ -269,7 +269,7 @@ test "Transition: callback" {
     const t0: f64 = 1000.0;
     trans.setTo(10.0, t0);
 
-    // 多次更新 (每 100ms)
+    // multiple updates (every 100ms)
     trans.update(t0 + 100.0);
     trans.update(t0 + 200.0);
     trans.update(t0 + 300.0);

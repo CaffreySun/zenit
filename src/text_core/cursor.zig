@@ -1,8 +1,8 @@
-/// DocCursor，通用文档光标
+/// DocCursor - generic document cursor
 ///
-/// 基于字节偏移的光标系统，支持选区和行列映射。
+/// Byte-offset cursor system with selection and line-col mapping support.
 ///
-/// 泛型参数 Doc: 任何提供以下 API 的文档类型:
+/// Generic parameter Doc: any type providing these APIs:
 ///   totalLength() -> usize
 ///   offsetToLineCol(offset) -> LineCol
 ///   lineColToOffset(line, col) -> usize
@@ -10,8 +10,8 @@
 ///   getLineStart(line) -> usize
 ///   getLineEnd(line) -> usize
 ///   getByteAt(offset) -> ?u8
-///   deleteRange(start, len) -> !void   (唯一的 mut 操作)
-/// 行列坐标
+///   deleteRange(start, len) -> !void   (only mutation operation)
+/// Line-column coordinates
 pub const LineCol = struct {
     line: usize,
     col: usize,
@@ -19,17 +19,18 @@ pub const LineCol = struct {
 
 const grapheme = @import("grapheme.zig");
 
-/// DocCursor，通用文档光标
-/// Doc: 任何提供 totalLength/offsetToLineCol/lineColToOffset/lineCount/getLineStart/getLineEnd/getByteAt/deleteRange 的类型
+/// DocCursor - generic document cursor
+/// Doc: any type providing
+/// totalLength/offsetToLineCol/lineColToOffset/lineCount/getLineStart/getLineEnd/getByteAt/deleteRange
 pub fn DocCursor(comptime Doc: type) type {
     return struct {
         const Self = @This();
 
-        /// 字节偏移
+        /// Byte offset
         offset: usize = 0,
-        /// 选区锚点 (非 null 时有选区)
+        /// Selection anchor (non-null when selection exists)
         anchor: ?usize = null,
-        /// 上下移动时保持的目标列
+        /// Target column preserved during up/down movement
         preferred_col: ?usize = null,
 
         pub fn selection(self: *const Self) ?struct { start: usize, end: usize } {
@@ -76,7 +77,7 @@ pub fn DocCursor(comptime Doc: type) type {
             return sel.start;
         }
 
-        // ===== 导航 =====
+        // ===== Navigation =====
 
         pub fn moveLeft(self: *Self, doc: *const Doc, shift: bool) void {
             if (!shift and self.hasSelection()) {
@@ -141,7 +142,7 @@ pub fn DocCursor(comptime Doc: type) type {
             if (shift) self.selectTo(target) else self.moveTo(target);
         }
 
-        // ===== 按词导航 =====
+        // ===== Word navigation =====
 
         pub fn moveWordLeft(self: *Self, doc: *const Doc, shift: bool) void {
             if (!shift and self.hasSelection()) {
@@ -161,8 +162,8 @@ pub fn DocCursor(comptime Doc: type) type {
             if (shift) self.selectTo(new_off) else self.moveTo(new_off);
         }
 
-        /// 返回 offset 所在词的 {start, end} 范围（双击选词用）
-        /// CJK 字符每个字单独成词；ASCII 词字符连续成词
+        /// Return {start, end} range of word containing offset (for double-click select)
+        /// CJK characters each form individual words; ASCII word chars form continuous words
         pub fn wordBoundsAt(doc: *const Doc, offset: usize) struct { start: usize, end: usize } {
             const total = doc.totalLength();
             if (total == 0) return .{ .start = 0, .end = 0 };
@@ -176,14 +177,15 @@ pub fn DocCursor(comptime Doc: type) type {
             const cur_off = prevCharBoundary(doc, probe_end);
             const b = doc.getByteAt(cur_off) orelse return .{ .start = offset, .end = offset };
 
-            // 表意/emoji（3/4 字节 lead）：每个 grapheme 独立成词。
-            // 用 grapheme 边界而非手算 char_len：ZWJ 家庭 emoji / 旗帜是多 codepoint 簇。
+            // Ideographic/emoji (3/4-byte lead): each grapheme is separate word.
+            // Use grapheme boundary not manual char_len: ZWJ families / flags are multi-codepoint
+            // clusters.
             if (b >= 0xE0) {
                 return .{ .start = cur_off, .end = nextCharBoundary(doc, cur_off) };
             }
 
             if (b < 0x80 and isWordSeparator(b)) {
-                // 在分隔符上：选中连续的分隔符
+                // On delimiter: select consecutive delimiters
                 var start = cur_off;
                 while (start > 0) {
                     const pb = doc.getByteAt(start - 1) orelse break;
@@ -199,9 +201,11 @@ pub fn DocCursor(comptime Doc: type) type {
                 return .{ .start = start, .end = end };
             }
 
-            // 词字符（ASCII 词字符 + 2 字节脚本如希腊/西里尔/拉丁扩展）：
-            // 向两侧扩展，遇 ASCII 分隔符或表意字符（>= 0xE0 lead）停止。
-            // 历史 bug：这里曾用 `pb >= 0x80` 一刀切，2 字节字符上双击选出空范围。
+            // Word characters (ASCII word chars + 2-byte scripts like Greek/Cyrillic/Latin
+            // Extended):
+            // expand both directions, stop at ASCII delimiter or ideographic (>= 0xE0 lead).
+            // Historical bug: previously used `pb >= 0x80` cutoff, double-click on 2-byte chars
+            // selected empty.
             var start = cur_off;
             while (start > 0) {
                 const pb = doc.getByteAt(start - 1) orelse break;
@@ -225,27 +229,30 @@ pub fn DocCursor(comptime Doc: type) type {
             return .{ .start = start, .end = end };
         }
 
-        /// 向前找词边界（跳分隔符再跳词字符）
-        /// CJK 字符每个字都是独立边界
+        /// Find previous word boundary (skip delimiters then word chars)
+        /// Each CJK character is an independent boundary
         pub fn prevWordBoundary(doc: *const Doc, offset: usize) usize {
             if (offset == 0) return 0;
             var p = offset;
-            // 跳过左边的空白/分隔符
+            // Skip whitespace/delimiters to the left
             while (p > 0) {
                 const b = doc.getByteAt(p - 1) orelse break;
                 if (!isWordSeparator(b)) break;
                 p -= 1;
             }
             if (p == 0) return 0;
-            // 前一个字符若是表意/emoji（>= 0xE0 lead）：单簇成词，退一个 grapheme
+            // If previous char is ideographic/emoji (>= 0xE0 lead): single cluster is word, retreat
+            // one grapheme
             {
                 const q = prevCharBoundary(doc, p);
                 const lead = doc.getByteAt(q) orelse return q;
                 if (lead >= 0xE0) return q;
             }
-            // 词字符（ASCII 词字符 + 2 字节脚本如希腊/西里尔/拉丁扩展）：连续回退，
-            // 遇 ASCII 分隔符或表意字符停止。
-            // 历史 bug：2 字节字符只退一个字符而非整词（与 nextWordBoundary 不对称）。
+            // Word characters (ASCII word chars + 2-byte scripts like Greek/Cyrillic/Latin
+            // Extended): retreat continuously,
+            // stop at ASCII delimiter or ideographic.
+            // Historical bug: 2-byte chars only retreat one char not whole word (asymmetric with
+            // nextWordBoundary).
             while (p > 0) {
                 const b = doc.getByteAt(p - 1) orelse break;
                 if (b < 0x80) {
@@ -261,23 +268,27 @@ pub fn DocCursor(comptime Doc: type) type {
             return p;
         }
 
-        /// 向后找词边界（跳词字符再跳分隔符）
-        /// CJK 字符每个字都是独立边界
+        /// Find next word boundary (skip word chars then delimiters)
+        /// Each CJK character is an independent boundary
         pub fn nextWordBoundary(doc: *const Doc, offset: usize) usize {
             const total = doc.totalLength();
             if (offset >= total) return total;
             var p = offset;
             const first = doc.getByteAt(p) orelse return p;
             if (first >= 0xE0) {
-                // 表意/emoji：跳过一个完整 grapheme（ZWJ 家庭 emoji / 旗帜是
-                // 多 codepoint 簇，手算 char_len 会落在簇中间），再跳分隔符
+                // Ideographic/emoji: skip one complete grapheme (ZWJ families / flags are
+                // multi-codepoint clusters, manual char_len lands mid-cluster), then skip
+                // delimiters
                 p = nextCharBoundary(doc, p);
             } else if (first >= 0x80 or !isWordSeparator(first)) {
-                // 词字符（ASCII 词字符 + 2 字节脚本如希腊/西里尔/拉丁扩展）：
-                // 连续跳过，遇 ASCII 分隔符或表意字符停止。
-                // 历史 bug：这里曾用 `b >= 0x80` 一刀切 break，2 字节字符上
-                // 光标原地不动（Alt+Right 失灵）。continuation byte（0x80-0xBF）
-                // 在本扫描域内只可能属于 2 字节字符，表意 lead 已先停住。
+                // Word characters (ASCII word chars + 2-byte scripts like Greek/Cyrillic/Latin
+                // Extended):
+                // skip continuously, stop at an ASCII delimiter or ideographic char.
+                // Do not cut off at `b >= 0x80`: on 2-byte chars the cursor would not move
+                // (Alt+Right).
+                // A continuation byte (0x80-0xBF) in this scan domain can only belong to a 2-byte
+                // char;
+                // an ideographic lead stops before it.
                 while (p < total) {
                     const b = doc.getByteAt(p) orelse break;
                     if (b < 0x80 and isWordSeparator(b)) break;
@@ -285,7 +296,7 @@ pub fn DocCursor(comptime Doc: type) type {
                     p += 1;
                 }
             }
-            // 跳过右边的空白/分隔符
+            // Skip whitespace/delimiters to the right
             while (p < total) {
                 const b = doc.getByteAt(p) orelse break;
                 if (!isWordSeparator(b)) break;
@@ -301,8 +312,8 @@ pub fn DocCursor(comptime Doc: type) type {
             };
         }
 
-        /// 判断 ASCII 字节是否是"词内部的字符"（字母、数字、下划线）。
-        /// 和 isWordSeparator 互补（对 ASCII 来说）。
+        /// Test if ASCII byte is 'word-internal character' (letter/digit/underscore).
+        /// Complement to isWordSeparator (for ASCII).
         pub fn isWordChar(c: u8) bool {
             return (c >= 'a' and c <= 'z') or
                 (c >= 'A' and c <= 'Z') or
@@ -310,18 +321,18 @@ pub fn DocCursor(comptime Doc: type) type {
                 c == '_';
         }
 
-        // ===== Subword 导航 =====
+        // ===== Subword navigation =====
         //
-        // Subword 把一个 word 内部按 camelCase / snake_case / letter↔digit 进一步切分。
-        // 例："getUserName_v2" -> ["get", "User", "Name", "_", "v", "2"]
+        // Subword breaks words further by camelCase/snake_case/letter<->digit.
+        // Example: "getUserName_v2" -> ["get", "User", "Name", "_", "v", "2"]
         //
-        // 边界判定规则（相邻两字节 p, c）：
-        //   1. 原 word 边界仍然是 subword 边界（isWordSeparator 切分）
-        //   2. lower->Upper / Upper->lower（`aB` -> `a|B`；`AB`+`a` -> `AB|a` 需要向前看）
-        //   3. letter ↔ digit（`v2` -> `v|2`）
-        //   4. 字符 ↔ `_` 或 `-`
+        // Boundary rules (adjacent bytes p, c):
+        //   1. Original word boundaries are still subword boundaries (isWordSeparator splits)
+        //   2. lower->Upper / Upper->lower (`aB` -> `a|B`; `AB`+`a` -> `AB|a` needs lookahead)
+        //   3. letter <-> digit (`v2` -> `v|2`)
+        //   4. char <-> `_` or `-`
         //
-        // multi-byte 字符按"每个字符是独立 subword 边界"对待（类似 CJK 词模型）。
+        // Multi-byte chars: each char is its own subword boundary (like CJK).
 
         fn byteClass(c: u8) enum { lower, upper, digit, underscore, dash, other } {
             if (c >= 'a' and c <= 'z') return .lower;
@@ -332,30 +343,30 @@ pub fn DocCursor(comptime Doc: type) type {
             return .other;
         }
 
-        /// 判断从 p -> c 之间是否存在 subword 边界（同 word 内部）。
-        /// 要求 p 和 c 都是 ASCII 词字符（调用前需过滤分隔符）。
+        /// Test if subword boundary exists between p -> c (within word).
+        /// Requires p and c both ASCII word chars (caller filters delimiters).
         fn isSubwordBoundaryAscii(p: u8, c: u8) bool {
             const pc = byteClass(p);
             const cc = byteClass(c);
             if (pc == cc) return false;
-            // lower -> Upper（camelCase 首字母）
+            // lower -> Upper (camelCase boundary)
             if (pc == .lower and cc == .upper) return true;
             // letter ↔ digit
             const p_is_letter = pc == .lower or pc == .upper;
             const c_is_letter = cc == .lower or cc == .upper;
             if (p_is_letter and cc == .digit) return true;
             if (pc == .digit and c_is_letter) return true;
-            // 任意字符 ↔ _ / -
+            // any char <-> _ or -
             if (pc == .underscore or pc == .dash or cc == .underscore or cc == .dash) return true;
             return false;
         }
 
-        /// 向前找 subword 边界。返回 <= offset 的最近边界。
+        /// Find previous subword boundary; return nearest boundary <= offset.
         pub fn prevSubwordBoundary(doc: *const Doc, offset: usize) usize {
             if (offset == 0) return 0;
             var p = offset;
 
-            // 跳过左边的空白/分隔符（和 prevWordBoundary 一致）
+            // Skip whitespace/delimiters to left (consistent with prevWordBoundary)
             while (p > 0) {
                 const b = doc.getByteAt(p - 1) orelse break;
                 if (!isWordSeparator(b)) break;
@@ -363,14 +374,15 @@ pub fn DocCursor(comptime Doc: type) type {
             }
             if (p == 0) return 0;
 
-            // 若前一个字节是 multi-byte（≥0x80），退一个完整 UTF-8 字符即算一个 subword
+            // If previous byte is multi-byte (>=0x80), retreat one complete UTF-8 char = one
+            // subword
             const prev_b = doc.getByteAt(p - 1) orelse return p;
             if (prev_b >= 0x80) {
                 return prevCharBoundary(doc, p);
             }
 
-            // ASCII 路径：往左扫到 subword 边界或原 word 边界
-            // 第一步：至少退一个字节
+            // ASCII path: scan left to subword or word boundary
+            // First step: retreat at least one byte
             p -= 1;
             while (p > 0) {
                 const cur = doc.getByteAt(p) orelse break;
@@ -382,7 +394,7 @@ pub fn DocCursor(comptime Doc: type) type {
             return p;
         }
 
-        /// 向后找 subword 边界。返回 >= offset 的最近边界。
+        /// Find next subword boundary; return nearest boundary >= offset.
         pub fn nextSubwordBoundary(doc: *const Doc, offset: usize) usize {
             const total = doc.totalLength();
             if (offset >= total) return total;
@@ -390,12 +402,12 @@ pub fn DocCursor(comptime Doc: type) type {
 
             const first = doc.getByteAt(p) orelse return p;
 
-            // multi-byte 字符：跳过一个完整字符就算一个 subword。
-            // 历史 bug：只判 >= 0xE0，2 字节字符落进 ASCII 路径 p += 1
-            // 直接停在字符中间。
+            // Multi-byte char: skip one complete char = one subword.
+            // Historical bug: only checked >= 0xE0, 2-byte chars fell into ASCII path p += 1,
+            // stopped mid-char.
             if (first >= 0x80) {
                 p = nextCharBoundary(doc, p);
-                // 跳过右侧分隔符以和 word 版本保持一致
+                // Skip right-side delimiters to match word version
                 while (p < total) {
                     const b = doc.getByteAt(p) orelse break;
                     if (!isWordSeparator(b)) break;
@@ -404,7 +416,8 @@ pub fn DocCursor(comptime Doc: type) type {
                 return p;
             }
 
-            // ASCII 分隔符：先跳过所有分隔符（和 nextWordBoundary 一致的前置处理）
+            // ASCII delimiters: first skip all delimiters (preprocessing consistent with
+            // nextWordBoundary)
             if (isWordSeparator(first)) {
                 while (p < total) {
                     const b = doc.getByteAt(p) orelse break;
@@ -414,7 +427,7 @@ pub fn DocCursor(comptime Doc: type) type {
                 return p;
             }
 
-            // 词内部：扫到下一个 subword 边界
+            // Within word: scan to next subword boundary
             p += 1;
             while (p < total) {
                 const cur = doc.getByteAt(p) orelse break;
@@ -449,12 +462,15 @@ pub fn DocCursor(comptime Doc: type) type {
             if (shift) self.selectTo(new_off) else self.moveTo(new_off);
         }
 
-        // ===== 段落导航 =====
+        // ===== Paragraph navigation =====
         //
-        // 段落 = 被空行分隔的文本块。空行 = 完全空或只含空白字符的行。
+        // Paragraph = text block separated by blank lines. Blank line = no content or only
+        // whitespace.
         //
-        // moveToPrevParagraph：跳到当前段落的开头；若已在段首，跳到上一段的开头。
-        // moveToNextParagraph：跳到当前段落之后的空行（或文档末尾）。
+        // moveToPrevParagraph: jump to the start of the current paragraph; if already there, to the
+        // start of the previous one.
+        // moveToNextParagraph: jump to the blank line after the current paragraph (or document
+        // end).
 
         fn isBlankLine(doc: *const Doc, line: usize) bool {
             const start = doc.getLineStart(line);
@@ -471,24 +487,25 @@ pub fn DocCursor(comptime Doc: type) type {
             const lc = doc.offsetToLineCol(self.offset);
             var line = lc.line;
 
-            // 若当前不在行首或非空白，先尝试从当前行继续往上
-            // 规则：往上找第一个空行（跳过当前所在的连续非空行）
-            // 再继续跳过其上方的连续空行（段落之间的间隙）
-            // 最终光标停在"非空段首行"的第 0 列
+            // If not at line start or blank, try continuing up from current line.
+            // Rule: find first blank line up (skip current non-blank lines), continue skipping
+            // blank lines above (gap between paragraphs), stop at col 0 of 'non-blank paragraph
+            // start line'.
 
-            // 第一步：如果当前行不是空行，先跳过当前段落（往上到空行或文档头）
+            // Step 1: if current line is not blank, skip current paragraph first (up to blank or
+            // doc start)
             if (!isBlankLine(doc, line)) {
                 while (line > 0 and !isBlankLine(doc, line - 1)) : (line -= 1) {}
-                // line 停在段首
+                // line stops at paragraph start
             } else {
-                // 当前是空行 -> 跳过连续空行
+                // Current is blank -> skip consecutive blank lines
                 while (line > 0 and isBlankLine(doc, line - 1)) : (line -= 1) {}
-                // 再跳过上一段
+                // then skip previous paragraph
                 while (line > 0 and !isBlankLine(doc, line - 1)) : (line -= 1) {}
             }
 
             const target = doc.getLineStart(line);
-            // 若未移动（已经在段首且光标就在行首）-> 尝试再往上一段
+            // If didn't move (already at paragraph start with cursor at line start) -> try next up
             if (target == self.offset and line > 0) {
                 var l2 = line - 1;
                 while (l2 > 0 and isBlankLine(doc, l2)) : (l2 -= 1) {}
@@ -506,13 +523,13 @@ pub fn DocCursor(comptime Doc: type) type {
             const total_lines = doc.lineCount();
             var line = lc.line;
 
-            // 当前是非空行：跳过当前段到第一个空行
+            // Current is non-blank: skip current paragraph to first blank line
             if (!isBlankLine(doc, line)) {
                 while (line + 1 < total_lines and !isBlankLine(doc, line + 1)) : (line += 1) {}
-                // 落在段末；目标 = 段末的下一行（空行）开头
+                // Land at paragraph end; target = start of next line (blank line)
                 line += 1;
             } else {
-                // 当前是空行：跳过连续空行再跳过下一段
+                // Current is blank: skip consecutive blank lines then next paragraph
                 while (line + 1 < total_lines and isBlankLine(doc, line + 1)) : (line += 1) {}
                 while (line + 1 < total_lines and !isBlankLine(doc, line + 1)) : (line += 1) {}
                 line += 1;
@@ -522,7 +539,7 @@ pub fn DocCursor(comptime Doc: type) type {
             if (shift) self.selectTo(target) else self.moveTo(target);
         }
 
-        // ===== UTF-8 字符边界 =====
+        // ===== UTF-8 character boundaries =====
 
         /// Keep an existing grapheme boundary, or floor an interior byte offset
         /// to the containing cluster's start. Retains byte-column navigation.
@@ -533,16 +550,15 @@ pub fn DocCursor(comptime Doc: type) type {
             return prevCharBoundary(doc, offset + 1);
         }
 
-        /// 向前找前一个 grapheme cluster 的起始位置（UAX #29 extended grapheme cluster）
-        ///
-        /// 不能按 codepoint 退：家庭 emoji / 组合记号 / 旗帜 / 肤色修饰符都由多个
-        /// codepoint 组成，按 codepoint 退会把它们拆成残缺序列。
+        /// Find start of previous grapheme cluster (UAX #29 extended grapheme cluster).
+        /// Cannot retreat by codepoint: family emoji / combining marks / flags / skin-tone
+        /// modifiers are multi-codepoint; retreating by codepoint splits them into fragments.
         pub fn prevCharBoundary(doc: *const Doc, offset: usize) usize {
             if (offset == 0) return 0;
             return grapheme.prevBoundaryDoc(Doc, doc, offset);
         }
 
-        /// 向后找下一个 grapheme cluster 的起始位置
+        /// Find start of next grapheme cluster
         pub fn nextCharBoundary(doc: *const Doc, offset: usize) usize {
             const total = doc.totalLength();
             if (offset >= total) return total;
@@ -551,11 +567,11 @@ pub fn DocCursor(comptime Doc: type) type {
     };
 }
 
-// ===== 多行 Doc 路径的 grapheme 边界回归测试 =====
+// ===== Multi-line Doc grapheme boundary regression tests =====
 
 const std_t = @import("std");
 
-/// 只实现 prev/nextCharBoundary 需要的两个方法的最小 Doc
+/// Minimal Doc implementing only methods needed for prev/nextCharBoundary
 const StubDoc = struct {
     bytes: []const u8,
     pub fn totalLength(self: *const StubDoc) usize {
@@ -576,9 +592,9 @@ test "DocCursor 边界按 grapheme cluster 而非 codepoint" {
     try std_t.testing.expectEqual(@as(usize, 1 + family.len), C.nextCharBoundary(&doc, 1));
     try std_t.testing.expectEqual(@as(usize, doc.bytes.len), C.nextCharBoundary(&doc, 1 + family.len));
 
-    // 旗帜整对回退
+    // Flag pairs retreat intact
     try std_t.testing.expectEqual(@as(usize, 1 + family.len), C.prevCharBoundary(&doc, doc.bytes.len));
-    // 家庭 emoji 整个回退
+    // Family emoji retreat intact
     try std_t.testing.expectEqual(@as(usize, 1), C.prevCharBoundary(&doc, 1 + family.len));
 }
 
@@ -590,34 +606,34 @@ test "DocCursor 组合记号与肤色修饰符不被拆开" {
     try std_t.testing.expectEqual(@as(usize, 0), C.prevCharBoundary(&doc, 3));
 }
 
-// ===== 2 字节脚本（希腊/西里尔/拉丁扩展）词导航回归 =====
+// ===== 2-byte scripts (Greek/Cyrillic/Latin Extended) word navigation =====
 //
-// 历史 bug：nextWordBoundary/wordBoundsAt 只把 >= 0xE0（3/4 字节）当 multi-byte，
-// 2 字节 lead（0xC2-0xDF）落进 ASCII 词路径后又被 `b >= 0x80` 立即 break,
-// 光标原地不动（Alt+Right 失灵）、双击选词返回空范围。
+// nextWordBoundary/wordBoundsAt must treat 2-byte leads (0xC2-0xDF) as multi-byte, not only
+// >= 0xE0 (3/4-byte). Otherwise they fall into the ASCII word path and break at once on
+// `b >= 0x80`: cursor unmoved (Alt+Right) and double-click selects an empty range.
 
 test "DocCursor 词导航：希腊/西里尔词按整词跳，不原地卡住" {
     const C = DocCursor(StubDoc);
-    const greek = "λόγος"; // 每字符 2 字节
+    const greek = "λόγος"; // Each char 2 bytes
     const cyr = "слово";
     const doc = StubDoc{ .bytes = greek ++ " " ++ cyr ++ " test" };
 
-    // Alt+Right：整词 + 尾随分隔符
+    // Alt+Right: whole word + trailing delimiters
     try std_t.testing.expectEqual(@as(usize, greek.len + 1), C.nextWordBoundary(&doc, 0));
     try std_t.testing.expectEqual(
         @as(usize, greek.len + 1 + cyr.len + 1),
         C.nextWordBoundary(&doc, greek.len + 1),
     );
 
-    // Alt+Left：从词尾回到词首
+    // Alt+Left: from word end back to word start
     try std_t.testing.expectEqual(@as(usize, 0), C.prevWordBoundary(&doc, greek.len));
-    // 从 "test" 词首回退：越过空格回到西里尔词首
+    // From "test" word start retreat: skip space, land at Cyrillic word start
     try std_t.testing.expectEqual(
         @as(usize, greek.len + 1),
         C.prevWordBoundary(&doc, greek.len + 1 + cyr.len + 1),
     );
 
-    // 双击选词：整词非空范围
+    // Double-click select word: select entire non-empty word
     const bounds = C.wordBoundsAt(&doc, 2);
     try std_t.testing.expectEqual(@as(usize, 0), bounds.start);
     try std_t.testing.expectEqual(@as(usize, greek.len), bounds.end);
@@ -625,12 +641,12 @@ test "DocCursor 词导航：希腊/西里尔词按整词跳，不原地卡住" {
 
 test "DocCursor 词导航：ASCII 与 2 字节字符混排聚成一个词，CJK 仍单字成词" {
     const C = DocCursor(StubDoc);
-    // "naïve 中文x"：naïve 是 ASCII+2 字节混词；中/文 各自成词；x 独立
+    // "naive CJKx": naive is ASCII+2byte mixed word; each separate; x independent
     const doc = StubDoc{ .bytes = "naïve 中文x" };
     const naive_len = "naïve".len; // 6
 
     try std_t.testing.expectEqual(@as(usize, naive_len + 1), C.nextWordBoundary(&doc, 0));
-    // CJK：单字一跳
+    // CJK: single char per hop
     try std_t.testing.expectEqual(@as(usize, naive_len + 1 + 3), C.nextWordBoundary(&doc, naive_len + 1));
     try std_t.testing.expectEqual(@as(usize, 0), C.prevWordBoundary(&doc, naive_len));
 
@@ -642,18 +658,18 @@ test "DocCursor 词导航：ASCII 与 2 字节字符混排聚成一个词，CJK 
 test "DocCursor subword 导航：2 字节字符不落在字符中间" {
     const C = DocCursor(StubDoc);
     const doc = StubDoc{ .bytes = "λω x" };
-    // 旧实现：p += 1 落在 λ 的 continuation byte 上
+    // Old impl: p += 1 landed on λ's continuation byte
     const n1 = C.nextSubwordBoundary(&doc, 0);
-    try std_t.testing.expect(n1 == 2 or n1 == 4 or n1 == 5); // 任一合法字符边界
-    try std_t.testing.expect(n1 != 1 and n1 != 3); // 不得是字符中间
-    try std_t.testing.expect(n1 > 0); // 不得原地踏步
+    try std_t.testing.expect(n1 == 2 or n1 == 4 or n1 == 5); // Any valid char boundary
+    try std_t.testing.expect(n1 != 1 and n1 != 3); // Not mid-character
+    try std_t.testing.expect(n1 > 0); // Not unmoved
 }
 
 test "DocCursor 词导航：ZWJ 家庭 emoji 整簇一跳" {
     const C = DocCursor(StubDoc);
     const family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}";
     const doc = StubDoc{ .bytes = family ++ "ab" };
-    // 旧实现手算 char_len=4 只跳一个 codepoint，落在 ZWJ 序列中间
+    // Old impl manual char_len=4 skipped one codepoint, landed mid-ZWJ sequence
     try std_t.testing.expectEqual(@as(usize, family.len), C.nextWordBoundary(&doc, 0));
 }
 
@@ -663,17 +679,17 @@ test "DocCursor 双击文末 CJK/emoji 始终返回完整 UTF-8 边界" {
     const thumbs = "\u{1F44D}";
     const doc = StubDoc{ .bytes = "a" ++ cjk ++ thumbs };
 
-    // CJK continuation byte 上的命中也归一化到字符开头。
+    // Hits on CJK continuation bytes also normalize to char start.
     const cjk_bounds = C.wordBoundsAt(&doc, 2);
     try std_t.testing.expectEqual(@as(usize, 1), cjk_bounds.start);
     try std_t.testing.expectEqual(@as(usize, 1 + cjk.len), cjk_bounds.end);
 
-    // EOF 位于四字节 emoji 之后；旧实现从 total - 1（续字节）开始选择。
+    // EOF after 4-byte emoji; old impl started selection at total-1 (continuation byte).
     const eof_bounds = C.wordBoundsAt(&doc, doc.bytes.len);
     try std_t.testing.expectEqual(@as(usize, 1 + cjk.len), eof_bounds.start);
     try std_t.testing.expectEqual(@as(usize, doc.bytes.len), eof_bounds.end);
 
-    // emoji 内部任意续字节同样不得成为选区边界。
+    // Continuation bytes within emoji also cannot be selection boundaries.
     const emoji_bounds = C.wordBoundsAt(&doc, 1 + cjk.len + 2);
     try std_t.testing.expectEqual(eof_bounds.start, emoji_bounds.start);
     try std_t.testing.expectEqual(eof_bounds.end, emoji_bounds.end);

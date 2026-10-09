@@ -1,19 +1,19 @@
-//! macOS NSAccessibility C ABI bridge (zig 侧 export)
+//! macOS NSAccessibility C ABI bridge (zig-side export).
 //!
-//! v0.6 §2.1，让 macOS NSAccessibility 协议方法 (accessibilityChildren /
-//! accessibilityHitTest: / accessibilityRole / etc.) 通过 C ABI 回弹 zig，
-//! 从 cx.accessibility_tree 拉 a11y node 数据。
+//! NSAccessibility protocol methods (accessibilityChildren / accessibilityHitTest: /
+//! accessibilityRole / etc) call back into zig via C ABI and pull a11y node data from
+//! cx.accessibility_tree.
 //!
-//! 反向 (zig -> ObjC notify_*) 由本模块的 retained-tree push hooks 精确定位；
-//! system_sdk 的 snapshot API 仅作为显式兼容入口保留。
+//! Reverse direction (zig -> ObjC notify_*) is precise dispatch via this module's retained-tree
+//! push hooks; the system_sdk snapshot API is kept only as an explicit compat entry.
 //!
-//! 设计:
-//! - element_handle = ElementId.raw() (u32 packed)。ObjC 侧懒生成 NSAccessibilityElement
-//!   代理对象时只持 handle，不持 zig 内存
-//! - 字符串通过 cx.a11y_label_buf hash -> []const u8 反查；C ABI 把 UTF-8 字节 copy 到
-//!   ObjC 提供的 buffer
-//! - active context 按 window_id 路由（见 `g_active` 表）。ObjC 侧的
-//!   ZenitA11yElement / MetalView 代理各自持所属 window_id，每次回调带进来
+//! Design:
+//! - element_handle = ElementId.raw() (u32 packed). ObjC lazily generates NSAccessibilityElement
+//!   proxies that hold only the handle, no zig memory
+//! - strings via cx.a11y_label_buf hash -> []const u8 reverse lookup; C ABI copies UTF-8 bytes to
+//!   an ObjC-provided buffer
+//! - active context routed by window_id (see `g_active` table). ObjC ZenitA11yElement / MetalView
+//!   proxies each hold window_id and pass it with every protocol method call
 
 const std = @import("std");
 const tree_mod = @import("tree.zig");
@@ -22,41 +22,48 @@ const element_id_mod = @import("../core/element_id.zig");
 const core_types = @import("../core/types.zig");
 
 pub const ElementId = element_id_mod.ElementId;
+pub const AXId = tree_mod.AXId;
 pub const A11yNode = tree_mod.A11yNode;
 pub const AccessibilityTree = tree_mod.AccessibilityTree;
 pub const PlatformBridge = router_mod.PlatformBridge;
 
-// compile-time invariant: tree.Role enum 顺序与 window_bridge.m 的
-// ZenitA11yTreeRole NS_ENUM 必须一致。改 tree.Role 顺序要同步改 ObjC 端。
+// compile-time invariant: tree.Role enum order matches window_bridge.m
+// ZenitA11yTreeRole NS_ENUM. change tree.Role order must sync ObjC side.
 comptime {
     const r = tree_mod.Role;
-    std.debug.assert(@intFromEnum(r.none) == 0);
-    std.debug.assert(@intFromEnum(r.button) == 2);
-    std.debug.assert(@intFromEnum(r.checkbox) == 3);
-    std.debug.assert(@intFromEnum(r.progressbar) == 8);
-    std.debug.assert(@intFromEnum(r.textbox) == 10);
-    std.debug.assert(@intFromEnum(r.dialog) == 28);
-    std.debug.assert(@intFromEnum(r.generic) == 51);
+    std.debug.assert(@backingInt(r.none) == 0);
+    std.debug.assert(@backingInt(r.button) == 2);
+    std.debug.assert(@backingInt(r.checkbox) == 3);
+    std.debug.assert(@backingInt(r.progressbar) == 8);
+    std.debug.assert(@backingInt(r.textbox) == 10);
+    std.debug.assert(@backingInt(r.dialog) == 28);
+    std.debug.assert(@backingInt(r.generic) == 51);
+    std.debug.assert(@backingInt(r.static_text) == 52);
+    std.debug.assert(@backingInt(r.switch_control) == 53);
+    std.debug.assert(@backingInt(r.scroll_area) == 54);
     std.debug.assert(@as(u32, @bitCast(tree_mod.State{ .disabled = true })) == (@as(u32, 1) << 0));
     std.debug.assert(@as(u32, @bitCast(tree_mod.State{ .focused = true })) == (@as(u32, 1) << 12));
     std.debug.assert(@as(u32, @bitCast(tree_mod.State{ .secure = true })) == (@as(u32, 1) << 17));
     std.debug.assert(@as(u32, @bitCast(tree_mod.State{ .expanded_present = true })) == (@as(u32, 1) << 18));
     std.debug.assert(@as(u16, @bitCast(tree_mod.A11yDirtyFlag{ .geometry_changed = true })) == (@as(u16, 1) << 8));
     std.debug.assert(@as(u16, @bitCast(tree_mod.A11yDirtyFlag{ .selection_changed = true })) == (@as(u16, 1) << 9));
+    std.debug.assert(@as(u16, @bitCast(tree_mod.A11yDirtyFlag{ .row_count_changed = true })) == (@as(u16, 1) << 10));
 }
 
-/// caller 必须实现的"从 ID 查 cx-level 字符串"接口。Cx 持有 a11y_label_buf
-/// (hash -> []const u8)，把指向 buf 的 fn ptr 注入 setActiveContext。
+/// caller-implemented "query cx-level string from ID" interface. Cx holds a11y_label_buf
+/// (hash -> []const u8), inject fn ptr to label_buf into setActiveContext.
 pub const LabelResolver = *const fn (ctx: *anyopaque, hash: u64) ?[]const u8;
 
-pub const Action = enum(u8) { press = 0, toggle = 1, increment = 2, decrement = 3 };
-pub const ActionHandler = *const fn (ctx: *anyopaque, element: ElementId, action: Action) bool;
-pub const SelectionHandler = *const fn (ctx: *anyopaque, element: ElementId, start_utf8: u32, end_utf8: u32) bool;
-pub const FocusHandler = *const fn (ctx: *anyopaque, element: ElementId, focused: bool) bool;
-pub const TextValueHandler = *const fn (ctx: *anyopaque, element: ElementId, value: []const u8) bool;
-pub const NumericValueHandler = *const fn (ctx: *anyopaque, element: ElementId, value: f32) bool;
-pub const TextFrameHandler = *const fn (ctx: *anyopaque, element: ElementId, start_utf8: u32, end_utf8: u32, out: *tree_mod.Frame) bool;
-pub const TextRangeAtPointHandler = *const fn (ctx: *anyopaque, element: ElementId, x: f32, y: f32, start_utf8: *u32, end_utf8: *u32) bool;
+/// scroll_to_visible: AXScrollToVisible, VoiceOver cursor moves off-viewport element call.
+/// any element (include static_text, disabled) supported, no need declare in actions.
+pub const Action = enum(u8) { press = 0, toggle = 1, increment = 2, decrement = 3, scroll_to_visible = 4 };
+pub const ActionHandler = *const fn (ctx: *anyopaque, element: AXId, action: Action) bool;
+pub const SelectionHandler = *const fn (ctx: *anyopaque, element: AXId, start_utf8: u32, end_utf8: u32) bool;
+pub const FocusHandler = *const fn (ctx: *anyopaque, element: AXId, focused: bool) bool;
+pub const TextValueHandler = *const fn (ctx: *anyopaque, element: AXId, value: []const u8) bool;
+pub const NumericValueHandler = *const fn (ctx: *anyopaque, element: AXId, value: f32) bool;
+pub const TextFrameHandler = *const fn (ctx: *anyopaque, element: AXId, start_utf8: u32, end_utf8: u32, out: *tree_mod.Frame) bool;
+pub const TextRangeAtPointHandler = *const fn (ctx: *anyopaque, element: AXId, x: f32, y: f32, start_utf8: *u32, end_utf8: *u32) bool;
 
 const ActiveContext = struct {
     tree: *AccessibilityTree,
@@ -72,13 +79,13 @@ const ActiveContext = struct {
     text_range_at_point_handler: ?TextRangeAtPointHandler = null,
 };
 
-/// 同时可注册的窗口数上限。定长数组而非 HashMap：这张表在 NSAccessibility
-/// 回调路径上被**高频**读（VoiceOver 每次导航都会走一遍 children/role/label），
-/// 需要无分配的确定性查找；窗口数天然是个位数。
+/// Max concurrent registered windows. Fixed array, not HashMap: this table is read on the
+/// **high-frequency** NSAccessibility callback path (VoiceOver walks children/role/label on each
+/// navigation) and needs alloc-free deterministic lookup; window count is single digit.
 ///
-/// ⚠️ 线程模型：本表**依赖主线程串行化**，槽位写入（?Slot 多字 struct）不是
-/// 原子的。AppKit 的 NSAccessibility 协议方法在主线程投递，zenit 渲染循环也在
-/// 主线程，生产路径串行。若将来出现非主线程回调，需给槽位加原子指针/seqlock。
+/// WARNING: thread model: the table **relies on main-thread serialization**; multi-word struct
+/// writes are not atomic. NSAccessibility protocol methods and the zenit render loop both run on
+/// the main thread. If non-main-thread callbacks appear, slots need an atomic pointer/seqlock.
 pub const MAX_WINDOWS = 16;
 
 const Slot = struct {
@@ -162,12 +169,12 @@ pub fn clearTextInputResolverForOwner(window_id: u32, owner: *anyopaque) void {
     };
 }
 
-/// ObjC 端在拿不到具体 window_id 时传的通配值（旧 single-window 代理、
-/// 未接线的 test harness）。查找时退化成"表里第一个有效窗口"。
+/// ObjC passes wildcard when can't get specific window_id (old single-window proxy,
+/// unhooked test harness). lookup degrades to "first registered window in table".
 pub const ANY_WINDOW: u32 = 0;
 /// C ABI missing-handle sentinel. Handle zero is a valid first ElementId and
 /// must never be overloaded as failure.
-pub const INVALID_HANDLE: u32 = ElementId.NULL.raw();
+pub const INVALID_HANDLE: u64 = AXId.NULL.raw();
 
 fn lookup(window_id: u32) ?ActiveContext {
     if (window_id == ANY_WINDOW) {
@@ -184,13 +191,13 @@ fn lookup(window_id: u32) ?ActiveContext {
     return null;
 }
 
-/// cx 在 init/render 路径设这个；deinit 清空。
+/// cx sets this during init/render and clears it on deinit.
 ///
-/// 按 `window_id` 注册：多个窗口各自注册自己的 a11y 树，ObjC 侧的代理对象
-/// 持所属 window_id 回调进来时命中各自的槽位，互不覆盖。
-/// 同一 window_id 重复注册 = 原地更新（每帧 syncA11yTree 都会调）。
+/// Registered by `window_id`: multiple windows each register their own a11y tree; ObjC proxy
+/// objects hold window_id so callbacks hit their own slot without overriding.
+/// Re-registering the same window_id updates in place (syncA11yTree calls it each frame).
 ///
-/// 表满时静默丢弃（返回 false），a11y 降级好过让渲染路径报错。
+/// Table full: silently discard (return false); a11y degrading beats a render crash.
 pub fn setActiveContext(
     window_id: u32,
     tree: *AccessibilityTree,
@@ -284,7 +291,7 @@ pub fn setActiveContextWithFullInteractions(
     return true;
 }
 
-/// 注销某个窗口的 a11y 树。其他窗口的注册不受影响。
+/// unregister a window's a11y tree. other window registrations unaffected.
 pub fn clearActiveContext(window_id: u32) void {
     var removed = false;
     for (&g_active) |*maybe| {
@@ -318,13 +325,13 @@ pub fn clearActiveContextForOwner(window_id: u32, owner: *anyopaque) void {
     clearTextInputResolverForOwner(window_id, owner);
 }
 
-/// 清空整张表（测试 fixture 用；生产路径应按窗口 clearActiveContext）。
+/// clear entire table (test fixture; production should clearActiveContext per-window).
 pub fn clearAllActiveContexts() void {
     g_active = @splat(null);
     g_text_input = @splat(null);
 }
 
-/// 当前已注册的窗口数（诊断/测试用）。
+/// current registered window count (diagnostic/test).
 pub fn activeContextCount() usize {
     var n: usize = 0;
     for (g_active) |maybe| {
@@ -333,13 +340,10 @@ pub fn activeContextCount() usize {
     return n;
 }
 
-// ============================================================================
-// C ABI exports (ObjC 调进来)
-// ----------------------------------------------------------------------------
-// 每个 export 的首参都是 `window_id`, ObjC 侧的 ZenitA11yElement / MetalView
-// 代理持所属窗口的 id 并在每次协议方法里带进来，zig 端据此路由到该窗口自己的
-// AccessibilityTree。传 ANY_WINDOW(0) 退化成"第一个已注册窗口"（旧行为）。
-// ============================================================================
+// C ABI exports (called from ObjC).
+// Each export's first parameter is `window_id`; ObjC-side ZenitA11yElement / MetalView
+// proxy holds owning window id and passes it each protocol method, zig end routes to that window's
+// own AccessibilityTree. Pass ANY_WINDOW(0) degrades to "first registered window" (old behavior).
 
 const INVALID_TEXT_OFFSET: u64 = std.math.maxInt(u64);
 
@@ -480,53 +484,68 @@ export fn zenit_text_input_utf8_for_utf16(window_id: u32, utf16_offset: u64) u64
     return utf8ForUtf16(client, utf16_offset) orelse INVALID_TEXT_OFFSET;
 }
 
-/// 顶级 a11y 节点数 (parent.isNull())。
+/// count top-level a11y nodes (parent.isNull()).
 export fn zenit_a11y_root_count(window_id: u32) c_int {
     const active = lookup(window_id) orelse return 0;
-    var n: c_int = 0;
-    for (active.tree.nodes.items) |maybe| {
-        if (maybe) |node| {
-            if (node.parent.isNull() and !node.state.hidden) n += 1;
-        }
-    }
-    return n;
+    return @intCast(active.tree.exposedChildren(AXId.NULL).len);
 }
 
-/// 第 idx 个 root 的 handle，按 sibling_index（再按 raw handle）稳定排序。
-/// 越界返回 INVALID_HANDLE；ElementId raw=0 是合法句柄。
-export fn zenit_a11y_root_at(window_id: u32, idx: c_int) u32 {
+/// idx-th root handle, stable-sort by sibling_index (then raw handle).
+/// out-of-bounds returns INVALID_HANDLE; ElementId raw=0 valid.
+export fn zenit_a11y_root_at(window_id: u32, idx: c_int) u64 {
     const active = lookup(window_id) orelse return INVALID_HANDLE;
-    if (idx < 0) return INVALID_HANDLE;
-    return nthExposedChild(active.tree, ElementId.NULL, @intCast(idx)) orelse INVALID_HANDLE;
+    return exposedChildAt(active.tree, AXId.NULL, idx);
 }
 
 /// Whether a virtual element handle still belongs to the current window tree.
 /// Native bridges use this to retain live NSAccessibilityElement instances
 /// while pruning stale generational handles after a rebuild.
-export fn zenit_a11y_exists(window_id: u32, handle: u32) c_int {
+export fn zenit_a11y_exists(window_id: u32, handle: u64) c_int {
     const active = lookup(window_id) orelse return 0;
-    return if (active.tree.get(ElementId.fromRaw(handle)) != null) 1 else 0;
+    return if (active.tree.get(AXId.fromRaw(handle)) != null) 1 else 0;
 }
 
-/// 某节点的 a11y children 数。
-export fn zenit_a11y_children_count(window_id: u32, parent_raw: u32) c_int {
+/// element's a11y children count. collection tables report all data rows (matches NSTableView AXChildren).
+export fn zenit_a11y_children_count(window_id: u32, parent_raw: u64) c_int {
     const active = lookup(window_id) orelse return 0;
-    const parent = ElementId.fromRaw(parent_raw);
-    var n: c_int = 0;
-    for (active.tree.nodes.items) |maybe| {
-        if (maybe) |node| {
-            if (node.parent.eql(parent) and !node.state.hidden) n += 1;
-        }
-    }
-    return n;
+    const n = active.tree.childCount(AXId.fromRaw(parent_raw));
+    return @intCast(@min(n, std.math.maxInt(c_int)));
 }
 
-/// 第 idx 个 child handle。
-export fn zenit_a11y_children_at(window_id: u32, parent_raw: u32, idx: c_int) u32 {
+/// idx-th child handle. Collection table rows materialized on-demand here.
+export fn zenit_a11y_children_at(window_id: u32, parent_raw: u64, idx: c_int) u64 {
     const active = lookup(window_id) orelse return INVALID_HANDLE;
     if (idx < 0) return INVALID_HANDLE;
-    const parent = ElementId.fromRaw(parent_raw);
-    return nthExposedChild(active.tree, parent, @intCast(idx)) orelse INVALID_HANDLE;
+    const child = active.tree.childAt(AXId.fromRaw(parent_raw), @intCast(idx)) orelse return INVALID_HANDLE;
+    return child.raw();
+}
+
+/// Collection table row info: row count, visible range by committed offset intersect viewport.
+/// non-collection-table returns 0.
+export fn zenit_a11y_collection_info(window_id: u32, handle: u64, count: ?*u32, first_visible: ?*u32, visible_len: ?*u32) c_int {
+    const active = lookup(window_id) orelse return 0;
+    const c = active.tree.collections.collectionForTable(AXId.fromRaw(handle)) orelse return 0;
+    const visible = if (c.hidden) @TypeOf(c.visibleRange()){ .first = 0, .len = 0 } else c.visibleRange();
+    if (count) |out| out.* = if (c.hidden) 0 else c.count;
+    if (first_visible) |out| out.* = visible.first;
+    if (visible_len) |out| out.* = visible.len;
+    return 1;
+}
+
+/// Collection table index-th row (AXRows paginated fetch). out-of-bounds or non-collection returns INVALID.
+export fn zenit_a11y_collection_row_at(window_id: u32, handle: u64, index: u32) u64 {
+    const active = lookup(window_id) orelse return INVALID_HANDLE;
+    const row = active.tree.collections.rowAt(active.tree.allocator, AXId.fromRaw(handle), index) orelse return INVALID_HANDLE;
+    return row.raw();
+}
+
+/// call inside AX callback (not deferred): write collection entry scroll-into-viewport offset to a11y
+/// layer committed offset, subsequent frame / visible row reads this frame reflect new position.
+/// app-side scroll by deferred execute perform_action(scroll_to_visible) follow. non-collection-entry
+/// returns 0.
+export fn zenit_a11y_commit_scroll_to_visible(window_id: u32, handle: u64) c_int {
+    const active = lookup(window_id) orelse return 0;
+    return if (active.tree.collections.commitScrollToVisible(AXId.fromRaw(handle))) 1 else 0;
 }
 
 fn nodeComesBefore(a: A11yNode, b: A11yNode) bool {
@@ -534,41 +553,36 @@ fn nodeComesBefore(a: A11yNode, b: A11yNode) bool {
     return a.element.raw() < b.element.raw();
 }
 
-/// Allocation-free nth-child selection for the high-frequency native pull
-/// path. Typical sibling sets are small; deterministic O(n * idx) is preferable
-/// to allocating/sorting inside AppKit callbacks.
-fn nthExposedChild(tree: *const AccessibilityTree, parent: ElementId, requested: usize) ?u32 {
-    var previous: ?A11yNode = null;
-    var rank: usize = 0;
-    while (rank <= requested) : (rank += 1) {
-        var best: ?A11yNode = null;
-        for (tree.nodes.items) |maybe| {
-            const node = maybe orelse continue;
-            if (node.state.hidden or !node.parent.eql(parent)) continue;
-            if (previous) |prev| {
-                if (!nodeComesBefore(prev, node)) continue;
-            }
-            if (best == null or nodeComesBefore(node, best.?)) best = node;
-        }
-        const found = best orelse return null;
-        if (rank == requested) return found.element.raw();
-        previous = found;
-    }
-    return null;
+/// top element: ordered child list index on tree, O(1).
+fn exposedChildAt(tree: *AccessibilityTree, parent: AXId, idx: c_int) u64 {
+    if (idx < 0) return INVALID_HANDLE;
+    const kids = tree.exposedChildren(parent);
+    const i: usize = @intCast(idx);
+    if (i >= kids.len) return INVALID_HANDLE;
+    return kids[i].raw();
 }
 
-/// 节点 role（a11y_tree.Role 的 u16）。无效 handle 或不存在 -> .none (0)。
-export fn zenit_a11y_role(window_id: u32, handle: u32) c_int {
+/// set total count (aria-setsize / aria-rowcount), 0 = undeclared.
+export fn zenit_a11y_set_size(window_id: u32, handle: u64) u32 {
     const active = lookup(window_id) orelse return 0;
-    const id = ElementId.fromRaw(handle);
+    const id = AXId.fromRaw(handle);
+    if (active.tree.collections.collectionForTable(id)) |c| return if (c.hidden) 0 else c.count;
     const node = active.tree.get(id) orelse return 0;
-    return @intCast(@intFromEnum(node.role));
+    return node.set_size;
 }
 
-/// 节点 state packed bits (a11y_tree.State 的 u32)。
-export fn zenit_a11y_state(window_id: u32, handle: u32) u32 {
+/// node role (a11y_tree.Role u16). invalid handle or absent -> .none (0).
+export fn zenit_a11y_role(window_id: u32, handle: u64) c_int {
     const active = lookup(window_id) orelse return 0;
-    const id = ElementId.fromRaw(handle);
+    const id = AXId.fromRaw(handle);
+    const node = active.tree.get(id) orelse return 0;
+    return @intCast(@backingInt(node.role));
+}
+
+/// node state packed bits (a11y_tree.State u32).
+export fn zenit_a11y_state(window_id: u32, handle: u64) u32 {
+    const active = lookup(window_id) orelse return 0;
+    const id = AXId.fromRaw(handle);
     const node = active.tree.get(id) orelse return 0;
     return @bitCast(node.state);
 }
@@ -576,13 +590,13 @@ export fn zenit_a11y_state(window_id: u32, handle: u32) u32 {
 /// Parent/focus/active-descendant relationships are pulled by the native
 /// proxy cache. INVALID_HANDLE means absent and is never confused with a live
 /// index-zero element.
-export fn zenit_a11y_parent(window_id: u32, handle: u32) u32 {
+export fn zenit_a11y_parent(window_id: u32, handle: u64) u64 {
     const active = lookup(window_id) orelse return INVALID_HANDLE;
-    const node = active.tree.get(ElementId.fromRaw(handle)) orelse return INVALID_HANDLE;
+    const node = active.tree.get(AXId.fromRaw(handle)) orelse return INVALID_HANDLE;
     return if (node.parent.isNull()) INVALID_HANDLE else node.parent.raw();
 }
 
-export fn zenit_a11y_focused(window_id: u32) u32 {
+export fn zenit_a11y_focused(window_id: u32) u64 {
     const active = lookup(window_id) orelse return INVALID_HANDLE;
     const focused = active.tree.focused;
     const node = active.tree.get(focused) orelse return INVALID_HANDLE;
@@ -590,9 +604,9 @@ export fn zenit_a11y_focused(window_id: u32) u32 {
     return focused.raw();
 }
 
-export fn zenit_a11y_active_descendant(window_id: u32, handle: u32) u32 {
+export fn zenit_a11y_active_descendant(window_id: u32, handle: u64) u64 {
     const active = lookup(window_id) orelse return INVALID_HANDLE;
-    const node = active.tree.get(ElementId.fromRaw(handle)) orelse return INVALID_HANDLE;
+    const node = active.tree.get(AXId.fromRaw(handle)) orelse return INVALID_HANDLE;
     if (node.active_descendant.isNull()) return INVALID_HANDLE;
     const descendant = active.tree.get(node.active_descendant) orelse return INVALID_HANDLE;
     if (descendant.state.hidden) return INVALID_HANDLE;
@@ -600,7 +614,7 @@ export fn zenit_a11y_active_descendant(window_id: u32, handle: u32) u32 {
     return descendant.element.raw();
 }
 
-fn isDescendantOf(tree: *const AccessibilityTree, child: A11yNode, ancestor: ElementId) bool {
+fn isDescendantOf(tree: *const AccessibilityTree, child: A11yNode, ancestor: AXId) bool {
     var parent = child.parent;
     var depth: usize = 0;
     while (!parent.isNull() and depth <= tree.nodes.items.len) : (depth += 1) {
@@ -613,7 +627,7 @@ fn isDescendantOf(tree: *const AccessibilityTree, child: A11yNode, ancestor: Ele
 
 /// Deepest exposed element containing a window-content point. Equal-depth
 /// overlap resolves to later sibling order, matching retained paint order.
-export fn zenit_a11y_hit_test(window_id: u32, x: f32, y: f32) u32 {
+export fn zenit_a11y_hit_test(window_id: u32, x: f32, y: f32) u64 {
     const active = lookup(window_id) orelse return INVALID_HANDLE;
     var best: ?A11yNode = null;
     var best_depth: usize = 0;
@@ -628,6 +642,15 @@ export fn zenit_a11y_hit_test(window_id: u32, x: f32, y: f32) u32 {
         {
             best = node;
             best_depth = depth;
+        }
+    }
+    // Collection: a point inside the viewport lands on an entry. Deeper nodes inside a bound row
+    // (button, text) are hit by the node scan above, and the deeper one wins; an unbound row can
+    // only hit its entry element.
+    if (active.tree.collections.hitTest(active.tree.allocator, x, y)) |hit| {
+        if (active.tree.get(hit.id)) |item| {
+            const depth = nodeDepth(active.tree, item);
+            if (best == null or depth > best_depth) return hit.id.raw();
         }
     }
     return if (best) |node| node.element.raw() else INVALID_HANDLE;
@@ -646,9 +669,9 @@ fn nodeDepth(tree: *const AccessibilityTree, start: A11yNode) usize {
 
 /// Element frame in window content coordinates (logical points, top-left
 /// origin). Return 1 on success; invalid/stale handles return 0 and never write.
-export fn zenit_a11y_frame(window_id: u32, handle: u32, x: ?*f32, y: ?*f32, width: ?*f32, height: ?*f32) c_int {
+export fn zenit_a11y_frame(window_id: u32, handle: u64, x: ?*f32, y: ?*f32, width: ?*f32, height: ?*f32) c_int {
     const active = lookup(window_id) orelse return 0;
-    const node = active.tree.get(ElementId.fromRaw(handle)) orelse return 0;
+    const node = active.tree.get(AXId.fromRaw(handle)) orelse return 0;
     if (!node.frame.isUsable()) return 0;
     if (x) |out| out.* = node.frame.x;
     if (y) |out| out.* = node.frame.y;
@@ -657,27 +680,27 @@ export fn zenit_a11y_frame(window_id: u32, handle: u32, x: ?*f32, y: ?*f32, widt
     return 1;
 }
 
-export fn zenit_a11y_orientation(window_id: u32, handle: u32) u8 {
-    const active = lookup(window_id) orelse return @intFromEnum(tree_mod.Orientation.undefined);
-    const node = active.tree.get(ElementId.fromRaw(handle)) orelse return @intFromEnum(tree_mod.Orientation.undefined);
-    return @intFromEnum(node.orientation);
+export fn zenit_a11y_orientation(window_id: u32, handle: u64) u8 {
+    const active = lookup(window_id) orelse return @backingInt(tree_mod.Orientation.undefined);
+    const node = active.tree.get(AXId.fromRaw(handle)) orelse return @backingInt(tree_mod.Orientation.undefined);
+    return @backingInt(node.orientation);
 }
 
-export fn zenit_a11y_sort_direction(window_id: u32, handle: u32) u8 {
-    const active = lookup(window_id) orelse return @intFromEnum(tree_mod.SortDirection.none);
-    const node = active.tree.get(ElementId.fromRaw(handle)) orelse return @intFromEnum(tree_mod.SortDirection.none);
-    return @intFromEnum(node.sort_direction);
+export fn zenit_a11y_sort_direction(window_id: u32, handle: u64) u8 {
+    const active = lookup(window_id) orelse return @backingInt(tree_mod.SortDirection.none);
+    const node = active.tree.get(AXId.fromRaw(handle)) orelse return @backingInt(tree_mod.SortDirection.none);
+    return @backingInt(node.sort_direction);
 }
 
-export fn zenit_a11y_level(window_id: u32, handle: u32) u16 {
+export fn zenit_a11y_level(window_id: u32, handle: u64) u16 {
     const active = lookup(window_id) orelse return 0;
-    const node = active.tree.get(ElementId.fromRaw(handle)) orelse return 0;
+    const node = active.tree.get(AXId.fromRaw(handle)) orelse return 0;
     return node.level;
 }
 
-export fn zenit_a11y_row_index_range(window_id: u32, handle: u32, index: ?*u32, span: ?*u32) c_int {
+export fn zenit_a11y_row_index_range(window_id: u32, handle: u64, index: ?*u32, span: ?*u32) c_int {
     const active = lookup(window_id) orelse return 0;
-    const node = active.tree.get(ElementId.fromRaw(handle)) orelse return 0;
+    const node = active.tree.get(AXId.fromRaw(handle)) orelse return 0;
     switch (node.role) {
         .row, .cell, .rowheader, .columnheader => {
             if (index) |out| out.* = node.row_index;
@@ -686,7 +709,9 @@ export fn zenit_a11y_row_index_range(window_id: u32, handle: u32, index: ?*u32, 
             if (index) |out| out.* = node.row_index;
         },
         .listitem => {
-            if (index) |out| out.* = node.sibling_index;
+            // if declared pos_in_set (virtual list data position) use it, else fall back visible
+            // sibling order.
+            if (index) |out| out.* = if (node.pos_in_set > 0) node.pos_in_set - 1 else node.sibling_index;
         },
         else => return 0,
     }
@@ -694,9 +719,9 @@ export fn zenit_a11y_row_index_range(window_id: u32, handle: u32, index: ?*u32, 
     return 1;
 }
 
-export fn zenit_a11y_column_index_range(window_id: u32, handle: u32, index: ?*u32, span: ?*u32) c_int {
+export fn zenit_a11y_column_index_range(window_id: u32, handle: u64, index: ?*u32, span: ?*u32) c_int {
     const active = lookup(window_id) orelse return 0;
-    const node = active.tree.get(ElementId.fromRaw(handle)) orelse return 0;
+    const node = active.tree.get(AXId.fromRaw(handle)) orelse return 0;
     switch (node.role) {
         .cell, .rowheader, .columnheader => {},
         else => return 0,
@@ -708,37 +733,38 @@ export fn zenit_a11y_column_index_range(window_id: u32, handle: u32, index: ?*u3
 
 /// Packed tree.Actions. Capability bits are additionally masked by whether
 /// this window registered a live interaction handler.
-export fn zenit_a11y_actions(window_id: u32, handle: u32) u8 {
+export fn zenit_a11y_actions(window_id: u32, handle: u64) u8 {
     const active = lookup(window_id) orelse return 0;
     if (active.interaction_ctx == null or active.action_handler == null) return 0;
-    const node = active.tree.get(ElementId.fromRaw(handle)) orelse return 0;
+    const node = active.tree.get(AXId.fromRaw(handle)) orelse return 0;
     if (node.state.disabled) return 0;
     return @bitCast(node.actions);
 }
 
-export fn zenit_a11y_perform_action(window_id: u32, handle: u32, action_raw: u8) c_int {
+export fn zenit_a11y_perform_action(window_id: u32, handle: u64, action_raw: u8) c_int {
     const active = lookup(window_id) orelse return 0;
     const ctx = active.interaction_ctx orelse return 0;
     const handler = active.action_handler orelse return 0;
-    const id = ElementId.fromRaw(handle);
+    const id = AXId.fromRaw(handle);
     const node = active.tree.get(id) orelse return 0;
-    if (node.state.disabled) return 0;
-    const action = std.meta.intToEnum(Action, action_raw) catch return 0;
+    const action = std.enums.fromInt(Action, action_raw) orelse return 0;
+    if (node.state.disabled and action != .scroll_to_visible) return 0;
     const advertised = switch (action) {
         .press => node.actions.press,
         .toggle => node.actions.toggle,
         .increment => node.actions.increment,
         .decrement => node.actions.decrement,
+        .scroll_to_visible => true,
     };
     if (!advertised) return 0;
     return if (handler(ctx, id, action)) 1 else 0;
 }
 
-export fn zenit_a11y_set_focus(window_id: u32, handle: u32, focused: c_int) c_int {
+export fn zenit_a11y_set_focus(window_id: u32, handle: u64, focused: c_int) c_int {
     const active = lookup(window_id) orelse return 0;
     const ctx = active.interaction_ctx orelse return 0;
     const handler = active.focus_handler orelse return 0;
-    const id = ElementId.fromRaw(handle);
+    const id = AXId.fromRaw(handle);
     const node = active.tree.get(id) orelse return 0;
     // Clearing stale focus remains legal after a control becomes disabled or
     // hidden; acquiring focus is restricted to an enabled, exposed target.
@@ -749,9 +775,9 @@ export fn zenit_a11y_set_focus(window_id: u32, handle: u32, focused: c_int) c_in
 
 /// Returns UTF-8 byte selection/caret offsets. Native bridges convert these to
 /// their required unit (UTF-16 on AppKit). No complete contract => return 0.
-export fn zenit_a11y_text_selection(window_id: u32, handle: u32, start: ?*u32, end: ?*u32, caret: ?*u32) c_int {
+export fn zenit_a11y_text_selection(window_id: u32, handle: u64, start: ?*u32, end: ?*u32, caret: ?*u32) c_int {
     const active = lookup(window_id) orelse return 0;
-    const node = active.tree.get(ElementId.fromRaw(handle)) orelse return 0;
+    const node = active.tree.get(AXId.fromRaw(handle)) orelse return 0;
     const editable = node.editable_text orelse return 0;
     if (start) |out| out.* = editable.selection_start;
     if (end) |out| out.* = editable.selection_end;
@@ -761,43 +787,43 @@ export fn zenit_a11y_text_selection(window_id: u32, handle: u32, start: ?*u32, e
 
 /// bit 0 = readable range/value contract, bit 1 = writable selection,
 /// bit 2 = writable value, bit 3 = range geometry / point hit-testing.
-export fn zenit_a11y_text_capabilities(window_id: u32, handle: u32) u8 {
+export fn zenit_a11y_text_capabilities(window_id: u32, handle: u64) u8 {
     const active = lookup(window_id) orelse return 0;
-    const node = active.tree.get(ElementId.fromRaw(handle)) orelse return 0;
+    const node = active.tree.get(AXId.fromRaw(handle)) orelse return 0;
     const editable = node.editable_text orelse return 0;
-    const mutable = active.interaction_ctx != null and !node.state.disabled and !node.state.readonly;
+    const interactive = active.interaction_ctx != null and !node.state.disabled;
     return @as(u8, 1) |
-        (if (editable.can_set_selection and active.selection_handler != null and mutable) @as(u8, 2) else 0) |
-        (if (editable.can_set_value and active.text_value_handler != null and mutable) @as(u8, 4) else 0) |
+        (if (editable.can_set_selection and active.selection_handler != null and interactive) @as(u8, 2) else 0) |
+        (if (editable.can_set_value and active.text_value_handler != null and interactive and !node.state.readonly) @as(u8, 4) else 0) |
         (if (active.text_frame_handler != null and active.text_range_at_point_handler != null) @as(u8, 8) else 0);
 }
 
-export fn zenit_a11y_set_text_selection(window_id: u32, handle: u32, start_utf8: u32, end_utf8: u32) c_int {
+export fn zenit_a11y_set_text_selection(window_id: u32, handle: u64, start_utf8: u32, end_utf8: u32) c_int {
     const active = lookup(window_id) orelse return 0;
     const ctx = active.interaction_ctx orelse return 0;
     const handler = active.selection_handler orelse return 0;
-    const id = ElementId.fromRaw(handle);
+    const id = AXId.fromRaw(handle);
     const node = active.tree.get(id) orelse return 0;
     const editable = node.editable_text orelse return 0;
-    if (!editable.can_set_selection or node.state.disabled or node.state.readonly) return 0;
+    if (!editable.can_set_selection or node.state.disabled) return 0;
     return if (handler(ctx, id, start_utf8, end_utf8)) 1 else 0;
 }
 
-export fn zenit_a11y_text_visible_range(window_id: u32, handle: u32, start: ?*u32, end: ?*u32) c_int {
+export fn zenit_a11y_text_visible_range(window_id: u32, handle: u64, start: ?*u32, end: ?*u32) c_int {
     const active = lookup(window_id) orelse return 0;
-    const node = active.tree.get(ElementId.fromRaw(handle)) orelse return 0;
+    const node = active.tree.get(AXId.fromRaw(handle)) orelse return 0;
     const editable = node.editable_text orelse return 0;
     if (start) |out| out.* = editable.visible_start;
     if (end) |out| out.* = editable.visible_end;
     return 1;
 }
 
-export fn zenit_a11y_set_text_value(window_id: u32, handle: u32, bytes: ?[*]const u8, len: c_int) c_int {
+export fn zenit_a11y_set_text_value(window_id: u32, handle: u64, bytes: ?[*]const u8, len: c_int) c_int {
     if (len < 0 or (len > 0 and bytes == null)) return 0;
     const active = lookup(window_id) orelse return 0;
     const ctx = active.interaction_ctx orelse return 0;
     const handler = active.text_value_handler orelse return 0;
-    const id = ElementId.fromRaw(handle);
+    const id = AXId.fromRaw(handle);
     const node = active.tree.get(id) orelse return 0;
     const editable = node.editable_text orelse return 0;
     if (!editable.can_set_value or node.state.disabled or node.state.readonly) return 0;
@@ -807,7 +833,7 @@ export fn zenit_a11y_set_text_value(window_id: u32, handle: u32, bytes: ?[*]cons
 
 export fn zenit_a11y_text_frame(
     window_id: u32,
-    handle: u32,
+    handle: u64,
     start_utf8: u32,
     end_utf8: u32,
     x: ?*f32,
@@ -818,7 +844,7 @@ export fn zenit_a11y_text_frame(
     const active = lookup(window_id) orelse return 0;
     const ctx = active.interaction_ctx orelse return 0;
     const handler = active.text_frame_handler orelse return 0;
-    const id = ElementId.fromRaw(handle);
+    const id = AXId.fromRaw(handle);
     const node = active.tree.get(id) orelse return 0;
     if (node.editable_text == null) return 0;
     var frame: tree_mod.Frame = .{};
@@ -832,7 +858,7 @@ export fn zenit_a11y_text_frame(
 
 export fn zenit_a11y_text_range_at_point(
     window_id: u32,
-    handle: u32,
+    handle: u64,
     x: f32,
     y: f32,
     start_utf8: ?*u32,
@@ -841,7 +867,7 @@ export fn zenit_a11y_text_range_at_point(
     const active = lookup(window_id) orelse return 0;
     const ctx = active.interaction_ctx orelse return 0;
     const handler = active.text_range_at_point_handler orelse return 0;
-    const id = ElementId.fromRaw(handle);
+    const id = AXId.fromRaw(handle);
     const node = active.tree.get(id) orelse return 0;
     if (node.editable_text == null) return 0;
     var start: u32 = 0;
@@ -852,12 +878,12 @@ export fn zenit_a11y_text_range_at_point(
     return 1;
 }
 
-export fn zenit_a11y_set_numeric_value(window_id: u32, handle: u32, value: f32) c_int {
+export fn zenit_a11y_set_numeric_value(window_id: u32, handle: u64, value: f32) c_int {
     if (!std.math.isFinite(value)) return 0;
     const active = lookup(window_id) orelse return 0;
     const ctx = active.interaction_ctx orelse return 0;
     const handler = active.numeric_value_handler orelse return 0;
-    const id = ElementId.fromRaw(handle);
+    const id = AXId.fromRaw(handle);
     const node = active.tree.get(id) orelse return 0;
     if (!validNumericNode(node) or !node.can_set_numeric_value or node.state.disabled or node.state.readonly) return 0;
     const clamped = std.math.clamp(value, node.value_min, node.value_max);
@@ -865,9 +891,9 @@ export fn zenit_a11y_set_numeric_value(window_id: u32, handle: u32, value: f32) 
 }
 
 /// bit 0 = readable numeric contract, bit 1 = writable numeric value.
-export fn zenit_a11y_numeric_capabilities(window_id: u32, handle: u32) u8 {
+export fn zenit_a11y_numeric_capabilities(window_id: u32, handle: u64) u8 {
     const active = lookup(window_id) orelse return 0;
-    const node = active.tree.get(ElementId.fromRaw(handle)) orelse return 0;
+    const node = active.tree.get(AXId.fromRaw(handle)) orelse return 0;
     if (!validNumericNode(node)) return 0;
     const readable: u8 = switch (node.role) {
         .slider, .spinbutton, .progressbar => 1,
@@ -879,31 +905,32 @@ export fn zenit_a11y_numeric_capabilities(window_id: u32, handle: u32) u8 {
     return readable | (if (writable) @as(u8, 2) else 0);
 }
 
-/// label 拷贝到 buf。返回写入字节数 (UTF-8)；0 表示无 label / 失败。
-/// ObjC 侧典型用法：先调一次拿长度（buf=NULL, buf_len=0 时 zig 会返实际长度供 caller 分配）。
-export fn zenit_a11y_label(window_id: u32, handle: u32, buf: ?[*]u8, buf_len: c_int) c_int {
+/// copy label to buf. return bytes written (UTF-8); 0 = no label / fail.
+/// ObjC typical: call once for length (buf=NULL, buf_len=0 zig return actual length for caller
+/// alloc).
+export fn zenit_a11y_label(window_id: u32, handle: u64, buf: ?[*]u8, buf_len: c_int) c_int {
     return resolveStringFromNode(window_id, handle, .label, buf, buf_len);
 }
 
-export fn zenit_a11y_description(window_id: u32, handle: u32, buf: ?[*]u8, buf_len: c_int) c_int {
+export fn zenit_a11y_description(window_id: u32, handle: u64, buf: ?[*]u8, buf_len: c_int) c_int {
     return resolveStringFromNode(window_id, handle, .description, buf, buf_len);
 }
 
-export fn zenit_a11y_placeholder(window_id: u32, handle: u32, buf: ?[*]u8, buf_len: c_int) c_int {
+export fn zenit_a11y_placeholder(window_id: u32, handle: u64, buf: ?[*]u8, buf_len: c_int) c_int {
     return resolveStringFromNode(window_id, handle, .placeholder, buf, buf_len);
 }
 
-export fn zenit_a11y_identifier(window_id: u32, handle: u32, buf: ?[*]u8, buf_len: c_int) c_int {
+export fn zenit_a11y_identifier(window_id: u32, handle: u64, buf: ?[*]u8, buf_len: c_int) c_int {
     return resolveStringFromNode(window_id, handle, .identifier, buf, buf_len);
 }
 
-export fn zenit_a11y_value(window_id: u32, handle: u32, buf: ?[*]u8, buf_len: c_int) c_int {
+export fn zenit_a11y_value(window_id: u32, handle: u64, buf: ?[*]u8, buf_len: c_int) c_int {
     return resolveStringFromNode(window_id, handle, .value, buf, buf_len);
 }
 
-export fn zenit_a11y_numeric_value(window_id: u32, handle: u32, now: ?*f32, min: ?*f32, max: ?*f32) c_int {
+export fn zenit_a11y_numeric_value(window_id: u32, handle: u64, now: ?*f32, min: ?*f32, max: ?*f32) c_int {
     const active = lookup(window_id) orelse return 0;
-    const node = active.tree.get(ElementId.fromRaw(handle)) orelse return 0;
+    const node = active.tree.get(AXId.fromRaw(handle)) orelse return 0;
     if (!validNumericNode(node)) return 0;
     switch (node.role) {
         .slider, .spinbutton, .progressbar => {},
@@ -926,9 +953,17 @@ fn validNumericNode(node: A11yNode) bool {
 
 const StringField = enum { label, description, placeholder, identifier, value };
 
-fn resolveStringFromNode(window_id: u32, handle: u32, field: StringField, buf: ?[*]u8, buf_len: c_int) c_int {
+/// Collection entry text temp buffer. export only called by AX callback on main thread, no reentry.
+var g_item_text_buf: [512]u8 = undefined;
+
+fn resolveStringFromNode(window_id: u32, handle: u64, field: StringField, buf: ?[*]u8, buf_len: c_int) c_int {
     const active = lookup(window_id) orelse return 0;
-    const id = ElementId.fromRaw(handle);
+    const id = AXId.fromRaw(handle);
+    if (id.kind == .cell_text) {
+        if (field != .value) return 0;
+        const text = active.tree.collections.itemText(id, &g_item_text_buf) orelse return 0;
+        return copyOut(text, buf, buf_len);
+    }
     const node = active.tree.get(id) orelse return 0;
     const hash: u64 = switch (field) {
         .label => node.label_hash,
@@ -939,9 +974,13 @@ fn resolveStringFromNode(window_id: u32, handle: u32, field: StringField, buf: ?
     };
     if (hash == 0) return 0;
     const str = active.label_resolver(active.label_ctx, hash) orelse return 0;
+    return copyOut(str, buf, buf_len);
+}
+
+fn copyOut(str: []const u8, buf: ?[*]u8, buf_len: c_int) c_int {
     if (str.len == 0) return 0;
 
-    // probe 模式：buf=NULL -> 返实际长度
+    // probe mode: buf=NULL -> return actual length
     if (buf == null or buf_len <= 0) return @intCast(str.len);
 
     const write_len = @min(@as(usize, @intCast(buf_len)), str.len);
@@ -952,28 +991,33 @@ fn resolveStringFromNode(window_id: u32, handle: u32, field: StringField, buf: ?
 // ============================================================================
 // Push side (zig -> ObjC NSAccessibilityPostNotification)
 // ----------------------------------------------------------------------------
-// cx.render() 末尾 a11y_router.flushToBridge 把 dirty queue 推到
-// 这里。window_id 由 PushCxRef 携带（cx 持的 system_sdk WindowId），ObjC 端
-// zenitWrapperForWindowId 按 NSWindow.windowNumber 匹配到对应 wrapper。
+// At end of cx.render(), a11y_router.flushToBridge pushes the dirty queue here.
+// window_id is carried by PushCxRef (cx's system_sdk WindowId); the ObjC side
+// zenitWrapperForWindowId matches the wrapper by NSWindow.windowNumber.
 //
 // All retained-tree notifications use this exact-element route. The older
 // SystemSdk snapshot calls remain an explicit compatibility API and Cx does
 // not automatically duplicate focus notifications through that path.
 // ============================================================================
 
-/// Platform push hooks, example builds (window_bridge.m linked) override 这些 fn ptr
-/// 把通知发到 NSAccessibilityPostNotification；test builds 默认 no-op 不触发 link 错误。
-/// 设计上类比 weak symbol; runtime register via setPushHooks.
+/// Platform push hooks, example builds (window_bridge.m linked) override these fn ptr to send
+/// notifications to NSAccessibilityPostNotification;
+/// test builds default no-op to avoid link errors. Designed analogous to weak symbol; register
+/// runtime via setPushHooks.
 pub const PushHooks = struct {
-    property_changed: ?*const fn (window_id: u32, element_raw: u32, flags: u16) callconv(.c) c_int = null,
-    focus_changed: ?*const fn (window_id: u32, element_raw: u32) callconv(.c) c_int = null,
-    children_changed: ?*const fn (window_id: u32, element_raw: u32) callconv(.c) c_int = null,
+    property_changed: ?*const fn (window_id: u32, element_raw: u64, flags: u16) callconv(.c) c_int = null,
+    focus_changed: ?*const fn (window_id: u32, element_raw: u64) callconv(.c) c_int = null,
+    children_changed: ?*const fn (window_id: u32, element_raw: u64) callconv(.c) c_int = null,
     announce: ?*const fn (window_id: u32, text_ptr: [*]const u8, text_len: c_int, priority: u8) callconv(.c) c_int = null,
-    /// aria-activedescendant, caller pass container ElementId
-    /// (combobox/listbox/grid) + 当前 active 子项 ElementId。当 active.isNull() 时
-    /// 表示无 active descendant (popover 关闭等)。
-    active_descendant_changed: ?*const fn (window_id: u32, container_raw: u32, active_raw: u32) callconv(.c) c_int = null,
+    /// aria-activedescendant, caller pass container ElementId (combobox/listbox/grid) + current
+    /// active child ElementId.
+    /// When active.isNull(), indicates no active descendant (popover closed etc).
+    active_descendant_changed: ?*const fn (window_id: u32, container_raw: u64, active_raw: u64) callconv(.c) c_int = null,
     window_cleared: ?*const fn (window_id: u32) callconv(.c) c_int = null,
+    /// Single node exits tree: platform sends UIElementDestroyed and removes from element cache.
+    element_destroyed: ?*const fn (window_id: u32, element_raw: u64) callconv(.c) c_int = null,
+    /// One flush ends: platform dispatches consolidated layout notifications.
+    flush_end: ?*const fn (window_id: u32) callconv(.c) c_int = null,
 };
 
 var g_push_hooks: PushHooks = .{};
@@ -982,43 +1026,55 @@ pub fn setPushHooks(hooks: PushHooks) void {
     g_push_hooks = hooks;
 }
 
-/// Caller-supplied context, cx 实例化时塞 window_id + 自己的 label_buf 指针。
+/// Caller-supplied context, cx inits with window_id + its own label_buf pointer.
 pub const PushCxRef = struct {
     window_id: u32,
     label_ctx: *anyopaque,
     label_resolver: LabelResolver,
 };
 
-fn pushChildrenChanged(ctx: *anyopaque, id: ElementId) void {
+fn pushChildrenChanged(ctx: *anyopaque, id: AXId) void {
     const cx: *PushCxRef = @ptrCast(@alignCast(ctx));
     const hook = g_push_hooks.children_changed orelse return;
     _ = hook(cx.window_id, id.raw());
 }
 
-fn pushAnnounce(ctx: *anyopaque, _: ElementId, text_hash: u64, live: tree_mod.LiveRegion) void {
+fn pushAnnounce(ctx: *anyopaque, _: AXId, text_hash: u64, live: tree_mod.LiveRegion) void {
     const cx: *PushCxRef = @ptrCast(@alignCast(ctx));
     const hook = g_push_hooks.announce orelse return;
     const str = cx.label_resolver(cx.label_ctx, text_hash) orelse return;
     if (str.len == 0) return;
-    _ = hook(cx.window_id, str.ptr, @intCast(str.len), @intFromEnum(live));
+    _ = hook(cx.window_id, str.ptr, @intCast(str.len), @backingInt(live));
 }
 
-fn pushProperty(ctx: *anyopaque, id: ElementId, _: A11yNode, flag: tree_mod.A11yDirtyFlag) void {
+fn pushProperty(ctx: *anyopaque, id: AXId, _: A11yNode, flag: tree_mod.A11yDirtyFlag) void {
     const cx: *PushCxRef = @ptrCast(@alignCast(ctx));
     const hook = g_push_hooks.property_changed orelse return;
     _ = hook(cx.window_id, id.raw(), @bitCast(flag));
 }
 
-fn pushFocus(ctx: *anyopaque, id: ElementId, _: ?A11yNode) void {
+fn pushFocus(ctx: *anyopaque, id: AXId, _: ?A11yNode) void {
     const cx: *PushCxRef = @ptrCast(@alignCast(ctx));
     const hook = g_push_hooks.focus_changed orelse return;
     _ = hook(cx.window_id, if (id.isNull()) INVALID_HANDLE else id.raw());
 }
 
-fn pushActiveDescendant(ctx: *anyopaque, container: ElementId, active: ElementId) void {
+fn pushActiveDescendant(ctx: *anyopaque, container: AXId, active: AXId) void {
     const cx: *PushCxRef = @ptrCast(@alignCast(ctx));
     const hook = g_push_hooks.active_descendant_changed orelse return;
     _ = hook(cx.window_id, container.raw(), active.raw());
+}
+
+fn pushDestroyed(ctx: *anyopaque, id: AXId) void {
+    const cx: *PushCxRef = @ptrCast(@alignCast(ctx));
+    const hook = g_push_hooks.element_destroyed orelse return;
+    _ = hook(cx.window_id, id.raw());
+}
+
+fn pushFlushEnd(ctx: *anyopaque) void {
+    const cx: *PushCxRef = @ptrCast(@alignCast(ctx));
+    const hook = g_push_hooks.flush_end orelse return;
+    _ = hook(cx.window_id);
 }
 
 const PUSH_VTABLE = PlatformBridge.VTable{
@@ -1027,9 +1083,11 @@ const PUSH_VTABLE = PlatformBridge.VTable{
     .notify_children_changed = pushChildrenChanged,
     .announce = pushAnnounce,
     .notify_active_descendant = pushActiveDescendant,
+    .notify_destroyed = pushDestroyed,
+    .flush_end = pushFlushEnd,
 };
 
-/// Caller-side: 拿一个绑定到 cx_ref 的 PlatformBridge 实例。
+/// Caller-side: get PlatformBridge instance bound to cx_ref.
 pub fn pushBridge(cx_ref: *PushCxRef) PlatformBridge {
     return .{ .ctx = cx_ref, .vtable = &PUSH_VTABLE };
 }
@@ -1040,8 +1098,9 @@ pub fn pushBridge(cx_ref: *PushCxRef) PlatformBridge {
 
 const testing = std.testing;
 
-/// 测试用 window_id。真实值来自 NSWindow.windowNumber，测试里只要求非 0
-/// （0 是 ANY_WINDOW 通配值，会退化成"第一个已注册窗口"，测不出路由）。
+/// Test window_id. Real values from NSWindow.windowNumber, tests only require non-zero (0 is
+/// ANY_WINDOW wildcard, degrades to
+/// "first registered window", can't test routing).
 const WIN: u32 = 7;
 
 const TestLabelCtx = struct {
@@ -1058,9 +1117,9 @@ test "macos_bridge: root_count / root_at" {
     var ctx = TestLabelCtx{ .map = std.AutoHashMap(u64, []const u8).init(testing.allocator) };
     defer ctx.map.deinit();
 
-    const r1: ElementId = .{ .index = 1, .generation = 0 };
-    const r2: ElementId = .{ .index = 2, .generation = 0 };
-    const child: ElementId = .{ .index = 3, .generation = 0 };
+    const r1 = AXId.node(.{ .index = 1, .generation = 0 });
+    const r2 = AXId.node(.{ .index = 2, .generation = 0 });
+    const child = AXId.node(.{ .index = 3, .generation = 0 });
     try tree.upsert(.{ .element = r1, .role = .button });
     try tree.upsert(.{ .element = r2, .role = .button });
     try tree.upsert(.{ .element = child, .parent = r1, .role = .listitem });
@@ -1085,9 +1144,9 @@ test "macos_bridge: raw handle zero is valid and exposure order is semantic" {
     var ctx = TestLabelCtx{ .map = std.AutoHashMap(u64, []const u8).init(testing.allocator) };
     defer ctx.map.deinit();
 
-    const zero: ElementId = .{ .index = 0, .generation = 0 };
-    const early: ElementId = .{ .index = 3, .generation = 0 };
-    const hidden: ElementId = .{ .index = 4, .generation = 0 };
+    const zero = AXId.node(.{ .index = 0, .generation = 0 });
+    const early = AXId.node(.{ .index = 3, .generation = 0 });
+    const hidden = AXId.node(.{ .index = 4, .generation = 0 });
     try tree.upsert(.{ .element = zero, .role = .button, .sibling_index = 20 });
     try tree.upsert(.{ .element = early, .role = .checkbox, .sibling_index = 2 });
     try tree.upsert(.{ .element = hidden, .role = .link, .sibling_index = 1, .state = .{ .hidden = true } });
@@ -1098,7 +1157,7 @@ test "macos_bridge: raw handle zero is valid and exposure order is semantic" {
     try testing.expectEqual(early.raw(), zenit_a11y_root_at(WIN, 0));
     try testing.expectEqual(zero.raw(), zenit_a11y_root_at(WIN, 1));
     try testing.expectEqual(INVALID_HANDLE, zenit_a11y_root_at(WIN, 2));
-    try testing.expectEqual(@as(c_int, @intFromEnum(tree_mod.Role.button)), zenit_a11y_role(WIN, 0));
+    try testing.expectEqual(@as(c_int, @backingInt(tree_mod.Role.button)), zenit_a11y_role(WIN, 0));
 }
 
 test "macos_bridge: children_count / children_at" {
@@ -1107,9 +1166,9 @@ test "macos_bridge: children_count / children_at" {
     var ctx = TestLabelCtx{ .map = std.AutoHashMap(u64, []const u8).init(testing.allocator) };
     defer ctx.map.deinit();
 
-    const parent: ElementId = .{ .index = 1, .generation = 0 };
-    const c1: ElementId = .{ .index = 2, .generation = 0 };
-    const c2: ElementId = .{ .index = 3, .generation = 0 };
+    const parent = AXId.node(.{ .index = 1, .generation = 0 });
+    const c1 = AXId.node(.{ .index = 2, .generation = 0 });
+    const c2 = AXId.node(.{ .index = 3, .generation = 0 });
     try tree.upsert(.{ .element = parent, .role = .group });
     try tree.upsert(.{ .element = c1, .parent = parent, .role = .button, .sibling_index = 0 });
     try tree.upsert(.{ .element = c2, .parent = parent, .role = .button, .sibling_index = 1 });
@@ -1131,7 +1190,7 @@ test "macos_bridge: role + state" {
     var ctx = TestLabelCtx{ .map = std.AutoHashMap(u64, []const u8).init(testing.allocator) };
     defer ctx.map.deinit();
 
-    const id: ElementId = .{ .index = 1, .generation = 0 };
+    const id = AXId.node(.{ .index = 1, .generation = 0 });
     try tree.upsert(.{
         .element = id,
         .role = .checkbox,
@@ -1141,7 +1200,7 @@ test "macos_bridge: role + state" {
     try testing.expect(setActiveContext(WIN, &tree, &ctx, &TestLabelCtx.resolve));
     defer clearActiveContext(WIN);
 
-    try testing.expectEqual(@as(c_int, @intFromEnum(tree_mod.Role.checkbox)), zenit_a11y_role(WIN, id.raw()));
+    try testing.expectEqual(@as(c_int, @backingInt(tree_mod.Role.checkbox)), zenit_a11y_role(WIN, id.raw()));
     const state_bits: tree_mod.State = @bitCast(zenit_a11y_state(WIN, id.raw()));
     try testing.expect(state_bits.checked);
     try testing.expect(state_bits.focusable);
@@ -1153,7 +1212,7 @@ test "macos_bridge: frame is element-local snapshot and stale handles fail close
     var labels = TestLabelCtx{ .map = std.AutoHashMap(u64, []const u8).init(testing.allocator) };
     defer labels.map.deinit();
 
-    const id: ElementId = .{ .index = 5, .generation = 2 };
+    const id = AXId.node(.{ .index = 5, .generation = 2 });
     try tree.upsert(.{ .element = id, .role = .button, .frame = .{ .x = 12.5, .y = 31, .width = 88, .height = 24 } });
     try testing.expect(setActiveContext(WIN, &tree, &labels, &TestLabelCtx.resolve));
     defer clearActiveContext(WIN);
@@ -1167,7 +1226,7 @@ test "macos_bridge: frame is element-local snapshot and stale handles fail close
     try testing.expectEqual(@as(f32, 31), y);
     try testing.expectEqual(@as(f32, 88), width);
     try testing.expectEqual(@as(f32, 24), height);
-    const stale: ElementId = .{ .index = 5, .generation = 3 };
+    const stale = AXId.node(.{ .index = 5, .generation = 3 });
     try testing.expectEqual(@as(c_int, 0), zenit_a11y_frame(WIN, stale.raw(), &x, &y, &width, &height));
 }
 
@@ -1184,14 +1243,14 @@ const TestInteractionCtx = struct {
     numeric_count: usize = 0,
     numeric_value: f32 = 0,
 
-    fn action(ctx: *anyopaque, _: ElementId, requested: Action) bool {
+    fn action(ctx: *anyopaque, _: AXId, requested: Action) bool {
         const self: *TestInteractionCtx = @ptrCast(@alignCast(ctx));
         self.action_count += 1;
         self.last_action = requested;
         return true;
     }
 
-    fn selection(ctx: *anyopaque, _: ElementId, start: u32, end: u32) bool {
+    fn selection(ctx: *anyopaque, _: AXId, start: u32, end: u32) bool {
         const self: *TestInteractionCtx = @ptrCast(@alignCast(ctx));
         self.selection_count += 1;
         self.selection_start = start;
@@ -1199,33 +1258,33 @@ const TestInteractionCtx = struct {
         return true;
     }
 
-    fn focus(ctx: *anyopaque, _: ElementId, focused: bool) bool {
+    fn focus(ctx: *anyopaque, _: AXId, focused: bool) bool {
         const self: *TestInteractionCtx = @ptrCast(@alignCast(ctx));
         self.focus_count += 1;
         self.last_focused = focused;
         return true;
     }
 
-    fn textValue(ctx: *anyopaque, _: ElementId, value: []const u8) bool {
+    fn textValue(ctx: *anyopaque, _: AXId, value: []const u8) bool {
         const self: *TestInteractionCtx = @ptrCast(@alignCast(ctx));
         self.text_value_count += 1;
         self.text_value_len = value.len;
         return true;
     }
 
-    fn numericValue(ctx: *anyopaque, _: ElementId, value: f32) bool {
+    fn numericValue(ctx: *anyopaque, _: AXId, value: f32) bool {
         const self: *TestInteractionCtx = @ptrCast(@alignCast(ctx));
         self.numeric_count += 1;
         self.numeric_value = value;
         return true;
     }
 
-    fn textFrame(_: *anyopaque, _: ElementId, start: u32, end: u32, out: *tree_mod.Frame) bool {
+    fn textFrame(_: *anyopaque, _: AXId, start: u32, end: u32, out: *tree_mod.Frame) bool {
         out.* = .{ .x = @floatFromInt(start), .y = 8, .width = @floatFromInt(end - start), .height = 16 };
         return true;
     }
 
-    fn rangeAtPoint(_: *anyopaque, _: ElementId, _: f32, _: f32, start: *u32, end: *u32) bool {
+    fn rangeAtPoint(_: *anyopaque, _: AXId, _: f32, _: f32, start: *u32, end: *u32) bool {
         start.* = 2;
         end.* = 6;
         return true;
@@ -1238,7 +1297,7 @@ test "macos_bridge: actions and editable text require a live per-window route" {
 
     const WIN_A: u32 = 31;
     const WIN_B: u32 = 32;
-    const id: ElementId = .{ .index = 1, .generation = 4 };
+    const id = AXId.node(.{ .index = 1, .generation = 4 });
     var tree_a = AccessibilityTree.init(testing.allocator);
     defer tree_a.deinit();
     var tree_b = AccessibilityTree.init(testing.allocator);
@@ -1277,8 +1336,8 @@ test "macos_bridge: actions and editable text require a live per-window route" {
 
     try testing.expectEqual(@as(u8, 0b1100), zenit_a11y_actions(WIN_A, id.raw()));
     try testing.expectEqual(@as(u8, 0), zenit_a11y_actions(WIN_B, id.raw()));
-    try testing.expectEqual(@as(c_int, 1), zenit_a11y_perform_action(WIN_A, id.raw(), @intFromEnum(Action.increment)));
-    try testing.expectEqual(@as(c_int, 0), zenit_a11y_perform_action(WIN_B, id.raw(), @intFromEnum(Action.increment)));
+    try testing.expectEqual(@as(c_int, 1), zenit_a11y_perform_action(WIN_A, id.raw(), @backingInt(Action.increment)));
+    try testing.expectEqual(@as(c_int, 0), zenit_a11y_perform_action(WIN_B, id.raw(), @backingInt(Action.increment)));
     try testing.expectEqual(@as(usize, 1), interactions_a.action_count);
     try testing.expectEqual(Action.increment, interactions_a.last_action.?);
     var now: f32 = 0;
@@ -1313,7 +1372,7 @@ test "macos_bridge: full text numeric focus and geometry contracts stay per-wind
 
     const WIN_A: u32 = 41;
     const WIN_B: u32 = 42;
-    const id: ElementId = .{ .index = 0, .generation = 0 };
+    const id = AXId.node(.{ .index = 0, .generation = 0 });
     const node: A11yNode = .{
         .element = id,
         .role = .slider,
@@ -1393,6 +1452,18 @@ test "macos_bridge: full text numeric focus and geometry contracts stay per-wind
     try testing.expectEqual(@as(u32, 2), point_start);
     try testing.expectEqual(@as(u32, 6), point_end);
 
+    var readonly_node = node;
+    readonly_node.state.readonly = true;
+    try tree_a.upsert(readonly_node);
+    try testing.expectEqual(@as(u8, 0b1011), zenit_a11y_text_capabilities(WIN_A, id.raw()));
+    try testing.expectEqual(@as(c_int, 1), zenit_a11y_set_text_selection(WIN_A, id.raw(), 0, 3));
+    try testing.expectEqual(@as(c_int, 0), zenit_a11y_set_text_value(WIN_A, id.raw(), "changed".ptr, 7));
+    readonly_node.state.disabled = true;
+    try tree_a.upsert(readonly_node);
+    try testing.expectEqual(@as(u8, 0b1001), zenit_a11y_text_capabilities(WIN_A, id.raw()));
+    try testing.expectEqual(@as(c_int, 0), zenit_a11y_set_text_selection(WIN_A, id.raw(), 0, 3));
+    try tree_a.upsert(node);
+
     try testing.expectEqual(id.raw(), zenit_a11y_focused(WIN_A));
     try testing.expectEqual(@as(c_int, 1), zenit_a11y_set_focus(WIN_A, id.raw(), 0));
     try testing.expectEqual(false, interactions.last_focused.?);
@@ -1407,9 +1478,9 @@ test "macos_bridge: parent active descendant and deepest hit test are exact" {
     defer tree.deinit();
     var labels = TestLabelCtx{ .map = std.AutoHashMap(u64, []const u8).init(testing.allocator) };
     defer labels.map.deinit();
-    const root: ElementId = .{ .index = 0, .generation = 0 };
-    const child: ElementId = .{ .index = 1, .generation = 0 };
-    const active: ElementId = .{ .index = 2, .generation = 0 };
+    const root = AXId.node(.{ .index = 0, .generation = 0 });
+    const child = AXId.node(.{ .index = 1, .generation = 0 });
+    const active = AXId.node(.{ .index = 2, .generation = 0 });
     try tree.upsert(.{
         .element = root,
         .role = .listbox,
@@ -1445,7 +1516,7 @@ test "macos_bridge: label resolve + probe length" {
     var ctx = TestLabelCtx{ .map = std.AutoHashMap(u64, []const u8).init(testing.allocator) };
     defer ctx.map.deinit();
 
-    const id: ElementId = .{ .index = 1, .generation = 0 };
+    const id = AXId.node(.{ .index = 1, .generation = 0 });
     const label = "Click Me";
     const label_hash: u64 = std.hash.Wyhash.hash(0, label);
     try ctx.map.put(label_hash, label);
@@ -1455,10 +1526,10 @@ test "macos_bridge: label resolve + probe length" {
     try testing.expect(setActiveContext(WIN, &tree, &ctx, &TestLabelCtx.resolve));
     defer clearActiveContext(WIN);
 
-    // probe: buf=null 返实际长度
+    // probe: buf=null returns actual length
     try testing.expectEqual(@as(c_int, @intCast(label.len)), zenit_a11y_label(WIN, id.raw(), null, 0));
 
-    // copy: 写入 buf
+    // copy: write to buf
     var buf: [32]u8 = undefined;
     const n = zenit_a11y_label(WIN, id.raw(), &buf, buf.len);
     try testing.expectEqual(@as(c_int, @intCast(label.len)), n);
@@ -1472,8 +1543,9 @@ test "macos_bridge: no active context returns zero" {
     try testing.expectEqual(@as(c_int, 0), zenit_a11y_children_count(WIN, 0));
 }
 
-// 多窗口路由的核心验收：两个窗口各注册各的树，按 window_id 查各自的内容，
-// 且注销其中一个不影响另一个。改这个文件前先让这三个断言过。
+// Multi-window routing acceptance core: two windows register separate trees, query each by
+// window_id get each's content,
+// unregister one doesn't affect the other. Pass this before modifying this file.
 test "macos_bridge: two windows route independently" {
     clearAllActiveContexts();
     defer clearAllActiveContexts();
@@ -1491,15 +1563,15 @@ test "macos_bridge: two windows route independently" {
     var ctx_b = TestLabelCtx{ .map = std.AutoHashMap(u64, []const u8).init(testing.allocator) };
     defer ctx_b.map.deinit();
 
-    // A: 1 个 root，label "Alpha"。B: 2 个 root，第一个 label "Bravo"。
-    const a_root: ElementId = .{ .index = 1, .generation = 0 };
+    // A: 1 root, label Alpha. B: 2 roots, first label Bravo.
+    const a_root = AXId.node(.{ .index = 1, .generation = 0 });
     const label_a = "Alpha";
     const hash_a = std.hash.Wyhash.hash(0, label_a);
     try ctx_a.map.put(hash_a, label_a);
     try tree_a.upsert(.{ .element = a_root, .role = .button, .label_hash = hash_a });
 
-    const b_root1: ElementId = .{ .index = 1, .generation = 0 };
-    const b_root2: ElementId = .{ .index = 2, .generation = 0 };
+    const b_root1 = AXId.node(.{ .index = 1, .generation = 0 });
+    const b_root2 = AXId.node(.{ .index = 2, .generation = 0 });
     const label_b = "Bravo";
     const hash_b = std.hash.Wyhash.hash(0, label_b);
     try ctx_b.map.put(hash_b, label_b);
@@ -1510,30 +1582,30 @@ test "macos_bridge: two windows route independently" {
     try testing.expect(setActiveContext(WIN_B, &tree_b, &ctx_b, &TestLabelCtx.resolve));
     try testing.expectEqual(@as(usize, 2), activeContextCount());
 
-    // 各查各的 root 数，旧的单槽实现下 B 会覆盖 A，这里 A 会变成 2。
+    // Each queries own root count, old single-slot impl B overwrites A, here A becomes 2.
     try testing.expectEqual(@as(c_int, 1), zenit_a11y_root_count(WIN_A));
     try testing.expectEqual(@as(c_int, 2), zenit_a11y_root_count(WIN_B));
 
-    // 同一个 handle raw 值在两个窗口里指向不同节点，role 必须各自解析。
+    // Same raw handle value in two windows points to different nodes, role must resolve per-window.
     try testing.expectEqual(
-        @as(c_int, @intFromEnum(tree_mod.Role.button)),
+        @as(c_int, @backingInt(tree_mod.Role.button)),
         zenit_a11y_role(WIN_A, a_root.raw()),
     );
     try testing.expectEqual(
-        @as(c_int, @intFromEnum(tree_mod.Role.checkbox)),
+        @as(c_int, @backingInt(tree_mod.Role.checkbox)),
         zenit_a11y_role(WIN_B, b_root1.raw()),
     );
 
-    // label 走各自的 label_ctx（不同的 hash 表）。
+    // label uses each own label_ctx (different hash table).
     var buf: [32]u8 = undefined;
     const na = zenit_a11y_label(WIN_A, a_root.raw(), &buf, buf.len);
     try testing.expectEqualStrings(label_a, buf[0..@intCast(na)]);
     const nb = zenit_a11y_label(WIN_B, b_root1.raw(), &buf, buf.len);
     try testing.expectEqualStrings(label_b, buf[0..@intCast(nb)]);
-    // A 的 hash 在 B 的表里查不到，证明 label_ctx 没串。
+    // A's hash doesn't find in B's table, proves label_ctx not crossed.
     try testing.expectEqual(@as(c_int, 0), zenit_a11y_label(WIN_B, b_root2.raw(), &buf, buf.len));
 
-    // 注销 A 不影响 B。
+    // Unregister A doesn't affect B.
     clearActiveContext(WIN_A);
     try testing.expectEqual(@as(usize, 1), activeContextCount());
     try testing.expectEqual(@as(c_int, 0), zenit_a11y_root_count(WIN_A));
@@ -1548,12 +1620,12 @@ test "macos_bridge: ANY_WINDOW falls back to first registered window" {
     defer tree.deinit();
     var ctx = TestLabelCtx{ .map = std.AutoHashMap(u64, []const u8).init(testing.allocator) };
     defer ctx.map.deinit();
-    try tree.upsert(.{ .element = .{ .index = 1, .generation = 0 }, .role = .button });
+    try tree.upsert(.{ .element = AXId.node(.{ .index = 1, .generation = 0 }), .role = .button });
 
     try testing.expect(setActiveContext(99, &tree, &ctx, &TestLabelCtx.resolve));
-    // 未接线的 ObjC 代理传 0 时仍能拿到树（旧 single-window 行为兼容）。
+    // Unlinked ObjC proxy pass 0 still gets tree (old single-window behavior compat).
     try testing.expectEqual(@as(c_int, 1), zenit_a11y_root_count(ANY_WINDOW));
-    // 但错的具体 window_id 查不到，通配不等于"任何 id 都命中"。
+    // But wrong window_id doesn't find, wildcard != "any id hits".
     try testing.expectEqual(@as(c_int, 0), zenit_a11y_root_count(98));
 }
 
@@ -1569,19 +1641,19 @@ test "macos_bridge: table full degrades instead of erroring" {
     for (0..MAX_WINDOWS) |i| {
         try testing.expect(setActiveContext(@intCast(i + 1), &tree, &ctx, &TestLabelCtx.resolve));
     }
-    // 第 MAX_WINDOWS+1 个窗口注册失败但不 panic / 不报错。
+    // MAX_WINDOWS+1 register fails but no panic / no error.
     try testing.expect(!setActiveContext(9999, &tree, &ctx, &TestLabelCtx.resolve));
-    // 已注册的照常工作。
+    // Already registered works normally.
     try testing.expectEqual(@as(c_int, 0), zenit_a11y_root_count(9999));
 }
 
 const PushTestState = struct {
     property_count: usize = 0,
     property_window: u32 = 0,
-    property_handle: u32 = INVALID_HANDLE,
+    property_handle: u64 = INVALID_HANDLE,
     property_flags: u16 = 0,
     focus_count: usize = 0,
-    focus_handle: u32 = INVALID_HANDLE,
+    focus_handle: u64 = INVALID_HANDLE,
     announce_count: usize = 0,
     announce_priority: u8 = 0,
     clear_count: usize = 0,
@@ -1590,7 +1662,7 @@ const PushTestState = struct {
 
 var g_push_test = PushTestState{};
 
-fn testPushProperty(window_id: u32, handle: u32, flags: u16) callconv(.c) c_int {
+fn testPushProperty(window_id: u32, handle: u64, flags: u16) callconv(.c) c_int {
     g_push_test.property_count += 1;
     g_push_test.property_window = window_id;
     g_push_test.property_handle = handle;
@@ -1598,7 +1670,7 @@ fn testPushProperty(window_id: u32, handle: u32, flags: u16) callconv(.c) c_int 
     return 1;
 }
 
-fn testPushFocus(_: u32, handle: u32) callconv(.c) c_int {
+fn testPushFocus(_: u32, handle: u64) callconv(.c) c_int {
     g_push_test.focus_count += 1;
     g_push_test.focus_handle = handle;
     return 1;
@@ -1634,7 +1706,7 @@ test "macos_bridge: retained push preserves exact target flags priority and focu
     const text = "Danger";
     const hash = std.hash.Wyhash.hash(0, text);
     try labels.map.put(hash, text);
-    const id: ElementId = .{ .index = 0, .generation = 0 };
+    const id = AXId.node(.{ .index = 0, .generation = 0 });
     var ref = PushCxRef{ .window_id = 77, .label_ctx = &labels, .label_resolver = &TestLabelCtx.resolve };
     try tree.upsert(.{
         .element = id,
@@ -1645,7 +1717,7 @@ test "macos_bridge: retained push preserves exact target flags priority and focu
     });
     router_mod.flushToBridge(&tree, pushBridge(&ref));
     try testing.expectEqual(@as(usize, 1), g_push_test.announce_count);
-    try testing.expectEqual(@as(u8, @intFromEnum(tree_mod.LiveRegion.assertive)), g_push_test.announce_priority);
+    try testing.expectEqual(@as(u8, @backingInt(tree_mod.LiveRegion.assertive)), g_push_test.announce_priority);
     try testing.expectEqual(@as(usize, 1), g_push_test.focus_count);
     try testing.expectEqual(id.raw(), g_push_test.focus_handle);
 
@@ -1680,8 +1752,8 @@ test "macos_bridge: clearing one window emits one teardown and preserves peers" 
     defer tree_b.deinit();
     var labels = TestLabelCtx{ .map = std.AutoHashMap(u64, []const u8).init(testing.allocator) };
     defer labels.map.deinit();
-    try tree_a.upsert(.{ .element = .{ .index = 0, .generation = 0 }, .role = .button });
-    try tree_b.upsert(.{ .element = .{ .index = 0, .generation = 0 }, .role = .checkbox });
+    try tree_a.upsert(.{ .element = AXId.node(.{ .index = 0, .generation = 0 }), .role = .button });
+    try tree_b.upsert(.{ .element = AXId.node(.{ .index = 0, .generation = 0 }), .role = .checkbox });
     try testing.expect(setActiveContext(81, &tree_a, &labels, &TestLabelCtx.resolve));
     try testing.expect(setActiveContext(82, &tree_b, &labels, &TestLabelCtx.resolve));
 
@@ -1752,7 +1824,7 @@ test "macos_bridge: live text client maps CJK and non-BMP UTF-8 UTF-16 ranges" {
     try testing.expectEqual(@as(u64, 11), zenit_text_input_length(TEXT_WINDOW));
     try testing.expectEqual(@as(u64, 0), zenit_text_input_utf16_for_utf8(TEXT_WINDOW, 0));
     try testing.expectEqual(@as(u64, 1), zenit_text_input_utf16_for_utf8(TEXT_WINDOW, 1));
-    // A request inside 中 clamps to the scalar start rather than failing.
+    // A request inside the CJK character (U+4E2D) clamps to scalar start rather than failing.
     try testing.expectEqual(@as(u64, 1), zenit_text_input_utf16_for_utf8(TEXT_WINDOW, 2));
     try testing.expectEqual(@as(u64, 2), zenit_text_input_utf16_for_utf8(TEXT_WINDOW, 4));
     try testing.expectEqual(@as(u64, 2), zenit_text_input_utf16_for_utf8(TEXT_WINDOW, 5));
@@ -1838,4 +1910,31 @@ test "macos_bridge: applied preedit publishes only a live nonsecure model range"
     clearTextInputResolverForOwner(903, &state);
     publishAppliedPreedit(903);
     try testing.expectEqual(@as(usize, 2), Capture.calls);
+}
+
+test "macos_bridge: 虚拟化列表报逻辑总数与数据位置，而不是可见槽位" {
+    clearAllActiveContexts();
+    defer clearAllActiveContexts();
+    var tree = AccessibilityTree.init(testing.allocator);
+    defer tree.deinit();
+    var ctx = TestLabelCtx{ .map = std.AutoHashMap(u64, []const u8).init(testing.allocator) };
+    defer ctx.map.deinit();
+
+    const list = AXId.node(.{ .index = 1, .generation = 0 });
+    const visible_first = AXId.node(.{ .index = 2, .generation = 0 });
+    const plain = AXId.node(.{ .index = 3, .generation = 0 });
+    try tree.upsert(.{ .element = list, .role = .list, .set_size = 100_000 });
+    // Visible first row is actually data row 5000 (pos_in_set counts from 1).
+    try tree.upsert(.{ .element = visible_first, .parent = list, .role = .listitem, .sibling_index = 0, .pos_in_set = 5000 });
+    // Row without declared pos_in_set falls back to visible sibling order.
+    try tree.upsert(.{ .element = plain, .parent = list, .role = .listitem, .sibling_index = 1 });
+    try testing.expect(setActiveContext(WIN, &tree, &ctx, &TestLabelCtx.resolve));
+
+    try testing.expectEqual(@as(u32, 100_000), zenit_a11y_set_size(WIN, list.raw()));
+    var index: u32 = 0;
+    var span: u32 = 0;
+    try testing.expectEqual(@as(c_int, 1), zenit_a11y_row_index_range(WIN, visible_first.raw(), &index, &span));
+    try testing.expectEqual(@as(u32, 4999), index);
+    try testing.expectEqual(@as(c_int, 1), zenit_a11y_row_index_range(WIN, plain.raw(), &index, &span));
+    try testing.expectEqual(@as(u32, 1), index);
 }

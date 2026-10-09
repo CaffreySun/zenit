@@ -1,7 +1,6 @@
-/// render_engine 内部状态结构体定义
-/// 包含：RetainedIds、NodeRenderState、NodeContentRenderState、
-///       NodeExecutionState、NodeExecutionPlan、NodeContentSlices、
-///       ChildRenderPass 及相关枚举
+/// render_engine internal state struct definitions.
+/// Includes: RetainedIds, NodeRenderState, NodeContentRenderState,
+/// NodeExecutionState, NodeExecutionPlan, NodeContentSlices, ChildRenderPass and related enums.
 const std = @import("std");
 const types = @import("../types.zig");
 const display_list_mod = @import("../display_list.zig");
@@ -12,9 +11,9 @@ const ComputedRect = types.ComputedRect;
 const Transform2D = types.Transform2D;
 const Point = types.Point;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 基础 ID 容器
-// ─────────────────────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------
+// Basic ID containers
+// ---------------------------------------------------------------------
 
 pub const RetainedIds = struct {
     transform_id: u32,
@@ -22,9 +21,9 @@ pub const RetainedIds = struct {
     effect_id: u32,
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 渲染状态（含变换/缩放/裁剪/效果，基于世界坐标）
-// ─────────────────────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------
+// Render state (transform/scale/clip/effects, world-coordinate based)
+// ---------------------------------------------------------------------
 
 pub const NodeRenderState = struct {
     world_transform: Transform2D,
@@ -54,7 +53,7 @@ pub const NodeRenderState = struct {
     use_rounded_clip: bool,
 };
 
-/// 内容渲染状态：不含缩放/旋转的内容坐标，用于文本和子节点精确定位
+/// Content render state: content coords without scale/rotation; for text and child positioning.
 pub const NodeContentRenderState = struct {
     content_transform: Transform2D,
     content_rect: ComputedRect,
@@ -83,9 +82,9 @@ pub const NodeContentRenderState = struct {
     use_rounded_clip: bool,
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 执行状态：合并世界坐标、场景 runtime、compositor plan
-// ─────────────────────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------
+// Execution state: merges world coords, scene runtime, compositor plan
+// ---------------------------------------------------------------------
 
 pub const NodeExecutionState = struct {
     retained_runtime: scene_runtime_mod.SceneNodeRuntime,
@@ -121,17 +120,18 @@ pub const NodeExecutionState = struct {
     clip_bounds_fallback: bool,
     use_rounded_clip: bool,
     promoted_layer_id: u32,
-    /// 跨帧稳定身份（CompositedLayer.stable_id）；写入 node 缓存/跨帧比较用它，
-    /// promoted_layer_id（帧内序号）只用于本帧 planMark* API。
+    /// Cross-frame stable identity (CompositedLayer.stable_id); used for node cache writes /
+    /// cross-frame compare. promoted_layer_id (frame-local index) only for this frame's planMark*
+    /// API.
     promoted_layer_stable_id: u32,
     is_promoted_layer: bool,
     promoted_surface_valid: bool,
     subtree_force_linear_text: bool,
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 枚举：invalidation / 重建策略 / 渲染 pass
-// ─────────────────────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------
+// Enums: invalidation / rebuild strategy / render pass
+// ---------------------------------------------------------------------
 
 pub const PromotedSurfaceInvalidationReason = enum {
     none,
@@ -144,13 +144,13 @@ pub const NodeRebuildStrategy = enum {
     descendant_scoped_promoted,
 };
 
-/// 子节点绘制带 = paint_order.PaintBand（regular / sticky / positive_z），
-/// 与 hit_runtime 共用同一判定函数，见 core/paint_order.zig。
+/// Child render band = paint_order.PaintBand (regular / sticky / positive_z); shared judgment
+/// with hit_runtime (see core/paint_order.zig).
 pub const ChildRenderPass = @import("../paint_order.zig").PaintBand;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 执行计划：决定缓存策略、显示列表策略、重建策略
-// ─────────────────────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------
+// Execution plan: decides cache / display list / rebuild strategy
+// ---------------------------------------------------------------------
 
 pub const NodeExecutionPlan = struct {
     promoted_surface_invalidation_reason: PromotedSurfaceInvalidationReason,
@@ -170,44 +170,44 @@ pub const NodeExecutionPlan = struct {
     needs_rect_clip_fallback: bool,
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 桥范围 / 内容切片
-// ─────────────────────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------
+// Bridge scope / content slice
+// ---------------------------------------------------------------------
 
-/// Per-pass list of child node ids that contributed to the parent's paint.
-/// finalizeNodeCaches 用这个 + 每个 child 的 runtime.subtree_display_item_*
-/// 范围去拼 cache band，**不依赖** cx.display_list 的 idx，因为 child 走
-/// subtree-replay / own-replay 短路时不写 display_list 末尾，但 runtime range
-/// 仍指向 prebuilt 位置。从 runtime 拼能正确捕获两种路径。
+/// Per-pass list of child node ids that contributed to parent's paint.
+/// finalizeNodeCaches uses this + each child's runtime.subtree_display_item_* range
+/// to splice cache band; **doesn't depend** on cx.display_list idx, since child
+/// subtree-replay / own-replay shortcut doesn't write display_list end, but runtime range
+/// still points prebuilt. Splicing from runtime correctly captures both paths.
 pub const NodeContentSlices = struct {
     regular_children: std.ArrayList(u32),
     sticky_children: std.ArrayList(u32),
     overlay_children: std.ArrayList(u32),
-    /// Tail items (overflow_fade) 总是 paint 期间 fresh-emit 到 display_list 末尾，
-    /// 这两个 idx 直接切 display_list 拿到。
+    /// Tail items (overflow_fade) always fresh-emit to display_list end during paint;
+    /// these two idx slice display_list directly.
     tail_start_idx: usize,
     tail_end_idx: usize,
-    /// children 是否被本节点 overflow clip 的 node-local token 对包围
-    /// （emitScrollClipBegin 返回 true）。promoted cache 拼装据此把这对 token
-    /// 一并写进缓存（见 CachedRenderSlice.descendant_clip_open_count）。
+    /// Whether children surrounded by this node's overflow clip node-local token pair
+    /// (emitScrollClipBegin returns true). Promoted cache splicing writes this pair into cache
+    /// accordingly (see CachedRenderSlice.descendant_clip_open_count).
     clip_wrapped: bool = false,
 
-    // 无 deinit：三个 children 列表一律分配在 frame arena 上（帧末整体回收），
-    // 不允许用通用分配器释放。
+    // No deinit: three children lists all allocated on frame arena (bulk-reclaimed at frame end);
+    // don't use general allocator release.
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 效果桥相关（渲染时，非显示列表版本）
-// ─────────────────────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------
+// Effect bridge related (render time, non-display-list version)
+// ---------------------------------------------------------------------
 
-/// EffectBridgeEntry：渲染时效果桥链上的单条记录
+/// EffectBridgeEntry: single record on effect bridge chain at render time.
 pub const EffectBridgeEntry = struct {
     effect_id: u32,
     effect: @import("../property_tree.zig").EffectNode,
     state: layer_tree_mod.LayerTree.EffectPlanState,
 };
 
-/// ReplayBridgeOptions：回放缓存命令时的桥选项
+/// ReplayBridgeOptions: bridge options when replaying cached commands.
 pub const ReplayBridgeOptions = struct {
     use_bridge: bool,
     reuse_origin: bool,

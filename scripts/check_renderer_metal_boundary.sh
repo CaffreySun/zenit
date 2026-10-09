@@ -13,11 +13,11 @@ cleanup() {
 trap cleanup EXIT
 
 PATTERN='Backend\.metal_bindings|\bmtl\.|MTL[A-Z][A-Za-z0-9_]*|metal_[a-zA-Z0-9_]+'
-# 只看**代码**，不看注释：把 `//` 之后的内容剪掉再匹配。
-# 2026-09-22：text_renderer.zig 有一行注释写着「泄漏的是 MTLBuffer/PSO/CoreText
-# 资源」，被当成新的 Metal 依赖而误报 —— 注释里提一句 Metal 类型名不是依赖。
-# （行内字符串里含 `//` 的情况在 src/render 下不存在；真出现会是保守误报，
-# 不会漏报。）
+# Check code only, not comments: strip everything after // before matching.
+# 2026-09-22: text_renderer.zig had a comment line mentioning 'leaked MTLBuffer/PSO/CoreText
+# resources', matched as new Metal dependency—mentioning Metal type in comment is not a dependency.
+# (Inline strings with // don't exist in src/render; if they do, it's conservative false-positive,
+# not false-negative.)
 { rg -n "$PATTERN" src/render --glob '*.zig' || true; } |
   awk -F: '{ line=$0; sub(/\/\/.*/, "", line); if (line ~ /Backend\.metal_bindings|[^a-zA-Z0-9_]mtl\.|MTL[A-Z]|metal_[a-zA-Z0-9_]/) print }' |
   awk -F: '{ count[$1]++ } END { for (path in count) print count[path], path }' |

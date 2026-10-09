@@ -35,14 +35,14 @@ export function comparePixels(a: DecodedPng, b: DecodedPng, threshold: number) {
   };
 }
 
-/** 单 case golden 阈值配置（从 manifest 抽出，供库调用方直接构造）。 */
+/** Single case golden threshold config (extracted from manifest, for lib callers to construct directly). */
 export interface GoldenConfig {
   pixel_delta_threshold: number;
   max_changed_ratio: number;
   max_rmse: number;
 }
 
-/** 单 case 比较结果。dimension mismatch / 解码失败 -> ok=false + error（不 throw）。 */
+/** Single case comparison result. Dimension mismatch / decode failure -> ok=false + error (no throw). */
 export interface GoldenResult {
   ok: boolean;
   changed_ratio: number | null;
@@ -50,7 +50,7 @@ export interface GoldenResult {
   error?: string;
 }
 
-/** 对两张已解码 PNG 做 golden 比较，返回结构化结果（不 throw，失败进 error）。 */
+/** Compare two decoded PNGs with golden compare, return structured result (no throw, failure goes to error). */
 export function compareGolden(baseline: DecodedPng, actual: DecodedPng, config: GoldenConfig): GoldenResult {
   try {
     const { changed_ratio, rmse } = comparePixels(baseline, actual, config.pixel_delta_threshold);
@@ -61,7 +61,7 @@ export function compareGolden(baseline: DecodedPng, actual: DecodedPng, config: 
   }
 }
 
-/** 对两个 PNG 文件路径做 golden 比较。缺文件/解码失败 -> ok=false + error。 */
+/** Compare two PNG file paths with golden. Missing files / decode failure -> ok=false + error. */
 export function compareGoldenFiles(baselinePath: string, actualPath: string, config: GoldenConfig): GoldenResult {
   for (const p of [baselinePath, actualPath]) {
     if (!existsSync(p)) return { ok: false, changed_ratio: null, rmse: null, error: `missing file: ${p}` };
@@ -80,7 +80,8 @@ function selfTest(): void {
     throw new Error("delta metric self-test failed");
   }
 
-  // 库入口（compareGolden / compareGoldenFiles）必须把失败落进 error，而非 throw。
+  // Library entry points (compareGolden / compareGoldenFiles) must put failures in error, not
+  // throw.
   const config: GoldenConfig = { pixel_delta_threshold: 2, max_changed_ratio: 0.01, max_rmse: 0.5 };
   const ok = compareGolden(image([0, 0, 0, 0, 0, 0]), image([0, 0, 0, 0, 0, 0]), config);
   if (!ok.ok || ok.changed_ratio !== 0 || ok.rmse !== 0) throw new Error("compareGolden identical self-test failed");

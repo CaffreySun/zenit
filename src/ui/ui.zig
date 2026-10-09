@@ -47,6 +47,7 @@ const std = @import("std");
 
 const core = @import("core.zig");
 const reactive_mod = @import("reactive.zig");
+const bind_mod = @import("bind.zig");
 const events_mod = @import("events.zig");
 const theme_mod = @import("theme.zig");
 const hooks_mod = @import("hooks.zig");
@@ -109,8 +110,8 @@ pub const system_icons = @import("zenit_system_icons");
 
 /// Hit-testing query API (`HitQuery`, `HitShapeSpec`, `HitBehavior`, ...).
 /// Most apps don't need this directly, `Button`/`Input` already wire hit-test.
-/// 系统剪贴板 / 文件对话框。这些函数收 `?*SystemSdk` 而不是挂在 `Cx` 上：
-/// `ui.platform_services.clipboardSetText(cx.system_sdk, text)`。
+/// System clipboard / file dialogs. These functions take `?*SystemSdk` rather than
+/// hanging off `Cx`: `ui.platform_services.clipboardSetText(cx.system_sdk, text)`.
 pub const platform_services = core.platform_services;
 
 pub const hit = struct {
@@ -149,57 +150,65 @@ pub const devtools = @import("devtools.zig");
 /// console attached to a window.
 pub const console = @import("console.zig");
 
-/// Phase 6 手势识别 + 仲裁层（tap/pan/long_press/triple_tap + requireFailure 关系）。
+/// Phase 6 gesture recognition + arbitration layer (tap/pan/long_press/triple_tap
+/// + requireFailure relationships).
 pub const gesture = @import("input/gesture_recognizer.zig");
 
-/// 平台无障碍接线。**这不是应用作者用的东西**，组件的 a11y 走
-/// `node.behavior.interaction.a11y`（见 A11yRole / A11yProps）。
+/// Platform a11y wiring. **Not for app authors**: component a11y uses
+/// `node.behavior.interaction.a11y` (see A11yRole / A11yProps).
 ///
-/// 这里只暴露平台运行时接线需要的那一个入口：zenit_app 在 App.init 里把
-/// 原生侧实装的 `zenit_a11y_push_*` 注册进来。
-///
-/// 此前这里是三个平级顶层命名空间（a11y_tree / a11y_router /
-/// a11y_macos_bridge），把 a11y 的内部分层原样摊在公共面上；tree 与
-/// router 的消费者全在 src/ui 内部，直连 import 即可。
+/// Only exposes the one entry point the platform runtime needs: zenit_app registers native
+/// `zenit_a11y_push_*` implementations in App.init. Tree and router consumers are all
+/// internal to src/ui and import directly.
 pub const a11y = struct {
+    pub const wordBoundaries = @import("a11y/tree.zig").wordBoundaries;
+    pub const paragraphBoundaries = @import("a11y/tree.zig").paragraphBoundaries;
+    pub const characterBoundaries = @import("a11y/tree.zig").characterBoundaries;
+    /// AX element identity (64-bit handle). Platform bridge (Windows UIA) queries tree by it.
+    pub const AXId = @import("a11y/tree.zig").AXId;
     pub const macos_bridge = @import("a11y/macos_bridge.zig");
+    /// System accessibility display preferences (reduce motion, lower transparency...).
+    /// Components read via `cx.a11yPreferencesSignal(scope)`; platform runtime injects
+    /// read function here.
+    pub const preferences = @import("a11y/preferences.zig");
 };
 
-/// Phase 7 Radix-style controlled/uncontrolled props 类型。
-pub const ControlledProp = @import("components/controlled.zig").ControlledProp;
-
-/// v0.2-P8 Select headless 骨架（Radix-style slot 解耦）。
+/// Phase 7 Radix-style controlled/uncontrolled props types.
+/// v0.2-P8 Select headless skeleton (Radix-style slot decoupling).
 pub const select_headless = @import("components/select_headless/mod.zig");
 
 /// Inspector data structure (used by the panel + accessible programmatically).
-// 折行布局产物的只读类型见下面的 TextLayout / LineInfo。整个
-// `core.text_layout` 模块不再导出，宿主拿这两个类型就够，模块本身
-// 含 computeTextLayout 等内部函数。
-/// 系统字体目录（字体选择器的数据层）：枚举家族 + 判定每行该画什么。
-/// ⚠ 只做枚举与元数据，字体族轴在渲染管线里还不存在，选中一个家族
-/// 并不能让它出现在画布上，那需要 TextProps/text_run/FontSelector 一起加 family。
-/// GlyphRun shape 管线的字体解析入口。App 必须把自己的 FontSelector 装
-/// 进去，否则光标/选区与绘制用两套字体（见 zenit_app.App.setFontSelector）。
+// Read-only types for text layout output below (TextLayout / LineInfo). Full
+// `core.text_layout` module no longer exported; hosts need only these two types,
+// module contains internal functions like computeTextLayout.
+/// System font directory (font selector data layer): enumerate families +
+/// determine what to draw per line.
+/// WARNING: enumeration and metadata only; the font family axis doesn't exist in the render
+/// pipeline yet. Selecting a family doesn't draw it; TextProps/text_run/FontSelector
+/// must add family together.
+/// GlyphRun shape pipeline font resolution entry. App must install its FontSelector,
+/// else cursor/selection and drawing use different fonts (see
+/// zenit_app.App.setFontSelector).
 ///
-/// 此前这里导出的是整个 `core.layout_engine`（约 2400 行，含 layout /
-/// computeTextLayout 等纯内部函数），动机只是为了够到下面这一个函数。
-/// 收窄成窄命名空间：布局引擎本身是引擎内部，不该出现在公共面上。
+/// Exports a narrow namespace, not all of `core.layout_engine`: the layout engine is
+/// internal and shouldn't appear publicly.
 pub const text_shaping = struct {
     pub const ShapeFontResolveFn = core.layout_engine.ShapeFontResolveFn;
     pub const setShapeFontResolver = core.layout_engine.setShapeFontResolver;
     pub const setDrawnTextMeasure = core.layout_engine.setDrawnTextMeasure;
 };
-/// 文字折行布局产物（只读）。宿主（如白板类 App）在"文字太小、改画版式
-/// 色块"的降级档需要每行的真实几何（byte 区间 + 测量宽度）：用这个类型让
-/// 降级复用**同一份 glyph shaping 测量**，而不是另写一套字符宽度估算。
+/// Text line-breaking layout output (read-only). Hosts (e.g., whiteboard apps) at
+/// 'text too small, redraw layout block' degradation need per-line geometry (byte
+/// range + measured width): use this type to reuse the **same glyph shaping measurement**
+/// rather than writing a separate character-width estimate.
 ///
-/// 取法是 `node.getLayoutOutput().artifacts.text_layout`，不需要 import
-/// 模块本身。
+/// Access via `node.getLayoutOutput().artifacts.text_layout`, no module import needed.
 pub const TextLayout = core.text_layout.TextLayout;
-/// `TextLayout` 里的单行几何。
+/// Single line geometry within `TextLayout`.
 pub const LineInfo = core.text_layout.LineInfo;
-/// 逐视觉行 `TextProps.text_align` 的起点偏移。宿主自己算光标 / 命中 / 选区时必须用
-/// 这一个公式（与绘制同源），否则居中文字上的光标与字形错位。
+/// Per-visual-line start offset of `TextProps.text_align`. Hosts computing own
+/// cursor/hit/selection must use this formula (same source as drawing); else cursor
+/// misaligns with glyphs on centered text.
 pub const textAlignLineOffset = core.text_layout.alignLineOffset;
 /// Accessibility bridge, wires nodes' `a11y` props to the platform.
 
@@ -212,7 +221,7 @@ pub const Cx = core.Cx;
 pub const AfterLayoutResult = core.AfterLayoutResult;
 pub const AfterLayoutFn = core.AfterLayoutFn;
 pub const max_after_layout_rounds = core.max_after_layout_rounds;
-/// 批量矩形提交单元（见 core.BulkQuad / Cx.setBulkQuads）。
+/// Batch rectangle submission unit (see core.BulkQuad / Cx.setBulkQuads).
 pub const BulkQuad = core.BulkQuad;
 pub const Node = core.Node;
 pub const PointerDownFocus = core.PointerDownFocus;
@@ -243,12 +252,17 @@ pub const TextProps = core.TextProps;
 pub const ImageProps = core.ImageProps;
 pub const CornerRadius = core.CornerRadius;
 pub const Shadow = core.Shadow;
+pub const ShadowList = core.ShadowList;
+pub const InsetShadowList = core.InsetShadowList;
+pub const Inset = core.Inset;
+pub const InsetValue = core.InsetValue;
 pub const InsetShadow = core.InsetShadow;
 pub const Gradient = core.Gradient;
 pub const GradientStop = core.GradientStop;
 pub const MultiGradient = core.MultiGradient;
 pub const GradientDirection = core.GradientDirection;
 pub const GlassParams = core.GlassParams;
+pub const BlurGradient = core.BlurGradient;
 pub const GlassSurface = core.GlassSurface;
 
 // ── Node constructors ──
@@ -259,44 +273,77 @@ pub const vstack = core.vstack;
 pub const text = core.text;
 pub const textFmt = core.textFmt;
 
-// ── Styled constructors（主题安全的具名样式函数消费端，见 docs/STYLING.md） ──
+// ── Styled constructors (theme-safe named style function consumer, see docs/STYLING.md) ──
 pub const boxStyled = core.boxStyled;
 pub const hstackStyled = core.hstackStyled;
 pub const vstackStyled = core.vstackStyled;
 pub const textStyled = core.textStyled;
 pub const TextStyle = core.TextStyle;
+/// Style declaration: which properties declared at layer (sparse, immutable; see style_decl.zig).
+pub const StyleDecl = @import("style_decl.zig").StyleDecl;
 
-// ── Recipe（CVA/Panda 风格样式变体系统，见 docs/STYLING.md） ──
-/// 模块命名空间：`ui.recipe.recipe(...)` / `ui.recipe.slotRecipe(...)`
+// ── Recipe (CVA/Panda-style style variant system, see docs/STYLING.md) ──
+/// Module namespace: `ui.recipe.recipe(...)` / `ui.recipe.slotRecipe(...)`
 pub const recipe = core.recipe;
+/// Object-style styling (parallels Panda css / cva, zero runtime parsing; tokens are
+/// named references, compile-time lookup):
+/// `ui.css(.{ .padding = .space400, ._hover = .{ .background = .bg_hover } })`
+/// or `ui.cva(.{ .base, .variants, .compound, .defaults })`.
+/// See docs/STYLING.md.
+pub const css = @import("css.zig").css;
+pub const cva = @import("css.zig").cva;
+pub const sva = @import("css.zig").sva;
+/// Parameterized styling (.yss `style name($p: T) { ... }` output): put
+/// `S.name.of(.{ .p = source })` into style; hand-written Zig uses
+/// `S.name.resolve(args, t)`.
+pub const paramStyle = @import("css.zig").paramStyle;
+/// Fallback value for optional parameters (parameterized style `$p ?? value`).
+pub const orElse = @import("css.zig").orElse;
+/// Style literal -> box style (parse token by current theme; parameterized style
+/// output).
+pub const boxFrom = @import("css.zig").boxFrom;
+/// Token color mix: `ui.mix(T.color.bg_primary, T.color.accent, 0.25)`, evaluated
+/// at apply time, follows theme change.
+pub const mix = @import("css.zig").mix;
+pub const ColorMix = @import("css.zig").ColorMix;
+/// Style field name -> token category (which token table for enum literals in
+/// css/cva/sva). Toolchain: .yss schema generated by reflection.
+pub const styleCategory = @import("css.zig").catOf;
+pub const StyleCategory = @import("css.zig").Category;
+/// Get token reference by name (same parsing as enum literals in css/cva/sva:
+/// original name first, then with `-` replaced by `_`). .yss mix() operands looked up via it.
+pub const tokenRef = @import("css.zig").tokenRef;
+/// CSS-style transition declaration: write `.transition = ui.transition("background
+/// 150ms ease-out")` in style object.
+pub const transition = @import("recipe.zig").transition;
 pub const ConditionalStyle = core.ConditionalStyle;
 pub const ThemeTokens = theme_mod.ThemeTokens;
 pub const ColorScheme = theme_mod.ColorScheme;
 
-/// 任意值逃生舱，对标 Panda CSS 的 arbitrary values（`[18px]` / `[#316ff6]`）。
-///
-/// token 是默认，但设计上确有不在 scale 上的值（对齐特定视觉稿、一次性的
-/// 品牌色、像素级微调）。这时**不要**写裸字面量，用 `ui.arb.*` 包一层：
+/// Arbitrary value escape hatch, parallel to Panda CSS arbitrary values (`[18px]` / `[#316ff6]`).
+/// Tokens are the default, but designs do include off-scale values (matching specific mockups,
+/// one-off brand colors, pixel-level tweaks). Don't write bare literals; wrap with `ui.arb.*`:
 ///
 /// ```zig
-/// .font_size = ui.arb.px(18),          // 有意off-scale，非偷懒
-/// .background = ui.arb.hex(0x316FF6),  // 一次性品牌色
+/// .font_size = ui.arb.px(18),          // deliberately off-scale, not laziness
+/// .background = ui.arb.hex(0x316FF6),  // one-off brand color
 /// ```
 ///
-/// 零运行时成本（inline 恒等）；价值在语义与工具链：
-///   - 读者一眼区分"有意的任意值"与"该迁 token 的偷懒字面量"；
-///   - scripts/check_style_literals.sh 的 ratchet 只抓裸字面量，arb 天然放行；
-///   - 全局 grep `ui.arb` 即可盘点所有 off-token 值，评估是否该晋升为 token。
+/// Zero runtime cost (always inline); semantic and tooling value:
+///   - readers distinguish "intentional arbitrary value" from "lazy literal needing token
+///     migration";
+///   - scripts/check_style_literals.sh ratchet catches bare literals, arb passes naturally;
+///   - global `grep ui.arb` inventories all off-token values for promotion evaluation.
 pub const arb = struct {
-    /// 任意尺寸/字号（px）
+    /// Arbitrary size/font size (px).
     pub inline fn px(v: f32) f32 {
         return v;
     }
-    /// 任意颜色（0xRRGGBB）
+    /// Arbitrary color (0xRRGGBB).
     pub inline fn hex(rgb: u24) Color {
         return Color.hex(rgb);
     }
-    /// 任意颜色（0xRRGGBB + alpha 0..1）
+    /// Arbitrary color (0xRRGGBB + alpha 0..1).
     pub inline fn hexA(rgb: u24, alpha: f32) Color {
         const a: u8 = @intFromFloat(@round(std.math.clamp(alpha, 0.0, 1.0) * 255.0));
         return Color.hex(rgb).withAlpha(a);
@@ -310,6 +357,8 @@ pub const spacer = core.spacer;
 pub const clickable = core.clickable;
 pub const grid = core.grid;
 pub const GridStyle = core.GridStyle;
+pub const GridTrackSize = core.GridTrackSize;
+pub const GridPlacement = core.GridPlacement;
 
 pub const SvgAsset = svg_assets_mod.Asset;
 
@@ -361,16 +410,53 @@ fn isFixedPxSizing(sizing: Sizing) bool {
     };
 }
 
-// ── Reactive essentials (full surface lives in `ui.reactive`) ──
+// -- Reactive essentials (full surface lives in `ui.reactive`) --
+// App code always creates via Scope: `scope.createSignal / createMemo /
+// createEffect`, lifetime follows scope (disposed on component unmount). Owner-level
+// free functions (`ui.reactive.createEffect/createMemo`,
+// `Signal(T).create(owner, ...)`) are low-level primitives not released with scope,
+// not exported at top level.
 pub const Signal = reactive_mod.Signal;
 pub const Memo = reactive_mod.Memo;
-pub const createEffect = reactive_mod.createEffect;
-pub const createMemo = reactive_mod.createMemo;
+
+// -- Signal-first component props (docs/SIGNAL_API_DESIGN.md) --
+// Component props: read-only use `Source(T)`, controlled values (component proposes
+// write-back, data source decides) use `Model(T)`, events use `Handler(T)`.
+// Call sites write literals / `*Signal` / derived values; `props.coerce` normalizes
+// at comptime.
+pub const Source = reactive_mod.Source;
+pub const Model = reactive_mod.Model;
+pub const Handler = core.Handler;
+pub const Derived = reactive_mod.Derived;
+pub const split = reactive_mod.split;
+pub const derive = reactive_mod.derive;
+pub const not = reactive_mod.not;
+pub const eq = reactive_mod.eq;
+pub const map = reactive_mod.map;
+pub const map2 = reactive_mod.map2;
+pub const field = reactive_mod.field;
+pub const assumeOutlives = reactive_mod.assumeOutlives;
+pub const bind = bind_mod.bind;
+pub const bindText = bind_mod.bindText;
+pub const bindTextLabel = bind_mod.bindTextLabel;
+pub const bindTextA11y = bind_mod.bindTextA11y;
+pub const rebuildOn = bind_mod.rebuildOn;
+pub const bindOptionalTextRow = bind_mod.bindOptionalTextRow;
 
 // ── Control flow (full surface lives in `ui.control_flow`) ──
 pub const Show = control_flow_mod.Show;
 pub const For = control_flow_mod.For;
 pub const Match = control_flow_mod.Match;
+
+// ── Declarative view tree (Solid-style JSX Zig version; see docs/VIEW_DSL.md) ──
+// `const v = ui.view;` then `v.render(scope, cx, v.col(.{ .style = S.root }, .{ ... }))`.
+pub const view = @import("view.zig");
+/// Component protocol for `ui.view` (mount returns Result; component implements
+/// `viewParts`).
+pub const ViewParts = @import("view_parts.zig").ViewParts;
+/// Event composer: `.on_click = ui.on.set(sig, v) / toggle / update / assign / call /
+/// bind`. (Keyboard binding Action system is `ui.actions`, separate.)
+pub const on = @import("on.zig");
 
 // ── A11y ──
 pub const A11yRole = core.A11yRole;
@@ -386,150 +472,155 @@ pub const TextInputSelection = core.TextInputSelection;
 // (Full `Event` enum + payload structs live in `ui.events`.)
 pub const HandlerRef = core.HandlerRef;
 
-// ============================================================================
-// 注：原 `core_internal` 顶层暴露在 Phase 7 删除（OSS boundary 纪律）。
-// 框架 contributor 直接 @import("core.zig")（在 ui module 内部）；
-// 外部 consumer 应当只用 `ui.*` 命名空间公开 API。
-// ============================================================================
+// Note: original `core_internal` top-level export removed in Phase 7 (OSS boundary discipline).
+// Framework contributors directly @import("core.zig") (inside ui module);
+// external consumers should only use `ui.*` namespace public API.
+
+// Load internal contract tests independently of the unnamed API smoke test.
+// A narrow --test-filter can exclude that smoke test before these modules are
+// reached through public functions, otherwise returning success with no cases.
+comptime {
+    if (@import("builtin").is_test) {
+        _ = @import("core/cx_a11y.zig");
+        _ = @import("core/a11y_projection.zig");
+        _ = @import("core/a11y_geometry.zig");
+        _ = @import("components/input/textarea.zig");
+        _ = @import("components/input/render.zig");
+    }
+}
 
 test {
     _ = @import("hooks_test.zig");
+    _ = @import("bind.zig");
+    // refAllDecls doesn't collect test blocks in subfiles; new modules need explicit
+    // import (see docs/STYLING.md).
+    _ = @import("view.zig");
+    _ = @import("on.zig");
+    _ = @import("style_decl.zig");
     std.testing.refAllDecls(@This());
 }
 
 test "公共命名空间不泄漏渲染引擎内部（发布后删 pub 是 break-API）" {
-    // ui.zig 开头声明了锁定的两层命名空间，但 `test` 块之后曾追加导出
-    // render_engine / debug_trace / paint_table / compute_position,
-    // 其中 render_engine 连带暴露一组**可变全局**（current_frame_* 帧时钟
-    // 与 setFrameClock），消费者能把时钟写坏。这与 API_STABILITY.md 把
-    // render_engine 列为 Internal 直接矛盾。
+    // ui.zig's top-level declarations are a locked two-level namespace. Internal modules
+    // (e.g. render_engine, which exposes mutable globals current_frame_* clock +
+    // setFrameClock that let consumers corrupt the clock) must not leak into it; this
+    // contradicts API_STABILITY.md listing render_engine as Internal.
     //
-    // check_oss_boundary.sh 抓不到这个：它只查 src/ui/ import 了什么、
-    // hello_button 链接了什么，从不检查根模块 pub 了什么。所以在这里守。
+    // check_oss_boundary.sh can't catch this: it checks what src/ui/ imports and
+    // hello_button links, never root-module pub. Guard here.
     //
-    // 需要帧时间的 hook 用只读的 `ui.frame.*`（够不到 Cx 时）或
-    // `cx.frame_time_ms`（多窗口下正确的那个）。
-    // 白名单而非黑名单。
+    // Hooks needing frame time use read-only `ui.frame.*` (can't reach Cx) or
+    // `cx.frame_time_ms` (multi-window correct).
     //
-    // 这里原本是一张只列了四个名字的黑名单（render_engine / debug_trace /
-    // paint_table / compute_position），于是同类的「整模块内部 pub」只要不叫
-    // 这四个名字就畅通无阻，实际漏过去的有 layout_engine（2400 行布局引擎，
-    // 只为导出一个 setShapeFontResolver）、theme_schema（一半字段是 DevTools
-    // 专用色）、a11y_router、perf_overlay（死模块）。2026-09-22 全部清掉后
-    // 改成白名单：**新增一个顶层命名空间必须来这里登记**，逼作者回答一句
-    // 「这东西凭什么给应用作者看」。
-    //
-    // 只管命名空间（`pub const x = @import(...)` 这类），不管值类型与函数,
-    // 后者数量大且天然属于公共面，逐个登记收益不抵成本。
+    // Whitelist, not blacklist: a new top-level namespace must be registered here,
+    // forcing the author to answer 'why show app authors this'. Only namespaces (pub
+    // const x = @import(...)) are covered, not value types/functions; those are abundant
+    // and per-item cost exceeds gain.
+    @setEvalBranchQuota(4000);
     const allowed_namespaces = [_][]const u8{
-        // 组件与效果
-        "widgets",  "fx",           "interaction",  "select_headless",
-        // 资源
-        "icons",    "system_icons", "assets",
-        // 能力域
-              "theme",
-        "reactive", "control_flow", "actions",      "focus",
-        "hit",      "path",         "a11y",         "recipe",
-        "styles",   "arb",          "text_shaping", "platform_services",
-        "gesture",  "input",
-        // 工具与诊断
-               "devtools",     "console",
-        "frame",    "router",       "animation",    "hooks",
-        "events",   "math",
+        // Components and effects.
+        "widgets",      "fx",                "interaction", "select_headless",
+        // Resources.
+        "icons",        "system_icons",      "assets",
+        // Capability domains.
+             "theme",
+        "reactive",     "control_flow",      "actions",     "focus",
+        // Declarative view tree and event composer: app author main UI entry
+        // (docs/VIEW_DSL.md).
+        "view",         "on",                "hit",         "path",
+        "a11y",         "recipe",            "styles",      "arb",
+        "text_shaping", "platform_services", "gesture",     "input",
+        // Tools and diagnostics.
+        "devtools",     "console",           "frame",       "router",
+        "animation",    "hooks",             "events",      "math",
     };
-    inline for (@typeInfo(@This()).@"struct".decls) |decl| {
-        const T = @TypeOf(@field(@This(), decl.name));
-        if (T == type and @typeInfo(@field(@This(), decl.name)) == .@"struct") {
-            // 只检查「看起来是命名空间」的：struct 类型且首字母小写
-            if (decl.name[0] >= 'a' and decl.name[0] <= 'z') {
+    inline for (@typeInfo(@This()).@"struct".decl_names) |name| {
+        const T = @TypeOf(@field(@This(), name));
+        if (T == type and @typeInfo(@field(@This(), name)) == .@"struct") {
+            // Only check 'looks like namespace': struct type, lowercase start.
+            if (name[0] >= 'a' and name[0] <= 'z') {
                 var ok = false;
-                inline for (allowed_namespaces) |name| {
-                    if (std.mem.eql(u8, decl.name, name)) ok = true;
+                inline for (allowed_namespaces) |allowed| {
+                    if (std.mem.eql(u8, name, allowed)) ok = true;
                 }
                 if (!ok) {
                     std.debug.print(
                         "ui.{s} 是个未登记的顶层命名空间。\n" ++
                             "  内部实现不该进公共面；确实要公开就加进 ui.zig 的 " ++
                             "allowed_namespaces，并在那里说明它面向谁。\n",
-                        .{decl.name},
+                        .{name},
                     );
                     return error.UnregisteredPublicNamespace;
                 }
             }
         }
     }
-    // 只读帧时钟必须在（上面那条的替代路径）
+    // The read-only frame clock must be present (it is the replacement path for the removed
+    // render_engine clock).
     try std.testing.expect(@hasDecl(@This(), "frame"));
     _ = frame.timeMs();
     _ = frame.dtSeconds();
     _ = frame.dtMs();
     _ = frame.estimateTimeMs();
-    // debug_trace 的**能力**是公开的（DevTools Render/Trace 面板数据源，
-    // 宿主自建 inspector 要用），只是不该挂在顶层。归到 devtools 下。
+    // debug_trace **capability** public (DevTools Render/Trace data source;
+    // host custom inspector needs); just shouldn't top-level. Move under devtools.
     try std.testing.expect(@hasDecl(devtools, "trace"));
     try std.testing.expect(@hasDecl(devtools.trace, "setGlobalTraceTarget"));
     try std.testing.expect(@hasDecl(devtools.trace, "clearGlobalTraceTarget"));
 }
 
-// 分片任务调度：只导出 `Cx.enqueueTask` / `Cx.cancelTask` 两个公共方法真正
-// 需要的类型。
+// Sliced work scheduler: only export `Cx.enqueueTask` / `Cx.cancelTask` truly
+// need types.
 //
-// 此前这里导出了 work 全家 7 个（work / WorkPriority / WorkKey / WorkSpec /
-// WorkResult / WorkHandle / Task），但那套面**从外部根本用不起来**：
-// `WorkResult.step` 的类型是 `WorkStep`，而 `WorkStep` 没有被导出，外部
-// 无法构造 `Task.runSlice` 要求的返回值。那是被顺手搬上来的内部实现，
-// 不是设计过的公共面。
+// The work family (work / WorkPriority / WorkKey / WorkSpec / WorkResult / WorkHandle /
+// Task) is **not usable from outside**: `WorkResult.step` is `WorkStep`, which is not
+// exported, so callers can't construct the `Task.runSlice` return. Not a designed
+// public surface.
 //
-// 需要自定义分片任务的宿主，请连同 `WorkStep` 一起提 issue，那时再把
-// 这组词汇统一好（内部同时存在 Task/TaskPriority 与 Work* 两套叫法）
-// 一次性导出，而不是现在半成品地暴露。
+// Hosts needing custom-sliced tasks: file an issue for `WorkStep`, then export this
+// vocab set in one coordinated change (internal dual Task/TaskPriority and Work* naming).
 pub const Task = core.Task;
 pub const WorkKey = core.WorkKey;
-/// 渲染输出的扁平指令项，`ui` 层的最终产物（`render` 层消费它）。
-/// custom-draw 回调拿到的就是这个。
-///
-/// 注：此前顶层还导出过一个指向本类型的旧 IR 别名（那个 IR 早已删除），
-/// 是个改名陷阱且零消费者，已随 v0.5 deletion gate 一并清除。
+/// Flattened render-output instruction item, `ui` layer final product (`render` layer
+/// consumes). Custom-draw callbacks receive this.
 pub const DisplayItem = core.DisplayItem;
 
-/// 四角圆角半径（`CornerRadii.fromArray([4]f32)`）。
+/// Four-corner corner radius (`CornerRadii.fromArray([4]f32)`).
 ///
-/// 宿主应用在 `Cx.render()` 之后往 `cx.lowering.main_paint` 追加屏幕空间
-/// 诊断图元时需要它构造 `.radii`。paint_table 模块本身是引擎内部，但这个
-/// 值类型是那条公开路径的必需品，所以单独导出类型而不是整个模块。
+/// A host appending a screen-space diagnostic item to `cx.lowering.main_paint` after
+/// `Cx.render()` needs it to build `.radii`. paint_table is internal, but this type is
+/// required on the public path; export the type alone, not the whole module.
 pub const CornerRadii = core.paint_table.CornerRadii;
 pub const DrawContext = core.DrawContext;
 pub const IconProps = core.IconProps;
 pub const AlignItems = core.AlignItems;
 pub const JustifyContent = core.JustifyContent;
-/// 帧时钟的**只读**视图。
+/// Frame clock **read-only** view.
 ///
-/// `before_render` hook 只拿到 `*Node`，够不到 `Cx`，但按时间驱动的动画
-/// （blur 扫动、Spinner 这类直写 style 的）需要"现在几点"。以前这条路
-/// 是 `ui.render_engine.current_frame_time_ms`，那等于把整个渲染引擎
-/// 连同一组**可变全局**（帧时钟本体 + setFrameClock）暴露给消费者，
-/// 谁都能把时钟写坏。这里只给读，不给写。
+/// `before_render` hook gets `*Node`, can't reach `Cx`, but time-driven animation
+/// (blur sweep, Spinner direct-style) needs the current time. Exposes only a read-only
+/// view, not `ui.render_engine` (mutable clock globals + setFrameClock).
 ///
-/// 有 `Cx` 时优先用 `cx.frame_time_ms`：那是 per-context 的，多窗口下
-/// 才正确；本命名空间服务的是够不到 Cx 的 hook 回调。
+/// Have `Cx` -> prefer `cx.frame_time_ms` (per-context, multi-window correct);
+/// use this namespace where callbacks can't reach Cx.
 pub const frame = struct {
-    /// 当前帧的绝对时间戳（ms），单调递增，相对于应用启动。
+    /// Current frame absolute timestamp (ms), monotonic, relative app start.
     pub inline fn timeMs() f64 {
         return core.render_engine.current_frame_time_ms;
     }
-    /// 当前帧的 dt（秒）。
+    /// Current frame dt (seconds).
     pub inline fn dtSeconds() f32 {
         return core.render_engine.current_frame_dt_seconds;
     }
-    /// 当前帧的 dt（ms），Spring 这类需要增量的消费者用。
+    /// Current frame dt (ms); Spring-type incremental consumers use.
     pub inline fn dtMs() f32 {
         return core.render_engine.current_frame_dt_ms;
     }
-    /// 估算"此刻"的时间戳（ms）。
+    /// Estimate 'now' timestamp (ms).
     ///
-    /// 事件阶段可能发生在两帧之间，此时 `timeMs()` 停在上一帧。这个函数用
-    /// 真实单调时钟补上帧内已流逝的部分，输入驱动的动画（点击起手的
-    /// 高亮、闪烁）用它起算才不会有最多一帧的偏差。
+    /// Events may fire between frames; `timeMs()` stops at last frame. This adds
+    /// elapsed in-frame from real monotonic clock; input-driven animation (tap
+    /// highlight, blink) uses to avoid frame-worth skew.
     pub inline fn estimateTimeMs() f64 {
         return core.render_engine.estimateTimeMs();
     }

@@ -1,27 +1,25 @@
-/// Path Tessellator, CPU 端路径细分
+/// Path tessellator: CPU-side path flattening.
 ///
-/// 将 PathGeometry（Bezier 路径命令流）展平为折线轮廓（contour）列表。
-/// 每条 contour 是一组 f32 顶点（x,y 交叉排列），代表一个封闭或开放子路径。
+/// Flattens PathGeometry (Bezier path command stream) into line contour lists. Each contour is a
+/// group of f32 vertices (x,y interleaved), a closed or open subpath.
 ///
-/// 支持：
-///   move_to / line_to / quad_to（二次 Bezier） / close
-///   cubic_to, D1 阶段用控制点折线近似，D4 阶段替换为自适应细分
+/// Supports:
+///   move_to / line_to / quad_to (quadratic Bezier) / close / cubic_to (adaptive subdivision)
 ///
-/// 内存模型：flatten 的结果写入 tessellator 持有的复用 buffer
-/// （vertex_pool / contours_buf），返回借用切片，调用方不释放，
-/// 下一次 flatten 调用即失效。tessellator 销毁时需调 deinit。
+/// Memory: flatten writes into tessellator-owned reusable buffers (vertex_pool / contours_buf)
+/// and returns a borrowed slice; caller does not free; invalidated by the next flatten call.
+/// Call deinit when destroying the tessellator.
 ///
-/// Zig 0.15 注意：std.ArrayList 是无 allocator 字段的新 API，
-/// append/deinit 等方法均需显式传入 allocator。
+/// Zig 0.15: std.ArrayList has no allocator field; append/deinit etc. take an explicit allocator.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-/// 二维点（与 types.zig 的 Point 布局一致，避免跨模块依赖）
+/// 2D point (layout compatible with types.zig Point, avoid cross-module dependency)
 pub const TPoint = struct { x: f32, y: f32 };
 
-/// 单条轮廓：平面顶点序列，格式 [x0,y0, x1,y1, ...]
+/// single contour: planar vertex sequence, format [x0,y0, x1,y1, ...]
 pub const Contour = struct {
-    vertices: []f32, // 长度必须是偶数，由 tessellator 保证
+    vertices: []f32, // length must be even, guaranteed by tessellator
     closed: bool = false,
 
     pub fn pointCount(self: Contour) usize {
@@ -33,7 +31,7 @@ pub const Contour = struct {
     }
 };
 
-/// 二次 Bezier 平坦度阈值（像素）
+/// quadratic Bezier flatness threshold (pixels)
 const FLATNESS_THRESHOLD: f32 = 0.5;
 /// A pathological but finite curve/tolerance must not grow the recursion tree
 /// without bound. 2^12 segments is already beyond useful UI-path precision.
@@ -41,12 +39,13 @@ const MAX_CURVE_SUBDIVISION_DEPTH: u8 = 12;
 
 pub const PathTessellator = struct {
     allocator: Allocator,
-    /// 所有 contour 顶点连续存放的复用池；flatten 返回的切片借用于此
-    vertex_pool: std.ArrayList(f32) = .{},
-    /// contour 的 (start, len, closed) 记录，顶点写入 pool 期间 pool 可能
-    /// 扩容搬迁，故先记 span，flatten 末尾再物化为指向 pool 的切片
-    spans: std.ArrayList(Span) = .{},
-    contours_buf: std.ArrayList(Contour) = .{},
+    /// reusable pool for all contour vertices stored contiguously; slices returned by flatten
+    /// borrow from here
+    vertex_pool: std.ArrayList(f32) = .empty,
+    /// record each contour's (start, len, closed); pool may reallocate during vertex writes, so
+    /// record spans first and materialize slices at end
+    spans: std.ArrayList(Span) = .empty,
+    contours_buf: std.ArrayList(Contour) = .empty,
 
     const Span = struct { start: usize, len: usize, closed: bool };
 
@@ -60,12 +59,12 @@ pub const PathTessellator = struct {
         self.contours_buf.deinit(self.allocator);
     }
 
-    /// 将路径命令展平为 contour 列表。
-    /// scale_factor: 当前渲染比例（Retina = 2.0），用于自适应阈值。
-    /// 返回借用切片：下一次 flatten 或 deinit 即失效，调用方不释放。
+    /// Flatten path commands to contour list. scale_factor: current render scale (Retina = 2.0),
+    /// for adaptive threshold. Returns borrowed slice: invalidated on next flatten or deinit;
+    /// caller does not free.
     pub fn flatten(
         self: *PathTessellator,
-        /// PathCommand 类型通过 comptime 传入，避免循环依赖
+        /// PathCommand type passed at comptime to avoid circular dependency
         comptime PathCommand: type,
         commands: []const PathCommand,
         scale_factor: f32,
@@ -78,16 +77,17 @@ pub const PathTessellator = struct {
         self.contours_buf.clearRetainingCapacity();
 
         const pool = &self.vertex_pool;
-        // 当前 contour 在 pool 中的起始下标
+        // current contour start index in pool
         var cur_start: usize = 0;
 
         var cur_x: f32 = 0;
         var cur_y: f32 = 0;
-        // 当前子路径起点（最近一次 move_to）。SVG 语义：close 之后当前点回到
-        // 子路径起点；紧跟的 L/C/Q（无 M）隐式从该点开新子路径。
+        // current subpath start point (last move_to). SVG semantics: after close, current point
+        // returns to subpath start; subsequent L/C/Q without M implicitly start new subpath from
+        // here.
         var sub_x: f32 = 0;
         var sub_y: f32 = 0;
-        // close 之后、下一条 M 之前：下一条绘制命令需先补一个起点顶点。
+        // after close and before next M: next draw command must prepend start vertex
         var reopen_at_start = false;
 
         for (commands) |cmd| {
@@ -112,7 +112,7 @@ pub const PathTessellator = struct {
                         sub_y = 0;
                         continue;
                     }
-                    // 新 contour 起点
+                    // new contour start point
                     try pool.append(alloc, p.x);
                     try pool.append(alloc, p.y);
                     cur_x = p.x;
@@ -128,7 +128,7 @@ pub const PathTessellator = struct {
                     cur_y = p.y;
                 },
                 .quad_to => |q| {
-                    // 自适应二次 Bezier 细分
+                    // adaptive quadratic Bezier subdivision
                     try flattenQuad(
                         alloc,
                         pool,
@@ -147,7 +147,7 @@ pub const PathTessellator = struct {
                     }
                 },
                 .cubic_to => |c| {
-                    // 自适应三次 Bezier 细分（de Casteljau）
+                    // adaptive cubic Bezier subdivision (de Casteljau)
                     try flattenCubic(
                         alloc,
                         pool,
@@ -170,8 +170,8 @@ pub const PathTessellator = struct {
                 .close => {
                     try self.finishContour(cur_start, true);
                     cur_start = pool.items.len;
-                    // 回到子路径起点而不是原点：此前置 (0,0)，`Z` 后直接 `L`/`C`
-                    // 会从原点拉出一根尖刺。
+                    // return to subpath start, not origin: if previously (0,0), direct L/C after Z
+                    // draws spike from origin
                     cur_x = sub_x;
                     cur_y = sub_y;
                     reopen_at_start = true;
@@ -179,10 +179,10 @@ pub const PathTessellator = struct {
             }
         }
 
-        // 保存最后一条未关闭的 contour
+        // save last unclosed contour
         try self.finishContour(cur_start, false);
 
-        // 物化：pool 至此不再增长，切片稳定到下一次 flatten
+        // materialize: pool stops growing here, slices stable until next flatten
         try self.contours_buf.ensureTotalCapacity(alloc, self.spans.items.len);
         for (self.spans.items) |span| {
             self.contours_buf.appendAssumeCapacity(.{
@@ -193,7 +193,7 @@ pub const PathTessellator = struct {
         return self.contours_buf.items;
     }
 
-    /// 结束当前 contour：≥2 个点则记 span，否则回退 pool 丢弃
+    /// end current contour: if >= 2 points, record span; otherwise roll back pool and discard
     fn finishContour(self: *PathTessellator, cur_start: usize, closed: bool) !void {
         const len = self.vertex_pool.items.len - cur_start;
         if (len >= 4) {
@@ -204,10 +204,8 @@ pub const PathTessellator = struct {
     }
 };
 
-/// 自适应二次 Bezier 细分（de Casteljau）
-///
-/// p0=(x0,y0)  p1=(cx,cy)  p2=(ex,ey)
-/// 输出点追加到 `out`（不包括起点，包括终点）。
+/// adaptive quadratic Bezier subdivision (de Casteljau). p0=(x0,y0) p1=(cx,cy) p2=(ex,ey). Output
+/// points appended to `out` (excludes start, includes end).
 fn flattenQuad(
     alloc: Allocator,
     out: *std.ArrayList(f32),
@@ -228,10 +226,10 @@ fn flattenQuad(
         return appendFiniteEndpoint(alloc, out, ex, ey);
     }
 
-    // 曲线中点
+    // curve midpoint
     const mx = (x0 + 2.0 * cx + ex) * 0.25;
     const my = (y0 + 2.0 * cy + ey) * 0.25;
-    // 弦中点
+    // chord midpoint
     const lx = (x0 + ex) * 0.5;
     const ly = (y0 + ey) * 0.5;
 
@@ -240,13 +238,13 @@ fn flattenQuad(
     const dist2 = dx * dx + dy * dy;
 
     if (!std.math.isFinite(dist2) or dist2 <= tol * tol) {
-        // 足够平坦，直接输出终点
+        // flat enough, output end point directly
         try out.append(alloc, ex);
         try out.append(alloc, ey);
         return;
     }
 
-    // 细分：左半 + 右半
+    // Subdivide: left half + right half
     const m01x = (x0 + cx) * 0.5;
     const m01y = (y0 + cy) * 0.5;
     const m12x = (cx + ex) * 0.5;
@@ -258,11 +256,11 @@ fn flattenQuad(
     try flattenQuad(alloc, out, mmx, mmy, m12x, m12y, ex, ey, tol, depth + 1);
 }
 
-/// 自适应三次 Bezier 细分（de Casteljau）
+/// Adaptive cubic Bezier subdivision (de Casteljau)
 ///
 /// p0=(x0,y0)  p1=(c1x,c1y)  p2=(c2x,c2y)  p3=(ex,ey)
-/// 平坦度：控制点到弦的最大距离 < tol
-/// 输出点追加到 `out`（不包括起点，包括终点）。
+/// Flatness: max distance from control points to chord < tol
+/// Output points appended to `out` (excludes start, includes end).
 fn flattenCubic(
     alloc: Allocator,
     out: *std.ArrayList(f32),
@@ -286,18 +284,19 @@ fn flattenCubic(
         return appendFiniteEndpoint(alloc, out, ex, ey);
     }
 
-    // 用两个控制点到弦的距离之和作为平坦度度量（比最大值更保守，但简单高效）
-    // 弦向量
+    // Use sum of both control point distances to chord as flatness metric (more conservative than
+    // max, but simple/fast)
+    // Chord vector
     const chord_dx = ex - x0;
     const chord_dy = ey - y0;
     const chord_len2 = chord_dx * chord_dx + chord_dy * chord_dy;
 
     var flat = false;
     if (!std.math.isFinite(chord_len2) or chord_len2 < 1e-10) {
-        // 退化为点，直接输出
+        // Degenerates to point, output directly
         flat = true;
     } else {
-        // 控制点到弦的垂直距离（利用叉积）
+        // Perpendicular distance from control point to chord (using cross product)
         const inv_chord = 1.0 / @sqrt(chord_len2);
         const d1 = @abs((c1x - x0) * chord_dy * inv_chord - (c1y - y0) * chord_dx * inv_chord);
         const d2 = @abs((c2x - x0) * chord_dy * inv_chord - (c2y - y0) * chord_dx * inv_chord);
@@ -310,7 +309,7 @@ fn flattenCubic(
         return;
     }
 
-    // de Casteljau 细分到 t=0.5
+    // de Casteljau subdivide at t=0.5
     const m01x = (x0 + c1x) * 0.5;
     const m01y = (y0 + c1y) * 0.5;
     const m12x = (c1x + c2x) * 0.5;
@@ -337,7 +336,7 @@ fn appendFiniteEndpoint(alloc: Allocator, out: *std.ArrayList(f32), x: f32, y: f
 }
 
 // ============================================================================
-// 单元测试
+// Unit tests
 // ============================================================================
 
 const TestPoint = struct { x: f32, y: f32 };
@@ -354,7 +353,7 @@ test "close 后无 move_to 的 line_to 从子路径起点续画（不从原点�
     var tess = PathTessellator.init(alloc);
     defer tess.deinit();
 
-    // M50,50 L60,50 L60,60 Z L70,70, SVG 语义：第二段从 (50,50) 开始
+    // M50,50 L60,50 L60,60 Z L70,70, SVG semantics: second segment starts at (50,50)
     const cmds = [_]TestPathCommand{
         .{ .move_to = .{ .x = 50, .y = 50 } },
         .{ .line_to = .{ .x = 60, .y = 50 } },
@@ -368,10 +367,10 @@ test "close 后无 move_to 的 line_to 从子路径起点续画（不从原点�
     try std.testing.expect(contours[0].closed);
     const second = contours[1];
     try std.testing.expect(!second.closed);
-    // 起点是子路径起点 (50,50)
+    // Start is subpath start (50,50)
     try std.testing.expectEqual(@as(f32, 50), second.vertices[0]);
     try std.testing.expectEqual(@as(f32, 50), second.vertices[1]);
-    // 任何顶点都不在原点附近（原 bug：曲线起点取 (0,0)）
+    // No vertex near origin (old bug: curve start took (0,0))
     var k: usize = 0;
     while (k < second.vertices.len) : (k += 2) {
         try std.testing.expect(second.vertices[k] >= 50 and second.vertices[k + 1] >= 50);
@@ -403,7 +402,7 @@ test "flatten quad bezier subdivides to multiple points" {
     var tess = PathTessellator.init(alloc);
     defer tess.deinit();
 
-    // 90° 弧形近似：从 (0,0) 经控制点 (50,0) 到 (50,50)
+    // 90-degree arc approximation: from (0,0) via control (50,0) to (50,50)
     const cmds = [_]TestPathCommand{
         .{ .move_to = .{ .x = 0, .y = 0 } },
         .{ .quad_to = .{ .ctrl = .{ .x = 50, .y = 0 }, .end = .{ .x = 50, .y = 50 } } },
@@ -413,7 +412,7 @@ test "flatten quad bezier subdivides to multiple points" {
     const contours = try tess.flatten(TestPathCommand, &cmds, 1.0);
 
     try std.testing.expectEqual(@as(usize, 1), contours.len);
-    // 50 像素跨度下，细分后点数应 > 2（起点 + 多个细分点）
+    // 50px span, post-subdivision point count should > 2 (start + multiple subdivisions)
     try std.testing.expect(contours[0].pointCount() > 2);
     try std.testing.expect(contours[0].closed);
 }
@@ -446,7 +445,7 @@ test "flatten cubic bezier produces more points than endpoints only" {
     var tess = PathTessellator.init(alloc);
     defer tess.deinit();
 
-    // S 形三次 Bezier：从 (0,0) 经 (0,100),(100,0) 到 (100,100)
+    // S-curve cubic Bezier: from (0,0) via (0,100),(100,0) to (100,100)
     const cmds = [_]TestPathCommand{
         .{ .move_to = .{ .x = 0, .y = 0 } },
         .{ .cubic_to = .{
@@ -460,7 +459,7 @@ test "flatten cubic bezier produces more points than endpoints only" {
     const contours = try tess.flatten(TestPathCommand, &cmds, 1.0);
 
     try std.testing.expectEqual(@as(usize, 1), contours.len);
-    // 100px 跨度的 S 形应细分为多个点
+    // 100px S-curve should subdivide to multiple points
     try std.testing.expect(contours[0].pointCount() > 3);
     try std.testing.expect(contours[0].closed);
 }
@@ -502,7 +501,7 @@ test "repeated flatten reuses buffers and stays correct" {
         .close,
     };
 
-    // 第二次 flatten 使前一次结果失效，本身必须仍然正确
+    // Second flatten invalidates previous result, must itself still work
     for (0..3) |_| {
         const a = try tess.flatten(TestPathCommand, &square, 1.0);
         try std.testing.expectEqual(@as(usize, 1), a.len);
@@ -520,7 +519,7 @@ test "degenerate contour before move_to is discarded and pool rewinds" {
     defer tess.deinit();
 
     const cmds = [_]TestPathCommand{
-        .{ .move_to = .{ .x = 99, .y = 99 } }, // 单点 contour，应被丢弃
+        .{ .move_to = .{ .x = 99, .y = 99 } }, // Single-point contour, should discard
         .{ .move_to = .{ .x = 0, .y = 0 } },
         .{ .line_to = .{ .x = 10, .y = 0 } },
         .{ .line_to = .{ .x = 10, .y = 10 } },

@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# run_devtools_smoke.sh — DevTools Performance 面板真窗口冒烟验证
+# run_devtools_smoke.sh -- DevTools Performance panel real window smoke test
 #
-# 断言（详见 examples/devtools_probe/main.zig 头注）：
-#   Phase A: target 活跃时帧间隔历史被回填、FPS 文本实时更新、DevTools 保活不断链；
-#   Phase B: target 停帧后 DevTools 仍自轮询渲染、FPS 行出现 idle 标注。
-# 用法：bash scripts/run_devtools_smoke.sh [frames=180]
+# Assertions (see examples/devtools_probe/main.zig header):
+#   Phase A: target active, frame interval history backfilled, FPS text updated in real
+#            time, DevTools alive, no chain break;
+#   Phase B: target stalled, DevTools still auto-polls render, FPS row shows idle note.
+# Usage: bash scripts/run_devtools_smoke.sh [frames=180]
 set -uo pipefail
 cd "$(dirname "$0")/.."
 

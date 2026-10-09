@@ -14,7 +14,7 @@ const paint_order = @import("../paint_order.zig");
 const render_context_mod = @import("render_context.zig");
 pub const RenderContext = render_context_mod.RenderContext;
 
-// 子模块：已提取的独立功能
+// Submodules: extracted standalone functions
 const geometry = @import("geometry.zig");
 const clip_mod = @import("clip.zig");
 const tick_mod = @import("tick.zig");
@@ -88,11 +88,10 @@ fn restoreChildOrders(restores: *const std.ArrayList(ChildOrderRestore)) void {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 子模块导入别名：将子模块的类型和函数引入当前命名空间
-// ─────────────────────────────────────────────────────────────────────────────
+// Submodule import aliases: bring submodule types and functions into current
+// namespace
 
-// node_state：核心数据结构体
+// node_state: core data structure
 const RetainedIds = node_state.RetainedIds;
 const NodeRenderState = node_state.NodeRenderState;
 const NodeContentRenderState = node_state.NodeContentRenderState;
@@ -111,69 +110,133 @@ fn childPasses(_: bool) []const ChildRenderPass {
     return &paint_order.bands;
 }
 
-// node_style_render：背景/边框/阴影/媒体渲染
+// node_style_render: background / stroke / shadow / media render
 const makeDisplayItemHeader = style_render.makeDisplayItemHeader;
 const appendNodeShadowAndBackground = style_render.appendNodeShadowAndBackground;
 const appendNodeBorder = style_render.appendNodeBorder;
 const appendNodeOutline = style_render.appendNodeOutline;
 const appendNodeMedia = style_render.appendNodeMedia;
 
-// text_item_render：DisplayList 文本项生成
+// text_item_render: DisplayList text item generation
 const appendDisplayTextItem = text_item_render.appendDisplayTextItem;
 
-// 波浪线下划线（diagnostic squiggle）纯几何工具，对外暴露做单测
+// Wavy underline (diagnostic squiggle) pure geometry tool, exposed for unit
+// tests
 pub const WavyParams = text_item_render.WavyParams;
 pub const wavyCenterAt = text_item_render.wavyCenterAt;
 pub const wavyDotStep = text_item_render.wavyDotStep;
 
-// text_render：文本渲染
+// text_render: text rendering
 const resolveNodeLogicalTextProps = text_render.resolveNodeLogicalTextProps;
 const computeContentExtent = text_render.computeContentExtent;
 const renderOverflowFade = text_render.renderOverflowFade;
 
-// cache_finalize：节点缓存最终化
+// cache_finalize: node cache finalization
 const finalizeNodeCaches = cache_finalize.finalizeNodeCaches;
 
-// retained_metadata：PropertyTree 写入 + SceneRuntime 更新 + 调试工具
+// retained_metadata: PropertyTree write + SceneRuntime update + debug tools
 const shouldDebugOverlayNode = retained_meta.shouldDebugOverlayNode;
 const debugOverlayPlan = retained_meta.debugOverlayPlan;
 const appendRetainedMetadata = retained_meta.appendRetainedMetadata;
 
-// effect_bridge：效果/裁剪桥接层
+// effect_bridge: effect / clip bridge layer
 
-// display_list_lowering：DisplayItem local->world lowering 主路径。
-// 2026-05-08 重命名 display_list_replay -> display_list_lowering 后保留 4 个 alias
-// 给 tests.zig：getNodeDisplayItems / getNodeTextBlobs / getNodeDisplayPayload /
-// appendNodeDisplayPayloadToRenderList。GpuDraw B-7 paint_table 主路径接入后再
-// 评估能否进一步内联到 cx.render() 末尾、彻底删本文件。
+// display_list_lowering: main path for DisplayItem local->world lowering.
+// Four aliases are kept for tests.zig: getNodeDisplayItems / getNodeTextBlobs /
+// getNodeDisplayPayload / appendNodeDisplayPayloadToRenderList.
+// TODO: after GpuDraw B-7 paint_table main path integration, consider inlining into the
+// cx.render() tail and deleting this file.
 pub const getNodeDisplayItems = display_list_lowering_mod.getNodeDisplayItems;
 pub const getNodeTextBlobs = display_list_lowering_mod.getNodeTextBlobs;
 pub const getNodeDisplayPayload = display_list_lowering_mod.getNodeDisplayPayload;
 pub const appendNodeDisplayPayloadToRenderList = display_list_lowering_mod.appendNodeDisplayPayloadToRenderList;
 const appendNodeDisplayPayloadToRenderListForReplay = display_list_lowering_mod.appendNodeDisplayPayloadToRenderListForReplay;
 
-/// 当前帧的 dt（秒），由 tickBeforeRender 设置，供 on_before_render hook 读取
+/// Current frame dt (seconds), set by tickBeforeRender, read by on_before_render
+/// hook
 pub var current_frame_dt_seconds: f32 = 1.0 / 60.0;
 
-/// 当前帧的绝对时间戳（ms），单调递增，相对于应用启动。
-/// 动画系统通过 (now_ms - start_time_ms) / duration 计算精确 progress，零累积误差。
+/// Current frame absolute timestamp (ms), monotonic increasing relative to app
+/// launch. Animation system computes exact progress via (now_ms - start_time_ms) /
+/// duration, zero cumulative error.
 pub var current_frame_time_ms: f64 = 0;
-/// 记录设置 `current_frame_time_ms` 时的真实单调时钟（ms），用于事件阶段估算“当前时刻”。
+/// Record real monotonic clock (ms) when `current_frame_time_ms` set, used for
+/// event phase to estimate "current time".
 pub var current_frame_monotonic_ms: f64 = 0;
-/// 当前帧的增量 dt（ms），保留给 Spring 物理模拟等需要增量的消费者。
+/// Current frame delta dt (ms): actual frame interval (max 1s, idle wake first
+/// frame nominal), for delta consumers.
 pub var current_frame_dt_ms: f32 = 16.667;
 
+pub var current_reduced_motion: bool = false;
+pub var current_frame_io: ?std.Io = null;
+
 pub const FrameClock = struct {
+    io: std.Io,
+    reduced_motion: bool = false,
     time_ms: f64,
     dt_ms: f32,
     dt_seconds: f32,
 };
 
+/// Complete snapshot of global animation clock (includes monotonic moment for
+/// event phase estimate), save/restore for nested host entry.
+pub const SavedFrameClock = struct {
+    io: ?std.Io,
+    time_ms: f64,
+    monotonic_ms: f64,
+    dt_ms: f32,
+    dt_seconds: f32,
+};
+
+pub fn saveFrameClock() SavedFrameClock {
+    return .{
+        .io = current_frame_io,
+        .time_ms = current_frame_time_ms,
+        .monotonic_ms = current_frame_monotonic_ms,
+        .dt_ms = current_frame_dt_ms,
+        .dt_seconds = current_frame_dt_seconds,
+    };
+}
+
+pub fn restoreFrameClock(saved: SavedFrameClock) void {
+    current_frame_io = saved.io;
+    current_frame_time_ms = saved.time_ms;
+    current_frame_monotonic_ms = saved.monotonic_ms;
+    current_frame_dt_ms = saved.dt_ms;
+    current_frame_dt_seconds = saved.dt_seconds;
+}
+
 pub fn setFrameClock(clock: FrameClock) void {
+    current_frame_io = clock.io;
+    current_reduced_motion = clock.reduced_motion;
     current_frame_time_ms = clock.time_ms;
-    current_frame_monotonic_ms = @as(f64, @floatFromInt(std.time.nanoTimestamp())) / 1_000_000.0;
+    current_frame_monotonic_ms = @as(f64, @floatFromInt(@import("zenit_time").monotonicTimestamp(clock.io))) / 1_000_000.0;
     current_frame_dt_ms = clock.dt_ms;
     current_frame_dt_seconds = clock.dt_seconds;
+}
+
+test "nested frame clock restores the owning IO context and time" {
+    const original = saveFrameClock();
+    const original_reduced_motion = current_reduced_motion;
+    defer {
+        restoreFrameClock(original);
+        current_reduced_motion = original_reduced_motion;
+    }
+    var nested = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer nested.deinit();
+    setFrameClock(.{ .io = std.testing.io, .time_ms = 125, .dt_ms = 10, .dt_seconds = 0.01 });
+    const outer = saveFrameClock();
+    setFrameClock(.{ .io = nested.io(), .time_ms = 500, .dt_ms = 20, .dt_seconds = 0.02 });
+    try std.testing.expect(current_frame_io.?.userdata == nested.io().userdata);
+    restoreFrameClock(outer);
+    try std.testing.expect(current_frame_io.?.userdata == std.testing.io.userdata);
+    try std.testing.expectEqual(@as(f64, 125), current_frame_time_ms);
+    try std.testing.expectEqual(outer.monotonic_ms, current_frame_monotonic_ms);
+    try std.testing.expectEqual(@as(f32, 10), current_frame_dt_ms);
+    try std.testing.expectEqual(@as(f32, 0.01), current_frame_dt_seconds);
+    restoreFrameClock(.{ .io = null, .time_ms = 42, .monotonic_ms = 0, .dt_ms = 0, .dt_seconds = 0 });
+    try std.testing.expect(current_frame_io == null);
+    try std.testing.expectEqual(@as(f64, 42), estimateTimeMs());
 }
 
 fn shouldCacheOverflowSubtree(node: *Node) bool {
@@ -207,13 +270,14 @@ fn nodeHasSpannedText(node: *Node) bool {
     return false;
 }
 
-/// custom_draw 回调上下文：直接写 lowered DisplayItem，替代子节点递归
+/// custom_draw callback context: directly write lowered DisplayItem, substitute
+/// for child node recursion
 pub const DrawContext = struct {
     /// Maps absolute anchors to the active surface content frame.
     content_from_world: Transform2D = Transform2D.identity(),
     lowering_buffer: *std.ArrayList(display_list_mod.DisplayItem),
-    /// encoder 主路径吃 paint_table.DisplayItem；DrawContext 暴露此
-    /// buffer 给 snapshot.appendTo 等需要直接写到 encoder 路径的 caller。
+    /// encoder main path consumes paint_table.DisplayItem; DrawContext exposes this
+    /// buffer to snapshot.appendTo and other callers needing direct encoder-path writes.
     lowering_buffer_paint: ?*std.ArrayList(@import("../paint_table.zig").DisplayItem) = null,
     display_list: ?*display_list_mod.DisplayList = null,
     display_header: ?display_list_mod.ItemHeader = null,
@@ -228,12 +292,12 @@ pub const DrawContext = struct {
     clip: ?ComputedRect,
 };
 
-/// Pre-render pass: tickBeforeRender 公共入口（转发到 tick 子模块）
+/// Pre-render pass: tickBeforeRender common entry (forwards to tick submodule)
 pub fn tickBeforeRender(node: *Node, offset_x: f32, offset_y: f32, clip_opt: ?ComputedRect, allocator: Allocator, dt_ms: f32) bool {
     return tick_mod.tickBeforeRender(node, offset_x, offset_y, clip_opt, allocator, dt_ms, current_frame_time_ms);
 }
 
-// ─────────── 帧初始化 ───────────
+// -- Frame initialization --
 
 fn beginRetainedFrame(cx: *RenderContext) void {
     cx.display_payload_prefix_broken = false;
@@ -242,6 +306,9 @@ fn beginRetainedFrame(cx: *RenderContext) void {
     cx.layer_tree.planClear();
     cx.display_list.clear();
     cx.text_blob_store.clear();
+    // Previous frame blob borrow invalidates: reclaim text switched out between
+    // frames
+    cx.world.content.releaseRetired();
     _ = cx.property_tree.appendTransform(.{
         .parent = 0,
         .node_id = 0,
@@ -253,12 +320,13 @@ fn beginRetainedFrame(cx: *RenderContext) void {
             .is_axis_aligned = true,
             .is_integer_translation = true,
         },
-        // 不可降级：这是 property_tree 的根 transform（id 0），后续所有
-        // transform_id 都相对它编号。缺失 -> 全帧 transform 索引整体错位。
+        // Non-degradable: this is property_tree root transform (id 0), all subsequent
+        // transform_ids indexed relative to it. Missing -> all-frame transform indices
+        // misaligned.
     }) catch @panic("OOM: property_tree root transform append");
 }
 
-// ─────────── 显示列表 payload 范围更新 ───────────
+// -- Display list payload range update --
 
 fn updateNodeDisplayPayloadRanges(
     cx: *RenderContext,
@@ -288,7 +356,7 @@ fn updateNodeSubtreeDisplayPayloadRanges(
     }
 }
 
-// ─────────── 显示列表决策 ───────────
+// -- Display list decision --
 
 fn canUseSafeSelfEffectDisplayPayload(
     cx: *RenderContext,
@@ -331,19 +399,18 @@ fn canRepresentOwnContentInDisplayList(
 ) bool {
     const allow_safe_self_effect = canUseSafeSelfEffectDisplayPayload(cx, node, exec_state, active_parent_effect_id);
     const uses_relative_effect_space = active_parent_effect_id != INVALID_ID or allow_safe_self_effect;
-    // Phase G experiment: removed `hasScrollAncestor` restriction.
-    // Replay path reads world transforms from property tree at replay time,
-    // so coordinates stay correct across scroll. The previous restriction
-    // completely disabled own-content display list caching for all editor
-    // content (which lives inside a ScrollArea), forcing every frame to
-    // rebuild ~100 nodes. Measured ph_rep=55ms p50 on sqlite3_test.c edit_cfile.
-    // blur-only effect owner（无 opacity layer / rounded_clip 捕获面）可表示：
-    // item 的 effect header 会让 lowering 在正确位置开 begin_blur，内容保持
-    // world 帧（.self_blur 同合同）。blur 节点恒 promoted，但它没有内容捕获
-    // 面（applyBackdropBlur 即时合成），promoted 拒绝理由（内容走 surface
-    // 缓存路径）对它不成立。拒绝它会把嵌套 blur 子树整棵推回 paint pass
-    // 尾部 fresh emit -> 存储序倒挂，玻璃背板糊掉树序在后的兄弟内容
-    //（下游应用 header 双层毛玻璃 + 面包屑消失实拍）。
+    // No `hasScrollAncestor` restriction: replay reads world transforms from the property tree
+    // at replay time, so coordinates stay correct across scroll. The restriction would disable
+    // own-content display list caching for all content inside a ScrollArea, forcing a rebuild
+    // of every node each frame.
+    //
+    // Blur-only effect owner (no opacity layer / rounded_clip capture surface) is representable:
+    // the item's effect header lets lowering begin_blur at the correct position, and content
+    // stays in the world frame (same contract as .self_blur). A blur node is always promoted but
+    // has no content capture surface (applyBackdropBlur composes instantly), so the promoted
+    // rejection rationale (content through the surface cache path) does not apply. Rejecting it
+    // pushes the nested blur subtree to the paint pass tail (fresh emit) -> storage order
+    // inverted, and the glass backplate obscures tree-later sibling content.
     const blur_only_effect = effectiveBackdropBlurRadius(node) >= 0.5 and !exec_state.use_opacity_layer and !exec_state.use_rounded_clip;
     if (exec_state.use_opacity_layer and !allow_safe_self_effect) return false;
     if (exec_state.is_promoted_layer and !blur_only_effect) return false;
@@ -400,7 +467,7 @@ fn tryReplaySubtreePayloadFromPlan(
     parent_effect_id: u32,
 ) !bool {
     if (!exec_plan.should_try_display_payload_subtree_replay) return false;
-    if (std.posix.getenv("ZENIT_DISABLE_SUBTREE_PAYLOAD_REPLAY") != null) return false; // 逃生阀:排查裁剪/残影时切除
+    if (@import("zenit_environment").has("ZENIT_DISABLE_SUBTREE_PAYLOAD_REPLAY")) return false; // Escape hatch: cut when investigating clipping / artifacts
     if (try appendNodeDisplayPayloadToRenderListForReplay(
         cx,
         node,
@@ -568,12 +635,11 @@ fn subtreeCanUseDisplayListPrepassWithSelfBlur(
     if (@abs(node.style.scale_x() - 1.0) > 0.0001 or @abs(node.style.scale_y() - 1.0) > 0.0001) return false;
     if (@abs(node.style.rotate()) > 0.0001) return false;
     if (node.getOpacity() < 0.999) return false;
-    // 无子节点的 blur 节点（如下游应用 header 的毛玻璃通铺带）也必须走 prepass：
-    // display_list 存储序 = z 序，若它被 prepass 拒绝而落到 paint pass 尾部
-    // fresh emit，会排到**树序在它之后、但走了 prepass** 的兄弟内容后面,
-    // 玻璃背板画在后画内容之上，把文字整片糊掉（下游应用 header 面包屑消失
-    // 实拍）。leaf 的 own 内容即 subtree payload，.self_blur 的世界坐标
-    // 语义对 leaf 同样成立。
+    // Blur nodes without children (e.g. a glass header band) must also use prepass:
+    // display_list storage order = z order. If rejected by prepass and left to fresh emit at the
+    // paint pass tail, it sorts after **tree-later but prepass'd** sibling content, so the glass
+    // backplate paints over it and obscures the text. The leaf's own content is subtree payload,
+    // and .self_blur world coordinate semantics hold for a leaf equally.
     if (node.frame_state.state_bits.flags.has_custom_draw_subtree) return false;
     if (subtreeHasOutOfBandPasses(node)) return false;
     if (exec_state.retained_ids.effect_id == INVALID_ID) return false;
@@ -594,8 +660,8 @@ fn subtreeCanUseDisplayListPrepassWithSelfBlur(
         ) orelse return false;
         const child_exec_plan = buildNodeExecutionPlan(cx, child, child_exec_state, exec_state.retained_ids.effect_id);
         if (child.children.items.len == 0) {
-            // 嵌套 blur 叶子（progressive blur 内层）：blur 恒 promoted ->
-            // should_write_promoted_cache 会误拒；它自身能走 self_blur 即合格。
+            // Nested blur leaf (progressive blur inner layer): blur always promoted ->
+            // should_write_promoted_cache wrongly rejects; it qualifies by self_blur itself.
             if (subtreeCanUseDisplayListPrepassWithSelfBlur(cx, child, child_exec_state, exec_state.retained_ids.effect_id)) continue;
             if (!canRepresentOwnContentInDisplayList(cx, child, child_exec_state, exec_state.retained_ids.effect_id)) return false;
             if (child_exec_plan.should_try_promoted_replay or child_exec_plan.should_try_legacy_overflow_replay) return false;
@@ -655,67 +721,70 @@ fn markNodeSubtreeRenderedClean(node: *Node) void {
     }
 }
 
-// ─────────── 跨帧子树 payload 缓存（单点脏帧放大器修复） ───────────
+// -- Cross-frame subtree payload cache (avoids O(full tree) re-record on a single dirty leaf) --
 //
-// 现状：display_list / scene_runtime / property_tree 每帧全清重建，任意一个
-// 叶子 markRenderDirty 会把 subtree_render 冒泡到根，prebuild pass 对整棵
-// simple 子树全量重录（appendNodeOwnContent × 全树），O(全树) 放大器。
+// display_list / scene_runtime / property_tree are cleared and rebuilt each frame, and any leaf
+// markRenderDirty bubbles subtree_render to the root, so the prebuild pass would re-record the
+// entire simple subtree (appendNodeOwnContent * full tree).
 //
-// 修法：prebuild fresh 路径为每个 .simple 子树节点写一份跨帧 DisplayItem
-// 副本（text_run 物化断开 blob 引用，content/spans 深拷贝）。下一帧重录父
-// 子树时，干净的兄弟子树直接 appendSlice 缓存副本（splice），只有脏子树 +
-// 根路径 fresh 重录。失效语义与 promoted cache 同源：
-//   - 缓存 header 的 transform/effect/clip id 是写入帧的帧内序号；根 id 三元组
-//     未平移 ⇒ 遍历前缀未变 ⇒ 子树内序号未变，可安全 splice；否则 MISS。
-//   - 节点或子树任何 dirty 位（render/layout/composite × self/subtree）-> MISS。
-//   - hooks / custom_draw / overlay / 动画 / disable_render_cache -> 不参与。
-// 坐标正确性：缓存 item 是 local 空间 + transform_id header，lower 时读当帧
-// property tree 的最新矩阵，祖先平移/滚动不需要失效缓存。
+// The prebuild fresh path therefore writes a cross-frame DisplayItem copy for each .simple
+// subtree node (text_run materialized, blob ref broken, content/spans deep-copied). When the
+// parent subtree is re-recorded, clean sibling subtrees appendSlice their cached copies
+// (splice); only dirty subtrees and the root path are re-recorded. Invalidation follows the
+// promoted cache:
+//   - Cache header transform/effect/clip ids are the frame-internal seq of the write frame;
+//     root id triplet unshifted => traversal prefix unchanged => internal seq unchanged,
+//     safe to splice; else MISS.
+//   - Any dirty bit on node or subtree (render/layout/composite x self/subtree) -> MISS.
+//   - hooks / custom_draw / overlay / animation / disable_render_cache -> excluded.
+// Coordinates: cached items are local space + transform_id header and read the current frame's
+// property tree matrix on lower, so ancestor shifts/scrolls need not invalidate the cache.
 
-/// 单节点缓存 item 数上限：限制祖先-后代重叠拷贝的内存放大
-/// （根子树不缓存、叶/小分支缓存 -> splice 粒度自然落在兄弟层级）。
+/// Single-node cached item count limit: caps ancestor-descendant overlapping copy
+/// memory amplification (root subtree uncached, leaf/small branches cached -> splice
+/// granularity naturally lands at sibling level).
 const subtree_payload_cache_max_items: usize = 256;
 
-/// before_render hook 是否已声明"只影响自身"（NodeFlags 同名位）。
+/// before_render hook declared "self-only impact" (same-named NodeFlags bit).
 ///
-/// 命中时 prebuild **不**打断 paint 前缀：hook 所在节点自身仍然不参与跨帧
-/// payload 缓存（nodeEligibleForSubtreePayloadCache 里的 hasBeforeRenderHooks
-/// 那条继续拦它），但它的**兄弟与后代**恢复正常的缓存资格。
+/// When set, prebuild does **not** cut the paint prefix: the hook's own node is still excluded
+/// from the cross-frame payload cache (hasBeforeRenderHooks in
+/// nodeEligibleForSubtreePayloadCache keeps blocking), but its **siblings and descendants**
+/// regain normal cache eligibility.
 ///
-/// 两条不可放行的例外，与声明位无关（调用方担保不了它们）：
-///   - overlay candidate：弹层每帧由 hook 重定位（setPopoverTranslate），
-///     预录会烘焙首帧 translate=0 的位置 -> 内容残留左上角。
-///   - 活跃的手动 transform/opacity 动画：hook 每帧写的就是祖先级变换。
+/// Two exceptions apply regardless of the declaration (callsites can't guarantee them):
+///   - overlay candidate: the hook relocates the float each frame (setPopoverTranslate), so
+///     prebake burns in the first-frame translate=0 position -> residue at top-left.
+///   - Active manual transform/opacity animation: the hook writes ancestor-level transform
+///     each frame.
 ///
-/// 逃生阀 ZENIT_DISABLE_HOOK_SELF_SCOPE=1 -> 整个降级失效，回到保守语义。
+/// Escape hatch ZENIT_DISABLE_HOOK_SELF_SCOPE=1 disables the downgrade entirely.
 fn hookScopeIsSelfOnly(node: *Node, exec_state: NodeExecutionState, parent_effect_id: u32) bool {
     if (!node.frame_state.state_bits.flags.before_render_hook_affects_self_only) return false;
-    // 逃生阀与同文件其它两处（ZENIT_DISABLE_SUBTREE_PAYLOAD_REPLAY/
-    // ZENIT_DISABLE_SUBTREE_SPLICE）保持一致：不缓存。
-    // 交叉审查提醒：进程级一次性 cache 会把值焊死，同一测试二进制内再也
-    // 覆盖不到另一分支，且行为与"当前 env"矛盾，排查时极具误导性。
-    // 这条判定每帧至多每节点一次，getenv 的开销不值得用那份风险去换。
-    if (std.posix.getenv("ZENIT_DISABLE_HOOK_SELF_SCOPE") != null) return false;
-    // 例外一：弹层重定位由 hook 每帧改 transform，担保不成立。
+    // Escape hatch is not cached, consistent with ZENIT_DISABLE_SUBTREE_PAYLOAD_REPLAY /
+    // ZENIT_DISABLE_SUBTREE_SPLICE: a process-level one-shot cache bakes the value, so the same
+    // test binary can't reach the other branch and behavior contradicts the "current env".
+    // This check runs at most once per node per frame; getenv overhead is not worth that risk.
+    if (@import("zenit_environment").has("ZENIT_DISABLE_HOOK_SELF_SCOPE")) return false;
+    // Exception one: float relocation hook changes transform each frame, guarantee
+    // void.
     if (exec_state.retained_runtime.is_overlay_candidate) return false;
-    // 例外二：手动动画进行中时 hook 写的是变换本身。
+    // Exception two: manual animation in progress, hook writes transform itself.
     const flags = node.frame_state.state_bits.flags;
     if (flags.manual_transform_animation_active or flags.manual_opacity_animation_active) return false;
-    // 例外三：本节点自己是 promoted surface owner。
+    // Exception three: this node itself is promoted surface owner.
     if (exec_state.is_promoted_layer) return false;
-    // 例外四（storybook damage-rect 回归实测）：**位于某个 retained/effect
-    // surface 之内**的节点不放行。
+    // Exception four: nodes **inside a retained/effect surface** are not allowed.
     //
-    // 机制：retained 层的部分重绘（opacity_layer.zig:730-741）靠"本帧内容没命中
-    // 缓存 -> 重录 -> diff 出脏区"来产出 damage rect。一旦本节点的内容改走跨帧
-    // splice，retained 层就看不到这次变化，partial_repaints 不再增长,
-    // 实测 storybook「modal 内按钮悬停触发部分重绘」从 PASS 变 FAIL
-    // （107 -> 107，逃生阀关掉即恢复 121/121）。
+    // Retained layer partial redraws (opacity_layer.zig:730-741) derive the damage rect from
+    // "frame content missed cache -> re-record -> diff dirty region". If this node's content
+    // switched to cross-frame splice, the retained layer couldn't see the change and
+    // partial_repaints would stop growing (storybook "button hover in modal triggers partial
+    // redraw" fails; ZENIT_DISABLE_SUBTREE_SPLICE restores it).
     //
-    // 判据用 parent_effect_id：它沿递归下传，非 INVALID 即表示"祖先链上有
-    // effect/promoted surface"，正是 damage-rect 与 promoted cache assembly
-    // 两条路径的作用域。这也同时覆盖了交叉审查担心的 GlassLab 形态
-    // （blur 岛内的节点）。
+    // Criterion uses parent_effect_id: passed down recursively, non-INVALID means an
+    // effect/promoted surface is on the ancestor chain, exactly the scope of the damage-rect and
+    // promoted cache assembly paths. Also covers nodes inside a blur island (GlassLab).
     if (parent_effect_id != INVALID_ID) return false;
     return true;
 }
@@ -788,11 +857,12 @@ fn subtreePayloadStampValid(
     return true;
 }
 
-/// 干净子树跨帧 payload splice：命中则整支子树免重录，直接把缓存副本追加到
-/// display_list 当前位置（与 fresh prebuild 落点一致，paint-order 不变式保持），
-/// 并回填 runtime ranges + prebuilt 标记，paint pass 走既有 subtree-replay 短路。
+/// Clean subtree cross-frame payload splice: on hit, entire subtree avoids re-record,
+/// directly append cached copy to display_list current position (matches fresh prebuild
+/// landing, paint-order invariant maintained), backfill runtime ranges + prebuilt flag,
+/// paint pass takes existing subtree-replay shortcut.
 fn trySpliceSubtreePayloadCache(cx: *RenderContext, node: *Node) !bool {
-    if (std.posix.getenv("ZENIT_DISABLE_SUBTREE_SPLICE") != null) return false; // 逃生阀:排查裁剪/残影时切除
+    if (@import("zenit_environment").has("ZENIT_DISABLE_SUBTREE_SPLICE")) return false; // Escape hatch: cut when investigating clipping / artifacts
     const cache = node.meta.per_frame.caches.commands.subtree_payload orelse return false;
     if (!nodeCleanForSubtreePayloadSplice(node)) return false;
     const runtime = cx.scene_runtime.get(node.id) orelse return false;
@@ -810,15 +880,15 @@ fn trySpliceSubtreePayloadCache(cx: *RenderContext, node: *Node) !bool {
 
     const start = cx.display_list.items.items.len;
     try appendCachedCommands(cx, cache.commands);
-    // 记账用 append 后的实际长度差：appendCachedCommands 会静默 continue
-    // 跳过本帧无 scene_runtime 记录的缓存项（后代被 cull），用 cache.commands.len
-    // 会虚高，splice 追加在列表尾，虚高范围会侵入后续 sibling 的显示项，
-    // 下次以此为源重建缓存时把邻居的 item 吸进来。
+    // Use actual length delta after append: appendCachedCommands silently skips cache items
+    // without scene_runtime records this frame (descendants culled), using cache.commands.len
+    // gives false high, splice appends to list tail, false high range invades next sibling's
+    // display items, rebuilding cache from this source next time absorbs neighbor items.
     const appended: u32 = @intCast(cx.display_list.items.items.len - start);
     if (cx.scene_runtime.nodes.getPtr(node.id)) |rt| {
         rt.display_item_start = @intCast(start);
         rt.display_item_count = cache.self_content_command_count;
-        // 缓存内文本已物化（content 内联，blob 断开），blob range 置零。
+        // Cached text materialized (content inlined, blob disconnected), blob range zeroed.
         rt.text_blob_start = 0;
         rt.text_blob_count = 0;
         rt.subtree_display_item_start = @intCast(start);
@@ -835,8 +905,9 @@ fn trySpliceSubtreePayloadCache(cx: *RenderContext, node: *Node) !bool {
     return true;
 }
 
-/// fresh prebuild 后写跨帧缓存：拷贝本子树刚写入 display_list 的区段，
-/// 物化 text blob 引用后深拷贝持久化。仅 .simple 策略子树内调用。
+/// After fresh prebuild, write cross-frame cache: copy section just written to
+/// display_list by this subtree, materialize text blob reference then deep-copy persist.
+/// Called only within .simple strategy subtrees.
 fn maybeWriteSubtreePayloadCache(cx: *RenderContext, node: *Node, subtree_display_start: usize) void {
     const end = cx.display_list.items.items.len;
     if (end <= subtree_display_start) {
@@ -859,8 +930,9 @@ fn maybeWriteSubtreePayloadCache(cx: *RenderContext, node: *Node, subtree_displa
 
     const buf = cx.frame_allocator.alloc(DisplayItem, count) catch return;
     @memcpy(buf, cx.display_list.items.items[subtree_display_start..end]);
-    // 跨帧自包含化（同 assembleCacheCommands）：blob-backed text_run 就地物化，
-    // 断开对每帧重建 text_blob_store 的 id 引用（blob_id 跨帧失效坑）。
+    // Cross-frame self-containment (same as assembleCacheCommands): blob-backed text_run
+    // materialize in-place, sever id reference to per-frame rebuilt text_blob_store
+    // (blob_id cross-frame expiry trap).
     for (buf) |*item| {
         switch (item.*) {
             .text_run => |*t| {
@@ -883,8 +955,8 @@ fn maybeWriteSubtreePayloadCache(cx: *RenderContext, node: *Node, subtree_displa
         runtime.clip_id,
         runtime.world_bounds,
     );
-    // stamp content_version 与 runtime 对齐（buildCachedRenderSlice 取的是
-    // node 缓存 versions，splice 端比对的是 runtime.content_version）。
+    // Stamp content_version aligned with runtime (buildCachedRenderSlice takes node cache
+    // versions, splice side compares against runtime.content_version).
     if (node.meta.per_frame.caches.commands.subtree_payload) |*cache| {
         cache.content_version = runtime.content_version;
     }
@@ -900,22 +972,25 @@ fn prebuildSimpleDisplayPayloadSubtree(
     const subtree_display_start = cx.display_list.items.items.len;
     const subtree_blob_start = cx.text_blob_store.blobs.items.len;
 
-    // R3c: appendNodeOwnContent 仍写 cx.lowering_buffer（effect_bridge 路径）但
-    // 这一帧整个 cx.lowering_buffer 末尾被 derive clear+rewrite，不需要 prebuild
-    // truncate 保护主 buffer。display_list 写出物保留，它就是 prebuilt payload。
+    // R3c: appendNodeOwnContent still writes cx.lowering_buffer (effect_bridge path) but
+    // entire cx.lowering_buffer tail derived clear+rewrite this frame, no need prebuild
+    // truncate protect main buffer. display_list write output retained, it is prebuilt
+    // payload.
     try appendNodeOwnContent(cx, node, exec_state);
     setNodeDisplayPayloadOwnPrebuilt(cx, node.id, true);
 
-    // scroll 容器的像素裁剪对必须录进 prebuilt payload(children 包围),
-    // 否则 subtree replay / splice 命中帧零裁剪,见 prebuildScrollClipBegin。
+    // Scroll container's pixel clip pair must record into prebuilt payload (encloses
+    // children), else subtree replay / splice hits frame-zero clipping, see
+    // prebuildScrollClipBegin.
     const scroll_clip_on = try prebuildScrollClipBegin(cx, node, exec_state);
     for (node.children.items) |child| {
         if (!shouldRenderChildInPass(child, exec_state.use_opacity_layer, .regular)) continue;
-        // 下游回归：干净兄弟子树跨帧 payload 命中 -> 直接 splice，免重录。
+        // Downstream regression: clean sibling subtree cross-frame payload hit -> splice
+        // directly, avoid re-record.
         if (allow_subtree_payload_cache and try trySpliceSubtreePayloadCache(cx, child)) continue;
-        // prebuild 阶段不传 parent_clip 给子节点，避免 viewport culling 导致
-        // 缓存的 display payload 缺少被 cull 子节点的内容。
-        // display payload 是跨帧复用的，但 clip 区域会因滚动而变化。
+        // prebuild phase doesn't pass parent_clip to children, avoid viewport culling
+        // causing cached display payload missing culled child content. display payload reused
+        // cross-frame, but clip area changes with scrolling.
         const child_exec_state = buildNodeExecutionState(
             cx,
             child,
@@ -943,11 +1018,10 @@ fn prebuildDisplayPayloadSubtrees(
     inherited_force_linear_text: bool,
     parent_effect_id: u32,
 ) !void {
-    // Paint-order 前缀不变式：前面某个节点已把内容留给 paint pass，
-    // 那么 paint 顺序在其后的一切都必须同样留给 paint pass fresh emit
-    // 这里再 prebuild 会让"后画"的 items 排到"先画"的 fresh items
-    // 之前（fresh 只能追加在表尾）。scene_runtime 每帧清零，默认即
-    // not-prebuilt，直接返回即可。
+    // Paint-order prefix invariant: if some earlier node left content for paint pass, all
+    // painting later must likewise leave for paint pass fresh emit; prebuild here would put
+    // "paint-later" items before "paint-earlier" fresh items (fresh only appends to tail).
+    // scene_runtime cleared per-frame, default is not-prebuilt, return immediately.
     if (cx.display_payload_prefix_broken) return;
     const crosses_cache_boundary = if (cx.render_cache_boundary_blocked) |blocked|
         blocked.contains(node.id)
@@ -957,7 +1031,8 @@ fn prebuildDisplayPayloadSubtrees(
     // the clean-runtime shortcut so a newly enabled descendant boundary cannot
     // inherit last frame's "already prebuilt" state and bypass this pass.
     if (crosses_cache_boundary) dropSubtreePayloadCache(node);
-    // 快速跳过：节点和子树都 clean 且已有有效 prebuild payload -> 不需要重建
+    // Fast skip: node and subtree both clean with valid prebuild payload -> no rebuild
+    // needed
     if (!crosses_cache_boundary and
         !node.frame_state.state_bits.dirty.core.render and
         !node.frame_state.state_bits.dirty.core.subtree_render)
@@ -966,8 +1041,9 @@ fn prebuildDisplayPayloadSubtrees(
             if (runtime.display_payload_subtree_prebuilt) return;
         }
     }
-    // 下游回归：干净子树跨帧 payload 命中 -> 整支免重录（含 own/subtree 两个
-    // prebuild pass, subtree_prebuilt=true 会让 own pass 与 paint pass 都短路）。
+    // Downstream regression: clean subtree cross-frame payload hit -> entire subtree
+    // avoids re-record (includes both own/subtree prebuild passes, subtree_prebuilt=true
+    // shortcuts both own and paint passes).
     if (try trySpliceSubtreePayloadCache(cx, node)) return;
     setNodeDisplayPayloadSubtreePrebuilt(cx, node.id, false, .none);
     const exec_state = buildNodeExecutionState(
@@ -978,34 +1054,37 @@ fn prebuildDisplayPayloadSubtrees(
         inherited_force_linear_text,
     ) orelse return;
 
-    // Overlay 候选（z_index>0）且自带 before_render hook 的节点（Popover/Menu/
-    // Dropdown content）每帧由 hook 在 render 时重定位（setPopoverTranslate）。
-    // 跨帧 prebuild 的 display payload 会按**首次 prebuild 时**的 transform 烘焙
-    // （弹层刚开时 translate=0 -> 内容在 (0,0)），之后被 replay 在旧位置 -> 弹层
-    // 内容残留屏幕左上角。这类节点不参与跨帧 payload 缓存，强制每帧 paint pass
-    // 走真实 world transform 重新发射，与 hook 定位一致。
+    // Overlay candidates (z_index>0) with before_render hooks (Popover/Menu/Dropdown content) are
+    // relocated by the hook every frame (setPopoverTranslate). Cross-frame prebuild payload bakes
+    // the **first prebuild** transform (a just-opened float has translate=0 -> content at (0,0)),
+    // later replayed at the old position -> content lingers at screen top-left. These nodes are
+    // excluded from the cross-frame payload cache and forced through the paint pass each frame,
+    // with the real world transform, aligned with hook positioning.
     //
-    // 注意：composited_group surface owner（Modal/Sheet）**不**在此排除，它的子树
-    // payload 必须正常 prebuild，否则 promoted-surface cache assembly
-    // （node_cache_finalize.assembleCacheCommands）的 regular_children 取不到子项 ->
-    // settle 帧 dialog 只剩 self（白底框）、标题/×/body 全丢。
+    // NOTE: composited_group surface owners (Modal/Sheet) are **not** excluded: their subtree
+    // payload must prebuild normally, else promoted-surface cache assembly
+    // (node_cache_finalize.assembleCacheCommands) gets no regular_children and the settle frame
+    // keeps only the dialog itself (white box), losing title/x/body.
     if (node.hasBeforeRenderHooks() and
         (exec_state.retained_runtime.is_overlay_candidate or
             !exec_state.retained_runtime.content_flags.has_custom_draw) and
         !hookScopeIsSelfOnly(node, exec_state, parent_effect_id))
     {
-        // 内容留给 paint pass -> 前缀到此为止（不变式见 prefix_broken 声明）。
-        // 不限 overlay candidate：任何 before_render hook（拖拽 spring 写
-        // translate、滚动条 fade 等）都逐帧改变本子树的 transform/内容，
-        // prebuild 下潜预录其子会烘焙**本帧 hook 运行前**的状态；paint 侧一旦
-        // 又对同一子树 fresh/direct 发射，就得到"半 prebuilt 半 fresh"的
-        // 双份（GlassLab 拖拽球滚动闪烁根因：settle 帧 prebuild 深入 ->
-        // 玻璃+高光双合成偏白，滚动帧 prefix 早断 -> 单份，两态逐帧切换）。
-        // 例外：custom-draw 节点（Spinner/Progress）的 hook 只推进动画参数，
-        // own 内容经 display payload replay 按本帧 transform 重投影是安全设计
-        //（有单测锚定 display_list_own_replay_count），保持原预录路径。
+        // Content left for the paint pass -> prefix stops here (invariant: see prefix_broken
+        // declaration). Not limited to overlay candidates: any before_render hook (drag spring
+        // writes
+        // translate, scrollbar fade, etc.) changes this subtree's transform/content per frame, and
+        // prebuild descent bakes the **state before the hook runs this frame**. If the paint side
+        // then fresh-emits the same subtree you get a "half-prebuilt half-fresh" double emit (e.g.
+        // glass+specularity composed twice and washed out on the settle frame, once on scroll
+        // frames).
+        // Exception: custom-draw nodes (Spinner/Progress): the hook only advances animation params
+        // and
+        // own content replays via display payload, re-projected by this frame's transform, which is
+        // safe (anchored by unit test display_list_own_replay_count); keep the original prebuild
+        // path.
         cx.display_payload_prefix_broken = true;
-        return; // 保持 subtree_prebuilt=false → paint pass fresh emit
+        return; // Keep subtree_prebuilt=false -> paint pass fresh emit
     }
 
     if (subtreeCanUseDisplayListPrepassWithSelfScale(cx, node, exec_state, parent_effect_id)) {
@@ -1027,8 +1106,8 @@ fn prebuildDisplayPayloadSubtrees(
                     .self_safe_effect
                 else
                     .simple;
-            // 跨帧 payload 缓存保守版仅覆盖 .simple 策略（无 self-effect 空间
-            // 变换，splice 语义与 fresh emit 完全等价）。
+            // Cross-frame payload cache conservative version covers only .simple strategy (no
+            // self-effect spatial transform, splice semantics identical to fresh emit).
             try prebuildSimpleDisplayPayloadSubtree(cx, node, exec_state, strategy == .simple);
             setNodeDisplayPayloadSubtreePrebuilt(
                 cx,
@@ -1041,34 +1120,33 @@ fn prebuildDisplayPayloadSubtrees(
         }
     }
 
-    // Stage B S5.2 ordering 修复：在 recurse children 前先 emit 自己 own
-    // content，让 display_list 顺序与 paint pass walk (own -> children)
-    // 一致。否则 prebuildOwnDisplayPayloads pass 会把 root own 推迟到所有
-    // children subtree 之后写，导致 PERMUTATION 视觉错乱（parent 覆盖
-    // children）。
+    // Stage B S5.2 ordering fix: emit own content before recurse children, let
+    // display_list order match paint pass walk (own -> children). Else
+    // prebuildOwnDisplayPayloads pass defers root own to after all children subtree write,
+    // causes PERMUTATION visual chaos (parent covers children).
     setNodeDisplayPayloadOwnPrebuilt(cx, node.id, false);
     const own_prebuilt = try prebuildOwnDisplayPayloadForNode(cx, node, exec_state, parent_effect_id);
-    if (std.posix.getenv("ZENIT_DEBUG_PREPASS") != null) {
+    if (@import("zenit_environment").has("ZENIT_DEBUG_PREPASS")) {
         std.debug.print("[prepass] node={d} fallback own_prebuilt={} has_own={} children={d}\n", .{ node.id, own_prebuilt, nodeHasOwnPaintContent(node, exec_state), node.children.items.len });
     }
 
-    // Paint-order 不变式：display_list raw 顺序 == paint 顺序（own -> children）。
-    // 若 own 内容存在但**不能**先行 prebuild（典型：is_promoted_layer surface owner，
-    // canRepresentOwnContentInDisplayList=false），children 也不得 prebuild，否则
-    // children 先落 list、own 由 paint pass 追加到末尾，derive 后父背景盖住整个子树
-    // （settle 帧 Modal 空白面板的根因）。整棵留给 paint pass 按正确顺序 fresh emit；
-    // paint pass renderNodeTransform 会回填 subtree ranges，promoted cache assembly
-    // 仍取得到 children items。
+    // Paint-order invariant: display_list raw order == paint order (own -> children). If own
+    // content exists but **can't** prebuild early (typically is_promoted_layer surface owner,
+    // canRepresentOwnContentInDisplayList=false), children can't prebuild either; otherwise
+    // children land first, own is appended to the tail by the paint pass, and derive after the
+    // parent background covers the whole subtree (blank Modal panel on the settle frame). The
+    // whole subtree is left for the paint pass to fresh-emit in correct order; renderNodeTransform
+    // backfills subtree ranges, and promoted cache assembly still gets children items.
     if (!own_prebuilt and nodeHasOwnPaintContent(node, exec_state)) {
-        // own（典型：rotate/scale 变换、promoted surface owner）只能由
-        // paint pass fresh emit -> 前缀到此为止
+        // own (typical: rotate/scale transform, promoted surface owner) only by paint pass
+        // fresh emit -> prefix stops here
         cx.display_payload_prefix_broken = true;
         return; // subtree_prebuilt=false → paint pass fresh emit
     }
 
-    // scroll 容器 children 的裁剪对同样要录进 fallback 路径的 display_list
-    // 区段(paint pass 对局部 prebuilt 的子孙仍可能走 replay 短路),
-    // 见 prebuildScrollClipBegin。
+    // Scroll container children's clip pair also must record into fallback path
+    // display_list section (paint pass may still take replay shortcut for locally prebuilt
+    // descendants), see prebuildScrollClipBegin.
     const scroll_clip_on = try prebuildScrollClipBegin(cx, node, exec_state);
     for (childPasses(exec_state.use_opacity_layer)) |pass| {
         for (node.children.items) |child| {
@@ -1085,29 +1163,29 @@ fn prebuildDisplayPayloadSubtrees(
     }
     try prebuildScrollClipEnd(cx, exec_state, scroll_clip_on);
 
-    // Stage B S5.2: 跟 simple subtree 路径对齐，fall-through 也 emit overflow_fade
-    // 到 display_list。R3c 后 cx.lowering_buffer 整体被 derive 覆盖，无需 truncate
-    // paint pass 写入。
-    // 前缀不变式：children 循环里若有子树把内容留给了 paint pass，fade
-    //（paint 顺序在 children 之后）也必须留给 paint pass（paint 侧的
-    // appendNodeOverflowFade 会补），否则 fade 会被 fresh children 盖住。
+    // Align with the simple subtree path: the fall-through also emits overflow_fade to
+    // display_list; cx.lowering_buffer derive covers it entirely, so no truncate or paint pass
+    // write is needed. Prefix invariant: if any child subtree in the loop left content for the
+    // paint pass, the fade (paint order after children) must also be left for the paint pass
+    // (appendNodeOverflowFade supplies it), else it gets covered by fresh children.
     if (!cx.display_payload_prefix_broken) {
         try appendNodeOverflowFade(cx, node, exec_state);
     }
 }
 
-/// 节点自身是否有可见 paint 内容（不含子树）。用于 paint-order 不变式判定：
-/// own 有内容但不能先行 prebuild 时，children 不得先落 display_list。
+/// Whether node itself has visible paint content (excludes subtree). Used for
+/// paint-order invariant check: when own has content but can't prebuild early, children
+/// can't land display_list first.
 fn nodeHasOwnPaintContent(node: *Node, exec_state: NodeExecutionState) bool {
     const flags = exec_state.retained_runtime.content_flags;
     return flags.has_background or flags.has_border or flags.has_shadow or
         flags.has_image or flags.has_icon or flags.has_custom_draw or node.getText() != null;
 }
 
-/// 单节点 own prebuild, emit own content 到 display_list。供
-/// prebuildDisplayPayloadSubtrees 在非 simple 路径递归 children 前调用，让
-/// display_list 顺序与 paint pass walk (own -> children) 一致。返回是否成功
-/// prebuilt own。
+/// Single node own prebuild, emit own content to display_list. Called by
+/// prebuildDisplayPayloadSubtrees before recursing children on non-simple path, let
+/// display_list order match paint pass walk (own -> children). Return whether successfully
+/// prebuilt own.
 fn prebuildOwnDisplayPayloadForNode(
     cx: *RenderContext,
     node: *Node,
@@ -1133,11 +1211,11 @@ fn prebuildOwnDisplayPayloads(
     inherited_force_linear_text: bool,
     parent_effect_id: u32,
 ) !void {
-    // 前缀不变式（同 prebuildDisplayPayloadSubtrees 入口）：own pass 跑在
-    // subtree pass 之后、追加在表尾，前缀一旦截断，这里补录的 own 会
-    // 排到断点后 fresh 内容之前，同样错序。断点前的节点要么整支 prebuilt
-    //（本函数开头就跳过），要么 own 已在 subtree pass 落位（epoch 检查
-    // 跳过），全局 bail 不会漏掉合法工作。
+    // Prefix invariant (same as prebuildDisplayPayloadSubtrees entry): own pass runs after
+    // subtree pass, appends to tail, prefix once broken own recorded here sorts before
+    // post-break fresh content, same mispaint. Pre-break nodes either entire subtree prebuilt
+    // (skip at function start) or own already landed in subtree pass (epoch check skip),
+    // global bail misses no legitimate work.
     if (cx.display_payload_prefix_broken) return;
     const runtime = cx.scene_runtime.get(node.id) orelse return;
     if (runtime.display_payload_subtree_prebuilt) return;
@@ -1150,20 +1228,21 @@ fn prebuildOwnDisplayPayloads(
         inherited_force_linear_text,
     ) orelse return;
 
-    // Stage B S5.2: 若 prebuildDisplayPayloadSubtrees 已经在递归 children
-    // 前处理过该节点 own (display_payload_own_prebuilt=true 当帧)，则跳过，
-    // 避免重复 emit。display_list ordering 由 subtree pass 维护 (own 先于
-    // children 写入)。
+    // Stage B S5.2: if prebuildDisplayPayloadSubtrees already handled this node own
+    // before recursing children (display_payload_own_prebuilt=true this frame), skip, avoid
+    // duplicate emit. display_list ordering maintained by subtree pass (own written before
+    // children).
     if (runtime.display_payload_own_prebuilt and
         runtime.display_payload_own_prebuilt_epoch == cx.scene_runtime.frame_epoch)
     {
-        // 已被 subtree pass prebuilt，仅需 recurse children
+        // Already prebuilt by subtree pass, only recurse children
     } else {
         setNodeDisplayPayloadOwnPrebuilt(cx, node.id, false);
         const own_prebuilt = try prebuildOwnDisplayPayloadForNode(cx, node, exec_state, parent_effect_id);
-        // Paint-order 不变式（与 prebuildDisplayPayloadSubtrees 同理）：own 有可见
-        // 内容但不能先行 prebuild -> children 也不得先落 display_list，整棵留给
-        // paint pass fresh emit（否则父背景在 derive 后盖住 children）。
+        // Paint-order invariant (same as prebuildDisplayPayloadSubtrees): own has visible
+        // content but can't prebuild early -> children can't land display_list first, entire
+        // subtree left for paint pass fresh emit (else parent background covers children after
+        // derive).
         if (!own_prebuilt and nodeHasOwnPaintContent(node, exec_state)) return;
     }
 
@@ -1182,7 +1261,7 @@ fn prebuildOwnDisplayPayloads(
     }
 }
 
-// ─────────── 显示载荷预构建 ───────────
+// -- Display payload prebuild --
 
 fn prebuildDisplayPayloads(
     cx: *RenderContext,
@@ -1217,7 +1296,7 @@ fn prebuildDisplayPayloads(
     );
 }
 
-// ─────────── 节点渲染状态计算 ───────────
+// -- Node render state computation --
 
 fn computeNodeRenderState(
     cx: *RenderContext,
@@ -1228,7 +1307,7 @@ fn computeNodeRenderState(
     const self_tx = node.style.translate_x;
     const self_ty = node.style.translate_y;
     const world_transform = geometry.nodeWorldTransform(parent_transform, node);
-    // World.LayoutTable 读 rect。
+    // Read rect from World.LayoutTable.
     const local_rect = cx.rectFromWorld(node);
     const world_rect = world_transform.transformRect(ComputedRect.init(0, 0, local_rect.w, local_rect.h));
     const render_x = world_rect.x;
@@ -1241,12 +1320,14 @@ fn computeNodeRenderState(
     const clip_spec = clip_mod.resolveNodeRenderClipSpec(cx, node, cx.allocator, scale_min);
     var clip_world_rect = world_transform.transformRect(clip_spec.local_rect);
     var needs_clip = clip_spec.enabled;
-    // 外部裁剪矩形（视口系旁表）：节点声明"我受这个矩形裁剪"而无须与裁剪
-    // 来源构成父子（宿主场景：画布 frame 与其成员是平铺兄弟 Node）。
-    // 与自身 overflow clip 取交；完全出界时下方的 <0.1 早退直接 cull 整树。
+    // External clip rectangle (viewport-frame side table): node declares "I'm clipped by
+    // this rectangle" without parent-child with clip source (host scenario: canvas frame
+    // and members are sibling Nodes). Intersect with own overflow clip; fully out-of-bounds
+    // <0.1 below early-exit culls entire tree.
     if (cx.external_clip_rects) |ext_map| if (ext_map.get(node.id)) |ecr| {
         const ext = ComputedRect.init(ecr[0], ecr[1], ecr[2], ecr[3]);
-        // 交集为空 = 零尺寸 clip，走下方 <0.1 早退把整棵子树 cull 掉。
+        // Intersection empty = zero-size clip, take <0.1 below early-exit cull entire
+        // subtree.
         clip_world_rect = if (needs_clip)
             (geometry.intersectRect(clip_world_rect, ext) orelse ComputedRect.init(ext.x, ext.y, 0, 0))
         else
@@ -1270,12 +1351,12 @@ fn computeNodeRenderState(
     else
         world_rect;
 
-    // opacity ≤ 0.001 无条件 cull GPU draw，含 prewarm 隐藏副本（HIDDEN_OPACITY=0.001）。
-    // keep_rendering_when_transparent 只决定**是否留在 tick/layout traversal**
-    // （见 tick.zig：让隐藏子树的 transition 继续推进、layout 测量通路保持预热），
-    // **不**决定是否发射 paint。早先把该 flag 接进 paint cull -> prewarm 副本以
-    // 0.001 经 GPU 混色后在屏幕左上角 (0,0) 留下肉眼可见淡残影（overlay prewarm 把
-    // translate reset 到 0）。这里解耦两件事：0.001 永远不画，预热仅靠 tick/layout。
+    // opacity <= 0.001 unconditionally culls GPU draw, including the prewarm hidden copy
+    // (HIDDEN_OPACITY=0.001). keep_rendering_when_transparent only decides **whether to stay in
+    // tick/layout traversal** (see tick.zig: hidden subtree transitions advance, layout
+    // measurement stays warm), **not** whether to emit paint. Wiring it into paint cull would let
+    // the 0.001 prewarm copy leave faint GPU-blend residue at screen (0,0) (overlay prewarm
+    // resets translate to 0). So 0.001 never draws; preheat goes only via tick/layout.
     if (node_opacity <= 0.001) return null;
     if (needs_clip and (clip_world_rect.w < 0.1 or clip_world_rect.h < 0.1)) return null;
 
@@ -1342,9 +1423,9 @@ fn computeNodeRenderState(
     };
 }
 
-/// "本节点是否开 offscreen opacity/composited surface" 的唯一真值表。
-/// 曾在 computeNodeRenderState / computeNodeContentRenderState 各复制一份，
-/// P6.3 收敛为单点（提升判定归一的第一步）。
+/// Single truth table: "does this node open offscreen opacity/composited surface".
+/// Once duplicated in computeNodeRenderState / computeNodeContentRenderState, P6.3
+/// converged to single point (first step of lifting judgment normalization).
 fn computeUseOpacityLayer(
     node: *Node,
     has_rotation: bool,
@@ -1354,8 +1435,9 @@ fn computeUseOpacityLayer(
     blur_radius: f32,
     node_opacity: f32,
 ) bool {
-    return node.style.composited_group() or
-        // 非 normal blend 必须独立光栅化成 src 再与背景做 W3C 混合。
+    return node.style.composited_group() or node.style.contentWarp() != null or
+        // Non-normal blend must independently rasterize to src then W3C-blend with
+        // background.
         node.style.blendMode() != .normal or
         (!geometry.canInlineLeafOpacity(node, has_rotation, has_scale, prepromote_composite, needs_clip, blur_radius) and node_opacity < 0.999) or
         has_rotation or has_scale or prepromote_composite;
@@ -1371,13 +1453,14 @@ fn computeNodeContentRenderState(
     const self_ty = node.style.translate_y;
     const has_rotation = @abs(node.style.rotate()) > 0.0001;
     const has_scale = @abs(node.style.scale_x() - 1.0) > 0.0001 or @abs(node.style.scale_y() - 1.0) > 0.0001;
-    // P6.3 后 content_transform 语义唯一：surface 内 unscaled 渲染（include_scale=false），
-    // scale 由 surface composite 的 draw_transform 统一施加。不再有 inline_scale 分叉。
+    // After P6.3 content_transform semantics unique: surface unscaled render
+    // (include_scale=false), scale uniformly applied by surface composite draw_transform. No
+    // more inline_scale fork.
     const content_transform = retained_scene.buildNodeWorldTransform(node, parent_transform, .{
         .include_scale = false,
         .include_rotation = false,
     });
-    // World.LayoutTable 读 rect。
+    // Read rect from World.LayoutTable.
     const local_rect = cx.rectFromWorld(node);
     const content_rect = content_transform.transformRect(ComputedRect.init(0, 0, local_rect.w, local_rect.h));
     const render_x = content_rect.x;
@@ -1390,9 +1473,10 @@ fn computeNodeContentRenderState(
     const clip_spec = clip_mod.resolveNodeRenderClipSpec(cx, node, cx.allocator, scale_min);
     var clip_content_rect = content_transform.transformRect(clip_spec.local_rect);
     var needs_clip = clip_spec.enabled;
-    // 外部裁剪矩形：与 computeNodeRenderState 同一注入（见彼处注释）。
-    // 矩形是视口系；宿主只对无 scale/rotation、不在 effect surface 内的
-    // 平铺节点标注，此时 content 帧与 world 帧重合。
+    // External clip rectangle: same injection as computeNodeRenderState (see note
+    // there). Rectangle is viewport-frame; host only annotates flat nodes without
+    // scale/rotation, not inside effect surface, at which point content frame and world
+    // frame coincide.
     if (cx.external_clip_rects) |ext_map| if (ext_map.get(node.id)) |ecr| {
         const ext = ComputedRect.init(ecr[0], ecr[1], ecr[2], ecr[3]);
         clip_content_rect = if (needs_clip)
@@ -1416,8 +1500,9 @@ fn computeNodeContentRenderState(
     else
         content_rect;
 
-    // 同 computeNodeRenderState：0.001 prewarm 副本无条件不画（见上方注释），
-    // keep_rendering_when_transparent 仅管 tick/layout 预热，不放行 paint。
+    // Same as computeNodeRenderState: 0.001 prewarm copy unconditionally not drawn
+    // (see note above), keep_rendering_when_transparent only manages tick/layout preheat,
+    // doesn't allow paint.
     if (node_opacity <= 0.001) return null;
     if (needs_clip and (clip_content_rect.w < 0.1 or clip_content_rect.h < 0.1)) return null;
 
@@ -1489,19 +1574,19 @@ fn shouldUseRoundedClipBridge(node: *Node, clip_shape_kind: display_list_mod.Cli
     if (radius <= 0.5) return false;
     if (node.frame_state.state_bits.flags.manual_opacity_animation_active or node.frame_state.state_bits.flags.manual_transform_animation_active) return false;
     if (use_blur) return true;
-    // rounded_clip effect（及 Stage 3 fold 进 opacity layer 的圆角 mask）是
-    // **节点级**的：owner 自己的 shadow / background / border 与后代同在该
-    // effect 内，被同一张 mask 裁掉，阴影只剩 border-box 内那一截（Popover
-    // 圆角外的矩形灰块），描边与贴边内容同层、被内容盖住。owner 有这类内容时
-    // 改走 children 包围的 node-local push_clip（shader SDF 圆角，
-    // emitScrollClipBegin），只裁后代。
+    // rounded_clip effect (and the Stage 3 fold into the opacity layer rounded mask) is
+    // **node-level**: the owner's own shadow / background / border and descendants are clipped
+    // by the same mask, so the shadow keeps only the border-box part (Popover rectangle gray
+    // outside the radius) and stroke/edge content shares the layer and gets covered by content.
+    // When the owner has such content, switch to a children-enclosing node-local push_clip
+    // (shader SDF radius, emitScrollClipBegin) that clips descendants only.
     if (clip_mod.ownerPaintsOutsideChildClip(node)) return false;
     if (use_opacity_layer) return true;
-    // Stage 2 保守收紧：z>0 只在动画期/will_change 时建 rounded_clip effect（保留
-    // shouldPromoteLayer 的 surface promote 载体）。静态 z>0 圆角容器改走 ClipNode
-    // -> push_clip fallback（Stage 1 shader SDF clip 覆盖），省 effect node/plan
-    // layer/两条 display item。will_change 情形实际已被 prepromote_composite ->
-    // use_opacity_layer 吸收，此处仅防御性保留。
+    // Conservative: z>0 creates a rounded_clip effect only during animation/will_change (keeps
+    // the shouldPromoteLayer surface promote vehicle). Static z>0 rounded containers use
+    // ClipNode -> push_clip fallback (shader SDF clip), saving an effect node, plan layer and
+    // two display items. The will_change case is actually absorbed by prepromote_composite ->
+    // use_opacity_layer; kept here defensively.
     const anim_checks = @import("animation_checks.zig");
     return node.style.z_index() > 0 and
         (anim_checks.hasActiveCompositeAnimation(node) or
@@ -1509,7 +1594,7 @@ fn shouldUseRoundedClipBridge(node: *Node, clip_shape_kind: display_list_mod.Cli
             node.style.will_change_opacity());
 }
 
-// ─────────── 属性树构建 ───────────
+// -- Property tree construction --
 
 fn buildRetainedSubtree(
     cx: *RenderContext,
@@ -1532,56 +1617,50 @@ fn buildRetainedSubtree(
     // surfaces to mix "panel frame" animation with "content relayout" jumps.
     const content_state = computeNodeContentRenderState(cx, node, parent_transform, parent_clip) orelse return;
 
-    // surface owner 的 content transform：是否把 self.world.invert() 折进去，取决于
-    // surface composite **是否会重新施加** owner 的 world transform。
+    // Surface owner's content transform: whether to fold self.world.invert() depends on whether
+    // surface composite **re-applies** the owner's world transform (must align with
+    // layer_tree.has_surface_transform).
     //
-    // - has_surface_transform（owner 带 scale / rotation / 非轴对齐）：surface 以
-    //   draw_transform 把内容**带着 owner transform 合成回去**，所以 surface 内 content
-    //   必须先 surface-local（剥掉 owner world），否则 scale/rotate 被施加两次。此时
-    //   surface_inverse = self.world.invert()（S5.2 行为，scale 文本保持清晰、composite 时缩放）。
+    // - has_surface_transform (owner with scale / rotation / non-axis-aligned): the surface is
+    //   composited back via draw_transform **with the owner transform**, so surface content must
+    //   first be surface-local (owner world stripped), else scale/rotate applies twice.
+    //   surface_inverse = self.world.invert() (scale text stays sharp, composite-time scaling).
+    //   This is the scale_fade **animation period**.
     //
-    // - 纯平移 / 轴对齐（典型 overlay：popover/menu/tooltip 落位后 translate=(dx,dy)，
-    //   scale=1，无旋转）：surface 是一次 axis-aligned blit，composite **不**重施 translate，
-    //   GPU encoder 的 offscreenOffset = -(surface bounds 原点) 已把 surface 内 world 坐标转
-    //   surface-local（见 command_encoder.offscreenOffset / opacity_layer.beginOpacityLayer，
-    //   clip bridge 也据此用 world_aabb）。此时 content 必须以 **world 坐标** emit ->
-    //   surface_inverse 必须保持 identity。早先无条件用 self.world.invert() 让 content 退化成
-    //   owner-relative，但 encoder 减的是含 shadow margin 的 surface bounds 原点，二者错开 ->
-    //   整个 overlay 面板飞到屏幕左上角 (0,0)、内容不可见。
-    // Stage B S5.2 + 2026-06-06 修：当本节点开 surface (use_opacity_layer) 时，self/children
-    // 的 content 用哪种坐标系，取决于 surface 合成方式（必须与 layer_tree.has_surface_transform
-    // 一致）：
-    //  - **有 surface transform**（owner 自身 scale≠1 / rotate≠0 / 非轴对齐）：composite 用
-    //    draw_transform 带着 owner transform 把内容合成回去，故 surface 内 content 必须先剥掉
-    //    owner world -> surface_inverse = self.world.invert()。这是 scale_fade **动画期**。
-    //  - **纯平移 / 轴对齐**（settled 的居中 dialog：scale=1、rotate=0）：surface 是一次
-    //    axis-aligned blit，composite **不**重施 transform，encoder 的 offscreenOffset =
-    //    -(surface bounds 原点) 已把 surface 内 world 坐标转 surface-local。此时 content 必须以
-    //    **world 坐标** emit -> surface_inverse 保持 identity（继承 parent）。
-    //    早先无条件用 self.world.invert() -> content 退化成 owner-relative，但 encoder 减的是
-    //    含 shadow margin 的 surface bounds 原点，二者错开 -> 居中 dialog 飞到 (0,0)（先闪左上角
-    //    再到中间）。这正是本次要修的 bug。
-    // 2026-08-02（下游回归根治）：内容帧的唯一判据是"本节点是否开**内容
-    // 捕获**的 offscreen surface"，而不是"是否开 opacity layer"：
-    //  - use_opacity_layer（opacity/composited_group/blend/scale/rotate）-> 捕获。
-    //  - use_rounded_clip -> promoted rounded_clip effect 在 encoder 恒走 layer
-    //    模式（begin token 带 use_draw_transform，见 layer_tree has_surface_transform
-    //    恒 true），同样捕获内容进 owner-local 纹理。早先此分支漏掉 ->
-    //    "blur+rounded_clip 同节点"的玻璃岛内容以 world 坐标画进 owner-local
-    //    纹理（整体偏移出纹理）-> 岛内容全丢只剩玻璃壳。
-    //  - use_blur 单独存在（无 clip）-> applyBackdropBlur 即时合成、不开捕获
-    //    scope，内容必须保持 world 帧（self_blur replay 同合同），不进此分支。
+    // - pure translate / axis-aligned (typical overlay: popover/menu/tooltip with
+    //   translate=(dx,dy),
+    //   scale=1, no rotate; settled centered dialog): the surface is one axis-aligned blit and
+    //   composite **doesn't** re-apply translate. The GPU encoder's offscreenOffset = -(surface
+    //   bounds origin) already converts surface-internal world coords to surface-local (see
+    //   command_encoder.offscreenOffset / opacity_layer.beginOpacityLayer; the clip bridge likewise
+    //   uses world_aabb). Content must emit in **world coords**, so surface_inverse stays identity
+    //   (inherit parent). Using self.world.invert() here makes content owner-relative while the
+    //   encoder subtracts the surface bounds origin (with shadow margin): mismatch, and the whole
+    //   panel flies to screen (0,0).
+    //
+    // The sole criterion for the content frame is "does this node open a **content-capture**
+    // offscreen surface", not "does it open an opacity layer":
+    //  - use_opacity_layer (opacity/composited_group/blend/scale/rotate) -> capture.
+    //  - use_rounded_clip -> a promoted rounded_clip effect is always layer mode in the encoder
+    //    (begin token has use_draw_transform; layer_tree has_surface_transform is always true),
+    //    so it also captures content into an owner-local texture. Missing this branch draws
+    //    "blur+rounded_clip same node" glass island content in world coords into an owner-local
+    //    texture (offset out of the texture), leaving only the shell.
+    //  - use_blur alone (no clip) -> applyBackdropBlur composes instantly, opens no capture
+    //    scope; content must stay in the world frame (self_blur replay, same contract), so it
+    //    doesn't enter this branch.
     const opens_capture_surface = render_state.use_opacity_layer or render_state.use_rounded_clip;
     const self_surface_inverse: Transform2D = if (opens_capture_surface)
         render_state.world_transform.invert()
     else
         surface_inverse;
-    // children 的坐标链（content_transform）**不含** owner 的动画 scale/rotate（unscaled
-    // rest 帧），故 children 的 surface_inverse 必须是 unscaled 逆，这样 children 的
-    // content 在 texture 内是**静态** owner-local，scale 由 M_composite 统一施加。
-    // 若沿用含 scale 的完整逆（早先行为），children content 被反向缩放，composite 的
-    // scale 恰好抵消 -> "modal 背景在 scale、内容纹丝不动"。own（self）仍用完整逆：
-    // 自身 world 含 scale，完整逆使 own content = 纯 local，与 children 同帧。
+    // Children's coordinate chain (content_transform) **excludes** the owner's animation
+    // scale/rotate (unscaled rest frame), so children's surface_inverse must be the unscaled
+    // inverse. Then children's content in the texture is **static** owner-local and scale is
+    // applied uniformly by M_composite. A full inverse with scale would reverse-scale children
+    // and composite's scale would cancel it ("modal background scales, content doesn't budge").
+    // own (self) still uses the full inverse: own world includes scale, so the full inverse makes
+    // own content pure local, the same frame as children.
     const surface_child_inverse: Transform2D = if (opens_capture_surface)
         content_state.content_transform.invert()
     else
@@ -1724,22 +1803,22 @@ fn buildNodeExecutionState(
 }
 
 fn hasBeforeRenderHookSubtree(node: *Node) bool {
-    // O(1)：NodeFlags.has_before_render_subtree 由 addBeforeRender 置位并沿
-    // 祖先冒泡、appendChild 并入父链维护（保守不清位：hook 删除后保持 true，
-    // 多算 true 只会让本函数更保守地拒绝缓存，方向安全）。替代旧实现每节点
-    // 递归下钻（整帧 O(n·depth)）。
+    // O(1): NodeFlags.has_before_render_subtree is set by addBeforeRender, propagates up
+    // ancestors, and appendChild merges it into the parent chain. Conservative: never cleared, so
+    // it stays true after a hook is deleted; overcounting only makes this function reject the
+    // cache more often, which is the safe direction.
     return node.frame_state.state_bits.flags.has_before_render_subtree;
 }
 
 fn hasBeforeRenderHookDescendants(node: *Node) bool {
-    // 只扫直接子节点（读各自 O(1) 标志），不再递归下钻。
+    // Scan only direct children (read each O(1) flag), no recursive descent.
     for (node.children.items) |child| {
         if (child.frame_state.state_bits.flags.has_before_render_subtree) return true;
     }
     return false;
 }
 
-// ─────────── 执行计划生成 ───────────
+// -- Plan generation --
 
 fn buildNodeExecutionPlan(
     cx: *RenderContext,
@@ -1802,9 +1881,9 @@ fn buildNodeExecutionPlan(
         !exec_state.plan_state.needs_rect_clip_fallback;
     const disable_spanned_text_retained = disableSpannedTextRetainedEnabled() and nodeHasSpannedText(node);
 
-    // disable_spanned_text_retained 只禁止**跨帧**缓存（promoted / legacy overflow），
-    // 不禁止同帧内的 display payload prebuild+replay（subtree / own），
-    // 否则 prebuild 标记 subtree_prebuilt=true 后 replay 被跳过会导致内容丢失。
+    // disable_spanned_text_retained only disables **cross-frame** cache (promoted / legacy
+    // overflow), not same-frame display payload prebuild+replay (subtree / own), else after
+    // prebuild sets subtree_prebuilt=true replay skips causing content loss.
     return .{
         .promoted_surface_invalidation_reason = promoted_surface_invalidation_reason,
         .has_promoted_descendant_subtree = exec_state.retained_runtime.has_promoted_descendant_subtree,
@@ -1813,11 +1892,14 @@ fn buildNodeExecutionPlan(
         .has_prebuilt_display_payload_own = has_prebuilt_display_payload_own,
         .has_prebuilt_display_payload_subtree = exec_state.retained_runtime.display_payload_subtree_prebuilt,
         .prebuilt_display_payload_strategy = exec_state.retained_runtime.display_payload_subtree_strategy,
-        // subtree/own replay 是把 runtime 区间从**本帧** display_list 下沉到
-        // render list，区间必须是本帧 prebuild 写的（epoch 硬条件）。stale
-        // 区间指向的表位如今被别的内容占据（典型：GlassLab 滚动时 502 的旧区
-        // 间罩住兄弟玻璃球的 fresh 条目），下沉即把别人的条目再画一遍,
-        // 半透明玻璃/高光叠两次整体增白，settle/滚动两态切换即滚动闪烁根因。
+        // subtree/own replay sinks a runtime range from the **this-frame** display_list to the
+        // render
+        // list; the range must be written by this-frame prebuild (epoch hard constraint). A stale
+        // range points at table positions now occupied by other content (e.g. an old range masking
+        // a
+        // sibling glass ball's fresh entries), so sinking re-draws others' entries:
+        // semi-transparent
+        // glass/specularity double-stacks and whitens, and toggling settle/scroll state flickers.
         .should_try_display_payload_subtree_replay = !has_before_render_hooks and
             !has_manual_overlay_animation and
             subtree_payload_fresh_this_frame and
@@ -1840,14 +1922,15 @@ fn buildNodeExecutionPlan(
     };
 }
 
-// ─────────── 缓存回放 ───────────
+// -- Cache replay --
 
-/// 缓存命中帧的 z>0 直接子节点补渲染（legacy overflow 缓存替放时它们已被
-/// appendLegacyCachedCommandsWithoutEscapedOverlays 从缓存命令里剔除）。
-/// 选中集合与旧的"逃逸"判据相同（positive_z 带 + 父节点不走 opacity layer），
-/// 这属于带外缓存机制，留给 C3 统一；但裁剪不再逃逸：传父节点的 clip 与
-/// clip_id，补渲染的内容落在缓存 token 对之外时仍由 clip-bridge 裁到父节点的
-/// 裁剪链（z_index 只影响同级顺序，不影响裁剪，方案 §5.3）。
+/// Cache hit frame: z>0 direct children re-render (legacy overflow cache replacement already
+/// excludes them via appendLegacyCachedCommandsWithoutEscapedOverlays). Selection is the same
+/// as the old "escape" criterion (positive_z band + parent not using opacity layer), part of the
+/// out-of-band cache mechanism; defer to C3 unification. Clipping no longer escapes: pass the
+/// parent clip and clip_id, so re-rendered content outside the cache token pair is still
+/// clipped by the clip bridge to the parent's clip chain (z_index only affects sibling order,
+/// not clipping, design 5.3).
 fn renderOverlayChildrenAfterCacheHit(
     cx: *RenderContext,
     node: *Node,
@@ -1866,7 +1949,8 @@ fn renderOverlayChildrenAfterCacheHit(
     }
 }
 
-/// 子节点的唯一渲染入口：永远继承父节点的 effective_clip 与 retained clip_id。
+/// Child node's sole render entry: always inherit parent's effective_clip and
+/// retained clip_id.
 fn renderChildWithParentClip(
     cx: *RenderContext,
     child: *Node,
@@ -1917,30 +2001,39 @@ fn renderChildPass(
     }
 }
 
-/// 节点当前 glass 参数的指纹（逐字段喂，避开 struct padding）。
-/// promoted 缓存的 begin_blur token 按值烘焙参数，替放前必须比对（见
-/// CachedRenderSlice.cached_glass_hash 注释：dirty 位守不住这条通路）。
+/// Current node glass parameters fingerprint (field-by-field feed, avoid struct
+/// padding). promoted cache begin_blur token bakes parameters by value, must compare
+/// before replacement (see CachedRenderSlice.cached_glass_hash note: dirty bit can't
+/// guard this path).
 pub fn nodeGlassParamsHash(node: *Node) u64 {
     const gp = node.style.glass_params() orelse return std.math.maxInt(u64);
     const resolved = gp.resolve();
     var hasher = std.hash.Wyhash.init(0);
-    inline for (@typeInfo(@TypeOf(resolved)).@"struct".fields) |f| {
+    inline for (@import("zenit_reflection").fields(@TypeOf(resolved))) |f| {
         hasher.update(std.mem.asBytes(&@field(resolved, f.name)));
+    }
+    // GlassGroup: table content change (member move/material interpolation) doesn't
+    // change pointer, feed table version.
+    if (resolved.group) |grp| {
+        hasher.update(std.mem.asBytes(&grp.version));
+        hasher.update(std.mem.asBytes(&grp.count));
     }
     return hasher.final();
 }
 
 fn canReusePromotedCommands(node: *Node, runtime: scene_runtime_mod.SceneNodeRuntime, exec_state: NodeExecutionState, cache: node_mod.CachedRenderSlice) bool {
-    // 参数插值进行中（GlassBox interactive boost 等）由组件挂 disable_render_cache
-    // 退出全部缓存，token 按值烘焙参数，任何 stamp 方案都躲不开洗白/时序竞态。
+    // Parameter interpolation in progress (GlassBox interactive boost etc.) component
+    // attaches disable_render_cache exit all cache, token bakes parameters by value, no
+    // stamp scheme escapes washing/timing race.
     if (node.frame_state.state_bits.flags.disable_render_cache) return false;
     if (cache.cached_glass_hash != nodeGlassParamsHash(node)) return false;
     if (runtime.promoted_layer_id == scene_runtime_mod.INVALID_ID) return false;
     if (cache.promoted_layer_id != runtime.promoted_layer_id) return false;
     if (cache.content_version != runtime.content_version) return false;
-    // 根 id 三元组比对拦截"缓存根自身语义变化"（promoted 语义依赖根 effect 链）；
-    // 子树**内部**的帧内序号平移不在此拦截，appendCachedCommands 替放时按
-    // node_id 统一改写为本帧值（rewriteSplicedItemHeaders，下游回归根治）。
+    // Root id triplet comparison intercepts "cache root semantic self-change" (promoted semantics
+    // depend on the root effect chain). **Internal** frame-internal seq shifts of the subtree are
+    // not intercepted here: the appendCachedCommands replacement rewrites by node_id to this
+    // frame's value uniformly (rewriteSplicedItemHeaders).
     if (cache.cached_transform_id != exec_state.retained_ids.transform_id) return false;
     if (cache.cached_effect_id != exec_state.retained_ids.effect_id) return false;
     if (cache.cached_clip_id != exec_state.retained_ids.clip_id) return false;
@@ -1951,17 +2044,16 @@ fn canReusePromotedCommands(node: *Node, runtime: scene_runtime_mod.SceneNodeRun
 }
 
 fn appendCachedCommands(cx: *RenderContext, commands: []const DisplayItem) !void {
-    // 坐标正确性：cache 内 DisplayItem 是 local 空间；display_list_lowering 在
-    // lower 时按 header.transform_id 读当帧 property tree 矩阵重算坐标。
-    // splice 逐条过滤 + 改写（原 rewriteSplicedItemHeaders，下游回归与残影根治合并）：
-    //   - node 本帧存在、id 平移 -> 改写为本帧值；
-    //   - node 本帧**不存在**（典型：运行时 setOpacity(0) 后 buildRetainedSubtree
-    //     整支跳过，无 scene_runtime 条目）-> **丢弃**。此前 `orelse continue`
-    //     把 stale 写入帧序号原样放行，去索引本帧重建的 property tree 会命中
-    //     **别的元素**的 transform，下游应用 layers"键画到行左、划过即留"残影
-    //     的根因。没被遍历 = 不可见/已摘除，本就不该画，丢弃恒安全。
-    //   - control token（transform_id == INVALID，begin/end layer 等）原样透传，
-    //     内容条目的增删不影响其配对。
+    // Coordinates: cached DisplayItems are local space; display_list_lowering reads this frame's
+    // property tree matrix by header.transform_id on lower and recalculates coords. Splice filters
+    // and rewrites per item:
+    //   - node exists this frame, id shifted -> rewrite to this-frame value;
+    //   - node **not exist** this frame (e.g. after runtime setOpacity(0), buildRetainedSubtree
+    //     skips the whole branch, no scene_runtime entry) -> **discard**. Passing a stale frame seq
+    //     through would index this frame's rebuilt property tree and hit **another element**'s
+    //     transform. Not traversed = invisible/removed, so discarding is always safe.
+    //   - control token (transform_id == INVALID, begin/end layer etc.) passes through unchanged,
+    //     so content entry add/remove doesn't affect pairing.
     for (commands) |command| {
         const h = command.header();
         if (h.transform_id == INVALID_ID) {
@@ -1977,7 +2069,8 @@ fn appendCachedCommands(cx: *RenderContext, commands: []const DisplayItem) !void
             fresh.clip_id != h.clip_id or
             fresh.effect_id != h.effect_id)
         {
-            // 观测计数（原下游回归不变式探针语义升级为"已改写条数"）。
+            // Observation count (original downstream regression invariant probe semantics
+            // upgraded to "count rewritten").
             cx.perf.subtree_payload_stale_header_count += 1;
             const hp = item.headerPtr();
             hp.transform_id = fresh.transform_id;
@@ -1991,19 +2084,19 @@ fn appendCachedCommands(cx: *RenderContext, commands: []const DisplayItem) !void
     }
 }
 
-// 下游回归背景（改写逻辑现内联在 appendCachedCommands）：header 的
-// transform/clip/effect_id 是**写入帧**的帧内序号（property_tree 每帧 clear
-// 重建的 append 索引）。effect/clip 是条件分配（use_opacity_layer / needs_clip /
-// blur / rounded_clip，动画期会翻转；opacity==0 子树整支跳过不分配），任何更早
-// 节点的分配集合变化都会平移其后所有节点的序号，而 stamp 只能比对缓存根，
-// "一增一减总长不变"的对冲平移甚至骗过全帧表长度比对且不自愈。
-// 唯一不变式是：**每条 content item 的 header id 恒等于其 node 在写入帧
-// scene_runtime 里的值**（makeDisplayItemHeader 单一 stamp 路径）。而
-// buildRetainedSubtree 在任何 splice 之前已为全树重建本帧 scene_runtime，
-// 故 splice 时按 node_id 逐条改写为本帧值即可整类消除 stale id；本帧无条目
-// 的 node 直接丢弃（残影根治，见 appendCachedCommands）。四条回放路径
-// （subtree payload / promoted replay / descendant-scoped rebuild /
-// legacy overflow）全部汇入 appendCachedCommands，那里是唯一改写点。
+// Header transform/clip/effect_id is the **write-frame**'s frame-internal seq (property_tree
+// is cleared and rebuilt each frame, ids are append indexes). effect/clip are conditional
+// allocations (use_opacity_layer / needs_clip / blur / rounded_clip, flip during animation;
+// opacity==0 skips the whole subtree with no alloc), so any earlier allocation-set change
+// shifts all following seqs. A stamp only compares the cache root, and an offset where "one
+// add one subtract leaves the total unchanged" fools even a full-frame table length compare,
+// never self-healing. Sole invariant: **each content item's header id always equals its
+// node's value in write-frame scene_runtime** (makeDisplayItemHeader is the single stamp
+// path). buildRetainedSubtree rebuilds this-frame scene_runtime for the entire tree before any
+// splice, so rewriting per item to this-frame values eliminates the whole class of stale ids;
+// nodes with no entry this frame are discarded (see appendCachedCommands). All four replay
+// paths (subtree payload / promoted replay / descendant-scoped rebuild / legacy overflow)
+// converge into appendCachedCommands, the sole rewrite point.
 
 fn collectSubtreeNodeIds(
     node: *Node,
@@ -2064,7 +2157,7 @@ fn hasSameLinearTransform(a: Transform2D, b: Transform2D) bool {
         @abs(a.d - b.d) < 0.0001;
 }
 
-// ─────────── 缓存回放执行 ───────────
+// -- Cache replay execution --
 
 fn replayPromotedCacheHit(
     cx: *RenderContext,
@@ -2094,7 +2187,20 @@ fn replayLegacyOverflowCacheHit(
     exec_state: NodeExecutionState,
     cache: node_mod.CachedRenderSlice,
 ) !void {
-    try appendLegacyCachedCommandsWithoutEscapedOverlays(cx, node, cache.commands);
+    const own_prebuilt = exec_state.retained_runtime.display_payload_own_prebuilt and
+        exec_state.retained_runtime.display_payload_own_prebuilt_epoch == cx.scene_runtime.frame_epoch;
+    const splice_start = cx.display_list.items.items.len;
+    const self_count = @min(cache.self_content_command_count, cache.commands.len);
+    try appendLegacyCachedCommandsWithoutEscapedOverlays(cx, node, if (own_prebuilt) cache.commands[self_count..] else cache.commands);
+    if (!own_prebuilt) {
+        if (cx.scene_runtime.nodes.getPtr(node.id)) |runtime| {
+            runtime.display_item_start = @intCast(splice_start);
+            runtime.display_item_count = @intCast(self_count);
+            // Assembly materializes cached text; there are no frame-local blobs.
+            runtime.text_blob_start = 0;
+            runtime.text_blob_count = 0;
+        }
+    }
     try renderOverlayChildrenAfterCacheHit(cx, node, exec_state);
 }
 
@@ -2110,7 +2216,8 @@ fn replayCachedNodeHit(
         _ = exec_plan;
         try appendCachedCommands(cx, commands);
     } else if (options.reuse_origin) {
-        // reuse_origin 只影响 scroll 偏移语义，不豁免 header 帧内序号改写。
+        // reuse_origin only affects scroll offset semantics, doesn't exempt header
+        // frame-internal seq rewrite.
         try appendCachedCommands(cx, commands);
     } else {
         try appendCachedCommands(cx, commands);
@@ -2180,7 +2287,8 @@ fn tryReplayPromotedCacheHit(
     }
     const cache = node.meta.per_frame.caches.commands.promoted orelse return false;
     var runtime_for_cache = exec_state.retained_runtime;
-    // 跨帧比较用 stable id（帧内序号会因节点增删平移 -> spurious miss）。
+    // Cross-frame compare uses stable id (frame-internal seq shifts with node add/delete
+    // -> spurious miss).
     runtime_for_cache.promoted_layer_id = exec_state.promoted_layer_stable_id;
     if (!canReusePromotedCommands(node, runtime_for_cache, exec_state, cache)) {
         markPromotedSurfaceInvalidated(cx, node.id, exec_state.promoted_layer_id, .self);
@@ -2196,10 +2304,11 @@ fn tryReplayPromotedCacheHit(
         runtime.promoted_surface_flags.invalidated_by_descendant_this_frame = false;
         runtime.promoted_surface_flags.invalidated_by_self_this_frame = false;
     }
-    // splice 本身就是 [own(self段), children] 的正确 paint 顺序，**不再**额外镜像
-    // own content（早先 mirror + splice = own 画两遍：半透明阴影叠加变深，hover
-    // 动画期 fresh(一遍)/replay(两遍) 帧交替 -> 阴影深浅脉动"抖动"）。下帧 cache
-    // assembly 需要的 own range 直接指向 splice 的 self 区段。
+    // Splice itself yields the correct paint order [own (self segment), children]; do **not**
+    // additionally mirror own content (mirror + splice draws own twice: semi-transparent shadow
+    // stacks deeper, and hover animation alternating fresh(once)/replay(twice) frames makes
+    // shadow depth pulsate). The own range needed by next-frame cache assembly points directly
+    // at the splice's self segment.
     const splice_start = cx.display_list.items.items.len;
     try replayPromotedCacheHit(
         cx,
@@ -2212,7 +2321,8 @@ fn tryReplayPromotedCacheHit(
     if (cx.scene_runtime.nodes.getPtr(node.id)) |runtime| {
         runtime.display_item_start = @intCast(splice_start);
         runtime.display_item_count = cache.self_content_command_count;
-        // own 文本已在缓存内物化（content 字节内联，blob 断开），blob range 置零。
+        // own text materialized in cache (content bytes inlined, blob disconnected), blob
+        // range zeroed.
         runtime.text_blob_start = 0;
         runtime.text_blob_count = 0;
     }
@@ -2227,16 +2337,18 @@ fn tryReplayLegacyOverflowCacheHit(
 ) !bool {
     const cache = node.meta.per_frame.caches.commands.own orelse return false;
     cx.perf.render_cache_hit += 1;
+    // legacy overflow cache is assembled by the "own first, descendants after" contract
+    // (finalizeNodeCaches / assembleCacheCommands). If own was already written sequentially in
+    // the prebuild phase this frame, replay takes only the descendant segment; else replay
+    // includes own. Either way own appears exactly once and ranks before descendants (replay then
+    // mirroring own would let the parent background cover all descendants, e.g. an
+    // overflow_hidden progress track covering its fill).
     try replayLegacyOverflowCacheHit(
         cx,
         node,
         exec_state,
         cache,
     );
-    // Stage B R3e: throwaway swap 删除 (R3b 后 appendNodeOwnContent 不写 cx.lowering_buffer)。
-    // 不可降级：漏掉 own content 后仍 markNodeReplayClean，节点会被当成
-    // "已正确重放"缓存下来，之后每帧都少画自身内容 = 持久静默渲染错误。
-    appendNodeOwnContent(cx, node, exec_state) catch @panic("OOM: appendNodeOwnContent on legacy overflow replay");
     markNodeReplayClean(node);
     return true;
 }
@@ -2270,9 +2382,9 @@ fn tryReplayNodeFromPlan(
     return false;
 }
 
-// ─────────── 节点桥管理 ───────────
+// -- Node bridge management --
 
-// ─────────── 节点内容渲染 ───────────
+// -- Node content render --
 
 fn appendNodeText(
     cx: *RenderContext,
@@ -2283,24 +2395,26 @@ fn appendNodeText(
     try appendDisplayTextItem(cx, node, exec_state, &logical_t, node.getLayoutOutput().artifacts.text_layout);
 }
 
-/// scroll 容器(tag==.scroll)children 渲染前后的真像素裁剪对。
-/// ⚠ 普通容器的 overflow_hidden 此前**没有像素裁剪**(push_clip 只有
-/// effect apply_clip 与 border_side 两个发射点);虚拟列表 overscan 行/
-/// 部分滚出的首末行原样画出容器(下游应用侧栏行压搜索框/页脚,用户多次
-/// 截图实锤)。children 渲染路径有多条(直绘/分桶缓存拼装/retained),
-/// 每条都要包，只修一条时 40 行小板好了、200 行大板(走分桶路径)照旧。
-/// 本包围覆盖 childPasses 的全部三个带(regular/sticky/positive_z):z>0
-/// 子节点同样被裁，z_index 只影响同级顺序,不影响裁剪。要画到容器外
-/// 只能挂 portal(cx.ensurePopoverPortalRoot / OverlayStack)。
+/// scroll container (tag==.scroll) children render between a real pixel clip pair.
+/// WARNING: a regular container's overflow_hidden previously had **no pixel clipping**
+/// (push_clip had only two emission points: effect apply_clip and border_side);
+/// virtual list overscan rows / partially scrolled-out first/last rows draw outside the
+/// container. Children render paths are multiple (direct / bucket-cache assembly / retained)
+/// and all must be wrapped: fixing one leaves e.g. 200-line boards (bucket path) unchanged.
+/// This wrapper covers all three childPasses bands (regular/sticky/positive_z): z>0 children
+/// are clipped too, z_index only affects sibling order, not clipping. To paint outside the
+/// container, use a portal (cx.ensurePopoverPortalRoot / OverlayStack).
 fn emitScrollClipBegin(cx: *RenderContext, node: *Node, exec_state: NodeExecutionState) !bool {
-    const on = scrollClipWanted(node, exec_state); // 逃生阀 ZENIT_DISABLE_SCROLL_CLIP 在内
+    const on = scrollClipWanted(node, exec_state); // Escape hatch ZENIT_DISABLE_SCROLL_CLIP inside
     if (on) {
         const token = scrollClipPushToken(exec_state);
-        // ⚠ token 必须同时落 display_list:paint 流会被"从 display_list 重建"
-        // 的路径整体替换/绕过(帧末全量 derive、subtree payload replay、splice)。
-        // 只直发 paint 流的话,凡走重建路径的帧裁剪整个消失，大板 sidebar
-        // 溢出行画到岛外(用户截图实锤,间歇性:取决于该帧命中哪条缓存路径)。
-        // 节点局部 clip 与 paint 共用 header，缓存重放时一起重定位。
+        // WARNING: the token must land in display_list too: paint flow is entirely
+        // replaced/bypassed
+        // by "rebuild from display_list" paths (frame-end full derive, subtree payload replay,
+        // splice). Emitting only in the direct paint flow makes clipping vanish on any frame that
+        // takes a rebuild path (intermittent: depends on which cache path the frame hits).
+        // Node-local
+        // clip and paint share a header, so they relocate together on cache replay.
         try cx.display_list.append(token);
         const transform = cx.property_tree.transforms.items[exec_state.retained_ids.transform_id].content;
         try display_list_lowering_mod.appendLoweredBoth(cx, display_list_lowering_mod.lowerNodeClip(token, transform));
@@ -2313,60 +2427,55 @@ fn emitScrollClipEnd(cx: *RenderContext, exec_state: NodeExecutionState, on: boo
     const token: DisplayItem = .{ .pop_clip = .{
         .header = scrollClipTokenHeader(exec_state),
     } };
-    try cx.display_list.append(token); // 与 push 对称,见 emitScrollClipBegin 注释
+    try cx.display_list.append(token); // Symmetric with push, see emitScrollClipBegin note
     try display_list_lowering_mod.appendLoweredBoth(cx, token);
 }
 
 fn scrollClipWanted(node: *Node, exec_state: NodeExecutionState) bool {
-    // 判据是**节点自己声明了 overflow_hidden**（exec_state.needs_clip 即由
-    // style.overflow_hidden 推导，见 clip.resolveNodeRenderClipSpec 开头的早退），
-    // 而不是节点的 tag。
+    // Criterion is **the node itself declares overflow_hidden** (exec_state.needs_clip derived
+    // from style.overflow_hidden, see the early exit at the start of
+    // clip.resolveNodeRenderClipSpec), not the node's tag. Requiring `tag == .scroll or tag ==
+    // .input` leaves any **regular box** with overflow_hidden unclipped. Input is exactly this
+    // shape: input_container (tag=.input) sets overflow_hidden=false (non-symmetric radius needs
+    // border_side clipping), while the inner editable_surface (regular box, overflow_hidden=true)
+    // does the clipping of scrolled text; each condition alone misses one of them and long input
+    // text draws out of the input box over the leading icon and neighbors. Clipping by
+    // declaration matches CSS overflow:hidden semantics, independent of type. z>0 children are
+    // inside this wrapper too (positive_z band also between the token pair).
     //
-    // 曾经这里额外要求 `tag == .scroll or tag == .input`，于是任何声明了
-    // overflow_hidden 的**普通 box** 都拿不到像素裁剪。Input 组件正是这个形状：
-    // 它把 input_container（tag=.input）显式设成 overflow_hidden=false
-    // （非对称圆角场景要走 border_side 裁剪），真正负责裁剪滚动文本的是内层
-    // editable_surface，一个 overflow_hidden=true 的普通 box。两个条件
-    // 各自落空：.input 那个 needs_clip=false，editable_surface 那个 tag 不对。
-    // 结果超长输入的文字直接画到输入框外，盖住 leading icon 与邻近控件
-    // （下游编辑器链接浮层实测：文本盒 208.4px 画在 204px 的容器里，溢出到左边框外）。
+    // Exception: when the node **itself has an offscreen effect** (opacity / composited_group /
+    // backdrop_blur / rounded_clip) don't emit. Its clipping is already borne by the compositor
+    // plan (effect_bridge projects apply_clip to the owner-local frame, rounded_clip takes the
+    // surface mask), and another CONTROL push_clip pair is not just duplicate: lowering toggles
+    // the effect bridge by group, a control token cuts the effect group mid-way, and content
+    // after the token falls outside the blur/opacity layer (tests.zig "same-frame two
+    // blur+rounded_clip islands": content ranks after end_blur).
     //
-    // 按声明裁剪也与 CSS 的 overflow:hidden 语义一致：谁声明谁裁剪，与
-    // 元素类型无关。z>0 子节点同样在本包围内（positive_z 带也在 token 对之间），
-    // z_index 不带来任何裁剪逃逸。
-    //
-    // 例外：节点**自己带离屏效果**（opacity / composited_group /
-    // backdrop_blur / rounded_clip）时不发。它的裁剪已由 compositor plan 承担
-    // （effect_bridge 把 apply_clip 投到 owner-local 帧、rounded_clip 走 surface mask），
-    // 再发一对 CONTROL push_clip 不只是重复：lowering 按组开关 effect bridge，控制
-    // token 会把 effect 组从中间切开，token 之后的内容落到 blur/opacity 层**外面**
-    // （tests.zig「同帧两个 blur+rounded_clip 岛」实测 content 排在 end_blur 之后；
-    // 这正是 43bb5f3 放宽判据后 test-ui-core 六个失败的来源）。
-    //
-    // opacity / composited_group owner 若有画在 children clip 之外的自身内容
-    // （阴影 / 描边，clip_mod.ownerPaintsOutsideChildClip）则**不**排除：compositor
-    // 的 apply_clip 在 begin_layer 后立即 push、覆盖整个 surface 内容，会把 owner
-    // 自己的阴影裁成矩形、让贴边内容压住描边（Popover 实拍）。这类 owner 的
-    // overflow clip 由此处只包 children 的 token 承担，layer_tree 的 apply_clip
-    // 相应退回父 clip（ClipNode.owner_wraps_children）。token 带真实 header（见
-    // scrollClipTokenHeader），不会把 effect 组切开；promoted cache 也把这对
-    // token 写进缓存（CachedRenderSlice.descendant_clip_open_count）。
+    // But if an opacity / composited_group owner has self-content painted outside the children
+    // clip (shadow / stroke, clip_mod.ownerPaintsOutsideChildClip), do **not** exclude: the
+    // compositor's apply_clip right after begin_layer push covers the entire surface content and
+    // would clip the owner's own shadow to a rectangle and press edge content against the stroke
+    // (Popover). That owner's overflow clip is then borne by this token, covering children only,
+    // and layer_tree's apply_clip correspondingly retreats to the parent clip
+    // (ClipNode.owner_wraps_children). The token has a real header (see scrollClipTokenHeader) so
+    // it doesn't cut the effect group; the promoted cache also writes this pair into the cache
+    // (CachedRenderSlice.descendant_clip_open_count).
     if (exec_state.use_rounded_clip or effectiveBackdropBlurRadius(node) > 0) return false;
     if (exec_state.use_opacity_layer and !clip_mod.ownerPaintsOutsideChildClip(node)) return false;
     return exec_state.needs_clip and
         exec_state.clip_rect.w > 0 and exec_state.clip_rect.h > 0 and
-        std.posix.getenv("ZENIT_DISABLE_SCROLL_CLIP") == null;
+        !@import("zenit_environment").has("ZENIT_DISABLE_SCROLL_CLIP");
 }
 
-/// token 带**本节点的真实 header**而不是 CONTROL_HEADER。
-///
-/// lowering 按 (effect_id, clip_id) 分组、按组开关 effect bridge：CONTROL header 的
-/// effect_id 是 INVALID，token 自成一组、effect 链为空 -> 祖先的 opacity/blur 层在
-/// token 前被 end、在其后被 begin 重开。结果是一个带 overflow_hidden 的普通子节点
-/// 把祖先的合成层切成两段：组 opacity 变成两次独立合成（重叠区二次混合），blur
-/// 背板被采样两次。真实 header 让 token 与本节点子内容同组，effect 链不变；
-/// splice 的 header 改写（appendCachedCommands）也照常覆盖它。push_clip 的
-/// node_local 标志让 lowering 按该 header 变换几何；pop_clip 仍是控制项。
+/// The token carries **this node's real header**, not CONTROL_HEADER. Lowering groups by
+/// (effect_id, clip_id) and toggles the effect bridge per group: a CONTROL header has effect_id
+/// INVALID, so the token self-groups with an empty effect chain, ending ancestor opacity/blur
+/// layers before the token and reopening them after. A normal child with overflow_hidden would
+/// then cut the ancestor composite layer in two (group opacity becomes two independent
+/// composites with double-blended overlap; blur backdrop sampled twice). A real header lets the
+/// token group with this node's child content and leaves the effect chain unchanged; splice
+/// header rewrite (appendCachedCommands) covers it normally. push_clip's node_local flag makes
+/// lowering transform geometry by that header; pop_clip is still a control item.
 pub fn scrollClipTokenHeader(exec_state: NodeExecutionState) display_list_mod.ItemHeader {
     return makeDisplayItemHeader(exec_state);
 }
@@ -2389,11 +2498,10 @@ pub fn scrollClipPushToken(exec_state: NodeExecutionState) DisplayItem {
     } };
 }
 
-/// prepass(prebuild)版 scroll clip 包围:**只写 display_list**。
-/// prepass 的写出物 = prebuilt payload,由 subtree replay / splice / 全量
-/// derive 消费，区段里没有这对 token 的话,凡命中缓存重放的帧,溢出行
-/// 就带着零裁剪画出去(paint pass 的 emitScrollClipBegin 在 replay 短路
-/// 层级之下,根本不执行)。
+/// Prepass (prebuild) version of the scroll clip wrapper: **display_list only**. Prepass output
+/// is the prebuilt payload consumed by subtree replay / splice / full derive; without this
+/// token pair in the segment, any cache-replay frame draws overflow rows with zero clipping
+/// (the paint pass's emitScrollClipBegin never executes under the replay shortcut).
 fn prebuildScrollClipBegin(cx: *RenderContext, node: *Node, exec_state: NodeExecutionState) !bool {
     const on = scrollClipWanted(node, exec_state);
     if (on) try cx.display_list.append(scrollClipPushToken(exec_state));
@@ -2413,7 +2521,7 @@ fn appendNodeBodyContent(
     exec_state: NodeExecutionState,
 ) !void {
     if (node.meta.per_frame.custom_hooks.draw) |draw| {
-        // World.LayoutTable 读 rect。
+        // Read rect from World.LayoutTable.
         const local_rect = cx.rectFromWorld(node);
         const draw_ctx = DrawContext{
             .lowering_buffer = cx.lowering_buffer,
@@ -2458,11 +2566,11 @@ fn appendNodeOwnContent(
     if (node.meta.per_frame.custom_hooks.draw != null and node.children.items.len == 0) {
         try appendNodeBodyContent(cx, node, exec_state);
     }
-    // backdrop_blur 的 begin token 由 content item 的 effect header 驱动
-    //（lowering 按组开 effect bridge）。无 bg/渐变/边框/文本的"纯玻璃"节点
-    // 零 item -> 没有任何组携带它的 effect_id -> begin_blur 永不发射，玻璃
-    // 静默不渲染（下游应用 header 双层 progressive blur 的内层实拍）。补一条
-    // 透明占位 rect 让 effect 有载体；a=0 不产生可见像素。
+    // backdrop_blur's begin token is driven by the content item's effect header (lowering toggles
+    // the effect bridge by group). A "pure glass" node with no bg/gradient/border/text has zero
+    // items, so no group carries its effect_id, begin_blur never emits and the glass silently
+    // doesn't render. Add one transparent placeholder rect as effect vehicle; a=0 produces no
+    // visible pixels.
     if (cx.display_list.items.items.len == display_start and
         effectiveBackdropBlurRadius(node) >= 0.5)
     {
@@ -2485,25 +2593,29 @@ fn appendNodeDescendantContent(
     node: *Node,
     exec_state: NodeExecutionState,
 ) !NodeContentSlices {
-    // frame arena + 预留满容量：slice 只活到本帧 cache 拼装结束；arena 上
-    // append-grow 无法原地 realloc（中间夹子递归的分配），必须一次性预留。
+    // frame arena + reserve full capacity: slice only lives until this-frame cache
+    // assembly ends; append-grow on arena can't realloc in place (recursion-mid
+    // allocations), must reserve one-shot.
     const child_cap = node.children.items.len;
-    var regular_children: std.ArrayList(u32) = .{};
-    var sticky_children: std.ArrayList(u32) = .{};
-    var overlay_children: std.ArrayList(u32) = .{};
+    var regular_children: std.ArrayList(u32) = .empty;
+    var sticky_children: std.ArrayList(u32) = .empty;
+    var overlay_children: std.ArrayList(u32) = .empty;
     try regular_children.ensureTotalCapacity(cx.frame_allocator, child_cap);
     try sticky_children.ensureTotalCapacity(cx.frame_allocator, child_cap);
     try overlay_children.ensureTotalCapacity(cx.frame_allocator, child_cap);
     var clip_wrapped = false;
 
     if (node.meta.per_frame.custom_hooks.draw) |draw| {
-        // custom_hooks.draw 路径直接 emit 到 display_list 当前末尾；不走 children
-        // pass，所以 cache 端把它当 regular_children=[]，节点 own-content range
-        // 已由 appendNodeOwnContent 写入 runtime.display_item_*，custom_draw 增加
-        // 的 items 进 own range 之外，cache 不归任何 child 而是 tail 后？
+        // custom_hooks.draw emits directly to the current tail of display_list and doesn't go
+        // through
+        // the children pass, so the cache side sees regular_children=[]. The node's own-content
+        // range
+        // is already written by appendNodeOwnContent into runtime.display_item_*; items added by
+        // custom_draw fall outside the own range and belong to no child, only to the tail.
         //
-        // 当前简化：custom_draw 节点不参与 promoted cache 的 per-pass 归类（极少
-        // 同时具备 has_custom_draw + promoted layer 的场景）；让 paint 直接 emit。
+        // Simplification: custom_draw nodes don't participate in promoted cache per-pass
+        // classification (rarely both has_custom_draw + promoted layer); the paint pass emits
+        // directly.
         const draw_local_rect = cx.rectFromWorld(node);
         const draw_ctx = DrawContext{
             .lowering_buffer = cx.lowering_buffer,
@@ -2578,10 +2690,10 @@ fn childPassHasCleanDescendant(node: *Node, use_opacity_layer: bool, pass: Child
     return false;
 }
 
-/// 缓存 splice 后回填 child 的 subtree range，指向本帧 display_list 中刚 splice
-/// 的区段。scene_runtime 每帧清空，若不回填，下次 cache assembly
-/// （assembleCacheCommands 按 per-child range 切片）会取到 count=0 -> 该 child
-/// 内容从缓存里静默消失。
+/// After cache splice backfill child's subtree range, point to just-spliced section
+/// in this-frame display_list. scene_runtime cleared per-frame, if not backfilled, next
+/// cache assembly (assembleCacheCommands slices by per-child range) gets count=0 -> that
+/// child content silently disappears from cache.
 fn setChildSpliceRange(cx: *RenderContext, child_id: u32, start: usize, len: usize) void {
     if (cx.scene_runtime.nodes.getPtr(child_id)) |runtime| {
         runtime.subtree_display_item_start = @intCast(start);
@@ -2597,8 +2709,8 @@ fn replayCachedDescendantPass(
     pass: ChildRenderPass,
 ) !bool {
     if (pass == .regular) {
-        // regular band 有 per-child 计数（regular_child_slices）：逐 child splice
-        // 并回填精确 range，保持 assembly 的 per-child 归属正确。
+        // regular band has per-child count (regular_child_slices): per-child splice and
+        // backfill precise range, maintain assembly per-child ownership correct.
         if (cache.regular_child_slices.len == 0) return false;
         for (cache.regular_child_slices) |slice| {
             const commands = cache.regularChildCommands(slice.child_id) orelse return false;
@@ -2616,8 +2728,9 @@ fn replayCachedDescendantPass(
         .positive_z => cache.descendantOverlayCommands(),
     };
     if (commands.len == 0) return false;
-    // sticky/overlay band 无 per-child 计数：仅当该 pass 恰有一个 child 时整段
-    // 归属之；多 child 无法精确切分，放弃 band 替放退回 fresh render（保正确）。
+    // sticky/overlay band no per-child count: only when that pass has exactly one child
+    // does entire section belong to it; multiple children can't precisely split, abandon
+    // band replacement fall back fresh render (preserve correctness).
     var sole_child_id: u32 = INVALID_ID;
     var pass_child_count: usize = 0;
     for (node.children.items) |child| {
@@ -2694,7 +2807,7 @@ fn appendNodeOverflowFade(
     const bw_left = border_widths[types.Border.SIDE_LEFT];
     const inner_x = bw_left;
     const inner_y = bw_top;
-    // World.LayoutTable 读 rect。
+    // Read rect from World.LayoutTable.
     const local_rect = cx.rectFromWorld(node);
     const inner_w = @max(@as(f32, 0), local_rect.w - bw_left - bw_right);
     const inner_h = @max(@as(f32, 0), local_rect.h - bw_top - bw_bottom);
@@ -2764,9 +2877,9 @@ fn appendNodeOverflowFade(
     }
 }
 
-// ─────────── 缓存最终化 ───────────
+// -- Cache finalization --
 
-// ─────────── 重建策略与主渲染流 ───────────
+// -- Rebuild strategy and main render flow --
 
 fn renderNodeRebuildCommon(
     cx: *RenderContext,
@@ -2775,13 +2888,12 @@ fn renderNodeRebuildCommon(
     exec_plan: NodeExecutionPlan,
     parent_effect_id: u32,
 ) !void {
-    const legacy_overflow_start_idx = cx.display_list.items.items.len;
-    // Ordering 修复（2026-05-31）：若本节点 own content 本帧已在 prebuild 阶段
-    // 按序写入 display_list（own_prebuilt 且 epoch=当前帧），但 own-replay 因
-    // clip fallback 等不安全（should_try_display_payload_own_replay=false），
-    // 则**不能**在此 fresh re-emit，否则 own（含背景）被追加到已 prebuilt 的
-    // children 之后，背景覆盖 children（overflow_hidden + 背景节点整子树被盖住
-    // 的根因，如 Table）。prebuild 的 own 副本已正确排在 children 之前。
+    // Ordering: if this node's own content was already written sequentially in the prebuild phase
+    // this frame (own_prebuilt and epoch=current frame) but own-replay is unsafe, e.g. clip
+    // fallback (should_try_display_payload_own_replay=false), then **don't** fresh re-emit here:
+    // own (including background) would be appended after the already-prebuilt children and the
+    // background would cover them (e.g. overflow_hidden + background nodes like Table). The
+    // prebuild own copy already ranks before children.
     const own_already_prebuilt_fresh = exec_state.retained_runtime.display_payload_own_prebuilt and
         exec_state.retained_runtime.display_payload_own_prebuilt_epoch == cx.scene_runtime.frame_epoch;
     if (!try tryReplayOwnContentFromPlan(cx, node, exec_state, exec_plan, parent_effect_id)) {
@@ -2789,6 +2901,11 @@ fn renderNodeRebuildCommon(
             try appendNodeOwnContent(cx, node, exec_state);
         }
     }
+    // legacy overflow cache no longer sliced by paint tail section, instead assembled
+    // by finalizeNodeCaches by content_slices (own first, descendants after), cache content
+    // independent of where own written this frame; this starting point kept only for
+    // signature.
+    const legacy_overflow_start_idx = cx.display_list.items.items.len;
     const content_slices = try appendNodeDescendantContent(cx, node, exec_state);
 
     finalizeNodeCaches(
@@ -2799,7 +2916,7 @@ fn renderNodeRebuildCommon(
         exec_state,
         exec_plan,
     );
-    // content_slices 在 frame arena 上，帧末整体回收，无需 deinit。
+    // content_slices on frame arena, entire reclaim frame-end, no deinit needed.
 }
 
 fn appendDescendantScopedPromotedSelfSlice(
@@ -2810,7 +2927,8 @@ fn appendDescendantScopedPromotedSelfSlice(
     _ = exec_state;
     const cache = node.meta.per_frame.caches.commands.promoted orelse return false;
     if (node.frame_state.state_bits.flags.disable_render_cache) return false;
-    // glass 参数烘焙在缓存 token 里，参数变了不许替放旧 self slice。
+    // glass parameters baked in cache token, changed params forbid replacing old self
+    // slice.
     if (cache.cached_glass_hash != nodeGlassParamsHash(node)) return false;
     const self_commands = cache.selfCommands();
     if (self_commands.len == 0) return false;
@@ -2834,11 +2952,11 @@ fn renderNodeDescendantScopedPromotedRebuild(
         }
     }
     const existing_cache = node.meta.per_frame.caches.commands.promoted;
-    // frame arena + 满容量预留，同 appendNodeDescendantContent。
+    // frame arena + full capacity reserve, same as appendNodeDescendantContent.
     const child_cap = node.children.items.len;
-    var regular_children: std.ArrayList(u32) = .{};
-    var sticky_children: std.ArrayList(u32) = .{};
-    var overlay_children: std.ArrayList(u32) = .{};
+    var regular_children: std.ArrayList(u32) = .empty;
+    var sticky_children: std.ArrayList(u32) = .empty;
+    var overlay_children: std.ArrayList(u32) = .empty;
     try regular_children.ensureTotalCapacity(cx.frame_allocator, child_cap);
     try sticky_children.ensureTotalCapacity(cx.frame_allocator, child_cap);
     try overlay_children.ensureTotalCapacity(cx.frame_allocator, child_cap);
@@ -2872,7 +2990,9 @@ fn renderNodeDescendantScopedPromotedRebuild(
         if (existing_cache) |cache| {
             if (!pass_has_dirty) {
                 if (try replayCachedDescendantPass(cx, node, exec_state, cache, pass)) {
-                    // 整段从 cache 替到 display_list；child id 顺序按 children 列表
+                    // entire segment replaces from cache to display_list; child id order by
+                    // children
+                    // list
                     for (node.children.items) |child| {
                         if (!shouldRenderChildInPass(child, exec_state.use_opacity_layer, pass)) continue;
                         target.appendAssumeCapacity(child.id);
@@ -2916,7 +3036,7 @@ fn renderNodeDescendantScopedPromotedRebuild(
         exec_state,
         exec_plan,
     );
-    // content_slices 在 frame arena 上，帧末整体回收，无需 deinit。
+    // content_slices on frame arena, entire reclaim frame-end, no deinit needed.
 }
 
 fn renderNodeWithRebuildStrategy(
@@ -2942,12 +3062,12 @@ fn markNodeRenderedClean(node: *Node) void {
     node.frame_state.state_bits.dirty.pipeline.subtree_composite = false;
 }
 
-// ─────────── 公开入口 ───────────
+// -- Public entry points --
 
 pub fn renderNode(cx: *RenderContext, node: *Node) anyerror!void {
-    // (phase_*_us PerfCounters 字段已删，全 6 项 0 read，纯 dead telemetry)
+    // (phase_*_us PerfCounters fields deleted, all 6 items 0 read, pure dead telemetry)
     beginRetainedFrame(cx);
-    var child_order_restores: std.ArrayList(ChildOrderRestore) = .{};
+    var child_order_restores: std.ArrayList(ChildOrderRestore) = .empty;
     defer restoreChildOrders(&child_order_restores);
     try sortSubtreeChildrenByZ(cx, node, &child_order_restores);
     buildRetainedSubtree(cx, node, Transform2D.identity(), null, 0, INVALID_ID, INVALID_ID, Transform2D.identity());
@@ -2962,25 +3082,27 @@ pub fn renderNode(cx: *RenderContext, node: *Node) anyerror!void {
     try prebuildDisplayPayloads(cx, node, Transform2D.identity(), null, false, INVALID_ID);
     const r = renderNodeTransform(cx, node, Transform2D.identity(), null, false, 0, INVALID_ID, INVALID_ID);
 
-    // Stage B-1: shadow GpuDraw encode (debug-only). 不改主路径，只验证
-    // display_list -> GpuDraw lowering 在真场景下不丢信息。divergence 累计到
-    // PerfCounters.stage_b_shadow_count_mismatches，devtools 可观察。
-    if (@import("builtin").mode == .Debug) {
+    // Stage B-1: shadow GpuDraw encode (debug-only). Doesn't alter main path, only
+    // verify display_list -> GpuDraw lowering doesn't lose info in real scenarios.
+    // divergence accumulates to PerfCounters.stage_b_shadow_count_mismatches, devtools
+    // observable.
+    if (@import("builtin").mode == .debug) {
         runShadowEncode(cx);
     }
 
     return r;
 }
 
-/// Stage B-1/B-2: shadow encode 入口（debug-only 在 renderNode 末尾自动调；测试也直接调）。
-/// 内联 cmd -> PipelineId 映射 (与 paint_table.DisplayItemKind -> PipelineId 对偶)：
-///   1=rect, 2=text, 3=image, 4=path, 5=shadow, 6=gradient, 0=控制流（不计）
+/// Shadow encode entry (debug-only, auto-called at renderNode tail; tests also call it
+/// directly). Inline cmd -> PipelineId map (dual of paint_table.DisplayItemKind -> PipelineId):
+///   1=rect, 2=text, 3=image, 4=path, 5=shadow, 6=gradient, 0=control flow (not counted)
 pub fn runShadowEncode(cx: *RenderContext) void {
     const display_items = cx.display_list.items.items;
     if (display_items.len == 0) return;
 
-    // Stage B S6 R3a: cache 已迁 DisplayItem，paint pass cx.lowering_buffer 不再是 cache
-    // 索引基准。expected_pipelines 由 display_list 自身派生而非 lowering_buffer 比对。
+    // Stage B S6 R3a: cache migrated to DisplayItem; paint pass cx.lowering_buffer no longer
+    // cache index baseline. expected_pipelines derived from display_list itself not lowering_buffer
+    // compare.
     const expected_pipelines = cx.frame_allocator.alloc(u16, cx.display_list.items.items.len) catch return;
     var drawable_commands: usize = 0;
     for (display_items) |it| {
@@ -3009,7 +3131,7 @@ pub fn runShadowEncode(cx: *RenderContext) void {
         }
     }
 
-    // 按 lowered kind 累计 display_list item 数
+    // Count display_list items by lowered kind.
     for (display_items) |it| {
         const lowered = gpu_draw_shadow.lowerDisplayItem(it);
         switch (lowered.kind) {
@@ -3023,7 +3145,7 @@ pub fn runShadowEncode(cx: *RenderContext) void {
         }
     }
 
-    // frame_allocator: 每帧重置，无需 free
+    // frame_allocator: reset per-frame, no need to free.
     const draws = cx.frame_allocator.alloc(gpu_draw_shadow.GpuDraw, display_items.len) catch return;
     const result = gpu_draw_shadow.encodeShadow(
         display_items,
@@ -3056,7 +3178,7 @@ fn renderNodeTransform(
     _: u32,
     parent_effect_id: u32,
 ) anyerror!void {
-    // on_before_render 已在 tickBeforeRender 中统一执行
+    // on_before_render already unified in tickBeforeRender.
     const subtree_display_start = cx.display_list.items.items.len;
     const subtree_blob_start = cx.text_blob_store.blobs.items.len;
     const exec_state = buildNodeExecutionState(cx, node, parent_transform, parent_clip, inherited_force_linear_text) orelse return;
@@ -3077,28 +3199,31 @@ fn renderNodeTransform(
     }
 
     try renderNodeWithRebuildStrategy(cx, node, exec_state, exec_plan, parent_effect_id);
-    // Stage B S5.2: 如果 paint pass 入口时 display_list 已含本节点子树 prebuild
-    // contribution (subtree_display_start 之后到 paint pass 入口前)，paint pass
-    // fresh emit 又会在末尾追加同样内容。truncate 末尾 fresh 部分留 prebuild。
-    // 判定：subtree_display_start < (prebuild 后位置). 但 prebuild 后位置 ==
-    // subtree_display_start (paint pass 入口时 cx.display_list 长度)。所以无法
-    // 直接判. 用 scene_runtime 的 subtree_display_item_count (prebuild 写的)
-    // 替代，如 > 0，prebuild 写过本节点子树，truncate fresh 部分。
+    // If the paint pass entry already contains this node's subtree prebuild contribution (after
+    // subtree_display_start, before paint pass entry), paint pass fresh emit would append the same
+    // content at the end; truncate the fresh portion and keep prebuild.
+    // Comparing positions can't detect this: the position after prebuild == subtree_display_start
+    // (cx.display_list length at paint pass entry). Use scene_runtime's subtree_display_item_count
+    // (written by prebuild) instead: if > 0, prebuild wrote this node's subtree, so truncate the
+    // fresh portion.
     if (cx.scene_runtime.get(node.id)) |rt| {
         if (rt.display_payload_subtree_prebuilt and rt.subtree_display_item_count > 0) {
             cx.display_list.items.shrinkRetainingCapacity(subtree_display_start);
-            // ⚠️ 只能截 display_list，**不能**截 text_blob_store。
+            // WARNING: only display_list can be truncated, never text_blob_store.
             //
-            // 保留下来的是 prebuild 那份 display item，它们的 text_run 仍以
-            // `blob_id` 间接引用 blob（prebuildSimpleDisplayPayloadSubtree 不做
-            // 物化，只记录范围）。而 prebuild 的 blob 就落在
-            // [subtree_blob_start, ...) 这段里，截掉正是截掉它们自己引用的
-            // 数据。槽位随后被后续节点的文本复用，resolveTextRunContent 便按
-            // 旧 offset 去切新 blob 的字节：终端画出状态栏的 "plaintext"
-            // 切片 "plainte"、编辑器 tab 名，或空串。
+            // The kept prebuild display items' text_run still reference blobs indirectly by blob_id
+            // (prebuildSimpleDisplayPayloadSubtree doesn't materialize, it only records a range),
+            // and
+            // prebuild's blobs fall in [subtree_blob_start, ...); truncating would truncate exactly
+            // the
+            // data they reference. The slot is then reused by later nodes' text, and
+            // resolveTextRunContent
+            // slices the new blob's bytes by the old offset (e.g. status bar "plaintext" becomes
+            // "plainte", tab name garbled or empty).
             //
-            // blob 只增不减、每帧 clear，多留几条的代价是本帧一点内存；
-            // 截错则是画面直接错。
+            // Blobs only grow and are cleared per frame; keeping extras costs some memory this
+            // frame,
+            // while truncating wrongly renders wrong.
         }
     }
     updateNodeSubtreeDisplayPayloadRanges(cx, node.id, subtree_display_start, subtree_blob_start);
@@ -3106,13 +3231,14 @@ fn renderNodeTransform(
     markNodeRenderedClean(node);
 }
 
-// ===== 等宽快速路径辅助函数 =====
+// ===== Monospace fast-path helper functions =====
 
-// 检查 spans 是否只做颜色覆盖（无 font_weight/italic/strikethrough）
-// 纯文本编辑器的语法高亮只有 color 和 bg_color，永远返回 true
+// Check if spans only override color (no font_weight/italic/strikethrough).
+// Pure-text editor syntax highlight only has color and bg_color, always returns true.
 
 pub fn estimateTimeMs() f64 {
-    const now = @as(f64, @floatFromInt(std.time.nanoTimestamp())) / 1_000_000.0;
+    const io = current_frame_io orelse return current_frame_time_ms;
+    const now = @as(f64, @floatFromInt(@import("zenit_time").monotonicTimestamp(io))) / 1_000_000.0;
     const delta = now - current_frame_monotonic_ms;
     return if (delta <= 0) current_frame_time_ms else current_frame_time_ms + delta;
 }

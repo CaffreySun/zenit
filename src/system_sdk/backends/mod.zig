@@ -14,9 +14,9 @@ pub const windows = @import("windows.zig");
 
 /// Native backend selector.
 ///
-/// 统一入口:
-/// - 调用方只依赖 `backends.initSystemSdk`
-/// - 具体平台实现者在此处分发
+/// Unified entry point:
+/// - Callers depend only on backends.initSystemSdk
+/// - Concrete platform implementations dispatch here
 pub fn initSystemSdk(allocator: Allocator, window: anytype, window_id: WindowId) !SystemSdk {
     return switch (comptime builtin.target.os.tag) {
         .macos => macos.MacOSBackend.initSystemSdk(allocator, window, window_id),

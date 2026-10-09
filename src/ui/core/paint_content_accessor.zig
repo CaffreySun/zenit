@@ -1,22 +1,19 @@
-//! paint_content_accessor, v0.9 god-object split: 从 node.zig 抽出
-//! §a NodeContent SoA + §b paint state SoA + §L NodeLayoutOutput SoA 的
-//! accessor 路由层。
-//!
-//! 包含：callback 类型定义 + 全局 callback 槽 + registrar + standalone
-//! fallback hashmap（element_id == 0xFFFFFFFF 的非 cx mock test 用 node
-//! 指针 key fallback）+ Node-agnostic 路由 free function。
-//!
-//! Node 上的 get/setText/Image/Icon + getBackground/setBackgroundRaw +
-//! getLayoutOutput/setLayoutOutput/layoutOutputPtr 等方法降为 thin
-//! one-liner，delegate 到本模块。source of truth 见 world.ContentTable /
-//! world.PaintStateTable / world.LayoutOutputTable；本层只做 callback
-//! 分发 + mock fallback。
+//! paint_content_accessor: routes access to NodeContent SoA, paint state SoA and
+//! NodeLayoutOutput SoA, split out of node.zig.
+//! Contains: callback type defs + global callback slots + registrar +
+//! standalone fallback hashmap (element_id == 0xFFFFFFFF for non-cx mock test
+//! nodes, keyed by node ptr) + Node-agnostic routing free functions. Node methods
+//! (get/setText/Image/Icon, getBackground/setBackgroundRaw,
+//! getLayoutOutput/setLayoutOutput/layoutOutputPtr) are thin one-liners
+//! delegating here. Source of truth: world.ContentTable / world.PaintStateTable /
+//! world.LayoutOutputTable; this layer handles callback dispatch + mock fallback.
 
 const std = @import("std");
 const world_mod = @import("world.zig");
 
-/// 仍走**旧进程级全局回调**的属性访问次数（world_ref == null 的节点）。
-/// P0-3 阶段 3 迁移后，生产路径应恒为 0，只剩 cx-less test mock 会命中。
+/// Count of property accesses still using **old process-level global callbacks**
+/// (world_ref == null nodes). After P0-3 phase 3 migration, production paths
+/// should be 0; only cx-less test mocks hit this.
 pub var legacy_callback_hits: u64 = 0;
 const types = @import("types.zig");
 const nlo = @import("node_layout_output.zig");
@@ -54,12 +51,13 @@ pub fn setPaintOpacityReadCallback(cb: ?PaintStateOpacityReadFn) void {
     g_paint_opacity_read = cb;
 }
 
-// 不可降级说明：这些 map 是 fallback 节点 paint/content 的**唯一权威存储**
-// （write 进来、read 从这里出去）。put 失败 = 写入的样式/文本被静默丢弃，
-// 读侧拿到默认值 -> 节点画错而不报错。故 OOM 一律 panic。
-// standalone fallback for non-cx mock tests (element_id == 0xFFFFFFFF)。
-// Paint state 比 §a content 简单：Color/f32 是 POD，无 inline_buf 自指
-// 问题，hashmap rehash 不需要 re-fixup。
+// Non-degradable: these maps are the **sole authoritative storage** for fallback
+// node paint/content (writes in, reads out). A put failure silently discards written
+// styles/text and reads get defaults, so nodes render wrong without error.
+// Therefore OOM always panics. Standalone fallback for non-cx mock tests
+// (element_id == 0xFFFFFFFF). Paint state is simpler than content: Color/f32
+// are POD with no inline_buf self-reference issues; hashmap rehash needs no
+// re-fixup.
 var g_standalone_paint_bg: std.AutoHashMap(usize, Color) = undefined;
 var g_standalone_paint_opacity: std.AutoHashMap(usize, f32) = undefined;
 var g_standalone_paint_init: bool = false;
@@ -71,10 +69,11 @@ fn ensureStandalonePaintInit() void {
     g_standalone_paint_init = true;
 }
 
-/// 无副作用 background 写路由：element_id!=0xFFFFFFFF 走 World callback，
-/// mock node 落 standalone fallback by node ptr。
+/// Side-effect-free background write routing: element_id!=0xFFFFFFFF uses World
+/// callback; mock nodes fall through to standalone fallback by node ptr.
 pub fn writeBackground(world_ref: ?*world_mod.World, element_id_raw: u32, node_ptr: usize, color: Color) void {
-    // P0-3 阶段 3：优先直连 owner World，退化到旧全局回调只为 cx-less mock。
+    // P0-3 phase 3: prefer direct owner World connection; degrade to old global
+    // callbacks only for cx-less mocks.
     if (element_id_raw != 0xFFFFFFFF) {
         if (world_ref) |w| {
             const eid = world_mod.ElementId.fromRaw(element_id_raw);
@@ -110,7 +109,8 @@ pub fn writeOpacity(world_ref: ?*world_mod.World, element_id_raw: u32, node_ptr:
     g_standalone_paint_opacity.put(node_ptr, value) catch @panic("OOM: standalone paint opacity store");
 }
 
-/// background 读路由：World callback -> standalone fallback -> 默认 TRANSPARENT。
+/// Background read routing: World callback -> standalone fallback -> default
+/// TRANSPARENT.
 pub fn readBackground(world_ref: ?*world_mod.World, element_id_raw: u32, node_ptr: usize) Color {
     if (element_id_raw != 0xFFFFFFFF) {
         if (world_ref) |w| {
@@ -193,7 +193,7 @@ fn standaloneSetText(node_ptr: usize, t: ?TextProps) void {
     ensureStandaloneContentInit();
     if (t) |val| {
         g_standalone_content_text.put(node_ptr, val) catch @panic("OOM: standalone content text store");
-        // hashmap put 可能 rehash 移动 entry；re-fixup 全表
+        // hashmap put may rehash and move entry; re-fixup entire table.
         var it = g_standalone_content_text.iterator();
         while (it.next()) |e| {
             if (e.value_ptr.inline_len > 0) {
@@ -209,8 +209,8 @@ fn standaloneSetText(node_ptr: usize, t: ?TextProps) void {
     }
 }
 
-/// text 写路由：element_id!=0xFFFFFFFF 走 World callback，mock 落 standalone
-/// (含 inline_buf 自指 re-fixup)。
+/// Text write routing: element_id!=0xFFFFFFFF uses World callback; mock falls
+/// through to standalone (including inline_buf self-reference re-fixup).
 pub fn writeText(world_ref: ?*world_mod.World, element_id_raw: u32, node_ptr: usize, t: ?TextProps) void {
     if (element_id_raw != 0xFFFFFFFF) {
         if (world_ref) |w| {
@@ -304,20 +304,20 @@ pub fn readIcon(world_ref: ?*world_mod.World, element_id_raw: u32, node_ptr: usi
     return g_standalone_content_icon.get(node_ptr);
 }
 
-// ─────────────────────────────────────────────────────────────────────
-// §L NodeLayoutOutput SoA, write/read/ptr callback + standalone fallback
-// ─────────────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
+// NodeLayoutOutput SoA, write/read/ptr callback + standalone fallback
+// ---------------------------------------------------------------------------
 //
-// layout_output 只在 render/hit 路径用，生产 caller 全 cx-backed
-// (element_id 有效) 走 World.LayoutOutputTable。但 hit_runtime / tests
-// 用 cx-less Node.create + setPathHitGeometry (element_id==0xFFFFFFFF)，
-// 需 standalone fallback（与 §a content / §b paint 同型 mock 墙）。
+// layout_output is used only in render/hit paths. Production callers are cx-backed
+// (valid element_id) and use World.LayoutOutputTable. hit_runtime and tests use
+// cx-less Node.create + setPathHitGeometry (element_id==0xFFFFFFFF) and need a
+// standalone fallback.
 //
-// 关键差异：layoutOutputPtr 要求**稳定地址**（owner 方法原地改子字段 +
-// display_list 指针逃逸）。AutoHashMap 值地址 rehash 会失效，故 standalone
-// 存 *NodeLayoutOutput（heap pool，永久稳定地址），map 只存指针。
-// path geometry 堆内存由 Node.releaseAllGeometry 在 freeNode 释放（cx-less
-// mock 进程短；entry 不主动回收，与 §a g_standalone stale 决议一致）。
+// layoutOutputPtr requires a stable address (owner methods modify child fields
+// in place, display_list pointers escape). AutoHashMap value addresses move on
+// rehash, so standalone stores *NodeLayoutOutput (heap pool, stable address) and
+// the map holds only pointers. Path geometry is freed by Node.releaseAllGeometry
+// on freeNode; entries are not reclaimed (cx-less mocks are short-lived).
 
 pub const LayoutOutputWriteFn = *const fn (element_id_raw: u32, v: NodeLayoutOutput) void;
 pub const LayoutOutputReadFn = *const fn (element_id_raw: u32) ?NodeLayoutOutput;
@@ -346,7 +346,8 @@ fn ensureStandaloneLayoutOutputInit() void {
     g_standalone_layout_output_init = true;
 }
 
-/// cx-less mock 节点的稳定 layout_output slot（heap pool，地址永久稳定）。
+/// Stable layout_output slot for cx-less mock nodes (heap pool, permanently
+/// stable address).
 fn standaloneLayoutOutputPtr(node_ptr: usize) ?*NodeLayoutOutput {
     ensureStandaloneLayoutOutputInit();
     if (g_standalone_layout_output.get(node_ptr)) |p| return p;
@@ -402,19 +403,19 @@ pub fn readLayoutOutput(world_ref: ?*world_mod.World, element_id_raw: u32, node_
     return .{};
 }
 
-// ─────────────────────────────────────────────────────────────────────
-// standalone fallback storage 的显式回收
+// ---------------------------------------------------------------------------
+// Explicit cleanup of standalone fallback storage
 //
-// 这几张表是**进程级**的，用 page_allocator 且此前从无 teardown,
-// 于是 `zig build test` 的 GPA leak check 对它们完全盲视（走的不是 GPA），
-// 全绿并不代表这条路径没泄漏。审查报告把这点列为 GPA 盲区。
+// These tables are process-level, use page_allocator and have no implicit teardown,
+// so the GPA leak check in `zig build test` cannot see them: all-green does not
+// mean this path is leak-free.
 //
-// 它们只服务 cx-less 的 test mock（element_id == INVALID 的裸 Node），
-// 生产路径不 hit。这里提供显式回收入口，让测试/工具能在收尾时清干净并
-// 断言"确实没有残留"，而不是把泄漏藏在 allocator 之外。
-// ─────────────────────────────────────────────────────────────────────
+// They only serve cx-less test mocks (bare Node with element_id == INVALID);
+// production never hits them. Explicit cleanup lets tests/tools tear down and
+// assert "no leaks left".
+// ---------------------------------------------------------------------------
 
-/// 当前 standalone fallback 表中的条目总数（诊断/验收用）。
+/// Current entry count in standalone fallback table (diagnostic/acceptance use).
 pub fn standaloneEntryCount() usize {
     var n: usize = 0;
     if (g_standalone_paint_init) {
@@ -430,8 +431,8 @@ pub fn standaloneEntryCount() usize {
     return n;
 }
 
-/// 释放所有 standalone fallback storage。进程收尾/测试收尾调用。
-/// 幂等：重复调用安全，之后再用到会按需重新 init。
+/// Free all standalone fallback storage. Called at process/test shutdown.
+/// Idempotent: safe to call repeatedly; subsequent use reinitializes on-demand.
 pub fn deinitStandaloneStorage() void {
     if (g_standalone_paint_init) {
         g_standalone_paint_bg.deinit();
@@ -445,8 +446,8 @@ pub fn deinitStandaloneStorage() void {
         g_standalone_content_init = false;
     }
     if (g_standalone_layout_output_init) {
-        // value 是 page_allocator.create 出来的裸指针，必须逐个 destroy，
-        // 否则只回收 map 本身仍会漏掉每个 NodeLayoutOutput。
+        // Value is raw pointer from page_allocator.create; must destroy individually,
+        // otherwise freeing the map alone leaks each NodeLayoutOutput.
         var it = g_standalone_layout_output.valueIterator();
         while (it.next()) |slot_ptr| std.heap.page_allocator.destroy(slot_ptr.*);
         g_standalone_layout_output.deinit();

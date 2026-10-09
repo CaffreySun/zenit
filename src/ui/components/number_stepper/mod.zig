@@ -1,4 +1,4 @@
-/// NumberStepper，数值步进器（B5）：[-] 42 [+]
+/// NumberStepper - numeric stepper (B5): [-] 42 [+]
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const core = @import("../../core.zig");
@@ -6,304 +6,473 @@ const Cx = core.Cx;
 const Node = core.Node;
 const box = core.box;
 const Padding = core.Padding;
-const Scope = @import("../../reactive.zig").Scope;
+const reactive = @import("../../reactive.zig");
+const Scope = reactive.Scope;
+const Signal = reactive.Signal;
+const Source = reactive.Source;
+const Model = reactive.Model;
+const Handler = core.Handler;
 const KeyCode = core.KeyCode;
 const Modifiers = core.Modifiers;
 const EventResult = core.EventResult;
+const view = @import("../../view.zig");
 
 pub const NumberStepperProps = struct {
-    value: f64 = 0,
+    /// current value: `f64` uncontrolled initial; `*Signal(f64)` controlled (interactions write
+    /// directly); `ui.split` intercepts. out-of-bounds external values display clamped, not written
+    /// back.
+    value: Model(f64) = .{ .local = 0 },
     min: ?f64 = null,
     max: ?f64 = null,
     step: f64 = 1,
     width: f32 = 140,
-    disabled: bool = false,
-    /// 值变化后触发；caller 读 state.value
-    on_change: ?core.HandlerRef = null,
+    disabled: Source(bool) = .{ .value = false },
+    /// called after user steps and lands (landed value)
+    on_change: ?Handler(f64) = null,
 };
 
-pub const NumberStepperState = struct {
-    value: f64,
+/// NumberStepper runtime (scope-owned): view = f(value, disabled)
+pub const NumberStepperRuntime = struct {
+    value: reactive.Bound(f64),
+    disabled: Source(bool),
+    on_change: ?Handler(f64),
     min: ?f64,
     max: ?f64,
     step: f64,
-    disabled: bool,
+    /// current displayed value (data value clamped to range)
+    shown: f64 = 0,
+    is_disabled: bool = false,
     value_node: *Node,
-    /// wrapper 节点：role=spinbutton 的 a11y 数值挂在它身上
-    wrapper_node: ?*Node = null,
-    buf: [32]u8 = [_]u8{0} ** 32,
-    on_change: ?core.HandlerRef,
+    minus: *Node,
+    plus: *Node,
+    /// wrapper node: a11y numeric value for role=spinbutton lives here
+    wrapper_node: *Node,
+    cx: *Cx,
 
-    fn clampValue(self: *const NumberStepperState, v: f64) f64 {
+    fn clampValue(self: *const NumberStepperRuntime, v: f64) f64 {
         var out = v;
         if (self.min) |m| out = @max(out, m);
         if (self.max) |m| out = @min(out, m);
         return out;
     }
 
-    pub fn setValue(self: *NumberStepperState, v: f64) void {
-        const clamped = self.clampValue(v);
-        if (clamped == self.value) return;
-        self.value = clamped;
-        self.syncLabel();
-        if (self.on_change) |h| h.invoke();
+    fn view(self: *NumberStepperRuntime, comptime tracked: bool) !void {
+        const v = self.clampValue(self.value.readAs(tracked));
+        const dis = self.disabled.read(tracked);
+        if (dis != self.is_disabled) {
+            self.is_disabled = dis;
+            self.applyDisabled();
+        }
+        // NaN != NaN: first time (shown is NaN sentinel) and external NaN write both trigger,
+        // latter formats once
+        if (v != self.shown and !(std.math.isNan(v) and std.math.isNan(self.shown))) {
+            self.shown = v;
+            try self.syncLabel();
+        }
     }
 
-    pub fn increment(self: *NumberStepperState) void {
-        if (self.disabled) return;
-        self.setValue(self.value + self.step);
+    fn viewEffect(self: *NumberStepperRuntime) void {
+        self.view(true) catch |err| std.log.err("[NumberStepper] update failed: {}", .{err});
     }
 
-    pub fn decrement(self: *NumberStepperState) void {
-        if (self.disabled) return;
-        self.setValue(self.value - self.step);
-    }
-
-    fn syncLabel(self: *NumberStepperState) void {
-        // 整数 step + 整数值 -> 无小数显示
-        // @intFromFloat 对 inf / |v| >= 2^63 直接 panic：超出 i64 的值走浮点格式化
-        const fits_i64 = std.math.isFinite(self.value) and @abs(self.value) < 0x1p63;
-        const is_int = fits_i64 and self.value == @trunc(self.value) and self.step == @trunc(self.step);
-        const label = if (is_int)
-            std.fmt.bufPrint(&self.buf, "{d}", .{@as(i64, @intFromFloat(self.value))}) catch "?"
-        else
-            std.fmt.bufPrint(&self.buf, "{d:.2}", .{self.value}) catch "?";
+    fn applyDisabled(self: *NumberStepperRuntime) void {
+        const dis = self.is_disabled;
+        const t = self.cx.tokens;
+        self.wrapper_node.setFocusable(!dis);
+        if (self.wrapper_node.behavior.interaction.a11y) |*a| a.disabled = dis;
+        for ([_]*Node{ self.minus, self.plus }) |btn| {
+            btn.style.cursor = if (dis) .default else .pointer;
+            if (btn.behavior.interaction.a11y) |*a| a.disabled = dis;
+            const label = btn.children.items[0];
+            if (label.getText()) |old| {
+                var txt = old;
+                txt.color = styles.stepBtnLabelStyle(dis, t).color;
+                label.setText(txt);
+            }
+            btn.markRenderDirty();
+        }
         if (self.value_node.getText()) |old| {
-            var t = old;
-            t.content = label;
-            self.value_node.setText(t);
+            var txt = old;
+            txt.color = styles.stepperValueStyle(dis, t).color;
+            self.value_node.setText(txt);
         }
         self.value_node.markRenderDirty();
+    }
 
-        // a11y 数值跟着每次步进走。syncLabel 是唯一的值落地点（init 与
-        // setValue 都经过这里），挂在这儿就不会有"改了值但 AT 没跟上"的缝。
-        // min/max 缺省时用当前值填充，表示该方向无界，总比报 0 强，
-        // 报 0 会让 AT 以为"已经到底了"。
-        if (self.wrapper_node) |w| {
-            if (w.behavior.interaction.a11y) |*a| {
-                a.value_now = @floatCast(self.value);
-                a.value_min = @floatCast(self.min orelse self.value);
-                a.value_max = @floatCast(self.max orelse self.value);
-                a.value_text = self.value_node.getText().?.content;
-                if (a.value_range) |*range| {
-                    range.now = @floatCast(self.value);
-                    range.min = @floatCast(self.min orelse self.value);
-                    range.max = @floatCast(self.max orelse self.value);
-                }
+    fn syncLabel(self: *NumberStepperRuntime) !void {
+        // integer step + integer value -> no decimal display. @intFromFloat panics on inf / |v| >=
+        // 2^63: values outside i64 range use float format
+        var buf: [32]u8 = undefined;
+        const fits_i64 = std.math.isFinite(self.shown) and @abs(self.shown) < 0x1p63;
+        const is_int = fits_i64 and self.shown == @trunc(self.shown) and self.step == @trunc(self.step);
+        const label = if (is_int)
+            std.fmt.bufPrint(&buf, "{d}", .{@as(i64, @intFromFloat(self.shown))}) catch "?"
+        else
+            std.fmt.bufPrint(&buf, "{d:.2}", .{self.shown}) catch "?";
+        try self.value_node.setTextContent(self.cx.allocator, label);
+        self.value_node.markRenderDirty();
+
+        // min/max when absent filled with current value, indicates that direction unbounded, better
+        // than reporting 0: reporting 0 makes AT think 'already at limit'. value_text points to
+        // text copy owned by node.
+        if (self.wrapper_node.behavior.interaction.a11y) |*a| {
+            a.value_now = @floatCast(self.shown);
+            a.value_min = @floatCast(self.min orelse self.shown);
+            a.value_max = @floatCast(self.max orelse self.shown);
+            a.value_text = self.value_node.getText().?.content;
+            if (a.value_range) |*range| {
+                range.now = @floatCast(self.shown);
+                range.min = @floatCast(self.min orelse self.shown);
+                range.max = @floatCast(self.max orelse self.shown);
             }
         }
     }
+
+    /// user input: clamped to range then proposed; landing calls on_change (last step, may destroy
+    /// component)
+    fn propose(self: *NumberStepperRuntime, raw: f64) void {
+        if (self.is_disabled or std.math.isNan(raw)) return;
+        const landed = self.value.commit(self.clampValue(raw)) orelse return;
+        if (self.on_change) |h| h.call(landed);
+    }
+
+    /// step baseline: when external writes NaN (shows as NaN only if unbounded) start from min or
+    /// 0, else keys fail
+    fn base(self: *const NumberStepperRuntime) f64 {
+        return if (std.math.isNan(self.shown)) self.min orelse 0 else self.shown;
+    }
+
+    fn increment(self: *NumberStepperRuntime) void {
+        self.propose(self.base() + self.step);
+    }
+
+    fn decrement(self: *NumberStepperRuntime) void {
+        self.propose(self.base() - self.step);
+    }
 };
 
+/// returns true if control handled request (caller focuses based on this)
 fn setA11yStepperValue(context: *anyopaque, value: f32) bool {
-    const state: *NumberStepperState = @ptrCast(@alignCast(context));
-    state.setValue(value);
+    const rt: *NumberStepperRuntime = @ptrCast(@alignCast(context));
+    if (rt.is_disabled) return false;
+    rt.propose(value);
     return true;
 }
 
-pub const NumberStepperMount = struct {
+pub const NumberStepperResult = struct {
     wrapper: *Node,
-    state: *NumberStepperState,
+    /// value signal (`ui.split` = null)
+    value: ?*Signal(f64),
+    /// `ui.view` integration (see src/ui/view_parts.zig).
+    pub fn viewParts(self: NumberStepperResult) core.ViewParts {
+        return .{ .root = self.wrapper };
+    }
 };
 
 fn onMinus(ctx: *anyopaque) void {
-    const s: *NumberStepperState = @ptrCast(@alignCast(ctx));
-    s.decrement();
+    const rt: *NumberStepperRuntime = @ptrCast(@alignCast(ctx));
+    rt.decrement();
 }
 
 fn onPlus(ctx: *anyopaque) void {
-    const s: *NumberStepperState = @ptrCast(@alignCast(ctx));
-    s.increment();
+    const rt: *NumberStepperRuntime = @ptrCast(@alignCast(ctx));
+    rt.increment();
 }
 
 fn onStepKey(key: KeyCode, _: Modifiers, context: ?*anyopaque) EventResult {
-    const state: *NumberStepperState = @ptrCast(@alignCast(context orelse return .ignored));
+    const rt: *NumberStepperRuntime = @ptrCast(@alignCast(context orelse return .ignored));
+    if (rt.is_disabled) return .ignored;
     switch (key) {
-        .right, .up => state.increment(),
-        .left, .down => state.decrement(),
+        .right, .up => rt.increment(),
+        .left, .down => rt.decrement(),
         else => return .ignored,
     }
     return .handled;
 }
 
-// 样式层已析出到 styles.zig
+// styling extracted to styles.zig
 const styles = @import("styles.zig");
 const stepBtnStyle = styles.stepBtnStyle;
 const stepBtnLabelStyle = styles.stepBtnLabelStyle;
 const stepperWrapperStyle = styles.stepperWrapperStyle;
 const stepperValueStyle = styles.stepperValueStyle;
 
-fn stepBtn(cx: *Cx, t: *const core.ThemeTokens, label: []const u8, disabled: bool, a11y_label: []const u8) !*Node {
-    const btn = try box(cx, stepBtnStyle(t), .{});
-    // sweep：txt 建失败时 btn 不能漏
-    errdefer cx.freeNode(btn);
-    if (!disabled) btn.style.cursor = .pointer;
-    // 子树文本是 "-"/"+"，靠 fallback 会读成"连字符""加号"这种无意义的字符名；
-    // 必须显式给语义化 label。
-    btn.behavior.interaction.a11y = .{
-        .role = .button,
-        .label = a11y_label,
-        .disabled = disabled,
-    };
-    const txt = try core.adoptChild(cx, cx.allocator, btn, try box(cx, .{ .width = .{ .fit = .{} }, .height = .{ .fit = .{} } }, .{}));
-    var txt_props = stepBtnLabelStyle(disabled, t);
-    txt_props.content = label;
-    txt.setText(txt_props);
-    return btn;
+const StepBtnProps = struct { style: core.BoxStyle, a11y: core.A11yProps, on_click: core.HandlerRef };
+const StepLabelProps = struct { style: core.TextStyle };
+
+fn stepBtn(t: *const core.ThemeTokens, label: []const u8, a11y_label: []const u8, on_click: core.HandlerRef) view.Box(StepBtnProps, view.Text(StepLabelProps, []const u8), null) {
+    // subtree text is '-'/'+', fallback reads as 'hyphen'/'plus' meaningless char names; must
+    // explicitly give semantic labels.
+    return view.box(StepBtnProps{
+        .style = stepBtnStyle(t),
+        .a11y = .{ .role = .button, .label = a11y_label },
+        .on_click = on_click,
+    }, view.text(StepLabelProps{ .style = stepBtnLabelStyle(false, t) }, label));
 }
 
-pub fn mountNumberStepper(props: NumberStepperProps, scope: *Scope, cx: *Cx) !NumberStepperMount {
-    const my_scope = try scope.childScope();
-    const allocator = cx.allocator;
-    const t = cx.tokens;
+/// create NumberStepper: `W.NumberStepper(.{ .value = qty, .min = 0 }).mount(scope, cx)`
+pub fn NumberStepper(props: anytype) NumberStepperBuilder {
+    return .{ .props = reactive.props.coerce(NumberStepperProps, props) };
+}
 
-    const state = try my_scope.allocator.create(NumberStepperState);
-    try my_scope.adoptResource(@ptrCast(state), struct {
-        fn cleanup(ptr: *anyopaque, alloc: Allocator) void {
-            alloc.destroy(@as(*NumberStepperState, @ptrCast(@alignCast(ptr))));
-        }
-    }.cleanup);
+pub const NumberStepperBuilder = struct {
+    props: NumberStepperProps,
 
-    const wrapper = try box(cx, stepperWrapperStyle(props.width, t), .{});
-    wrapper.style.overflow_hidden = true;
-    wrapper.meta.ownership.meta.component_name = "NumberStepper";
-    // sweep：wrapper 守到 return（连带 dispose 绑上的 my_scope）；子节点建好即 adopt
-    errdefer cx.freeNode(wrapper);
-    try core.bindScopeToNode(my_scope, wrapper);
-    // role=spinbutton 是 ARIA 给"带增减按钮的数值输入"的专用角色：AT 据此
-    // 提示用户可以用上下键调值，并播报当前值与可用范围。
-    wrapper.behavior.interaction.a11y = .{
-        .role = .spinbutton,
-        .disabled = props.disabled,
-    };
-    wrapper.setFocusable(!props.disabled);
+    pub fn mount(self: NumberStepperBuilder, scope: *Scope, cx: *Cx) !NumberStepperResult {
+        cx.owner.enterMount();
+        defer cx.owner.exitMount();
+        const props = self.props;
+        const my_scope = try scope.childScope();
+        var scope_bound = false;
+        errdefer if (!scope_bound) my_scope.dispose();
+        const t = cx.tokens;
+        reactive.checkBorrow(my_scope, props.disabled);
+        const value = try reactive.resolveModel(f64, my_scope, props.value);
+        const initially_disabled = props.disabled.read(false);
 
-    const minus = try core.adoptChild(cx, allocator, wrapper, try stepBtn(cx, t, "-", props.disabled, "Decrease"));
+        // runtime created first (reclaimed with my_scope), button clicks point directly to it; node
+        // handle filled after mount
+        const rt = try my_scope.allocator.create(NumberStepperRuntime);
+        try my_scope.adoptResource(@ptrCast(rt), struct {
+            fn cleanup(ptr: *anyopaque, alloc: Allocator) void {
+                alloc.destroy(@as(*NumberStepperRuntime, @ptrCast(@alignCast(ptr))));
+            }
+        }.cleanup);
 
-    const value_cell = try core.adoptChild(cx, allocator, wrapper, try box(cx, .{
-        .width = .{ .grow = .{} },
-        .height = .{ .grow = .{} },
-        .justify = .center,
-        .align_items = .center,
-    }, .{}));
-    const value_node = try core.adoptChild(cx, allocator, value_cell, try box(cx, .{ .width = .{ .fit = .{} }, .height = .{ .fit = .{} } }, .{}));
-    value_node.setText(stepperValueStyle(props.disabled, t));
+        const Parts = struct { minus: *Node = undefined, value: *Node = undefined, plus: *Node = undefined };
+        var parts: Parts = .{};
+        const wrapper = try view.render(my_scope, cx, view.box(.{
+            .style = .{ stepperWrapperStyle(props.width, t), .{ .overflow_hidden = true } },
+            // role=spinbutton is ARIA's dedicated role for 'numeric input with
+            // increment/decrement': AT uses this to prompt user for arrow keys, announce current
+            // value and range.
+            .a11y = .{ .role = .spinbutton },
+        }, .{
+            view.capture(&parts.minus, stepBtn(t, "-", "Decrease", .{ .callback = onMinus, .context = @ptrCast(rt) })),
+            view.box(.{ .style = core.BoxStyle{
+                .width = .{ .grow = .{} },
+                .height = .{ .grow = .{} },
+                .justify = .center,
+                .align_items = .center,
+            } }, view.capture(&parts.value, view.text(.{ .style = stepperValueStyle(false, t) }, "0"))),
+            view.capture(&parts.plus, stepBtn(t, "+", "Increase", .{ .callback = onPlus, .context = @ptrCast(rt) })),
+        }));
+        wrapper.meta.ownership.meta.component_name = "NumberStepper";
+        // sweep: wrapper guards until return (with disposing attached my_scope)
+        errdefer cx.freeNode(wrapper);
+        try core.bindScopeToNode(my_scope, wrapper);
+        scope_bound = true;
 
-    const plus = try core.adoptChild(cx, allocator, wrapper, try stepBtn(cx, t, "+", props.disabled, "Increase"));
-
-    state.* = .{
-        .value = props.value,
-        .min = props.min,
-        .max = props.max,
-        .step = props.step,
-        .disabled = props.disabled,
-        .value_node = value_node,
-        .wrapper_node = wrapper,
-        .on_change = props.on_change,
-    };
-    // 初始值也走 clamp + 格式化
-    state.value = state.clampValue(props.value);
-    if (wrapper.behavior.interaction.a11y) |*a11y| {
-        a11y.value_range = .{
-            .now = @floatCast(state.value),
-            .min = @floatCast(state.min orelse state.value),
-            .max = @floatCast(state.max orelse state.value),
-            // The native value setter is only truthful when both published
-            // bounds are real. Unbounded steppers remain operable through
-            // increment/decrement actions instead of advertising a direct
-            // setter that would be clamped to the synthetic current-value
-            // fallback used for missing bounds.
-            .context = if (state.min != null and state.max != null) state else null,
-            .set_value = if (state.min != null and state.max != null) setA11yStepperValue else null,
+        rt.* = .{
+            .value = value,
+            .disabled = props.disabled,
+            .on_change = props.on_change,
+            .min = props.min,
+            .max = props.max,
+            .step = props.step,
+            // NaN sentinel and negated disabled state: first view necessarily applies
+            .shown = std.math.nan(f64),
+            .is_disabled = !initially_disabled,
+            .value_node = parts.value,
+            .minus = parts.minus,
+            .plus = parts.plus,
+            .wrapper_node = wrapper,
+            .cx = cx,
         };
-    }
-    state.syncLabel();
+        if (wrapper.behavior.interaction.a11y) |*a11y| {
+            const bounded = props.min != null and props.max != null;
+            a11y.value_range = .{
+                .small_change = @floatCast(props.step),
+                .now = 0,
+                .min = @floatCast(props.min orelse 0),
+                .max = @floatCast(props.max orelse 0),
+                // The native value setter is only truthful when both published
+                // bounds are real. Unbounded steppers remain operable through
+                // increment/decrement actions instead of advertising a direct
+                // setter that would be clamped to the synthetic current-value
+                // fallback used for missing bounds.
+                .context = if (bounded) rt else null,
+                .set_value = if (bounded) setA11yStepperValue else null,
+            };
+        }
 
-    if (!props.disabled) {
+        // interaction always mounted, disable determined at runtime (disabled can be dynamic)
         wrapper.behavior.events.on_key_down = onStepKey;
-        wrapper.behavior.events.key_context = @ptrCast(state);
-    }
+        wrapper.behavior.events.key_context = @ptrCast(rt);
 
-    if (!props.disabled) {
-        minus.behavior.events.on_click = .{ .callback = onMinus, .context = @ptrCast(state) };
-        plus.behavior.events.on_click = .{ .callback = onPlus, .context = @ptrCast(state) };
+        try rt.view(false);
+        // value is Model: local is also signal, interaction changes it, must have effect
+        try my_scope.createEffect(rt, NumberStepperRuntime.viewEffect);
+        return .{ .wrapper = wrapper, .value = value.asSignal() };
     }
-
-    return .{ .wrapper = wrapper, .state = state };
-}
+};
 
 // ============================================================================
 
+fn runtimeOf(r: NumberStepperResult) *NumberStepperRuntime {
+    return @ptrCast(@alignCast(r.wrapper.behavior.events.key_context.?));
+}
+
+fn valueText(r: NumberStepperResult) []const u8 {
+    return runtimeOf(r).value_node.getText().?.content;
+}
+
 test "NumberStepper: 步进 + clamp" {
     const testing = std.testing;
-    var cx = try Cx.init(testing.allocator);
+    var cx = try Cx.init(testing.allocator, std.testing.io);
     defer cx.deinit();
     const root = try box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
     cx.root = root;
     const scope = try Scope.init(testing.allocator, null, cx.owner);
     defer scope.dispose();
 
-    const ns = try mountNumberStepper(.{ .value = 9, .min = 0, .max = 10, .step = 2 }, scope, cx);
+    const ns = try NumberStepper(.{ .value = 9, .min = 0, .max = 10, .step = 2 }).mount(scope, cx);
     try root.appendChild(testing.allocator, ns.wrapper);
+    const rt = runtimeOf(ns);
 
-    try testing.expectEqualStrings("9", ns.state.value_node.getText().?.content);
-    ns.state.increment();
-    try testing.expectEqual(@as(f64, 10), ns.state.value); // clamp 到 max
-    try testing.expectEqualStrings("10", ns.state.value_node.getText().?.content);
-    ns.state.decrement();
-    ns.state.decrement();
-    ns.state.decrement();
-    ns.state.decrement();
-    ns.state.decrement();
-    try testing.expectEqual(@as(f64, 0), ns.state.value); // clamp 到 min
+    try testing.expectEqualStrings("9", valueText(ns));
+    rt.increment();
+    try testing.expectEqual(@as(f64, 10), ns.value.?.peek()); // clamp to max
+    try testing.expectEqualStrings("10", valueText(ns));
+    for (0..5) |_| rt.decrement();
+    try testing.expectEqual(@as(f64, 0), ns.value.?.peek()); // clamp to min
 }
 
 test "NumberStepper: inf / 超 i64 范围的值不 panic" {
     const testing = std.testing;
-    var cx = try Cx.init(testing.allocator);
+    var cx = try Cx.init(testing.allocator, std.testing.io);
     defer cx.deinit();
     const root = try box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
     cx.root = root;
     const scope = try Scope.init(testing.allocator, null, cx.owner);
     defer scope.dispose();
 
-    const ns = try mountNumberStepper(.{ .value = 0, .step = 1 }, scope, cx);
+    const ns = try NumberStepper(.{ .value = 0, .step = 1 }).mount(scope, cx);
     try root.appendChild(testing.allocator, ns.wrapper);
-    ns.state.setValue(1e19);
-    ns.state.setValue(-0x1p63);
-    ns.state.setValue(std.math.inf(f64));
-    ns.state.setValue(-std.math.inf(f64));
-    try testing.expect(ns.state.value_node.getText().?.content.len > 0);
-    ns.state.setValue(42);
-    try testing.expectEqualStrings("42", ns.state.value_node.getText().?.content);
+    const v = ns.value.?;
+    v.set(1e19);
+    v.set(-0x1p63);
+    v.set(std.math.inf(f64));
+    v.set(-std.math.inf(f64));
+    v.set(std.math.nan(f64));
+    try testing.expect(valueText(ns).len > 0);
+    v.set(42);
+    try testing.expectEqualStrings("42", valueText(ns));
 }
 
-test "NumberStepper: disabled 不响应" {
+test "NumberStepper: bound value, landed on_change, a11y value_text follows the node copy" {
     const testing = std.testing;
-    var cx = try Cx.init(testing.allocator);
+    var cx = try Cx.init(testing.allocator, std.testing.io);
+    defer cx.deinit();
+    const scope = try Scope.init(testing.allocator, null, cx.owner);
+    defer scope.dispose();
+
+    const qty = try scope.createSignal(f64, 1);
+    var landed: f64 = 0;
+    const ns = try NumberStepper(.{ .value = qty, .min = 1, .max = 99, .on_change = cx.on(f64, &landed, struct {
+        fn f(out: *f64, v: f64) void {
+            out.* = v;
+        }
+    }.f) }).mount(scope, cx);
+    defer cx.freeNode(ns.wrapper);
+    qty.set(1000); // external out-of-bounds: display clamped, not written back
+    try testing.expectEqualStrings("99", valueText(ns));
+    try testing.expectEqual(@as(f64, 1000), qty.peek());
+    cx.owner.beginBatch(); // real inputs all in host batch
+    _ = onStepKey(.down, .{}, ns.wrapper.behavior.events.key_context);
+    cx.owner.endBatch();
+    try testing.expectEqual(@as(f64, 98), qty.peek());
+    try testing.expectEqual(@as(f64, 98), landed);
+    try testing.expectEqualStrings("98", valueText(ns));
+    try testing.expectEqual(valueText(ns).ptr, ns.wrapper.behavior.interaction.a11y.?.value_text.?.ptr);
+}
+
+test "NumberStepper: 外部写入 NaN 后按键仍能从 min / 0 起步" {
+    const testing = std.testing;
+    var cx = try Cx.init(testing.allocator, std.testing.io);
+    defer cx.deinit();
+    const scope = try Scope.init(testing.allocator, null, cx.owner);
+    defer scope.dispose();
+    const ns = try NumberStepper(.{ .value = 3 }).mount(scope, cx);
+    defer cx.freeNode(ns.wrapper);
+    ns.value.?.set(std.math.nan(f64));
+    runtimeOf(ns).increment();
+    try testing.expectEqual(@as(f64, 1), ns.value.?.peek());
+}
+
+test "NumberStepper: on_change 在宿主 batch 内销毁组件，batch 结束时不运行已销毁的 effect" {
+    const testing = std.testing;
+    var cx = try Cx.init(testing.allocator, std.testing.io);
+    defer cx.deinit();
+    const root = try box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
+    cx.root = root;
+    const scope = try Scope.init(testing.allocator, null, cx.owner);
+    defer scope.dispose();
+    const Killer = struct {
+        cx: *Cx,
+        wrapper: *Node = undefined,
+        fn changed(self: *@This(), _: f64) void {
+            self.cx.detachChild(self.wrapper.parent.?, self.wrapper);
+            self.cx.freeNode(self.wrapper);
+        }
+    };
+    var killer = Killer{ .cx = cx };
+    const ns = try NumberStepper(.{ .value = 1, .on_change = cx.on(Killer, &killer, Killer.changed) }).mount(scope, cx);
+    killer.wrapper = ns.wrapper;
+    try root.appendChild(testing.allocator, ns.wrapper);
+    cx.owner.beginBatch();
+    _ = onStepKey(.up, .{}, ns.wrapper.behavior.events.key_context);
+    cx.owner.endBatch(); // view effect destroyed with scope: drain must skip it
+    try testing.expectEqual(@as(usize, 0), root.children.items.len);
+}
+
+test "NumberStepper: disabled 不响应；可动态切换" {
+    const testing = std.testing;
+    var cx = try Cx.init(testing.allocator, std.testing.io);
     defer cx.deinit();
     const root = try box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
     cx.root = root;
     const scope = try Scope.init(testing.allocator, null, cx.owner);
     defer scope.dispose();
 
-    const ns = try mountNumberStepper(.{ .value = 5, .disabled = true }, scope, cx);
+    const off = try scope.createSignal(bool, true);
+    const ns = try NumberStepper(.{ .value = 5, .disabled = off }).mount(scope, cx);
     try root.appendChild(testing.allocator, ns.wrapper);
-    ns.state.increment();
-    try testing.expectEqual(@as(f64, 5), ns.state.value);
+    const rt = runtimeOf(ns);
+    rt.increment();
+    try testing.expectEqual(@as(f64, 5), ns.value.?.peek());
+    try testing.expectEqual(EventResult.ignored, onStepKey(.up, .{}, ns.wrapper.behavior.events.key_context));
+    try testing.expect(!ns.wrapper.behavior.interaction.focusable);
+    try testing.expect(rt.plus.behavior.interaction.a11y.?.disabled);
+    off.set(false);
+    try testing.expect(ns.wrapper.behavior.interaction.focusable);
+    try testing.expect(!rt.plus.behavior.interaction.a11y.?.disabled);
+    rt.plus.behavior.events.on_click.?.callback(rt.plus.behavior.events.on_click.?.context);
+    try testing.expectEqual(@as(f64, 6), ns.value.?.peek());
 }
 
-// styles.zig 的测试收集，这行是必需的，见 docs/STYLING.md
+// test collection for styles.zig, this line is required, see docs/STYLING.md
 test {
     _ = @import("styles.zig");
 }
 
-// 逐分配点 OOM sweep，见 src/ui/components/oom_sweep.zig
+// per-allocation OOM sweep, see src/ui/components/oom_sweep.zig
 test "number_stepper: mount 在任意分配点失败时不泄漏（sweep）" {
     const sw = @import("../oom_sweep.zig");
     try sw.sweepMount("number_stepper", struct {
         fn m(scope: *sw.Scope, cx: *sw.Cx) anyerror!?*sw.Node {
-            return (try mountNumberStepper(.{ .value = 9, .min = 0, .max = 10, .step = 2 }, scope, cx)).wrapper;
+            return (try NumberStepper(.{ .value = 9, .min = 0, .max = 10, .step = 2 }).mount(scope, cx)).wrapper;
+        }
+    }.m);
+}
+
+test "number_stepper: 动态值 / disabled 的 mount 在任意分配点失败时不泄漏（sweep）" {
+    const sw = @import("../oom_sweep.zig");
+    try sw.sweepMount("number_stepper(dynamic)", struct {
+        fn m(scope: *sw.Scope, cx: *sw.Cx) anyerror!?*sw.Node {
+            const v = try scope.createSignal(f64, 3);
+            const off = try scope.createSignal(bool, false);
+            return (try NumberStepper(.{ .value = v, .min = 0, .max = 10, .disabled = off }).mount(scope, cx)).wrapper;
         }
     }.m);
 }

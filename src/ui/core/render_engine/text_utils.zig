@@ -1,5 +1,5 @@
-/// 文本渲染工具函数：UTF-8 处理、字符宽度、等宽快速路径检测
-/// 这些是无状态纯函数，不依赖 NodeExecutionState 或渲染上下文
+/// Text render utility functions: UTF-8 handling, char width, monospace fast path
+/// detect. Stateless pure functions, no NodeExecutionState or render context.
 const std = @import("std");
 
 const text_layout = @import("../text_layout.zig");
@@ -10,10 +10,11 @@ pub inline fn measureSegmentWidth(text: []const u8, font_size: f32, font_weight:
     return text_layout.measureTextWidthByFontKind(text, font_size, font_weight, use_italic, use_monospace);
 }
 
-/// cx-aware variant，走 RenderContext.shaping_cache (GlyphRun pipeline)
-/// 替代 measureTextWidthByFontKind 直调 platform 桥。
-/// 权威 width-as-drawn 回调不依赖 shaping_cache / font_system；只有宿主未安装
-/// 回调时的兼容 shaper 才需要它们。两条路径都不可用时降级旧 platform measure。
+/// cx-aware variant: uses RenderContext.shaping_cache (GlyphRun pipeline) instead of the
+/// direct platform bridge measureTextWidthByFontKind. The authoritative width-as-drawn
+/// callback is independent of shaping_cache / font_system; only the compat shaper needs them
+/// when the host lacks the callback. Falls back to platform measure when both paths are
+/// unavailable.
 pub fn measureSegmentWidthCtx(
     cx: *render_context_mod.RenderContext,
     text: []const u8,
@@ -26,6 +27,11 @@ pub fn measureSegmentWidthCtx(
     monospace_char_width: f32,
 ) f32 {
     if (text.len == 0) return 0;
+    if (cx.measure_font_fn) |measure| {
+        if (cx.measure_font_context) |ctx| {
+            if (measure(ctx, text, font_size, font_weight, use_italic, use_monospace, font_family, use_symbols, monospace_char_width)) |width| return width;
+        }
+    }
     return layout_engine.shapeViaPipeline(
         cx.shaping_cache,
         cx.font_system,
@@ -46,7 +52,8 @@ pub fn nextUtf8Boundary(text: []const u8, pos: usize) usize {
     return @min(text.len, pos + char_len);
 }
 
-/// 计算 UTF-8 文本的显示像素宽度（等宽字体: ASCII=1cw, CJK/全角=2cw）
+/// Calculate display pixel width of UTF-8 text (monospace: ASCII=1cw,
+/// CJK/fullwidth=2cw)
 pub fn utf8DisplayWidth(text: []const u8, char_width: f32) f32 {
     var width: f32 = 0;
     var i: usize = 0;
@@ -74,7 +81,7 @@ pub fn utf8DisplayWidth(text: []const u8, char_width: f32) f32 {
     return width;
 }
 
-/// 判断是否是全角/CJK 字符（占 2 个等宽字符宽度）
+/// Check if fullwidth/CJK char (occupies 2 monospace char widths)
 pub fn isWideChar(cp: u21) bool {
     if (cp >= 0x4E00 and cp <= 0x9FFF) return true; // CJK Unified Ideographs
     if (cp >= 0x3400 and cp <= 0x4DBF) return true; // CJK Extension A

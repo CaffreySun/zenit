@@ -1,7 +1,7 @@
-/// TextareaDocument，轻量文档类型
+/// TextareaDocument, lightweight document type
 ///
-/// 满足 DocCursor(Doc) + WrapMap(Doc) 的 comptime duck typing 接口。
-/// 使用连续 u8 数组 + line_starts 索引，适合 Textarea 的中等规模文本。
+/// Satisfies comptime duck typing for DocCursor(Doc) + WrapMap(Doc).
+/// Uses contiguous u8 array + line_starts index, suitable for Textarea's mid-size text.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const core_mod = @import("text_core");
@@ -9,9 +9,9 @@ pub const LineCol = core_mod.cursor.LineCol;
 
 pub const TextareaDocument = struct {
     allocator: Allocator,
-    text: std.ArrayListUnmanaged(u8) = .{},
-    /// 每行的起始字节偏移（line_starts[0] == 0 恒成立）
-    line_starts: std.ArrayListUnmanaged(usize) = .{},
+    text: std.ArrayListUnmanaged(u8) = .empty,
+    /// Start byte offset of each line (line_starts[0] == 0 always holds)
+    line_starts: std.ArrayListUnmanaged(usize) = .empty,
 
     pub fn init(allocator: Allocator) TextareaDocument {
         return initFallible(allocator) catch @panic("OOM: TextareaDocument.init 无法建立 line_starts[0]=0 不变式");
@@ -65,7 +65,7 @@ pub const TextareaDocument = struct {
         return .{ .owner = self, .candidate = candidate };
     }
 
-    // ===== DocCursor 接口 (8 个) =====
+    // ===== DocCursor interface (8 items) =====
 
     pub fn totalLength(self: *const TextareaDocument) usize {
         return self.text.items.len;
@@ -78,7 +78,7 @@ pub const TextareaDocument = struct {
     pub fn offsetToLineCol(self: *const TextareaDocument, offset: usize) LineCol {
         const off = @min(offset, self.text.items.len);
         const starts = self.line_starts.items;
-        // 二分查找：找到最大的 line 使得 line_starts[line] <= off
+        // Binary search: find max line such that line_starts[line] <= off
         var lo: usize = 0;
         var hi: usize = starts.len;
         while (lo < hi) {
@@ -110,7 +110,7 @@ pub const TextareaDocument = struct {
         const starts = self.line_starts.items;
         if (line >= starts.len) return self.text.items.len;
         if (line + 1 < starts.len) {
-            // 行尾 = 下一行起始 - 1 (跳过 \n)
+            // Line end = next line start - 1 (skip \n)
             return starts[line + 1] - 1;
         }
         return self.text.items.len;
@@ -128,7 +128,7 @@ pub const TextareaDocument = struct {
         const actual_len = actual_end - actual_start;
         if (actual_len == 0) return;
 
-        // 删除文本
+        // Delete text
         const items = self.text.items;
         if (actual_end < items.len) {
             std.mem.copyForwards(u8, items[actual_start .. items.len - actual_len], items[actual_end..items.len]);
@@ -143,7 +143,7 @@ pub const TextareaDocument = struct {
         }
     }
 
-    // ===== WrapMap 额外接口 (3 个) =====
+    // ===== WrapMap additional interface (3 items) =====
 
     pub fn getLineLength(self: *const TextareaDocument, line: usize) usize {
         return self.getLineEnd(line) - self.getLineStart(line);
@@ -172,7 +172,7 @@ pub const TextareaDocument = struct {
         return result;
     }
 
-    // ===== 自身方法 =====
+    // ===== Own methods =====
 
     /// Compatibility wrapper: a failed replacement preserves the old document.
     pub fn setText(self: *TextareaDocument, content: []const u8) void {
@@ -194,7 +194,7 @@ pub const TextareaDocument = struct {
         prepared.commit();
     }
 
-    /// 获取全部文本
+    /// Get all text
     pub fn getText(self: *const TextareaDocument) []const u8 {
         return self.text.items;
     }
@@ -365,17 +365,17 @@ test "TextareaDocument: WrapMap compatibility" {
 
     doc.setText("short\nthis is a longer line that might wrap");
 
-    var wm = WrapMap(TextareaDocument).init(alloc);
+    var wm = WrapMap(TextareaDocument).init(alloc, @import("std").testing.io);
     defer wm.deinit();
     wm.char_width = 8.0;
     wm.setWrapWidth(100, &doc);
     wm.setEnabled(true, &doc);
     _ = wm.rewrapInterpolatedAll(&doc);
 
-    // 至少有 2 个 display line（第二行会被 wrap）
+    // At least 2 display lines (second line will be wrapped)
     try std.testing.expect(wm.total_display_lines >= 2);
 
-    // bufferToDisplay 应该正常工作
+    // bufferToDisplay should work normally
     const dp = wm.bufferToDisplay(0, 3);
     try std.testing.expectEqual(@as(u32, 0), dp.display_line);
     try std.testing.expectEqual(@as(usize, 3), dp.display_col);
@@ -394,8 +394,8 @@ test "TextareaDocument allocation failure keeps replacement text and line index"
         failing.resize_fail_index = failing.resize_index;
         if (insertion) {
             // Fits the existing text allocation, but exceeds line index capacity.
-            _ = doc.insertAt(0, "\n" ** 12) catch {};
-        } else doc.setText("new\n" ** 300);
+            _ = doc.insertAt(0, (@as([("\n").len * (12)]u8, @bitCast(@as([12][("\n").len]u8, @splat(("\n").*)))) ++ "")) catch {};
+        } else doc.setText((@as([("new\n").len * (300)]u8, @bitCast(@as([300][("new\n").len]u8, @splat(("new\n").*)))) ++ ""));
         failing.fail_index = std.math.maxInt(usize);
         failing.resize_fail_index = std.math.maxInt(usize);
         try t.expect(failing.has_induced_failure);
@@ -414,13 +414,13 @@ test "TextareaDocument replacement and aliased insertion fail atomically at ever
             var failing = t.FailingAllocator.init(t.allocator, .{});
             var doc = TextareaDocument.init(failing.allocator());
             defer doc.deinit();
-            const initial = "a\n" ** 100;
+            const initial = (@as([("a\n").len * (100)]u8, @bitCast(@as([100][("a\n").len]u8, @splat(("a\n").*)))) ++ "");
             try doc.setTextChecked(initial);
             const old_text = doc.text.items.ptr;
             const old_lines = doc.line_starts.items.ptr;
             failing.fail_index = failing.alloc_index + failure;
             failing.resize_fail_index = failing.resize_index;
-            const result = if (insertion) doc.insertAt(1, doc.getText()) else doc.setTextChecked("b\n" ** 300);
+            const result = if (insertion) doc.insertAt(1, doc.getText()) else doc.setTextChecked((@as([("b\n").len * (300)]u8, @bitCast(@as([300][("b\n").len]u8, @splat(("b\n").*)))) ++ ""));
             failing.fail_index = std.math.maxInt(usize);
             failing.resize_fail_index = std.math.maxInt(usize);
             if (result) |_| {
@@ -432,9 +432,9 @@ test "TextareaDocument replacement and aliased insertion fail atomically at ever
                 try t.expectEqual(old_lines, doc.line_starts.items.ptr);
                 try t.expectEqual(@as(usize, 101), doc.lineCount());
                 for (doc.line_starts.items, 0..) |offset, line| try t.expectEqual(line * 2, offset);
-                if (insertion) try doc.insertAt(1, doc.getText()) else try doc.setTextChecked("b\n" ** 300);
+                if (insertion) try doc.insertAt(1, doc.getText()) else try doc.setTextChecked((@as([("b\n").len * (300)]u8, @bitCast(@as([300][("b\n").len]u8, @splat(("b\n").*)))) ++ ""));
             }
-            const expected = if (insertion) "a" ++ initial ++ initial[1..] else "b\n" ** 300;
+            const expected = if (insertion) "a" ++ initial ++ initial[1..] else (@as([("b\n").len * (300)]u8, @bitCast(@as([300][("b\n").len]u8, @splat(("b\n").*)))) ++ "");
             try t.expectEqualStrings(expected, doc.getText());
             var line: usize = 1;
             for (expected, 0..) |byte, i| {
@@ -478,4 +478,27 @@ test "TextareaDocument deletion allocates nothing and public ranges saturate" {
     try t.expectEqualStrings("", doc.getText());
     try t.expectEqualSlices(usize, &.{0}, doc.line_starts.items);
     try t.expectEqual(allocations, failing.alloc_index);
+}
+
+/// Current canonical display rows, including hard-newline bytes in the final
+/// segment of each buffer line. No estimated/interpolated rows are published.
+pub fn displayLineBoundaries(allocator: std.mem.Allocator, doc: *const TextareaDocument, map: anytype) ![]u32 {
+    if (map.enabled and (map.needs_rebuild or map.has_interpolated_lines)) return error.AccessibilityLayoutPending;
+    const length = doc.totalLength();
+    if (length > std.math.maxInt(u32)) return error.AccessibilityTextTooLarge;
+    var result: std.ArrayList(u32) = .empty;
+    defer result.deinit(allocator);
+    try result.append(allocator, 0);
+    for (0..doc.lineCount()) |line| {
+        const start = doc.getLineStart(line);
+        if (start > length) return error.AccessibilityInvalidLine;
+        if (start > result.items[result.items.len - 1]) try result.append(allocator, @intCast(start));
+        for (map.breaksForBuffer(line)) |relative| {
+            const position = start + relative;
+            if (position > length or position <= result.items[result.items.len - 1]) return error.AccessibilityInvalidLine;
+            try result.append(allocator, @intCast(position));
+        }
+    }
+    if (result.items[result.items.len - 1] != length) try result.append(allocator, @intCast(length));
+    return result.toOwnedSlice(allocator);
 }

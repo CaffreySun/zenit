@@ -182,10 +182,10 @@ pub fn attach(cx: *Cx, scope: *Scope, parent: *Node, config: Config) !*Node {
         fn destroy(ptr: *anyopaque, alloc: Allocator) void {
             const s: *OverlayState = @ptrCast(@alignCast(ptr));
             if (s.nodes_alive) {
-                // Scope 先于节点树销毁：树上还挂着指回 state 的 before_render
-                // hook / anim_state / on_cleanup，label 文本还 alias 着
-                // state.label_buf，不摘干净，下一帧 tickBeforeRender 或
-                // setTheme 的 hook 遍历就是 use-after-free。
+                // Scope destroyed before node tree: tree still has before_render hooks, anim_state,
+                // on_cleanup pointing to state, label text still aliases state.label_buf; if not
+                // cleaned up, next frame's tickBeforeRender or setTheme hook traversal is
+                // use-after-free.
                 s.container.meta.per_frame.hooks.before_render.main = null;
                 s.container.meta.per_frame.hooks.slots.anim_state = null;
                 s.container.meta.ownership.hooks.on_cleanup = null;
@@ -201,8 +201,8 @@ pub fn attach(cx: *Cx, scope: *Scope, parent: *Node, config: Config) !*Node {
 
     container.meta.per_frame.hooks.slots.anim_state = @ptrCast(state);
     container.meta.per_frame.hooks.before_render.main = beforeRender;
-    // 反向拆链：节点树先被释放时，标记 nodes_alive=false，
-    // 让上面的 scope 析构器跳过对已释放节点的触碰。
+    // Reverse unlinking: when node tree freed first, mark nodes_alive=false so scope destructor
+    // skips touching freed nodes above.
     container.meta.ownership.hooks.on_cleanup = Cx.simpleHandler(struct {
         fn cleanup(ptr: *anyopaque) void {
             const s: *OverlayState = @ptrCast(@alignCast(ptr));
@@ -235,12 +235,12 @@ fn beforeRender(node: *Node) void {
     }
 
     const t = target.?;
-    // 全变换 world rect（含祖先 scale/rotate），hit-test 选中节点用的就是
-    // 完整变换，高亮必须同口径，否则 scaled 子树里的节点框会脱位。
+    // Full transform world rect (with ancestor scale/rotate), hit-test selects nodes with full
+    // transform, highlight must match or bounds in scaled subtrees misalign.
     const rect = inspector_mod.nodeWorldRect(t);
-    // box/label 是 container 的子节点，translate 相对 container 生效；
-    // world 坐标必须先减去 container 自身的 world 原点，否则 attach 在
-    // 非原点父节点（如 title bar 下方的内容区）时全部高亮双重偏移。
+    // box/label are children of container, translate applies container-local; world coords must
+    // subtract container's own world origin or attach to non-origin parent (like content area below
+    // title bar) doubles the highlight offset.
     const org = inspector_mod.nodeWorldRect(state.container);
     const local_x = rect.x - org.x;
     const local_y = rect.y - org.y;
@@ -306,9 +306,9 @@ fn setHidden(state: *OverlayState, hidden: bool) void {
         state.label.markRenderDirty();
         state.label.markLayoutDirty();
 
-        // label_bg 是 fit + padding + 不透明背景：只清文本仍会留一个
-        // ~12×4px 的残点钉在最后的悬停位置。移出视口（尺寸清零挡不住
-        // padding 的自撑尺寸）。
+        // label_bg is fit + padding + opaque background: clearing only the text still leaves a
+        // ~12x4px remnant pinned at the last hover position. Move it out of the viewport (zeroing
+        // its size cannot stop the padding's self-sizing).
         state.label_bg.style.translate_x = -10_000;
         state.label_bg.style.translate_y = -10_000;
         state.label_bg.markRenderDirty();
@@ -321,7 +321,7 @@ fn setHidden(state: *OverlayState, hidden: bool) void {
 // ============================================================================
 
 test "overlay: attach mounts a 4-child container under the parent" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
 
     const root = try builders.box(cx, .{ .width = .{ .px = 200 }, .height = .{ .px = 100 } }, .{});
@@ -346,7 +346,7 @@ test "overlay: attach mounts a 4-child container under the parent" {
 }
 
 test "overlay: hidden when nothing is hovered" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
 
     const root = try builders.box(cx, .{ .width = .{ .px = 200 }, .height = .{ .px = 100 } }, .{});
@@ -369,7 +369,7 @@ test "overlay: hidden when nothing is hovered" {
 }
 
 test "overlay: positions the highlight over the hovered node" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
 
     const root = try builders.box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
@@ -403,13 +403,13 @@ test "overlay: positions the highlight over the hovered node" {
 }
 
 test "overlay: attach 在非原点父节点下不双重计入父偏移" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
 
     const root = try builders.box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
     cx.root = root;
 
-    // 内容区壳（如 title bar 下方），世界位置 (100, 50)。
+    // Content shell (e.g., area below title bar), world position (100, 50).
     const wrapper = try builders.box(cx, .{ .width = .{ .px = 300 }, .height = .{ .px = 250 } }, .{});
     try root.appendChild(std.testing.allocator, wrapper);
     wrapper.setLayoutRect(.{ .x = 100, .y = 50, .w = 300, .h = 250 });
@@ -425,16 +425,15 @@ test "overlay: attach 在非原点父节点下不双重计入父偏移" {
     cx.hovered_node = target;
     overlay_node.meta.per_frame.hooks.before_render.main.?(overlay_node);
 
-    // box 是 container（挂在 wrapper 下）的子节点：translate 必须是
-    // container-local 的 (50, 30)，而不是 world 的 (150, 80),
-    // 后者叠加 wrapper 自身位置后会画到 (250, 130)。
+    // box is child of container (under wrapper): translate must be container-local (50, 30), not
+    // world (150, 80); the latter stacked with wrapper's own position would paint at (250, 130).
     const state: *OverlayState = @ptrCast(@alignCast(overlay_node.meta.per_frame.hooks.slots.anim_state.?));
     try std.testing.expectApproxEqAbs(@as(f32, 50), state.box.style.translate_x, 0.001);
     try std.testing.expectApproxEqAbs(@as(f32, 30), state.box.style.translate_y, 0.001);
 }
 
 test "overlay: scope 先销毁时摘干净所有指回 state 的引用（UAF 防线）" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
 
     const root = try builders.box(cx, .{ .width = .{ .px = 200 }, .height = .{ .px = 100 } }, .{});
@@ -445,8 +444,8 @@ test "overlay: scope 先销毁时摘干净所有指回 state 的引用（UAF 防
     try std.testing.expect(overlay_node.meta.per_frame.hooks.before_render.main != null);
     try std.testing.expect(overlay_node.meta.ownership.hooks.on_cleanup != null);
 
-    // scope 先于节点树销毁（组件级 scope 卸载的顺序）,
-    // dispose 后节点树仍在渲染，任何残留引用都是下一帧的 use-after-free。
+    // Scope destroyed before node tree (component-level scope unload order), after dispose the node
+    // tree still renders, any stale reference is next frame's use-after-free.
     scope.dispose();
     try std.testing.expect(overlay_node.meta.per_frame.hooks.before_render.main == null);
     try std.testing.expect(overlay_node.meta.per_frame.hooks.slots.anim_state == null);
@@ -454,7 +453,7 @@ test "overlay: scope 先销毁时摘干净所有指回 state 的引用（UAF 防
 }
 
 test "overlay: skips inspectable=false nodes (so it doesn't highlight itself)" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
 
     const root = try builders.box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});

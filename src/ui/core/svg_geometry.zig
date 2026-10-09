@@ -34,7 +34,7 @@ pub fn hashSvgTexture(svg_data: []const u8) u64 {
 /// Each contour becomes a `move_to` + n `line_to`s; closed contours add a
 /// `close`. The resulting commands are owned by the caller (`.owned = true`).
 pub fn createIconPathGeometry(allocator: Allocator, rep: icon_ir.Rep) !PathGeometry {
-    var commands = std.ArrayList(PathCommand){};
+    var commands = @as(std.ArrayList(PathCommand), .empty);
     errdefer commands.deinit(allocator);
 
     var fill_rule: PathFillRule = .nonzero;

@@ -14,12 +14,12 @@ pub const Transition = struct {
         outgoing: *Node,
         duration_s: f32,
     ) !void {
-        // captureDisplayed 优先用 promoted_cached_commands / cached_commands,
-        // 对于复杂 editor 这种子树大量 promoted 的场景，才能抓到完整视觉；
-        // 裸 Snapshot.capture 会错过 promoted 子树内容，导致 snapshot 只剩外壳白底。
-        // captureDisplayed 走 cache 路径时 commands 空间是 parent-relative，bounds.y 已含
-        // node.rect.y 偏移；若再按 (world_origin + bounds - local_offset) 合成 capture_origin，
-        // 会把 rect.y 加两次。直接用 outgoing.globalRect 作为 anchor 才是屏幕真实位置。
+        // captureDisplayed prefers promoted_cached_commands / cached_commands; for a complex
+        // editor-like subtree with much promoted content it captures the complete visual; naked
+        // Snapshot.capture misses the promoted subtree and yields an empty shell. Via the cache
+        // path, commands are in parent-relative space and bounds.y already includes the node.rect.y
+        // offset; composing capture_origin as (world_origin + bounds - local_offset) double-adds
+        // rect.y. Use outgoing.globalRect directly as the anchor for the true screen position.
         const snapshot = (try Snapshot.captureDisplayed(cx, outgoing)) orelse return;
         const gr = outgoing.globalRect();
         var layer = try snapshot_layer.SnapshotLayer(.{
@@ -59,8 +59,27 @@ pub const Transition = struct {
 
 pub const SnapshotTransition = Transition;
 
+/// This frame has a composite layer moving the snapshot to (x, y) with size w*h; the layer
+/// draws the snapshot content. Snapshot position is not baked into rect geometry: it is
+/// carried by the begin_opacity_layer wrapping it via draw_x / draw_y (rect keeps snapshot
+/// local coords, encoder uses a transform to move the layer to the anchor), same invariant
+/// as snapshot_layer.zig tests.
+fn drewSnapshotAt(cx: *Cx, x: f32, y: f32, w: f32, h: f32) bool {
+    var in_layer = false;
+    for (cx.lowerForEncoderPaintTable()) |cmd| {
+        if (cmd.kind == .control and cmd.control_kind == .begin_opacity_layer) {
+            in_layer = @abs(cmd.draw_x - x) < 0.01 and @abs(cmd.draw_y - y) < 0.01 and @abs(cmd.draw_w - w) < 0.01 and @abs(cmd.draw_h - h) < 0.01;
+        } else if (cmd.kind == .control and cmd.control_kind == .end_opacity_layer) {
+            in_layer = false;
+        } else if (in_layer and cmd.isFillRect() and @abs(cmd.geom.w - w) < 0.01 and @abs(cmd.geom.h - h) < 0.01) {
+            return true;
+        }
+    }
+    return false;
+}
+
 test "Transition.dissolve keeps content visible after source unmount" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(240, 160);
 
@@ -90,40 +109,19 @@ test "Transition.dissolve keeps content visible after source unmount" {
 
     cx.frame_time_ms = 16;
     _ = cx.render();
-    const during = cx.lowerForEncoderPaintTable();
-    var found_during = false;
-    for (during) |cmd| {
-        if (cmd.isFillRect()) {
-            if (@abs(cmd.geom.x - 18) < 0.01 and @abs(cmd.geom.y - 14) < 0.01 and @abs(cmd.geom.w - 36) < 0.01 and @abs(cmd.geom.h - 22) < 0.01) {
-                found_during = true;
-                break;
-            }
-        }
-    }
-    try std.testing.expect(found_during);
+    try std.testing.expect(drewSnapshotAt(cx, 18, 14, 36, 22));
 
     cx.frame_time_ms = 266;
     _ = cx.render();
     _ = cx.drainDeferredWork(cx.deferredBudgetUs());
     cx.frame_time_ms = 282;
     _ = cx.render();
-    const after = cx.lowerForEncoderPaintTable();
-    var found_after = false;
-    for (after) |cmd| {
-        if (cmd.isFillRect()) {
-            if (@abs(cmd.geom.x - 18) < 0.01 and @abs(cmd.geom.y - 14) < 0.01 and @abs(cmd.geom.w - 36) < 0.01 and @abs(cmd.geom.h - 22) < 0.01) {
-                found_after = true;
-                break;
-            }
-        }
-    }
-
-    try std.testing.expect(!found_after);
+    try std.testing.expect(!drewSnapshotAt(cx, 18, 14, 36, 22));
     try std.testing.expectEqual(@as(usize, 0), root.children.items.len);
 }
 
 test "Transition.crossfade reveals incoming while outgoing dissolves" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(240, 160);
 

@@ -1,74 +1,64 @@
-//! Anchor，在文档编辑中保持稳定的位置标记。
+//! Anchor - stable position marker in document editing.
 //!
-//! 参考 Zed `text::Anchor`。我们的实现基于 PieceTree 的 `(source, buffer_offset)` 对：
-//!   - `original_buffer` 和 `add_buffer` 都是 **append-only**（insert 只追加、delete 不实际释放）
-//!   - 所以 `(source, buffer_offset)` 是该字节的**永久坐标**
-//!   - 即使 piece 因 insert/delete 被 split / replace，`buffer_offset` 指向的字节不变
-//!   - resolve 时扫当前 piece 列表，找到包含该 `(source, offset)` 的 piece，算出 doc offset
+//! Modeled on Zed `text::Anchor`, based on the PieceTree `(source, buffer_offset)` pair:
+//! - `original_buffer` and `add_buffer` are both **append-only** (insert appends,
+//!   delete doesn't free)
+//! - so `(source, buffer_offset)` is the **permanent coordinate** of that byte
+//! - even if pieces split/replace on insert/delete, `buffer_offset` points to the same byte
+//! - resolve scans the current piece list for the piece containing `(source, offset)`
+//!   and computes the doc offset
 //!
-//! ## Bias 语义
+//! ## Bias semantics
 //!
-//! 当 anchor 位置正好位于某次 insert 的起点或 delete 边界时，Bias 决定 anchor 偏向哪边：
-//!   - `.left`：anchor "粘"在左侧字符后 -> insert 在 anchor 位置时，anchor 不移动
-//!   - `.right`：anchor "粘"在右侧字符前 -> insert 在 anchor 位置时，anchor 跟着往右移
+//! When the anchor sits exactly at an insert start or delete boundary, Bias decides
+//! which side it sticks to:
+//! `.left`: glued to the char before -> insert at anchor, anchor doesn't move
+//! `.right`: glued to the char after -> insert at anchor, anchor follows right
 //!
-//! 典型用法：
-//!   - `Selection.start` 用 `.right`（选区起点跟着后面的字符走）
-//!   - `Selection.end` 用 `.left`（选区终点粘在前面的字符）
+//! Typical usage: `Selection.start` uses `.right`, `Selection.end` uses `.left`.
 //!
-//! 删除场景：如果 anchor 落在被删除的范围内，resolve 会根据 bias 回退到
-//!   range.start（.left）或 range.end（.right）。
+//! Delete: if the anchor falls in the deleted range, resolve backs up to range.start
+//! (.left) or range.end (.right) per bias.
 //!
-//! ## 历史备注
-//!
-//! Phase 0 的占位 `Anchor` 基于 `(timestamp, offset, Unclipped)` 模拟 OT 语义。
-//! 该设计对齐 Zed `text::Anchor`，但 resolve 需要 PieceTree 记录每次编辑的 diff log。
-//! 为了在 Phase 1.5 就能交付可用 Anchor（给 Find Panel / Multi-cursor 用），
-//! 改为基于 PieceTree 本身结构（append-only buffer）的简化实现。
-//!
-//! 两个实现都对齐 Zed 概念；差别在于 resolve 的查找策略。
-//! 未来若需要 OT 语义可扩展为 `(source, buffer_offset, bias, version)`。
+//! Future OT semantics can extend this to `(source, buffer_offset, bias, version)`.
 
 const std = @import("std");
 
-/// Bias，决定 anchor 在编辑边界上的"粘性"方向。
+/// Bias - determines anchor 'stickiness' direction at edit boundaries.
 pub const Bias = enum(u8) {
-    /// 粘左（anchor 在字符之间时偏向左边的字符）
+    /// stick left (anchor between chars leans toward left char)
     left,
-    /// 粘右（anchor 在字符之间时偏向右边的字符）
+    /// stick right (anchor between chars leans toward right char)
     right,
 };
 
-/// PieceTree 的 source 枚举镜像。
-/// 值必须与 `piece_tree.Source` 一致（piece_tree 会用 `@intFromEnum` 转换）。
+/// mirror of PieceTree's source enum. values must match `piece_tree.Source` (piece_tree converts
+/// via `@intFromEnum`).
 pub const Source = enum(u8) {
     original = 0,
     add = 1,
 };
 
-/// Anchor kind：normal = 普通锚点；start/end = 文档两端特殊锚点。
+/// Anchor kind: normal = ordinary anchor; start/end = special end anchors.
 pub const Kind = enum(u8) {
-    /// 普通 anchor：基于 (source, buffer_offset) 解析
+    /// ordinary anchor: resolves via (source, buffer_offset)
     normal,
-    /// 文档起始：resolve 永远返回 0
+    /// document start: resolve always returns 0
     start_of_document,
-    /// 文档末尾：resolve 永远返回 totalLength()
+    /// document end: resolve always returns totalLength()
     end_of_document,
 };
 
-/// Anchor，稳定位置标记。
-///
-/// 两个特殊常量：
-///   - `START`：永远指向文档 offset 0
-///   - `END`：永远指向文档末尾（totalLength）
+/// Anchor - stable position marker. two special constants: `START` always points to document offset
+/// 0, `END` always points to document end (totalLength)
 pub const Anchor = struct {
-    /// 源 buffer（original / add）。kind != .normal 时忽略此字段。
+    /// source buffer (original / add). ignored when kind != .normal.
     source: Source,
-    /// 该 buffer 中的字节偏移。kind != .normal 时忽略此字段。
+    /// byte offset in that buffer. ignored when kind != .normal.
     buffer_offset: usize,
-    /// 粘性方向。
+    /// stickiness direction.
     bias: Bias,
-    /// Anchor kind。
+    /// Anchor kind.
     kind: Kind,
 
     pub const START: Anchor = .{
@@ -93,14 +83,14 @@ pub const Anchor = struct {
             a.bias == b.bias;
     }
 
-    /// 判断 anchor 是否指向某 source 的某 offset（忽略 bias 和 kind）
+    /// check if anchor points to certain source's offset (ignore bias and kind)
     pub fn pointsTo(self: Anchor, source: Source, offset: usize) bool {
         if (self.kind != .normal) return false;
         return self.source == source and self.buffer_offset == offset;
     }
 };
 
-/// 一段范围（起点 + 终点，都是 anchor）。
+/// range segment (start + end, both anchors).
 pub const AnchorRange = struct {
     start: Anchor,
     end: Anchor,
@@ -111,7 +101,7 @@ pub const AnchorRange = struct {
 };
 
 // ============================================================================
-// Tests（纯类型测试，不依赖 PieceTree；resolve 测试在 piece_tree.zig）
+// Tests (pure type tests, independent of PieceTree; resolve tests in piece_tree.zig)
 // ============================================================================
 
 const testing = std.testing;

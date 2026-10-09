@@ -1,24 +1,21 @@
-/// UI Components Module
-///
-/// Phase 3.2-3.4: VSCode 风格组件库
-/// 参考 vscode-ui-lib SolidJS 实现
-///
-/// 组件分类:
-/// - 基础组件: Button, Input, Checkbox, Switch, Badge
-/// - 布局组件: Stack, Card, Divider, ScrollArea
-/// - 交互组件: Tabs, Tooltip, Modal
-///
-/// 设计原则:
-/// 1. SolidJS 风格：组件函数执行一次，通过 Signal 更新
-/// 2. 无障碍性：ARIA 属性、键盘导航
-/// 3. 主题支持：VSCode 暗色主题
-/// 4. 动画支持：过渡、缓动
+/// UI Components Module: VSCode-style component library.
+/// Reference: vscode-ui-lib SolidJS implementation.
+/// Component categories:
+/// - Primitives: Button, Input, Checkbox, Switch, Badge
+/// - Layout: Stack, Card, Divider, ScrollArea
+/// - Interactive: Tabs, Tooltip, Modal
+/// Design principles:
+/// 1. SolidJS style: component function executes once; updates via Signal
+/// 2. Accessibility: ARIA attributes, keyboard navigation
+/// 3. Theme support: VSCode dark theme
+/// 4. Animation support: transitions, easing.
 const std = @import("std");
 const core = @import("../core.zig");
 
-// 统一基底
+// Unified base.
 pub const control_shell = @import("control_shell/mod.zig");
-/// 测试支撑：组件 mount 的逐分配点 OOM sweep。导出给消费方复用同一套判定口径。
+/// Test support: per-allocation OOM sweep during component mount. Export for consumers
+/// to reuse same criteria.
 pub const oom_sweep = @import("oom_sweep.zig");
 pub const controlShell = control_shell.controlShell;
 pub const ControlShellConfig = control_shell.ControlShellConfig;
@@ -26,36 +23,37 @@ pub const ControlShellResult = control_shell.ControlShellResult;
 pub const ControlVariant = control_shell.ControlVariant;
 pub const ControlSize = control_shell.ControlSize;
 
-// 基础组件
+// Primitives.
 pub const button = @import("button/mod.zig");
 pub const Button = button.Button;
-pub const setButtonBackgroundOverride = button.setBackgroundOverride;
-pub const setButtonInteractionOverride = button.setInteractionOverride;
 pub const ButtonVariant = ControlVariant;
 pub const ButtonSize = ControlSize;
 
 pub const number_stepper = @import("number_stepper/mod.zig");
-pub const NumberStepper = number_stepper.mountNumberStepper;
+pub const NumberStepper = number_stepper.NumberStepper;
 pub const tags_input = @import("tags_input/mod.zig");
-pub const TagsInput = tags_input.mountTagsInput;
+pub const TagsInput = tags_input.TagsInput;
+pub const TagsInputResult = tags_input.TagsInputResult;
 pub const file_upload = @import("file_upload/mod.zig");
-pub const FileUpload = file_upload.mountFileUpload;
+pub const FileUpload = file_upload.FileUpload;
+pub const FileUploadResult = file_upload.FileUploadResult;
 pub const data_table = @import("data_table/mod.zig");
-/// 菜单键盘导航共享逻辑（Menu / DropdownMenu 复用同一份 nextEnabledIndex）
-pub const menu_navigation = @import("menu_navigation.zig");
-/// 共享选择模型（列表/树类组件的单选+多选）
+/// Shared selection model (list/tree single + multi-select).
 pub const selection = @import("selection.zig");
 pub const SelectionMode = selection.SelectionMode;
 pub const SelectionModel = selection.SelectionModel;
 pub const ClickIntent = selection.ClickIntent;
-pub const DataTable = data_table.mountDataTable;
+pub const DataTable = data_table.DataTable;
+pub const DataTableResult = data_table.DataTableResult;
 pub const DataTableProps = data_table.DataTableProps;
 pub const combo_box = @import("combo_box/mod.zig");
-pub const ComboBox = combo_box.mountComboBox;
+pub const ComboBox = combo_box.ComboBox;
+pub const ComboBoxResult = combo_box.ComboBoxResult;
 pub const ComboOption = combo_box.ComboOption;
 pub const ComboBoxProps = combo_box.ComboBoxProps;
 pub const select = @import("select/mod.zig");
-pub const Select = select.mountSelect;
+pub const Select = select.Select;
+pub const SelectResult = select.SelectResult;
 pub const SelectProps = select.SelectProps;
 pub const SelectOption = select.SelectOption;
 pub const SelectState = select.SelectState;
@@ -81,7 +79,7 @@ pub const badge = @import("badge/mod.zig");
 pub const Badge = badge.Badge;
 pub const StatusBadge = badge.StatusBadge;
 
-// 布局组件
+// Layout.
 pub const stack = @import("stack/mod.zig");
 pub const VStack = stack.VStack;
 pub const HStack = stack.HStack;
@@ -92,6 +90,24 @@ pub const glass_box = @import("glass_box/mod.zig");
 pub const GlassBox = glass_box.GlassBox;
 pub const GlassBoxReadability = glass_box.GlassBoxReadability;
 pub const GlassBoxEmphasis = glass_box.GlassBoxEmphasis;
+pub const glass_group = @import("glass_group/mod.zig");
+pub const GlassGroup = glass_group.GlassGroup;
+pub const GlassShape = glass_group.GlassShape;
+pub const glass_controls = @import("glass_controls/mod.zig");
+/// ConcentricRectangle / containerShape (concentric corners, SwiftUI macOS 26).
+pub const concentric = @import("../concentric.zig");
+pub const ConcentricRectangle = concentric.ConcentricRectangle;
+pub const background_extension = @import("background_extension/mod.zig");
+pub const BackgroundExtension = background_extension.BackgroundExtension;
+pub const GlassSlider = glass_controls.GlassSlider;
+pub const GlassToggle = glass_controls.GlassToggle;
+pub const glass_toolbar = @import("glass_toolbar/mod.zig");
+pub const GlassToolbar = glass_toolbar.GlassToolbar;
+pub const glass_bars = @import("glass_bars/mod.zig");
+pub const GlassNavigationBar = glass_bars.GlassNavigationBar;
+pub const GlassTabBar = glass_bars.GlassTabBar;
+pub const GlassBottomToolbar = glass_bars.GlassBottomToolbar;
+pub const GlassButton = glass_bars.GlassButton;
 
 pub const group = @import("group/mod.zig");
 pub const Group = group.Group;
@@ -100,15 +116,16 @@ pub const addGroupItem = group.addGroupItem;
 pub const divider = @import("divider/mod.zig");
 pub const Divider = divider.Divider;
 
-// 交互组件
+// Interactive.
 pub const tabs = @import("tabs/mod.zig");
 pub const Tabs = tabs.Tabs;
 pub const TabPanel = tabs.TabPanel;
 
 pub const scroll_area = @import("scroll_area/mod.zig");
-pub const mountScrollArea = scroll_area.mountScrollArea;
+pub const ScrollArea = scroll_area.ScrollArea;
 pub const ScrollAreaResult = scroll_area.ScrollAreaResult;
-/// 程序化滚动公共入口（别直接写 state.scroll_y，会跳过 clamp/动量复位/像素对齐）
+/// Programmatic scroll entry point (don't write state.scroll_y directly; skips
+/// clamp/momentum reset/pixel align).
 pub const ScrollAlign = scroll_area.ScrollAlign;
 pub const setScrollY = scroll_area.setScrollY;
 pub const scrollIntoView = scroll_area.scrollIntoView;
@@ -119,7 +136,7 @@ pub const VirtualList = virtual_list.VirtualList;
 pub const VirtualListState = virtual_list.VirtualListState;
 
 pub const grid = @import("grid/mod.zig");
-pub const mountGrid = grid.mountGrid;
+pub const Grid = grid.Grid;
 pub const GridState = grid.GridState;
 pub const GridProps = grid.GridProps;
 
@@ -166,20 +183,15 @@ pub const SnapshotLayerProps = snapshot_layer.SnapshotLayerProps;
 pub const SnapshotLayerResult = snapshot_layer.SnapshotLayerResult;
 pub const BackdropConfig = snapshot_layer.BackdropConfig;
 
-// legacy select.zig 删除（2026-04-30）。用 select_headless 替代。
-// select_headless 通过 ui.select_headless 直接公开（src/ui/ui.zig:155）；
-// SelectOption(ValueT) 通过 select_headless.Option(ValueT) 暴露。
+// legacy select.zig removed (2026-04-30). Use select_headless instead.
+// select_headless exposed via ui.select_headless (src/ui/ui.zig:155);
+// SelectOption(ValueT) exposed as select_headless.Option(ValueT).
 
 pub const menu = @import("menu/mod.zig");
 pub const Menu = menu.Menu;
 pub const MenuItem = menu.MenuItem;
 pub const MenuItemKind = menu.MenuItemKind;
-
-pub const dropdown_menu = @import("dropdown_menu/mod.zig");
-pub const DropdownMenu = dropdown_menu.DropdownMenu;
-pub const DropdownItem = dropdown_menu.DropdownItem;
-pub const DropdownItemKind = dropdown_menu.DropdownItemKind;
-pub const DropdownMenuState = dropdown_menu.DropdownMenuState;
+pub const MenuState = menu.MenuState;
 
 pub const slider = @import("slider/mod.zig");
 pub const Slider = slider.Slider;
@@ -255,11 +267,11 @@ pub const SpinnerProps = spinner.SpinnerProps;
 pub const accordion = @import("accordion/mod.zig");
 pub const Accordion = accordion.Accordion;
 pub const AccordionItem = accordion.AccordionItem;
-pub const AccordionState = accordion.AccordionState;
+pub const accordionItemOpen = accordion.accordionItemOpen;
 pub const AccordionResult = accordion.AccordionResult;
 pub const AccordionItemResult = accordion.AccordionItemResult;
 
-// Form 组件
+// Form component
 pub const form = @import("form/mod.zig");
 pub const FormOf = form.FormOf;
 pub const ValidationResult = form.ValidationResult;
@@ -269,17 +281,18 @@ pub const FormFieldOf = form.FormFieldOf;
 pub const FormFieldResult = form.FormFieldResult;
 pub const FormFieldConfig = form.FormFieldConfig;
 
-// 导出类型
+// Exported types.
 pub const Size = core.Size;
 pub const Padding = core.Padding;
 pub const Color = core.Color;
 pub const ThemeTokens = core.ThemeTokens;
 
-// popover 的析出单测（popover/tests.zig）由 popover/mod.zig 自己的 test 块
-// 显式 import, refAllDecls 只递归本文件引用过的模块，析出的测试文件若无人
-// 显式 import 等于静默丢失。
+// popover's extracted unit tests (popover/tests.zig) must be explicitly imported by
+// popover/mod.zig's test block. refAllDecls only recurses modules referenced in this file;
+// extracted test file without explicit import is silently lost.
 test {
     std.testing.refAllDecls(@This());
-    // 跨组件控件高度合同测试（析出文件必须显式 import，否则静默丢失）
+    // Cross-component control height contract tests (extracted file must be explicitly imported;
+    // else silently lost).
     _ = @import("control_height_tests.zig");
 }

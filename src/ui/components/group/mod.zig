@@ -1,16 +1,16 @@
-/// Group Component，组合容器 HOC
-///
-/// 将多个子组件组合成一个视觉整体：
-/// - gap = -1 让子项边框重叠（避免双边框）
-/// - 首项：右侧圆角清零（TR=0, BR=0），保留左侧圆角
-/// - 末项：左侧圆角清零（TL=0, BL=0），保留右侧圆角
-/// - 中间项：四角全部清零
-/// - 不加外框 border，不干扰子项其他样式
-///
-/// 参考: React Group (CMC UI Kit) attached 模式
+/// Group Component: composition container HOC.
+/// Combines child components into visual unit:
+/// - gap = -1 overlaps child borders (avoid double border)
+/// - first: zero right corners (TR=0, BR=0), keep left
+/// - last: zero left corners (TL=0, BL=0), keep right
+/// - between: zero all
+/// - only: keep all
+/// - no outer border; doesn't affect other child styles.
+/// Reference: React Group (CMC UI Kit) attached mode.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const core = @import("../../core.zig");
+const view = @import("../../view.zig");
 const Cx = core.Cx;
 const Node = core.Node;
 const box = core.box;
@@ -20,13 +20,13 @@ const Scope = core.Scope;
 const Padding = core.Padding;
 const BorderSideColors = @import("../../core/types.zig").BorderSideColors;
 
-/// Group 方向
+/// Group direction.
 pub const GroupOrientation = enum {
     horizontal,
     vertical,
 };
 
-/// 子项在 Group 中的位置
+/// Child position in Group.
 pub const GroupItemPosition = enum {
     first,
     between,
@@ -34,52 +34,55 @@ pub const GroupItemPosition = enum {
     only,
 };
 
-/// Group 属性
+/// Group properties.
 pub const GroupProps = struct {
-    /// 方向
+    /// Direction.
     orientation: GroupOrientation = .horizontal,
-    /// 宽度
+    /// Width.
     width: Sizing = .{ .fit = .{} },
-    /// 对齐方式
+    /// Alignment.
     align_items: core.AlignItems = .stretch,
 };
 
-/// Group mount 返回值
+/// Group mount return value.
 pub const GroupResult = struct {
     container: *Node,
+    /// `ui.view` integration (see src/ui/view_parts.zig).
+    pub fn viewParts(self: GroupResult) core.ViewParts {
+        return .{ .root = self.container, .slot = self.container };
+    }
 };
 
-pub fn Group(props: GroupProps) GroupBuilder {
-    return GroupBuilder{ .props = props };
+pub fn Group(props: anytype) GroupBuilder {
+    return .{ .props = @import("../../reactive.zig").props.coerce(GroupProps, props) };
 }
 
 pub const GroupBuilder = struct {
     props: GroupProps,
 
-    pub fn mount(self: GroupBuilder, _: *Scope, cx: *Cx) !GroupResult {
+    pub fn mount(self: GroupBuilder, scope: *Scope, cx: *Cx) !GroupResult {
         const p = self.props;
         const dir: core.Direction = if (p.orientation == .horizontal) .row else .column;
 
-        const container = try box(cx, .{
+        const container = try view.render(scope, cx, view.box(.{ .style = .{
             .width = p.width,
             .height = .{ .fit = .{} },
             .direction = dir,
             .align_items = p.align_items,
             .gap = 0,
-        }, .{});
+        } }, {}));
         container.meta.ownership.meta.component_name = "Group";
 
         return .{ .container = container };
     }
 };
 
-/// 将子节点添加到 Group 中，根据位置设置 per-corner radius
-///
-/// Horizontal 布局 (radii 顺序: TL, TR, BR, BL):
-/// - first: 保留 TL/BL，清零 TR/BR
-/// - last:  保留 TR/BR，清零 TL/BL
-/// - between: 全部清零
-/// - only: 保留全部
+/// Add child node to Group; set per-corner radius by position.
+/// Horizontal layout (radii order: TL, TR, BR, BL):
+/// - first: keep TL/BL, zero TR/BR
+/// - last: keep TR/BR, zero TL/BL
+/// - between: zero all
+/// - only: keep all.
 pub fn addGroupItem(
     container: *Node,
     allocator: Allocator,
@@ -105,7 +108,7 @@ pub fn addGroupItem(
         .between => .{ .all = 0 },
     };
 
-    // border.radius 清零（per-corner 由 ext.corner_radius 控制）
+    // Zero border.radius (per-corner controlled by ext.corner_radius).
     child.style.border.radius = 0;
     child.setMargin(Padding.ZERO);
     switch (pos) {
@@ -135,11 +138,11 @@ pub fn addGroupItem(
     try container.appendChild(allocator, child);
 }
 
-// ========== 测试 ==========
+// ========== Tests ==========
 
 test "Group: structure" {
     const alloc = std.testing.allocator;
-    var ctx = try Cx.init(alloc);
+    var ctx = try Cx.init(alloc, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 200 } }, .{});
@@ -157,7 +160,7 @@ test "Group: structure" {
 
 test "Group: addGroupItem per-corner radius" {
     const alloc = std.testing.allocator;
-    var ctx = try Cx.init(alloc);
+    var ctx = try Cx.init(alloc, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 200 } }, .{});
@@ -195,7 +198,7 @@ test "Group: addGroupItem per-corner radius" {
     try std.testing.expectEqual(@as(f32, 8), r3[2]);
     try std.testing.expectEqual(@as(f32, 0), r3[3]);
 
-    // border width/color 不被修改
+    // border width/color not modified.
     try std.testing.expectEqual(@as(f32, 1), c1.style.border.width);
     try std.testing.expectEqual(Color.hex(0xE5E5E5), c2.style.border.color);
     try std.testing.expectEqual(@as(f32, -1), c2.style.margin.left);
@@ -204,7 +207,7 @@ test "Group: addGroupItem per-corner radius" {
 
 test "Group: overlap follows child border width" {
     const alloc = std.testing.allocator;
-    var ctx = try Cx.init(alloc);
+    var ctx = try Cx.init(alloc, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 240 }, .height = .{ .px = 120 } }, .{});
@@ -227,7 +230,7 @@ test "Group: overlap follows child border width" {
 
 test "Group: attached seam keeps leading border on later items" {
     const alloc = std.testing.allocator;
-    var ctx = try Cx.init(alloc);
+    var ctx = try Cx.init(alloc, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 240 }, .height = .{ .px = 120 } }, .{});
@@ -252,7 +255,7 @@ test "Group: attached seam keeps leading border on later items" {
     try std.testing.expect(c2.style.border_side_colors().?.top == null);
 }
 
-// 逐分配点 OOM sweep，见 src/ui/components/oom_sweep.zig
+// Per-allocation OOM sweep; see src/ui/components/oom_sweep.zig.
 test "group: mount 在任意分配点失败时不泄漏（sweep）" {
     const sw = @import("../oom_sweep.zig");
     try sw.sweepMount("group", struct {

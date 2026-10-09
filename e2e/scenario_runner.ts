@@ -1,19 +1,19 @@
 #!/usr/bin/env bun
 /**
- * scenario_runner.ts, zenit UI 自动化 runner（最小可靠闭环）
+ * scenario_runner.ts: zenit UI automation runner (minimal reliable loop)
  *
- * 读 scenario（JSON 或 YAML）-> zig build -> 起 app（精确 executable + 唯一 RPC dir）
- * -> 逐 case：setup -> 执行 timeline（wait_for/click/hover/screenshot/assert…）
- * -> 抓帧 -> design/golden 比对 -> 落 report（JSON + 静态 HTML）。
+ * Read scenario (JSON or YAML) -> zig build -> launch app (exact executable + unique RPC dir)
+ * -> per case: setup -> execute timeline (wait_for/click/hover/screenshot/assert...)
+ * -> capture frame -> design/golden comparison -> output report (JSON + static HTML).
  *
- * 对应 docs/internal/UI_AUTOMATION_PLAN.md §4（v2 schema）。
+ * Corresponds to docs/internal/UI_AUTOMATION_PLAN.md section 4 (v2 schema).
  *
- * 用法:
+ * Usage:
  *   bun e2e/scenario_runner.ts <scenario.json|scenario.yaml> [--out reports/] [--skip-build]
  *
- * 最小闭环暂支持的 timeline 操作（其余在「交互 DSL」阶段补）：
+ * Minimal loop currently supports timeline ops (rest in "interaction DSL" phase):
  *   wait / wait_for / screenshot / click / hover / assert
- * expect 支持: design（比对 reference PNG）、golden（比对 baseline PNG）、needs_review。
+ * expect supports: design (compare to reference PNG), golden (compare to baseline PNG), needs_review.
  */
 
 import { spawn, spawnSync } from "node:child_process";
@@ -28,7 +28,7 @@ import { decodePng } from "./png";
 import { startMockServer, type MockServer, type MockDef, type MockResponse } from "./mock";
 import { exportNodes } from "./pencil_export";
 
-// ── 类型（宽松，bun 直跑不做 strict 类型检查）──
+// ── Types (loose, bun runs without strict checking) ──
 
 interface Target {
   build: { step: string; args?: string[] };
@@ -63,7 +63,7 @@ interface CaseDef {
   expect: ExpectDef[];
 }
 
-// timeline 每个条目是「单键对象」，如 { click: { target: ... } }
+// timeline item single-key object, e.g. { click: { target: ... } }
 type TimelineOp = Record<string, any>;
 
 type ExpectDef =
@@ -114,7 +114,7 @@ function loadScenario(path: string): Scenario {
   return validateScenario(obj as Scenario, path);
 }
 
-/** macOS 自带 ruby，用它做可靠的 YAML->JSON（dev tooling 无外部依赖）。 */
+/** macOS has built-in ruby, use for reliable YAML->JSON (dev tooling no external deps). */
 function yamlToJson(yaml: string, path: string): unknown {
   const proc = spawnSync("ruby", ["-ryaml", "-rjson", "-e", "puts JSON.generate(YAML.load_file(ARGV[0]))", path], {
     encoding: "utf8",
@@ -179,7 +179,7 @@ function isExecutable(p: string): boolean {
   }
 }
 
-// ── timeline 执行 ──
+// ── timeline execution ──
 
 async function resolvePointer(target: PointerTarget): Promise<{ x: number; y: number }> {
   const pos = await client.screenPos(target.test_id);
@@ -397,9 +397,9 @@ async function executeTimeline(
   return artifacts;
 }
 
-// ── expect 评估 ──
+// ── expect evaluation ──
 
-/** 从 .pen 取参考图（带缓存：.pen 未变则复用，避免每次 code 变更都重新导出）。 */
+/** Get ref image from .pen (cached: .pen unchanged = reuse, avoid re-export per code change). */
 async function fetchPenReference(pen: { file: string; node_id: string; scale?: number }, scenarioId: string): Promise<string> {
   const cacheDir = join("designs-cache", scenarioId);
   mkdirSync(cacheDir, { recursive: true });
@@ -420,7 +420,7 @@ async function evaluateExpect(exp: ExpectDef, artifacts: Artifact[], scenarioId:
   if (exp.kind === "needs_review") {
     return { kind: "needs_review", ok: false, note: "需人工 review" };
   }
-  // design/golden 都取最后一个 screenshot 产物做比对
+  // design/golden both take last screenshot product for compare
   const shot = [...artifacts].reverse().find((a) => a.kind === "screenshot");
   if (!shot) throw new Error(`expect ${exp.kind} 需要截图产物，但 case 没截图`);
   if (exp.kind === "design") {
@@ -624,7 +624,7 @@ async function main(): Promise<void> {
     const a = argv[i];
     if (a.startsWith("--")) {
       flags.add(a);
-      if (valueFlags.has(a)) i++; // 消费该 flag 的值
+      if (valueFlags.has(a)) i++; // Consume that flag's value
       continue;
     }
     positional.push(a);
@@ -656,13 +656,13 @@ async function main(): Promise<void> {
   try {
     report.commit = gitHash();
     report.dirty = gitDirty();
-  } catch { /* 非 git 环境可忽略 */ }
+  } catch { /* not a git checkout; ignore */ }
 
   if (!flags.has("--skip-build")) {
     buildTarget(scenario.target);
   }
 
-  // 内嵌 mock（同进程，不单独起）。app 经 ZENIT_API_BASE 指向它。
+  // In-process mock (no separate spawn). app via ZENIT_API_BASE points to it.
   const mock: MockServer | undefined = scenario.mocks && scenario.mocks.length > 0
     ? startMockServer(scenario.mocks, dirname(scenarioPath))
     : undefined;
@@ -671,7 +671,7 @@ async function main(): Promise<void> {
   for (let i = 0; i < scenario.cases.length; i++) {
     const caseDef = scenario.cases[i];
     const caseSlug = slug(caseDef.name) || `case${i}`;
-    // 绝对路径：harness 的 recording/screenshot 有些要求绝对路径（recording 严格校验）
+    // Absolute path: harness recording/screenshot some need absolute (recording strict validation)
     const caseOut = resolve(join(outRoot, scenario.meta.id, runId, `case-${i}-${caseSlug}`));
     mkdirSync(caseOut, { recursive: true });
     const rpcDir = join(tmpdir(), `zenit_scenario_${runId}_${i}`);
@@ -679,7 +679,7 @@ async function main(): Promise<void> {
     const logPath = join(caseOut, "app.log");
     const app = launchApp(scenario.target, rpcDir, logPath, mock ? { ZENIT_API_BASE: mock.url } : undefined);
 
-    // client 从 process.env 读 RPC dir，必须和 app 用同一个目录（文件 RPC，不是 HTTP）。
+    // client reads RPC dir from process.env, must use same dir as app (file RPC, not HTTP).
     process.env.ZENIT_E2E_FILE_RPC_DIR = rpcDir;
 
     const started = Date.now();
@@ -694,7 +694,7 @@ async function main(): Promise<void> {
     try {
       await client.waitForServerReady();
 
-      // setup（app 未注册 /scenario/setup 时 404，容忍并继续）
+      // setup (app unregistered /scenario/setup = 404, tolerate + continue)
       if (caseDef.setup) {
         const setup = caseDef.setup;
         try {
@@ -714,14 +714,14 @@ async function main(): Promise<void> {
         }
       }
 
-      // 每 case 原子激活 mock 覆盖 + 清审计
+      // Per-case atomic mock override + audit clear
       mock?.resetAudit();
       mock?.setCaseOverrides(caseDef.mocks ?? {});
 
       const ctx = { outDir: caseOut, epoch: i, mock };
       result.artifacts = await executeTimeline(caseDef.timeline, ctx);
 
-      // 未匹配的 mock 请求 -> 该 case 失败（漏 mock 的调用要显式暴露）
+      // Unmatched mock request -> case fail (unmocked calls explicit surface)
       const unmatched = mock?.getAudit().unmatched ?? [];
       if (unmatched.length > 0) {
         throw new Error(`存在未匹配的 mock 请求: ${JSON.stringify(unmatched)}`);
@@ -731,14 +731,16 @@ async function main(): Promise<void> {
         result.expectations.push(await evaluateExpect(exp, result.artifacts, scenario.meta.id));
       }
 
-      // 状态判定：任一自动 expect 失败 -> fail；全是 needs_review -> needs_review；否则 pass
+      // Status check: any auto expect fails -> fail; all are needs_review -> needs_review; else
+      // pass
       const auto = result.expectations.filter((e) => e.kind !== "needs_review");
       const anyFail = auto.some((e) => e.ok === false);
       if (anyFail) result.status = "fail";
       else if (auto.length === 0) result.status = "needs_review";
       else result.status = "pass";
 
-      // design-pass -> 存 golden-candidate（人工评审后经单独提交晋升为 approved baseline，不直接覆盖）
+      // design-pass -> save golden-candidate (after manual review, promoted via separate commit to
+      // approved baseline, not overwritten directly)
       for (let e = 0; e < result.expectations.length; e++) {
         const res = result.expectations[e];
         if (res.kind === "design" && res.ok === true) {

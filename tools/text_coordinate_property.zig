@@ -35,8 +35,8 @@ const Rng = struct {
     }
 };
 
-fn parseSeed() u64 {
-    const value = std.posix.getenv("ZENIT_TEST_SEED") orelse return 0x5eed_cafe_2026_0731;
+fn parseSeed(environ: *const std.process.Environ.Map) u64 {
+    const value = environ.get("ZENIT_TEST_SEED") orelse return 0x5eed_cafe_2026_0731;
     const text: []const u8 = value;
     const base: u8 = if (std.mem.startsWith(u8, text, "0x")) 16 else 10;
     const digits = if (base == 16) text[2..] else text;
@@ -78,8 +78,8 @@ fn checkCase(text: []const u8) !void {
     }
 }
 
-pub fn main() !void {
-    const seed = parseSeed();
+pub fn main(init: std.process.Init) !void {
+    const seed = parseSeed(init.environ_map);
     var rng = Rng{ .state = if (seed == 0) 1 else seed };
     var storage: [4096]u8 = undefined;
     const iterations: usize = 2000;

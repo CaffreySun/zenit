@@ -1,4 +1,4 @@
-//! Minimal zenit consumer build.zig (Zig 0.15+).
+//! Minimal zenit consumer build.zig (Zig 0.17.0).
 //!
 //! zenit ships its build wiring as a public API: `@import("zenit")` resolves
 //! the dependency's build.zig, and `zenit.attach(dep, exe)` adds the `ui` /

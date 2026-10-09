@@ -1,4 +1,12 @@
 const std = @import("std");
+pub const visual_quality = @import("visual_quality.zig");
+pub const shader_sources = @import("shader_sources.zig");
+/// Glass shader uniform ABI (backdrop_blur.zig), for backend contract direct use not hand-copied
+/// layout.
+pub const GlassUniforms = @import("backdrop_blur.zig").GlassUniforms;
+/// Per-frame glass cost counters (read and reset by the app renderer).
+pub const backdrop_blur = @import("backdrop_blur.zig");
+pub const offscreen_texture = @import("offscreen_texture.zig");
 
 // Text rendering (from text abstraction layer)
 const text = @import("text");
@@ -14,12 +22,12 @@ const text_renderer = @import("text_renderer.zig");
 pub const TextRenderer = text_renderer.TextRenderer;
 pub const Color = text_renderer.Color;
 
-// SDF renderer (primary，真正 SDF 阴影/空心边框)
+// SDF renderer (primary, real SDF shadow/hollow stroke).
 const sdf_renderer = @import("sdf_renderer.zig");
 pub const SdfRenderer = sdf_renderer.SdfRenderer;
 pub const SDFInstance = sdf_renderer.SDFInstance;
 
-// Image renderer (纹理图片渲染)
+// Image renderer (texture image rendering).
 const image_renderer = @import("image_renderer.zig");
 pub const ImageRenderer = image_renderer.ImageRenderer;
 pub const ImageTextureStore = image_renderer.ImageTextureStore;
@@ -29,7 +37,7 @@ pub const TextureId = image_renderer.TextureId;
 // Icon renderer (UI icon mask pipeline)
 const icon_renderer = @import("icon_renderer.zig");
 pub const IconRenderer = icon_renderer.IconRenderer;
-/// icon 管线模块级累计 GPU draw 数（FrameStats 取每帧增量用）
+/// Icon pipeline module-level cumulative GPU draw count (FrameStats takes per-frame delta).
 pub fn iconDrawCallsTotal() u64 {
     return icon_renderer.icon_draw_calls;
 }
@@ -39,12 +47,13 @@ pub fn sdfDrawCallsTotal() u64 {
 pub fn textDrawCallsTotal() u64 {
     return text_renderer.text_draw_calls;
 }
-/// text uniform 槽位溢出累计次数。健康态恒为 0；持续增长 = 一帧内 clip
-/// 切换次数远超预期（clip flush 风暴），需要去查 clip 链而不是调大上限。
+/// Text uniform slot overflow cumulative count. Healthy state always 0; sustained growth = clip
+/// switches per frame far exceed expectation (clip flush storm), investigate clip chain not
+/// increase limit.
 pub fn textUniformOverflowTotal() u64 {
     return text_renderer.text_uniform_overflow_total;
 }
-/// image 管线模块级累计计数（FrameStats 取每帧增量用）
+/// Image pipeline module-level cumulative count (FrameStats takes per-frame delta).
 pub fn imageDrawCallsTotal() u64 {
     return image_renderer.image_draw_calls;
 }
@@ -57,26 +66,29 @@ pub fn imageTextureBindsTotal() u64 {
 pub const TextureMemoryStats = image_renderer.TextureMemoryStats;
 pub const IconInstance = icon_renderer.IconInstance;
 
-// DisplayItem encoder (UI -> GPU 统一编码器)
+// DisplayItem encoder (UI -> GPU unified encoder).
 const command_encoder_mod = @import("command_encoder.zig");
 pub const RenderCommandEncoder = command_encoder_mod.RenderCommandEncoder;
+pub const FrameDamage = @import("frame_damage.zig").FrameDamage;
+pub const RetainedPlan = @import("command_encoder/retained_plan.zig").Plan;
 pub const OffscreenTexturePool = @import("offscreen_texture.zig").OffscreenTexturePool;
-/// 跨帧持久的 path/blur/glass GPU 资源缓存（由 AppRenderer 持有）。
+/// Cross-frame persistent path/blur/glass GPU resource cache (held by AppRenderer).
 pub const PersistentGpuCache = @import("command_encoder.zig").PersistentGpuCache;
 pub const FontSelector = command_encoder_mod.FontSelector;
 pub const TextFontProps = command_encoder_mod.TextFontProps;
-/// CSS font-family 式的显式字体回退栈：应用声明有序族栈 + per-OS 系统兜底，
-/// shaping 前按码点在栈内显式选字体，CoreText 级联只作最后兜底。
+/// CSS font-family style explicit font fallback stack: app-declared ordered family stack + per-OS
+/// system fallback, before shaping check codepoint in stack to select font explicitly, CoreText
+/// cascade only final fallback.
 pub const font_fallback_stack = @import("font_fallback_stack.zig");
 pub const FontFallbackStack = font_fallback_stack.FontFallbackStack;
-/// 进程级字体族注册表(id ↔ 族名 + face 缓存)。给 family 轴用,
-/// 见 font_registry.zig 文件头对「为什么是 id 不是字符串」的说明。
+/// Process-level font family registry (id -> family name + face cache). For family axis, see
+/// font_registry.zig file header on 'why id not string'.
 pub const font_registry = @import("font_registry.zig");
 pub const FontRegistry = font_registry.FontRegistry;
 pub const FamilyId = font_registry.FamilyId;
 pub const colorToFloat4 = command_encoder_mod.colorToFloat4;
 
-// Path rendering (矢量路径 fill/stroke)
+// Path rendering (vector path fill/stroke).
 const path_tessellator_mod = @import("path_tessellator.zig");
 pub const PathTessellator = path_tessellator_mod.PathTessellator;
 pub const TPoint = path_tessellator_mod.TPoint;
@@ -85,17 +97,19 @@ pub const Contour = path_tessellator_mod.Contour;
 const path_renderer_mod = @import("path_renderer.zig");
 pub const PathRenderer = path_renderer_mod.PathRenderer;
 
-// command_encoder 的单测已析出到独立文件（原文件里占 679 行）。
-// 必须显式 import 才会被 test runner 收集，refAllDecls 只递归到
-// 本文件引用过的模块，漏了这行等于静默失去 16 个测试。
+// command_encoder tests extracted to separate file (occupied 679 lines in original). Must
+// explicitly import to be collected by test runner, refAllDecls only recurses modules referenced in
+// this file, missing this line silently loses 16 tests.
 test {
     _ = @import("command_encoder_test.zig");
-    // RTL shaping 合同测试：必须跑真实 CoreText（本 test target 链了桥）。
+    _ = @import("texture_upload_validation_test.zig");
+    _ = @import("frame_damage.zig");
+    // RTL shaping contract test: must run real CoreText (this test target linked bridge).
     _ = @import("rtl_shaping_test.zig");
-    // 同上：font_registry 的测试也必须显式 import，
-    // pub const 引用**不会**让它的 test 被收集。
+    // Same: font_registry tests must also be explicitly imported, pub const reference will not
+    // cause its tests to be collected.
     _ = @import("font_registry.zig");
-    // 显式字体回退栈：纯逻辑测试 + macOS 真实字体覆盖测试。
+    // Explicit font fallback stack: pure logic test + real macOS font coverage test.
     _ = @import("font_fallback_stack.zig");
     std.testing.refAllDecls(@This());
 }

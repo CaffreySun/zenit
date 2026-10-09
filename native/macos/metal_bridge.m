@@ -1,56 +1,114 @@
 /// Metal C API Bridge
 ///
-/// 提供 C API 接口，让 Zig 代码能调用 Metal Objective-C API
+/// Provides C API for Zig code to call Metal Objective-C API
 ///
-/// 参考: wgpu-hal metal backend 和 metal-rs
+/// Reference: wgpu-hal metal backend and metal-rs
 ///
 /// ============================================================================
-/// ⚠️ 所有权 ABI 合同（2026-07-29 确立 —— 违反会直接导致泄漏或 UAF）
+/// WARNING: Ownership ABI contract (violation causes leak or UAF)
 /// ============================================================================
 ///
-/// 本文件所有返回 `void*` 的函数遵循下列两条规则之一，**必须在函数注释中标明**：
+/// All void* returns must follow one rule, marked in function comment:
 ///
-///   [owned]    用 `__bridge_retained` 返回 +1 对象。调用方（Zig）直接接管
-///              所有权，**不得再 retain**，用完 release 一次。
-///              适用：create / new / copy / nextDrawable 这类"生产"函数。
+///   [owned]    Use __bridge_retained to return +1 object. Caller (Zig)
+///              takes ownership; must not retain again; release once when
+///              done. For 'produce' functions: create/new/copy/nextDrawable.
 ///
-///   [borrowed] 用 `__bridge` 返回 +0 对象。所有权仍属被查询的父对象，
-///              Zig 侧**只有需要跨作用域保存时才 retain**（并自行 release）。
-///              适用：单纯的属性 getter。
+///   [borrowed] Use __bridge to return +0 object. Ownership stays with
+///              queried parent; Zig retains only when saving across scopes
+///              (self-releases). For simple property getters.
 ///
-/// 历史教训：bridge 返回 +1、Zig 侧又 retain 一次、销毁只 release 一次 ——
-/// 每帧净泄漏 CAMetalDrawable / MTLCommandBuffer / MTLRenderCommandEncoder。
-/// drawable 池只有 2-3 个，几秒即耗尽 → nextDrawable 永久阻塞、画面冻死。
+/// Mixing them up leaks per frame (e.g. CAMetalDrawable/MTLCommandBuffer/
+/// MTLRenderCommandEncoder). The drawable pool has 2-3 entries, so exhaustion makes
+/// nextDrawable block forever and freezes the screen.
 ///
-/// 已知例外（不要"顺手统一"，会引入新泄漏）：
-///   `metal_drawable_get_texture` 定义在 **window_bridge.m:2966**，是
-///   [borrowed]（`__bridge`）。Zig 侧 surface.zig 对它的 retain 是必需的。
+/// Known exceptions (do not 'unify' carelessly, introduces new leaks):
+///   `metal_drawable_get_texture` in window_bridge.m is
+///   [borrowed] (__bridge). Zig side surface.zig must retain it.
 
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
+#include <stdatomic.h>
 #import <Foundation/Foundation.h>
 #import <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+// Opt-in timing evidence only. Keep the normal submission/presentation path
+// unchanged and never wait for a diagnostic callback.
+_Bool metal_glass_clock_trace_enabled(void) {
+    static _Atomic(int) cached = -1;
+    const int enabled = atomic_load_explicit(&cached, memory_order_acquire);
+    if (enabled >= 0) return enabled != 0;
+    const char *value = getenv("ZENIT_GLASS_CLOCK_TRACE");
+    const int initial = value && strcmp(value, "1") == 0;
+    // The process environment is configured before launch. Concurrent first
+    // readers can publish the same value; callbacks subsequently only load it.
+    atomic_store_explicit(&cached, initial, memory_order_release);
+    return initial != 0;
+}
+
+double metal_glass_clock_trace_host_time(void) { return CACurrentMediaTime(); }
+
+void metal_glass_clock_trace_line(const char *line, size_t length) {
+    if (!metal_glass_clock_trace_enabled()) return;
+    // One stdio call shares stderr's lock with the asynchronous Metal records.
+    fprintf(stderr, "[glass-clock] %.*s\n", (int)length, line);
+}
+
+void metal_glass_clock_trace_frame(void *buffer, void *drawable, uint64_t frame,
+                                  double sampleHostTime, double sampleFrameTimeMs,
+                                  double sampleFrameDtMs) {
+    if (!metal_glass_clock_trace_enabled()) return;
+    id<MTLCommandBuffer> cmd = (__bridge id<MTLCommandBuffer>)buffer;
+    id<CAMetalDrawable> image = (__bridge id<CAMetalDrawable>)drawable;
+    const uintptr_t identity = (uintptr_t)buffer;
+    const unsigned long long drawableID = image.drawableID;
+    fprintf(stderr, "[glass-clock] {\"kind\":\"submit-ready\",\"frame\":%llu,"
+            "\"command_buffer\":\"%p\",\"drawable_id\":%llu,\"host_time\":%.9f,"
+            "\"sample_host_time\":%.9f,\"sample_frame_time_ms\":%.6f,\"sample_frame_dt_ms\":%.6f}\n",
+            (unsigned long long)frame, buffer, drawableID, CACurrentMediaTime(),
+            sampleHostTime, sampleFrameTimeMs, sampleFrameDtMs);
+    // Capture scalar identities, not the objects whose handlers own these
+    // blocks. The callback arguments stay alive for the duration of each call.
+    [cmd addCompletedHandler:^(id<MTLCommandBuffer> completed) {
+        fprintf(stderr, "[glass-clock] {\"kind\":\"gpu-complete\",\"frame\":%llu,"
+                "\"command_buffer\":\"%p\",\"drawable_id\":%llu,\"host_time\":%.9f,"
+                "\"gpu_start_time\":%.9f,\"gpu_end_time\":%.9f,\"status\":%ld}\n",
+                (unsigned long long)frame, (void *)identity, drawableID, CACurrentMediaTime(),
+                completed.GPUStartTime, completed.GPUEndTime, (long)completed.status);
+    }];
+    [image addPresentedHandler:^(id<MTLDrawable> presented) {
+        fprintf(stderr, "[glass-clock] {\"kind\":\"presented\",\"frame\":%llu,"
+                "\"command_buffer\":\"%p\",\"drawable_id\":%llu,\"host_time\":%.9f,"
+                "\"presented_time\":%.9f}\n",
+                (unsigned long long)frame, (void *)identity, drawableID, CACurrentMediaTime(),
+                presented.presentedTime);
+    }];
+}
 
 // ============================================================================
 // Device Management
 // ============================================================================
 
-/// 创建系统默认 Metal 设备
+/// Create system default Metal device
 void* metal_create_system_default_device(void) {
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
     return (__bridge_retained void*)device;
 }
 
-/// 获取所有 Metal 设备
-/// @param out_count 输出系统当前设备总数
-/// @param out_devices 输出设备数组（每个元素 +1 retained，归调用者），传 NULL 仅查询数量
-/// @param capacity out_devices 的容量；写入数不会超过它
-/// @return 实际写入 out_devices 的数量（min(capacity, 总数)）
+/// Get all Metal devices
+/// @param out_count output system device count
+/// @param out_devices output device array (each +1 retained, caller owns); pass NULL to query count
+/// only
+/// @param capacity capacity of out_devices; write count won't exceed it
+/// @return actual write count to out_devices (min(capacity, total))
 ///
-/// 桥不写超过 capacity：两次调用（查数量→按数量分配→取设备）之间热插拔
-/// eGPU 会让第二次的总数变大，无条件写满曾是堆越界写。
-/// 本文件以 -fobjc-arc 编译：MTLCopyAllDevices 的 +1 返回由 ARC 在
-/// 作用域结束时自动配平，无需手动 release。
+/// Never writes past capacity: a hot-plugged eGPU can increase the total between query
+/// (count -> alloc -> get) and fill.
+/// File compiled with -fobjc-arc: MTLCopyAllDevices +1 return auto-balanced by ARC at
+/// scope end, no manual release needed.
 size_t metal_copy_all_devices(size_t* out_count, void** out_devices, size_t capacity) {
     #if TARGET_OS_OSX
     NSArray<id<MTLDevice>>* devices = MTLCopyAllDevices();
@@ -74,17 +132,17 @@ size_t metal_copy_all_devices(size_t* out_count, void** out_devices, size_t capa
     #endif
 }
 
-/// 获取设备名称
+/// Get device name
 /// @param device MTLDevice
-/// @return C 字符串（不需要释放，由设备对象管理）
+/// @return C string (caller does not free; managed by device)
 const char* metal_device_get_name(void* device) {
     id<MTLDevice> dev = (__bridge id<MTLDevice>)device;
     return [[dev name] UTF8String];
 }
 
-/// 创建命令队列
+/// Create command queue
 /// @param device MTLDevice
-/// @return MTLCommandQueue (需要 release)
+/// @return MTLCommandQueue (needs release)
 void* metal_device_new_command_queue(void* device) {
     id<MTLDevice> dev = (__bridge id<MTLDevice>)device;
     id<MTLCommandQueue> queue = [dev newCommandQueue];
@@ -95,11 +153,11 @@ void* metal_device_new_command_queue(void* device) {
 // Buffer Management
 // ============================================================================
 
-/// 创建 Buffer
+/// Create Buffer
 /// @param device MTLDevice
-/// @param length 缓冲区大小（字节）
+/// @param length buffer size (bytes)
 /// @param options MTLResourceOptions
-/// @return MTLBuffer (需要 release)
+/// @return MTLBuffer (needs release)
 void* metal_device_new_buffer(void* device, size_t length, unsigned int options) {
     id<MTLDevice> dev = (__bridge id<MTLDevice>)device;
     id<MTLBuffer> buffer = [dev newBufferWithLength:length
@@ -107,17 +165,17 @@ void* metal_device_new_buffer(void* device, size_t length, unsigned int options)
     return (__bridge_retained void*)buffer;
 }
 
-/// 获取 Buffer 内容指针
+/// Get Buffer content pointer
 /// @param buffer MTLBuffer
-/// @return 内存指针（由 buffer 管理生命周期）
+/// @return memory pointer (lifetime managed by buffer)
 void* metal_buffer_contents(void* buffer) {
     id<MTLBuffer> buf = (__bridge id<MTLBuffer>)buffer;
     return [buf contents];
 }
 
-/// 获取 Buffer 大小
+/// Get Buffer size
 /// @param buffer MTLBuffer
-/// @return 字节大小
+/// @return byte size
 size_t metal_buffer_get_length(void* buffer) {
     id<MTLBuffer> buf = (__bridge id<MTLBuffer>)buffer;
     return [buf length];
@@ -133,8 +191,8 @@ void metal_buffer_set_label(void* buffer, const char* label) {
 // Texture Management
 // ============================================================================
 
-/// 创建纹理描述符
-/// @return MTLTextureDescriptor (需要 release)
+/// Create texture descriptor
+/// @return MTLTextureDescriptor (needs release)
 unsigned int metal_texture_get_width(void* texture) {
     if (!texture) return 0;
     id<MTLTexture> tex = (__bridge id<MTLTexture>)texture;
@@ -152,7 +210,7 @@ void* metal_texture_descriptor_new(void) {
     return (__bridge_retained void*)desc;
 }
 
-/// 设置纹理描述符属性
+/// Set texture descriptor properties
 void metal_texture_descriptor_set_pixel_format(void* desc, unsigned long format) {
     MTLTextureDescriptor* d = (__bridge MTLTextureDescriptor*)desc;
     d.pixelFormat = (MTLPixelFormat)format;
@@ -198,10 +256,10 @@ void metal_texture_descriptor_set_storage_mode(void* desc, unsigned long mode) {
     d.storageMode = (MTLStorageMode)mode;
 }
 
-/// 创建纹理
+/// Create texture
 /// @param device MTLDevice
 /// @param desc MTLTextureDescriptor
-/// @return MTLTexture (需要 release)
+/// @return MTLTexture (needs release)
 void* metal_device_new_texture(void* device, void* desc) {
     id<MTLDevice> dev = (__bridge id<MTLDevice>)device;
     MTLTextureDescriptor* d = (__bridge MTLTextureDescriptor*)desc;
@@ -219,8 +277,8 @@ void metal_texture_set_label(void* texture, const char* label) {
 // Sampler Management
 // ============================================================================
 
-/// 创建采样器描述符
-/// @return MTLSamplerDescriptor (需要 release)
+/// Create sampler descriptor
+/// @return MTLSamplerDescriptor (needs release)
 void* metal_sampler_descriptor_new(void) {
     MTLSamplerDescriptor* desc = [MTLSamplerDescriptor new];
     return (__bridge_retained void*)desc;
@@ -282,10 +340,10 @@ void metal_sampler_descriptor_set_label(void* desc, const char* label) {
     d.label = [NSString stringWithUTF8String:label];
 }
 
-/// 创建采样器
+/// Create sampler
 /// @param device MTLDevice
 /// @param desc MTLSamplerDescriptor
-/// @return MTLSamplerState (需要 release)
+/// @return MTLSamplerState (needs release)
 void* metal_device_new_sampler(void* device, void* desc) {
     id<MTLDevice> dev = (__bridge id<MTLDevice>)device;
     MTLSamplerDescriptor* d = (__bridge MTLSamplerDescriptor*)desc;
@@ -294,17 +352,17 @@ void* metal_device_new_sampler(void* device, void* desc) {
 }
 
 // ============================================================================
-// 便捷的纹理/采样器创建函数
+// Convenience texture/sampler creation functions
 // ============================================================================
 
-/// 便捷函数：创建 2D 纹理
+/// Convenience function: create 2D texture
 /// @param device MTLDevice
-/// @param width 宽度
-/// @param height 高度
-/// @param pixelFormat 像素格式
-/// @param usage 用途
-/// @param storageMode 存储模式
-/// @return MTLTexture (需要 release)
+/// @param width
+/// @param height
+/// @param pixelFormat pixel format
+/// @param usage
+/// @param storageMode storage mode
+/// @return MTLTexture (needs release)
 void* metal_device_create_texture(void* device, unsigned int width, unsigned int height, unsigned long pixelFormat, unsigned long usage, unsigned long storageMode) {
     @autoreleasepool {
         if (width == 0 || height == 0) {
@@ -323,7 +381,7 @@ void* metal_device_create_texture(void* device, unsigned int width, unsigned int
     }
 }
 
-/// 便捷函数：创建 2D 纹理（可选 mipmaps）
+/// Convenience function: create 2D texture (optional mipmaps)
 void* metal_device_create_texture_mipmapped(void* device, unsigned int width, unsigned int height, unsigned long pixelFormat, unsigned long usage, unsigned long storageMode, int mipmapped) {
     @autoreleasepool {
         if (width == 0 || height == 0) {
@@ -342,13 +400,13 @@ void* metal_device_create_texture_mipmapped(void* device, unsigned int width, un
     }
 }
 
-/// 便捷函数：创建采样器
+/// Convenience function: create sampler
 /// @param device MTLDevice
-/// @param minFilter 最小过滤
-/// @param magFilter 最大过滤
-/// @param sAddressMode S 地址模式
-/// @param tAddressMode T 地址模式
-/// @return MTLSamplerState (需要 release)
+/// @param minFilter min filter
+/// @param magFilter mag filter
+/// @param sAddressMode S address mode
+/// @param tAddressMode T address mode
+/// @return MTLSamplerState (needs release)
 void* metal_device_create_sampler(void* device, unsigned long minFilter, unsigned long magFilter, unsigned long sAddressMode, unsigned long tAddressMode) {
     @autoreleasepool {
         id<MTLDevice> dev = (__bridge id<MTLDevice>)device;
@@ -363,7 +421,7 @@ void* metal_device_create_sampler(void* device, unsigned long minFilter, unsigne
     }
 }
 
-/// 便捷函数：创建采样器（含 mip filter）
+/// Convenience function: create sampler (with mip filter)
 void* metal_device_create_sampler_with_mip(void* device, unsigned long minFilter, unsigned long magFilter, unsigned long mipFilter, unsigned long sAddressMode, unsigned long tAddressMode) {
     @autoreleasepool {
         id<MTLDevice> dev = (__bridge id<MTLDevice>)device;
@@ -379,14 +437,14 @@ void* metal_device_create_sampler_with_mip(void* device, unsigned long minFilter
     }
 }
 
-/// 替换纹理区域内容
+/// Replace texture region content
 /// @param texture MTLTexture
-/// @param x X 坐标
-/// @param y Y 坐标
-/// @param width 宽度
-/// @param height 高度
-/// @param bytes 像素数据
-/// @param bytesPerRow 每行字节数
+/// @param x X coordinate
+/// @param y Y coordinate
+/// @param width
+/// @param height
+/// @param bytes pixel data
+/// @param bytesPerRow bytes per row
 void metal_texture_replace_region(void* texture, unsigned int x, unsigned int y, unsigned int width, unsigned int height, const void* bytes, unsigned int bytesPerRow) {
     id<MTLTexture> tex = (__bridge id<MTLTexture>)texture;
     MTLRegion region = MTLRegionMake2D(x, y, width, height);
@@ -396,7 +454,7 @@ void metal_texture_replace_region(void* texture, unsigned int x, unsigned int y,
            bytesPerRow:bytesPerRow];
 }
 
-/// 替换纹理区域内容（指定 mip level）
+/// Replace texture region content (specified mip level)
 void metal_texture_replace_region_level(void* texture, unsigned int x, unsigned int y, unsigned int width, unsigned int height, unsigned long mipLevel, const void* bytes, unsigned int bytesPerRow) {
     id<MTLTexture> tex = (__bridge id<MTLTexture>)texture;
     MTLRegion region = MTLRegionMake2D(x, y, width, height);
@@ -406,8 +464,8 @@ void metal_texture_replace_region_level(void* texture, unsigned int x, unsigned 
            bytesPerRow:bytesPerRow];
 }
 
-/// 从纹理读取 BGRA8 像素（mip0）。
-/// 返回 1 表示成功，0 表示失败。
+/// Read BGRA8 pixels from texture (mip0).
+/// Returns 1 on success, 0 on failure.
 int metal_texture_read_bgra8(
     void* texture,
     uint8_t* out_bytes,
@@ -444,23 +502,27 @@ int metal_texture_read_bgra8(
 // Command Queue & Buffer
 // ============================================================================
 
-/// 创建命令缓冲区
+/// Create command buffer
 /// @param queue MTLCommandQueue
-/// @return MTLCommandBuffer (需要 release)
+/// @return MTLCommandBuffer (needs release)
 void* metal_command_queue_command_buffer(void* queue) {
     id<MTLCommandQueue> q = (__bridge id<MTLCommandQueue>)queue;
     id<MTLCommandBuffer> cmd_buffer = [q commandBuffer];
     return (__bridge_retained void*)cmd_buffer;
 }
 
-/// 提交命令缓冲区
+/// Submit command buffer
 /// @param buffer MTLCommandBuffer
 void metal_command_buffer_commit(void* buffer) {
     id<MTLCommandBuffer> buf = (__bridge id<MTLCommandBuffer>)buffer;
+    if (metal_glass_clock_trace_enabled()) {
+        fprintf(stderr, "[glass-clock] {\"kind\":\"commit\",\"command_buffer\":\"%p\",\"host_time\":%.9f}\n",
+                buffer, CACurrentMediaTime());
+    }
     [buf commit];
 }
 
-/// 等待命令缓冲区完成
+/// Wait for command buffer completion
 /// @param buffer MTLCommandBuffer
 void metal_command_buffer_wait_until_completed(void* buffer) {
     id<MTLCommandBuffer> buf = (__bridge id<MTLCommandBuffer>)buffer;
@@ -471,12 +533,12 @@ void metal_command_buffer_wait_until_completed(void* buffer) {
 // Shader Library
 // ============================================================================
 
-/// 从源码创建着色器库
+/// Create shader library from source
 /// @param device MTLDevice
-/// @param source MSL 源码
-/// @param source_length 源码长度
-/// @param error_out 错误信息输出（如果非空）
-/// @return MTLLibrary (需要 release)
+/// @param source MSL source code
+/// @param source_length source length
+/// @param error_out error message output (if non-null)
+/// @return MTLLibrary (needs release)
 void* metal_device_new_library_with_source(void* device, const char* source, size_t source_length, char** error_out) {
     id<MTLDevice> dev = (__bridge id<MTLDevice>)device;
     NSString* source_str = [[NSString alloc] initWithBytes:source
@@ -496,10 +558,10 @@ void* metal_device_new_library_with_source(void* device, const char* source, siz
     return (__bridge_retained void*)library;
 }
 
-/// 从库中获取函数
+/// Get function from library
 /// @param library MTLLibrary
-/// @param name 函数名
-/// @return MTLFunction (需要 release)
+/// @param name function name
+/// @return MTLFunction (needs release)
 void* metal_library_new_function(void* library, const char* name) {
     id<MTLLibrary> lib = (__bridge id<MTLLibrary>)library;
     NSString* name_str = [NSString stringWithUTF8String:name];
@@ -511,17 +573,17 @@ void* metal_library_new_function(void* library, const char* name) {
 // Reference Counting
 // ============================================================================
 
-/// 释放对象
-/// @param obj 任意 Objective-C 对象
+/// Release object
+/// @param obj any Objective-C object
 void metal_release(void* obj) {
     if (obj) {
         CFRelease(obj);
     }
 }
 
-/// 保留对象
-/// @param obj 任意 Objective-C 对象
-/// @return 同一个对象（引用计数 +1）
+/// Retain object
+/// @param obj any Objective-C object
+/// @return same object (reference count +1)
 void* metal_retain(void* obj) {
     if (obj) {
         CFRetain(obj);
@@ -533,12 +595,12 @@ void* metal_retain(void* obj) {
 // Autorelease Pool Management (ARC-compatible)
 // ============================================================================
 
-/// 在 ARC 模式下，我们不能直接管理 NSAutoreleasePool
-/// 而是提供基于回调的 API
+/// Under ARC, NSAutoreleasePool cannot be directly managed;
+/// provide callback-based API instead.
 
-/// 在 autorelease pool 中执行函数
-/// @param callback 回调函数
-/// @param context 传递给回调的上下文
+/// Execute function in autorelease pool
+/// @param callback callback function
+/// @param context context passed to callback
 typedef void (*AutoreleaseCallback)(void* context);
 
 void objc_autoreleasepool_run(AutoreleaseCallback callback, void* context) {
@@ -547,8 +609,8 @@ void objc_autoreleasepool_run(AutoreleaseCallback callback, void* context) {
     }
 }
 
-// Push/Pop API 在 ARC 下需要使用不同的实现
-// 使用私有 runtime 函数（不推荐但可行）
+// Push/Pop API requires different implementation under ARC;
+// use private runtime functions (not recommended but viable).
 extern void* objc_autoreleasePoolPush(void);
 extern void objc_autoreleasePoolPop(void* pool);
 
@@ -564,32 +626,27 @@ void objc_autoreleasepool_pop(void* pool) {
 // CAMetalLayer Management
 // ============================================================================
 
-/// 设置 layer 的设备
 void metal_layer_set_device(void* layer, void* device) {
     CAMetalLayer* l = (__bridge CAMetalLayer*)layer;
     id<MTLDevice> d = (__bridge id<MTLDevice>)device;
     l.device = d;
 }
 
-/// 设置像素格式
 void metal_layer_set_pixel_format(void* layer, unsigned long format) {
     CAMetalLayer* l = (__bridge CAMetalLayer*)layer;
     l.pixelFormat = (MTLPixelFormat)format;
 }
 
-/// 设置 framebuffer only
 void metal_layer_set_framebuffer_only(void* layer, _Bool value) {
     CAMetalLayer* l = (__bridge CAMetalLayer*)layer;
     l.framebufferOnly = value;
 }
 
-/// 设置最大 drawable 数量
 void metal_layer_set_maximum_drawable_count(void* layer, size_t count) {
     CAMetalLayer* l = (__bridge CAMetalLayer*)layer;
     l.maximumDrawableCount = count;
 }
 
-/// 设置 display sync
 void metal_layer_set_display_sync_enabled(void* layer, _Bool enabled) {
     CAMetalLayer* l = (__bridge CAMetalLayer*)layer;
     if (@available(macOS 10.13, *)) {
@@ -597,7 +654,6 @@ void metal_layer_set_display_sync_enabled(void* layer, _Bool enabled) {
     }
 }
 
-/// 设置 drawable timeout
 void metal_layer_set_allows_next_drawable_timeout(void* layer, _Bool allows) {
     CAMetalLayer* l = (__bridge CAMetalLayer*)layer;
     if (@available(macOS 10.13, *)) {
@@ -605,13 +661,11 @@ void metal_layer_set_allows_next_drawable_timeout(void* layer, _Bool allows) {
     }
 }
 
-/// 设置不透明度
 void metal_layer_set_opaque(void* layer, _Bool opaque) {
     CAMetalLayer* l = (__bridge CAMetalLayer*)layer;
     l.opaque = opaque;
 }
 
-/// 设置 HDR 内容
 void metal_layer_set_wants_edr(void* layer, _Bool wants) {
     CAMetalLayer* l = (__bridge CAMetalLayer*)layer;
     if (@available(macOS 10.15, *)) {
@@ -619,20 +673,136 @@ void metal_layer_set_wants_edr(void* layer, _Bool wants) {
     }
 }
 
-/// 设置 drawable 尺寸
 void metal_layer_set_drawable_size(void* layer, unsigned int width, unsigned int height) {
     CAMetalLayer* l = (__bridge CAMetalLayer*)layer;
     l.drawableSize = CGSizeMake(width, height);
 }
 
-/// 获取 nextDrawable —— [owned] 返回 +1，调用方接管，勿再 retain
-void* metal_layer_next_drawable(void* layer) {
-    CAMetalLayer* l = (__bridge CAMetalLayer*)layer;
-    id<CAMetalDrawable> drawable = [l nextDrawable];
-    return (__bridge_retained void*)drawable;
+/// Get nextDrawable — [owned] return +1, caller takes ownership, do not retain again.
+// AX frame-interior service
+//
+// Problem: the main thread spends most of each frame blocked in [CAMetalLayer nextDrawable]'s
+// semaphore (which also throttles vsync); the run loop spins only ~0.1ms per 16.7ms. AppKit
+// dispatches AX requests on the main run loop, so each AXChildren round-trip adds a fixed
+// ~33ms. VoiceOver issues dozens of queries per step, so animated UI reads stutter.
+//
+// Solution: run the blocking nextDrawable on a serial queue; the main thread meanwhile runs only
+// in `com.apple.accessibilityServerIPC` run loop mode. That mode contains **only** the AX
+// service MIG source (no timers, observers, other sources), so the wait processes AX requests
+// only: no input events, timers, or CATransaction re-entry mid-frame. a11y projection is already
+// complete at this point (Cx.render runs before drawable fetch), so AX queries read a consistent
+// snapshot; state-mutating AX actions are deferred by window_bridge.m to post-frame
+// (zenit_ax_in_frame_service).
+//
+// Fallback: the mode exists only while an AX client is connected; if absent,
+// CFRunLoopRunInMode returns Finished immediately and it degrades to plain blocking (zero
+// overhead). Off-thread calls behave similarly. Rollback: ZENIT_AX_FRAME_SERVICE=0.
+static _Atomic int g_zenit_ax_service_depth = 0;
+
+int zenit_ax_in_frame_service(void) {
+    return atomic_load(&g_zenit_ax_service_depth) > 0;
 }
 
-// metal_drawable_get_texture 已在 macos_window_bridge.m 中定义
+static CFStringRef zenitAXServerMode(void) {
+    return CFSTR("com.apple.accessibilityServerIPC");
+}
+
+static BOOL zenitAXFrameServiceEnabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *v = getenv("ZENIT_AX_FRAME_SERVICE");
+        enabled = (v && v[0] == '0') ? 0 : 1;
+    }
+    return enabled == 1;
+}
+
+/// AX mode present in main run loop (created when AX client connects). Once present,
+/// cache as true; check each time before (CFRunLoopCopyAllModes is just ~10 elements).
+static BOOL zenitAXServerModeExists(void) {
+    static BOOL seen = NO;
+    if (seen) return YES;
+    CFArrayRef modes = CFRunLoopCopyAllModes(CFRunLoopGetMain());
+    if (!modes) return NO;
+    seen = CFArrayContainsValue(modes, CFRangeMake(0, CFArrayGetCount(modes)), zenitAXServerMode());
+    CFRelease(modes);
+    return seen;
+}
+
+static void zenitAXWakeSourcePerform(void *info) { (void)info; }
+
+/// Debug switch ZENIT_DEBUG_DRAWABLE_DELAY_MS=N: artificially wait N ms before
+/// nextDrawable, reliably reproducing 'main thread blocked on drawable backpressure'.
+/// Real backpressure depends on window visibility, refresh rate and compositor load, so it is
+/// intermittent. Makes AX latency regression tests deterministic (scripts/check_a11y.sh: with
+/// 30ms injected, AXChildren must still be sub-millisecond).
+static void zenitDebugDrawableDelay(void) {
+    // Main thread (early exit path) and drawable-fetching queue thread both arrive here;
+    // lazy init with atomic.
+    static _Atomic int ms = -1;
+    int value = atomic_load(&ms);
+    if (value < 0) {
+        const char *v = getenv("ZENIT_DEBUG_DRAWABLE_DELAY_MS");
+        value = v ? atoi(v) : 0;
+        atomic_store(&ms, value);
+    }
+    if (value > 0) usleep((useconds_t)value * 1000);
+}
+
+void* metal_layer_next_drawable(void* layer) {
+    CAMetalLayer* l = (__bridge CAMetalLayer*)layer;
+    if (!zenitAXFrameServiceEnabled() || ![NSThread isMainThread] || !zenitAXServerModeExists()) {
+        zenitDebugDrawableDelay();
+        id<CAMetalDrawable> drawable = [l nextDrawable];
+        return (__bridge_retained void*)drawable;
+    }
+
+    // Only main thread arrives here (already checked above); static flag suffices.
+    // Avoid dispatch_once: its inline macro triggers UBSan in Zig Debug builds
+    // (see image_bridge.m comment).
+    static dispatch_queue_t queue;
+    static CFRunLoopSourceRef wakeSource;
+    if (!queue) {
+        queue = dispatch_queue_create("zenit.drawable-acquire",
+            dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0));
+        CFRunLoopSourceContext ctx = {0};
+        ctx.perform = zenitAXWakeSourcePerform;
+        wakeSource = CFRunLoopSourceCreate(kCFAllocatorDefault, 0, &ctx);
+        CFRunLoopAddSource(CFRunLoopGetMain(), wakeSource, zenitAXServerMode());
+    }
+
+    __block id<CAMetalDrawable> drawable = nil;
+    __block _Atomic bool done = false;
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    CFRunLoopRef mainLoop = CFRunLoopGetMain();
+    dispatch_async(queue, ^{
+        zenitDebugDrawableDelay();
+        drawable = [l nextDrawable];
+        atomic_store(&done, true);
+        dispatch_semaphore_signal(sem);
+        CFRunLoopSourceSignal(wakeSource);
+        CFRunLoopWakeUp(mainLoop);
+    });
+
+    atomic_fetch_add(&g_zenit_ax_service_depth, 1);
+    // @finally: if AX callback throws ObjC exception, depth must be restored too,
+    // else all subsequent AX actions permanently deferred (cross-review noted).
+    @try {
+        while (!atomic_load(&done)) {
+            // returnAfterSourceHandled: return after handling one AX request or woken by
+            // wakeSource, re-check done at loop head. 0.1s timeout is backstop only;
+            // normal path woken by wakeSource.
+            SInt32 result = CFRunLoopRunInMode(zenitAXServerMode(), 0.1, true);
+            if (result == kCFRunLoopRunFinished || result == kCFRunLoopRunStopped) {
+                // Mode removed / stopped externally: revert to blocking wait, never busy-loop.
+                dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+                break;
+            }
+        }
+    } @finally {
+        atomic_fetch_sub(&g_zenit_ax_service_depth, 1);
+    }
+    return (__bridge_retained void*)drawable;
+}
 
 /// Drawable present
 void metal_drawable_present(void* drawable) {
@@ -640,13 +810,11 @@ void metal_drawable_present(void* drawable) {
     [d present];
 }
 
-/// 检查 presents with transaction
 _Bool metal_layer_presents_with_transaction(void* layer) {
     CAMetalLayer* l = (__bridge CAMetalLayer*)layer;
     return l.presentsWithTransaction;
 }
 
-/// 获取 layer bounds
 typedef struct {
     double width;
     double height;
@@ -661,7 +829,6 @@ MetalLayerBounds metal_layer_get_bounds(void* layer) {
     };
 }
 
-/// 获取 contents scale
 double metal_layer_get_contents_scale(void* layer) {
     CAMetalLayer* l = (__bridge CAMetalLayer*)layer;
     return l.contentsScale;
@@ -684,7 +851,8 @@ void metal_command_buffer_wait_until_scheduled(void* buffer) {
     [buf waitUntilScheduled];
 }
 
-/// 从 queue 创建 command buffer —— [owned] 返回 +1，调用方接管，勿再 retain
+/// Create command buffer from queue — [owned] return +1, caller takes ownership,
+/// do not retain again.
 void* metal_queue_command_buffer(void* queue) {
     id<MTLCommandQueue> q = (__bridge id<MTLCommandQueue>)queue;
     id<MTLCommandBuffer> cmd_buffer = [q commandBuffer];
@@ -695,33 +863,33 @@ void* metal_queue_command_buffer(void* queue) {
 // Render Pass Descriptor
 // ============================================================================
 
-/// 创建渲染通道描述符
-/// @return MTLRenderPassDescriptor (autorelease，需在 autorelease pool 中使用)
+/// Create render pass descriptor
+/// @return MTLRenderPassDescriptor (autoreleased; use within autorelease pool)
 void* metal_render_pass_descriptor_new(void) {
     MTLRenderPassDescriptor* desc = [MTLRenderPassDescriptor renderPassDescriptor];
-    return (__bridge_retained void*)desc;  // 显式 retain
+    return (__bridge_retained void*)desc; // Explicit retain
 }
 
-/// 获取颜色附件描述符
+/// Get color attachment descriptor
 /// @param desc MTLRenderPassDescriptor
-/// @param index 附件索引
-/// @return MTLRenderPassColorAttachmentDescriptor (autorelease)
+/// @param index attachment index
+/// @return MTLRenderPassColorAttachmentDescriptor (autoreleased)
 void* metal_render_pass_get_color_attachment(void* desc, unsigned long index) {
     MTLRenderPassDescriptor* d = (__bridge MTLRenderPassDescriptor*)desc;
     return (__bridge void*)[d.colorAttachments objectAtIndexedSubscript:index];
 }
 
-/// 获取深度附件描述符
+/// Get depth attachment descriptor
 /// @param desc MTLRenderPassDescriptor
-/// @return MTLRenderPassDepthAttachmentDescriptor (autorelease)
+/// @return MTLRenderPassDepthAttachmentDescriptor (autoreleased)
 void* metal_render_pass_get_depth_attachment(void* desc) {
     MTLRenderPassDescriptor* d = (__bridge MTLRenderPassDescriptor*)desc;
     return (__bridge void*)d.depthAttachment;
 }
 
-/// 获取模板附件描述符
+/// Get stencil attachment descriptor
 /// @param desc MTLRenderPassDescriptor
-/// @return MTLRenderPassStencilAttachmentDescriptor (autorelease)
+/// @return MTLRenderPassStencilAttachmentDescriptor (autoreleased)
 void* metal_render_pass_get_stencil_attachment(void* desc) {
     MTLRenderPassDescriptor* d = (__bridge MTLRenderPassDescriptor*)desc;
     return (__bridge void*)d.stencilAttachment;
@@ -731,32 +899,27 @@ void* metal_render_pass_get_stencil_attachment(void* desc) {
 // Render Pass Color Attachment Configuration
 // ============================================================================
 
-/// 设置颜色附件的纹理
 void metal_color_attachment_set_texture(void* attachment, void* texture) {
     MTLRenderPassColorAttachmentDescriptor* at = (__bridge MTLRenderPassColorAttachmentDescriptor*)attachment;
     id<MTLTexture> tex = (__bridge id<MTLTexture>)texture;
     at.texture = tex;
 }
 
-/// 设置加载操作
 void metal_color_attachment_set_load_action(void* attachment, unsigned long action) {
     MTLRenderPassColorAttachmentDescriptor* at = (__bridge MTLRenderPassColorAttachmentDescriptor*)attachment;
     at.loadAction = (MTLLoadAction)action;
 }
 
-/// 设置存储操作
 void metal_color_attachment_set_store_action(void* attachment, unsigned long action) {
     MTLRenderPassColorAttachmentDescriptor* at = (__bridge MTLRenderPassColorAttachmentDescriptor*)attachment;
     at.storeAction = (MTLStoreAction)action;
 }
 
-/// 设置清除颜色
 void metal_color_attachment_set_clear_color(void* attachment, double r, double g, double b, double a) {
     MTLRenderPassColorAttachmentDescriptor* at = (__bridge MTLRenderPassColorAttachmentDescriptor*)attachment;
     at.clearColor = MTLClearColorMake(r, g, b, a);
 }
 
-/// 设置 resolve 纹理（用于 MSAA）
 void metal_color_attachment_set_resolve_texture(void* attachment, void* texture) {
     MTLRenderPassColorAttachmentDescriptor* at = (__bridge MTLRenderPassColorAttachmentDescriptor*)attachment;
     id<MTLTexture> tex = (__bridge id<MTLTexture>)texture;
@@ -767,51 +930,43 @@ void metal_color_attachment_set_resolve_texture(void* attachment, void* texture)
 // Render Pass Depth/Stencil Attachment Configuration
 // ============================================================================
 
-/// 设置深度附件的纹理
 void metal_depth_attachment_set_texture(void* attachment, void* texture) {
     MTLRenderPassDepthAttachmentDescriptor* at = (__bridge MTLRenderPassDepthAttachmentDescriptor*)attachment;
     id<MTLTexture> tex = (__bridge id<MTLTexture>)texture;
     at.texture = tex;
 }
 
-/// 设置深度附件的加载操作
 void metal_depth_attachment_set_load_action(void* attachment, unsigned long action) {
     MTLRenderPassDepthAttachmentDescriptor* at = (__bridge MTLRenderPassDepthAttachmentDescriptor*)attachment;
     at.loadAction = (MTLLoadAction)action;
 }
 
-/// 设置深度附件的存储操作
 void metal_depth_attachment_set_store_action(void* attachment, unsigned long action) {
     MTLRenderPassDepthAttachmentDescriptor* at = (__bridge MTLRenderPassDepthAttachmentDescriptor*)attachment;
     at.storeAction = (MTLStoreAction)action;
 }
 
-/// 设置清除深度值
 void metal_depth_attachment_set_clear_depth(void* attachment, double depth) {
     MTLRenderPassDepthAttachmentDescriptor* at = (__bridge MTLRenderPassDepthAttachmentDescriptor*)attachment;
     at.clearDepth = depth;
 }
 
-/// 设置模板附件的纹理
 void metal_stencil_attachment_set_texture(void* attachment, void* texture) {
     MTLRenderPassStencilAttachmentDescriptor* at = (__bridge MTLRenderPassStencilAttachmentDescriptor*)attachment;
     id<MTLTexture> tex = (__bridge id<MTLTexture>)texture;
     at.texture = tex;
 }
 
-/// 设置模板附件的加载操作
 void metal_stencil_attachment_set_load_action(void* attachment, unsigned long action) {
     MTLRenderPassStencilAttachmentDescriptor* at = (__bridge MTLRenderPassStencilAttachmentDescriptor*)attachment;
     at.loadAction = (MTLLoadAction)action;
 }
 
-/// 设置模板附件的存储操作
 void metal_stencil_attachment_set_store_action(void* attachment, unsigned long action) {
     MTLRenderPassStencilAttachmentDescriptor* at = (__bridge MTLRenderPassStencilAttachmentDescriptor*)attachment;
     at.storeAction = (MTLStoreAction)action;
 }
 
-/// 设置清除模板值
 void metal_stencil_attachment_set_clear_stencil(void* attachment, unsigned int stencil) {
     MTLRenderPassStencilAttachmentDescriptor* at = (__bridge MTLRenderPassStencilAttachmentDescriptor*)attachment;
     at.clearStencil = stencil;
@@ -821,10 +976,11 @@ void metal_stencil_attachment_set_clear_stencil(void* attachment, unsigned int s
 // Render Command Encoder
 // ============================================================================
 
-/// 创建渲染命令编码器
+/// Create render command encoder
 /// @param buffer MTLCommandBuffer
 /// @param desc MTLRenderPassDescriptor
-/// @return MTLRenderCommandEncoder —— [owned] 返回 +1，调用方接管，勿再 retain
+/// @return MTLRenderCommandEncoder, [owned] +1, caller takes ownership,
+/// do not retain again.
 void* metal_command_buffer_create_render_encoder(void* buffer, void* desc) {
     id<MTLCommandBuffer> buf = (__bridge id<MTLCommandBuffer>)buffer;
     MTLRenderPassDescriptor* d = (__bridge MTLRenderPassDescriptor*)desc;
@@ -832,59 +988,50 @@ void* metal_command_buffer_create_render_encoder(void* buffer, void* desc) {
     return (__bridge_retained void*)encoder;
 }
 
-/// 结束渲染编码器
 void metal_render_encoder_end_encoding(void* encoder) {
     id<MTLRenderCommandEncoder> enc = (__bridge id<MTLRenderCommandEncoder>)encoder;
     [enc endEncoding];
 }
 
-/// 设置渲染管线状态
 void metal_render_encoder_set_render_pipeline_state(void* encoder, void* pipeline) {
     id<MTLRenderCommandEncoder> enc = (__bridge id<MTLRenderCommandEncoder>)encoder;
     id<MTLRenderPipelineState> ps = (__bridge id<MTLRenderPipelineState>)pipeline;
     [enc setRenderPipelineState:ps];
 }
 
-/// 设置视口
 void metal_render_encoder_set_viewport(void* encoder, double x, double y, double width, double height, double znear, double zfar) {
     id<MTLRenderCommandEncoder> enc = (__bridge id<MTLRenderCommandEncoder>)encoder;
     MTLViewport viewport = {x, y, width, height, znear, zfar};
     [enc setViewport:viewport];
 }
 
-/// 设置裁剪矩形
 void metal_render_encoder_set_scissor_rect(void* encoder, unsigned long x, unsigned long y, unsigned long width, unsigned long height) {
     id<MTLRenderCommandEncoder> enc = (__bridge id<MTLRenderCommandEncoder>)encoder;
     MTLScissorRect scissor = {x, y, width, height};
     [enc setScissorRect:scissor];
 }
 
-/// 设置剔除模式
 void metal_render_encoder_set_cull_mode(void* encoder, unsigned long mode) {
     id<MTLRenderCommandEncoder> enc = (__bridge id<MTLRenderCommandEncoder>)encoder;
     [enc setCullMode:(MTLCullMode)mode];
 }
 
-/// 设置正面朝向
 void metal_render_encoder_set_front_facing_winding(void* encoder, unsigned long winding) {
     id<MTLRenderCommandEncoder> enc = (__bridge id<MTLRenderCommandEncoder>)encoder;
     [enc setFrontFacingWinding:(MTLWinding)winding];
 }
 
-/// 设置三角形填充模式
 void metal_render_encoder_set_triangle_fill_mode(void* encoder, unsigned long fillMode) {
     id<MTLRenderCommandEncoder> enc = (__bridge id<MTLRenderCommandEncoder>)encoder;
     [enc setTriangleFillMode:(MTLTriangleFillMode)fillMode];
 }
 
-/// 设置深度模板状态
 void metal_render_encoder_set_depth_stencil_state(void* encoder, void* state) {
     id<MTLRenderCommandEncoder> enc = (__bridge id<MTLRenderCommandEncoder>)encoder;
     id<MTLDepthStencilState> ds = (__bridge id<MTLDepthStencilState>)state;
     [enc setDepthStencilState:ds];
 }
 
-/// 设置深度偏移
 void metal_render_encoder_set_depth_bias(void* encoder, float constant, float slope, float clamp) {
     id<MTLRenderCommandEncoder> enc = (__bridge id<MTLRenderCommandEncoder>)encoder;
     [enc setDepthBias:constant slopeScale:slope clamp:clamp];
@@ -894,55 +1041,47 @@ void metal_render_encoder_set_depth_bias(void* encoder, float constant, float sl
 // Render Encoder - Resource Binding
 // ============================================================================
 
-/// 设置顶点缓冲区
 void metal_render_encoder_set_vertex_buffer(void* encoder, void* buffer, unsigned long offset, unsigned long index) {
     id<MTLRenderCommandEncoder> enc = (__bridge id<MTLRenderCommandEncoder>)encoder;
     id<MTLBuffer> buf = (__bridge id<MTLBuffer>)buffer;
     [enc setVertexBuffer:buf offset:offset atIndex:index];
 }
 
-/// 设置片段缓冲区
 void metal_render_encoder_set_fragment_buffer(void* encoder, void* buffer, unsigned long offset, unsigned long index) {
     id<MTLRenderCommandEncoder> enc = (__bridge id<MTLRenderCommandEncoder>)encoder;
     id<MTLBuffer> buf = (__bridge id<MTLBuffer>)buffer;
     [enc setFragmentBuffer:buf offset:offset atIndex:index];
 }
 
-/// 设置顶点纹理
 void metal_render_encoder_set_vertex_texture(void* encoder, void* texture, unsigned long index) {
     id<MTLRenderCommandEncoder> enc = (__bridge id<MTLRenderCommandEncoder>)encoder;
     id<MTLTexture> tex = (__bridge id<MTLTexture>)texture;
     [enc setVertexTexture:tex atIndex:index];
 }
 
-/// 设置片段纹理
 void metal_render_encoder_set_fragment_texture(void* encoder, void* texture, unsigned long index) {
     id<MTLRenderCommandEncoder> enc = (__bridge id<MTLRenderCommandEncoder>)encoder;
     id<MTLTexture> tex = (__bridge id<MTLTexture>)texture;
     [enc setFragmentTexture:tex atIndex:index];
 }
 
-/// 设置顶点采样器
 void metal_render_encoder_set_vertex_sampler(void* encoder, void* sampler, unsigned long index) {
     id<MTLRenderCommandEncoder> enc = (__bridge id<MTLRenderCommandEncoder>)encoder;
     id<MTLSamplerState> samp = (__bridge id<MTLSamplerState>)sampler;
     [enc setVertexSamplerState:samp atIndex:index];
 }
 
-/// 设置片段采样器
 void metal_render_encoder_set_fragment_sampler(void* encoder, void* sampler, unsigned long index) {
     id<MTLRenderCommandEncoder> enc = (__bridge id<MTLRenderCommandEncoder>)encoder;
     id<MTLSamplerState> samp = (__bridge id<MTLSamplerState>)sampler;
     [enc setFragmentSamplerState:samp atIndex:index];
 }
 
-/// 设置顶点字节数据（小数据量）
 void metal_render_encoder_set_vertex_bytes(void* encoder, const void* bytes, unsigned long length, unsigned long index) {
     id<MTLRenderCommandEncoder> enc = (__bridge id<MTLRenderCommandEncoder>)encoder;
     [enc setVertexBytes:bytes length:length atIndex:index];
 }
 
-/// 设置片段字节数据（小数据量）
 void metal_render_encoder_set_fragment_bytes(void* encoder, const void* bytes, unsigned long length, unsigned long index) {
     id<MTLRenderCommandEncoder> enc = (__bridge id<MTLRenderCommandEncoder>)encoder;
     [enc setFragmentBytes:bytes length:length atIndex:index];
@@ -952,7 +1091,6 @@ void metal_render_encoder_set_fragment_bytes(void* encoder, const void* bytes, u
 // Render Encoder - Draw Calls
 // ============================================================================
 
-/// 绘制图元
 void metal_render_encoder_draw_primitives(void* encoder, unsigned long primitiveType, unsigned long vertexStart, unsigned long vertexCount) {
     id<MTLRenderCommandEncoder> enc = (__bridge id<MTLRenderCommandEncoder>)encoder;
     [enc drawPrimitives:(MTLPrimitiveType)primitiveType
@@ -960,7 +1098,6 @@ void metal_render_encoder_draw_primitives(void* encoder, unsigned long primitive
             vertexCount:vertexCount];
 }
 
-/// 绘制图元（带实例）
 void metal_render_encoder_draw_primitives_instanced(void* encoder, unsigned long primitiveType, unsigned long vertexStart, unsigned long vertexCount, unsigned long instanceCount) {
     id<MTLRenderCommandEncoder> enc = (__bridge id<MTLRenderCommandEncoder>)encoder;
     [enc drawPrimitives:(MTLPrimitiveType)primitiveType
@@ -969,7 +1106,6 @@ void metal_render_encoder_draw_primitives_instanced(void* encoder, unsigned long
           instanceCount:instanceCount];
 }
 
-/// 绘制图元（带实例和基础实例）
 void metal_render_encoder_draw_primitives_instanced_base_instance(void* encoder, unsigned long primitiveType, unsigned long vertexStart, unsigned long vertexCount, unsigned long instanceCount, unsigned long baseInstance) {
     id<MTLRenderCommandEncoder> enc = (__bridge id<MTLRenderCommandEncoder>)encoder;
     [enc drawPrimitives:(MTLPrimitiveType)primitiveType
@@ -979,7 +1115,6 @@ void metal_render_encoder_draw_primitives_instanced_base_instance(void* encoder,
            baseInstance:baseInstance];
 }
 
-/// 绘制索引图元
 void metal_render_encoder_draw_indexed_primitives(void* encoder, unsigned long primitiveType, unsigned long indexCount, unsigned long indexType, void* indexBuffer, unsigned long indexBufferOffset) {
     id<MTLRenderCommandEncoder> enc = (__bridge id<MTLRenderCommandEncoder>)encoder;
     id<MTLBuffer> buf = (__bridge id<MTLBuffer>)indexBuffer;
@@ -990,7 +1125,6 @@ void metal_render_encoder_draw_indexed_primitives(void* encoder, unsigned long p
              indexBufferOffset:indexBufferOffset];
 }
 
-/// 绘制索引图元（带实例）
 void metal_render_encoder_draw_indexed_primitives_instanced(void* encoder, unsigned long primitiveType, unsigned long indexCount, unsigned long indexType, void* indexBuffer, unsigned long indexBufferOffset, unsigned long instanceCount) {
     id<MTLRenderCommandEncoder> enc = (__bridge id<MTLRenderCommandEncoder>)encoder;
     id<MTLBuffer> buf = (__bridge id<MTLBuffer>)indexBuffer;
@@ -1002,7 +1136,6 @@ void metal_render_encoder_draw_indexed_primitives_instanced(void* encoder, unsig
                  instanceCount:instanceCount];
 }
 
-/// 绘制索引图元（完整参数）
 void metal_render_encoder_draw_indexed_primitives_full(void* encoder, unsigned long primitiveType, unsigned long indexCount, unsigned long indexType, void* indexBuffer, unsigned long indexBufferOffset, unsigned long instanceCount, unsigned long baseVertex, unsigned long baseInstance) {
     id<MTLRenderCommandEncoder> enc = (__bridge id<MTLRenderCommandEncoder>)encoder;
     id<MTLBuffer> buf = (__bridge id<MTLBuffer>)indexBuffer;
@@ -1020,62 +1153,54 @@ void metal_render_encoder_draw_indexed_primitives_full(void* encoder, unsigned l
 // Compute Command Encoder
 // ============================================================================
 
-/// 创建计算命令编码器
+/// Create compute command encoder
 /// @param buffer MTLCommandBuffer
-/// @return MTLComputeCommandEncoder (需要 release)
+/// @return MTLComputeCommandEncoder (needs release)
 void* metal_command_buffer_create_compute_encoder(void* buffer) {
     id<MTLCommandBuffer> buf = (__bridge id<MTLCommandBuffer>)buffer;
     id<MTLComputeCommandEncoder> encoder = [buf computeCommandEncoder];
     return (__bridge_retained void*)encoder;
 }
 
-/// 结束计算编码器
 void metal_compute_encoder_end_encoding(void* encoder) {
     id<MTLComputeCommandEncoder> enc = (__bridge id<MTLComputeCommandEncoder>)encoder;
     [enc endEncoding];
 }
 
-/// 设置计算管线状态
 void metal_compute_encoder_set_compute_pipeline_state(void* encoder, void* pipeline) {
     id<MTLComputeCommandEncoder> enc = (__bridge id<MTLComputeCommandEncoder>)encoder;
     id<MTLComputePipelineState> ps = (__bridge id<MTLComputePipelineState>)pipeline;
     [enc setComputePipelineState:ps];
 }
 
-/// 设置缓冲区
 void metal_compute_encoder_set_buffer(void* encoder, void* buffer, unsigned long offset, unsigned long index) {
     id<MTLComputeCommandEncoder> enc = (__bridge id<MTLComputeCommandEncoder>)encoder;
     id<MTLBuffer> buf = (__bridge id<MTLBuffer>)buffer;
     [enc setBuffer:buf offset:offset atIndex:index];
 }
 
-/// 设置纹理
 void metal_compute_encoder_set_texture(void* encoder, void* texture, unsigned long index) {
     id<MTLComputeCommandEncoder> enc = (__bridge id<MTLComputeCommandEncoder>)encoder;
     id<MTLTexture> tex = (__bridge id<MTLTexture>)texture;
     [enc setTexture:tex atIndex:index];
 }
 
-/// 设置采样器
 void metal_compute_encoder_set_sampler(void* encoder, void* sampler, unsigned long index) {
     id<MTLComputeCommandEncoder> enc = (__bridge id<MTLComputeCommandEncoder>)encoder;
     id<MTLSamplerState> samp = (__bridge id<MTLSamplerState>)sampler;
     [enc setSamplerState:samp atIndex:index];
 }
 
-/// 设置字节数据
 void metal_compute_encoder_set_bytes(void* encoder, const void* bytes, unsigned long length, unsigned long index) {
     id<MTLComputeCommandEncoder> enc = (__bridge id<MTLComputeCommandEncoder>)encoder;
     [enc setBytes:bytes length:length atIndex:index];
 }
 
-/// 设置 threadgroup 内存长度
 void metal_compute_encoder_set_threadgroup_memory_length(void* encoder, unsigned long length, unsigned long index) {
     id<MTLComputeCommandEncoder> enc = (__bridge id<MTLComputeCommandEncoder>)encoder;
     [enc setThreadgroupMemoryLength:length atIndex:index];
 }
 
-/// 调度计算
 void metal_compute_encoder_dispatch_threadgroups(void* encoder, unsigned long threadgroupsX, unsigned long threadgroupsY, unsigned long threadgroupsZ, unsigned long threadsPerGroupX, unsigned long threadsPerGroupY, unsigned long threadsPerGroupZ) {
     id<MTLComputeCommandEncoder> enc = (__bridge id<MTLComputeCommandEncoder>)encoder;
     MTLSize threadgroups = MTLSizeMake(threadgroupsX, threadgroupsY, threadgroupsZ);
@@ -1087,22 +1212,20 @@ void metal_compute_encoder_dispatch_threadgroups(void* encoder, unsigned long th
 // Blit Command Encoder
 // ============================================================================
 
-/// 创建 Blit 命令编码器
+/// Create Blit command encoder
 /// @param buffer MTLCommandBuffer
-/// @return MTLBlitCommandEncoder (需要 release)
+/// @return MTLBlitCommandEncoder (needs release)
 void* metal_command_buffer_create_blit_encoder(void* buffer) {
     id<MTLCommandBuffer> buf = (__bridge id<MTLCommandBuffer>)buffer;
     id<MTLBlitCommandEncoder> encoder = [buf blitCommandEncoder];
     return (__bridge_retained void*)encoder;
 }
 
-/// 结束 Blit 编码器
 void metal_blit_encoder_end_encoding(void* encoder) {
     id<MTLBlitCommandEncoder> enc = (__bridge id<MTLBlitCommandEncoder>)encoder;
     [enc endEncoding];
 }
 
-/// 复制缓冲区
 void metal_blit_encoder_copy_buffer(void* encoder, void* sourceBuffer, unsigned long sourceOffset, void* destinationBuffer, unsigned long destinationOffset, unsigned long size) {
     id<MTLBlitCommandEncoder> enc = (__bridge id<MTLBlitCommandEncoder>)encoder;
     id<MTLBuffer> src = (__bridge id<MTLBuffer>)sourceBuffer;
@@ -1114,7 +1237,6 @@ void metal_blit_encoder_copy_buffer(void* encoder, void* sourceBuffer, unsigned 
                    size:size];
 }
 
-/// 复制纹理
 void metal_blit_encoder_copy_texture(void* encoder, void* sourceTexture, unsigned long sourceSlice, unsigned long sourceLevel, void* destinationTexture, unsigned long destinationSlice, unsigned long destinationLevel, unsigned long width, unsigned long height, unsigned long depth) {
     id<MTLBlitCommandEncoder> enc = (__bridge id<MTLBlitCommandEncoder>)encoder;
     id<MTLTexture> src = (__bridge id<MTLTexture>)sourceTexture;
@@ -1135,7 +1257,6 @@ void metal_blit_encoder_copy_texture(void* encoder, void* sourceTexture, unsigne
        destinationOrigin:destinationOrigin];
 }
 
-/// 复制纹理区域（支持自定义 source/destination origin）
 void metal_blit_encoder_copy_texture_region(
     void* encoder,
     void* sourceTexture,
@@ -1170,11 +1291,11 @@ void metal_blit_encoder_copy_texture_region(
 // Shader Library Management
 // ============================================================================
 
-/// 从源码创建 Metal Library
+/// Create Metal Library from source
 /// @param device MTLDevice
-/// @param source Metal Shading Language 源码
-/// @param error_out 错误信息输出（如果非 NULL 且发生错误）
-/// @return MTLLibrary (需要 release)，失败时返回 NULL
+/// @param source Metal Shading Language source
+/// @param error_out error message output (if non-NULL and error occurs)
+/// @return MTLLibrary (needs release); NULL on failure
 void* metal_device_new_library_from_source(void* device, const char* source, char** error_out) {
     id<MTLDevice> dev = (__bridge id<MTLDevice>)device;
     NSString* sourceStr = [NSString stringWithUTF8String:source];
@@ -1192,66 +1313,59 @@ void* metal_device_new_library_from_source(void* device, const char* source, cha
     return (__bridge_retained void*)library;
 }
 
-// metal_library_new_function 已在上方定义
+// metal_library_new_function already defined above
 
 // ============================================================================
 // Render Pipeline Management
 // ============================================================================
 
-/// 创建渲染管线描述符
-/// @return MTLRenderPipelineDescriptor (需要 release)
+/// Create render pipeline descriptor
+/// @return MTLRenderPipelineDescriptor (needs release)
 void* metal_render_pipeline_descriptor_new(void) {
     MTLRenderPipelineDescriptor* desc = [[MTLRenderPipelineDescriptor alloc] init];
     return (__bridge_retained void*)desc;
 }
 
-/// 设置顶点函数
 void metal_render_pipeline_descriptor_set_vertex_function(void* desc, void* function) {
     MTLRenderPipelineDescriptor* d = (__bridge MTLRenderPipelineDescriptor*)desc;
     d.vertexFunction = (__bridge id<MTLFunction>)function;
 }
 
-/// 设置片段函数
 void metal_render_pipeline_descriptor_set_fragment_function(void* desc, void* function) {
     MTLRenderPipelineDescriptor* d = (__bridge MTLRenderPipelineDescriptor*)desc;
     d.fragmentFunction = (__bridge id<MTLFunction>)function;
 }
 
-/// 设置颜色附件像素格式
 void metal_render_pipeline_descriptor_set_color_attachment_format(void* desc, unsigned long index, unsigned long format) {
     MTLRenderPipelineDescriptor* d = (__bridge MTLRenderPipelineDescriptor*)desc;
     d.colorAttachments[index].pixelFormat = (MTLPixelFormat)format;
 }
 
-/// 设置深度附件像素格式
 void metal_render_pipeline_descriptor_set_depth_attachment_format(void* desc, unsigned long format) {
     MTLRenderPipelineDescriptor* d = (__bridge MTLRenderPipelineDescriptor*)desc;
     d.depthAttachmentPixelFormat = (MTLPixelFormat)format;
 }
 
-/// 设置模板附件像素格式
 void metal_render_pipeline_descriptor_set_stencil_attachment_format(void* desc, unsigned long format) {
     MTLRenderPipelineDescriptor* d = (__bridge MTLRenderPipelineDescriptor*)desc;
     d.stencilAttachmentPixelFormat = (MTLPixelFormat)format;
 }
 
-/// 设置采样数量
 void metal_render_pipeline_descriptor_set_sample_count(void* desc, unsigned long count) {
     MTLRenderPipelineDescriptor* d = (__bridge MTLRenderPipelineDescriptor*)desc;
     d.rasterSampleCount = count;
 }
 
-/// 设置顶点描述符
 void metal_render_pipeline_descriptor_set_vertex_descriptor(void* desc, void* vertex_desc) {
     MTLRenderPipelineDescriptor* d = (__bridge MTLRenderPipelineDescriptor*)desc;
     d.vertexDescriptor = (__bridge MTLVertexDescriptor*)vertex_desc;
 }
 
-/// 创建渲染管线状态
+/// Create render pipeline state
 /// @param device MTLDevice
 /// @param desc MTLRenderPipelineDescriptor
-/// @param error_out 错误信息输出
-/// @return MTLRenderPipelineState (需要 release)
+/// @param error_out error message output
+/// @return MTLRenderPipelineState (needs release)
 void* metal_device_new_render_pipeline_state(void* device, void* desc, char** error_out) {
     id<MTLDevice> dev = (__bridge id<MTLDevice>)device;
     MTLRenderPipelineDescriptor* d = (__bridge MTLRenderPipelineDescriptor*)desc;
@@ -1270,44 +1384,38 @@ void* metal_device_new_render_pipeline_state(void* device, void* desc, char** er
 // Vertex Descriptor Management
 // ============================================================================
 
-/// 创建顶点描述符
-/// @return MTLVertexDescriptor (需要 release)
+/// Create vertex descriptor
+/// @return MTLVertexDescriptor (needs release)
 void* metal_vertex_descriptor_new(void) {
     MTLVertexDescriptor* desc = [[MTLVertexDescriptor alloc] init];
     return (__bridge_retained void*)desc;
 }
 
-/// 设置顶点属性格式
 void metal_vertex_descriptor_set_attribute_format(void* desc, unsigned long index, unsigned long format) {
     MTLVertexDescriptor* d = (__bridge MTLVertexDescriptor*)desc;
     d.attributes[index].format = (MTLVertexFormat)format;
 }
 
-/// 设置顶点属性偏移
 void metal_vertex_descriptor_set_attribute_offset(void* desc, unsigned long index, unsigned long offset) {
     MTLVertexDescriptor* d = (__bridge MTLVertexDescriptor*)desc;
     d.attributes[index].offset = offset;
 }
 
-/// 设置顶点属性缓冲区索引
 void metal_vertex_descriptor_set_attribute_buffer_index(void* desc, unsigned long index, unsigned long buffer_index) {
     MTLVertexDescriptor* d = (__bridge MTLVertexDescriptor*)desc;
     d.attributes[index].bufferIndex = buffer_index;
 }
 
-/// 设置顶点布局步长
 void metal_vertex_descriptor_set_layout_stride(void* desc, unsigned long index, unsigned long stride) {
     MTLVertexDescriptor* d = (__bridge MTLVertexDescriptor*)desc;
     d.layouts[index].stride = stride;
 }
 
-/// 设置顶点布局步进函数
 void metal_vertex_descriptor_set_layout_step_function(void* desc, unsigned long index, unsigned long step_function) {
     MTLVertexDescriptor* d = (__bridge MTLVertexDescriptor*)desc;
     d.layouts[index].stepFunction = (MTLVertexStepFunction)step_function;
 }
 
-/// 设置顶点布局步进速率
 void metal_vertex_descriptor_set_layout_step_rate(void* desc, unsigned long index, unsigned long step_rate) {
     MTLVertexDescriptor* d = (__bridge MTLVertexDescriptor*)desc;
     d.layouts[index].stepRate = step_rate;
@@ -1317,29 +1425,27 @@ void metal_vertex_descriptor_set_layout_step_rate(void* desc, unsigned long inde
 // Depth Stencil State Management
 // ============================================================================
 
-/// 创建深度模板描述符
-/// @return MTLDepthStencilDescriptor (需要 release)
+/// Create depth-stencil descriptor
+/// @return MTLDepthStencilDescriptor (needs release)
 void* metal_depth_stencil_descriptor_new(void) {
     MTLDepthStencilDescriptor* desc = [[MTLDepthStencilDescriptor alloc] init];
     return (__bridge_retained void*)desc;
 }
 
-/// 设置深度比较函数
 void metal_depth_stencil_descriptor_set_depth_compare_function(void* desc, unsigned long compare_function) {
     MTLDepthStencilDescriptor* d = (__bridge MTLDepthStencilDescriptor*)desc;
     d.depthCompareFunction = (MTLCompareFunction)compare_function;
 }
 
-/// 设置深度写入启用
 void metal_depth_stencil_descriptor_set_depth_write_enabled(void* desc, int enabled) {
     MTLDepthStencilDescriptor* d = (__bridge MTLDepthStencilDescriptor*)desc;
     d.depthWriteEnabled = enabled ? YES : NO;
 }
 
-/// 创建深度模板状态
+/// Create depth-stencil state
 /// @param device MTLDevice
 /// @param desc MTLDepthStencilDescriptor
-/// @return MTLDepthStencilState (需要 release)
+/// @return MTLDepthStencilState (needs release)
 void* metal_device_new_depth_stencil_state(void* device, void* desc) {
     id<MTLDevice> dev = (__bridge id<MTLDevice>)device;
     MTLDepthStencilDescriptor* d = (__bridge MTLDepthStencilDescriptor*)desc;
@@ -1351,49 +1457,41 @@ void* metal_device_new_depth_stencil_state(void* device, void* desc) {
 // Color Attachment Blending
 // ============================================================================
 
-/// 设置颜色附件混合启用
 void metal_render_pipeline_color_attachment_set_blending_enabled(void* desc, unsigned long index, int enabled) {
     MTLRenderPipelineDescriptor* d = (__bridge MTLRenderPipelineDescriptor*)desc;
     d.colorAttachments[index].blendingEnabled = enabled ? YES : NO;
 }
 
-/// 设置源 RGB 混合因子
 void metal_render_pipeline_color_attachment_set_source_rgb_blend_factor(void* desc, unsigned long index, unsigned long factor) {
     MTLRenderPipelineDescriptor* d = (__bridge MTLRenderPipelineDescriptor*)desc;
     d.colorAttachments[index].sourceRGBBlendFactor = (MTLBlendFactor)factor;
 }
 
-/// 设置目标 RGB 混合因子
 void metal_render_pipeline_color_attachment_set_destination_rgb_blend_factor(void* desc, unsigned long index, unsigned long factor) {
     MTLRenderPipelineDescriptor* d = (__bridge MTLRenderPipelineDescriptor*)desc;
     d.colorAttachments[index].destinationRGBBlendFactor = (MTLBlendFactor)factor;
 }
 
-/// 设置 RGB 混合操作
 void metal_render_pipeline_color_attachment_set_rgb_blend_operation(void* desc, unsigned long index, unsigned long operation) {
     MTLRenderPipelineDescriptor* d = (__bridge MTLRenderPipelineDescriptor*)desc;
     d.colorAttachments[index].rgbBlendOperation = (MTLBlendOperation)operation;
 }
 
-/// 设置源 Alpha 混合因子
 void metal_render_pipeline_color_attachment_set_source_alpha_blend_factor(void* desc, unsigned long index, unsigned long factor) {
     MTLRenderPipelineDescriptor* d = (__bridge MTLRenderPipelineDescriptor*)desc;
     d.colorAttachments[index].sourceAlphaBlendFactor = (MTLBlendFactor)factor;
 }
 
-/// 设置目标 Alpha 混合因子
 void metal_render_pipeline_color_attachment_set_destination_alpha_blend_factor(void* desc, unsigned long index, unsigned long factor) {
     MTLRenderPipelineDescriptor* d = (__bridge MTLRenderPipelineDescriptor*)desc;
     d.colorAttachments[index].destinationAlphaBlendFactor = (MTLBlendFactor)factor;
 }
 
-/// 设置 Alpha 混合操作
 void metal_render_pipeline_color_attachment_set_alpha_blend_operation(void* desc, unsigned long index, unsigned long operation) {
     MTLRenderPipelineDescriptor* d = (__bridge MTLRenderPipelineDescriptor*)desc;
     d.colorAttachments[index].alphaBlendOperation = (MTLBlendOperation)operation;
 }
 
-/// 设置颜色写入掩码
 void metal_render_pipeline_color_attachment_set_write_mask(void* desc, unsigned long index, unsigned long mask) {
     MTLRenderPipelineDescriptor* d = (__bridge MTLRenderPipelineDescriptor*)desc;
     d.colorAttachments[index].writeMask = (MTLColorWriteMask)mask;
@@ -1403,8 +1501,8 @@ void metal_render_pipeline_color_attachment_set_write_mask(void* desc, unsigned 
 // GPU Frame Synchronization
 // ============================================================================
 
-/// 添加 command buffer 完成回调（用于 triple buffering 信号量同步）
-/// callback 签名: void (*)(void* context)
+/// Add command buffer completion callback (for triple-buffering semaphore sync).
+/// Callback signature: void (*)(void* context)
 typedef void (*MetalCompletedCallback)(void* context);
 
 void metal_command_buffer_add_completed_handler(void* buffer, void* context, MetalCompletedCallback callback) {
@@ -1421,13 +1519,13 @@ void metal_command_buffer_add_completed_handler(void* buffer, void* context, Met
 }
 
 // ============================================================================
-// Command buffer 错误观测
+// Command buffer error observation
 // ============================================================================
 
-/// command buffer 完成时若 status == Error，回调错误码与描述。
-/// 此前全仓库没有任何 MTLCommandBufferStatus 检查：GPU fault / hang /
-/// 设备移除全部静默，画面冻结而无诊断。
-/// callback 在 Metal 的 completion 线程上执行；desc 只在回调期间有效。
+/// When command buffer completes with status == Error, invoke callback with error
+/// code and description. Previously entire codebase lacked any MTLCommandBufferStatus
+/// checks: GPU faults, hangs, device removal all silent, UI freezes with no diagnostics.
+/// Callback executes on Metal's completion thread; desc valid only during callback.
 typedef void (*MetalErrorCallback)(void* context, long code, const char* desc);
 
 void metal_command_buffer_notify_error(void* buffer, void* context, MetalErrorCallback callback) {
@@ -1441,17 +1539,17 @@ void metal_command_buffer_notify_error(void* buffer, void* context, MetalErrorCa
 }
 
 // ============================================================================
-// GPU 执行时间（真 GPU 时间，非 CPU 墙钟）
+// GPU execution time (real GPU time, not CPU wall clock)
 // ============================================================================
 
-/// 读取 command buffer 的 GPU 执行起止时刻（秒，CPU 时间基准）。
-/// **必须在 command buffer 完成之后调用**（completed handler 里或
-/// waitUntilCompleted 之后），否则返回 0。
+/// Read command buffer's GPU execution start/end time (seconds, CPU time base).
+/// **Must be called after command buffer completes** (in completed handler or
+/// after waitUntilCompleted); otherwise returns 0.
 ///
-/// 这是 FrameStats.gpu_encode_us 无法替代的信息：后者是 CPU 侧编码+提交的
-/// 墙钟，混入了 wait / drawable acquire；GPUStartTime/GPUEndTime 才是 GPU
-/// 实际执行这批命令的时间（审查报告 §4 指出的缺口）。
-/// 可用性：macOS 10.15+ / iOS 10.3+。
+/// This provides what FrameStats.gpu_encode_us cannot: the latter is CPU-side encode+submit wall
+/// clock mixed with wait / drawable acquire, whereas GPUStartTime/GPUEndTime give the time the GPU
+/// actually spent executing the batch.
+/// Availability: macOS 10.15+ / iOS 10.3+.
 double metal_command_buffer_gpu_start_time(void* buffer) {
     if (!buffer) return 0.0;
     id<MTLCommandBuffer> cmd = (__bridge id<MTLCommandBuffer>)buffer;
@@ -1464,13 +1562,39 @@ double metal_command_buffer_gpu_end_time(void* buffer) {
     return (double)cmd.GPUEndTime;
 }
 
-/// 非阻塞查询 command buffer 是否已完成（completed 或 error 均算终态）。
-/// 用于把"必须等 GPU 才能读回的数据"改成机会式读取：没完成就跳过本次，
-/// 而不是把主线程钉在 waitUntilCompleted 上。
+/// Non-blocking query: is command buffer complete (either completed or error counts
+/// as terminal). Use to replace 'must wait on GPU for read-back data' with opportunistic
+/// reads: skip this frame if not done yet, rather than pin main thread to
+/// waitUntilCompleted.
 bool metal_command_buffer_is_completed(void* buffer) {
     if (!buffer) return false;
     id<MTLCommandBuffer> cmd = (__bridge id<MTLCommandBuffer>)buffer;
     MTLCommandBufferStatus status = cmd.status;
     return status == MTLCommandBufferStatusCompleted ||
            status == MTLCommandBufferStatusError;
+}
+
+// Test-mode GPU ownership probe. No production path calls these helpers.
+// The watchdog bounds a failed test's queue stall; probes must verify value is
+// still zero before releasing it themselves, otherwise the probe is invalid.
+void* metal_test_gate_new(void* device) {
+    id<MTLDevice> dev = (__bridge id<MTLDevice>)device;
+    id<MTLSharedEvent> event = [dev newSharedEvent];
+    if (!event) return NULL;
+    event.signaledValue = 0;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC),
+                   dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        if (event.signaledValue == 0) event.signaledValue = 1;
+    });
+    return (__bridge_retained void*)event;
+}
+void metal_test_gate_wait(void* buffer, void* event) {
+    id<MTLCommandBuffer> cmd = (__bridge id<MTLCommandBuffer>)buffer;
+    [cmd encodeWaitForEvent:(__bridge id<MTLSharedEvent>)event value:1];
+}
+uint64_t metal_test_gate_value(void* event) {
+    return ((__bridge id<MTLSharedEvent>)event).signaledValue;
+}
+void metal_test_gate_release(void* event) {
+    ((__bridge id<MTLSharedEvent>)event).signaledValue = 1;
 }

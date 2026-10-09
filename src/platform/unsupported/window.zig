@@ -2,8 +2,8 @@ const std = @import("std");
 
 /// Unsupported platform window stub.
 ///
-/// 用于让非 macOS 目标先具备可编译的平台接口层，
-/// 后续可替换为真正的平台实现。
+/// Allows non-macOS targets to have compilable platform interface layer initially;
+/// can later be replaced with real platform implementation.
 pub const UnsupportedWindow = struct {
     width: u32 = 0,
     height: u32 = 0,
@@ -19,8 +19,8 @@ pub const UnsupportedWindow = struct {
         file_size: u64 = 0,
         frame_count: u64 = 0,
         dropped_frames: u64 = 0,
-        path: [768]u8 = [_]u8{0} ** 768,
-        error_message: [256]u8 = [_]u8{0} ** 256,
+        path: [768]u8 = @as([768]u8, @splat(0)),
+        error_message: [256]u8 = @as([256]u8, @splat(0)),
 
         pub fn pathText(self: *const WindowRecordingState) []const u8 {
             return self.path[0..(std.mem.indexOfScalar(u8, &self.path, 0) orelse self.path.len)];
@@ -87,7 +87,7 @@ pub const UnsupportedWindow = struct {
         momentum: u8,
     };
 
-    /// IME replacementRange 哨兵：与 macos 平台保持同一 API 形状。
+    /// IME replacementRange sentinel: maintains same API shape as macOS platform.
     pub const ime_no_replacement: u32 = 0xFFFF_FFFF;
 
     pub const TextInputEvent = struct {
@@ -178,13 +178,14 @@ pub const UnsupportedWindow = struct {
         return 1.0;
     }
 
-    /// 无真实显示器，返回标称 60Hz（与 Cx.display_refresh_hz 默认值一致）。
+    /// No real display, returns nominal 60Hz (consistent with Cx.display_refresh_hz default).
     pub fn getDisplayRefreshRate(self: *UnsupportedWindow) f32 {
         _ = self;
         return 60.0;
     }
 
-    /// 无平台窗口，返 1，保持"单窗口"语义，不是 0（0 是 a11y 的通配键）。
+    /// No platform window, returns 1 to maintain 'single window' semantics, not 0 (0 is a11y
+    /// wildcard).
     pub fn getWindowId(self: *UnsupportedWindow) u32 {
         _ = self;
         return 1;
@@ -406,7 +407,7 @@ pub const UnsupportedWindow = struct {
         return false;
     }
 
-    /// 菜单动作枚举（与 macOS 侧一致）
+    /// Menu action enum (consistent with macOS side)
     pub const MenuAction = enum(c_int) {
         none = 0,
         new_file = 1,

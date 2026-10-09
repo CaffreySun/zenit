@@ -1,56 +1,79 @@
-//! 组件 mount 的逐分配点 OOM 注入 sweep，测试支撑，不进产品代码路径。
+//! Component mount per-allocation OOM injection sweep. Test support, not a product code path.
 //!
-//! 由来：第124～126轮（下游编辑器）与（Spinner）都证明，mount 里的守卫
-//! 靠读代码审不完；只有在每一个分配点上各注入一次失败、用 per-case GPA 判定
-//! "有没有东西没释放"才靠得住。scroll_area / spinner 各自手抄了一份 40 行的
-//! sweep，这里收成一个泛型入口，让每个组件的 sweep 测试只剩 5 行。
+//! Guards in mount cannot be verified by reading code; the reliable method is injecting a failure
+//! at each allocation point and using a per-case GPA to judge whether anything leaked.
 //!
-//! 判定口径：
-//! - 每个注入点一个独立的 `GeneralPurposeAllocator(.{ .safety = true })`，
-//!   用它的 `deinit() == .leak` 做判定。用 arena 会把泄漏整体回收，看不见。
-//! - mount 成功时调用方（这里）负责 `freeNode(root)`；失败时不做任何事,
-//!   失败路径该不该自己收拾干净正是被测的契约。
-//! - 空转防护按**比例**而不是绝对下限：`induced > 0` 只要求 889 个分配点里
-//!   有 1 个被诱发失败，实测值是 885（99.5%），门槛低了三个数量级，mount
-//!   哪天提前 return、分配点从几百掉到个位数，测试照样绿。改成要求至少一半
-//!   分配点能诱发失败：比例是稳定不变式，绝对值会随组件演进漂移。
+//! Judgment criteria:
+//! - Each injection point gets its own `GeneralPurposeAllocator(.{ .safety = true })`; judge by
+//!   `deinit() == .leak`. An arena hides leaks entirely.
+//! - On mount success the caller (here) calls `freeNode(root)`; on failure it does nothing. Whether
+//!   the failure path cleans up after itself is the contract under test.
+//! - Idle protection is a **ratio**, not an absolute floor: `induced > 0` would pass with 1 of ~889
+//!   points failing. Require at least half of the points to induce failure; the ratio is a stable
+//!   invariant, absolute counts drift as components evolve.
 const std = @import("std");
 const core = @import("../core.zig");
 pub const Cx = core.Cx;
 pub const Node = core.Node;
 pub const Scope = @import("../reactive.zig").Scope;
 
-/// 被测 mount 的统一形态：返回要由调用方回收的根节点（null = 没有根节点要回收）。
+/// Tested mount unified shape: return root node caller must free (null = no root to free).
 pub const MountFn = *const fn (scope: *Scope, cx: *Cx) anyerror!?*Node;
+
+/// `ZENIT_MOUNT_STATS=1`: test mount once and print allocation count, new signals/memos/effects.
+fn mountStatsOnly() bool {
+    return @import("zenit_environment").has("ZENIT_MOUNT_STATS");
+}
 
 pub fn sweepMount(comptime label: []const u8, mount: MountFn) !void {
     const t = std.testing;
 
-    // 先量一次成功调用用掉多少个分配点。
+    // Measure successful call cost in allocation points.
     const total_allocs = blk: {
         var arena = std.heap.ArenaAllocator.init(t.allocator);
         defer arena.deinit();
         var counting = t.FailingAllocator.init(arena.allocator(), .{});
-        const ctx = try Cx.init(counting.allocator());
+        const ctx = try Cx.init(counting.allocator(), std.testing.io);
         defer ctx.deinit();
-        // Popover/Tooltip 一类要挂 portal，需要 cx.root；与各组件 basic 测试同形。
+        // Popover/Tooltip etc. need portal, require cx.root; same shape as component's basic tests.
         ctx.root = try core.box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
         const scope = try Scope.init(counting.allocator(), null, ctx.owner);
         defer scope.dispose();
         const before = counting.alloc_index;
+        const kinds_before = ctx.owner.graph.countByKind();
         _ = try mount(scope, ctx);
+        if (mountStatsOnly()) {
+            const kinds_after = ctx.owner.graph.countByKind();
+            std.debug.print("[mount-stats] {s} allocs={d} signal={d} memo={d} effect={d}\n", .{
+                label,
+                counting.alloc_index - before,
+                kinds_after.get(.signal) - kinds_before.get(.signal),
+                kinds_after.get(.memo) - kinds_before.get(.memo),
+                kinds_after.get(.effect) - kinds_before.get(.effect),
+            });
+        }
         break :blk counting.alloc_index - before;
     };
     try t.expect(total_allocs > 0);
+    // Skip per-point injection when only sampling mount baseline (docs/SIGNAL_API_DESIGN.md §7 P0
+    // baseline).
+    if (mountStatsOnly()) return;
+
+    // During injection, control flow regions (For / Show...) on allocation failure mid-effect
+    // downgrade to "log error, keep old row" by design, not leak; its err log fails the test,
+    // suppress here (leaks still judged by GPA).
+    const control_flow = @import("../control_flow.zig");
+    control_flow.control_flow_suppress_error_log = true;
+    defer control_flow.control_flow_suppress_error_log = false;
 
     var induced: usize = 0;
     var leaked: usize = 0;
     var first_leak: ?usize = null;
     for (0..total_allocs) |failure_index| {
-        var gpa = std.heap.GeneralPurposeAllocator(.{ .safety = true }){};
+        var gpa = std.heap.DebugAllocator(.{ .safety = true }){};
         {
             var failing = t.FailingAllocator.init(gpa.allocator(), .{});
-            const ctx = Cx.init(failing.allocator()) catch {
+            const ctx = Cx.init(failing.allocator(), std.testing.io) catch {
                 _ = gpa.deinit();
                 continue;
             };
@@ -82,8 +105,9 @@ pub fn sweepMount(comptime label: []const u8, mount: MountFn) !void {
             if (first_leak == null) first_leak = failure_index;
         }
     }
-    // 见文件头：按比例卡，不按绝对下限。正常值接近 100%（每个分配点注入一次
-    // 失败，mount 基本都会失败返回）；掉到一半以下说明 sweep 没真正覆盖 mount。
+    // See file header: card by ratio, not absolute floor. Normal ~100% (every allocation point
+    // induced once, mount mostly fails return); dropping below half means sweep doesn't truly cover
+    // mount.
     const min_induced = total_allocs / 2;
     if (induced < min_induced) {
         std.debug.print(

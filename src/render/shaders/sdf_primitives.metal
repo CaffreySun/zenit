@@ -1,20 +1,20 @@
 /// SDF Primitives Shader
 ///
-/// Metal Shading Language 实现的 SDF 图元渲染
-/// 支持：圆角矩形、圆形、线条
-/// 特性：抗锯齿、阴影、渐变、发光
+/// Metal Shading Language SDF primitive rendering.
+/// Support: rounded rects, circles, lines.
+/// Features: anti-alias, shadows, gradients, glow.
 
 #include <metal_stdlib>
 using namespace metal;
 
 // ============================================================================
-// Uniforms 和顶点数据结构
+// Uniforms and vertex data structures
 // ============================================================================
 
-/// 全局 Uniforms
+/// Global Uniforms
 struct Uniforms {
-    float2 viewport_size;  // 视口尺寸（物理像素）
-    float scale_factor;    // DPI 缩放因子 (Retina=2.0)
+    float2 viewport_size; // Viewport size (physical pixels)
+    float scale_factor; // DPI scale factor (Retina=2.0)
     uint clip_shape_kind;
     float4 clip_rect;
     float clip_radius;
@@ -23,61 +23,61 @@ struct Uniforms {
     uint clip_contour_count;
     uint clip_polygon_end_points[8];
     float2 clip_polygon_points[32];
-    uint frame_seed;  // 每帧递增，驱动 film_grain 动态噪声
+    uint frame_seed; // Per-frame increment, drives film_grain dynamic noise
 };
 
-/// 实例数据（每个图元一个）— 176 bytes
+/// Instance data (one per primitive) - 176 bytes
 struct InstanceData {
-    // ── 核心几何 ─────────────────────────────────────── offset 0
-    float4 rect;              // x, y, width, height（逻辑像素）
-    float4 rect_clip;         // x, y, w, h（逻辑像素）；negative size = disabled
-    // ── 颜色 ────────────────────────────────────────── offset 32
-    float4 fill_color;        // 填充颜色 RGBA (gradient: from)
-    float4 border_color;      // 边框颜色 RGBA
-    float4 shadow_color;      // 阴影颜色 RGBA
-    float4 gradient_to_color; // 渐变终止颜色 RGBA（stop_count=0 时使用）
-    float4 corner_radii;      // 四角圆角半径: TL, TR, BR, BL
-    // ── 标量效果参数 ──────────────────────────────────── offset 112
-    float border_width;       // 边框宽度
-    float shadow_blur;        // 阴影模糊半径（外阴影）
-    float shadow_offset_x;    // 阴影 X 偏移
-    float shadow_offset_y;    // 阴影 Y 偏移
-    // ── 类型和标志 ────────────────────────────────────── offset 128
+    // -- Core geometry ------------------------------------------------- offset 0
+    float4 rect; // x, y, width, height (logical pixels)
+    float4 rect_clip; // x, y, w, h (logical pixels); negative size = disabled
+    // -- Color ----------------------------------------------------- offset 32
+    float4 fill_color; // Fill color RGBA (gradient: from)
+    float4 border_color; // Border color RGBA
+    float4 shadow_color; // Shadow color RGBA
+    float4 gradient_to_color; // Gradient end color RGBA (stop_count=0 uses this)
+    float4 corner_radii; // Four corner radii: TL, TR, BR, BL
+    // -- Scalar effect params -------------------------------------------- offset 112
+    float border_width; // Border width
+    float shadow_blur; // Shadow blur radius (outer shadow)
+    float shadow_offset_x; // Shadow X offset
+    float shadow_offset_y; // Shadow Y offset
+    // -- Type and flags ------------------------------------------------- offset 128
     uint shape_type;          // 0=rect, 1=circle, 2=line, 3=arc
-    /// packed_flags 布局：
+    /// packed_flags layout:
     ///   bit 0-7:  gradient_direction (0=none,1=vert,2=horiz,3=diag,4=radial,5=conic)
     ///   bit 8-15: noise_mode (0=none, 1=value, 2=film_grain)
     ///   bit 16-23: noise_seed (0-255)
     ///   bit 24:   inset_shadow
     ///   bit 25:   has_shadow2
     uint packed_flags;
-    float noise_scale;        // 噪声缩放（逻辑像素单位，0=禁用）
-    float noise_intensity;    // 噪声混合强度 [0..1]
+    float noise_scale; // Noise scale (logical pixel units, 0=disabled)
+    float noise_intensity; // Noise blend strength [0..1]
     // ── Per-side border ──────────────────────────────── offset 144
-    float4 border_widths;     // per-side: top, right, bottom, left; 全零=用 border_width
-    // ── 多色渐变 / 多重阴影索引 ──────────────────────── offset 160
-    uint gradient_stop_offset; // GradientStop buffer 起始索引（stop_count=0 时忽略）
-    uint gradient_stop_count;  // stop 数量（0 = 用旧两色 fill/gradient_to_color）
-    uint shadow2_index;        // ShadowParam buffer 中第二阴影的索引
-    uint _ext_reserved;        // 保留扩展
+    float4 border_widths; // Per-side: top, right, bottom, left; all zero=use border_width
+    // -- Multi-color gradient / dual shadow index ----------------------- offset 160
+    uint gradient_stop_offset; // GradientStop buffer start index (ignored when stop_count=0)
+    uint gradient_stop_count; // Stop count (0 = use legacy two-color fill/gradient_to_color)
+    uint shadow2_index; // Second shadow index in ShadowParam buffer
+    uint _ext_reserved; // Reserved extension
 };
 
-/// 顶点输出
+/// Vertex output
 struct VertexOutput {
     float4 position [[position]];
-    float2 local_pos;      // 相对于图元中心的位置
-    float2 size;           // 图元尺寸的一半
-    float2 uv;            // 归一化坐标 (0-1)
-    float2 screen_pos;    // 当前片元的物理像素坐标
+    float2 local_pos; // Position relative to primitive center
+    float2 size; // Primitive size half
+    float2 uv; // Normalized coordinate (0-1)
+    float2 screen_pos; // Current fragment physical pixel coordinate
     float4 rect_clip;
     uint instance_id;
 };
 
 // ============================================================================
-// 程序性噪声函数
+// Procedural noise functions
 // ============================================================================
 
-/// Wang hash — 快速整数 hash
+/// Wang hash - fast integer hash
 uint hash_wang(uint x) {
     x = (x ^ 61u) ^ (x >> 16u);
     x = x + (x << 3u);
@@ -87,20 +87,20 @@ uint hash_wang(uint x) {
     return x;
 }
 
-/// 2D 整数坐标 → [0,1] float hash
+/// 2D integer coordinate -> [0,1] float hash
 float hash2d(float2 p) {
     uint ix = uint(abs(p.x) * 1000.0);
     uint iy = uint(abs(p.y) * 1000.0);
     return float(hash_wang(ix ^ hash_wang(iy * 2654435761u))) / 4294967295.0;
 }
 
-/// Value Noise：双线性插值格点噪声
-/// p: 局部坐标（逻辑像素），scale: 格点间距，seed: 实例种子
+/// Value Noise: bilinear interpolated grid noise.
+/// p: local coordinate (logical pixels), scale: grid spacing, seed: instance seed
 float value_noise(float2 p, float scale, uint seed) {
     float2 sp = p / max(scale, 0.001) + float2(float(seed) * 17.3, float(seed) * 31.7);
     float2 i = floor(sp);
     float2 f = fract(sp);
-    float2 u = f * f * (3.0 - 2.0 * f); // Hermite 平滑插值
+    float2 u = f * f * (3.0 - 2.0 * f); // Hermite smooth interpolation
     float a = hash2d(i);
     float b = hash2d(i + float2(1.0, 0.0));
     float c = hash2d(i + float2(0.0, 1.0));
@@ -108,17 +108,17 @@ float value_noise(float2 p, float scale, uint seed) {
     return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
 }
 
-/// Film Grain：基于物理像素坐标的高频颗粒噪声
-/// screen_pos: 物理像素坐标，seed: 实例种子
+/// Film Grain: high-freq grain noise from physical pixel coordinate.
+/// screen_pos: physical pixel coordinate, seed: instance seed
 float film_grain(float2 screen_pos, uint seed) {
     return hash2d(floor(screen_pos) + float2(float(seed & 255u) * 3.7, float((seed >> 8u) & 255u) * 5.1)) - 0.5;
 }
 
 // ============================================================================
-// 多色渐变
+// Multi-color gradient
 // ============================================================================
 
-/// GradientStop：多色渐变色标（buffer slot 2）
+/// GradientStop: multi-color gradient stop (buffer slot 2)
 struct GradientStop {
     float4 color;    // RGBA linear
     float  position; // [0.0, 1.0]
@@ -129,12 +129,13 @@ struct GradientStop {
 };
 
 // ============================================================================
-// Bayer 有序抖动（Blend2D 启发）
+// Bayer ordered dithering (Blend2D inspired)
 // ============================================================================
 //
-// 16×16 Bayer 矩阵，值域 [0, 255]，编译期常量
-// 用于在渐变写入 8bit framebuffer 前添加次像素偏移，消除色阶 banding
-// 参考：Blend2D fetchgradientpart.cpp GradientDitheringContext
+// 16x16 Bayer matrix, range [0, 255], compile-time constant.
+// Adds a sub-pixel offset before gradient write to the 8-bit framebuffer,
+// eliminating color banding.
+// Reference: Blend2D fetchgradientpart.cpp GradientDitheringContext
 constant uchar bayer_16x16[256] = {
       0,128, 32,160,  8,136, 40,168,  2,130, 34,162, 10,138, 42,170,
     192, 64,224, 96,200, 72,232,104,194, 66,226, 98,202, 74,234,106,
@@ -154,29 +155,29 @@ constant uchar bayer_16x16[256] = {
     255,127,223, 95,247,119,215, 87,253,125,221, 93,245,117,213, 85,
 };
 
-/// 从物理像素坐标取 Bayer 阈值，归一化到 [-0.5/255, +0.5/255]
-/// 用于渐变颜色写入前的次像素抖动
+/// Extract Bayer threshold from physical pixel coord, normalize to [-0.5/255, +0.5/255].
+/// Apply sub-pixel dither before gradient color write.
 inline float bayer_dither(float2 screen_pos) {
     uint ix = uint(screen_pos.x) & 15u;
     uint iy = uint(screen_pos.y) & 15u;
-    return (float(bayer_16x16[iy * 16u + ix]) - 127.5) / 65025.0; // ÷(255×255) 保持能量守恒
+    return (float(bayer_16x16[iy * 16u + ix]) - 127.5) / 65025.0; // ÷(255×255) preserves energy conservation
 }
 
 // ============================================================================
-// 多色渐变
+// Multi-color gradient
 // ============================================================================
 
-/// Premultiplied alpha 辅助（Blend2D 启发）
-/// 渐变插值在 premul 空间进行，避免半透明 stop 间颜色偏移
+/// Premultiplied alpha helper (Blend2D inspired).
+/// Gradient interpolation in premul space, avoid color shift between semi-transparent stops.
 inline float4 premul(float4 c)   { return float4(c.rgb * c.a, c.a); }
 inline float4 unpremul(float4 c) {
     return c.a > 1e-6 ? float4(c.rgb / c.a, c.a) : float4(0.0);
 }
 
-/// 多色渐变求值（premultiplied alpha 空间插值，stops 须按 position 升序）
+/// Evaluate multi-color gradient (premul alpha interpolation, stops must be position-sorted).
 float4 eval_gradient_stops(float t, constant GradientStop* stops, uint offset, uint count) {
     if (count == 0u) return float4(0.0);
-    if (count > 16u) return float4(1.0, 0.0, 1.0, 1.0); // 品红 = 参数错误（count 上限 16）
+    if (count > 16u) return float4(1.0, 0.0, 1.0, 1.0); // Magenta = parameter error (count limit 16)
     if (count == 1u) return stops[offset].color;
     float min_pos = stops[offset].position;
     float max_pos = stops[offset + count - 1u].position;
@@ -187,7 +188,7 @@ float4 eval_gradient_stops(float t, constant GradientStop* stops, uint offset, u
         if (t_c >= s0.position && t_c <= s1.position) {
             float span = s1.position - s0.position;
             float lt = (span > 1e-6) ? (t_c - s0.position) / span : 0.0;
-            // premul 空间插值：避免半透明 stop 之间 RGB 颜色偏移
+            // Premul space interpolation: avoid RGB shift between semi-transparent stops.
             float4 result_premul = mix(premul(s0.color), premul(s1.color), lt);
             return unpremul(result_premul);
         }
@@ -196,10 +197,10 @@ float4 eval_gradient_stops(float t, constant GradientStop* stops, uint offset, u
 }
 
 // ============================================================================
-// 多重阴影
+// Multiple shadows
 // ============================================================================
 
-/// ShadowParam：第二个阴影参数（buffer slot 3）
+/// ShadowParam: second shadow params (buffer slot 3)
 struct ShadowParam {
     float4 color;
     float  blur;
@@ -210,10 +211,10 @@ struct ShadowParam {
 };
 
 // ============================================================================
-// SDF 函数
+// SDF functions
 // ============================================================================
 
-/// SDF 圆角矩形（统一半径）
+/// SDF rounded rect (uniform radius)
 float sdf_rounded_rect(float2 p, float2 size, float radius) {
     float2 d = abs(p) - size + radius;
     return min(max(d.x, d.y), 0.0) + length(max(d, float2(0.0))) - radius;
@@ -224,25 +225,25 @@ float sdf_ellipse_clip(float2 p, float2 radius_xy) {
     return length(q) - 1.0;
 }
 
-/// 椭圆 SDF —— **返回真实像素距离**（梯度归一化的一阶 Newton 估计）。
+/// Ellipse SDF -- **returns true pixel distance** (1st-order Newton estimate of the
+/// normalized gradient).
 ///
-/// ⚠ 不要复用上面的 `sdf_ellipse_clip`：它返回**无量纲**的 `length(p/r)-1`，
-/// 只对裁剪成立（`shape_clip_alpha` 用 `fwidth` 自归一化）。填充路径的 AA 宽度
-/// 来自 `get_aa_width(local_pos)`，单位是**像素** —— 量纲不匹配会让 AA 过渡带
-/// 错几十倍，边缘要么硬锯齿要么糊成一片。
+/// WARNING: do not reuse sdf_ellipse_clip above; it returns a **dimensionless**
+/// `length(p/r)-1`, valid only for clipping (shape_clip_alpha self-normalizes via fwidth).
+/// AA width from sdf_aa_width(sdf) has a 0.5 **pixel** floor, so a dimension mismatch makes
+/// the AA band off by tens of times (edges hard-aliased or blurred to mush).
 ///
-/// 也不要退回 `(length(p/r)-1) * min(rx,ry)`（`path.metal` 里那种）：实测
-/// 10:1 椭圆的长轴端点读数只有真实距离的 **1/10**，AA 在扁端被拉宽 10 倍，
-/// 而 2:1 椭圆的描边就已经一边粗一倍（`abs(sdf)` 型描边宽 2.0px→4.0px）。
+/// Also avoid (length(p/r)-1) * min(rx,ry) (path.metal style): on a 10:1 ellipse the major
+/// endpoint reads 1/10 of the true distance and AA is 10x too wide at the flat end; a 2:1
+/// ellipse stroke is already 2x thicker on one edge (abs(sdf)-type stroke 2.0px->4.0px).
 ///
-/// 正确做法：椭圆没有解析闭式 SDF，用隐函数 `f = |p/r| - 1` 除以梯度模长
-/// 得到一阶距离估计。实测贴近边界处（AA/描边真正生效的地方）误差 0.2~2.4%，
-/// 远小于一个像素；10:1 极端比例下最坏 8%，肉眼不可察。
+/// Ellipse has no closed-form SDF; use implicit f=|p/r|-1 divided by gradient magnitude.
+/// Near edges (where AA/stroke apply) error is 0.2-2.4%; 10:1 extreme worst 8%, imperceptible.
 float sdf_ellipse(float2 p, float2 radius_xy) {
     const float2 r = max(radius_xy, float2(0.001));
     const float2 q = p / r;
     const float k = length(q);
-    // 中心点：梯度为 0，退化成"到最近边界"的最短半轴距离
+    // Center: zero gradient, degenerates to 'shortest semi-axis to boundary' distance.
     if (k < 1e-6) return -min(r.x, r.y);
     // |∇f| = length(p / r²) / k
     const float g = length(p / (r * r)) / k;
@@ -311,23 +312,23 @@ bool polygon_contains(float2 p, constant Uniforms& uniforms, uint count, uint co
     return polygon_winding(p, uniforms, count, contour_count) != 0;
 }
 
-/// SDF 圆角矩形（四角独立半径）
+/// SDF rounded rect (four independent corner radii).
 /// radii: top-left, top-right, bottom-right, bottom-left
 float sdf_rounded_rect_4(float2 p, float2 size, float4 radii) {
-    // 根据象限选择对应圆角
+    // Pick radius by quadrant
     float r = (p.x < 0.0)
-        ? ((p.y < 0.0) ? radii.x : radii.w)   // 左侧: TL / BL
-        : ((p.y < 0.0) ? radii.y : radii.z);   // 右侧: TR / BR
+        ? ((p.y < 0.0) ? radii.x : radii.w) // Left: TL / BL
+        : ((p.y < 0.0) ? radii.y : radii.z); // Right: TR / BR
     float2 d = abs(p) - size + r;
     return min(max(d.x, d.y), 0.0) + length(max(d, float2(0.0))) - r;
 }
 
-/// SDF 圆形
+/// SDF circle
 float sdf_circle(float2 p, float radius) {
     return length(p) - radius;
 }
 
-/// SDF 线条（胶囊形）
+/// SDF line (capsule)
 float sdf_line(float2 p, float2 a, float2 b, float thickness) {
     float2 pa = p - a;
     float2 ba = b - a;
@@ -335,44 +336,44 @@ float sdf_line(float2 p, float2 a, float2 b, float thickness) {
     return length(pa - ba * h) - thickness;
 }
 
-/// SDF 圆弧（圆环的一段）
-/// p: 相对于圆心的位置
-/// outer_radius: 外半径
-/// stroke_width: 线宽
-/// start_angle: 起始角（弧度，任意值，不需要规范化）
-/// end_angle: 结束角（弧度，end >= start，sweep = end - start）
+/// SDF arc (ring segment).
+/// p: position relative to center.
+/// outer_radius: outer radius.
+/// stroke_width: line width.
+/// start_angle: start angle (radians, arbitrary, no normalization needed).
+/// end_angle: end angle (radians, end >= start, sweep = end - start).
 float sdf_arc(float2 p, float outer_radius, float stroke_width, float start_angle, float end_angle) {
     float mid_radius = outer_radius - stroke_width * 0.5;
     float half_stroke = stroke_width * 0.5;
 
-    // 圆环 SDF（不带角度裁剪）
+    // Ring SDF (no angle clipping)
     float ring_sdf = abs(length(p) - mid_radius) - half_stroke;
 
-    // sweep = 弧长角度，clamp 到 [0, 2π]
+    // sweep = arc angle, clamp to [0, 2pi]
     float sweep = clamp(end_angle - start_angle, 0.0, 2.0 * M_PI_F);
 
-    // sweep >= 2π：完整圆环，直接返回
+    // sweep >= 2pi: full ring, return directly
     if (sweep >= 2.0 * M_PI_F - 0.0001) {
         return ring_sdf;
     }
 
-    // 把 p 的极角相对 start_angle 规范化到 [0, 2π)
+    // Normalize p's polar angle relative to start_angle to [0, 2pi)
     float raw_angle = atan2(p.y, p.x);
     float rel = raw_angle - start_angle;
-    // 规范化到 [0, 2π)
+    // Normalize to [0, 2pi)
     rel = rel - floor(rel / (2.0 * M_PI_F)) * (2.0 * M_PI_F);
 
-    // rel 在 [0, sweep] 内 → 在弧段内
+    // rel in [0, sweep] -> within arc segment
     if (rel <= sweep) {
         return ring_sdf;
     }
 
-    // 弧段外：直接返回正数（不渲染端帽，平头截断）
+    // Outside arc: positive (no end caps, flat cutoff)
     return half_stroke + 1.0;
 }
 
 // ============================================================================
-// 抗锯齿函数
+// Anti-aliasing functions
 // ============================================================================
 
 float aa_step(float edge, float x, float aa_width) {
@@ -440,25 +441,38 @@ float clip_alpha(float2 screen_pos, float4 rect_clip, constant Uniforms& uniform
     return rect_clip_alpha(screen_pos, rect_clip, uniforms.scale_factor) * shape_clip_alpha(screen_pos, uniforms);
 }
 
-float get_aa_width(float2 local_pos) {
-    return length(float2(dfdx(local_pos.x), dfdy(local_pos.y))) * 0.5;
+/// Fill AA half-width (pixels): half the SDF's screen-space gradient magnitude.
+/// Coverage is 1 at 0.5px inside the edge and 0 at 0.5px outside, so adjacent rects on integer
+/// boundaries are seamless. Do not use `length(float2(dfdx(local.x), dfdy(local.y)))`: the
+/// diagonal widens the AA band on axis-aligned edges by sqrt(2) (to 0.707px), so pixels next to
+/// integer edges get only ~94% coverage and a dark seam shows between adjacent rects (measured
+/// 255->242 on a Windows device with a 4px stripe background).
+float sdf_aa_width(float sdf) {
+    return length(float2(dfdx(sdf), dfdy(sdf))) * 0.5;
 }
 
-// src-over 预乘 alpha 合成
+// Src-over premultiplied alpha composite
 inline void composite_premul(thread float4& dst, float4 src) {
     dst += src * (1.0 - dst.a);
 }
 
 // ============================================================================
-// 顶点着色器
+// Vertex shader
 // ============================================================================
 
-vertex VertexOutput sdf_vertex_main(
-    uint vertex_id [[vertex_id]],
-    uint instance_id [[instance_id]],
-    constant Uniforms& uniforms [[buffer(0)]],
-    constant InstanceData* instances [[buffer(1)]],
-    constant ShadowParam* shadow_params [[buffer(3)]]
+// kRing: shadow-only instances emit '4 rects (24 verts) = expanded quad minus inner hole'.
+// Hole = body shrunk (max radius + 2 physical px): body SDF <= -2px inside, fill coverage
+// is constant 1, shadow * (1 - fill_alpha) = 0, so output is already zero. kClip: clamp quad
+// verts into rect_clip expanded by 2 physical px. rect_clip_alpha AA band
+// clip_aa = max(fwidth(sdf)*0.5, 0.5) <= 0.71px, so pixels >0.71px outside the clip have
+// alpha 0; affine in screen coords, clamping verts does not change kept pixels.
+template <bool kRing, bool kClip>
+inline VertexOutput sdf_vertex_impl(
+    uint vertex_id,
+    uint instance_id,
+    constant Uniforms& uniforms,
+    constant InstanceData* instances,
+    constant ShadowParam* shadow_params
 ) {
     VertexOutput out;
 
@@ -472,17 +486,17 @@ vertex VertexOutput sdf_vertex_main(
     };
 
     uint indices[6] = {0, 1, 2, 1, 3, 2};
-    uint corner_index = indices[vertex_id];
+    uint corner_index = indices[kRing ? vertex_id % 6u : vertex_id];
     float2 corner = corners[corner_index];
 
-    // Instance 坐标是逻辑像素，乘以 scale_factor 转物理像素
+    // Instance coords logical pixels, multiply by scale_factor to physical pixels.
     float s = uniforms.scale_factor;
 
     float expand = inst.shadow_blur * 2.0 + abs(inst.shadow_offset_x) + abs(inst.shadow_offset_y);
-    // bit 28：外阴影带 spread（noise_scale 复用），正 spread 让 quad 同步外扩。
+    // bit 28: outer shadow has spread (noise_scale reused), positive spread expands quad.
     if ((inst.packed_flags & (1u << 28u)) != 0u) expand += max(inst.noise_scale, 0.0);
-    // 双层阴影：quad 必须覆盖两层中扩展更大的那层，否则第二层大 blur 阴影
-    // 在 quad 边缘被硬切（面板周围一圈矩形亮带）。
+    // Dual shadow: quad must cover whichever layer has larger expansion, else second shadow's
+    // large blur gets hard-cut at quad edge (bright rect rim around panel).
     if ((inst.packed_flags & (1u << 25u)) != 0u) {
         ShadowParam s2v = shadow_params[inst.shadow2_index];
         float expand2 = s2v.blur * 2.0 + abs(s2v.offset_x) + abs(s2v.offset_y);
@@ -492,6 +506,29 @@ vertex VertexOutput sdf_vertex_main(
     float2 pos = (inst.rect.xy - expand) * s;
     float2 size = (inst.rect.zw + expand * 2.0) * s;
     float2 pixel_pos = pos + corner * size;
+    if (kRing) {
+        float radius = max(max(inst.corner_radii.x, inst.corner_radii.y),
+                           max(inst.corner_radii.z, inst.corner_radii.w)) * s;
+        float2 half_size = inst.rect.zw * s * 0.5;
+        float2 body_center = inst.rect.xy * s + half_size;
+        float2 inner_half = max(half_size - max(radius, 0.0) - 2.0, float2(0.0));
+        float2 lo = body_center - inner_half;
+        float2 hi = body_center + inner_half;
+        float2 tile_lo = pos;
+        float2 tile_hi = pos + size;
+        switch (vertex_id / 6u) {
+            case 0: tile_hi.x = lo.x; break; // Left stripe
+            case 1: tile_lo.x = hi.x; break; // Right stripe
+            case 2: tile_lo.x = lo.x; tile_hi = float2(hi.x, lo.y); break; // Top stripe
+            default: tile_lo = float2(lo.x, hi.y); tile_hi.x = hi.x; break; // Bottom stripe
+        }
+        pixel_pos = mix(tile_lo, tile_hi, corner);
+    }
+    if (kClip && inst.rect_clip.z >= 0.0 && inst.rect_clip.w >= 0.0) {
+        float2 clip_lo = inst.rect_clip.xy * s - 2.0;
+        float2 clip_hi = (inst.rect_clip.xy + inst.rect_clip.zw) * s + 2.0;
+        pixel_pos = clamp(pixel_pos, clip_lo, clip_hi);
+    }
 
     float2 ndc = (pixel_pos / uniforms.viewport_size) * 2.0 - 1.0;
     ndc.y = -ndc.y;
@@ -510,16 +547,56 @@ vertex VertexOutput sdf_vertex_main(
     return out;
 }
 
+vertex VertexOutput sdf_vertex_main(
+    uint vertex_id [[vertex_id]],
+    uint instance_id [[instance_id]],
+    constant Uniforms& uniforms [[buffer(0)]],
+    constant InstanceData* instances [[buffer(1)]],
+    constant ShadowParam* shadow_params [[buffer(3)]]
+) {
+    return sdf_vertex_impl<false, false>(vertex_id, instance_id, uniforms, instances, shadow_params);
+}
+
+vertex VertexOutput sdf_clipped_vertex_main(
+    uint vertex_id [[vertex_id]],
+    uint instance_id [[instance_id]],
+    constant Uniforms& uniforms [[buffer(0)]],
+    constant InstanceData* instances [[buffer(1)]],
+    constant ShadowParam* shadow_params [[buffer(3)]]
+) {
+    return sdf_vertex_impl<false, true>(vertex_id, instance_id, uniforms, instances, shadow_params);
+}
+
+vertex VertexOutput sdf_shadow_ring_vertex_main(
+    uint vertex_id [[vertex_id]],
+    uint instance_id [[instance_id]],
+    constant Uniforms& uniforms [[buffer(0)]],
+    constant InstanceData* instances [[buffer(1)]],
+    constant ShadowParam* shadow_params [[buffer(3)]]
+) {
+    return sdf_vertex_impl<true, true>(vertex_id, instance_id, uniforms, instances, shadow_params);
+}
+
 // ============================================================================
-// 片段着色器
+// Fragment shader
 // ============================================================================
 
-fragment float4 sdf_fragment_main(
-    VertexOutput in [[stage_in]],
-    constant Uniforms& uniforms        [[buffer(0)]],
-    constant InstanceData* instances   [[buffer(1)]],
-    constant GradientStop* grad_stops  [[buffer(2)]],
-    constant ShadowParam* shadow_params[[buffer(3)]]
+// Fragment body is a template: specialization passes compile-time constants and the compiler
+// inlines and deletes unreachable branches. Distance / AA / stroke / shadow / composite math
+// shares code with the general path; the CPU side (SdfRenderer.metalKind) selects a
+// specialization only when the runtime branch is already false, so per-pixel output is identical.
+//   kGeneral    : non-rect shapes, gradient/noise/inset shadow/shadow2
+//   kBorder     : stroke (uniform or per-side)
+//   kShadow     : outer shadow
+//   kShadowOnly : transparent fill, shadow-only: body interior shadow * (1-fill_alpha) = 0,
+//                 result is discarded anyway, early exit.
+template <bool kGeneral, bool kBorder, bool kShadow, bool kShadowOnly>
+inline float4 sdf_fragment_impl(
+    VertexOutput in,
+    constant Uniforms& uniforms,
+    constant InstanceData* instances,
+    constant GradientStop* grad_stops,
+    constant ShadowParam* shadow_params
 ) {
     InstanceData inst = instances[in.instance_id];
     const float s = uniforms.scale_factor;
@@ -531,7 +608,9 @@ fragment float4 sdf_fragment_main(
 
     float sdf;
 
-    switch (inst.shape_type) {
+    if (!kGeneral) {
+        sdf = sdf_rounded_rect_4(in.local_pos, in.size, corner_radii);
+    } else switch (inst.shape_type) {
         case 0:
             sdf = sdf_rounded_rect_4(in.local_pos, in.size, corner_radii);
             break;
@@ -542,8 +621,8 @@ fragment float4 sdf_fragment_main(
             sdf = abs(in.local_pos.y) - corner_radii.x;
             break;
         case 3:
-            // arc: corner_radii.x = 外半径, border_width = 线宽
-            //      shadow_offset_x = 起始角(弧度), shadow_offset_y = 结束角(弧度)
+            // arc: corner_radii.x = outer_radius, border_width = line_width.
+            //      shadow_offset_x = start_angle(radians), shadow_offset_y = end_angle(radians)
             sdf = sdf_arc(
                 in.local_pos,
                 corner_radii.x,
@@ -553,7 +632,7 @@ fragment float4 sdf_fragment_main(
             );
             break;
         case 4:
-            // ellipse: in.size 是半轴 (与 sdf_rounded_rect_4 同约定)
+            // ellipse: in.size is semi-axes (same convention as sdf_rounded_rect_4)
             sdf = sdf_ellipse(in.local_pos, in.size);
             break;
         default:
@@ -561,22 +640,31 @@ fragment float4 sdf_fragment_main(
             break;
     }
 
-    float aa_width = get_aa_width(in.local_pos);
-    if (aa_width < 0.5) aa_width = 0.5;
+    // Floor 0.5: SDF gradient discontinuous on shape centerline (quad diff can collapse to 0),
+    // cannot let band collapse to zero.
+    float aa_width = max(sdf_aa_width(sdf), 0.5);
 
     float fill_alpha = aa_step(0.0, sdf, aa_width);
+    // Clip alpha uses screen-space derivative (rect_clip_alpha fwidth): must evaluate with
+    // all 2x2 quad pixels alive. Early-exit entries pre-compute, result shared at end.
+    const float early_clip = kShadowOnly ? clip_alpha(in.screen_pos, in.rect_clip, uniforms) : 1.0;
+    if (kShadowOnly && fill_alpha >= 1.0) {
+        // Keep discard: large interior area, write 0 then blend costs more (measured +10%).
+        discard_fragment();
+        return float4(0.0);
+    }
 
     float border_alpha = 0.0;
     float4 bw = inst.border_widths * s;
-    // ⚠ per-side 分支的内轮廓**硬编码** sdf_rounded_rect_4（见下），对非矩形
-    // 形状会画出"矩形描边套在椭圆填充外面"。椭圆没有"四条边"，per-side 本身
-    // 无意义 —— 这里直接门禁掉，让它走 uniform 快速路径（`sdf + border_width`，
-    // 与形状无关，自动正确）。Zig 侧 `addEllipse` 负责把四个值折叠成
-    // `border_width = max(...)`，不能取第一个：{0,0,0,4} 会静默变成 0 宽描边。
-    bool has_per_side = (bw.x + bw.y + bw.z + bw.w) > 0.0 && inst.shape_type == 0u;
+    // WARNING: the per-side branch hard-codes sdf_rounded_rect_4 and draws 'rect stroke over
+    // ellipse fill' for non-rects. Ellipse has no 'four edges', so per-side is meaningless:
+    // gate it here and use the uniform fast path (`sdf + border_width`, shape-agnostic).
+    // Zig side addEllipse folds the four values to `border_width = max(...)`, not the first:
+    // {0,0,0,4} would silently become 0-width.
+    bool has_per_side = kBorder && (bw.x + bw.y + bw.z + bw.w) > 0.0 && inst.shape_type == 0u;
 
     if (has_per_side) {
-        // Per-side border: 计算内轮廓 SDF
+        // Per-side border: compute inner SDF.
         // bw = (top, right, bottom, left)
         float2 inner_half = float2(
             in.size.x - (bw.y + bw.w) * 0.5,
@@ -584,13 +672,13 @@ fragment float4 sdf_fragment_main(
         );
         inner_half = max(inner_half, float2(0.0));
 
-        // 不对称 border 导致内矩形中心偏移
+        // Asymmetric border shifts inner rect center
         float2 inner_offset = float2(
             (bw.w - bw.y) * 0.5,
             (bw.x - bw.z) * 0.5
         );
 
-        // 内圆角 = max(0, 外圆角 - max(相邻两边宽度))
+        // Inner radius = max(0, outer - max(adjacent widths))
         float4 inner_radii = max(corner_radii - float4(
             max(bw.x, bw.w),  // TL: top, left
             max(bw.x, bw.y),  // TR: top, right
@@ -602,23 +690,25 @@ fragment float4 sdf_fragment_main(
         float outer_mask = aa_step(0.0, sdf, aa_width);
         float inner_mask = aa_step(0.0, inner_sdf, aa_width);
         border_alpha = outer_mask - inner_mask;
-    } else if (border_width > 0.0) {
-        // Uniform border: 快速路径
+    } else if (kBorder && border_width > 0.0) {
+        // Uniform border: fast path
         float inner_sdf = sdf + border_width;
         border_alpha = aa_step(0.0, sdf, aa_width) - aa_step(0.0, inner_sdf, aa_width);
     }
 
     float shadow_alpha = 0.0;
-    if (shadow_blur > 0.0) {
+    if (kShadow && shadow_blur > 0.0) {
         float2 shadow_pos = in.local_pos - shadow_offset;
         float shadow_sdf;
-        // CSS spread：阴影形状按 spread 外扩 / 收缩（圆角同步），挖空仍按本体。
+        // CSS spread: shadow shape expands/shrinks by spread (corner follows), hole per body.
         const bool has_spread = (inst.packed_flags & (1u << 28u)) != 0u;
         const float spread = has_spread ? inst.noise_scale * s : 0.0;
         const float2 shadow_half = max(in.size + spread, float2(0.0));
         const float4 shadow_radii = max(corner_radii + spread, float4(0.0));
 
-        switch (inst.shape_type) {
+        if (!kGeneral) {
+            shadow_sdf = sdf_rounded_rect_4(shadow_pos, shadow_half, shadow_radii);
+        } else switch (inst.shape_type) {
             case 0:
                 shadow_sdf = sdf_rounded_rect_4(shadow_pos, shadow_half, shadow_radii);
                 break;
@@ -637,16 +727,16 @@ fragment float4 sdf_fragment_main(
         shadow_alpha *= (1.0 - fill_alpha);
     }
 
-    // ── 解包 packed_flags ──────────────────────────────────────────────────────
-    uint gradient_dir  = inst.packed_flags & 0xFFu;
-    uint noise_mode    = (inst.packed_flags >> 8u)  & 0xFFu;
+    // -- Unpack packed_flags --
+    uint gradient_dir  = kGeneral ? (inst.packed_flags & 0xFFu) : 0u;
+    uint noise_mode    = kGeneral ? ((inst.packed_flags >> 8u)  & 0xFFu) : 0u;
     uint noise_seed    = (inst.packed_flags >> 16u) & 0xFFu;
-    bool has_inset_shad = (inst.packed_flags & (1u << 24u)) != 0u;
-    bool has_shadow2    = (inst.packed_flags & (1u << 25u)) != 0u;
+    bool has_inset_shad = kGeneral && (inst.packed_flags & (1u << 24u)) != 0u;
+    bool has_shadow2    = kGeneral && (inst.packed_flags & (1u << 25u)) != 0u;
 
     float4 result = float4(0.0);
 
-    // 1. 外阴影
+    // 1. Outer shadow
     if (shadow_alpha > 0.0) {
         float4 shadow = inst.shadow_color;
         shadow.a *= shadow_alpha;
@@ -654,7 +744,7 @@ fragment float4 sdf_fragment_main(
         composite_premul(result, shadow);
     }
 
-    // 1b. 第二外阴影（has_shadow2）
+    // 1b. Second outer shadow (has_shadow2)
     if (has_shadow2) {
         ShadowParam s2 = shadow_params[inst.shadow2_index];
         float2 sp2 = in.local_pos - float2(s2.offset_x, s2.offset_y) * s;
@@ -673,18 +763,18 @@ fragment float4 sdf_fragment_main(
         composite_premul(result, shd2);
     }
 
-    // 2. 填充（渐变 + 噪声）
+    // 2. Fill (gradient + noise)
     if (fill_alpha > 0.0) {
-        // ── 渐变 t 值计算 ─────────────────────────────────────────────────────
+        // -- Gradient t value calc --
         float4 fill = inst.fill_color;
         if (gradient_dir > 0u) {
             float t = 0.0;
 
             if (gradient_dir == 4u) {
-                // Radial 渐变：直接用原始 UV，不做 shadow expand
-                // shadow_offset_x/y 复用为圆心偏移（UV 空间，默认 0,0 = 中心 0.5,0.5）
+                // Radial gradient: use raw UV, no shadow expand.
+                // shadow_offset_x/y reused as center offset (UV space, default 0,0=center 0.5,0.5).
                 float2 center_uv = float2(0.5 + inst.shadow_offset_x, 0.5 + inst.shadow_offset_y);
-                // bit 29：自定义椭圆半径（UV 单位；CSS radial-gradient(rx ry at cx cy)）。
+                // bit 29: custom ellipse radii (UV units; CSS radial-gradient(rx ry at cx cy)).
                 if ((inst.packed_flags & (1u << 29u)) != 0u) {
                     float2 rr = max(float2(inst.noise_scale, inst.noise_intensity), float2(1e-4));
                     t = length((in.uv - center_uv) / rr);
@@ -692,13 +782,13 @@ fragment float4 sdf_fragment_main(
                     t = length(in.uv - center_uv) * 2.0;
                 }
             } else if (gradient_dir == 5u) {
-                // Conic 渐变：直接用原始 UV，不做 shadow expand
-                // _ext_reserved 复用为起始角（bitcast float，弧度）
+                // Conic gradient: use raw UV, no shadow expand.
+                // _ext_reserved reused as start angle (bitcast float, radians).
                 float start_angle = as_type<float>(inst._ext_reserved);
                 float angle = atan2(in.uv.y - 0.5, in.uv.x - 0.5) - start_angle;
                 t = fract(angle / (2.0 * M_PI_F) + 0.5);
             } else {
-                // 线性渐变（vert/horiz/diag）：保留原有 shadow expand 逻辑
+                // Linear gradient (vert/horiz/diag): retain original shadow expand logic.
                 float expand = inst.shadow_blur * 2.0 + abs(inst.shadow_offset_x) + abs(inst.shadow_offset_y);
                 float2 orig_size = inst.rect.zw;
                 float2 expanded_size = orig_size + expand * 2.0;
@@ -711,40 +801,40 @@ fragment float4 sdf_fragment_main(
             // Extend Mode (packed_flags bit 26-27): 0=pad, 1=repeat, 2=reflect
             uint extend_mode = (inst.packed_flags >> 26u) & 0x3u;
             if (extend_mode == 1u) {
-                t = fract(t);                               // REPEAT: 循环平铺
+                t = fract(t); // REPEAT: loop tile
             } else if (extend_mode == 2u) {
                 float t2 = fmod(abs(t), 2.0);
-                t = (t2 > 1.0) ? (2.0 - t2) : t2;         // REFLECT: 镜像反射
+                t = (t2 > 1.0) ? (2.0 - t2) : t2; // REFLECT: mirror reflect
             } else {
-                t = clamp(t, 0.0, 1.0);                    // PAD（默认）：夹制到边界颜色
+                t = clamp(t, 0.0, 1.0); // PAD (default): clamp to edge color
             }
 
-            // 多色渐变（stop_count > 0）或旧两色模式
+            // Multi-color gradient (stop_count > 0) or legacy two-color mode
             if (inst.gradient_stop_count > 0u) {
                 fill = eval_gradient_stops(t, grad_stops, inst.gradient_stop_offset, inst.gradient_stop_count);
             } else {
-                // 旧两色模式也在 premul 空间插值
+                // Legacy two-color also interpolates in premul space
                 float4 from_p = premul(inst.fill_color);
                 float4 to_p   = premul(inst.gradient_to_color);
                 fill = unpremul(mix(from_p, to_p, t));
             }
 
-            // Bayer 有序抖动：消除 8bit framebuffer 的色阶 banding
-            // 仅对 RGB 通道施加次像素偏移，alpha 不动
+            // Bayer ordered dither: eliminate 8-bit framebuffer color banding.
+            // Apply sub-pixel offset to RGB only, alpha unchanged.
             float dither = bayer_dither(in.screen_pos);
             fill.rgb = saturate(fill.rgb + dither);
         }
 
-        // ── 程序性噪声叠加 ───────────────────────────────────────────────────
+        // -- Procedural noise overlay --
         if (noise_mode > 0u && inst.noise_scale > 0.0) {
             float n = 0.0;
-            float ns = inst.noise_scale * s; // 转物理像素
+            float ns = inst.noise_scale * s; // Convert to physical pixels
             if (noise_mode == 1u) {
-                // Value Noise（基于逻辑坐标，随缩放自适应）
+                // Value Noise (logical-coord based, scale-adaptive)
                 n = value_noise(in.local_pos / s, ns / s, noise_seed) - 0.5;
             } else if (noise_mode == 2u) {
-                // Film Grain（基于物理像素坐标，与 DPI 无关）
-                // 用 frame_seed XOR instance seed，每帧产生不同噪声图案
+                // Film Grain (physical-pixel based, DPI-agnostic).
+                // XOR frame_seed with instance seed for different per-frame patterns.
                 n = film_grain(in.screen_pos, noise_seed ^ (uniforms.frame_seed & 0xFFu));
             }
             float ni = inst.noise_intensity;
@@ -756,10 +846,11 @@ fragment float4 sdf_fragment_main(
         composite_premul(result, fill);
     }
 
-    // 2b. Inset Shadow（在填充之上）
+    // 2b. Inset Shadow (atop fill)
     if (has_inset_shad && fill_alpha > 0.0) {
-        // CSS inset 语义：阴影形状 = 本体按 offset 平移；内阴影落在「本体内、形状外」。
-        // offset_y > 0 → 形状下移 → 顶边露出一条（inset 0 1px 0 白 = 顶部高光）。
+        // CSS inset semantics: shadow shape = body offset. Inset shadow in 'body interior and
+        // outside shape'. offset_y > 0 -> shape down -> top edge exposed (inset 0 1px 0 white =
+        // highlight).
         float2 inset_pos = in.local_pos - shadow_offset;
         float inset_sdf;
         switch (inst.shape_type) {
@@ -768,12 +859,13 @@ fragment float4 sdf_fragment_main(
             case 4: inset_sdf = sdf_ellipse(inset_pos, in.size);                  break;
             default: inset_sdf = -1.0; break;
         }
-        // 内阴影仅在形状内部（fill_alpha > 0），沿内边界衰减。
-        // blur 为 0 是 CSS 常见的 1px 硬高光（inset 0 1px 0 …）：smoothstep 的两端
-        // 相等时未定义，给一个像素宽的抗锯齿带兜底。
+        // Inset shadow only where fill_alpha > 0, fade along inner boundary.
+        // blur=0 is common CSS 1px hard highlight (inset 0 1px 0 ...): smoothstep endpoints
+        // equal is undefined, floor to 1px AA band.
         float inset_soft = max(shadow_blur, 1.0);
-        // 平移后形状的外侧（sdf ≥ 0）满强度，向内 blur 宽度内渐隐到 0；形状内部深处不画。
-        // （曾写成 1 − smoothstep，整块本体被内阴影色填满——白玻璃卡片因此变成实心白。）
+        // Offset-shifted shape outside (sdf >= 0) full strength, blur distance inward to 0;
+        // deep interior nothing. (Was 1 - smoothstep: entire body filled shadow color -- white
+        // glass card became solid white.)
         float inset_a = fill_alpha * smoothstep(-inset_soft, 0.0, inset_sdf);
         float4 inset_c = inst.shadow_color;
         inset_c.a *= inset_a;
@@ -781,7 +873,7 @@ fragment float4 sdf_fragment_main(
         composite_premul(result, inset_c);
     }
 
-    // 3. 边框
+    // 3. Border
     if (border_alpha > 0.0) {
         float4 border = inst.border_color;
         border.a *= border_alpha;
@@ -789,10 +881,57 @@ fragment float4 sdf_fragment_main(
         composite_premul(result, border);
     }
 
-    result *= clip_alpha(in.screen_pos, in.rect_clip, uniforms);
+    result *= kShadowOnly ? early_clip : clip_alpha(in.screen_pos, in.rect_clip, uniforms);
     if (result.a < 0.001) {
+        // Under premul blend, output all 0 leaves dst unchanged, bitwise equivalent to discard.
+        // fill/bordered entries skip discard (measured -5%); shadow-only already discards body
+        // interior, whole pipeline has discard, keep it.
+        if (!kGeneral && !kShadowOnly) return float4(0.0);
         discard_fragment();
     }
 
     return result;
+}
+
+fragment float4 sdf_fragment_main(
+    VertexOutput in [[stage_in]],
+    constant Uniforms& uniforms        [[buffer(0)]],
+    constant InstanceData* instances   [[buffer(1)]],
+    constant GradientStop* grad_stops  [[buffer(2)]],
+    constant ShadowParam* shadow_params[[buffer(3)]]
+) {
+    return sdf_fragment_impl<true, true, true, false>(in, uniforms, instances, grad_stops, shadow_params);
+}
+
+// Rect + solid fill (with radii), no stroke/shadow/flags. ~70% of real UI SDF fragments.
+fragment float4 sdf_fill_fragment_main(
+    VertexOutput in [[stage_in]],
+    constant Uniforms& uniforms        [[buffer(0)]],
+    constant InstanceData* instances   [[buffer(1)]],
+    constant GradientStop* grad_stops  [[buffer(2)]],
+    constant ShadowParam* shadow_params[[buffer(3)]]
+) {
+    return sdf_fragment_impl<false, false, false, false>(in, uniforms, instances, grad_stops, shadow_params);
+}
+
+// Rect + fill + stroke (uniform/per-side), no shadow/flags.
+fragment float4 sdf_bordered_fragment_main(
+    VertexOutput in [[stage_in]],
+    constant Uniforms& uniforms        [[buffer(0)]],
+    constant InstanceData* instances   [[buffer(1)]],
+    constant GradientStop* grad_stops  [[buffer(2)]],
+    constant ShadowParam* shadow_params[[buffer(3)]]
+) {
+    return sdf_fragment_impl<false, true, false, false>(in, uniforms, instances, grad_stops, shadow_params);
+}
+
+// Rect, transparent fill, no stroke, outer shadow (can add spread).
+fragment float4 sdf_shadow_only_fragment_main(
+    VertexOutput in [[stage_in]],
+    constant Uniforms& uniforms        [[buffer(0)]],
+    constant InstanceData* instances   [[buffer(1)]],
+    constant GradientStop* grad_stops  [[buffer(2)]],
+    constant ShadowParam* shadow_params[[buffer(3)]]
+) {
+    return sdf_fragment_impl<false, false, true, true>(in, uniforms, instances, grad_stops, shadow_params);
 }

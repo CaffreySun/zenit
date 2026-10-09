@@ -25,30 +25,33 @@ pub const ClipboardVTable = struct {
     /// not fit; it may have changed since get_text_len. Empty means no text.
     get_text: *const fn (ctx: *anyopaque, buffer: []u8) SdkError![]const u8,
     get_text_len: ?*const fn (ctx: *anyopaque) SdkError!usize = null,
-    /// 探测剪贴板可提供的类型（位掩码：1=text, 2=image, 4=file_urls）。不解码，成本极低。
+    /// Probe clipboard available types (bitmask: 1=text, 2=image, 4=file_urls). No decode, minimal
+    /// cost.
     probe: ?*const fn (ctx: *anyopaque) u32 = null,
-    /// 剪贴板中的图片项数（支持 Finder 多选复制）
+    /// Clipboard image item count (supports Finder multi-select copy)
     image_count: ?*const fn (ctx: *anyopaque) usize = null,
-    /// 读取第 index 项：解码 RGBA + 原始字节。null = 该 index 无图片。
-    /// 所有 slice 用传入 allocator 分配，调用方 ClipboardImage.deinit 释放。
+    /// Read item at index: decode RGBA + raw bytes. null = no image at this index.
+    /// All slices allocated by passed allocator; caller ClipboardImage.deinit frees.
     get_image: ?*const fn (ctx: *anyopaque, alloc: std.mem.Allocator, index: usize) SdkError!?ClipboardImage = null,
-    /// 写入 PNG 编码图片（清空剪贴板原内容）
+    /// Write PNG-encoded image (clear clipboard original content)
     set_image_png: ?*const fn (ctx: *anyopaque, png_bytes: []const u8) SdkError!void = null,
-    /// 富文本写入：plain text + 可选 HTML 作为同一 pasteboard item 的多 representation。
-    /// RTF 不在此接口内（macOS HTML->RTF 转换依赖 WebKit 主线程嵌套 runloop，见 bridge 注释）。
+    /// Rich text write: plain text + optional HTML as multiple representation of one pasteboard
+    /// item.
+    /// RTF not in this interface (macOS HTML->RTF needs WebKit main-thread nested runloop, see
+    /// bridge comment).
     set_rich_text: ?*const fn (ctx: *anyopaque, rich: ClipboardRichText) SdkError!void = null,
-    /// 剪贴板 HTML representation 的字节长度；无 HTML 时返回 0。
+    /// Clipboard HTML representation byte length; no HTML returns 0.
     get_html_len: ?*const fn (ctx: *anyopaque) SdkError!usize = null,
     /// Same full-read/buffer-ownership contract as get_text. Empty means no HTML;
     /// the caller decides whether to fall back to plain text.
     get_html: ?*const fn (ctx: *anyopaque, buffer: []u8) SdkError![]const u8 = null,
 };
 
-/// 富剪贴板载荷。所有 slice 仅在 `set_rich_text` 调用期间 borrowed。
+/// Rich clipboard payload. All slices borrowed only during `set_rich_text` call.
 pub const ClipboardRichText = struct {
-    /// plain text representation（必填，非空 UTF-8）
+    /// plain text representation (required, non-empty UTF-8)
     text: []const u8,
-    /// HTML representation（可选；提供时必须是非空 UTF-8 片段）
+    /// HTML representation (optional; when present must be non-empty UTF-8 fragment)
     html: ?[]const u8 = null,
 
     pub fn validate(self: ClipboardRichText) SdkError!void {
@@ -64,11 +67,11 @@ pub const ClipboardRichText = struct {
 pub const ClipboardImage = struct {
     width: u32,
     height: u32,
-    /// premultiplied RGBA8，长度 = width * height * 4
+    /// Premultiplied RGBA8, length = width * height * 4
     rgba: []const u8,
-    /// 原始编码字节（PNG/JPEG/TIFF…），用于原样归档；null = 来源无原始字节
+    /// Raw encoded bytes (PNG/JPEG/TIFF...) for as-is archival; null = source had no raw bytes
     raw_bytes: ?[]const u8 = null,
-    /// 原始字节的 UTI（如 "public.png"）；file-url 来源为 "file.<ext>"
+    /// UTI of raw bytes (e.g. "public.png"); file-url source is "file.<ext>"
     uti: ?[]const u8 = null,
 
     pub fn deinit(self: *ClipboardImage, alloc: std.mem.Allocator) void {
@@ -111,11 +114,15 @@ pub const ImeVTable = struct {
 pub const CursorVTable = struct {
     set_shape: *const fn (ctx: *anyopaque, window_id: events.WindowId, shape: u8) SdkError!void,
 
-    /// 可选：自定义位图光标（shape 枚举 19 = custom 时走这里，set_shape 永远收不到 19）。
-    /// `rgba` 为预乘 RGBA8（len == width*height*4），调用期借用，后端须在返回前拷贝；
-    /// (hot_x, hot_y) 是左上原点的热点像素坐标；
-    /// `key` 为内容寻址键（调用方保证同位图同键），后端应按键缓存原生光标对象，
-    /// 使高频 set 不重复解码。返回 NotSupported 表示该后端只有固定形状。
+    /// Optional: custom bitmap cursor (shape enum 19 = custom uses this; set_shape never receives
+    /// 19).
+    /// `rgba` is premultiplied RGBA8 (len == width*height*4), borrowed during the call; backend
+    /// must copy
+    /// before returning. (hot_x, hot_y) is the hot-spot pixel coordinate, origin top-left.
+    /// `key` is content-addressed (same bitmap, same key); backend should cache the native cursor
+    /// object by key to avoid repeat decode on high-frequency set. Return NotSupported if the
+    /// backend
+    /// has only fixed shapes.
     set_custom: ?*const fn (
         ctx: *anyopaque,
         window_id: events.WindowId,
@@ -204,10 +211,10 @@ pub const MenuVTable = struct {
     set_model: *const fn (ctx: *anyopaque, model: MenuModel) SdkError!void,
 };
 
-/// `.file_url`: payload 是绝对路径或 file:// / 其他 scheme 的 URL 字符串。
-/// 指向已存在文件时，macOS backend 会写 NSPasteboardTypeFileURL，可直接拖出
-/// 到 Finder（由 Finder 执行复制）。"拖出时才生成文件"（NSFilePromiseProvider）
-/// 尚未支持，见 window_bridge.m TODO(file-promise)。
+/// `.file_url`: payload is absolute path or file:// or other scheme URL string.
+/// When pointing to existing file, macOS backend writes NSPasteboardTypeFileURL, drag out to
+/// Finder directly (Finder does copy). 'Generate file on drag' (NSFilePromiseProvider)
+/// not yet supported, see window_bridge.m TODO(file-promise).
 pub const DragPayloadKind = enum(u8) { text, file_url, internal };
 
 pub const DragOperations = packed struct(u8) {
@@ -233,13 +240,30 @@ pub const DragRequest = struct {
     hotspot_x: f32 = 0,
     hotspot_y: f32 = 0,
 
+    fn windowsAbsolute(path: []const u8) bool {
+        const extended = std.mem.startsWith(u8, path, "\\\\?\\");
+        const rest = if (extended) path[4..] else path;
+        if (rest.len >= 3 and std.ascii.isAlphabetic(rest[0]) and rest[1] == ':' and (rest[2] == '/' or rest[2] == '\\')) return true;
+        const unc = if (extended) blk: {
+            if (rest.len < 4 or !std.ascii.eqlIgnoreCase(rest[0..4], "UNC\\")) return false;
+            break :blk rest[4..];
+        } else blk: {
+            if (!std.mem.startsWith(u8, path, "\\\\")) return false;
+            break :blk path[2..];
+        };
+        const separator = std.mem.indexOfAny(u8, unc, "\\/") orelse return false;
+        return separator > 0 and separator + 1 < unc.len and unc[separator + 1] != '\\' and unc[separator + 1] != '/';
+    }
+
     pub fn validate(self: DragRequest) SdkError!void {
-        if (self.payload.len == 0 or !self.allowed_operations.any()) return SdkError.InvalidState;
+        if (self.payload.len == 0 or !self.allowed_operations.any() or self.allowed_operations._reserved != 0) return SdkError.InvalidState;
         if (!std.unicode.utf8ValidateSlice(self.payload)) return SdkError.InvalidState;
         if (self.payload_kind == .file_url) {
-            // 绝对路径，或带 scheme 的 URL（"xx://"）。相对路径没有稳定的
-            // 解释基准，backend 侧 NSURL fileURLWithPath 会静默相对 cwd，禁止。
-            const is_abs_path = self.payload[0] == '/';
+            // Absolute path or URL with scheme ("xx://"). Relative path has no stable
+            // interpretation base; backend NSURL fileURLWithPath silently relative to cwd,
+            // forbidden.
+            if (std.mem.indexOfScalar(u8, self.payload, 0) != null) return SdkError.InvalidState;
+            const is_abs_path = self.payload[0] == '/' or windowsAbsolute(self.payload);
             const has_scheme = std.mem.indexOf(u8, self.payload, "://") != null;
             if (!is_abs_path and !has_scheme) return SdkError.InvalidState;
         }
@@ -260,7 +284,7 @@ pub const DragTargetVTable = struct {
     set_allowed_operations: *const fn (ctx: *anyopaque, window_id: events.WindowId, operations: DragOperations) SdkError!void,
 };
 
-/// 平台 backend SPI
+/// Platform backend SPI
 pub const BackendVTable = struct {
     name: []const u8,
     deinit: *const fn (ctx: *anyopaque, allocator: Allocator) void,
@@ -268,9 +292,9 @@ pub const BackendVTable = struct {
 
     perform_haptic_feedback: ?*const fn (ctx: *anyopaque, pattern: HapticFeedbackPattern) SdkError!void = null,
     request_redraw: ?*const fn (ctx: *anyopaque) SdkError!void = null,
-    /// 静默同步输入状态（不产生事件）。
-    /// 用于 liveResize 等场景：系统代理了鼠标事件，
-    /// 恢复正常轮询前需要对齐内部按钮追踪状态。
+    /// Silent sync input state (no events generated).
+    /// Used in liveResize etc: system took mouse events;
+    /// before resuming normal polling, align internal button-track state.
     sync_input_state: ?*const fn (ctx: *anyopaque) void = null,
     clipboard: ?ClipboardVTable = null,
     dialog: ?DialogVTable = null,
@@ -283,9 +307,9 @@ pub const BackendVTable = struct {
     /// Borrowed native window handle. Valid only while the window remains
     /// registered; callers must not retain it across unregister/teardown.
     raw_window_handle: ?*const fn (ctx: *anyopaque, window_id: events.WindowId) SdkError!*anyopaque = null,
-    /// 多窗口: 注册窗口到事件系统
+    /// Multiwindow: register window to event system
     register_window: ?*const fn (ctx: *anyopaque, window: *platform.Window, window_id: events.WindowId) SdkError!void = null,
-    /// 多窗口: 从事件系统注销窗口
+    /// Multiwindow: unregister window from event system
     unregister_window: ?*const fn (ctx: *anyopaque, window_id: events.WindowId) void = null,
 };
 
@@ -330,8 +354,17 @@ test "DragRequest file_url requires absolute path or URL with scheme" {
         .payload_kind = .file_url,
         .payload = "relative/path.txt",
     }).validate());
-    // 同样的相对 payload 作为 .text 是合法的（约束只针对 file_url）
+    // Same relative payload valid as .text (constraint is file_url-specific)
     try (DragRequest{ .payload_kind = .text, .payload = "relative/path.txt" }).validate();
+}
+
+test "DragRequest accepts Windows absolute paths and rejects drive-relative and NUL paths" {
+    for ([_][]const u8{ "C:\\Users\\test\\输入-🧪.txt", "D:/folder/file.txt", "\\\\server\\share\\file.txt", "\\\\?\\C:\\long\\file.txt" }) |path|
+        try (DragRequest{ .payload_kind = .file_url, .payload = path }).validate();
+    for ([_][]const u8{ "C:file.txt", "\\rooted.txt", "\\\\server", "\\\\server\\", "1:\\file.txt", "C:\\file\x00.txt" }) |path|
+        try std.testing.expectError(SdkError.InvalidState, (DragRequest{ .payload_kind = .file_url, .payload = path }).validate());
+    try std.testing.expectError(SdkError.InvalidState, (DragRequest{ .payload_kind = .text, .payload = "text", .allowed_operations = .{ .copy = true, ._reserved = 1 } }).validate());
+    try (DragRequest{ .payload_kind = .internal, .payload = "row\x00payload" }).validate();
 }
 
 test "ClipboardRichText validates non-empty UTF-8 text and optional HTML" {

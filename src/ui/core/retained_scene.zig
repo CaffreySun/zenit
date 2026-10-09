@@ -10,10 +10,13 @@ pub const TransformBuildOptions = struct {
 };
 
 pub fn buildNodeLocalTransform(node: *const Node, options: TransformBuildOptions) Transform2D {
-    // NOTE: retained_scene 在 hit-test 路径中也被调，hit_runtime.buildRecursive 依赖 transformRect
-    // 与 node.rect 严格一致（World rect 经 sticky/translate 路径已在 syncScrollbarFrame 之后稍有
-    // delta）。即使 epoch==0 fallback 也不能完全保证此处行为等价。session 27 + session 29 都试过
-    // 并 revert。保持 node.rect 直读。
+    // NOTE: retained_scene also called in hit-test path, hit_runtime.buildRecursive relies on
+    // transformRect
+    // and node.rect strictly matching (World rect post-sticky/translate has small delta after
+    // syncScrollbarFrame).
+    // Even epoch==0 fallback can't fully guarantee behavior equivalence here. session 27 + session
+    // 29 both tried and reverted.
+    // Keep node.rect direct read.
     const origin = node.style.transform_origin().resolve(node.rectFromWorldOrFallback().w, node.rectFromWorldOrFallback().h);
 
     var transform = Transform2D.fromRectWithOrigin(
@@ -39,4 +42,15 @@ pub fn buildNodeLocalTransform(node: *const Node, options: TransformBuildOptions
 
 pub fn buildNodeWorldTransform(node: *const Node, parent_transform: Transform2D, options: TransformBuildOptions) Transform2D {
     return parent_transform.mul(buildNodeLocalTransform(node, options));
+}
+
+/// Owner-thread queries without a retained transform ID use the same local
+/// composition as render traversal, including nonsemantic ancestors.
+pub fn buildAncestorWorldTransform(node: *const Node, options: TransformBuildOptions) Transform2D {
+    var result = Transform2D.identity();
+    var current: ?*const Node = node;
+    while (current) |ancestor| : (current = ancestor.parent) {
+        result = buildNodeLocalTransform(ancestor, options).mul(result);
+    }
+    return result;
 }

@@ -1,8 +1,8 @@
-/// Metal Glyph Atlas - GPU 纹理图集管理 (Multi-Page)
+/// Metal Glyph Atlas - GPU texture atlas management (Multi-Page)
 ///
-/// 管理字形在 GPU 纹理中的存储和缓存
-/// 使用 Shelf Packing 算法分配纹理空间
-/// 支持多页 Atlas + 帧级 GC，彻底消除 resetAtlas 导致的卡顿
+/// Manages glyph storage and caching in GPU textures.
+/// Uses Shelf Packing for texture space allocation.
+/// Multi-page atlas + frame-level GC avoids resetAtlas stalls.
 const std = @import("std");
 const gpu = @import("gpu");
 const text = @import("text");
@@ -10,13 +10,13 @@ const Font = text.Font;
 const GlyphBitmap = text.GlyphBitmap;
 const text_trace = @import("trace").text_flicker;
 
-/// 页的像素格式。灰度页与彩色页共用同一个 pages 数组、同一套 page_index
-/// 编号（因此不存在"串号"问题：一个 page_index 唯一确定一页及其格式），
-/// 但各自独立打包，allocateInPages 只会把彩色字形放进彩色页。
+/// Pixel format per page. Gray and color pages share the same pages array and page_index
+/// numbering (no "collision": one page_index uniquely identifies a page and its format),
+/// but pack independently. allocateInPages only places color glyphs in color pages.
 pub const PageFormat = enum(u8) {
-    /// R8Unorm，1 字节/像素，覆盖率掩码。
+    /// R8Unorm, 1 byte/pixel, coverage mask.
     gray,
-    /// BGRA8Unorm_sRGB，4 字节/像素，premultiplied 彩色（emoji）。
+    /// BGRA8Unorm_sRGB, 4 bytes/pixel, premultiplied color (emoji).
     color,
 
     pub fn bytesPerPixel(self: PageFormat) u32 {
@@ -27,23 +27,22 @@ pub const PageFormat = enum(u8) {
     }
 };
 
-/// 已驱逐但延迟释放的纹理。
+/// Evicted but delayed-release textures.
 ///
-/// 修一个既存 bug：evictPage 此前是**同步**释放，GC 发生在
-/// beginFrame，而本帧之前提交的 command buffer 可能仍在 GPU 上执行并引用
-/// 该纹理，同步释放等于在飞行中抽掉资源。这里改成 epoch 延迟回收：
-/// 摘除时只记录 retire 帧号，等 MAX_FRAMES_IN_FLIGHT 帧后再真正 release。
+/// evictPage must not release synchronously: GC runs at beginFrame, but command buffers submitted
+/// earlier may still be executing on the GPU and hold references. Epoch-based delayed reclaim:
+/// record the retire frame at eviction, release after MAX_FRAMES_IN_FLIGHT frames.
 ///
-/// 为什么不直接用 src/gpu/resource_pool.zig 的 retire()：那个 pool 只管理
-/// 经它 alloc 出来的 handle，而 atlas 的纹理此前由 backend 独立创建，接进去
-/// 要改动 atlas 的所有权模型。这里用同样的 epoch
-/// 语义做了自洽的最小实现，新增的彩色页与既有灰度页走同一条路径。
+/// Why not src/gpu/resource_pool.zig retire(): that pool only manages handles it allocated, while
+/// atlas textures are created independently by the backend; integrating would require changing the
+/// atlas ownership model. This uses the same epoch semantics as a minimal self-contained version;
+/// color pages follow the same path as gray pages.
 const RetiredTexture = struct {
     texture: gpu.Backend.Texture,
     retired_at_frame: u64,
 };
 
-/// 单页 Atlas
+/// Single-page atlas.
 const AtlasPage = struct {
     texture: gpu.Backend.Texture,
     packer: RectPacker,
@@ -51,10 +50,10 @@ const AtlasPage = struct {
     format: PageFormat,
 };
 
-/// Glyph Atlas 管理 GPU 纹理图集 (Multi-Page)
-/// 模块级累计：因 atlas 页分配失败而被**静默跳过**的字形数。
-/// 恒为 0 是健康态。> 0 = 屏幕上出现过逐字丢字（未缓存字形不画、位置留白），
-/// 典型诱因是显存/内存压力下纹理创建失败。见 allocateInPages 的注释。
+/// Glyph Atlas manages GPU texture atlas (Multi-Page).
+/// Module-level accumulation: glyphs **silently skipped** due to atlas page allocation failure.
+/// 0 is healthy. > 0 = character-by-character loss on screen (unfilled positions), typical cause
+/// is memory/VRAM pressure on texture creation. See allocateInPages comment.
 pub var glyphs_dropped_total: u64 = 0;
 
 pub const GlyphAtlas = struct {
@@ -65,42 +64,43 @@ pub const GlyphAtlas = struct {
     pages: [MAX_PAGES]?AtlasPage,
     page_count: u32,
     current_frame: u64,
-    /// 本帧已执行的“缓存未命中并实际光栅化”次数
+    /// This frame's count of "cache miss AND actual rasterization".
     frame_insert_count: u32,
     cache: std.AutoHashMap(GlyphKey, AtlasRegion),
-    /// GC 回收页面后递增，通知渲染缓存失效（防止缓存命令引用已释放的纹理页）
+    /// Incremented after GC drains pages, signals render cache invalidation
+    /// (prevent cached commands from referencing released texture pages).
     gc_generation: u32 = 0,
-    /// 上次执行周期 GC 的帧号（见 maybeCollect）。
+    /// Frame number of last GC cycle execution (see maybeCollect).
     last_gc_frame: u64 = 0,
-    /// 已从页表摘除、但可能仍被在飞的 command buffer 引用的纹理。
-    /// 见 RetiredTexture / drainRetired。
-    retired: [MAX_RETIRED]?RetiredTexture = [_]?RetiredTexture{null} ** MAX_RETIRED,
+    /// Textures removed from page table but potentially still referenced by in-flight command
+    /// buffers.
+    /// See RetiredTexture / drainRetired.
+    retired: [MAX_RETIRED]?RetiredTexture = @as([MAX_RETIRED]?RetiredTexture, @splat(null)),
 
     pub const ATLAS_SIZE: u32 = 4096;
     pub const MAX_PAGES: u32 = 32;
-    /// 页面闲置多少帧后可被回收（~30 秒 @60fps）。
+    /// Pages idle for this many frames before becoming collectable (~30 sec at 60fps).
     pub const EVICT_THRESHOLD: u64 = 1800;
-    /// 每页字节数：4096×4096 R8 = 16 MiB。
+    /// Bytes per page: 4096x4096 R8 = 16 MiB.
     pub const PAGE_BYTES: u64 = @as(u64, ATLAS_SIZE) * @as(u64, ATLAS_SIZE);
-    /// 字节预算。超出即触发 age-based GC。
+    /// Byte budget. Exceeding triggers age-based GC.
     ///
-    /// 此前**没有**任何预算：MAX_PAGES=32 × 16 MiB = **512 MiB** 才开始驱逐，
-    /// 而 EVICT_THRESHOLD 虽已声明却从未被使用（审查报告 P1：
-    /// "声明的 eviction threshold 没有真正接入周期 GC"）。
-    /// 128 MiB = 8 页，对正常 UI 绰绰有余（实测 storybook 全组件 1 页）。
+    /// Without a budget, MAX_PAGES=32 * 16 MiB = **512 MiB** could accumulate before eviction
+    /// started. EVICT_THRESHOLD alone is not wired to periodic GC.
+    /// 128 MiB = 8 pages, plenty for normal UI (full storybook components fit in 1 page).
     pub const BYTE_BUDGET: u64 = 128 * 1024 * 1024;
-    /// GC 检查周期（帧）。避免每帧扫描页表。
+    /// GC check interval (frames). Avoid scanning page table every frame.
     pub const GC_INTERVAL_FRAMES: u64 = 120;
-    /// 与渲染器的三重缓冲一致：retire 后至少隔这么多帧才真正 release，
-    /// 保证在飞的 command buffer 不会引用已释放的纹理。
+    /// Matches renderer triple-buffer: at least this many frames after retire before truly release,
+    /// ensures in-flight command buffers don't reference freed textures.
     pub const MAX_FRAMES_IN_FLIGHT: u64 = 3;
-    /// retire 队列容量。一次 GC 最多摘 MAX_PAGES 页，留同等余量。
+    /// Retire queue capacity. GC evicts at most MAX_PAGES per cycle, reserve same capacity.
     pub const MAX_RETIRED: u32 = MAX_PAGES;
     const ATLAS_LOG_ENABLED = false;
 
-    /// 初始化 GlyphAtlas
+    /// Initialize GlyphAtlas.
     pub fn init(allocator: std.mem.Allocator, device: *gpu.Backend.Device) !GlyphAtlas {
-        // 创建采样器，Linear 在缩放时更平滑，减少笔画粗细抖动
+        // Create sampler, Linear smooths scaling, reduces stroke weight jitter.
         var sampler_linear = device.createSampler(allocator, .{
             .label = "Zenit.Text.GlyphAtlas.Linear",
             .min_filter = .linear,
@@ -109,7 +109,7 @@ pub const GlyphAtlas = struct {
             .address_mode_v = .clamp_to_border,
         }) catch return error.SamplerCreationFailed;
 
-        // 创建采样器，Nearest 保持 1:1 时的锐利度
+        // Create sampler, Nearest preserves sharpness at 1:1 scale.
         const sampler_nearest = device.createSampler(allocator, .{
             .label = "Zenit.Text.GlyphAtlas.Nearest",
             .min_filter = .nearest,
@@ -126,14 +126,15 @@ pub const GlyphAtlas = struct {
             .device = device,
             .sampler_nearest = sampler_nearest,
             .sampler_linear = sampler_linear,
-            .pages = [_]?AtlasPage{null} ** MAX_PAGES,
+            .pages = @as([MAX_PAGES]?AtlasPage, @splat(null)),
             .page_count = 0,
             .current_frame = 0,
             .frame_insert_count = 0,
             .cache = std.AutoHashMap(GlyphKey, AtlasRegion).init(allocator),
         };
+        errdefer self.deinit();
 
-        // 创建第一页（灰度，绝大多数文本走这条路；彩色页按需惰性创建）
+        // Create first page (grayscale, most text uses this; color pages created lazily on-demand).
         try self.addNewPage(.gray);
 
         if (ATLAS_LOG_ENABLED) {
@@ -143,7 +144,7 @@ pub const GlyphAtlas = struct {
         return self;
     }
 
-    /// 销毁
+    /// Destroy.
     pub fn deinit(self: *GlyphAtlas) void {
         self.cache.deinit();
         if (self.sampler_nearest) |*sampler| sampler.destroy();
@@ -151,8 +152,9 @@ pub const GlyphAtlas = struct {
         for (self.pages[0..self.page_count]) |*maybe_page| {
             if (maybe_page.*) |*page| page.texture.destroy();
         }
-        // 关窗路径：此时不再有新的 command buffer，retire 队列必须无条件排空，
-        // 否则未过安全期的纹理会随 atlas 一起泄漏。
+        // Window-close path: no new command buffers issued after this. Retire queue must drain
+        // fully,
+        // otherwise textures not yet in safe period leak with atlas.
         for (&self.retired) |*slot| {
             if (slot.*) |*entry| {
                 entry.texture.destroy();
@@ -164,12 +166,14 @@ pub const GlyphAtlas = struct {
         }
     }
 
-    /// 新增一页 Atlas
-    /// 不做全量清零（避免 16MB memset 开销），靠 RectPacker 的 padding 保证安全
+    /// Add new atlas page. No full zero-fill (avoid 16MB memset cost), RectPacker padding ensures
+    /// safety.
     fn addNewPage(self: *GlyphAtlas, format: PageFormat) !void {
-        // 已达上限 -> 回收最老页腾出空间（子像素降维后此分支极少触发）。
-        // 驱逐失败（所有页本帧都在用）必须报错：继续写 pages[page_count]
-        // 会越界，且驱逐 in-flight 页在 retire 队列满时是 use-after-free。
+        // Hit page limit -> evict oldest to make room (subpixel-reduced this branch rarely
+        // triggers).
+        // Eviction failure (all pages used this frame) must error: continuing to write
+        // pages[page_count]
+        // overflows, and evicting in-flight page with full retire queue is use-after-free.
         if (self.page_count >= MAX_PAGES) {
             if (!self.forceEvictOldestPage()) return error.AtlasFull;
         }
@@ -182,20 +186,22 @@ pub const GlyphAtlas = struct {
             .size = .{ .width = ATLAS_SIZE, .height = ATLAS_SIZE },
             .format = switch (format) {
                 .gray => .r8_unorm,
-                // _sRGB：CoreGraphics 写进来的 emoji 像素是 sRGB 编码值，而
-                // layer 是 BGRA8Unorm_sRGB（输出时再做 linear->sRGB 编码）。
-                // 用无 _sRGB 的格式采样 = 不解码就当 linear 用，等于编码两次，
-                // 中间调被抬亮，表现为 emoji 掉色/发白（纯色块几乎看不出，
-                // 中间调最明显）。灰度页是覆盖率不是颜色，必须保持 R8Unorm。
-                .color => .bgra8_unorm_srgb,
+                // _sRGB: CoreGraphics writes emoji pixels as sRGB-encoded values to layer
+                // BGRA8Unorm_sRGB
+                // (sRGB decode on output). Sample without _sRGB = treat encoded value as linear,
+                // double-encode,
+                // lifts midtones (emoji looks desaturated/blown-out; pure blocks barely visible,
+                // midtones worst).
+                // Grayscale page is coverage not color, must stay R8Unorm.
+                .color => gpu.color_format,
             },
             .usage = .{ .texture_binding = true, .copy_dst = true },
             .memory = .host_upload,
         }) catch return error.TextureCreationFailed;
 
-        // 注意：不做全量清零。Metal Shared 存储模式下新纹理内容是未定义的，
-        // 但 RectPacker 的 2px padding 保证了 glyph 之间不会采样到邻居。
-        // 对于 Linear 采样在纹理边缘的情况，ClampToZero 采样模式兜底。
+        // Note: no full zero-fill. Under Metal Shared storage, new texture content is undefined,
+        // but RectPacker's 2px padding ensures glyphs don't sample each other. For Linear sampling
+        // at texture edges, ClampToZero mode provides fallback.
 
         const page_idx = self.page_count;
         self.pages[page_idx] = AtlasPage{
@@ -211,9 +217,9 @@ pub const GlyphAtlas = struct {
         }
     }
 
-    /// 当前占用字节数（诊断 / 预算判定）。
-    /// 彩色页是 BGRA8，每像素 4 字节，必须按页格式加权，否则 GC 预算
-    /// 会把 64 MiB 的彩色页当成 16 MiB 记账，形成 4× 的隐形超支。
+    /// Current byte usage (diagnostics/budget check). Color pages are BGRA8, 4 bytes/pixel,
+    /// must weight by format; otherwise GC budget treats 64 MiB color page as 16 MiB,
+    /// creating 4x hidden overspend.
     pub fn bytesUsed(self: *const GlyphAtlas) u64 {
         var total: u64 = 0;
         for (self.pages[0..self.page_count]) |maybe_page| {
@@ -223,17 +229,13 @@ pub const GlyphAtlas = struct {
         return total;
     }
 
-    /// 周期性 age-based GC，由 beginFrame 驱动。
+    /// Periodic age-based GC driven by beginFrame.
     ///
-    /// 触发条件：距上次检查满 GC_INTERVAL_FRAMES **且**已超字节预算。
-    /// 回收对象：`last_used_frame` 距今超过 EVICT_THRESHOLD 的页。
-    /// 永远保留至少 1 页（避免刚回收就重建的抖动）。
-    ///
-    /// 这补上了此前完全缺失的一环：EVICT_THRESHOLD 声明了但没有任何调用者，
-    /// 实际只有 page_count 撞到 MAX_PAGES(=512 MiB) 才会驱逐。
+    /// Trigger: GC_INTERVAL_FRAMES elapsed **and** budget exceeded. Target: pages with
+    /// last_used_frame > EVICT_THRESHOLD frames ago. Always keep >= 1 page (avoid thrash).
     pub fn maybeCollect(self: *GlyphAtlas) void {
-        // 先排空已过安全期的 retire 纹理，必须在下面的 early return 之前，
-        // 否则不触发 GC 的帧永远不会真正释放上一轮驱逐的纹理（那就是泄漏）。
+        // Drain retired textures past safe window first. Must run before early return below,
+        // else frames without GC never actually release previous cycle's evicted textures (leak).
         self.drainRetired();
 
         if (self.current_frame < self.last_gc_frame + GC_INTERVAL_FRAMES) return;
@@ -252,11 +254,11 @@ pub const GlyphAtlas = struct {
         }
     }
 
-    /// 强制回收最老的页（page_count 达上限时调用）。
-    /// 只考虑**本帧未使用**的页：last_used_frame == current_frame 的页可能
-    /// 正被本帧已编码的 draw 引用，retire 队列有 in-flight 安全期兜底，但
-    /// 队列满退化为同步释放时就是 use-after-free。全部页都在本帧用过 ->
-    /// 返回 false，caller 放弃加页（跳过 glyph，比崩溃/花屏安全）。
+    /// Force evict oldest page (called when page_count hits limit). Only consider pages
+    /// **not used this frame**: last_used_frame == current_frame may be referenced by this
+    /// frame's encoded draws. Retire queue has in-flight safety, but a full queue degrades to
+    /// sync release = use-after-free. All pages used this frame -> return false, caller skips
+    /// glyph (safer than crash/corruption).
     fn forceEvictOldestPage(self: *GlyphAtlas) bool {
         var oldest_idx: ?u32 = null;
         var oldest_frame: u64 = std.math.maxInt(u64);
@@ -300,8 +302,8 @@ pub const GlyphAtlas = struct {
         return true;
     }
 
-    /// 把纹理推入延迟释放队列。队列满时（极端情况）退化为同步释放,
-    /// 那仍然不比修复前更糟，且有日志可查。
+    /// Enqueue texture for delayed release. Queue full (edge case) degrades to sync free,
+    /// still not worse than pre-fix, and logged.
     fn retireTexture(self: *GlyphAtlas, texture: gpu.Backend.Texture) void {
         var oldest_idx: usize = 0;
         var oldest_frame: u64 = std.math.maxInt(u64);
@@ -315,15 +317,15 @@ pub const GlyphAtlas = struct {
                 oldest_idx = i;
             }
         }
-        // 队列满：同步释放**最老**的 retire 条目给新纹理腾位，它离安全期
-        // 最近；同步释放刚驱逐的新纹理（几乎必然仍 in-flight）风险最大。
+        // Queue full: sync-free the **oldest** retire entry to make room (closest to safe window).
+        // Sync-freeing newly evicted texture (almost certainly still in-flight) is riskiest.
         std.log.warn("[GlyphAtlas] retire queue full, releasing oldest retired texture synchronously", .{});
         var victim = self.retired[oldest_idx].?;
         victim.texture.destroy();
         self.retired[oldest_idx] = .{ .texture = texture, .retired_at_frame = self.current_frame };
     }
 
-    /// 释放已过安全期的 retire 纹理。由 maybeCollect（即每帧 beginFrame）驱动。
+    /// Release retired textures past safe window. Driven by maybeCollect (each beginFrame).
     fn drainRetired(self: *GlyphAtlas) void {
         for (&self.retired) |*slot| {
             const entry = if (slot.*) |*value| value else continue;
@@ -333,31 +335,29 @@ pub const GlyphAtlas = struct {
         }
     }
 
-    /// 回收指定页
+    /// Evict specified page.
     fn evictPage(self: *GlyphAtlas, page_idx: u32) void {
         const page = self.pages[page_idx] orelse return;
 
-        // 从 cache 中删除所有指向该页的条目（动态数组，一次收集完）
-        var keys_to_remove = std.ArrayList(GlyphKey){};
-        defer keys_to_remove.deinit(self.allocator);
+        // Eviction must not allocate: it often runs under memory pressure, and
+        // every victim UV must disappear before another page takes this index.
+        // HashMap deletion only tombstones; remaining iterator entries stay put.
         var iter = self.cache.iterator();
         while (iter.next()) |entry| {
             if (entry.value_ptr.page_index == @as(u8, @intCast(page_idx))) {
-                keys_to_remove.append(self.allocator, entry.key_ptr.*) catch break;
+                self.cache.removeByPtr(entry.key_ptr);
             }
         }
-        for (keys_to_remove.items) |key| {
-            _ = self.cache.remove(key);
-        }
 
-        // 延迟释放纹理（不能同步 release，在飞的 command buffer 可能仍引用它）
+        // Enqueue texture for delayed release (can't sync release; in-flight command buffer may
+        // reference it).
         self.retireTexture(page.texture);
 
-        // 将最后一页 swap 到此位置（compact 数组）
+        // Swap last page to this position (compact array).
         const last_idx = self.page_count - 1;
         if (page_idx != last_idx) {
             self.pages[page_idx] = self.pages[last_idx];
-            // 更新 cache 中被 swap 页的 page_index
+            // Update page_index in cache for the swapped page.
             var cache_iter = self.cache.iterator();
             while (cache_iter.next()) |entry| {
                 if (entry.value_ptr.page_index == @as(u8, @intCast(last_idx))) {
@@ -373,10 +373,10 @@ pub const GlyphAtlas = struct {
         }
     }
 
-    /// 在当前页或新页中分配空间
+    /// Allocate space in current or new page.
     fn allocateInPages(self: *GlyphAtlas, w: u32, h: u32, format: PageFormat) ?struct { rect: RectPacker.Rect, page_idx: u8 } {
-        // 从后往前找**同格式**的最热页。灰度与彩色页混在同一个数组里，
-        // 只看最后一页会在两种格式交替出现时反复新建页。
+        // Search back for hottest page of **same format**. Gray and color pages mix in one array;
+        // checking last page only causes repeated new-page creation when formats alternate.
         var probe = self.page_count;
         while (probe > 0) {
             probe -= 1;
@@ -386,21 +386,24 @@ pub const GlyphAtlas = struct {
                     page.last_used_frame = self.current_frame;
                     return .{ .rect = rect, .page_idx = @intCast(probe) };
                 } else |_| {
-                    // 这页满了，同格式只保留最热一页作为分配目标，
-                    // 满了就直接新建，不再回溯更老的页（与原行为一致）。
+                    // This page full; keep only hottest same-format page as allocation target. Full
+                    // ->
+                    // create new directly, don't backtrack to older pages (matches old behavior).
                     break;
                 }
             }
         }
 
-        // 无可用同格式页 -> 新增一页
+        // No available same-format page -> create new.
         self.addNewPage(format) catch {
-            // 纹理创建失败（典型：显存/内存压力）-> 返回 null，调用方跳过此 glyph。
+            // Texture creation failed (typical: VRAM/memory pressure) -> return null, caller skips
+            // glyph.
             //
-            // ⚠️ 这条路径的用户可见后果是**逐字丢字**：未缓存的字形（CJK 长尾）
-            // 该帧直接不画、位置留白，压力缓解后自愈 -> 表现为闪烁。ASCII 因为
-            // 早已驻留第 0 页而不受影响。此前这里完全静默，线上发生过疑似此症状
-            // 却无从取证，必须留下日志（限频，压力期可能每帧成百上千次）。
+            // User-visible result: **character-by-character loss** (uncached glyphs not drawn,
+            // blanks remain),
+            // self-heals when pressure eases -> appears as flicker. ASCII unaffected (resident in
+            // page 0).
+            // Must log (rate-limited; pressure periods may trigger hundreds per frame).
             glyphs_dropped_total += 1;
             if (glyphs_dropped_total == 1 or glyphs_dropped_total % 256 == 0) {
                 std.log.warn("[GlyphAtlas] atlas page alloc failed; dropping glyphs (total dropped: {d}, pages: {d})", .{ glyphs_dropped_total, self.page_count });
@@ -418,7 +421,7 @@ pub const GlyphAtlas = struct {
         return null;
     }
 
-    /// 获取或插入字形到图集
+    /// Get or insert glyph into atlas.
     pub fn getOrInsert(
         self: *GlyphAtlas,
         font: *Font,
@@ -427,12 +430,12 @@ pub const GlyphAtlas = struct {
         const key = GlyphKey{
             .font_ptr = @intFromPtr(font),
             .glyph_index = glyph_index,
-            .scale_q = quantizeScale(font.scale_factor),
+            .scale_q = rasterKey(font),
         };
 
-        // 检查缓存
+        // Check cache.
         if (self.cache.get(key)) |region| {
-            // 更新页的 last_used_frame
+            // Update page's last_used_frame.
             if (region.page_index < self.page_count) {
                 if (self.pages[region.page_index]) |*page| {
                     page.last_used_frame = self.current_frame;
@@ -443,11 +446,11 @@ pub const GlyphAtlas = struct {
 
         self.frame_insert_count += 1;
 
-        // 缓存未命中: 光栅化并上传
+        // Cache miss: rasterize and upload.
         const bitmap = try font.rasterizeGlyph(glyph_index);
         defer bitmap.deinit(self.allocator);
 
-        // 空字形 (如空格)
+        // Empty glyph (e.g., space).
         if (bitmap.width == 0 or bitmap.height == 0) {
             const region = AtlasRegion{
                 .uv_min = .{ 0, 0 },
@@ -465,7 +468,7 @@ pub const GlyphAtlas = struct {
 
         const page_format: PageFormat = if (bitmap.is_color) .color else .gray;
 
-        // 分配空间（多页），null 表示无法分配（极端情况）-> 返回空 region
+        // Allocate space (multi-page), null = can't allocate (edge case) -> return empty region.
         const alloc_result = self.allocateInPages(bitmap.width, bitmap.height, page_format) orelse {
             text_trace.log(
                 self.current_frame,
@@ -491,10 +494,10 @@ pub const GlyphAtlas = struct {
             return empty;
         };
 
-        // 上传到 GPU
+        // Upload to GPU.
         try self.uploadToTexture(alloc_result.page_idx, bitmap, alloc_result.rect);
 
-        // 计算 UV 坐标
+        // Calculate UV coordinates.
         const region = AtlasRegion{
             .uv_min = .{
                 @as(f32, @floatFromInt(alloc_result.rect.x)) / @as(f32, @floatFromInt(ATLAS_SIZE)),
@@ -517,31 +520,31 @@ pub const GlyphAtlas = struct {
         return region;
     }
 
-    /// R6: 获取或插入字形（带子像素偏移）
+    /// R6: Get or insert glyph (with subpixel offset).
     pub fn getOrInsertSubpixel(
         self: *GlyphAtlas,
         font: *Font,
         glyph_index: u32,
         subpixel_bin_packed: u8,
     ) !AtlasRegion {
-        // **先查缓存，再问 hasColorGlyphs。**
+        // **Check cache first, then hasColorGlyphs.**
         //
-        // hasColorGlyphs 每次调用都进 CoreText（CTFontGetSymbolicTraits +
-        // 最多 3 次 CTFontCopyTable，非彩色字体必然 fall through 把三张表
-        // 都查一遍），而这个函数在滚动时每 glyph 每帧都会被 emit 路径调用。
-        // 放在缓存查找之前，等于给全部命中帧白付一次 CoreText 查表；采样里
-        // CTFontCopyTable 直接出现在 emitGlyphInstance 的热路径上。
-        // 非彩色字体命中后完全不触 CoreText；彩色字体（emoji，量极小）的
-        // 条目存在 bin=0 键下，这里必然 miss、照旧走下面的降级分支。
+        // hasColorGlyphs calls CoreText each time (CTFontGetSymbolicTraits + up to 3
+        // CTFontCopyTable calls; non-color fonts scan all three). This function is called per glyph
+        // per frame during scroll via the emit path, so calling it before the cache lookup wastes a
+        // CoreText table lookup on every hit. Non-color fonts hit the cache and never touch
+        // CoreText.
+        // Color fonts (emoji, few) are cached under the bin=0 key, so they always miss here and
+        // fall through.
         const key = GlyphKey{
             .font_ptr = @intFromPtr(font),
             .glyph_index = glyph_index,
             .subpixel_bin = subpixel_bin_packed,
-            .scale_q = quantizeScale(font.scale_factor),
+            .scale_q = rasterKey(font),
         };
 
         if (self.cache.get(key)) |region| {
-            // 更新页的 last_used_frame
+            // Update page's last_used_frame.
             if (region.page_index < self.page_count) {
                 if (self.pages[region.page_index]) |*page| {
                     page.last_used_frame = self.current_frame;
@@ -550,17 +553,16 @@ pub const GlyphAtlas = struct {
             return region;
         }
 
-        // 子像素分箱对彩色字形没有意义：emoji 是位图/分层矢量，没有需要靠
-        // 亚像素相位改善的细笔画，分箱只会把同一个 emoji 复制 4 份进 4×
-        // 内存的 BGRA 页。直接降级到无偏移路径（bin=0），与 getOrInsert 共用
-        // 同一份缓存条目。
+        // Subpixel binning meaningless for color glyphs: emoji are bitmaps/layered vectors,
+        // no fine strokes needing subpixel phase. Binning just copies one emoji 4x into 4x-VRAM
+        // BGRA page. Downgrade to un-offset path (bin=0), share cache entry with getOrInsert.
         if (font.hasColorGlyphs()) {
             return self.getOrInsert(font, glyph_index);
         }
 
         self.frame_insert_count += 1;
 
-        // 从 packed bin 提取 x/y 偏移
+        // Extract x/y offset from packed bin.
         const x_bin: u4 = @intCast(subpixel_bin_packed >> 4);
         const y_bin: u4 = @intCast(subpixel_bin_packed & 0x0F);
         const offset_x = subpixelOffset(x_bin);
@@ -586,7 +588,7 @@ pub const GlyphAtlas = struct {
 
         const page_format: PageFormat = if (bitmap.is_color) .color else .gray;
 
-        // 分配空间（多页），null -> 返回空 region
+        // Allocate space (multi-page), null -> return empty region.
         const alloc_result = self.allocateInPages(bitmap.width, bitmap.height, page_format) orelse {
             text_trace.log(
                 self.current_frame,
@@ -634,20 +636,20 @@ pub const GlyphAtlas = struct {
         return region;
     }
 
-    /// 上传位图数据到指定页的纹理。
+    /// Upload bitmap data to texture in specified page.
     ///
-    /// ⚠ 失败必须往上传，**不能吞**：页纹理是刻意不清零的（见 ensurePage
-    /// 的注释「新纹理内容是未定义的」），而调用方在上传之后会把 region 连同
-    /// 真实 UV 写进 cache（键含 font_ptr/glyph/scale，命中即短路，永不重传）。
-    /// 一旦上传失败还照常缓存，那个字形就会**每帧采样未定义的 GPU 内存**，
-    /// 表现为永久花字，且没有任何日志，是典型的「吞掉真错误导致 UI 静默
-    /// 损坏」。writeRegion 的失败是真实可达的：bitmap 尺寸字段与像素缓冲长度
-    /// 不一致时返回 error.InvalidTextureData（gpu/metal/resources.zig）。
+    /// WARN: failures must propagate, **never suppress**. Page texture intentionally not
+    /// zero-filled (see ensurePage comment), and caller writes region with real UV to cache
+    /// (key contains font_ptr/glyph/scale; hit short-circuits, never retransmit). Failed upload
+    /// still cached = glyph samples **undefined GPU memory every frame** = permanent garbled
+    /// text, zero logs. writeRegion failure is real: bitmap size fields mismatching pixel
+    /// buffer length returns error.InvalidTextureData (gpu/metal/resources.zig).
     fn uploadToTexture(self: *GlyphAtlas, page_idx: u8, bitmap: GlyphBitmap, rect: RectPacker.Rect) !void {
         if (page_idx < self.page_count) {
             if (self.pages[page_idx]) |*page| {
-                // BGRA 页每像素 4 字节，bytes_per_row 用 width 会让 Metal
-                // 按 1/4 行宽读取，画面变成斜切的乱码。
+                // BGRA page 4 bytes/pixel; bytes_per_row using width makes Metal read 1/4 line
+                // width,
+                // image becomes slanted garbage.
                 try page.texture.writeRegion(
                     0,
                     rect.x,
@@ -661,17 +663,15 @@ pub const GlyphAtlas = struct {
         }
     }
 
-    /// 获取缓存大小
-    /// 摘除某个 Font 指针名下的全部缓存条目。
+    /// Remove all cache entries under a Font pointer.
     ///
-    /// GlyphKey 以 `font_ptr`（Font 的堆地址）为身份。Font 被销毁后，
-    /// c_allocator / smp_allocator 会立刻把同一地址分给下一个 Font，若旧
-    /// 条目还在，新字体会以相同键命中旧字体的位图，画出**别的字体的字形**。
-    /// 所以任何在 atlas 仍存活时销毁 Font 的路径（典型：fallback wrapper 驱逐）
-    /// 都必须先调这里。只删 cache 条目，不动页：页内空间由 age-based GC 回收，
-    /// 在飞 command buffer 仍可安全采样旧 region。
+    /// GlyphKey uses `font_ptr` (Font heap address) as identity. After a Font is destroyed, the
+    /// allocator may reuse the address for the next Font; stale entries then make the new font hit
+    /// the old font's bitmap = **different font's glyphs**. Any path destroying a Font while the
+    /// atlas is alive (typical: fallback wrapper eviction) must call this first. Only deletes cache
+    /// entries, leaves pages (space reclaimed by age-based GC, in-flight buffers safe to sample).
     ///
-    /// 迭代中 removeByPtr 是安全的：std.HashMap 删除只打 tombstone、不搬移条目。
+    /// Safe to removeByPtr during iteration: HashMap deletion only tombstones, never relocates.
     pub fn forgetFont(self: *GlyphAtlas, font_ptr: usize) void {
         var iter = self.cache.iterator();
         while (iter.next()) |entry| {
@@ -683,7 +683,7 @@ pub const GlyphAtlas = struct {
         return self.cache.count();
     }
 
-    /// 获取指定页的纹理
+    /// Get texture for specified page.
     pub fn getPageTexture(self: *GlyphAtlas, page_idx: u8) ?gpu.Backend.TextureBinding {
         if (page_idx < self.page_count) {
             if (self.pages[page_idx]) |page| {
@@ -693,7 +693,8 @@ pub const GlyphAtlas = struct {
         return null;
     }
 
-    /// 获取指定页的像素格式（渲染侧据此决定绑到灰度还是彩色纹理槽）
+    /// Get pixel format of specified page (render uses this to choose grayscale or color texture
+    /// slot).
     pub fn getPageFormat(self: *GlyphAtlas, page_idx: u8) ?PageFormat {
         if (page_idx < self.page_count) {
             if (self.pages[page_idx]) |page| return page.format;
@@ -701,12 +702,12 @@ pub const GlyphAtlas = struct {
         return null;
     }
 
-    /// 获取页数
+    /// Get page count.
     pub fn getPageCount(self: *GlyphAtlas) u32 {
         return self.page_count;
     }
 
-    /// 获取采样器
+    /// Get sampler.
     pub fn getSamplerNearest(self: *GlyphAtlas) ?*gpu.Backend.Sampler {
         return if (self.sampler_nearest) |*sampler| sampler else null;
     }
@@ -716,7 +717,7 @@ pub const GlyphAtlas = struct {
     }
 };
 
-/// 字形在图集中的位置和度量信息
+/// Glyph position and metric data in atlas.
 pub const AtlasRegion = struct {
     uv_min: [2]f32,
     uv_max: [2]f32,
@@ -726,66 +727,75 @@ pub const AtlasRegion = struct {
     width: u32,
     height: u32,
     page_index: u8,
-    /// true = 该 region 位于 BGRA8 彩色页，shader 必须直接输出采样到的 RGBA，
-    /// 不能乘文字颜色（emoji 自带颜色）。
+    /// true = region on BGRA8 color page, shader must output sampled RGBA directly,
+    /// can't multiply by text color (emoji self-colored).
     is_color: bool = false,
 };
 
-/// 字形缓存键
+/// Glyph cache key.
 const GlyphKey = struct {
     font_ptr: usize,
     glyph_index: u32,
-    /// R6: 子像素 bin (高 4 位 = x bin, 低 4 位 = y bin, 各 0-3)
-    /// 0 = 无子像素偏移 (兼容旧 API)
+    /// R6: Subpixel bin (high 4 bits = x bin, low 4 bits = y bin, each 0-3).
+    /// 0 = no subpixel offset (backward compatible).
     subpixel_bin: u8 = 0,
-    /// HiDPI：量化后的 `Font.scale_factor`（见 quantizeScale）。
+    /// HiDPI: quantized `Font.scale_factor` (see quantizeScale).
     ///
-    /// 必须入键。`Font.scale_factor` 是**就地可变**字段，`setScaleFactor`
-    /// 不改变 Font 指针，所以若键里没有 scale，把窗口从 Retina 拖到非
-    /// Retina（或反之）后，同一 font_ptr 的已缓存字形会以完全相同的 key
-    /// 命中，永远不会按新 scale 重新光栅化：
-    ///   1x -> 2x：复用半分辨率位图 = 糊；
-    ///   2x -> 1x：复用双倍分辨率位图 = 尺寸/bearing 错位（bearing 在
-    ///            text_renderer 里按**当前** scale_factor 回除）。
+    /// Must be in key. `Font.scale_factor` is **in-place mutable**; setScaleFactor doesn't
+    /// change the Font pointer. Without scale in key, dragging a window Retina <-> non-Retina
+    /// hits cached glyphs with an identical key and never rasterizes at the new scale:
+    ///   1x -> 2x: reuse half-resolution bitmap = blurry.
+    ///   2x -> 1x: reuse double-resolution bitmap = size/bearing misaligned (bearing
+    ///             back-divided by **current** scale_factor in text_renderer).
     scale_q: u32 = quantizeScale(1.0),
 };
 
-/// 把 f32 scale 量化成可安全用作 AutoHashMap 键的整数（1/100 精度）。
+/// Quantize f32 scale to integer safe for AutoHashMap key (1/100 precision).
 ///
-/// 为什么量化而不是直接放 f32：AutoHashMap 对键做逐位（bitwise）哈希与
-/// 相等比较，浮点的 -0.0/+0.0、NaN、以及同一逻辑 scale 经不同浮点运算
-/// 路径得到的最后一位差异，都会产生"逻辑相同但键不等"的幽灵条目,
-/// 那是缓存永久 miss + 图集无限增长，比原 bug 更糟。
+/// Why quantize vs raw f32: HashMap does bitwise hash and equality. Float -0.0/+0.0, NaN,
+/// and the same logical scale via different float paths differing in the last bit give
+/// "logically same, key different" phantom entries = permanent cache miss + unbounded atlas.
 ///
-/// 为什么是 1/100 精度而不是固定档位（如只认 1x/2x）：macOS
-/// `backingScaleFactor` 实践中虽多为 1.0/2.0，但缩放分辨率模式与外接屏
-/// 可以给出其它值；固定档位会把不同的真实 scale 静默折叠到同一档，等于
-/// 把本 bug 换个形式保留。1/100 对所有现实取值都无损，而远粗于浮点噪声。
+/// Why 1/100 vs fixed tiers (1x/2x only): macOS `backingScaleFactor` is usually 1.0/2.0,
+/// but scaled-resolution modes and external displays give others. Fixed tiers silently
+/// collapse different real scales to one, bringing back the bug. 1/100 is lossless on all
+/// real values and much coarser than float noise.
 pub fn quantizeScale(scale: f32) u32 {
     const clamped = @max(0.01, @min(scale, 64.0));
     return @intFromFloat(@round(clamped * 100.0));
 }
 
-/// R6: 子像素 bin 数量 (每轴 4 个 = 16 个变体)
+/// A font's raster key: its quantized scale, plus the top bit when it rasterizes without font
+/// smoothing (the same glyph at the same scale is a different bitmap; Font.smooth_fonts). A
+/// backend whose rasterizer has no smoothing to turn off (`honors_smoothing = false`) keys both
+/// alike, so the flag does not store the same bitmap twice.
+pub fn rasterKey(font: anytype) u32 {
+    const F = @TypeOf(font.*);
+    const honored = @hasField(F, "smooth_fonts") and (!@hasDecl(F, "honors_smoothing") or F.honors_smoothing);
+    const smooth: bool = if (honored) font.smooth_fonts else true;
+    return quantizeScale(font.scale_factor) | (if (smooth) @as(u32, 0) else @as(u32, 1) << 31);
+}
+
+/// R6: Number of subpixel bins (4 per axis = 16 variants).
 pub const SUBPIXEL_BINS: u32 = 4;
 
-/// R6: 计算子像素 bin
+/// R6: Calculate subpixel bin.
 pub fn subpixelBin(fractional: f32) u4 {
     const clamped = @max(0.0, @min(fractional, 0.999));
     return @intFromFloat(clamped * @as(f32, @floatFromInt(SUBPIXEL_BINS)));
 }
 
-/// R6: 从 bin 值反算子像素偏移 (bin 中心值)
+/// R6: Reverse-calculate subpixel offset from bin (bin center value).
 pub fn subpixelOffset(bin: u4) f32 {
     return (@as(f32, @floatFromInt(bin)) + 0.5) / @as(f32, @floatFromInt(SUBPIXEL_BINS));
 }
 
-/// R6: 打包 x/y bin 到 u8
+/// R6: Pack x/y bin to u8.
 pub fn packSubpixelBin(x_bin: u4, y_bin: u4) u8 {
     return (@as(u8, x_bin) << 4) | @as(u8, y_bin);
 }
 
-/// 简单的矩形打包器 (Shelf packing algorithm)
+/// Simple rectangle packer (Shelf packing algorithm).
 const RectPacker = struct {
     width: u32,
     height: u32,
@@ -809,20 +819,20 @@ const RectPacker = struct {
     }
 
     pub fn allocate(self: *RectPacker, w: u32, h: u32) !Rect {
-        // 添加 1px padding 避免纹理采样出血
+        // Add 1px padding to avoid texture sample bleed.
         if (self.width < 2 or self.height < 2) return error.AtlasFull;
         if (w > self.width - 2 or h > self.height - 2) return error.AtlasFull;
         const padded_w = w + 2;
         const padded_h = h + 2;
 
-        // 换行检查
+        // Newline check.
         if (self.current_x > self.width or padded_w > self.width - self.current_x) {
             self.current_x = 0;
             self.current_y = std.math.add(u32, self.current_y, self.current_row_height) catch return error.AtlasFull;
             self.current_row_height = 0;
         }
 
-        // 空间不足
+        // Space insufficient.
         if (self.current_y > self.height or padded_h > self.height - self.current_y) {
             return error.AtlasFull;
         }
@@ -844,17 +854,17 @@ test "RectPacker rejects dimensions that would overflow padding" {
 
 test "color glyph detection: emoji font yes, text fonts no" {
     const testing = @import("std").testing;
-    var fs = try text.FontSystem.init(testing.allocator);
+    var fs = try text.FontSystem.init(testing.allocator, @import("std").testing.io);
     defer fs.deinit();
 
-    // Apple Color Emoji 有 sbix 表 -> 必须判为彩色，否则 emoji 会被光栅化成
-    // 单通道覆盖率掩码（灰块），颜色在光栅化那一刻就丢了。
+    // Apple Color Emoji has sbix table -> must mark as color. Else emoji rasterizes to
+    // single-channel coverage mask (gray block); color lost at rasterization.
     const emoji = try fs.findFont(.{ .family = "Apple Color Emoji", .size = 32 });
     defer emoji.deinit();
     try testing.expect(emoji.hasColorGlyphs());
 
-    // 普通文本字体必须判为非彩色，否则会白白走 4× 内存的 BGRA 页，
-    // 并丢掉子像素抗锯齿。
+    // Normal text fonts must mark non-color. Else wastes 4x VRAM for BGRA page,
+    // loses subpixel antialiasing.
     const helvetica = try fs.findFont(.{ .family = "Helvetica", .size = 32 });
     defer helvetica.deinit();
     try testing.expect(!helvetica.hasColorGlyphs());
@@ -866,8 +876,8 @@ test "color glyph detection: emoji font yes, text fonts no" {
 
 test "atlas page format: bytes-per-pixel drives budget accounting" {
     const testing = @import("std").testing;
-    // 彩色页是 BGRA8 = 4 字节/像素。bytesUsed 若不按格式加权，一页 64 MiB
-    // 会被当成 16 MiB 记账，GC 预算形成 4× 隐形超支。
+    // Color page is BGRA8 = 4 bytes/pixel. Unweighted bytesUsed: 64 MiB page recorded as
+    // 16 MiB, GC budget 4x overspend.
     try testing.expectEqual(@as(u32, 1), PageFormat.gray.bytesPerPixel());
     try testing.expectEqual(@as(u32, 4), PageFormat.color.bytesPerPixel());
 }
@@ -875,9 +885,9 @@ test "atlas page format: bytes-per-pixel drives budget accounting" {
 test "atlas retire queue: 延迟释放窗口覆盖三重缓冲" {
     const testing = @import("std").testing;
     const A = GlyphAtlas;
-    // 延迟窗口必须 >= 在飞帧数，否则同步释放的既有 bug 依然存在。
+    // Delay window must be >= in-flight frame count, else sync-free bug still exists.
     try testing.expect(A.MAX_FRAMES_IN_FLIGHT >= 3);
-    // retire 队列要装得下一次 GC 摘掉的所有页。
+    // Retire queue must hold all pages GC can evict at once.
     try testing.expect(A.MAX_RETIRED >= A.MAX_PAGES);
 }
 
@@ -885,36 +895,33 @@ test "glyph atlas: GC policy constants are self-consistent" {
     const testing = @import("std").testing;
     const A = GlyphAtlas;
 
-    // 预算必须小于硬上限，否则 GC 永远不触发，那正是修复前的状态：
-    // 只有 page_count 撞到 MAX_PAGES（32 × 16 MiB = 512 MiB）才驱逐，
-    // EVICT_THRESHOLD 声明了却无人调用。
+    // Budget must be < hard limit, else GC never triggers (pre-fix state: only page_count
+    // hitting MAX_PAGES (32 * 16 MiB = 512 MiB) triggered, EVICT_THRESHOLD unused).
     const hard_cap_bytes: u64 = @as(u64, A.MAX_PAGES) * A.PAGE_BYTES;
     try testing.expect(A.BYTE_BUDGET < hard_cap_bytes);
 
-    // 预算至少要容得下若干页，否则每次 GC 都会把工作集清空导致抖动。
+    // Budget should hold several pages, else each GC clears working set (thrash).
     try testing.expect(A.BYTE_BUDGET >= 4 * A.PAGE_BYTES);
 
-    // 页大小换算正确：4096×4096 R8 = 16 MiB。
+    // Page size arithmetic correct: 4096x4096 R8 = 16 MiB.
     try testing.expectEqual(@as(u64, 16 * 1024 * 1024), A.PAGE_BYTES);
 
-    // GC 间隔与老化阈值都必须为正，否则要么每帧扫描、要么立刻驱逐活跃页。
+    // GC interval and age threshold positive; else scan every frame or evict live pages.
     try testing.expect(A.GC_INTERVAL_FRAMES > 0);
     try testing.expect(A.EVICT_THRESHOLD > A.GC_INTERVAL_FRAMES);
 }
 
-// ══════════════════════════════════════════════════════════════════════
-// HiDPI (Retina) 审计回归测试，2026-07-31
+// HiDPI (Retina) audit regression test, 2026-07-31
 //
-// 背景：此前全仓 **零** HiDPI 测试覆盖（grep scale/dpi/retina 只命中
-// transform scale 与 theme spacing scale，都与设备像素比无关）。
-// 下面两条把审计实测到的事实钉住，防回退。
-// ══════════════════════════════════════════════════════════════════════
+// Background: entire repo had zero HiDPI test coverage (grep scale/dpi/retina only hit transform
+// scale and theme spacing scale, both unrelated to device pixel ratio). Tests below lock in audit
+// facts to prevent regression.
 
 test "HiDPI: 字形在 2x 下按物理像素光栅化（非逻辑尺寸再由 GPU 放大）" {
     const testing = @import("std").testing;
-    // 这是最常见的 HiDPI bug：Retina 下文字糊，根因是光栅化用逻辑尺寸、
-    // 采样时被 GPU 上采样。本测试走**真实 CoreText 路径**实测位图尺寸。
-    var fs = try text.FontSystem.init(testing.allocator);
+    // Most common HiDPI bug: blurry text on Retina because rasterized at logical size,
+    // GPU upsamples on display. This test runs **real CoreText path** measuring actual bitmap size.
+    var fs = try text.FontSystem.init(testing.allocator, @import("std").testing.io);
     defer fs.deinit();
 
     const f1 = try fs.findFont(.{ .family = "Helvetica", .size = 32 });
@@ -935,9 +942,9 @@ test "HiDPI: 字形在 2x 下按物理像素光栅化（非逻辑尺寸再由 GP
 
     try testing.expect(b1.width > 0 and b1.height > 0);
 
-    // coretext_bridge.m 的公式是 ceil(bbox * scale + subpixel) + 2（2px padding），
-    // 所以 2x 位图 ≈ 2 × 1x 位图，但因 padding/ceil 不是严格整倍。
-    // 判据：必须显著大于 1x（排除"没按 scale 光栅化"），且不超过 2 倍太多。
+    // coretext_bridge.m formula: ceil(bbox * scale + subpixel) + 2 (2px padding),
+    // so 2x bitmap ≈ 2 * 1x, but padding/ceil not strict multiple. Criterion: significantly
+    // larger than 1x (rules out "scale not passed"), not > 2x by much.
     const w1: f32 = @floatFromInt(b1.width);
     const w2: f32 = @floatFromInt(b2.width);
     const h1: f32 = @floatFromInt(b1.height);
@@ -945,25 +952,24 @@ test "HiDPI: 字形在 2x 下按物理像素光栅化（非逻辑尺寸再由 GP
     const ratio_w = w2 / w1;
     const ratio_h = h2 / h1;
 
-    // 1.7 下界：若 2x 与 1x 尺寸相同（ratio≈1.0），说明 scale_factor 根本
-    // 没传进 CoreText 光栅化，那就是 Retina 糊字的经典 bug。
-    // 实测（2026-07-31，Helvetica 'M' @32pt）：1x=24×25px，2x=46×48px，
-    // ratio=1.917/1.920（差的那点正是常数 +2px padding）。
+    // 1.7 lower bound: 2x same as 1x size (ratio ≈ 1.0) means scale_factor never reached
+    // CoreText rasterize = classic Retina blur bug. Real data (2026-07-31, Helvetica 'M' @32pt):
+    // 1x=24x25px, 2x=46x48px, ratio=1.917/1.920 (diff is constant +2px padding).
     try testing.expect(ratio_w > 1.7);
     try testing.expect(ratio_h > 1.7);
-    // 上界防"重复乘 scale"（4x）。
+    // Upper bound guards against scale multiplied twice (4x).
     try testing.expect(ratio_w < 2.4);
     try testing.expect(ratio_h < 2.4);
 }
 
-// 上面那条「GlyphKey 不含 scale（已知缺陷）」的锁定测试已按其自身注释的
-// 指示删除，缺陷已修（GlyphKey.scale_q）。下面三条是替代的正向测试。
+// Above "GlyphKey lacks scale (known bug)" locking test deleted per its own comment;
+// bug fixed (GlyphKey.scale_q). Below three are forward-looking replacements.
 
 test "HiDPI: 不同 scale 必须产生不同 GlyphKey（动态 scale 变化不再命中过期位图）" {
     const testing = @import("std").testing;
-    // 这是上一条缺陷锁定测试的正向替代。`Font.scale_factor` 就地可变、
-    // setScaleFactor 不改变 Font 指针，所以 scale 必须自己进键，否则
-    // Retina ↔ 非 Retina 切换后旧位图会被永久复用。
+    // Forward replacement for prior bug lock. `Font.scale_factor` in-place mutable,
+    // setScaleFactor doesn't change pointer, so scale must enter key; else Retina <->
+    // non-Retina toggle permanently reuses old bitmap.
     const k1x = GlyphKey{
         .font_ptr = 0xDEAD,
         .glyph_index = 7,
@@ -976,10 +982,10 @@ test "HiDPI: 不同 scale 必须产生不同 GlyphKey（动态 scale 变化不�
         .subpixel_bin = 0,
         .scale_q = quantizeScale(2.0),
     };
-    // 除 scale 外完全相同的两个键必须不等，这正是修复的核心。
+    // Keys identical except scale must be unequal; that's the core fix.
     try testing.expect(!std.meta.eql(k1x, k2x));
 
-    // 同一 scale 仍须命中同一条目（否则等于缓存全 miss）。
+    // Same scale still hits same entry (else cache all-miss).
     const k1x_again = GlyphKey{
         .font_ptr = 0xDEAD,
         .glyph_index = 7,
@@ -988,8 +994,8 @@ test "HiDPI: 不同 scale 必须产生不同 GlyphKey（动态 scale 变化不�
     };
     try testing.expect(std.meta.eql(k1x, k1x_again));
 
-    // 结构性断言：scale 维度确实存在于键里。
-    const fields = @typeInfo(GlyphKey).@"struct".fields;
+    // Structural assertion: scale dimension exists in key.
+    const fields = @import("zenit_reflection").fields(GlyphKey);
     var has_scale = false;
     inline for (fields) |fld| {
         if (std.mem.eql(u8, fld.name, "scale_q")) has_scale = true;
@@ -999,26 +1005,26 @@ test "HiDPI: 不同 scale 必须产生不同 GlyphKey（动态 scale 变化不�
 
 test "HiDPI: scale 量化保持不同真实 scale 可区分、同一 scale 稳定" {
     const testing = @import("std").testing;
-    // 量化不能把不同的真实 scale 折叠到一档（那等于把 bug 换个形式保留）。
+    // Quantization must not collapse different real scales (would preserve bug in disguise).
     try testing.expect(quantizeScale(1.0) != quantizeScale(2.0));
     try testing.expect(quantizeScale(1.0) != quantizeScale(1.5));
     try testing.expect(quantizeScale(1.5) != quantizeScale(2.0));
-    // 缩放分辨率模式下的非整数 scale 也必须可区分。
+    // Non-integer scale under scaled-resolution mode must also distinguish.
     try testing.expect(quantizeScale(1.25) != quantizeScale(1.5));
 
-    // 同一逻辑 scale 经不同浮点路径算出，必须量化到同一档（否则缓存永久
-    // miss + 图集无限增长）。2.0 vs 4.0/2.0 vs 1.0+1.0。
+    // Same logical scale via different float paths must quantize to same (else cache
+    // all-miss + unbounded atlas). 2.0 vs 4.0/2.0 vs 1.0+1.0.
     try testing.expectEqual(quantizeScale(2.0), quantizeScale(4.0 / 2.0));
     try testing.expectEqual(quantizeScale(2.0), quantizeScale(1.0 + 1.0));
-    // 远小于 1/100 的浮点噪声不应产生新档位。
+    // Float noise << 1/100 must not create new tier.
     try testing.expectEqual(quantizeScale(2.0), quantizeScale(2.0 + 1e-6));
 }
 
 test "HiDPI: 同一 Font 指针改 scale 后 getOrInsert 的键随之改变" {
     const testing = @import("std").testing;
-    // 端到端地钉住「setScaleFactor 不改变 Font 指针」这个前提下键仍会变。
-    // 走真实 CoreText Font，只验键的构造（不需要 Metal device）。
-    var fs = try text.FontSystem.init(testing.allocator);
+    // End-to-end anchor that "setScaleFactor doesn't change pointer" yet key changes.
+    // Real CoreText Font, only verify key construction (no Metal device needed).
+    var fs = try text.FontSystem.init(testing.allocator, @import("std").testing.io);
     defer fs.deinit();
     const f = try fs.findFont(.{ .family = "Helvetica", .size = 32 });
     defer f.deinit();
@@ -1035,7 +1041,7 @@ test "HiDPI: 同一 Font 指针改 scale 后 getOrInsert 的键随之改变" {
     };
 
     f.setScaleFactor(2.0);
-    // 前提复核：指针确实没变，这正是 scale 必须入键的原因。
+    // Premise check: pointer stays same, this is why scale must be in key.
     try testing.expectEqual(ptr_before, @intFromPtr(f));
     const key_2x = GlyphKey{
         .font_ptr = @intFromPtr(f),
@@ -1044,11 +1050,83 @@ test "HiDPI: 同一 Font 指针改 scale 后 getOrInsert 的键随之改变" {
     };
 
     try testing.expect(!std.meta.eql(key_1x, key_2x));
+    // unsmoothed glyphs are a different bitmap: a different key at the same scale
+    const smooth_key = rasterKey(f);
+    f.smooth_fonts = false;
+    defer f.smooth_fonts = true;
+    try testing.expect(rasterKey(f) != smooth_key);
+}
+
+test "rasterKey: a backend without smoothing (honors_smoothing = false) keys both alike" {
+    const Honoring = struct { scale_factor: f32 = 2, smooth_fonts: bool = true };
+    const Ignoring = struct {
+        scale_factor: f32 = 2,
+        smooth_fonts: bool = true,
+        pub const honors_smoothing = false;
+    };
+    var h = Honoring{};
+    var n = Ignoring{};
+    const h_on = rasterKey(&h);
+    const n_on = rasterKey(&n);
+    h.smooth_fonts = false;
+    n.smooth_fonts = false;
+    try std.testing.expect(rasterKey(&h) != h_on);
+    try std.testing.expectEqual(n_on, rasterKey(&n));
+}
+
+test "page eviction removes every victim glyph without allocating and remaps survivors" {
+    const testing = std.testing;
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    var atlas: GlyphAtlas = undefined;
+    atlas.allocator = failing.allocator();
+    atlas.cache = std.AutoHashMap(GlyphKey, AtlasRegion).init(testing.allocator);
+    defer atlas.cache.deinit();
+    atlas.pages = @as([GlyphAtlas.MAX_PAGES]?AtlasPage, @splat(null));
+    atlas.retired = @as([GlyphAtlas.MAX_RETIRED]?RetiredTexture, @splat(null));
+    atlas.current_frame = 100;
+    atlas.page_count = 3;
+    for (atlas.pages[0..3]) |*page| page.* = .{
+        .texture = gpu.Backend.Texture.fakeForTesting(1, 1, .r8_unorm),
+        .packer = RectPacker.init(1, 1),
+        .last_used_frame = 0,
+        .format = .gray,
+    };
+    // Fake textures are only enqueued, never destroyed or sampled by this test.
+    var region = AtlasRegion{
+        .uv_min = .{ 0, 0 },
+        .uv_max = .{ 1, 1 },
+        .bearing_x = 0,
+        .bearing_y = 0,
+        .advance = 1,
+        .width = 1,
+        .height = 1,
+        .page_index = 0,
+    };
+    for (0..3) |page| {
+        region.page_index = @intCast(page);
+        for (0..200) |glyph| try atlas.cache.put(.{
+            .font_ptr = 1,
+            .glyph_index = @intCast(page * 200 + glyph),
+        }, region);
+    }
+    atlas.evictPage(0);
+    try testing.expectEqual(@as(u32, 400), atlas.cache.count());
+    try testing.expectEqual(@as(u32, 2), atlas.page_count);
+    for (0..200) |glyph| try testing.expect(atlas.cache.get(.{
+        .font_ptr = 1,
+        .glyph_index = @intCast(glyph),
+    }) == null);
+    for (200..600) |glyph| {
+        const survivor = atlas.cache.get(.{ .font_ptr = 1, .glyph_index = @intCast(glyph) }).?;
+        try testing.expectEqual(@as(u8, if (glyph < 400) 1 else 0), survivor.page_index);
+    }
+    try testing.expect(atlas.retired[0] != null);
+    try testing.expect(!failing.has_induced_failure);
 }
 
 test "forgetFont 只摘除该 font_ptr 的全部条目（含各 scale / subpixel 变体）" {
     const testing = std.testing;
-    // forgetFont 只触碰 cache，不需要 Metal device。
+    // forgetFont only touches cache, no Metal device needed.
     var atlas: GlyphAtlas = undefined;
     atlas.cache = std.AutoHashMap(GlyphKey, AtlasRegion).init(testing.allocator);
     defer atlas.cache.deinit();
@@ -1074,7 +1152,7 @@ test "forgetFont 只摘除该 font_ptr 的全部条目（含各 scale / subpixel
     try testing.expectEqual(@as(u32, 200), atlas.cache.count());
     var iter = atlas.cache.iterator();
     while (iter.next()) |entry| try testing.expectEqual(survivor, entry.key_ptr.font_ptr);
-    // 地址复用后的新字体必须 miss，而不是命中旧位图。
+    // New font at reused address must miss, not hit old bitmap.
     try testing.expect(atlas.cache.get(.{ .font_ptr = doomed, .glyph_index = 7 }) == null);
     try testing.expect(atlas.cache.get(.{ .font_ptr = survivor, .glyph_index = 7 }) != null);
 }

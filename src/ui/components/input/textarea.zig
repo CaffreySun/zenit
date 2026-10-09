@@ -1,12 +1,14 @@
 const ImeReplacement = @import("ime_replacement.zig").ImeReplacement;
 const ImeText = @import("ime_text.zig").ImeText;
-/// Textarea，独立多行文本编辑组件
+/// Textarea, independent multiline text editing component.
 ///
-/// 完全独立于 TextInputState，直接使用 TextareaDocument + DocCursor + WrapMap。
-/// 支持：多行编辑、软换行、IME 中文输入、选区、Undo/Redo、VirtualList 虚拟滚动。
+/// Completely separate from TextInputState; uses TextareaDocument + DocCursor + WrapMap.
+/// Supports: multiline, soft wrapping, IME Chinese input, selection, Undo/Redo, VirtualList
+/// virtualization.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const core_ui = @import("../../core.zig");
+const view = @import("../../view.zig");
 const Cx = core_ui.Cx;
 const Node = core_ui.Node;
 const box = core_ui.box;
@@ -20,7 +22,12 @@ const Event = events_mod.Event;
 const EventResult = events_mod.EventResult;
 const KeyCode = events_mod.KeyCode;
 const Modifiers = events_mod.Modifiers;
-const Scope = @import("../../reactive.zig").Scope;
+const reactive = @import("../../reactive.zig");
+const Scope = reactive.Scope;
+const Source = reactive.Source;
+const Model = reactive.Model;
+const Handler = core_ui.Handler;
+const binding_mod = @import("binding.zig");
 const hooks = @import("../../hooks.zig");
 const recipe_mod = @import("../../recipe.zig");
 const editable_block = @import("../editable_block/mod.zig");
@@ -46,6 +53,9 @@ const text_layout = @import("../../core/text_layout.zig");
 pub const MeasureFn = text_layout.MeasureFn;
 
 const ImeComposePhase = editable_block.ImeComposePhase;
+const edit_reconcile = @import("edit_reconcile.zig");
+const UserEditTxn = @import("state.zig").UserEditTxn;
+const HistoryStash = @import("history_stash.zig").HistoryStash;
 
 // ============================================================================
 // Undo Entry
@@ -56,7 +66,7 @@ const UndoEntry = struct {
     cursor_offset: usize = 0,
     anchor: ?usize = null,
 
-    fn deinit(self: *UndoEntry, allocator: Allocator) void {
+    pub fn deinit(self: *UndoEntry, allocator: Allocator) void {
         if (self.text) |t| allocator.free(t);
         self.text = null;
     }
@@ -67,7 +77,8 @@ const UndoEntry = struct {
 // ============================================================================
 
 pub const TextareaState = struct {
-    // ===== 核心数据模型 =====
+    io: std.Io,
+    // ===== Core data model =====
     doc: *TextareaDocument,
     cursor: DocCursor(TextareaDocument) = .{},
     /// The same logical byte can have two visual carets at a bidi boundary.
@@ -75,13 +86,19 @@ pub const TextareaState = struct {
     /// Sticky physical x for repeated Up/Down navigation.
     preferred_visual_x: ?f32 = null,
     wrap_map: *TextareaWrapMap,
+    a11y_scroll_request: ?core_ui.A11yProps.TextScrollRequest = null,
     allocator: Allocator,
 
     // ===== Undo/Redo =====
-    undo_stack: [32]UndoEntry = [_]UndoEntry{.{}} ** 32,
+    undo_stack: [32]UndoEntry = @as([32]UndoEntry, @splat(.{})),
     undo_count: u8 = 0,
-    redo_stack: [32]UndoEntry = [_]UndoEntry{.{}} ** 32,
+    redo_stack: [32]UndoEntry = @as([32]UndoEntry, @splat(.{})),
     redo_count: u8 = 0,
+    /// Current user edit txn (semantics same as TextInputState.user_edit; Textarea has no undo
+    /// coalescing)
+    user_edit: UserEditTxn = .{},
+    /// Redo stack cleared in txn / evicted undo entries (put back on reject; see history_stash.zig)
+    undo_stash: HistoryStash(UndoEntry, 32) = .{},
 
     // ===== IME =====
     ime_preedit: ImeText = .{},
@@ -89,45 +106,46 @@ pub const TextareaState = struct {
     ime_cursor_utf8_offset: usize = 0,
     /// Persistent composed display text. Dynamic storage avoids truncating a
     /// long wrapped segment before/after the preedit insertion point.
-    ime_render_buffer: std.ArrayListUnmanaged(u8) = .{},
+    ime_render_buffer: std.ArrayListUnmanaged(u8) = .empty,
     ime_phase: ImeComposePhase = .idle,
     ime_pending_commit: ImeText = .{},
     ime_replacement: ?ImeReplacement = null,
     ime_selection_highlight: bool = false,
 
-    // ===== 渲染节点引用 =====
+    // ===== Render node refs =====
     cursor_node: ?*Node = null,
     selection_node: ?*Node = null,
     preedit_underline_node: ?*Node = null,
     overlay_node: ?*Node = null,
-    /// 选区底层(必须画在文本之下,否则选区色块盖住字形)
+    /// Selection underlay (must draw under text, else selection color blocks glyphs)
     selection_underlay_node: ?*Node = null,
     input_container_node: ?*Node = null,
     focus_ring_host: ?*Node = null,
     /// Mixed bidi selections can produce several rectangles per display line,
     /// so this storage must not impose a line/run-count ceiling.
-    extra_sel_nodes: std.ArrayListUnmanaged(*Node) = .{},
-    extra_preedit_nodes: std.ArrayListUnmanaged(*Node) = .{},
+    extra_sel_nodes: std.ArrayListUnmanaged(*Node) = .empty,
+    extra_preedit_nodes: std.ArrayListUnmanaged(*Node) = .empty,
 
     // ===== VirtualList =====
     vl_state: ?*VirtualListState = null,
 
-    // ===== 焦点/交互 =====
+    // ===== Focus / interaction =====
     focused: bool = false,
-    /// 光标闪烁相位（与 TextInputState 共用 caret_blink.CaretBlink）。
-    /// 这里原本是一份与 state.zig 逐字节相同的复制实现。
+    /// Caret blink phase (shared with TextInputState caret_blink.CaretBlink).
+    /// Originally byte-for-byte copy of state.zig implementation.
     blink: caret_blink.CaretBlink = .{},
     last_blink_visible: bool = true,
     is_dragging: bool = false,
+    drag_pointer: ?struct { x: f32, y: f32, time_ms: f64 } = null,
     suspend_drag_until_mouse_up: bool = false,
-    last_mouse_down_instant: ?std.time.Instant = null,
+    last_mouse_down_instant: ?@import("zenit_time").Instant = null,
     last_mouse_down_pos: [2]f32 = .{ 0, 0 },
     consecutive_mouse_downs: u8 = 0,
     hover_signal: ?*Signal(bool) = null,
     has_error: bool = false,
     dirty: bool = false,
 
-    // ===== 度量 =====
+    // ===== Metrics =====
     measure_fn: ?MeasureFn = null,
     char_width: f32 = 7.8,
     font_size: f32 = 13.0,
@@ -139,13 +157,17 @@ pub const TextareaState = struct {
     container_x: f32 = 0,
     container_y: f32 = 0,
 
-    // ===== 外部引用 =====
+    // ===== External refs =====
     cx_ref: ?*Cx = null,
     tokens: *const ThemeTokens = &theme.dark,
     placeholder_text: ?[]const u8 = null,
 
-    // ===== 回调 =====
+    // ===== Callbacks =====
     on_change: ?core_ui.HandlerRef = null,
+    /// After composition canceled: value binding applies writes deferred during composition
+    on_ime_cancelled: ?core_ui.HandlerRef = null,
+    /// Dynamic disable: true makes event handler ignore all input
+    disabled: bool = false,
 
     const blink_half_period_ns: i128 = 500 * std.time.ns_per_ms;
 
@@ -236,16 +258,29 @@ pub const TextareaState = struct {
     fn collectSelectionPlacements(self: *const TextareaState, allocator: Allocator, output: *std.ArrayListUnmanaged(SelectionPlacement)) !void {
         if (self.ime_replacement != null) return;
         const selection = self.cursor.selection() orelse return;
-        const start_lc = self.doc.offsetToLineCol(selection.start);
-        const end_lc = self.doc.offsetToLineCol(selection.end);
+        try self.collectRangePlacements(selection.start, selection.end, allocator, output);
+    }
+
+    /// Resolve arbitrary canonical UTF-8 offsets without changing the cursor.
+    /// Results use display-line coordinates and the retained row window; they
+    /// still need viewport/ancestor clipping before accessibility publication.
+    /// Empty ranges have no selection underlay (caret geometry is separate).
+    fn collectRangePlacements(self: *const TextareaState, start: usize, end: usize, allocator: Allocator, output: *std.ArrayListUnmanaged(SelectionPlacement)) !void {
+        const text = self.doc.getText();
+        if (start > end or end > text.len) return error.InvalidTextRange;
+        if ((start < text.len and text[start] & 0xc0 == 0x80) or
+            (end < text.len and text[end] & 0xc0 == 0x80)) return error.InvalidTextRange;
+        if (start == end) return;
+        const start_lc = self.doc.offsetToLineCol(start);
+        const end_lc = self.doc.offsetToLineCol(end);
         var first = self.wrap_map.bufferToDisplay(start_lc.line, start_lc.col).display_line;
         var last = self.wrap_map.bufferToDisplay(end_lc.line, end_lc.col).display_line;
 
         // An exclusive end exactly at a soft-wrap boundary belongs to the
         // preceding segment, not to an empty range at the next segment.
-        if (selection.end > 0 and last > first) {
+        if (end > 0 and last > first) {
             const last_seg = safeSegRange(self.doc, self.wrap_map.displayLineInfo(last, self.doc));
-            if (last_seg.start == selection.end) last -= 1;
+            if (last_seg.start == end) last -= 1;
         }
 
         // Selection underlays outside VirtualList's retained window cannot be
@@ -261,12 +296,11 @@ pub const TextareaState = struct {
         }
         if (first > last) return;
 
-        const text = self.doc.getText();
         var display_line = first;
         while (true) {
             const seg = safeSegRange(self.doc, self.wrap_map.displayLineInfo(display_line, self.doc));
-            const lo = @max(selection.start, seg.start);
-            const hi = @min(selection.end, seg.end);
+            const lo = @max(start, seg.start);
+            const hi = @min(end, seg.end);
             if (lo < hi) {
                 if (self.visualLineForSegment(seg.start, seg.end, display_line)) |geometry| {
                     const storage = try allocator.alloc(text_coordinates.SelectionRect, @max(geometry.line.caret_stops.len, 1));
@@ -291,13 +325,14 @@ pub const TextareaState = struct {
         }
     }
 
-    // ===== 文本操作 =====
+    // ===== Text operations =====
 
     pub fn getText(self: *const TextareaState) []const u8 {
         return self.doc.getText();
     }
 
     pub fn setAccessibilitySelection(self: *TextareaState, start_utf8: u32, end_utf8: u32) bool {
+        self.a11y_scroll_request = null;
         const text = self.doc.getText();
         const start = core_mod.text_coordinates.clampByteOffset(text, .{ .value = @min(@as(usize, start_utf8), text.len) }, .backward).value;
         const end = core_mod.text_coordinates.clampByteOffset(text, .{ .value = @min(@as(usize, end_utf8), text.len) }, .backward).value;
@@ -311,13 +346,51 @@ pub const TextareaState = struct {
         return true;
     }
 
+    /// External full replace (for value binding): cursor to end, clear selection and undo history,
+    /// don't fire on_change. On failure the document is unchanged.
+    pub fn setTextChecked(self: *TextareaState, value: []const u8) !void {
+        var prepared = try self.doc.prepareReplace(0, self.doc.totalLength(), value);
+        defer prepared.deinit();
+        prepared.commit();
+        self.ime_replacement = null;
+        self.supersedeImeComposition();
+        self.clearUndoHistory();
+        self.wrap_map.rebuildAll(self.doc);
+        self.cursor.offset = self.doc.totalLength();
+        self.cursor.anchor = null;
+        self.cursor.preferred_col = null;
+        self.resetBlink();
+        self.markDirty();
+    }
+
+    /// External write from value binding (binding.zig)
+    pub fn applyExternalText(self: *TextareaState, v: []const u8) !void {
+        try self.setTextChecked(v);
+    }
+
+    pub fn clearUndoHistory(self: *TextareaState) void {
+        // History void: clear stash too
+        self.undo_stash.discard(&self.redo_stack, self.allocator);
+        self.user_edit.pushes = 0;
+        var i: u8 = 0;
+        while (i < self.undo_count) : (i += 1) self.undo_stack[i].deinit(self.allocator);
+        self.undo_count = 0;
+        var j: u8 = 0;
+        while (j < self.redo_count) : (j += 1) self.redo_stack[j].deinit(self.allocator);
+        self.redo_count = 0;
+    }
+
     pub fn setAccessibilityValue(self: *TextareaState, value: []const u8) bool {
+        self.a11y_scroll_request = null;
+        // AX value write is user edit: value binding can fix in place (see reconcileUserEdit)
+        self.beginUserEdit();
+        defer self.endUserEdit();
         var prepared = self.doc.prepareReplace(0, self.doc.totalLength(), value) catch return false;
         defer prepared.deinit();
         self.pushUndoChecked() catch return false;
         prepared.commit();
         self.ime_replacement = null;
-        self.cancelImeComposition();
+        self.supersedeImeComposition();
         self.wrap_map.rebuildAll(self.doc);
         self.cursor.offset = self.doc.totalLength();
         self.cursor.anchor = null;
@@ -432,7 +505,7 @@ pub const TextareaState = struct {
         self.resetBlink();
     }
 
-    // ===== 光标/选区 =====
+    // ===== Cursor / selection =====
 
     pub fn moveCursorLeft(self: *TextareaState, shift: bool) void {
         self.moveCursorVisual(-1, shift);
@@ -529,7 +602,7 @@ pub const TextareaState = struct {
     }
 
     pub fn moveToLineStart(self: *TextareaState, shift: bool) void {
-        // 移到 display line（wrap 段）的开头，不是 buffer line 开头
+        // Move to display line start (wrap segment), not buffer line start
         const dp = self.cursorDisplayPoint();
         const info = self.wrap_map.displayLineInfo(dp.display_line, self.doc);
         const seg = safeSegRange(self.doc, info);
@@ -542,7 +615,7 @@ pub const TextareaState = struct {
     }
 
     pub fn moveToLineEnd(self: *TextareaState, shift: bool) void {
-        // 移到 display line（wrap 段）的末尾，不是 buffer line 末尾
+        // Move to display line end (wrap segment), not buffer line end
         const dp = self.cursorDisplayPoint();
         const info = self.wrap_map.displayLineInfo(dp.display_line, self.doc);
         const seg = safeSegRange(self.doc, info);
@@ -595,7 +668,7 @@ pub const TextareaState = struct {
         return txt[@min(sel.start, txt.len)..@min(sel.end, txt.len)];
     }
 
-    /// 按 display line 移动（结合 WrapMap）
+    /// Move by display line (combine WrapMap)
     fn moveVerticalVisual(self: *TextareaState, direction: i2, shift: bool) void {
         if (shift and self.cursor.anchor == null) {
             self.cursor.anchor = self.cursor.offset;
@@ -659,6 +732,7 @@ pub const TextareaState = struct {
             self.redo_stack[j].deinit(self.allocator);
         }
         self.redo_count = 0;
+        self.undo_stash.discard(&self.redo_stack, self.allocator);
         self.ime_render_buffer.deinit(self.allocator);
         self.extra_sel_nodes.deinit(self.allocator);
         self.extra_preedit_nodes.deinit(self.allocator);
@@ -667,18 +741,23 @@ pub const TextareaState = struct {
     fn pushUndoChecked(self: *TextareaState) !void {
         const txt = try self.allocator.dupe(u8, self.doc.getText());
         const entry = UndoEntry{ .text = txt, .cursor_offset = self.cursor.offset, .anchor = self.cursor.anchor };
+        const in_txn = self.user_edit.depth > 0;
         if (self.undo_count < 32) {
             self.undo_stack[self.undo_count] = entry;
             self.undo_count += 1;
         } else {
-            self.undo_stack[0].deinit(self.allocator);
+            // Evicted entries in txn stashed first; put back if edit rejected
+            if (!(in_txn and self.undo_stash.keepEvicted(self.undo_stack[0]))) self.undo_stack[0].deinit(self.allocator);
             var i: usize = 0;
             while (i < 31) : (i += 1) self.undo_stack[i] = self.undo_stack[i + 1];
             self.undo_stack[31] = entry;
         }
-        var j: u8 = 0;
-        while (j < self.redo_count) : (j += 1) self.redo_stack[j].deinit(self.allocator);
-        self.redo_count = 0;
+        if (!(in_txn and self.undo_stash.detachRedo(&self.redo_count))) {
+            var j: u8 = 0;
+            while (j < self.redo_count) : (j += 1) self.redo_stack[j].deinit(self.allocator);
+            self.redo_count = 0;
+        }
+        if (in_txn) self.user_edit.pushes +|= 1;
     }
 
     pub fn undo(self: *TextareaState) void {
@@ -687,6 +766,7 @@ pub const TextareaState = struct {
             return;
         }
         self.restoreHistory(false) catch return;
+        if (self.user_edit.depth > 0) self.user_edit.history_op = .undo;
     }
 
     pub fn redo(self: *TextareaState) void {
@@ -695,9 +775,96 @@ pub const TextareaState = struct {
             return;
         }
         self.restoreHistory(true) catch return;
+        if (self.user_edit.depth > 0) self.user_edit.history_op = .redo;
+    }
+
+    // ===== User edit txn (value binding reconcile in place, binding.zig;
+    // semantics see TextInputState.reconcileUserEdit) =====
+
+    pub fn beginUserEdit(self: *TextareaState) void {
+        if (self.user_edit.depth == 0) {
+            const replacement = self.ime_replacement;
+            self.user_edit = .{
+                .cursor = if (replacement) |r| r.cursor else self.cursor.offset,
+                .anchor = if (replacement) |r| r.anchor else self.cursor.anchor,
+            };
+        }
+        self.user_edit.depth += 1;
+    }
+
+    /// Edit done: stash cleared, checkpoint rebuilt from current state (see
+    /// TextInputState.settleUserEdit)
+    pub fn settleUserEdit(self: *TextareaState) void {
+        if (self.user_edit.depth == 0) return;
+        self.undo_stash.discard(&self.redo_stack, self.allocator);
+        self.user_edit = .{ .depth = self.user_edit.depth, .cursor = self.cursor.offset, .anchor = self.cursor.anchor };
+    }
+
+    pub fn endUserEdit(self: *TextareaState) void {
+        std.debug.assert(self.user_edit.depth > 0);
+        self.user_edit.depth -= 1;
+        // Txn ends, edit not rejected: stash freed per original logic
+        if (self.user_edit.depth == 0) self.undo_stash.discard(&self.redo_stack, self.allocator);
+    }
+
+    /// Reject: doc back to `landed`, selection to pre-edit, undo/redo stacks restored entry by
+    /// entry (a rejected undo/redo is reversed). Rewrite: doc becomes `landed`, cursor mapped by
+    /// edit_reconcile.zig, joined to this edit's undo unit. Outside a txn degrades to an external
+    /// write. On failure the doc is unchanged.
+    pub fn reconcileUserEdit(self: *TextareaState, landed: []const u8, rejected: bool) !void {
+        if (self.user_edit.depth == 0) return self.applyExternalText(landed);
+        const txn = self.user_edit;
+        var cursor: usize = undefined;
+        var anchor: ?usize = undefined;
+        if (rejected) {
+            switch (txn.history_op) {
+                .undo => self.redo(),
+                .redo => self.undo(),
+                .none => {},
+            }
+            cursor = txn.cursor;
+            anchor = txn.anchor;
+        } else {
+            const rewrite = edit_reconcile.Rewrite.diff(self.doc.getText(), landed);
+            cursor = rewrite.mapOffset(landed, self.cursor.offset);
+            anchor = if (self.cursor.anchor) |a| rewrite.mapOffset(landed, a) else null;
+        }
+        try self.replaceTextKeepingHistory(landed);
+        if (rejected and txn.history_op == .none) {
+            // Undo/redo stack entries restored to pre-edit (pop snapshot, put back evicted + redo)
+            self.undo_stash.restore(&self.undo_stack, &self.undo_count, &self.redo_stack, &self.redo_count, self.user_edit.pushes, self.allocator);
+            self.user_edit.pushes = 0;
+        }
+        const text = self.doc.getText();
+        self.cursor.offset = edit_reconcile.clampOffset(text, cursor);
+        self.cursor.anchor = if (anchor) |a| edit_reconcile.clampOffset(text, a) else null;
+        if (self.cursor.anchor == self.cursor.offset) self.cursor.anchor = null;
+        self.cursor.preferred_col = null;
+        self.cursor_affinity = .downstream;
+        self.preferred_visual_x = null;
+        self.markDirty();
+        self.resetBlink();
+    }
+
+    /// Change doc to `text`, replacing only the single changed region; no undo snapshot, cursor
+    /// untouched. On failure the doc is unchanged.
+    fn replaceTextKeepingHistory(self: *TextareaState, text: []const u8) !void {
+        const old = self.doc.getText();
+        if (std.mem.eql(u8, old, text)) return;
+        const rewrite = edit_reconcile.Rewrite.diff(old, text);
+        var prepared = try self.doc.prepareReplace(rewrite.prefix, rewrite.old_end, text[rewrite.prefix..rewrite.new_end]);
+        defer prepared.deinit();
+        const old_lc = self.doc.lineCount();
+        const first_line = self.doc.offsetToLineCol(rewrite.prefix).line;
+        prepared.commit();
+        self.wrap_map.applyEdit(self.doc, first_line, old_lc - first_line, self.doc.lineCount() - first_line);
+        _ = self.wrap_map.rewrapInterpolatedAll(self.doc);
+        _ = self.wrap_map.takePendingPatch();
     }
 
     fn restoreHistory(self: *TextareaState, redo_direction: bool) !void {
+        // Redo slot may reuse: truly free entries detached in txn
+        self.undo_stash.settleRedo(&self.redo_stack, self.allocator);
         const source = if (redo_direction) &self.redo_stack else &self.undo_stack;
         const source_count = if (redo_direction) &self.redo_count else &self.undo_count;
         const target = if (redo_direction) &self.undo_stack else &self.redo_stack;
@@ -728,16 +895,24 @@ pub const TextareaState = struct {
         self.resetBlink();
     }
 
-    // ===== 键盘 =====
+    // ===== Keyboard =====
 
     pub fn handleKeyDown(self: *TextareaState, key: KeyCode, modifiers: Modifiers) bool {
         switch (key) {
+            .home => {
+                if (modifiers.ctrl) self.moveToDocStart(modifiers.shift) else self.moveToLineStart(modifiers.shift);
+                return true;
+            },
+            .end => {
+                if (modifiers.ctrl) self.moveToDocEnd(modifiers.shift) else self.moveToLineEnd(modifiers.shift);
+                return true;
+            },
             .left => {
-                if (modifiers.super) self.moveToLineStart(modifiers.shift) else if (modifiers.alt) self.moveWordLeft(modifiers.shift) else self.moveCursorLeft(modifiers.shift);
+                if (modifiers.super) self.moveToLineStart(modifiers.shift) else if (modifiers.alt or (@import("builtin").target.os.tag == .windows and modifiers.ctrl)) self.moveWordLeft(modifiers.shift) else self.moveCursorLeft(modifiers.shift);
                 return true;
             },
             .right => {
-                if (modifiers.super) self.moveToLineEnd(modifiers.shift) else if (modifiers.alt) self.moveWordRight(modifiers.shift) else self.moveCursorRight(modifiers.shift);
+                if (modifiers.super) self.moveToLineEnd(modifiers.shift) else if (modifiers.alt or (@import("builtin").target.os.tag == .windows and modifiers.ctrl)) self.moveWordRight(modifiers.shift) else self.moveCursorRight(modifiers.shift);
                 return true;
             },
             .up => {
@@ -749,16 +924,23 @@ pub const TextareaState = struct {
                 return true;
             },
             .delete => {
-                if (modifiers.super) self.deleteToLineStart() else if (modifiers.alt) self.deleteWordBackward() else self.deleteBackward();
+                if (modifiers.super) self.deleteToLineStart() else if (modifiers.alt or (@import("builtin").target.os.tag == .windows and modifiers.ctrl)) self.deleteWordBackward() else self.deleteBackward();
                 return true;
             },
             .forward_delete => {
-                if (modifiers.alt) self.deleteWordForward() else self.deleteForward();
+                if (modifiers.alt or (@import("builtin").target.os.tag == .windows and modifiers.ctrl)) self.deleteWordForward() else self.deleteForward();
                 return true;
             },
             .z => {
-                if (modifiers.super) {
+                if (events_mod.primaryModifier(modifiers)) {
                     if (modifiers.shift) self.redo() else self.undo();
+                    return true;
+                }
+                return false;
+            },
+            .y => {
+                if (@import("builtin").target.os.tag == .windows and modifiers.ctrl) {
+                    self.redo();
                     return true;
                 }
                 return false;
@@ -779,9 +961,10 @@ pub const TextareaState = struct {
         }
     }
 
-    // ===== 鼠标 =====
+    // ===== Mouse =====
 
     pub fn handleMouseDown(self: *TextareaState, x: f32, y: f32, modifiers: Modifiers) void {
+        self.drag_pointer = null;
         if (self.imeIsComposing()) self.cancelImeComposition();
         const pos = self.hitTestAt(x, y);
         self.focused = true;
@@ -813,18 +996,47 @@ pub const TextareaState = struct {
     }
 
     pub fn handleMouseUp(self: *TextareaState) void {
+        self.drag_pointer = null;
         self.is_dragging = false;
         self.suspend_drag_until_mouse_up = false;
     }
 
     pub fn handleMouseDrag(self: *TextareaState, x: f32, y: f32) void {
         if (self.suspend_drag_until_mouse_up) return;
-        const pos = self.hitTestAt(x, y);
+        self.drag_pointer = .{ .x = x, .y = y, .time_ms = if (self.cx_ref) |cx| cx.frame_time_ms else 0 };
+        // Keep selection at the viewport edge; the frame timer advances the
+        // scroll offset. Passing the outside y through would jump whole rows.
+        const top = self.container_y + self.padding_v;
+        const bottom = if (self.input_container_node) |node| self.container_y + node.rectFromWorldOrFallback().h - self.padding_v else y;
+        const pos = self.hitTestAt(x, std.math.clamp(y, top, @max(top, bottom - 1)));
         if (pos != self.cursor.offset) {
             self.cursor.offset = pos;
             self.markDirty();
         }
         self.resetBlink();
+    }
+
+    pub fn advanceEdgeDrag(self: *TextareaState, time_ms: f64) bool {
+        const pointer = if (self.drag_pointer) |*p| p else return false;
+        const elapsed = std.math.clamp(time_ms - pointer.time_ms, 0, 100);
+        pointer.time_ms = time_ms;
+        if (!self.focused or !self.is_dragging or self.suspend_drag_until_mouse_up) return false;
+        const vl = self.vl_state orelse return false;
+        const node = self.input_container_node orelse return false;
+        const top = self.container_y + self.padding_v;
+        const bottom = self.container_y + node.rectFromWorldOrFallback().h - self.padding_v;
+        const distance = if (pointer.y < top) pointer.y - top else if (pointer.y > bottom) pointer.y - bottom else return false;
+        const max_scroll = vl.scroll_state.maxScrollY();
+        const scroll = vl.scroll_state.scroll_y;
+        if ((distance < 0 and scroll <= 0) or (distance > 0 and scroll >= max_scroll)) return false;
+        if (elapsed == 0) return true;
+        const speed = 200 + @min(@abs(distance), 200) * 4;
+        const step = speed * @as(f32, @floatCast(elapsed / 1000));
+        @import("../scroll_area/mod.zig").setScrollY(vl.scroll_state, vl.content_node, scroll + (if (distance < 0) -step else step));
+        self.cursor.offset = self.hitTestAt(pointer.x, if (distance < 0) top else @max(top, bottom - 1));
+        self.markDirty();
+        self.resetBlink();
+        return true;
     }
 
     // ===== Hit test =====
@@ -963,7 +1175,25 @@ pub const TextareaState = struct {
         return duplicate;
     }
 
+    /// Composition abandoned: notify value binding to apply deferred external writes
     pub fn cancelImeComposition(self: *TextareaState) void {
+        self.endImeComposition(true);
+    }
+
+    /// Composition superseded by single full write (external full replace / AX write): end
+    /// composition
+    /// without on_ime_cancelled, else deferred value overwrites just-written content (semantics
+    /// same
+    /// as TextInputState.supersedeImeComposition)
+    fn supersedeImeComposition(self: *TextareaState) void {
+        self.endImeComposition(false);
+    }
+
+    fn endImeComposition(self: *TextareaState, notify: bool) void {
+        const was_composing = self.ime_phase == .composing;
+        defer if (was_composing and notify) {
+            if (self.on_ime_cancelled) |h| h.invoke();
+        };
         if (self.ime_replacement) |replacement| {
             self.cursor.offset = @min(replacement.cursor, self.doc.totalLength());
             self.cursor.anchor = if (replacement.anchor) |anchor| @min(anchor, self.doc.totalLength()) else null;
@@ -1051,25 +1281,25 @@ pub const TextareaState = struct {
     // ===== Blink =====
 
     pub fn resetBlink(self: *TextareaState) void {
-        self.blink.reset();
+        self.blink.reset(self.io);
         self.last_blink_visible = true;
     }
 
-    pub fn blinkVisible(self: *TextareaState, now: std.time.Instant) bool {
+    pub fn blinkVisible(self: *TextareaState, now: @import("zenit_time").Instant) bool {
         return self.blink.visible(now);
     }
 
-    fn nextBlinkDelayNs(self: *const TextareaState, now: std.time.Instant) u64 {
+    fn nextBlinkDelayNs(self: *const TextareaState, now: @import("zenit_time").Instant) u64 {
         return self.blink.nextDelayNs(now);
     }
 
-    // ===== 辅助 =====
+    // ===== Helpers =====
 
     fn markDirty(self: *TextareaState) void {
         self.dirty = true;
-        // cx.render() 零脏帧 fast-path 跳过 textareaBeforeRender -> state.dirty
-        // 永不被读 + VirtualList 不刷新 -> 视觉文本不更新（同 password 之前的 bug）。
-        // 把 container node 标 layout dirty 让 fast-path 失效。
+        // cx.render() zero-dirty fast-path skips textareaBeforeRender -> state.dirty never read +
+        // VirtualList doesn't refresh -> visual text unchanged (same as password bug before).
+        // Mark container layout dirty to fail fast-path.
         if (self.input_container_node) |n| n.markLayoutDirty();
         if (self.cursor_node) |n| n.markRenderDirty();
         if (self.selection_node) |n| n.markRenderDirty();
@@ -1081,7 +1311,7 @@ pub const TextareaState = struct {
         return self.wrap_map.bufferToDisplay(lc.line, lc.col);
     }
 
-    /// 用真实测量函数计算文本宽度（pixel）
+    /// Compute text width with real measure function (pixel)
     fn measureSlice(self: *const TextareaState, text: []const u8) f32 {
         if (text.len == 0) return 0;
         if (self.cx_ref) |cx| {
@@ -1091,7 +1321,7 @@ pub const TextareaState = struct {
         return text_layout.measureTextWidthByFontKind(text, self.font_size, self.font_weight, false, false);
     }
 
-    /// 测量 text[0..byte_end] 的宽度
+    /// Measure text[0..byte_end] width
     fn measurePrefix(self: *const TextareaState, text: []const u8, byte_end: usize) f32 {
         return self.measureSlice(text[0..@min(byte_end, text.len)]);
     }
@@ -1107,7 +1337,7 @@ pub const TextareaState = struct {
         const dy = y - self.last_mouse_down_pos[1];
         const dist_sq = dx * dx + dy * dy;
         var is_multi = false;
-        const now_i = std.time.Instant.now() catch null;
+        const now_i = @import("zenit_time").Instant.now(self.io) catch null;
         if (now_i) |now| {
             if (self.last_mouse_down_instant) |last| {
                 is_multi = text_utils.safeElapsedNs(now, last) < events_mod.multi_click_interval_ns and dist_sq < events_mod.multi_click_slop_sq;
@@ -1121,7 +1351,7 @@ pub const TextareaState = struct {
 };
 
 // ============================================================================
-// 辅助函数
+// Helper functions
 // ============================================================================
 
 fn safeSegRange(doc: *const TextareaDocument, info: DisplayLineInfo) struct { start: usize, end: usize } {
@@ -1141,7 +1371,7 @@ fn fireOnChange(state: *TextareaState) void {
 }
 
 fn sanitizeText(text: []const u8, out: []u8) []const u8 {
-    // 过滤控制字符，保留 \n
+    // Filter control chars, preserve \n
     var out_len: usize = 0;
     var i: usize = 0;
     while (i < text.len and out_len < out.len) {
@@ -1161,27 +1391,41 @@ fn sanitizeText(text: []const u8, out: []u8) []const u8 {
             }
             continue;
         }
-        // ESC 序列必须先于通用控制字符过滤判定（ESC=0x1b < 0x20，放后面就是死代码，
-        // 粘贴 "\x1b[31mred" 会留下 "[31mred"）。CSI：ESC '[' 参数/中间字节 终止字节。
+        // ESC sequences before general control filter (ESC=0x1b < 0x20; put after = dead code.
+        // Paste "\x1b[31mred" leaves "[31mred"). CSI: ESC '[' params/intermediates terminator.
         if (b == 0x1b) {
             i += 1;
             if (i < text.len and text[i] == '[') {
                 i += 1;
                 while (i < text.len and text[i] >= 0x20 and text[i] <= 0x3F) : (i += 1) {}
             }
-            if (i < text.len) i += 1; // 终止字节 / 单字符转义
+            if (i < text.len) i += 1; // Terminator / single-char escape
             continue;
         }
         if (b < 0x20 and b != '\t') {
             i += 1;
             continue;
-        } // 过滤控制字符
+        } // Filter control chars
         out[out_len] = b;
         out_len += 1;
         i += 1;
     }
     return out[0..out_len];
 }
+
+/// Fixed-height box + own text (label / helper): `ui.view.text` builds fit-size text node;
+/// "boxed text" with fixed height written here on mount with style + content copy.
+const BoxText = struct {
+    style: core_ui.TextStyle,
+    content: []const u8,
+
+    fn apply(self: BoxText, node: *Node, _: *Scope, cx: *Cx) !void {
+        var props: core_ui.TextProps = .{};
+        _ = self.style.applyTo(&props);
+        node.setText(props);
+        try node.setTextContent(cx.allocator, self.content);
+    }
+};
 
 test "textarea sanitizeText: 剥离 ANSI ESC 序列而非只删 ESC 字节" {
     var out: [64]u8 = undefined;
@@ -1192,12 +1436,20 @@ test "textarea sanitizeText: 剥离 ANSI ESC 序列而非只删 ESC 字节" {
 }
 
 // ============================================================================
-// 事件处理器
+// Event handlers
 // ============================================================================
 
+/// Each event is one user edit txn (see TextareaState.beginUserEdit / events.zig
+/// inputEventHandler)
 pub fn textareaEventHandler(event: Event, context: ?*anyopaque) EventResult {
     const state: *TextareaState = @ptrCast(@alignCast(context orelse return .ignored));
+    if (state.disabled) return .ignored;
+    state.beginUserEdit();
+    defer state.endUserEdit();
+    return handleTextareaEvent(state, event);
+}
 
+fn handleTextareaEvent(state: *TextareaState, event: Event) EventResult {
     switch (event) {
         .key_down, .mouse_down, .focus, .blur => state.endImePendingCommit(),
         else => {},
@@ -1244,8 +1496,8 @@ pub fn textareaEventHandler(event: Event, context: ?*anyopaque) EventResult {
         },
         .key_down => |e| {
             if (state.ime_replacement != null and (e.modifiers.super or e.modifiers.ctrl) and e.key != .z) state.cancelImeComposition();
-            // 剪贴板
-            if (e.modifiers.super) {
+            // Clipboard
+            if (events_mod.primaryModifier(e.modifiers)) {
                 if (state.cx_ref) |cx| {
                     if (core_ui.platform_services.clipboardAvailable(cx.system_sdk)) {
                         switch (e.key) {
@@ -1319,7 +1571,7 @@ pub fn textareaEventHandler(event: Event, context: ?*anyopaque) EventResult {
             state.handleMouseDown(e.x, e.y, .{ .shift = e.modifiers.shift, .alt = e.modifiers.alt, .super = e.modifiers.super, .ctrl = e.modifiers.ctrl });
             return .handled;
         },
-        .mouse_up => |_| {
+        .mouse_up => {
             state.handleMouseUp();
             return .handled;
         },
@@ -1334,19 +1586,19 @@ pub fn textareaEventHandler(event: Event, context: ?*anyopaque) EventResult {
             }
             return .ignored;
         },
-        .click => |_| {
+        .click => {
             return .handled;
         },
         .scroll => |scroll| {
             if (state.vl_state) |vl_state| {
-                // 优先转发给 VirtualList 的 ScrollArea
+                // Priority forward to VirtualList ScrollArea
                 if (vl_state.content_node.parent) |sa_container| {
                     if (sa_container.behavior.events.event_context) |ctx| {
                         const r = scroll_area_event.scrollEventHandler(Event{ .scroll = scroll }, ctx);
                         if (r != .ignored) return r;
                     }
                 }
-                // Fallback: 直接操作 scroll_state
+                // Fallback: manipulate scroll_state directly
                 if (scroll.dy != 0) {
                     const prev_sy = vl_state.scroll_state.scroll_y;
                     const max_sy = vl_state.scroll_state.maxScrollY();
@@ -1390,7 +1642,7 @@ fn textareaRenderItem(item_node: *Node, index: usize, cx: *Cx, user_context: ?*a
     }
     const has_content = state.doc.totalLength() > 0 or state.hasImePreedit();
 
-    @import("row_text.zig").set(item_node, cx, line_content, if (has_content) state.tokens.color.fg_primary else state.tokens.color.fg_secondary, state.font_size) catch {
+    @import("row_text.zig").set(item_node, cx, line_content, if (has_content) state.tokens.tokens.color.fg_primary else state.tokens.tokens.color.fg_secondary, state.font_size) catch {
         state.dirty = true;
         @import("row_text.zig").retry(cx, state.input_container_node orelse item_node);
         return;
@@ -1398,8 +1650,143 @@ fn textareaRenderItem(item_node: *Node, index: usize, cx: *Cx, user_context: ?*a
 }
 
 // ============================================================================
-// beforeRender 钩子
+// beforeRender hook
 // ============================================================================
+
+fn textareaA11yScroll(context: *anyopaque, start: u32, end: u32, align_top: bool) bool {
+    const state: *TextareaState = @ptrCast(@alignCast(context));
+    const text = state.getText();
+    if (start > end or end > text.len) return false;
+    if ((start < text.len and text[start] & 0xc0 == 0x80) or (end < text.len and text[end] & 0xc0 == 0x80)) return false;
+    const first = text_coordinates.clampByteOffset(text, .{ .value = start }, .backward).value;
+    const last = text_coordinates.clampByteOffset(text, .{ .value = end }, .forward).value;
+    state.a11y_scroll_request = .{ .start = @intCast(first), .end = @intCast(last), .align_top = align_top, .text_hash = std.hash.Wyhash.hash(0, text), .caret = state.cursor.offset, .anchor = state.cursor.anchor };
+    if (state.input_container_node) |node| node.markRenderDirty();
+    return true;
+}
+
+fn applyTextareaA11yScroll(state: *TextareaState) void {
+    const request = state.a11y_scroll_request orelse return;
+    if (state.wrap_map.enabled and (state.wrap_map.needs_rebuild or state.wrap_map.has_interpolated_lines)) return;
+    state.a11y_scroll_request = null;
+    const text = state.getText();
+    if (request.text_hash != std.hash.Wyhash.hash(0, text) or request.caret != state.cursor.offset or request.anchor != state.cursor.anchor) return;
+    const list = state.vl_state orelse return;
+    const offset = if (request.align_top) request.start else if (request.end > request.start) grapheme.prevBoundary(text, request.end) else request.end;
+    const point = state.doc.offsetToLineCol(offset);
+    const row = state.wrap_map.bufferToDisplay(point.line, point.col).display_line;
+    virtual_list.scrollIndexIntoView(list, row, if (request.align_top) .start else .end);
+}
+
+fn textareaA11yLines(context: *anyopaque, allocator: std.mem.Allocator) ![]u32 {
+    const state: *TextareaState = @ptrCast(@alignCast(context));
+    return @import("textarea_document.zig").displayLineBoundaries(allocator, state.doc, state.wrap_map);
+}
+
+fn textareaA11yGeometry(context: *anyopaque, allocator: Allocator) ![]core_ui.A11yProps.TextGeometrySegment {
+    const state: *TextareaState = @ptrCast(@alignCast(context));
+    if (state.ime_replacement != null or
+        (state.wrap_map.enabled and (state.wrap_map.needs_rebuild or state.wrap_map.has_interpolated_lines)))
+        return error.AccessibilityLayoutPending;
+    var output: std.ArrayListUnmanaged(core_ui.A11yProps.TextGeometrySegment) = .empty;
+    errdefer output.deinit(allocator);
+    var first: u32 = 0;
+    var last: u32 = if (state.wrap_map.enabled) state.wrap_map.displayLineCount() else @intCast(state.doc.lineCount());
+    if (state.vl_state) |vl| {
+        if (!vl.initialized) return error.AccessibilityLayoutPending;
+        first = @intCast(@min(vl.prev_start, last));
+        last = @intCast(@min(vl.prev_end, last));
+    }
+    const scroll_y = if (state.vl_state) |vl| vl.scroll_state.effectiveScrollY() else 0;
+    var row = first;
+    while (row < last) : (row += 1) {
+        const span = safeSegRange(state.doc, state.wrap_map.displayLineInfo(row, state.doc));
+        if (span.start == span.end) continue;
+        const visual = state.visualLineForSegment(span.start, span.end, row) orelse return error.AccessibilityLayoutPending;
+        var segments = visual.line.selectionSegments();
+        while (segments.next()) |segment| {
+            if (segment.rect.width <= 0) continue;
+            if (output.items.len == core_ui.A11yProps.max_text_geometry_segments) return error.AccessibilityGeometryQuota;
+            try output.append(allocator, .{
+                .start = @intCast(span.start + segment.start.value),
+                .end = @intCast(span.start + segment.end.value),
+                .rect = .{
+                    .x = state.container_x + state.padding_h + segment.rect.x,
+                    .y = state.container_y + state.padding_v + @as(f32, @floatFromInt(row)) * state.line_height - scroll_y,
+                    .width = segment.rect.width,
+                    .height = state.line_height,
+                },
+            });
+        }
+    }
+    return output.toOwnedSlice(allocator);
+}
+
+fn textareaA11yRows(context: *anyopaque, allocator: Allocator) ![]core_ui.A11yProps.TextRowGeometry {
+    const state: *TextareaState = @ptrCast(@alignCast(context));
+    if (state.ime_replacement != null or state.input_inner_w <= 0 or
+        (state.wrap_map.enabled and (state.wrap_map.needs_rebuild or state.wrap_map.has_interpolated_lines))) return error.AccessibilityLayoutPending;
+    var output: std.ArrayListUnmanaged(core_ui.A11yProps.TextRowGeometry) = .empty;
+    errdefer output.deinit(allocator);
+    var first: u32 = 0;
+    var last: u32 = if (state.wrap_map.enabled) state.wrap_map.displayLineCount() else @intCast(state.doc.lineCount());
+    if (state.vl_state) |vl| {
+        if (!vl.initialized) return error.AccessibilityLayoutPending;
+        first = @intCast(@min(vl.prev_start, last));
+        last = @intCast(@min(vl.prev_end, last));
+    }
+    const scroll_y = if (state.vl_state) |vl| vl.scroll_state.effectiveScrollY() else 0;
+    var row = first;
+    while (row < last) : (row += 1) {
+        if (output.items.len == core_ui.A11yProps.max_text_geometry_segments) return error.AccessibilityGeometryQuota;
+        const span = safeSegRange(state.doc, state.wrap_map.displayLineInfo(row, state.doc));
+        const text = state.getText();
+        const end = span.end + @as(usize, @intFromBool(span.end < text.len and text[span.end] == '\n'));
+        try output.append(allocator, .{ .start = @intCast(span.start), .end = @intCast(end), .rect = .{
+            .x = state.container_x + state.padding_h,
+            .y = state.container_y + state.padding_v + @as(f32, @floatFromInt(row)) * state.line_height - scroll_y,
+            .width = state.input_inner_w,
+            .height = state.line_height,
+        } });
+    }
+    return output.toOwnedSlice(allocator);
+}
+
+fn textareaA11yCarets(context: *anyopaque, allocator: Allocator) ![]core_ui.A11yProps.TextCaretGeometry {
+    const state: *TextareaState = @ptrCast(@alignCast(context));
+    if (state.ime_replacement != null or
+        (state.wrap_map.enabled and (state.wrap_map.needs_rebuild or state.wrap_map.has_interpolated_lines)))
+        return error.AccessibilityLayoutPending;
+    var output: std.ArrayListUnmanaged(core_ui.A11yProps.TextCaretGeometry) = .empty;
+    errdefer output.deinit(allocator);
+    var first: u32 = 0;
+    var last: u32 = if (state.wrap_map.enabled) state.wrap_map.displayLineCount() else @intCast(state.doc.lineCount());
+    if (state.vl_state) |vl| {
+        if (!vl.initialized) return error.AccessibilityLayoutPending;
+        first = @intCast(@min(vl.prev_start, last));
+        last = @intCast(@min(vl.prev_end, last));
+    }
+    const scroll_y = if (state.vl_state) |vl| vl.scroll_state.effectiveScrollY() else 0;
+    var row = first;
+    while (row < last) : (row += 1) {
+        const span = safeSegRange(state.doc, state.wrap_map.displayLineInfo(row, state.doc));
+        const visual = state.visualLineForSegment(span.start, span.end, row) orelse return error.AccessibilityLayoutPending;
+        for (visual.line.caret_stops) |stop| {
+            if (output.items.len == core_ui.A11yProps.max_text_geometry_segments) return error.AccessibilityGeometryQuota;
+            try output.append(allocator, .{
+                .offset = @intCast(span.start + stop.position.byte.value),
+                .rect = .{
+                    .x = state.container_x + state.padding_h + stop.x.value,
+                    .y = state.container_y + state.padding_v + @as(f32, @floatFromInt(row)) * state.line_height - scroll_y,
+                    .width = 0,
+                    .height = state.line_height,
+                },
+                .downstream = stop.position.affinity == .downstream,
+            });
+        }
+    }
+    return output.toOwnedSlice(allocator);
+}
 
 fn textareaBeforeRender(node: *Node) void {
     const state: *TextareaState = @ptrCast(@alignCast(node.behavior.events.event_context orelse return));
@@ -1412,6 +1799,7 @@ fn textareaBeforeRender(node: *Node) void {
             .selection_start = @intCast(if (selection) |s| s.start else state.cursor.offset),
             .selection_end = @intCast(if (selection) |s| s.end else state.cursor.offset),
             .caret = @intCast(state.cursor.offset),
+            .uniform_format = true,
             .visible_start = textareaVisibleRange(state).start,
             .visible_end = textareaVisibleRange(state).end,
             .set_selection = struct {
@@ -1426,12 +1814,17 @@ fn textareaBeforeRender(node: *Node) void {
                     return textarea.setAccessibilityValue(value);
                 }
             }.set,
+            .scroll_into_view = textareaA11yScroll,
+            .line_boundaries = textareaA11yLines,
+            .geometry_segments = textareaA11yGeometry,
+            .row_geometry = textareaA11yRows,
+            .caret_geometry = textareaA11yCarets,
             .frame_for_range = textareaA11yFrame,
             .range_at_point = textareaA11yRangeAtPoint,
         };
     }
 
-    // 度量同步
+    // Metrics sync
     const coords = editable_block.computeRenderCoords(node, state.padding_h, state.padding_v);
     state.container_x = coords.global_x;
     state.container_y = coords.global_y;
@@ -1453,8 +1846,8 @@ fn textareaBeforeRender(node: *Node) void {
         }
     }
 
-    // 光标闪烁
-    const now = std.time.Instant.now() catch null;
+    // Caret blink
+    const now = @import("zenit_time").Instant.now(state.io) catch null;
     const blink_visible = if (state.focused and now != null) state.blinkVisible(now.?) else state.focused;
     if (state.focused and now != null) {
         if (state.cx_ref) |cx| cx.scheduleRedrawAfterNs(state.nextBlinkDelayNs(now.?));
@@ -1462,43 +1855,55 @@ fn textareaBeforeRender(node: *Node) void {
     }
     state.last_blink_visible = blink_visible;
 
-    // 拖拽：cursor 更新走 textareaEventHandler.mouse_move -> state.handleMouseDrag。
-    // 这里只清理 pressed_node==null 时 stale is_dragging。
-    // 不能在 before_render 里读 cx.mouse_x/y 重算 cursor，那个值只有 mouse_move
-    // 才更新；mouse_down 后到第一个 mouse_move 之间用到的是上一帧的 stale 坐标，
-    // 在 e2e 或 程序合成 click 场景下还停在 (0,0) -> cursor 直接被踢到 doc 开头。
+    // Only replay this textarea's recorded drag position, never stale Cx mouse coordinates.
+    var edge_scrolling = false;
     if (state.is_dragging) {
         if (state.cx_ref) |cx| {
-            if (cx.pressed_node == null) state.is_dragging = false;
+            if (cx.pressed_node == null or !state.focused) {
+                state.is_dragging = false;
+                state.drag_pointer = null;
+            } else if (state.advanceEdgeDrag(cx.frame_time_ms)) {
+                edge_scrolling = true;
+                cx.scheduleRedrawAfterNs(16 * std.time.ns_per_ms);
+            }
         }
     }
 
-    // VirtualList 刷新
+    // VirtualList refresh
     if (state.dirty) {
         state.dirty = false;
         if (state.vl_state) |vl_state| {
             const new_lc = @max(@as(u32, 1), state.wrap_map.displayLineCount());
-            if (new_lc != vl_state.props.item_count) {
-                // updateItemCount 会重建节点，可能触发 markRuntimeIndexDirty。
-                // 但焦点在 textarea_node 上（不在 pool 节点），不应丢失。
+            if (new_lc != vl_state.item_count) {
+                // updateItemCount rebuilds nodes, may trigger markRuntimeIndexDirty.
+                // Focus on textarea_node (not pool node), shouldn't be lost.
                 virtual_list.updateItemCount(vl_state, new_lc);
             } else {
                 virtual_list.refreshRange(vl_state, vl_state.prev_start, vl_state.prev_end);
             }
             const dp = state.cursorDisplayPoint();
-            virtual_list.ensureVisible(vl_state, dp.display_line);
+            // Autoscroll owns a continuous pixel offset. ensureVisible would
+            // round partial bottom rows up every frame and accelerate dragging.
+            if (!edge_scrolling) virtual_list.ensureVisible(vl_state, dp.display_line);
         }
         node.markRenderDirty();
     }
 
+    applyTextareaA11yScroll(state);
+    if (node.behavior.interaction.a11y) |*props| if (props.editable_text) |*editable| {
+        const visible = textareaVisibleRange(state);
+        editable.visible_start = visible.start;
+        editable.visible_end = visible.end;
+    };
+
     const container_inner_x = state.padding_h;
     const container_inner_y = state.padding_v;
     const cursor_h = @max(@as(f32, 12.0), state.line_height - 2.0);
-    // VirtualList scroll offset: overlay 是 absolute 定位在容器内，
-    // 但 VL 内容随滚动偏移，光标/选区需要补偿 scroll_y
+    // VirtualList scroll offset: overlay absolutely positioned in container,
+    // but VL content offset on scroll; cursor/selection need scroll_y compensation
     const scroll_y: f32 = if (state.vl_state) |vl| vl.scroll_state.effectiveScrollY() else 0;
 
-    // 光标节点
+    // Caret node
     if (state.cursor_node) |cnode| {
         if (state.focused) {
             const fallback_dp = state.cursorDisplayPoint();
@@ -1533,7 +1938,7 @@ fn textareaBeforeRender(node: *Node) void {
             const cursor_y = @as(f32, @floatFromInt(display_line)) * state.line_height - scroll_y;
 
             cnode.setLayoutRect(.{ .x = @round(container_inner_x + cursor_x), .y = @round(container_inner_y + cursor_y), .w = 1, .h = cursor_h });
-            cnode.setBackgroundRaw(if (blink_visible) state.tokens.color.fg_primary else Color.TRANSPARENT);
+            cnode.setBackgroundRaw(if (blink_visible) state.tokens.tokens.color.fg_primary else Color.TRANSPARENT);
             cnode.markRenderDirty();
 
             if (state.cx_ref) |cx| {
@@ -1547,13 +1952,13 @@ fn textareaBeforeRender(node: *Node) void {
         }
     }
 
-    // 选区节点
+    // Selection node
     if (state.selection_node) |sel| {
-        var placements: std.ArrayListUnmanaged(TextareaState.SelectionPlacement) = .{};
+        var placements: std.ArrayListUnmanaged(TextareaState.SelectionPlacement) = .empty;
         defer placements.deinit(state.allocator);
         state.collectSelectionPlacements(state.allocator, &placements) catch placements.clearRetainingCapacity();
         if (placements.items.len > 0) {
-            const sel_bg = state.tokens.color.selection_bg;
+            const sel_bg = state.tokens.tokens.color.selection_bg;
             const first = placements.items[0];
             sel.setLayoutRect(.{
                 .x = @round(container_inner_x + first.rect.x),
@@ -1584,12 +1989,12 @@ fn textareaBeforeRender(node: *Node) void {
         sel.markRenderDirty();
     }
 
-    // IME 下划线
+    // IME underline
     if (state.preedit_underline_node) |line| {
         if (state.hasImePreedit()) {
             const fallback_dp = state.cursorDisplayPoint();
             var display_line = fallback_dp.display_line;
-            var rects: std.ArrayListUnmanaged(text_coordinates.SelectionRect) = .{};
+            var rects: std.ArrayListUnmanaged(text_coordinates.SelectionRect) = .empty;
             defer rects.deinit(state.allocator);
             if (state.visualLineAtOffset(state.cursor.offset)) |geometry| {
                 display_line = geometry.display_line;
@@ -1616,7 +2021,7 @@ fn textareaBeforeRender(node: *Node) void {
             }
 
             const underline_y = container_inner_y + @as(f32, @floatFromInt(display_line)) * state.line_height - scroll_y + cursor_h - 1;
-            const accent = Color.rgba(state.tokens.color.accent.r, state.tokens.color.accent.g, state.tokens.color.accent.b, 220);
+            const accent = Color.rgba(state.tokens.tokens.color.accent.r, state.tokens.tokens.color.accent.g, state.tokens.tokens.color.accent.b, 220);
             if (rects.items.len > 0) {
                 const first = rects.items[0];
                 line.setLayoutRect(.{ .x = @round(container_inner_x + first.x), .y = @round(underline_y), .w = @round(@max(first.width, 1)), .h = 1.0 });
@@ -1831,10 +2236,11 @@ test "TextareaState: IME preedit text is fused into display segment content" {
     defer doc.deinit();
     doc.setText("abcd");
 
-    var wm = TextareaWrapMap.init(std.testing.allocator);
+    var wm = TextareaWrapMap.init(std.testing.allocator, @import("std").testing.io);
     defer wm.deinit();
 
     var state = TextareaState{
+        .io = std.testing.io,
         .doc = &doc,
         .wrap_map = &wm,
         .allocator = std.testing.allocator,
@@ -1855,10 +2261,11 @@ test "TextareaState: IME boundary insertion prefers next wrapped segment" {
     defer doc.deinit();
     doc.setText("abcd");
 
-    var wm = TextareaWrapMap.init(std.testing.allocator);
+    var wm = TextareaWrapMap.init(std.testing.allocator, @import("std").testing.io);
     defer wm.deinit();
 
     var state = TextareaState{
+        .io = std.testing.io,
         .doc = &doc,
         .wrap_map = &wm,
         .allocator = std.testing.allocator,
@@ -1878,10 +2285,11 @@ test "TextareaState: IME selection highlight keeps cursor at preedit end when of
     defer doc.deinit();
     doc.setText("ab");
 
-    var wm = TextareaWrapMap.init(std.testing.allocator);
+    var wm = TextareaWrapMap.init(std.testing.allocator, @import("std").testing.io);
     defer wm.deinit();
 
     var state = TextareaState{
+        .io = std.testing.io,
         .doc = &doc,
         .wrap_map = &wm,
         .allocator = std.testing.allocator,
@@ -1894,9 +2302,9 @@ test "TextareaState: IME selection highlight keeps cursor at preedit end when of
 }
 
 test "TextareaState: production caret order hit testing and vertical x survive isolates and overrides" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
-    var fonts = try core_ui.FontSystem.init(std.testing.allocator);
+    var fonts = try core_ui.FontSystem.init(std.testing.allocator, @import("std").testing.io);
     defer fonts.deinit();
     cx.text.setFontSystem(&fonts);
     defer cx.text.clearFontSystem();
@@ -1907,13 +2315,14 @@ test "TextareaState: production caret order hit testing and vertical x survive i
     var doc = TextareaDocument.init(std.testing.allocator);
     defer doc.deinit();
     doc.setText(document_text);
-    var wm = TextareaWrapMap.init(std.testing.allocator);
+    var wm = TextareaWrapMap.init(std.testing.allocator, @import("std").testing.io);
     defer wm.deinit();
     wm.setEnabled(true, &doc);
     wm.setWrapWidth(10000, &doc);
     _ = wm.rewrapInterpolatedAll(&doc);
 
     var state = TextareaState{
+        .io = std.testing.io,
         .doc = &doc,
         .wrap_map = &wm,
         .allocator = std.testing.allocator,
@@ -1960,9 +2369,9 @@ test "TextareaState: production caret order hit testing and vertical x survive i
 }
 
 test "Textarea accessibility range frame shares mixed-bidi VisualLine geometry" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
-    var fonts = try core_ui.FontSystem.init(std.testing.allocator);
+    var fonts = try core_ui.FontSystem.init(std.testing.allocator, @import("std").testing.io);
     defer fonts.deinit();
     cx.text.setFontSystem(&fonts);
     defer cx.text.clearFontSystem();
@@ -1971,13 +2380,14 @@ test "Textarea accessibility range frame shares mixed-bidi VisualLine geometry" 
     var doc = TextareaDocument.init(std.testing.allocator);
     defer doc.deinit();
     doc.setText(content);
-    var wm = TextareaWrapMap.init(std.testing.allocator);
+    var wm = TextareaWrapMap.init(std.testing.allocator, @import("std").testing.io);
     defer wm.deinit();
     wm.setEnabled(true, &doc);
     wm.setWrapWidth(10_000, &doc);
     _ = wm.rewrapInterpolatedAll(&doc);
 
     var state = TextareaState{
+        .io = std.testing.io,
         .doc = &doc,
         .wrap_map = &wm,
         .allocator = std.testing.allocator,
@@ -2012,17 +2422,83 @@ test "Textarea accessibility range frame shares mixed-bidi VisualLine geometry" 
     try std.testing.expectApproxEqAbs(@max(expected_max - expected_min, 1), frame.width, 0.01);
     try std.testing.expectApproxEqAbs(state.container_y + state.padding_v, frame.y, 0.01);
     try std.testing.expectApproxEqAbs(state.line_height, frame.height, 0.01);
+
+    var placements: std.ArrayListUnmanaged(TextareaState.SelectionPlacement) = .empty;
+    defer placements.deinit(std.testing.allocator);
+    // Cross the LTR/RTL boundary and keep each visual piece, rather than
+    // replacing the result with the enclosing frame used by the IME API.
+    const mixed_rects = try line.selectionRects(.{ .value = 2 }, .{ .value = 6 }, storage);
+    try state.collectRangePlacements(2, 6, std.testing.allocator, &placements);
+    try std.testing.expectEqual(mixed_rects.len, placements.items.len);
+    for (mixed_rects, placements.items) |expected, actual| {
+        try std.testing.expectEqual(@as(u32, 0), actual.display_line);
+        try std.testing.expectEqualDeep(expected, actual.rect);
+    }
+    try std.testing.expectEqual(@as(usize, 0), state.cursor.offset);
+    try std.testing.expect(state.cursor.anchor == null);
+}
+
+test "TextareaState: owned accessibility geometry preserves shaped spans and rejects pending layout" {
+    const t = std.testing;
+    var cx = try Cx.init(t.allocator, std.testing.io);
+    defer cx.deinit();
+    var fonts = try core_ui.FontSystem.init(t.allocator, @import("std").testing.io);
+    defer fonts.deinit();
+    cx.text.setFontSystem(&fonts);
+    defer cx.text.clearFontSystem();
+    var doc = TextareaDocument.init(t.allocator);
+    defer doc.deinit();
+    const content = "abc \u{05D0}\u{05D1}\u{05D2} 12\nx";
+    try doc.setTextChecked(content);
+    var wm = TextareaWrapMap.init(t.allocator, @import("std").testing.io);
+    defer wm.deinit();
+    wm.setEnabled(true, &doc);
+    wm.setWrapWidth(10000, &doc);
+    _ = wm.rewrapInterpolatedAll(&doc);
+    var state: TextareaState = .{ .io = @import("std").testing.io, .doc = &doc, .wrap_map = &wm, .allocator = t.allocator, .cx_ref = cx, .font_size = 16, .line_height = 20, .container_x = 11, .container_y = 13, .padding_h = 7, .padding_v = 5 };
+    defer state.deinit();
+    const owned = try textareaA11yGeometry(&state, t.allocator);
+    defer t.allocator.free(owned);
+    var index: usize = 0;
+    for (0..wm.displayLineCount()) |row| {
+        const span = safeSegRange(&doc, wm.displayLineInfo(@intCast(row), &doc));
+        const line = try cx.text.visualLine(.{ .text = content[span.start..span.end], .font_family = "system", .font_size = 16 });
+        var segments = line.selectionSegments();
+        while (segments.next()) |segment| {
+            if (segment.rect.width <= 0) continue;
+            try t.expect(index < owned.len);
+            const actual = owned[index];
+            try t.expectEqual(span.start + segment.start.value, actual.start);
+            try t.expectEqual(span.start + segment.end.value, actual.end);
+            try t.expectApproxEqAbs(18 + segment.rect.x, actual.rect.x, 0.01);
+            try t.expectApproxEqAbs(18 + @as(f32, @floatFromInt(row)) * 20, actual.rect.y, 0.01);
+            try t.expectEqual(segment.rect.width, actual.rect.width);
+            try t.expectEqual(@as(f32, 20), actual.rect.height);
+            index += 1;
+        }
+    }
+    try t.expect(index > 1 and index == owned.len);
+    const preserved = owned[0];
+    wm.has_interpolated_lines = true;
+    try t.expectError(error.AccessibilityLayoutPending, textareaA11yGeometry(&state, t.allocator));
+    wm.has_interpolated_lines = false;
+    try doc.setTextChecked("replacement");
+    wm.rebuildAll(&doc);
+    _ = wm.rewrapInterpolatedAll(&doc);
+    try t.expectEqualDeep(preserved, owned[0]);
+    try t.expectEqual(@as(usize, 0), state.cursor.offset);
+    try t.expect(state.cursor.anchor == null);
 }
 
 test "TextareaState: selection geometry has no sixteen-line ceiling" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
-    var fonts = try core_ui.FontSystem.init(std.testing.allocator);
+    var fonts = try core_ui.FontSystem.init(std.testing.allocator, @import("std").testing.io);
     defer fonts.deinit();
     cx.text.setFontSystem(&fonts);
     defer cx.text.clearFontSystem();
 
-    var source: std.ArrayListUnmanaged(u8) = .{};
+    var source: std.ArrayListUnmanaged(u8) = .empty;
     defer source.deinit(std.testing.allocator);
     for (0..40) |line_index| {
         try source.appendSlice(std.testing.allocator, "abc \u{05D0}\u{05D1} 12");
@@ -2031,12 +2507,13 @@ test "TextareaState: selection geometry has no sixteen-line ceiling" {
     var doc = TextareaDocument.init(std.testing.allocator);
     defer doc.deinit();
     doc.setText(source.items);
-    var wm = TextareaWrapMap.init(std.testing.allocator);
+    var wm = TextareaWrapMap.init(std.testing.allocator, @import("std").testing.io);
     defer wm.deinit();
     wm.setEnabled(true, &doc);
     wm.setWrapWidth(10000, &doc);
     _ = wm.rewrapInterpolatedAll(&doc);
     var state = TextareaState{
+        .io = std.testing.io,
         .doc = &doc,
         .wrap_map = &wm,
         .allocator = std.testing.allocator,
@@ -2047,7 +2524,7 @@ test "TextareaState: selection geometry has no sixteen-line ceiling" {
     state.cursor.anchor = 0;
     state.cursor.offset = doc.totalLength();
 
-    var placements: std.ArrayListUnmanaged(TextareaState.SelectionPlacement) = .{};
+    var placements: std.ArrayListUnmanaged(TextareaState.SelectionPlacement) = .empty;
     defer placements.deinit(std.testing.allocator);
     try state.collectSelectionPlacements(std.testing.allocator, &placements);
     try std.testing.expect(placements.items.len >= 40);
@@ -2055,16 +2532,66 @@ test "TextareaState: selection geometry has no sixteen-line ceiling" {
         try std.testing.expect(placement.rect.width >= 0);
         try std.testing.expect(std.math.isFinite(placement.rect.x));
     }
+    // Accessibility queries can ask for text unrelated to the live selection.
+    // Clearing the cursor must leave arbitrary-range geometry unchanged.
+    state.cursor.anchor = null;
+    state.cursor.offset = 3;
+    var queried: std.ArrayListUnmanaged(TextareaState.SelectionPlacement) = .empty;
+    defer queried.deinit(std.testing.allocator);
+    try state.collectRangePlacements(0, doc.totalLength(), std.testing.allocator, &queried);
+    try std.testing.expectEqualDeep(placements.items, queried.items);
+    try std.testing.expectEqual(@as(usize, 3), state.cursor.offset);
+    try std.testing.expect(state.cursor.anchor == null);
+}
+
+test "TextareaState: arbitrary range geometry respects exclusive wrap ends and scalar bounds" {
+    const t = std.testing;
+    var doc = TextareaDocument.init(t.allocator);
+    defer doc.deinit();
+    try doc.setTextChecked("abcdefgh\nx");
+    var wm = TextareaWrapMap.init(t.allocator, @import("std").testing.io);
+    defer wm.deinit();
+    wm.char_width = 8;
+    wm.setEnabled(true, &doc);
+    wm.setWrapWidth(32, &doc);
+    _ = wm.rewrapInterpolatedAll(&doc);
+    var state: TextareaState = .{ .io = @import("std").testing.io, .doc = &doc, .wrap_map = &wm, .allocator = t.allocator };
+    defer state.deinit();
+    state.cursor.offset = 10;
+    state.cursor.anchor = 9;
+    var placements: std.ArrayListUnmanaged(TextareaState.SelectionPlacement) = .empty;
+    defer placements.deinit(t.allocator);
+    try state.collectRangePlacements(0, 4, t.allocator, &placements);
+    try t.expectEqual(@as(usize, 1), placements.items.len);
+    try t.expectEqual(@as(u32, 0), placements.items[0].display_line);
+    placements.clearRetainingCapacity();
+    try state.collectRangePlacements(4, 9, t.allocator, &placements);
+    try t.expectEqual(@as(usize, 1), placements.items.len);
+    try t.expectEqual(@as(u32, 1), placements.items[0].display_line);
+    placements.clearRetainingCapacity();
+    try state.collectRangePlacements(4, 4, t.allocator, &placements);
+    try t.expectEqual(@as(usize, 0), placements.items.len);
+    try t.expectError(error.InvalidTextRange, state.collectRangePlacements(4, 3, t.allocator, &placements));
+    try t.expectError(error.InvalidTextRange, state.collectRangePlacements(0, 11, t.allocator, &placements));
+    try t.expectEqual(@as(usize, 10), state.cursor.offset);
+    try t.expectEqual(@as(?usize, 9), state.cursor.anchor);
+    try doc.setTextChecked("A中😀B");
+    wm.rebuildAll(&doc);
+    _ = wm.rewrapInterpolatedAll(&doc);
+    try t.expectError(error.InvalidTextRange, state.collectRangePlacements(2, 4, t.allocator, &placements));
+    try t.expectError(error.InvalidTextRange, state.collectRangePlacements(1, 6, t.allocator, &placements));
+    try t.expectEqual(@as(usize, 0), placements.items.len);
 }
 
 test "TextareaState: long IME composition preserves complete graphemes" {
-    var long_line: [4096]u8 = [_]u8{'x'} ** 4096;
+    var long_line: [4096]u8 = @as([4096]u8, @splat('x'));
     var doc = TextareaDocument.init(std.testing.allocator);
     defer doc.deinit();
     doc.setText(&long_line);
-    var wm = TextareaWrapMap.init(std.testing.allocator);
+    var wm = TextareaWrapMap.init(std.testing.allocator, @import("std").testing.io);
     defer wm.deinit();
     var state = TextareaState{
+        .io = std.testing.io,
         .doc = &doc,
         .wrap_map = &wm,
         .allocator = std.testing.allocator,
@@ -2077,7 +2604,7 @@ test "TextareaState: long IME composition preserves complete graphemes" {
     try std.testing.expectEqual(long_line.len + "👩‍💻".len, composed.len);
     try std.testing.expectEqualStrings("👩‍💻", composed[3000 .. 3000 + "👩‍💻".len]);
 
-    var oversized: [300]u8 = [_]u8{'a'} ** 300;
+    var oversized: [300]u8 = @as([300]u8, @splat('a'));
     const emoji = "👩‍💻";
     @memcpy(oversized[255 .. 255 + emoji.len], emoji);
     state.handleImePreedit(oversized[0 .. 255 + emoji.len], @intCast(255 + emoji.len));
@@ -2086,84 +2613,196 @@ test "TextareaState: long IME composition preserves complete graphemes" {
 }
 
 // ============================================================================
-// 公共 API：Textarea 组件
+// Public API: Textarea component
 // ============================================================================
 
 pub const TextareaProps = struct {
-    value: ?[]const u8 = null,
-    placeholder: ?[]const u8 = null,
-    label_text: ?[]const u8 = null,
-    helper: ?[]const u8 = null,
-    error_msg: ?[]const u8 = null,
+    /// Text value. Literal = self-held initial; `*Signal([]const u8)` controlled (interaction
+    /// writes directly; must be created by `scope.createText`); `ui.split` intercepted by parent.
+    /// External write rules same as Input.
+    value: Model([]const u8) = .{ .local = "" },
+    /// Placeholder / label / helper / error ("" = none; can pass signal)
+    placeholder: Source([]const u8) = .{ .value = "" },
+    label_text: Source([]const u8) = .{ .value = "" },
+    helper: Source([]const u8) = .{ .value = "" },
+    error_msg: Source([]const u8) = .{ .value = "" },
     rows: u32 = 4,
-    disabled: bool = false,
+    disabled: Source(bool) = .{ .value = false },
     required: bool = false,
     readonly: bool = false,
     width: ?f32 = null,
-    on_change: ?core_ui.HandlerRef = null,
-    context: ?*anyopaque = null,
+    /// Called after user edit settled (landed value; slice only valid during callback)
+    on_change: ?Handler([]const u8) = null,
 };
 
-pub fn Textarea(props: TextareaProps) TextareaBuilder {
-    return .{ .props = props };
+/// Create multiline text box: `W.Textarea(.{ .value = notes, .rows = 5 })`
+pub fn Textarea(props: anytype) TextareaBuilder {
+    return .{ .props = reactive.props.coerce(TextareaProps, props) };
 }
 
-pub const TextareaMount = struct {
+pub const TextareaResult = struct {
     wrapper: *Node,
     input: *Node,
+    /// Edit state (read cursor / composition etc interaction detail; write text via `value`)
     state: *TextareaState,
+    /// Text value signal (`ui.split` is null)
+    value: ?*Signal([]const u8),
+
+    /// `ui.view` hookup: `v.capture(&st.ta, W.Textarea(...))` grab edit state,
+    /// `.parts = .{ .input = "id" }` mark input.
+    pub fn viewParts(self: TextareaResult) core_ui.ViewParts {
+        return .{ .root = self.wrapper };
+    }
+};
+
+/// Textarea value binding (see binding.zig)
+pub const TextareaBinding = binding_mod.TextBinding(TextareaState);
+
+const label_row_h: f32 = 22;
+const helper_row_h: f32 = 20;
+
+/// Surrounding dynamics (all-static doesn't build effect): label / helper+error / placeholder /
+/// disabled
+const TextareaChrome = struct {
+    state: *TextareaState,
+    cx: *Cx,
+    tokens: *const ThemeTokens,
+    label: Source([]const u8),
+    helper: Source([]const u8),
+    error_msg: Source([]const u8),
+    placeholder: Source([]const u8),
+    disabled: Source(bool),
+    wrapper: *Node,
+    textarea_node: *Node,
+    field_h: f32,
+    label_node: ?*Node = null,
+    helper_node: ?*Node = null,
+    placeholder_copy: []u8 = &.{},
+    shown_disabled: bool = false,
+
+    fn effect(self: *TextareaChrome) void {
+        self.apply(true) catch |err| std.log.err("[Textarea] updating chrome failed: {}", .{err});
+    }
+
+    fn apply(self: *TextareaChrome, comptime tracked: bool) !void {
+        const a = self.cx.allocator;
+        var height = self.field_h;
+        if (self.label_node) |ln| {
+            const text = self.label.read(tracked);
+            if (!std.mem.eql(u8, ln.getText().?.content, text)) try ln.setTextContent(a, text);
+            ln.setDisplay(if (text.len > 0) .flex else .none);
+            if (text.len > 0) height += label_row_h;
+            if (self.textarea_node.behavior.interaction.a11y) |*attrs| attrs.label = ln.getText().?.content;
+        }
+        if (!self.placeholder.isStatic()) {
+            const ph = self.placeholder.read(tracked);
+            if (!std.mem.eql(u8, self.placeholder_copy, ph)) {
+                const copy = try a.dupe(u8, ph);
+                a.free(self.placeholder_copy);
+                self.placeholder_copy = copy;
+                self.state.placeholder_text = if (copy.len > 0) copy else null;
+                if (self.textarea_node.behavior.interaction.a11y) |*attrs| attrs.placeholder = self.state.placeholder_text;
+                self.state.markDirty();
+            }
+        }
+        const err_text = self.error_msg.read(tracked);
+        const help_text = self.helper.read(tracked);
+        const has_error = err_text.len > 0;
+        if (has_error != self.state.has_error) {
+            self.state.has_error = has_error;
+            if (!self.state.focused) self.textarea_node.setBorderColor(self.restingBorder());
+            if (self.textarea_node.behavior.interaction.a11y) |*attrs| attrs.invalid = has_error;
+            self.textarea_node.markRenderDirty();
+        }
+        if (self.helper_node) |hn| {
+            const shown = if (has_error) err_text else help_text;
+            if (!std.mem.eql(u8, hn.getText().?.content, shown)) try hn.setTextContent(a, shown);
+            var txt = hn.getText().?;
+            txt.color = styles.textareaHelperStyle(self.tokens, has_error).color;
+            hn.setText(txt);
+            hn.setDisplay(if (shown.len > 0) .flex else .none);
+            if (shown.len > 0) height += helper_row_h;
+            hn.markRenderDirty();
+        }
+        self.wrapper.style.height = .{ .px = height };
+        self.wrapper.markLayoutDirty();
+        const disabled = self.disabled.read(tracked);
+        if (disabled != self.shown_disabled) self.applyDisabled(disabled);
+    }
+
+    fn restingBorder(self: *const TextareaChrome) Color {
+        return styles.textareaInitialBorderColor(self.tokens, self.state.has_error, self.state.disabled);
+    }
+
+    fn applyDisabled(self: *TextareaChrome, disabled: bool) void {
+        self.shown_disabled = disabled;
+        self.state.disabled = disabled;
+        const node = self.textarea_node;
+        node.setBackground(styles.textareaBackground(self.tokens, disabled));
+        node.setBorderColor(self.restingBorder());
+        node.style.cursor = if (disabled) .default else .text;
+        // Blur first (dispatch blur, run original on_blur cleanup) then set unfocusable
+        if (disabled) {
+            self.state.cancelImeComposition();
+            if (self.cx.focus_manager.getFocused() == node) self.cx.clearFocus();
+        }
+        node.setFocusable(!disabled);
+        if (node.behavior.interaction.a11y) |*attrs| attrs.disabled = disabled;
+        node.markRenderDirty();
+    }
+
+    fn destroy(ptr: *anyopaque, alloc: Allocator) void {
+        const self: *TextareaChrome = @ptrCast(@alignCast(ptr));
+        self.cx.allocator.free(self.placeholder_copy);
+        alloc.destroy(self);
+    }
 };
 
 pub const TextareaBuilder = struct {
     props: TextareaProps,
 
-    pub fn placeholder(self: TextareaBuilder, t: []const u8) TextareaBuilder {
-        var n = self;
-        n.props.placeholder = t;
-        return n;
-    }
-    pub fn label(self: TextareaBuilder, t: []const u8) TextareaBuilder {
-        var n = self;
-        n.props.label_text = t;
-        return n;
-    }
-    pub fn rows(self: TextareaBuilder, r: u32) TextareaBuilder {
-        var n = self;
-        n.props.rows = r;
-        return n;
-    }
-    pub fn required(self: TextareaBuilder, value: bool) TextareaBuilder {
-        var n = self;
-        n.props.required = value;
-        return n;
-    }
-    pub fn readonly(self: TextareaBuilder, value: bool) TextareaBuilder {
-        var n = self;
-        n.props.readonly = value;
-        return n;
-    }
-
     pub fn mount(self: TextareaBuilder, scope: *Scope, cx: *Cx) !*Node {
-        return (try self.mountWithState(scope, cx)).wrapper;
+        return (try self.mountResult(scope, cx)).wrapper;
     }
 
-    /// Mounts the same component while exposing its editor state for demos and
-    /// integrations that need an imperative edit action.
-    pub fn mountWithState(self: TextareaBuilder, scope: *Scope, cx: *Cx) !TextareaMount {
+    /// `ui.view` hookup (see TextareaResult.viewParts).
+    pub fn viewMount(self: TextareaBuilder, scope: *Scope, cx: *Cx) !TextareaResult {
+        return self.mountResult(scope, cx);
+    }
+
+    /// Mount and return edit state + value signal
+    pub fn mountResult(self: TextareaBuilder, scope: *Scope, cx: *Cx) !TextareaResult {
+        cx.owner.enterMount();
+        defer cx.owner.exitMount();
         const my_scope = try scope.childScope();
+        var scope_bound = false;
+        errdefer if (!scope_bound) my_scope.dispose();
         const allocator = cx.allocator;
         const t = cx.tokens;
         const p = self.props;
-        const has_error = p.error_msg != null;
+        reactive.checkBorrow(my_scope, p.placeholder);
+        reactive.checkBorrow(my_scope, p.label_text);
+        reactive.checkBorrow(my_scope, p.helper);
+        reactive.checkBorrow(my_scope, p.error_msg);
+        reactive.checkBorrow(my_scope, p.disabled);
+        const has_error = p.error_msg.peek().len > 0;
+        const disabled0 = p.disabled.peek();
+        // Static disable as-is: disabled look, no event handler; dynamic by TextareaChrome gate
+        const static_disabled = p.disabled.isStatic() and disabled0;
+        const chrome_dynamic = !p.label_text.isStatic() or !p.helper.isStatic() or !p.error_msg.isStatic() or
+            !p.placeholder.isStatic() or !p.disabled.isStatic();
         const line_height: f32 = 20;
         const font_size: f32 = 13;
         const char_width: f32 = 7.8;
         const pad: f32 = 8;
 
-        // TextareaDocument
+        const value = try reactive.resolveTextModel(my_scope, p.value);
+
         const doc = try my_scope.allocator.create(TextareaDocument);
-        doc.* = TextareaDocument.init(my_scope.allocator);
-        if (p.value) |v| doc.setText(v);
+        doc.* = TextareaDocument.initFallible(my_scope.allocator) catch |err| {
+            my_scope.allocator.destroy(doc);
+            return err;
+        };
         try my_scope.adoptResource(@ptrCast(doc), struct {
             fn d(ptr: *anyopaque, alloc: Allocator) void {
                 const dd: *TextareaDocument = @ptrCast(@alignCast(ptr));
@@ -2171,6 +2810,8 @@ pub const TextareaBuilder = struct {
                 alloc.destroy(dd);
             }
         }.d);
+        const initial_value = value.peek();
+        if (initial_value.len > 0) try doc.setTextChecked(initial_value);
 
         // Measure through this window's Cx; the legacy context-free callback
         // can otherwise select a different live window's FontSelector.
@@ -2180,7 +2821,7 @@ pub const TextareaBuilder = struct {
 
         // WrapMap
         const wm = try my_scope.allocator.create(TextareaWrapMap);
-        wm.* = TextareaWrapMap.init(my_scope.allocator);
+        wm.* = TextareaWrapMap.init(my_scope.allocator, cx.io);
         wm.measure_ctx_fn = Cx.measureTextWidthCallback;
         wm.measure_ctx = cx;
         wm.char_width = real_char_width;
@@ -2194,9 +2835,13 @@ pub const TextareaBuilder = struct {
             }
         }.d);
 
+        // Static placeholder borrows caller literal; dynamic held by TextareaChrome copy
+        const placeholder0: ?[]const u8 = if (p.placeholder.isStatic() and p.placeholder.peek().len > 0) p.placeholder.peek() else null;
+
         // TextareaState
         const state = try my_scope.allocator.create(TextareaState);
         state.* = TextareaState{
+            .io = cx.io,
             .doc = doc,
             .wrap_map = wm,
             .allocator = my_scope.allocator,
@@ -2206,13 +2851,13 @@ pub const TextareaBuilder = struct {
             .line_height = line_height,
             .padding_h = pad,
             .padding_v = pad,
-            .placeholder_text = p.placeholder,
-            .on_change = p.on_change,
+            .placeholder_text = placeholder0,
             .cx_ref = cx,
             .tokens = t,
             .has_error = has_error,
+            .disabled = disabled0,
         };
-        if (p.value) |_| state.cursor.offset = doc.totalLength();
+        if (initial_value.len > 0) state.cursor.offset = doc.totalLength();
         try my_scope.adoptResource(@ptrCast(state), struct {
             fn d(ptr: *anyopaque, alloc: Allocator) void {
                 const s: *TextareaState = @ptrCast(@alignCast(ptr));
@@ -2221,8 +2866,15 @@ pub const TextareaBuilder = struct {
             }
         }.d);
 
-        // 初始化 wrap
-        // WrapMap 宽度在 beforeRender 首帧由实际容器宽度初始化（mount 时布局还没完成）
+        // Value binding: edit outlet / composition cancel both go through it
+        const binding = try my_scope.allocator.create(TextareaBinding);
+        binding.* = .{ .state = state, .value = value, .on_change = p.on_change };
+        try my_scope.adoptResource(@ptrCast(binding), TextareaBinding.destroy);
+        binding.install();
+
+        // Initialize wrap.
+        // WrapMap width initialized on first beforeRender frame by actual container width (layout
+        // not done at mount)
         if (p.width) |w| {
             const inner_w = @max(@as(f32, 0), w - pad * 2);
             state.input_inner_w = inner_w;
@@ -2233,108 +2885,151 @@ pub const TextareaBuilder = struct {
         _ = wm.takePendingPatch();
 
         const textarea_height = line_height * @as(f32, @floatFromInt(p.rows));
+        const label0 = p.label_text.peek();
+        const helper0 = if (has_error) p.error_msg.peek() else p.helper.peek();
+        const build_label = !p.label_text.isStatic() or label0.len > 0;
+        const build_helper = !p.helper.isStatic() or !p.error_msg.isStatic() or helper0.len > 0;
         var wrapper_height: f32 = textarea_height;
-        if (p.label_text != null) wrapper_height += 22;
-        if (has_error or p.helper != null) wrapper_height += 20;
+        if (label0.len > 0) wrapper_height += label_row_h;
+        if (helper0.len > 0) wrapper_height += helper_row_h;
 
-        // 节点树
-        const wrapper = try box(cx, .{ .width = if (p.width) |w| .{ .px = w } else .{ .grow = .{} }, .height = .{ .px = wrapper_height }, .direction = .column, .gap = 4 }, .{});
+        const field_radius: f32 = 8;
+        const textarea_bg = styles.textareaBackground(t, disabled0);
+        const border_color = styles.textareaInitialBorderColor(t, has_error, disabled0);
+        const fill_inset: core_ui.Inset = .{ .top = .{ .px = 0 }, .left = .{ .px = 0 }, .right = .{ .px = 0 }, .bottom = .{ .px = 0 } };
+        const zero_box: core_ui.BoxStyle = .{ .width = .{ .px = 0 }, .height = .{ .px = 0 } };
+        const layer_style: core_ui.BoxStyle = .{
+            .width = .{ .grow = .{} },
+            .height = .{ .grow = .{} },
+            .position = .absolute,
+            .inset = fill_inset,
+            .hit_behavior = .pass_through,
+        };
+
+        // Node tree (wrapper kept to return, disposedScope bound to it)
+        const Parts = struct {
+            label: ?*Node = null,
+            field_shell: *Node = undefined,
+            textarea: *Node = undefined,
+            underlay: *Node = undefined,
+            selection: *Node = undefined,
+            helper: ?*Node = null,
+        };
+        var parts: Parts = .{};
+        const wrapper = try view.render(my_scope, cx, view.col(.{ .style = core_ui.BoxStyle{
+            .width = if (p.width) |w| .{ .px = w } else .{ .grow = .{} },
+            .height = .{ .px = wrapper_height },
+            .gap = 4,
+        } }, .{
+            // Label (dynamic always built, hidden when empty): fixed-height box + own text
+            if (build_label) view.capture(&parts.label, view.setup(view.box(.{
+                .style = .{ .height = .{ .px = 18 } },
+                .visible = label0.len > 0,
+            }, {}), BoxText{ .style = styles.textareaLabelStyle(t), .content = label0 }, BoxText.apply)) else null,
+            view.capture(&parts.field_shell, view.col(.{ .style = core_ui.BoxStyle{
+                .width = .{ .grow = .{} },
+                .height = .{ .px = textarea_height },
+                .border = .{ .radius = field_radius },
+            } }, .{
+                view.capture(&parts.textarea, view.box(.{
+                    .style = core_ui.BoxStyle{
+                        .width = .{ .grow = .{} },
+                        .height = .{ .px = textarea_height },
+                        .background = textarea_bg,
+                        .border = .{ .width = 1, .color = border_color, .radius = field_radius },
+                        .overflow_hidden = true,
+                        .hit_shape = .{ .rounded_rect = field_radius },
+                        .clip_shape = .{ .rounded_rect = field_radius },
+                        // Explicitly declared scroll target to prevent wheel steal by outer
+                        // ScrollArea.
+                        .hit_roles = .{ .pointer = true, .scroll = true, .inspect = true },
+                        .cursor = if (!disabled0) .text else null,
+                    },
+                    .focusable = !disabled0,
+                }, .{
+                    // Selection underlay, append before text (vl.container):
+                    // selection color blocks glyphs when after. Before, selection was in overlay
+                    // after text,
+                    // paint order inverted, selected text buried.
+                    view.capture(&parts.underlay, view.box(.{ .style = layer_style }, .{
+                        view.capture(&parts.selection, view.box(.{ .style = zero_box }, {})),
+                    })),
+                })),
+            })),
+            // Helper / error text (dynamic always built, hidden when empty): fixed-height + own
+            // text
+            if (build_helper) view.capture(&parts.helper, view.setup(view.box(.{
+                .style = .{ .height = .{ .px = 16 } },
+                .visible = helper0.len > 0,
+            }, {}), BoxText{ .style = styles.textareaHelperStyle(t, has_error), .content = helper0 }, BoxText.apply)) else null,
+        }));
+        errdefer cx.freeNode(wrapper);
         wrapper.meta.ownership.meta.component_name = "Textarea";
         wrapper.frame_state.state_bits.flags.disable_render_cache = true;
         try core_ui.bindScopeToNode(my_scope, wrapper);
+        scope_bound = true;
+        wrapper.addDebugState(@ptrCast(state));
 
-        // 标签
-        if (p.label_text) |lbl| {
-            const label_node = try box(cx, .{ .height = .{ .px = 18 } }, .{});
-            var label_txt = styles.textareaLabelStyle(t);
-            label_txt.content = lbl;
-            label_node.setText(label_txt);
-            try wrapper.appendChild(allocator, label_node);
-        }
-
-        const field_radius: f32 = 8;
-        const field_shell = try box(cx, .{ .width = .{ .grow = .{} }, .height = .{ .px = textarea_height }, .border = .{ .radius = field_radius }, .direction = .column }, .{});
-
-        const textarea_bg = styles.textareaBackground(t, p.disabled);
-        const border_color = styles.textareaInitialBorderColor(t, has_error, p.disabled);
-        const textarea_node = try box(cx, .{ .width = .{ .grow = .{} }, .height = .{ .px = textarea_height }, .background = textarea_bg, .border = .{ .width = 1, .color = border_color, .radius = field_radius }, .overflow_hidden = true }, .{});
+        const label_text_node = parts.label;
+        const field_shell = parts.field_shell;
+        const textarea_node = parts.textarea;
+        // view doesn't declare node tag: edit area is semantic input node
         textarea_node.tag = .input;
-        textarea_node.setFocusable(true);
         textarea_node.behavior.interaction.a11y = .{
             .role = .textarea,
             // Keep an unlabeled editor unlabeled; its value is exposed through
             // AXValue, not recycled as a changing accessible name.
-            .label = p.label_text orelse "",
-            .placeholder = p.placeholder,
-            .disabled = p.disabled,
+            .label = if (label_text_node) |ln| ln.getText().?.content else "",
+            .placeholder = placeholder0,
+            .disabled = disabled0,
             .required = p.required,
             .readonly = p.readonly,
             .invalid = has_error,
             .multiline = true,
         };
-        if (!p.disabled and !p.readonly) {
+        if (!static_disabled and !p.readonly) {
             textarea_node.behavior.interaction.text_input_client = textareaLiveClient(state);
         }
-        const te = textarea_node.style.ensureExtPanic(allocator);
-        te.hit_shape = .{ .rounded_rect = field_radius };
-        te.clip_shape = .{ .rounded_rect = field_radius };
-        // 显式声明为 scroll 命中目标，避免滚轮被外层 ScrollArea 抢占。
-        te.hit_roles = .{ .pointer = true, .scroll = true, .inspect = true };
-        if (!p.disabled) textarea_node.style.cursor = .text;
         state.focus_ring_host = field_shell;
         state.input_container_node = textarea_node;
         textarea_node.applyTransition(allocator, &comptime recipe_mod.transition("border-color 150ms"));
+        state.selection_underlay_node = parts.underlay;
+        state.selection_node = parts.selection;
 
-        // VirtualList
+        // VirtualList (callback component: rows built on-demand by textareaRenderItem;
+        // container appended ready). Existing node skips view.mount: it has ambiguous cleanup
+        // responsibility for *Node children (see Input's shell.node).
         const initial_lc = @max(@as(u32, 1), wm.displayLineCount());
         const vl = try virtual_list.VirtualList(.{ .item_count = initial_lc, .item_height = line_height, .overscan = 3 }).mountWithContext(my_scope, cx, @ptrCast(state), null, textareaRenderItem);
-        state.vl_state = vl.state;
+        _ = try core_ui.adoptChild(cx, allocator, textarea_node, vl.container);
         vl.container.style.width = .{ .grow = .{} };
         vl.container.style.height = .{ .grow = .{} };
         vl.container.style.padding = Padding.all(pad);
-        const vl_ext = vl.container.style.ensureExtPanic(allocator);
-        const textarea_inner_shadow_alpha: u8 = if (t.color.input_bg.r <= 64 and t.color.input_bg.g <= 64 and t.color.input_bg.b <= 64) 84 else 40;
+        const vl_ext = try vl.container.style.ensureExtFallible(allocator);
+        const textarea_inner_shadow_alpha: u8 = if (t.tokens.color.input_bg.r <= 64 and t.tokens.color.input_bg.g <= 64 and t.tokens.color.input_bg.b <= 64) 84 else 40;
         vl_ext.overflow_fade = .{
             .size = 10,
             .color = Color.rgba(0, 0, 0, textarea_inner_shadow_alpha),
             .edges = .{ .top = true, .bottom = true, .left = false, .right = false },
         };
-        // Selection underlay，必须在文本(vl.container)之前 append:
-        // 选区色块要画在字形下面。之前选区挂在文本之后的 overlay 里,
-        // paint order 反转,选中的字直接被色块盖没。
-        const underlay = try box(cx, .{ .width = .{ .grow = .{} }, .height = .{ .grow = .{} }, .position = .absolute }, .{});
-        const ue = underlay.style.ensureExtPanic(allocator);
-        ue.inset = .{ .top = .{ .px = 0 }, .left = .{ .px = 0 }, .right = .{ .px = 0 }, .bottom = .{ .px = 0 } };
-        ue.hit_behavior = .pass_through;
-        state.selection_underlay_node = underlay;
-
-        const sel_node = try box(cx, .{ .width = .{ .px = 0 }, .height = .{ .px = 0 } }, .{});
-        state.selection_node = sel_node;
-        try underlay.appendChild(allocator, sel_node);
-        try textarea_node.appendChild(allocator, underlay);
-
-        try textarea_node.appendChild(allocator, vl.container);
-
-        // Overlay(preedit 下划线 + 光标，这两个要在文本之上)
-        const overlay = try box(cx, .{ .width = .{ .grow = .{} }, .height = .{ .grow = .{} }, .position = .absolute }, .{});
-        const oe = overlay.style.ensureExtPanic(allocator);
-        oe.inset = .{ .top = .{ .px = 0 }, .left = .{ .px = 0 }, .right = .{ .px = 0 }, .bottom = .{ .px = 0 } };
-        oe.hit_behavior = .pass_through;
+        var overlay: *Node = undefined;
+        var preedit_underline: *Node = undefined;
+        var cursor_node: *Node = undefined;
+        try view.mount(my_scope, cx, textarea_node, .{
+            // Overlay (IME underline + cursor, both above text)
+            view.capture(&overlay, view.box(.{ .style = layer_style }, .{
+                view.capture(&preedit_underline, view.box(.{ .style = zero_box }, {})),
+                view.capture(&cursor_node, view.box(.{ .style = zero_box }, {})),
+            })),
+        });
+        state.vl_state = vl.state;
         state.overlay_node = overlay;
-
-        const preedit_node = try box(cx, .{ .width = .{ .px = 0 }, .height = .{ .px = 0 } }, .{});
-        state.preedit_underline_node = preedit_node;
-        try overlay.appendChild(allocator, preedit_node);
-
-        const cnode = try box(cx, .{ .width = .{ .px = 0 }, .height = .{ .px = 0 } }, .{});
-        state.cursor_node = cnode;
-        try overlay.appendChild(allocator, cnode);
-
-        try textarea_node.appendChild(allocator, overlay);
+        state.preedit_underline_node = preedit_underline;
+        state.cursor_node = cursor_node;
         textarea_node.meta.per_frame.hooks.before_render.main = textareaBeforeRender;
 
-        // 事件
-        if (!p.disabled and !p.readonly) {
+        // Events (dynamic disable also installs, entry gated by state.disabled)
+        if (!static_disabled and !p.readonly) {
             textarea_node.behavior.events.on_event = textareaEventHandler;
             textarea_node.behavior.events.event_context = state;
 
@@ -2345,7 +3040,7 @@ pub const TextareaBuilder = struct {
                         const s: *TextareaState = @ptrCast(@alignCast(c));
                         s.focused = true;
                         if (!s.has_error) if (s.input_container_node) |cn| {
-                            cn.setBorderColor(styles.borderColor(s.tokens, s.tokens.color.input_border, false, true, false));
+                            cn.setBorderColor(styles.borderColor(s.tokens, s.tokens.tokens.color.input_border, false, true, false));
                             cn.style.border.width = 1.5;
                             cn.markRenderDirty();
                         };
@@ -2362,13 +3057,14 @@ pub const TextareaBuilder = struct {
                         s.cancelImeComposition();
                         s.cursor.anchor = null;
                         s.is_dragging = false;
+                        s.drag_pointer = null;
                         s.suspend_drag_until_mouse_up = false;
                         s.consecutive_mouse_downs = 0;
                         s.last_mouse_down_instant = null;
                         if (!s.has_error) {
                             const hovered = if (s.hover_signal) |hs| hs.get() else false;
                             if (s.input_container_node) |cn| {
-                                cn.setBorderColor(styles.borderColor(s.tokens, s.tokens.color.input_border, hovered, false, false));
+                                cn.setBorderColor(styles.borderColor(s.tokens, s.tokens.tokens.color.input_border, hovered, false, false));
                                 cn.style.border.width = 1;
                                 cn.markRenderDirty();
                             }
@@ -2381,44 +3077,146 @@ pub const TextareaBuilder = struct {
 
             const is_hovered = try hooks.useHover(my_scope, textarea_node);
             state.hover_signal = is_hovered;
-            try my_scope.createEffect(.{ .textarea = textarea_node, .is_hovered = is_hovered, .has_error = has_error, .state = state, .tokens = t }, struct {
+            try my_scope.createEffect(.{ .textarea = textarea_node, .is_hovered = is_hovered, .state = state, .tokens = t }, struct {
                 fn u(c: anytype) void {
                     const hovered = c.is_hovered.get();
-                    if (styles.hoverBorderApplies(c.state.focused, c.has_error))
-                        c.textarea.setBorderColor(styles.borderColor(c.tokens, c.tokens.color.input_border, hovered, false, false));
+                    if (!c.state.disabled and styles.hoverBorderApplies(c.state.focused, c.state.has_error))
+                        c.textarea.setBorderColor(styles.borderColor(c.tokens, c.tokens.tokens.color.input_border, hovered, false, false));
                 }
             }.u);
             try hooks.useFocusRing(my_scope, cx, field_shell, .{ .offset = 0 });
         }
 
-        try field_shell.appendChild(allocator, textarea_node);
-        try wrapper.appendChild(allocator, field_shell);
+        const helper_text_node = parts.helper;
 
-        if (p.error_msg orelse p.helper) |ht| {
-            const hn = try box(cx, .{ .height = .{ .px = 16 } }, .{});
-            var helper_txt = styles.textareaHelperStyle(t, has_error);
-            helper_txt.content = ht;
-            hn.setText(helper_txt);
-            try wrapper.appendChild(allocator, hn);
+        if (chrome_dynamic) {
+            const chrome = try my_scope.allocator.create(TextareaChrome);
+            chrome.* = .{
+                .state = state,
+                .cx = cx,
+                .tokens = t,
+                .label = p.label_text,
+                .helper = p.helper,
+                .error_msg = p.error_msg,
+                .placeholder = p.placeholder,
+                .disabled = p.disabled,
+                .wrapper = wrapper,
+                .textarea_node = textarea_node,
+                .field_h = textarea_height,
+                .label_node = label_text_node,
+                .helper_node = helper_text_node,
+                .shown_disabled = disabled0,
+            };
+            try my_scope.adoptResource(@ptrCast(chrome), TextareaChrome.destroy);
+            // First sync apply (fail exits), then effect follows
+            try chrome.apply(false);
+            try my_scope.createEffect(chrome, TextareaChrome.effect);
         }
 
-        return .{
-            .wrapper = wrapper,
-            .input = textarea_node,
-            .state = state,
-        };
+        // value is Model: external write enters doc via effect (first run same as initial,
+        // short-circuit)
+        try my_scope.createEffect(binding, TextareaBinding.valueEffect);
+
+        return .{ .wrapper = wrapper, .input = textarea_node, .state = state, .value = value.asSignal() };
     }
 };
+
+test "textarea 用户编辑事务：压栈脱离重做栈后同一事务内撤销不泄漏" {
+    const t = std.testing;
+    var doc = TextareaDocument.init(t.allocator);
+    defer doc.deinit();
+    var wm = TextareaWrapMap.init(t.allocator, @import("std").testing.io);
+    defer wm.deinit();
+    var state: TextareaState = .{ .io = @import("std").testing.io, .doc = &doc, .wrap_map = &wm, .allocator = t.allocator };
+    defer state.deinit();
+    state.insertText("a");
+    state.insertText("b");
+    state.undo();
+    try t.expectEqual(@as(u8, 1), state.redo_count);
+    state.beginUserEdit();
+    state.insertText("c");
+    try t.expectEqual(@as(u8, 0), state.redo_count);
+    state.undo();
+    state.endUserEdit();
+    try t.expect(state.undo_stash.isEmpty());
+}
+
+test "textarea 用户编辑事务：事务内历史被整体清空后，拒绝还原不会复活清空前的重做条目" {
+    const t = std.testing;
+    var doc = TextareaDocument.init(t.allocator);
+    defer doc.deinit();
+    var wm = TextareaWrapMap.init(t.allocator, @import("std").testing.io);
+    defer wm.deinit();
+    var state: TextareaState = .{ .io = @import("std").testing.io, .doc = &doc, .wrap_map = &wm, .allocator = t.allocator };
+    defer state.deinit();
+    state.insertText("a");
+    state.insertText("b");
+    state.undo();
+    try t.expectEqual(@as(u8, 1), state.redo_count);
+    state.beginUserEdit();
+    state.insertText("c");
+    try state.applyExternalText("x");
+    try state.reconcileUserEdit("x", true);
+    state.endUserEdit();
+    try t.expectEqual(@as(u8, 0), state.redo_count);
+    try t.expectEqual(@as(u8, 0), state.undo_count);
+}
+
+test "textarea 用户编辑事务：同一事务内先有一次已落地的编辑，后一次被拒只回滚它自己" {
+    const t = std.testing;
+    var doc = TextareaDocument.init(t.allocator);
+    defer doc.deinit();
+    var wm = TextareaWrapMap.init(t.allocator, @import("std").testing.io);
+    defer wm.deinit();
+    var state: TextareaState = .{ .io = @import("std").testing.io, .doc = &doc, .wrap_map = &wm, .allocator = t.allocator };
+    defer state.deinit();
+    state.insertText("x");
+    state.insertText("y");
+    state.undo();
+    try t.expectEqual(@as(u8, 1), state.redo_count);
+    state.beginUserEdit();
+    state.insertText("a");
+    state.settleUserEdit();
+    state.insertText("b");
+    try state.reconcileUserEdit("xa", true);
+    state.endUserEdit();
+    try t.expectEqualStrings("xa", state.getText());
+    try t.expectEqual(@as(usize, 2), state.cursor.offset);
+    try t.expectEqual(@as(u8, 2), state.undo_count);
+    try t.expectEqual(@as(u8, 0), state.redo_count);
+}
+
+test "textarea 用户编辑事务：不经值绑定的事务结束时暂存清空，之后被拒还原不复活旧重做条目" {
+    const t = std.testing;
+    var doc = TextareaDocument.init(t.allocator);
+    defer doc.deinit();
+    var wm = TextareaWrapMap.init(t.allocator, @import("std").testing.io);
+    defer wm.deinit();
+    var state: TextareaState = .{ .io = @import("std").testing.io, .doc = &doc, .wrap_map = &wm, .allocator = t.allocator };
+    defer state.deinit();
+    state.insertText("x");
+    state.insertText("y");
+    state.undo();
+    state.beginUserEdit();
+    state.insertText("a");
+    state.endUserEdit();
+    try t.expect(state.undo_stash.isEmpty());
+    state.beginUserEdit();
+    state.insertText("b");
+    try state.reconcileUserEdit("xa", true);
+    state.endUserEdit();
+    try t.expectEqual(@as(u8, 0), state.redo_count);
+}
 
 test "textarea event route commits complete long IME input once" {
     const t = std.testing;
     var doc = TextareaDocument.init(t.allocator);
     defer doc.deinit();
-    var wm = TextareaWrapMap.init(t.allocator);
+    var wm = TextareaWrapMap.init(t.allocator, @import("std").testing.io);
     defer wm.deinit();
-    var state: TextareaState = .{ .doc = &doc, .wrap_map = &wm, .allocator = t.allocator };
+    var state: TextareaState = .{ .io = @import("std").testing.io, .doc = &doc, .wrap_map = &wm, .allocator = t.allocator };
     defer state.deinit();
-    const value = "中\n" ** 300;
+    const value = (@as([("中\n").len * (300)]u8, @bitCast(@as([300][("中\n").len]u8, @splat(("中\n").*)))) ++ "");
     _ = textareaEventHandler(.{ .ime_commit = .{ .text = value } }, &state);
     _ = textareaEventHandler(.{ .text_input = .{ .text = value } }, &state);
     try t.expectEqualStrings(value, state.getText());
@@ -2430,14 +3228,14 @@ test "textarea failed IME replacement retains document selection and undo histor
     var doc = TextareaDocument.init(failing.allocator());
     defer doc.deinit();
     doc.setText("keep\nline");
-    var wm = TextareaWrapMap.init(t.allocator);
+    var wm = TextareaWrapMap.init(t.allocator, @import("std").testing.io);
     defer wm.deinit();
-    var state: TextareaState = .{ .doc = &doc, .wrap_map = &wm, .allocator = failing.allocator() };
+    var state: TextareaState = .{ .io = @import("std").testing.io, .doc = &doc, .wrap_map = &wm, .allocator = failing.allocator() };
     defer state.deinit();
     state.cursor.offset = doc.totalLength();
     state.cursor.anchor = 0;
     failing.fail_index = failing.alloc_index;
-    state.handleImeCommit("x" ** 1000);
+    state.handleImeCommit((@as([("x").len * (1000)]u8, @bitCast(@as([1000][("x").len]u8, @splat(("x").*)))) ++ ""));
     failing.fail_index = std.math.maxInt(usize);
     try t.expectEqualStrings("keep\nline", state.getText());
     try t.expectEqual(@as(?usize, 0), state.cursor.anchor);
@@ -2453,9 +3251,9 @@ test "textarea IME insertion preserves composition model and history through eve
             var doc = TextareaDocument.init(if (fail_model) failing.allocator() else t.allocator);
             defer doc.deinit();
             doc.setText("keep tail");
-            var wm = TextareaWrapMap.init(t.allocator);
+            var wm = TextareaWrapMap.init(t.allocator, @import("std").testing.io);
             defer wm.deinit();
-            var s: TextareaState = .{ .doc = &doc, .wrap_map = &wm, .allocator = if (fail_model) t.allocator else failing.allocator() };
+            var s: TextareaState = .{ .io = @import("std").testing.io, .doc = &doc, .wrap_map = &wm, .allocator = if (fail_model) t.allocator else failing.allocator() };
             defer s.deinit();
             s.cursor.offset = doc.totalLength();
             s.insertText("!");
@@ -2468,7 +3266,7 @@ test "textarea IME insertion preserves composition model and history through eve
             const old_lines = doc.line_starts.items.ptr;
             const old_undo = s.undo_count;
             const old_redo = s.redo_count;
-            const value = "中\n" ** 300;
+            const value = (@as([("中\n").len * (300)]u8, @bitCast(@as([300][("中\n").len]u8, @splat(("中\n").*)))) ++ "");
             failing.fail_index = failing.alloc_index + failure;
             failing.resize_fail_index = failing.resize_index;
             const result = s.handleImeCommitChecked(value);
@@ -2509,9 +3307,9 @@ test "textarea failed deletion retains selected text and redo history" {
     var doc = TextareaDocument.init(t.allocator);
     defer doc.deinit();
     doc.setText("keep\ntail");
-    var wm = TextareaWrapMap.init(t.allocator);
+    var wm = TextareaWrapMap.init(t.allocator, @import("std").testing.io);
     defer wm.deinit();
-    var s: TextareaState = .{ .doc = &doc, .wrap_map = &wm, .allocator = failing.allocator() };
+    var s: TextareaState = .{ .io = @import("std").testing.io, .doc = &doc, .wrap_map = &wm, .allocator = failing.allocator() };
     defer s.deinit();
     s.cursor.offset = doc.totalLength();
     s.insertText("!");
@@ -2539,11 +3337,11 @@ test "textarea set and history restore survive every allocation failure" {
                 var failing = t.FailingAllocator.init(t.allocator, .{});
                 var doc = TextareaDocument.init(if (fail_model) failing.allocator() else t.allocator);
                 defer doc.deinit();
-                const original = "keep\n" ** 80;
+                const original = (@as([("keep\n").len * (80)]u8, @bitCast(@as([80][("keep\n").len]u8, @splat(("keep\n").*)))) ++ "");
                 try doc.setTextChecked(original);
-                var wm = TextareaWrapMap.init(t.allocator);
+                var wm = TextareaWrapMap.init(t.allocator, @import("std").testing.io);
                 defer wm.deinit();
-                var s: TextareaState = .{ .doc = &doc, .wrap_map = &wm, .allocator = if (fail_model) t.allocator else failing.allocator() };
+                var s: TextareaState = .{ .io = @import("std").testing.io, .doc = &doc, .wrap_map = &wm, .allocator = if (fail_model) t.allocator else failing.allocator() };
                 defer s.deinit();
                 s.cursor.offset = original.len;
                 s.cursor.anchor = 0;
@@ -2561,7 +3359,7 @@ test "textarea set and history restore survive every allocation failure" {
                 failing.resize_fail_index = failing.resize_index;
                 switch (operation) {
                     0 => {
-                        _ = s.setAccessibilityValue("new\n" ** 120);
+                        _ = s.setAccessibilityValue((@as([("new\n").len * (120)]u8, @bitCast(@as([120][("new\n").len]u8, @splat(("new\n").*)))) ++ ""));
                     },
                     1 => s.undo(),
                     2 => s.redo(),
@@ -2579,7 +3377,7 @@ test "textarea set and history restore survive every allocation failure" {
                     try t.expectEqual(old_anchor, s.cursor.anchor);
                     switch (operation) {
                         0 => {
-                            try t.expect(s.setAccessibilityValue("new\n" ** 120));
+                            try t.expect(s.setAccessibilityValue((@as([("new\n").len * (120)]u8, @bitCast(@as([120][("new\n").len]u8, @splat(("new\n").*)))) ++ "")));
                         },
                         1 => s.undo(),
                         2 => s.redo(),
@@ -2587,7 +3385,7 @@ test "textarea set and history restore survive every allocation failure" {
                     }
                 }
                 const expected = switch (operation) {
-                    0 => "new\n" ** 120,
+                    0 => (@as([("new\n").len * (120)]u8, @bitCast(@as([120][("new\n").len]u8, @splat(("new\n").*)))) ++ ""),
                     1 => original,
                     2 => "x",
                     else => unreachable,
@@ -2617,9 +3415,9 @@ test "textarea events notify same length history changes and keep failed edits s
     var doc = TextareaDocument.init(t.allocator);
     defer doc.deinit();
     try doc.setTextChecked("old");
-    var wm = TextareaWrapMap.init(t.allocator);
+    var wm = TextareaWrapMap.init(t.allocator, @import("std").testing.io);
     defer wm.deinit();
-    var s: TextareaState = .{ .doc = &doc, .wrap_map = &wm, .allocator = failing.allocator(), .on_change = .{ .callback = Observer.notify, .context = &observer } };
+    var s: TextareaState = .{ .io = @import("std").testing.io, .doc = &doc, .wrap_map = &wm, .allocator = failing.allocator(), .on_change = .{ .callback = Observer.notify, .context = &observer } };
     defer s.deinit();
     try t.expect(s.setAccessibilityValue("new"));
     try t.expectEqual(@as(usize, 1), observer.calls);
@@ -2651,9 +3449,9 @@ test "textarea deletion variants require history allocation and no op preserves 
         var doc = TextareaDocument.init(t.allocator);
         defer doc.deinit();
         try doc.setTextChecked("keep\ntail");
-        var wm = TextareaWrapMap.init(t.allocator);
+        var wm = TextareaWrapMap.init(t.allocator, @import("std").testing.io);
         defer wm.deinit();
-        var s: TextareaState = .{ .doc = &doc, .wrap_map = &wm, .allocator = failing.allocator() };
+        var s: TextareaState = .{ .io = @import("std").testing.io, .doc = &doc, .wrap_map = &wm, .allocator = failing.allocator() };
         defer s.deinit();
         s.cursor.offset = 4;
         s.cursor.anchor = 0;
@@ -2689,9 +3487,9 @@ test "textarea frame retries pending wrap without a width change" {
     const Map = @import("text_core").wrap_map.WrapMap(Doc);
     var doc = Doc.init(t.allocator);
     defer doc.deinit();
-    doc.setText("abcdefgh" ** 8);
+    doc.setText((@as([("abcdefgh").len * (8)]u8, @bitCast(@as([8][("abcdefgh").len]u8, @splat(("abcdefgh").*)))) ++ ""));
     var failing = t.FailingAllocator.init(t.allocator, .{});
-    var wm = Map.init(failing.allocator());
+    var wm = Map.init(failing.allocator(), @import("std").testing.io);
     defer wm.deinit();
     wm.char_width = 8;
     wm.wrap_width = 64;
@@ -2703,7 +3501,7 @@ test "textarea frame retries pending wrap without a width change" {
     try t.expect(wm.has_interpolated_lines);
     failing.fail_index = std.math.maxInt(usize);
     failing.resize_fail_index = std.math.maxInt(usize);
-    var state: TextareaState = .{ .doc = &doc, .wrap_map = &wm, .allocator = t.allocator, .input_inner_w = 64 };
+    var state: TextareaState = .{ .io = @import("std").testing.io, .doc = &doc, .wrap_map = &wm, .allocator = t.allocator, .input_inner_w = 64 };
     defer state.deinit();
     var node: Node = .{ .id = 1, .tag = .box, .style = .{}, .children = .empty };
     node.setLayoutRect(.{ .x = 0, .y = 0, .w = 80, .h = 100 });
@@ -2720,9 +3518,9 @@ test "textarea events honor reconversion range for preedit and commit" {
     var doc = TextareaDocument.init(t.allocator);
     defer doc.deinit();
     doc.setText("x漢字y");
-    var wm = TextareaWrapMap.init(t.allocator);
+    var wm = TextareaWrapMap.init(t.allocator, @import("std").testing.io);
     defer wm.deinit();
-    var s: TextareaState = .{ .doc = &doc, .wrap_map = &wm, .allocator = t.allocator };
+    var s: TextareaState = .{ .io = @import("std").testing.io, .doc = &doc, .wrap_map = &wm, .allocator = t.allocator };
     defer s.deinit();
     s.cursor.offset = 8;
     _ = textareaEventHandler(.{ .ime_preedit = .{ .text = "かんじ", .cursor_utf8_offset = 9, .replace_start_utf8 = 1, .replace_end_utf8 = 7 } }, &s);
@@ -2742,9 +3540,9 @@ test "textarea reconversion commit preserves candidate and both histories throug
             var doc = TextareaDocument.init(if (fail_model) failing.allocator() else t.allocator);
             defer doc.deinit();
             doc.setText("x漢字y");
-            var wm = TextareaWrapMap.init(t.allocator);
+            var wm = TextareaWrapMap.init(t.allocator, @import("std").testing.io);
             defer wm.deinit();
-            var s: TextareaState = .{ .doc = &doc, .wrap_map = &wm, .allocator = if (fail_model) t.allocator else failing.allocator() };
+            var s: TextareaState = .{ .io = @import("std").testing.io, .doc = &doc, .wrap_map = &wm, .allocator = if (fail_model) t.allocator else failing.allocator() };
             defer s.deinit();
             s.cursor.offset = 8;
             s.insertText("!");
@@ -2754,7 +3552,7 @@ test "textarea reconversion commit preserves candidate and both histories throug
             s.handleImePreeditReplace("候选", 6, 1, 7);
             const old_undo = s.undo_count;
             const old_redo = s.redo_count;
-            const value = "新" ** 200;
+            const value = (@as([("新").len * (200)]u8, @bitCast(@as([200][("新").len]u8, @splat(("新").*)))) ++ "");
             failing.fail_index = failing.alloc_index + failure;
             failing.resize_fail_index = failing.resize_index;
             const result = s.handleImeCommitReplaceChecked(value, std.math.maxInt(u32), std.math.maxInt(u32));
@@ -2792,9 +3590,9 @@ test "textarea reconversion cancel display empty commit and explicit commit rang
     var doc = TextareaDocument.init(t.allocator);
     defer doc.deinit();
     doc.setText("x漢字y");
-    var wm = TextareaWrapMap.init(t.allocator);
+    var wm = TextareaWrapMap.init(t.allocator, @import("std").testing.io);
     defer wm.deinit();
-    var s: TextareaState = .{ .doc = &doc, .wrap_map = &wm, .allocator = t.allocator };
+    var s: TextareaState = .{ .io = @import("std").testing.io, .doc = &doc, .wrap_map = &wm, .allocator = t.allocator };
     defer s.deinit();
     s.cursor.offset = 8;
     s.cursor.anchor = 7;
@@ -2823,7 +3621,7 @@ test "IME rendered rows retain independent bytes across reconversion and model u
     const t = std.testing;
     const Doc = @import("textarea_document.zig").TextareaDocument;
     const Map = @import("text_core").wrap_map.WrapMap(Doc);
-    var cx = try Cx.init(t.allocator);
+    var cx = try Cx.init(t.allocator, std.testing.io);
     defer cx.deinit();
     const root = try core_ui.box(cx, .{}, .{});
     cx.root = root;
@@ -2834,10 +3632,10 @@ test "IME rendered rows retain independent bytes across reconversion and model u
     var doc = Doc.init(t.allocator);
     defer doc.deinit();
     try doc.setTextChecked("abc\ndefgh");
-    var wm = Map.init(t.allocator);
+    var wm = Map.init(t.allocator, @import("std").testing.io);
     defer wm.deinit();
     wm.setEnabled(false, &doc);
-    var s: TextareaState = .{ .doc = &doc, .wrap_map = &wm, .allocator = t.allocator };
+    var s: TextareaState = .{ .io = @import("std").testing.io, .doc = &doc, .wrap_map = &wm, .allocator = t.allocator };
     defer s.deinit();
     s.cursor.offset = doc.totalLength();
     s.handleImePreeditReplace("候选", 6, 1, 8);
@@ -2853,11 +3651,11 @@ test "IME rendered rows retain independent bytes across reconversion and model u
     try t.expectEqualStrings("defgh", second.getText().?.content);
     // Growing composition scratch must not invalidate a previously rendered row.
     s.handleImePreedit("候", 3);
-    _ = try s.composeSegmentWithImeChecked("x" ** 6000, 0);
+    _ = try s.composeSegmentWithImeChecked((@as([("x").len * (6000)]u8, @bitCast(@as([6000][("x").len]u8, @splat(("x").*)))) ++ ""), 0);
     try t.expectEqualStrings("abc", first.getText().?.content);
     s.cancelImeComposition();
     // Retained nodes must not borrow canonical document memory either.
-    try doc.setTextChecked("replacement" ** 600);
+    try doc.setTextChecked((@as([("replacement").len * (600)]u8, @bitCast(@as([600][("replacement").len]u8, @splat(("replacement").*)))) ++ ""));
     try t.expectEqualStrings("abc", first.getText().?.content);
     try t.expectEqualStrings("defgh", second.getText().?.content);
 }
@@ -2867,17 +3665,17 @@ test "IME row allocation failure retains text and schedules retry without anothe
     const Doc = @import("textarea_document.zig").TextareaDocument;
     const Map = @import("text_core").wrap_map.WrapMap(Doc);
     var failing = t.FailingAllocator.init(t.allocator, .{});
-    var cx = try Cx.init(failing.allocator());
+    var cx = try Cx.init(failing.allocator(), std.testing.io);
     defer cx.deinit();
     const row = try core_ui.box(cx, .{}, .{});
     cx.root = row;
     var doc = Doc.init(t.allocator);
     defer doc.deinit();
     try doc.setTextChecked("abc");
-    var wm = Map.init(t.allocator);
+    var wm = Map.init(t.allocator, @import("std").testing.io);
     defer wm.deinit();
     wm.setEnabled(false, &doc);
-    var s: TextareaState = .{ .doc = &doc, .wrap_map = &wm, .allocator = t.allocator };
+    var s: TextareaState = .{ .io = @import("std").testing.io, .doc = &doc, .wrap_map = &wm, .allocator = t.allocator };
     defer s.deinit();
     s.cursor.offset = 3;
     textareaRenderItem(row, 0, cx, &s);
@@ -2910,24 +3708,24 @@ test "IME row allocation failure retains text and schedules retry without anothe
 
 test "textarea composition allocation failure preserves the retained row for retry" {
     const t = std.testing;
-    var cx = try Cx.init(t.allocator);
+    var cx = try Cx.init(t.allocator, std.testing.io);
     defer cx.deinit();
     const row = try core_ui.box(cx, .{}, .{});
     cx.root = row;
     var doc = TextareaDocument.init(t.allocator);
     defer doc.deinit();
     try doc.setTextChecked("abc");
-    var wm = TextareaWrapMap.init(t.allocator);
+    var wm = TextareaWrapMap.init(t.allocator, @import("std").testing.io);
     defer wm.deinit();
     wm.setEnabled(false, &doc);
     var failing = t.FailingAllocator.init(t.allocator, .{});
-    var s: TextareaState = .{ .doc = &doc, .wrap_map = &wm, .allocator = failing.allocator() };
+    var s: TextareaState = .{ .io = @import("std").testing.io, .doc = &doc, .wrap_map = &wm, .allocator = failing.allocator() };
     defer s.deinit();
     s.cursor.offset = 3;
     s.handleImePreedit("候选", 6);
     textareaRenderItem(row, 0, cx, &s);
     try t.expectEqualStrings("abc候选", row.getText().?.content);
-    try doc.setTextChecked("x" ** 6000);
+    try doc.setTextChecked((@as([("x").len * (6000)]u8, @bitCast(@as([6000][("x").len]u8, @splat(("x").*)))) ++ ""));
     s.dirty = false;
     failing.fail_index = failing.alloc_index;
     failing.resize_fail_index = failing.resize_index;
@@ -2939,8 +3737,8 @@ test "textarea composition allocation failure preserves the retained row for ret
     failing.fail_index = std.math.maxInt(usize);
     failing.resize_fail_index = std.math.maxInt(usize);
     textareaRenderItem(row, 0, cx, &s);
-    try t.expectEqualStrings("xxx候选" ++ "x" ** 5997, row.getText().?.content);
-    try t.expectEqualStrings("x" ** 6000, s.getText());
+    try t.expectEqualStrings("xxx候选" ++ (@as([("x").len * (5997)]u8, @bitCast(@as([5997][("x").len]u8, @splat(("x").*)))) ++ ""), row.getText().?.content);
+    try t.expectEqualStrings((@as([("x").len * (6000)]u8, @bitCast(@as([6000][("x").len]u8, @splat(("x").*)))) ++ ""), s.getText());
 }
 
 test "independent textarea preserves long preedit and its grapheme cursor" {
@@ -2948,12 +3746,12 @@ test "independent textarea preserves long preedit and its grapheme cursor" {
     var doc = TextareaDocument.init(t.allocator);
     defer doc.deinit();
     try doc.setTextChecked("xyz");
-    var wm = TextareaWrapMap.init(t.allocator);
+    var wm = TextareaWrapMap.init(t.allocator, @import("std").testing.io);
     defer wm.deinit();
-    var s: TextareaState = .{ .allocator = t.allocator, .doc = &doc, .wrap_map = &wm };
+    var s: TextareaState = .{ .io = @import("std").testing.io, .allocator = t.allocator, .doc = &doc, .wrap_map = &wm };
     defer s.deinit();
     s.cursor.offset = 1;
-    const candidate = "漢" ** 1000 ++ "👩‍💻";
+    const candidate = (@as([("漢").len * (1000)]u8, @bitCast(@as([1000][("漢").len]u8, @splat(("漢").*)))) ++ "") ++ "👩‍💻";
     s.handleImePreedit(candidate, candidate.len - 1);
     try t.expectEqual(candidate.len, s.ime_preedit_len);
     try t.expectEqual(candidate.len, s.ime_cursor_utf8_offset);
@@ -2970,15 +3768,15 @@ test "independent long preedit failure preserves reconversion and commits owned 
     var doc = TextareaDocument.init(failing.allocator());
     defer doc.deinit();
     try doc.setTextChecked("x漢字y");
-    var wm = TextareaWrapMap.init(t.allocator);
+    var wm = TextareaWrapMap.init(t.allocator, @import("std").testing.io);
     defer wm.deinit();
-    var s: TextareaState = .{ .allocator = failing.allocator(), .doc = &doc, .wrap_map = &wm };
+    var s: TextareaState = .{ .io = @import("std").testing.io, .allocator = failing.allocator(), .doc = &doc, .wrap_map = &wm };
     defer s.deinit();
     s.cursor.offset = 8;
     s.cursor.anchor = 7;
     try s.handleImePreeditReplaceChecked("旧", 3, 1, 7);
     failing.fail_index = failing.alloc_index;
-    const candidate = "漢" ** 1000;
+    const candidate = (@as([("漢").len * (1000)]u8, @bitCast(@as([1000][("漢").len]u8, @splat(("漢").*)))) ++ "");
     try t.expectError(error.OutOfMemory, s.handleImePreeditReplaceChecked(candidate, candidate.len, 0, 8));
     failing.fail_index = std.math.maxInt(usize);
     try t.expectEqualStrings("旧", s.preeditText());
@@ -2995,4 +3793,461 @@ test "independent long preedit failure preserves reconversion and commits owned 
     try t.expectEqualStrings("x漢字y", s.getText());
     s.redo();
     try t.expectEqualStrings(candidate[3..], s.getText());
+}
+
+// ========== Value binding & surrounding dynamics (docs/SIGNAL_API_DESIGN.md @4.8) ==========
+
+const TaEnv = struct {
+    cx: *Cx,
+    scope: *Scope,
+
+    fn init() !TaEnv {
+        const cx = try Cx.init(std.testing.allocator, std.testing.io);
+        errdefer cx.deinit();
+        cx.root = try box(cx, .{ .width = .{ .px = 600 }, .height = .{ .px = 400 } }, .{});
+        return .{ .cx = cx, .scope = try Scope.init(std.testing.allocator, null, cx.owner) };
+    }
+
+    fn deinit(self: TaEnv) void {
+        self.scope.dispose();
+        self.cx.deinit();
+    }
+
+    fn send(r: TextareaResult, ev: Event) EventResult {
+        return textareaEventHandler(ev, @ptrCast(r.state));
+    }
+};
+
+test "Textarea value: 打字写回 signal；外部写入进文档且不可撤销；组字中推迟" {
+    const env = try TaEnv.init();
+    defer env.deinit();
+    const Spy = struct {
+        n: usize = 0,
+        fn f(self: *@This(), _: []const u8) void {
+            self.n += 1;
+        }
+    };
+    var spy = Spy{};
+    const v = try env.scope.createText("a", .{});
+    const r = try Textarea(.{ .value = v, .on_change = env.cx.on(Spy, &spy, Spy.f) }).mountResult(env.scope, env.cx);
+    defer env.cx.freeNode(r.wrapper);
+    try std.testing.expectEqualStrings("a", r.state.getText());
+
+    _ = TaEnv.send(r, .{ .text_input = .{ .text = "b" } });
+    try std.testing.expectEqualStrings("ab", v.peek());
+    try std.testing.expectEqual(@as(usize, 1), spy.n);
+
+    v.set("line1\nline2");
+    try std.testing.expectEqualStrings("line1\nline2", r.state.getText());
+    try std.testing.expectEqual(@as(usize, 1), spy.n);
+    _ = TaEnv.send(r, .{ .key_down = .{ .key = .z, .modifiers = .{ .super = true } } });
+    try std.testing.expectEqualStrings("line1\nline2", v.peek());
+
+    _ = TaEnv.send(r, .{ .ime_preedit = .{ .text = "ni", .cursor_utf8_offset = 2 } });
+    v.set("external");
+    try std.testing.expectEqualStrings("line1\nline2", r.state.getText());
+    _ = TaEnv.send(r, .{ .ime_preedit = .{ .text = "", .cursor_utf8_offset = 0 } });
+    try std.testing.expectEqualStrings("external", r.state.getText());
+
+    _ = TaEnv.send(r, .{ .ime_preedit = .{ .text = "ni", .cursor_utf8_offset = 2 } });
+    v.set("lost");
+    _ = TaEnv.send(r, .{ .ime_commit = .{ .text = "你" } });
+    try std.testing.expectEqualStrings("external你", r.state.getText());
+    try std.testing.expectEqualStrings("external你", v.peek());
+}
+
+test "Textarea value: ui.split 拒绝时文档退回数据源" {
+    const env = try TaEnv.init();
+    defer env.deinit();
+    const Parent = struct {
+        sig: *Signal([]const u8),
+        fn write(_: *@This(), _: []const u8) void {}
+    };
+    var parent = Parent{ .sig = try env.scope.createText("keep", .{}) };
+    const r = try Textarea(.{ .value = reactive.split(parent.sig, env.cx.on(Parent, &parent, Parent.write)) }).mountResult(env.scope, env.cx);
+    defer env.cx.freeNode(r.wrapper);
+    _ = TaEnv.send(r, .{ .text_input = .{ .text = "x" } });
+    try std.testing.expectEqualStrings("keep", r.state.getText());
+}
+
+// ---------- User edit rewritten/rejected by ui.split: fix in place (binding.zig onBufferChanged)
+// ----------
+
+const TaUpperParent = struct {
+    sig: *Signal([]const u8),
+    accept: bool = true,
+    reject_lower: bool = false,
+    buf: [256]u8 = undefined,
+    fn write(self: *@This(), x: []const u8) void {
+        if (!self.accept) return;
+        if (self.reject_lower) {
+            for (x) |c| if (std.ascii.isLower(c)) return;
+        }
+        const n = @min(x.len, self.buf.len);
+        for (x[0..n], 0..) |c, i| self.buf[i] = std.ascii.toUpper(c);
+        self.sig.set(self.buf[0..n]);
+    }
+};
+
+const ta_undo_key = Event{ .key_down = .{ .key = .z, .modifiers = .{ .super = true } } };
+const ta_redo_key = Event{ .key_down = .{ .key = .z, .modifiers = .{ .super = true, .shift = true } } };
+
+fn expectTaCaret(r: TextareaResult, text: []const u8, cursor: usize, anchor: ?usize) !void {
+    try std.testing.expectEqualStrings(text, r.state.getText());
+    try std.testing.expectEqual(cursor, r.state.cursor.offset);
+    try std.testing.expectEqual(anchor, r.state.cursor.anchor);
+}
+
+test "Textarea value: split 大写化中间插入——光标留在插入点后，撤销回到编辑前（batch 内外）" {
+    inline for (.{ false, true }) |batched| {
+        const env = try TaEnv.init();
+        defer env.deinit();
+        var parent = TaUpperParent{ .sig = try env.scope.createText("AB\nCD", .{}) };
+        const r = try Textarea(.{ .value = reactive.split(parent.sig, env.cx.on(TaUpperParent, &parent, TaUpperParent.write)) }).mountResult(env.scope, env.cx);
+        defer env.cx.freeNode(r.wrapper);
+        r.state.cursor.offset = 1;
+
+        if (batched) env.cx.owner.beginBatch();
+        _ = TaEnv.send(r, .{ .text_input = .{ .text = "x" } });
+        try expectTaCaret(r, "AXB\nCD", 2, null);
+        _ = TaEnv.send(r, .{ .key_down = .{ .key = .@"return" } });
+        _ = TaEnv.send(r, .{ .text_input = .{ .text = "yz" } });
+        try expectTaCaret(r, "AX\nYZB\nCD", 5, null);
+        if (batched) env.cx.owner.endBatch();
+        try expectTaCaret(r, "AX\nYZB\nCD", 5, null);
+        try std.testing.expectEqualStrings("AX\nYZB\nCD", parent.sig.peek());
+        try std.testing.expectEqual(@as(u8, 3), r.state.undo_count);
+
+        _ = TaEnv.send(r, ta_undo_key);
+        try expectTaCaret(r, "AX\nB\nCD", 3, null);
+        try std.testing.expectEqualStrings("AX\nB\nCD", parent.sig.peek());
+        _ = TaEnv.send(r, ta_undo_key);
+        _ = TaEnv.send(r, ta_undo_key);
+        try expectTaCaret(r, "AB\nCD", 1, null);
+        _ = TaEnv.send(r, ta_redo_key);
+        try expectTaCaret(r, "AXB\nCD", 2, null);
+        try std.testing.expectEqualStrings("AXB\nCD", parent.sig.peek());
+    }
+}
+
+test "Textarea value: split 拒绝——选区回到编辑前、不留撤销条目；被拒的撤销把栈还原（batch 内外）" {
+    inline for (.{ false, true }) |batched| {
+        const env = try TaEnv.init();
+        defer env.deinit();
+        var parent = TaUpperParent{ .sig = try env.scope.createText("AB\nC", .{}), .reject_lower = true };
+        const r = try Textarea(.{ .value = reactive.split(parent.sig, env.cx.on(TaUpperParent, &parent, TaUpperParent.write)) }).mountResult(env.scope, env.cx);
+        defer env.cx.freeNode(r.wrapper);
+
+        if (batched) env.cx.owner.beginBatch();
+        r.state.cursor.offset = 1;
+        _ = TaEnv.send(r, .{ .text_input = .{ .text = "x" } });
+        try expectTaCaret(r, "AB\nC", 1, null);
+        try std.testing.expectEqual(@as(u8, 0), r.state.undo_count);
+        r.state.cursor.anchor = 1;
+        r.state.cursor.offset = 4;
+        _ = TaEnv.send(r, .{ .text_input = .{ .text = "q" } });
+        try expectTaCaret(r, "AB\nC", 4, 1);
+        try std.testing.expectEqual(@as(u8, 0), r.state.undo_count);
+        r.state.cursor.anchor = null;
+        _ = TaEnv.send(r, .{ .text_input = .{ .text = "D" } });
+        try expectTaCaret(r, "AB\nCD", 5, null);
+        if (batched) env.cx.owner.endBatch();
+        try std.testing.expectEqualStrings("AB\nCD", parent.sig.peek());
+        try std.testing.expectEqual(@as(u8, 1), r.state.undo_count);
+
+        parent.accept = false;
+        _ = TaEnv.send(r, .{ .key_down = .{ .key = .delete } });
+        try expectTaCaret(r, "AB\nCD", 5, null);
+        try std.testing.expectEqual(@as(u8, 1), r.state.undo_count);
+        _ = TaEnv.send(r, ta_undo_key);
+        try expectTaCaret(r, "AB\nCD", 5, null);
+        try std.testing.expectEqual(@as(u8, 1), r.state.undo_count);
+        try std.testing.expectEqual(@as(u8, 0), r.state.redo_count);
+        parent.accept = true;
+        _ = TaEnv.send(r, ta_undo_key);
+        try expectTaCaret(r, "AB\nC", 4, null);
+    }
+}
+
+test "Textarea value: 组字中有推迟的外部写入时，AX 写值以 AX 的值为准" {
+    inline for (.{ false, true }) |batched| {
+        const env = try TaEnv.init();
+        defer env.deinit();
+        const v = try env.scope.createText("old", .{});
+        const r = try Textarea(.{ .value = v }).mountResult(env.scope, env.cx);
+        defer env.cx.freeNode(r.wrapper);
+        _ = TaEnv.send(r, .{ .ime_preedit = .{ .text = "ni", .cursor_utf8_offset = 2 } });
+        v.set("external");
+        try std.testing.expectEqualStrings("old", r.state.getText());
+        if (batched) env.cx.owner.beginBatch();
+        try std.testing.expect(r.state.setAccessibilityValue("typed\nline"));
+        try std.testing.expectEqualStrings("typed\nline", r.state.getText());
+        if (batched) env.cx.owner.endBatch();
+        try std.testing.expectEqualStrings("typed\nline", r.state.getText());
+        try std.testing.expectEqualStrings("typed\nline", v.peek());
+        try std.testing.expect(!r.state.imeIsComposing());
+        _ = TaEnv.send(r, ta_undo_key);
+        try std.testing.expectEqualStrings("old", r.state.getText());
+        try std.testing.expectEqualStrings("old", v.peek());
+    }
+}
+
+test "Textarea value: split 拒绝——重做栈与栈满淘汰的撤销条目完整还原" {
+    const env = try TaEnv.init();
+    defer env.deinit();
+    var parent = TaUpperParent{ .sig = try env.scope.createText("A", .{}), .reject_lower = true };
+    const r = try Textarea(.{ .value = reactive.split(parent.sig, env.cx.on(TaUpperParent, &parent, TaUpperParent.write)) }).mountResult(env.scope, env.cx);
+    defer env.cx.freeNode(r.wrapper);
+    const s = r.state;
+    s.cursor.offset = 1;
+
+    _ = TaEnv.send(r, .{ .text_input = .{ .text = "B" } });
+    _ = TaEnv.send(r, ta_undo_key);
+    try expectTaCaret(r, "A", 1, null);
+    try std.testing.expectEqual(@as(u8, 1), s.redo_count);
+    const redo_ptr = s.redo_stack[0].text.?.ptr;
+    _ = TaEnv.send(r, .{ .text_input = .{ .text = "c" } });
+    try expectTaCaret(r, "A", 1, null);
+    try std.testing.expectEqual(@as(u8, 1), s.redo_count);
+    try std.testing.expectEqual(redo_ptr, s.redo_stack[0].text.?.ptr);
+    _ = TaEnv.send(r, ta_redo_key);
+    try expectTaCaret(r, "AB", 2, null);
+
+    while (s.undo_count < 32) _ = TaEnv.send(r, .{ .text_input = .{ .text = "X" } });
+    _ = TaEnv.send(r, .{ .text_input = .{ .text = "X" } });
+    const bottom_ptr = s.undo_stack[0].text.?.ptr;
+    const top_ptr = s.undo_stack[31].text.?.ptr;
+    const len_before = s.getText().len;
+    _ = TaEnv.send(r, .{ .text_input = .{ .text = "z" } });
+    try std.testing.expectEqual(len_before, s.getText().len);
+    try std.testing.expectEqual(@as(u8, 32), s.undo_count);
+    try std.testing.expectEqual(bottom_ptr, s.undo_stack[0].text.?.ptr);
+    try std.testing.expectEqual(top_ptr, s.undo_stack[31].text.?.ptr);
+    try std.testing.expect(s.undo_stash.isEmpty());
+
+    // Accepted edit clears redo stack, later rejected edits can't revive old redo entries
+    _ = TaEnv.send(r, ta_undo_key);
+    try std.testing.expectEqual(@as(u8, 1), s.redo_count);
+    _ = TaEnv.send(r, .{ .text_input = .{ .text = "Q" } });
+    try std.testing.expectEqual(@as(u8, 0), s.redo_count);
+    _ = TaEnv.send(r, .{ .text_input = .{ .text = "q" } });
+    try std.testing.expectEqual(@as(u8, 0), s.redo_count);
+}
+
+test "Textarea value: IME 提交被大写化光标在提交后；外部写入语义不变；AX 写值被改写" {
+    const env = try TaEnv.init();
+    defer env.deinit();
+    var parent = TaUpperParent{ .sig = try env.scope.createText("AB", .{}) };
+    const r = try Textarea(.{ .value = reactive.split(parent.sig, env.cx.on(TaUpperParent, &parent, TaUpperParent.write)) }).mountResult(env.scope, env.cx);
+    defer env.cx.freeNode(r.wrapper);
+
+    r.state.cursor.offset = 1;
+    env.cx.owner.beginBatch();
+    _ = TaEnv.send(r, .{ .ime_preedit = .{ .text = "x", .cursor_utf8_offset = 1 } });
+    _ = TaEnv.send(r, .{ .ime_commit = .{ .text = "xy" } });
+    try expectTaCaret(r, "AXYB", 3, null);
+    env.cx.owner.endBatch();
+    try std.testing.expectEqual(@as(u8, 1), r.state.undo_count);
+
+    parent.sig.set("one\ntwo");
+    try expectTaCaret(r, "one\ntwo", 7, null);
+    try std.testing.expectEqual(@as(u8, 0), r.state.undo_count);
+
+    try std.testing.expect(r.state.setAccessibilityValue("three"));
+    try expectTaCaret(r, "THREE", 5, null);
+    try std.testing.expectEqualStrings("THREE", parent.sig.peek());
+    try std.testing.expectEqual(@as(u8, 1), r.state.undo_count);
+    r.state.undo();
+    try std.testing.expectEqualStrings("one\ntwo", r.state.getText());
+}
+
+test "Textarea chrome: 标签 / 错误 / 禁用来自 signal" {
+    const env = try TaEnv.init();
+    defer env.deinit();
+    const label = try env.scope.createText("Notes", .{});
+    const err = try env.scope.createText("", .{});
+    const d = try env.scope.createSignal(bool, false);
+    const v = try env.scope.createText("", .{});
+    const r = try Textarea(.{ .value = v, .label_text = label, .error_msg = err, .disabled = d, .rows = 3 }).mountResult(env.scope, env.cx);
+    defer env.cx.freeNode(r.wrapper);
+    const a11y = &r.input.behavior.interaction.a11y.?;
+    try std.testing.expectEqualStrings("Notes", a11y.label.?);
+    const h0 = r.wrapper.style.height.px;
+
+    err.set("Required");
+    try std.testing.expect(r.state.has_error and a11y.invalid);
+    try std.testing.expectEqual(h0 + helper_row_h, r.wrapper.style.height.px);
+    label.set("");
+    try std.testing.expectEqual(h0 + helper_row_h - label_row_h, r.wrapper.style.height.px);
+
+    d.set(true);
+    try std.testing.expect(a11y.disabled);
+    try std.testing.expectEqual(EventResult.ignored, TaEnv.send(r, .{ .text_input = .{ .text = "x" } }));
+    try std.testing.expectEqualStrings("", v.peek());
+    d.set(false);
+    _ = TaEnv.send(r, .{ .text_input = .{ .text = "x" } });
+    try std.testing.expectEqualStrings("x", v.peek());
+}
+
+test "textarea: mount 在任意分配点失败时不泄漏（sweep）" {
+    try @import("../oom_sweep.zig").sweepMount("textarea", struct {
+        fn m(scope: *Scope, cx: *Cx) anyerror!?*Node {
+            return (try Textarea(.{ .value = "hello\nworld", .label_text = "Notes", .helper = "h", .width = 300 }).mountResult(scope, cx)).wrapper;
+        }
+    }.m);
+}
+
+test "textarea(dynamic): mount 在任意分配点失败时不泄漏（sweep）" {
+    try @import("../oom_sweep.zig").sweepMount("textarea(dynamic)", struct {
+        fn m(scope: *Scope, cx: *Cx) anyerror!?*Node {
+            const v = try scope.createText("a\nb", .{});
+            const label = try scope.createText("L", .{});
+            const ph = try scope.createText("type", .{});
+            const d = try scope.createSignal(bool, true);
+            return (try Textarea(.{ .value = v, .label_text = label, .placeholder = ph, .disabled = d }).mountResult(scope, cx)).wrapper;
+        }
+    }.m);
+}
+
+test "textarea accessibility lines use current wrapping and reject pending layout" {
+    const t = std.testing;
+    var doc = TextareaDocument.init(t.allocator);
+    defer doc.deinit();
+    try doc.setTextChecked("abcdefgh\nx");
+    var wm = TextareaWrapMap.init(t.allocator, @import("std").testing.io);
+    defer wm.deinit();
+    wm.char_width = 8;
+    wm.setEnabled(true, &doc);
+    wm.setWrapWidth(32, &doc);
+    _ = wm.rewrapInterpolatedAll(&doc);
+    var state: TextareaState = .{ .io = @import("std").testing.io, .doc = &doc, .wrap_map = &wm, .allocator = t.allocator };
+    defer state.deinit();
+    const wrapped = try textareaA11yLines(&state, t.allocator);
+    defer t.allocator.free(wrapped);
+    try t.expectEqualSlices(u32, &.{ 0, 4, 9, 10 }, wrapped);
+    wm.setWrapWidth(64, &doc);
+    _ = wm.rewrapInterpolatedAll(&doc);
+    const wide = try textareaA11yLines(&state, t.allocator);
+    defer t.allocator.free(wide);
+    try t.expectEqualSlices(u32, &.{ 0, 9, 10 }, wide);
+    wm.has_interpolated_lines = true;
+    try t.expectError(error.AccessibilityLayoutPending, textareaA11yLines(&state, t.allocator));
+    wm.has_interpolated_lines = false;
+    wm.setEnabled(false, &doc);
+    try doc.setTextChecked("");
+    const empty = try textareaA11yLines(&state, t.allocator);
+    defer t.allocator.free(empty);
+    try t.expectEqualSlices(u32, &.{0}, empty);
+}
+
+test "textarea accessibility teardown keeps scroll cells alive through owned scope disposal" {
+    const allocator = std.testing.allocator;
+    const cx = try Cx.init(allocator, std.testing.io);
+    defer cx.deinit();
+    cx.setViewport(320, 240);
+    const root = try box(cx, .{ .width = .{ .px = 320 }, .height = .{ .px = 240 } }, .{});
+    cx.root = root;
+    const scope = try Scope.init(allocator, null, cx.owner);
+    cx.root_scope = scope;
+    const mounted = try Textarea(.{ .value = "hello wrapped world", .width = 100 }).mountResult(scope, cx);
+    try root.appendChild(allocator, mounted.wrapper);
+    try std.testing.expect(cx.scroll_ctx_cells.items.len > 0);
+    // Cx owns scope teardown. External scope.dispose() before Cx.deinit()
+    // does not exercise this lifetime order and previously hid the VM crash.
+}
+
+test "accessibility caret geometry Textarea retains blank and terminal rows" {
+    const t = std.testing;
+    const cx = try Cx.init(t.allocator, std.testing.io);
+    defer cx.deinit();
+    var fonts = try core_ui.FontSystem.init(t.allocator, @import("std").testing.io);
+    defer fonts.deinit();
+    cx.text.setFontSystem(&fonts);
+    defer cx.text.clearFontSystem();
+    var doc = TextareaDocument.init(t.allocator);
+    defer doc.deinit();
+    try doc.setTextChecked("A\n\n");
+    var wm = TextareaWrapMap.init(t.allocator, @import("std").testing.io);
+    defer wm.deinit();
+    wm.rebuildAll(&doc);
+    var state: TextareaState = .{ .io = @import("std").testing.io, .doc = &doc, .wrap_map = &wm, .allocator = t.allocator, .cx_ref = cx, .font_size = 16, .line_height = 20, .container_x = 11, .container_y = 13, .padding_h = 7, .padding_v = 5 };
+    defer state.deinit();
+    const owned = try textareaA11yCarets(&state, t.allocator);
+    defer t.allocator.free(owned);
+    try t.expectEqual(@as(usize, 4), owned.len);
+    try t.expectEqual(@as(u32, 2), owned[2].offset);
+    try t.expectEqual(@as(u32, 3), owned[3].offset);
+    try t.expectEqual(@as(f32, 38), owned[2].rect.y);
+    try t.expectEqual(@as(f32, 58), owned[3].rect.y);
+    try t.expectEqual(@as(f32, 18), owned[2].rect.x);
+    try t.expectEqual(@as(f32, 0), owned[3].rect.width);
+    try t.expectEqual(@as(f32, 20), owned[3].rect.height);
+    const boxes = try textareaA11yGeometry(&state, t.allocator);
+    defer t.allocator.free(boxes);
+    try t.expectEqual(@as(usize, 1), boxes.len);
+    try t.expectEqual(@as(u32, 0), boxes[0].start);
+    try t.expectEqual(@as(u32, 1), boxes[0].end);
+    state.wrap_map.enabled = true;
+    state.wrap_map.has_interpolated_lines = true;
+    try t.expectError(error.AccessibilityLayoutPending, textareaA11yCarets(&state, t.allocator));
+}
+
+test "a11y row geometry Textarea preserves blank terminal and wrapped spans" {
+    const t = std.testing;
+    var doc = TextareaDocument.init(t.allocator);
+    defer doc.deinit();
+    try doc.setTextChecked("A\n\n");
+    var map = TextareaWrapMap.init(t.allocator, @import("std").testing.io);
+    defer map.deinit();
+    var state: TextareaState = .{ .io = @import("std").testing.io, .allocator = t.allocator, .doc = &doc, .wrap_map = &map, .container_x = 11, .container_y = 13, .padding_h = 7, .padding_v = 5, .input_inner_w = 70, .line_height = 20 };
+    const rows = try textareaA11yRows(&state, t.allocator);
+    defer t.allocator.free(rows);
+    try t.expectEqual(@as(usize, 3), rows.len);
+    try t.expectEqual(@as(u32, 2), rows[1].start);
+    try t.expectEqual(@as(u32, 3), rows[1].end);
+    try t.expectEqual(@as(u32, 3), rows[2].start);
+    try t.expectEqual(rows[2].start, rows[2].end);
+    try t.expectEqual(@as(f32, 18), rows[1].rect.x);
+    try t.expectEqual(@as(f32, 38), rows[1].rect.y);
+    try t.expectEqual(@as(f32, 70), rows[1].rect.width);
+    try doc.setTextChecked("abcdefgh\nx");
+    map.char_width = 8;
+    map.setEnabled(true, &doc);
+    map.setWrapWidth(32, &doc);
+    _ = map.rewrapInterpolatedAll(&doc);
+    const wrapped = try textareaA11yRows(&state, t.allocator);
+    defer t.allocator.free(wrapped);
+    try t.expectEqual(@as(usize, 3), wrapped.len);
+    try t.expectEqual(@as(u32, 0), wrapped[0].start);
+    try t.expectEqual(@as(u32, 4), wrapped[0].end);
+    try t.expectEqual(@as(u32, 4), wrapped[1].start);
+    try t.expectEqual(@as(u32, 9), wrapped[1].end);
+    try t.expectEqual(@as(u32, 9), wrapped[2].start);
+    try t.expectEqual(@as(u32, 10), wrapped[2].end);
+    map.has_interpolated_lines = true;
+    try t.expectError(error.AccessibilityLayoutPending, textareaA11yRows(&state, t.allocator));
+}
+
+test "Textarea Home End navigation retains shift anchor and UTF8 offsets" {
+    const t = std.testing;
+    var doc = TextareaDocument.init(t.allocator);
+    defer doc.deinit();
+    doc.setText("abc\n你de\nxyz");
+    var wm = TextareaWrapMap.init(t.allocator, @import("std").testing.io);
+    defer wm.deinit();
+    wm.rebuildAll(&doc);
+    var state: TextareaState = .{ .io = @import("std").testing.io, .allocator = t.allocator, .doc = &doc, .wrap_map = &wm };
+    defer state.deinit();
+    state.cursor.offset = 7;
+    try t.expect(state.handleKeyDown(.home, .{}));
+    try t.expectEqual(@as(usize, 4), state.cursor.offset);
+    try t.expect(state.handleKeyDown(.end, .{ .shift = true }));
+    try t.expectEqual(@as(usize, 9), state.cursor.offset);
+    try t.expectEqual(@as(?usize, 4), state.cursor.anchor);
+    try t.expect(state.handleKeyDown(.home, .{ .ctrl = true, .shift = true }));
+    try t.expectEqual(@as(usize, 0), state.cursor.offset);
+    try t.expectEqual(@as(?usize, 4), state.cursor.anchor);
+    try t.expect(state.handleKeyDown(.end, .{ .ctrl = true }));
+    try t.expectEqual(doc.totalLength(), state.cursor.offset);
+    try t.expectEqual(@as(?usize, null), state.cursor.anchor);
 }

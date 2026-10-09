@@ -1,12 +1,12 @@
 /**
- * e2e/mock.ts，内嵌 mock HTTP 服务（runner 同进程，不单独起进程）。
+ * e2e/mock.ts: embedded mock HTTP service (runner runs in-process, no separate process).
  *
- * 对应 docs/internal/UI_AUTOMATION_PLAN.md §5：
- * - 每 case 原子激活覆盖（setCaseOverrides）
- * - method + path 匹配（query/headers/body 匹配与 sequence 属 P1）
- * - 请求审计：count / order / 未匹配（供 assert:requests 与失败判定）
- * - fixture：body_file 相对 scenario 文件解析
- * - delay_ms 撑 loading 态
+ * Implements docs/internal/UI_AUTOMATION_PLAN.md section 5:
+ * - Per-case atomic override activation (setCaseOverrides)
+ * - Matching by method + path (query/headers/body matching and sequence matching deferred to P1)
+ * - Request audit: count / order / unmatched (for assert:requests and failure detection)
+ * - Fixtures: body_file resolved relative to scenario file
+ * - delay_ms props up loading state
  */
 
 import { readFileSync } from "node:fs";
@@ -51,7 +51,7 @@ export function startMockServer(mocks: MockDef[], scenarioDir: string): MockServ
   const unmatched: Array<{ method: string; path: string }> = [];
 
   const server = Bun.serve({
-    port: 0, // 随机端口，避免并发冲突
+    port: 0, // Random port to avoid concurrent conflicts
     async fetch(req) {
       const url = new URL(req.url);
       const key = `${req.method} ${url.pathname}`;
@@ -112,18 +112,18 @@ async function selfTest(): Promise<void> {
   ];
   const srv = startMockServer(mocks, process.cwd());
 
-  // 1. 默认命中
+  // 1. Default match
   const r1 = await fetch(`${srv.url}/api/users`);
   const j1 = (await r1.json()) as { users: string[] };
   if (r1.status !== 200 || j1.users[0] !== "a") throw new Error("default mock failed");
 
-  // 2. case 覆盖
+  // 2. Case override
   srv.setCaseOverrides({ users: { status: 200, body_json: { users: [] } } });
   const r2 = await fetch(`${srv.url}/api/users`);
   const j2 = (await r2.json()) as { users: string[] };
   if (j2.users.length !== 0) throw new Error("override mock failed");
 
-  // 3. 未匹配 -> 404 + 审计
+  // 3. No match -> 404 + audit
   const r3 = await fetch(`${srv.url}/api/nope`);
   if (r3.status !== 404) throw new Error("unmatched should be 404");
   const audit = srv.getAudit();
@@ -131,13 +131,13 @@ async function selfTest(): Promise<void> {
     throw new Error(`audit failed: ${JSON.stringify(audit)}`);
   }
 
-  // 4. resetAudit 清空
+  // 4. resetAudit clears
   srv.resetAudit();
   if (srv.getAudit().counts["users"] !== undefined || srv.getAudit().order.length !== 0) {
     throw new Error("resetAudit failed");
   }
 
-  // 5. delay_ms 生效
+  // 5. delay_ms takes effect
   const t0 = Date.now();
   await (await fetch(`${srv.url}/api/slow`)).text();
   if (Date.now() - t0 < 25) throw new Error("delay_ms not honored");

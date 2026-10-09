@@ -1,82 +1,66 @@
-/// counter_reactive，演示 zenit 的响应式系统
+/// counter_reactive: showcases zenit's reactive system + `ui.view` declarative view tree
 ///
-/// 与 hello_button 不同：
-///   - hello_button 用命令式更新（手改 text + markRenderDirty）。
-///   - counter_reactive 用 Signal + Memo + textFmt，
-///     "声明数据流，框架自动同步 UI"。
+/// Minimal declarative example extending hello_button:
+///   - Signal + Memo + `ui.view`: declare data flow and UI structure, framework syncs UI.
 ///
-/// 三个 Signal-driven 的 UI 元素：
-///   - 主计数 Signal(u32)，点击 +1
-///   - 派生 Memo(u32)，主计数 × 2，自动跟随
-///   - "Reset" Button，把 Signal 拨回 0
-///
-/// 动态文本用 `ui.textFmt(cx, scope, fmt, .{signals...}, props)` 一行声明：
-/// 框架内部创建 effect,任一源变化即重新格式化并重绘。
+/// Highlights:
+///   - `v.text(.., v.fmt("count = {d}", .{count}))`: reactive text, one-liner;
+///   - `ui.on.update / ui.on.set`: button events write the signal directly, no Bindings struct;
+///   - `ui.css(...)` style objects: unified `TOKENS` reference JSON material, `_hover` in
+///     styles;
+///   - `S.Badge.of(.{ .even = even })`: reactive variant, fields auto-reset on cancel;
+///   - `v.show(...).fallback(...)`: conditional content stays at its declared position.
 const std = @import("std");
 const ui = @import("ui");
 const App = @import("zenit_app").App;
 
-/// 样式表：具名纯函数（fn(tokens) -> BoxStyle/TextStyle），与下面的业务逻辑分离。
+const v = ui.view;
+const W = ui.widgets;
+
+/// Stylesheet: named style objects (`ui.css`), separate from UI structure.
 const S = @import("styles.zig");
 
-const Bindings = struct {
-    count: *ui.Signal(u32),
+fn inc(n: u32) u32 {
+    return n + 1;
+}
 
-    fn onIncrement(b: *Bindings) void {
-        b.count.set(b.count.get() + 1);
-    }
-
-    fn onReset(b: *Bindings) void {
-        b.count.set(0);
-    }
-};
+fn isEven(n: u32) bool {
+    return n % 2 == 0;
+}
 
 fn mountUI(cx: *ui.Cx, scope: *ui.Scope) anyerror!*ui.Node {
-    const allocator = cx.allocator;
-
     const count = try scope.createSignal(u32, 0);
     const doubled = try scope.createMemo(u32, .{ .count = count }, struct {
         fn compute(ctx: anytype) u32 {
             return ctx.count.get() * 2;
         }
     }.compute);
+    const even = ui.map(count, isEven);
 
-    // boxStyled/textStyled：样式来自 styles.zig 的具名函数，setTheme 自动重放
-    const root = try ui.boxStyled(cx, S.root, .{});
+    return v.render(scope, cx, v.col(.{ .style = S.root }, .{
+        v.text(.{ .style = S.title }, "Reactive Counter"),
+        v.text(.{ .style = S.counterText }, v.fmt("count = {d}", .{count})),
+        v.text(.{ .style = S.derivedText }, v.fmt("doubled = {d}", .{doubled})),
 
-    try root.appendChild(allocator, try ui.textStyled(cx, S.title, "Reactive Counter"));
+        v.row(.{ .style = S.Badge.of(.{ .even = even }) }, .{
+            v.show(even, .{v.text(.{ .style = S.badgeText }, "even")})
+                .fallback(.{v.text(.{ .style = S.badgeText }, "odd")}),
+        }),
 
-    // textFmt 的内容是响应式的；样式取 mount 时的 token 快照
-    try root.appendChild(allocator, try ui.textFmt(cx, scope, "count = {d}", .{count}, S.counterText(cx.tokens)));
-
-    try root.appendChild(allocator, try ui.textFmt(cx, scope, "doubled = {d}", .{doubled}, S.derivedText(cx.tokens)));
-
-    const bindings = try cx.bindState(Bindings, .{ .count = count });
-    const inc_handler = cx.on(Bindings, bindings, Bindings.onIncrement);
-    const reset_handler = cx.on(Bindings, bindings, Bindings.onReset);
-
-    const button_row = try ui.hstackStyled(cx, S.buttonRow, .{});
-    try button_row.appendChild(allocator, try ui.widgets.Button(.{
-        .label = "+1",
-        .variant = .primary,
-        .on_click = inc_handler,
-    }).mount(scope, cx));
-    try button_row.appendChild(allocator, try ui.widgets.Button(.{
-        .label = "Reset",
-        .variant = .secondary,
-        .on_click = reset_handler,
-    }).mount(scope, cx));
-    try root.appendChild(allocator, button_row);
-
-    return root;
+        v.row(.{ .style = S.buttonRow }, .{
+            W.Button(.{ .label = "+1", .variant = .primary, .on_click = ui.on.update(count, inc) }),
+            W.Button(.{ .label = "Reset", .variant = .secondary, .on_click = ui.on.set(count, 0) }),
+        }),
+    }));
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+pub fn main(init: std.process.Init) !void {
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
 
     const app = try App.init(gpa.allocator(), .{
-        .window = .{ .width = 480, .height = 360, .title = "Reactive Counter" },
+        .io = init.io,
+        .window = .{ .width = 480, .height = 400, .title = "Reactive Counter" },
     });
     defer app.deinit();
 

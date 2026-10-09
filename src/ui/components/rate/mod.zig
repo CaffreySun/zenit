@@ -1,22 +1,27 @@
-/// Rate Component
+/// Rate: star rating component.
 ///
-/// 星星评分组件
-///
-/// 特性:
-/// - 星星 ★/☆ 显示
-/// - hover 预览
-/// - click 确认
-/// - 可选半星
+/// Features:
+/// - star display (filled/empty)
+/// - hover preview
+/// - click confirm
+/// - Signal-first: `value: Model(f32)`, `disabled: Source(bool)`; hover preview is pure visual temp
+///   state
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const core = @import("../../core.zig");
+const view = @import("../../view.zig");
 const Cx = core.Cx;
 const Node = core.Node;
 const box = core.box;
 const Color = core.Color;
 const PathCommand = core.PathCommand;
 const svg_assets = @import("../../svg_assets.zig");
-const Scope = @import("../../reactive.zig").Scope;
+const reactive = @import("../../reactive.zig");
+const Scope = reactive.Scope;
+const Signal = reactive.Signal;
+const Source = reactive.Source;
+const Model = reactive.Model;
+const Handler = core.Handler;
 const styles = @import("styles.zig");
 const events = @import("../../events.zig");
 const Event = events.Event;
@@ -24,267 +29,290 @@ const EventResult = events.EventResult;
 const KeyCode = core.KeyCode;
 const Modifiers = core.Modifiers;
 
-/// Rate 属性
+/// Rate properties
 pub const RateProps = struct {
     count: u8 = 5,
-    value: f32 = 0,
-    disabled: bool = false,
+    /// Current score: `f32` uncontrolled initial; `*Signal(f32)` controlled (interaction writes
+    /// directly); `ui.split` intercepts.
+    /// User input truncates and clamps to [0, count]; external out-of-range values clamped to
+    /// display, no write-back.
+    value: Model(f32) = .{ .local = 0 },
+    disabled: Source(bool) = .{ .value = false },
     size: f32 = 24,
-    on_change: ?core.HandlerRef = null,
-    /// 星标图标。默认实心星（common.star_filled，亮/灭只靠 tint 区分）；
-    /// 可换成自定义 SVG（心形、描边星等）。曾经默认为 null 时退化成 "*" 文本。
+    /// Called after user changes score and lands (landed value)
+    on_change: ?Handler(f32) = null,
+    /// Star icon. Default filled star (common.star_filled, bright/dim via tint only);
+    /// can swap custom SVG (heart, outline star etc).
     star_icon_asset: svg_assets.Asset = svg_assets.common.star_filled,
 };
 
-/// Rate 状态
-pub const RateState = struct {
-    value: f32,
-    hover_value: f32 = 0,
-    is_hovering: bool = false,
+/// Rate runtime (scope-owned). View = f(value, disabled) applied by effect;
+/// hover preview only tints stars, doesn't touch data source.
+pub const RateRuntime = struct {
+    value: reactive.Bound(f32),
+    disabled: Source(bool),
+    on_change: ?Handler(f32),
     count: u8,
-    on_change: ?core.HandlerRef,
+    /// Currently displayed score (data source value clamped to [0, count])
+    shown: f32 = 0,
+    is_disabled: bool = false,
+    hover_value: ?f32 = null,
     stars: [10]*Node = undefined, // max 10 stars
-    /// 容器节点：role=slider 的 a11y 数值挂在它身上
-    container_node: ?*Node = null,
+    /// Container node: role=slider a11y value hooked on it
+    container_node: *Node,
     cx: *Cx,
 
-    /// 同步 a11y 数值。**只报 self.value，不报 hover_value**, hover 预览
-    /// 是纯视觉的临时态，把它播报出去会让 AT 用户以为分数已经改了。
-    fn syncA11y(self: *RateState) void {
-        const node = self.container_node orelse return;
-        if (node.behavior.interaction.a11y) |*a| {
-            a.value_now = self.value;
-            if (a.value_range) |*range| range.now = self.value;
+    fn displayOf(self: *const RateRuntime, v: f32) f32 {
+        if (std.math.isNan(v)) return 0;
+        return std.math.clamp(v, 0, @as(f32, @floatFromInt(self.count)));
+    }
+
+    fn view(self: *RateRuntime, comptime tracked: bool) void {
+        const v = self.displayOf(self.value.readAs(tracked));
+        const dis = self.disabled.read(tracked);
+        if (dis != self.is_disabled) {
+            self.is_disabled = dis;
+            self.applyDisabled();
+        }
+        if (v != self.shown) {
+            self.shown = v;
+            self.syncA11y();
+            self.paintStars();
         }
     }
 
-    pub fn getValue(self: *const RateState) f32 {
-        return self.value;
+    fn viewEffect(self: *RateRuntime) void {
+        self.view(true);
     }
 
-    /// 程序化设置评分值。
-    ///
-    /// 此前 RateState 虽然公开、`value` 字段可写，但 `updateDisplay` 是私有的
-    /// 直接写 `state.value` **不会重绘**，看起来能驱动实则无效
-    /// （审查里归为"tier-b 陷阱"：暴露了 state 却没有生效的写入口）。
-    ///
-    /// 会 clamp 到 [0, count]，并同步星星显示。不触发 on_change
-    /// （程序化设值不是用户交互；需要通知请自行调用）。
-    pub fn setValue(self: *RateState, v: f32) void {
-        const max: f32 = @floatFromInt(self.count);
-        self.value = std.math.clamp(v, 0, max);
-        self.updateDisplay();
+    fn applyDisabled(self: *RateRuntime) void {
+        const dis = self.is_disabled;
+        self.container_node.setFocusable(!dis);
+        if (self.container_node.behavior.interaction.a11y) |*a| {
+            a.disabled = dis;
+            a.readonly = dis;
+        }
+        for (self.stars[0..self.count]) |star| star.style.cursor = if (dis) .default else .pointer;
+        if (dis) self.hover_value = null;
+        self.paintStars();
     }
 
-    /// 键盘步进：clamp 到 [0, count]，值变化时触发 on_change（用户交互）。
-    /// 当前 Rate 无半星实现（点击也只产生整数值），步长固定 1。
-    pub fn stepBy(self: *RateState, delta: f32) void {
-        const max: f32 = @floatFromInt(self.count);
-        const new_val = std.math.clamp(self.value + delta, 0, max);
-        if (new_val == self.value) return;
-        self.value = new_val;
-        self.is_hovering = false;
-        self.updateDisplay();
-        if (self.on_change) |handler| handler.invoke();
+    /// Sync a11y value. Only report landed score, not hover preview: speaking temp state
+    /// would confuse AT users into thinking score already changed.
+    fn syncA11y(self: *RateRuntime) void {
+        if (self.container_node.behavior.interaction.a11y) |*a| {
+            a.value_now = self.shown;
+            if (a.value_range) |*range| range.now = self.shown;
+        }
     }
 
-    fn updateDisplay(self: *RateState) void {
-        // 所有改 value 的路径（setValue / 点击星星）都汇到这里，挂在此处
-        // 不会漏。syncA11y 内部只读 self.value，hover 造成的重绘不会污染数值。
-        self.syncA11y();
-        const display_val = if (self.is_hovering) self.hover_value else self.value;
+    fn paintStars(self: *RateRuntime) void {
+        const display_val = self.hover_value orelse self.shown;
         const t = self.cx.tokens;
-        for (0..self.count) |i| {
-            const star = self.stars[i];
-            const fi: f32 = @floatFromInt(i);
-            const active = fi < display_val;
+        for (self.stars[0..self.count], 0..) |star, i| {
+            const active = @as(f32, @floatFromInt(i)) < display_val;
             if (star.children.items.len > 0) {
                 _ = star.children.items[0].setTint(styles.starColor(active, t));
             }
             star.markRenderDirty();
         }
     }
+
+    fn setHover(self: *RateRuntime, v: ?f32) void {
+        if (self.is_disabled) return;
+        self.hover_value = v;
+        self.paintStars();
+    }
+
+    /// User input: truncate, clamp, propose; after landing call on_change (last step, may destroy
+    /// this component)
+    fn propose(self: *RateRuntime, raw: f32) void {
+        if (std.math.isNan(raw)) return;
+        const v = std.math.clamp(@round(raw), 0, @as(f32, @floatFromInt(self.count)));
+        const landed = self.value.commit(v) orelse return;
+        if (self.on_change) |h| h.call(landed);
+    }
 };
 
-/// 方向键调分（与 NumberStepper onStepKey 同型）：Right/Up 加、Left/Down 减。
+/// Arrow key adjust: Right/Up increment, Left/Down decrement (no half-stars currently, step 1)
 fn onRateKey(key: KeyCode, _: Modifiers, context: ?*anyopaque) EventResult {
-    const state: *RateState = @ptrCast(@alignCast(context orelse return .ignored));
+    const rt: *RateRuntime = @ptrCast(@alignCast(context orelse return .ignored));
+    if (rt.is_disabled) return .ignored;
     switch (key) {
-        .right, .up => state.stepBy(1),
-        .left, .down => state.stepBy(-1),
+        .right, .up => rt.propose(rt.shown + 1),
+        .left, .down => rt.propose(rt.shown - 1),
         else => return .ignored,
     }
     return .handled;
 }
 
+/// Return true means this control handled request (caller focuses it)
 fn setA11yRateValue(context: *anyopaque, value: f32) bool {
-    const state: *RateState = @ptrCast(@alignCast(context));
-    state.setValue(value);
-    if (state.on_change) |handler| handler.invoke();
+    const rt: *RateRuntime = @ptrCast(@alignCast(context));
+    if (rt.is_disabled) return false;
+    rt.propose(value);
     return true;
 }
 
-/// Rate mount 结果
+/// Rate mount result
 pub const RateResult = struct {
     wrapper: *Node,
-    state: *RateState,
+    /// Score signal (`ui.split` when null)
+    value: ?*Signal(f32),
+    /// `ui.view` entry (see src/ui/view_parts.zig).
+    pub fn viewParts(self: RateResult) core.ViewParts {
+        return .{ .root = self.wrapper };
+    }
 };
 
-/// 创建 Rate
-pub fn Rate(props: RateProps) RateBuilder {
-    return RateBuilder{ .props = props };
+/// Create Rate: `W.Rate(.{ .count = 5, .value = score })`
+pub fn Rate(props: anytype) RateBuilder {
+    return .{ .props = reactive.props.coerce(RateProps, props) };
 }
 
 pub const RateBuilder = struct {
     props: RateProps,
 
-    pub fn count(self: RateBuilder, c: u8) RateBuilder {
-        var new = self;
-        new.props.count = c;
-        return new;
-    }
-
-    pub fn value(self: RateBuilder, v: f32) RateBuilder {
-        var new = self;
-        new.props.value = v;
-        return new;
-    }
-
-    pub fn onChange(self: RateBuilder, handler_ref: core.HandlerRef) RateBuilder {
-        var new = self;
-        new.props.on_change = handler_ref;
-        return new;
-    }
-
-    /// 保留模式: mount
+    /// Retain mode: mount
     pub fn mount(self: RateBuilder, scope: *Scope, cx: *Cx) !RateResult {
+        cx.owner.enterMount();
+        defer cx.owner.exitMount();
         const my_scope = try scope.childScope();
+        var scope_bound = false;
+        errdefer if (!scope_bound) my_scope.dispose();
         const allocator = cx.allocator;
         const t = cx.tokens;
         const p = self.props;
+        reactive.checkBorrow(my_scope, p.disabled);
+        const value = try reactive.resolveModel(f32, my_scope, p.value);
+        const initially_disabled = p.disabled.read(false);
 
         const star_count = @min(p.count, 10);
 
-        const container = try box(cx, .{
-            .width = .{ .fit = .{} },
-            .height = .{ .fit = .{} },
-            .direction = .row,
-            .gap = 4,
-        }, .{});
-        // sweep：container 守到 return；星星建好即 adopt
+        // Star count is runtime value (<=10): unused slots in fixed array left null, not emitted
+        var stars: [10]*Node = undefined;
+        const icon_px: core.Sizing = .{ .px = p.size * styles.star_icon_scale };
+        var star_elems: [10]?StarView = @splat(null);
+        for (0..star_count) |i| star_elems[i] = starView(&stars[i], p.size, p.star_icon_asset, icon_px, t);
+
+        const container = try view.render(my_scope, cx, view.row(.{
+            .style = .{ .width = .{ .fit = .{} }, .height = .{ .fit = .{} }, .gap = 4 },
+            // Rating is 'pick one value from 0..count', ARIA maps to role=slider.
+            // Exposing each star separately would make AT users hear 5 times before knowing current
+            // score.
+            .a11y = .{
+                .role = .slider,
+                .label = "Rating",
+                .value_min = 0,
+                .value_max = @as(f32, @floatFromInt(star_count)),
+                .orientation = .horizontal,
+            },
+        }, star_elems));
+        // sweep: container guards to return
         errdefer cx.freeNode(container);
         container.meta.ownership.meta.component_name = "Rate";
         try core.bindScopeToNode(my_scope, container);
-        // 评分本质是"在 0..count 里取一个值"，ARIA 对应 role=slider。
-        // 逐颗星星单独暴露反而让 AT 用户要听 5 遍才知道当前几分。
-        container.behavior.interaction.a11y = .{
-            .role = .slider,
-            .label = "Rating",
-            .disabled = p.disabled,
-            .readonly = p.disabled,
-            .value_now = p.value,
-            .value_min = 0,
-            .value_max = @floatFromInt(star_count),
-        };
+        scope_bound = true;
 
-        // State
-        const state = try allocator.create(RateState);
-        state.* = .{
-            .value = p.value,
-            .count = star_count,
+        const rt = try my_scope.allocator.create(RateRuntime);
+        rt.* = .{
+            .value = value,
+            .disabled = p.disabled,
             .on_change = p.on_change,
+            .count = star_count,
+            // Not equal to any display value: first view must apply
+            .shown = std.math.nan(f32),
+            // Negate first: ensure disabled state applied on first view
+            .is_disabled = !initially_disabled,
             .container_node = container,
             .cx = cx,
         };
-        if (container.behavior.interaction.a11y) |*a11y| {
-            a11y.value_range = .{
-                .now = state.value,
-                .min = 0,
-                .max = @floatFromInt(state.count),
-                .context = state,
-                .set_value = setA11yRateValue,
-            };
-            a11y.orientation = .horizontal;
-        }
-        try my_scope.adoptResource(@ptrCast(state), struct {
+        try my_scope.adoptResource(@ptrCast(rt), struct {
             fn cleanup(ptr: *anyopaque, alloc: Allocator) void {
-                alloc.destroy(@as(*RateState, @ptrCast(@alignCast(ptr))));
+                alloc.destroy(@as(*RateRuntime, @ptrCast(@alignCast(ptr))));
             }
         }.cleanup);
-
-        // 键盘交互：role=slider 的标配是方向键调值（与 NumberStepper 接线一致）。
-        container.setFocusable(!p.disabled);
-        if (!p.disabled) {
-            container.behavior.events.on_key_down = onRateKey;
-            container.behavior.events.key_context = @ptrCast(state);
+        if (container.behavior.interaction.a11y) |*a11y| {
+            a11y.value_range = .{
+                .small_change = 1,
+                .now = 0,
+                .min = 0,
+                .max = @floatFromInt(star_count),
+                .context = rt,
+                .set_value = setA11yRateValue,
+            };
         }
 
-        for (0..star_count) |i| {
-            const fi: f32 = @floatFromInt(i);
-            const is_filled = fi < p.value;
-            const star_color: Color = styles.starColor(is_filled, t);
+        // Keyboard interaction always hooked, disabled determined at runtime (disabled can be
+        // dynamic)
+        container.behavior.events.on_key_down = onRateKey;
+        container.behavior.events.key_context = @ptrCast(rt);
 
-            const star = try core.adoptChild(cx, allocator, container, try box(cx, styles.starBoxStyle(p.size), .{}));
-            _ = try core.adoptChild(cx, allocator, star, try core.iconTint(cx, p.star_icon_asset, star_color, .{
-                .width = .{ .px = p.size * styles.star_icon_scale },
-                .height = .{ .px = p.size * styles.star_icon_scale },
-            }));
-
+        // Star hit shape (star path) and raw events (click / hover preview) are node-level
+        // capability, wired after mount
+        for (stars[0..star_count], 0..) |star, i| {
             try configureStarHitShape(star, allocator, p.size);
 
-            if (!p.disabled) {
-                star.style.cursor = .pointer;
+            const star_ctx = try my_scope.allocator.create(StarClickCtx);
+            star_ctx.* = .{ .rt = rt, .index = @intCast(i) };
+            try my_scope.adoptResource(@ptrCast(star_ctx), struct {
+                fn cleanup(ptr: *anyopaque, alloc: Allocator) void {
+                    alloc.destroy(@as(*StarClickCtx, @ptrCast(@alignCast(ptr))));
+                }
+            }.cleanup);
+            star.behavior.events.on_event = starEventHandler;
+            star.behavior.events.event_context = @ptrCast(star_ctx);
 
-                const star_ctx = try allocator.create(StarClickCtx);
-                star_ctx.* = .{ .state = state, .index = @intCast(i) };
-                try my_scope.adoptResource(@ptrCast(star_ctx), struct {
-                    fn cleanup(ptr: *anyopaque, alloc: Allocator) void {
-                        alloc.destroy(@as(*StarClickCtx, @ptrCast(@alignCast(ptr))));
-                    }
-                }.cleanup);
-                star.behavior.events.on_event = starEventHandler;
-                star.behavior.events.event_context = @ptrCast(star_ctx);
-            }
-
-            state.stars[i] = star;
+            rt.stars[i] = star;
         }
 
-        return .{ .wrapper = container, .state = state };
+        rt.view(false);
+        // value is Model: local also signal, interaction changes it, must have effect
+        try my_scope.createEffect(rt, RateRuntime.viewEffect);
+        return .{ .wrapper = container, .value = value.asSignal() };
     }
 };
 
-// ========== 内部辅助 ==========
+// ========== Internal helpers ==========
+
+/// Single star: square grid centered + star icon (initially unlit, RateRuntime.paintStars changes
+/// tint at runtime)
+fn starView(dest: **Node, size: f32, asset: svg_assets.Asset, icon_px: core.Sizing, t: *const core.ThemeTokens) StarView {
+    return view.capture(dest, view.box(StarBoxProps{ .style = styles.starBoxStyle(size) }, view.icon(StarIconProps{
+        .style = .{ .width = icon_px, .height = icon_px },
+        .tint = styles.starColor(false, t),
+    }, asset)));
+}
+
+const StarBoxProps = struct { style: core.BoxStyle };
+const StarIconProps = struct { style: core.BoxStyle, tint: Color };
+const StarView = view.NodeCapture(**Node, view.Box(StarBoxProps, view.Icon(StarIconProps), null));
 
 const StarClickCtx = struct {
-    state: *RateState,
+    rt: *RateRuntime,
     index: u8,
 };
 
 fn starEventHandler(event: Event, context: ?*anyopaque) EventResult {
-    if (context) |ctx| {
-        const sc: *StarClickCtx = @ptrCast(@alignCast(ctx));
-        switch (event) {
-            .click => {
-                const new_val: f32 = @floatFromInt(sc.index + 1);
-                sc.state.value = new_val;
-                sc.state.is_hovering = false;
-                sc.state.updateDisplay();
-                if (sc.state.on_change) |handler| handler.invoke();
-                return .stop;
-            },
-            .mouse_enter => {
-                sc.state.is_hovering = true;
-                sc.state.hover_value = @floatFromInt(sc.index + 1);
-                sc.state.updateDisplay();
-                return .stop;
-            },
-            .mouse_leave => {
-                sc.state.is_hovering = false;
-                sc.state.updateDisplay();
-                return .stop;
-            },
-            else => {},
-        }
+    const sc: *StarClickCtx = @ptrCast(@alignCast(context orelse return .ignored));
+    if (sc.rt.is_disabled) return .ignored;
+    switch (event) {
+        .click => {
+            // End preview first and redraw: if proposal unchanged (clicked current score), view
+            // effect won't run again
+            sc.rt.setHover(null);
+            sc.rt.propose(@floatFromInt(sc.index + 1));
+            return .stop;
+        },
+        .mouse_enter => {
+            sc.rt.setHover(@floatFromInt(sc.index + 1));
+            return .stop;
+        },
+        .mouse_leave => {
+            sc.rt.setHover(null);
+            return .stop;
+        },
+        else => {},
     }
     return .ignored;
 }
@@ -317,10 +345,19 @@ fn configureStarHitShape(star: *Node, allocator: Allocator, size: f32) !void {
     ext.hit_shape = .{ .path = .{ .fill_rule = .nonzero } };
 }
 
-// ========== 测试 ==========
+// ========== Tests ==========
+
+fn runtimeOf(r: RateResult) *RateRuntime {
+    return @ptrCast(@alignCast(r.wrapper.behavior.events.key_context.?));
+}
+
+fn starLit(r: RateResult, i: usize, t: *const core.ThemeTokens) bool {
+    const ic = r.wrapper.children.items[i].children.items[0].getIcon().?;
+    return Color.eql(ic.tint, styles.starColor(true, t));
+}
 
 test "Rate: basic" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 300 }, .height = .{ .px = 100 } }, .{});
@@ -333,11 +370,11 @@ test "Rate: basic" {
 
     try root.appendChild(std.testing.allocator, result.wrapper);
     try std.testing.expectEqual(@as(usize, 5), result.wrapper.children.items.len);
-    try std.testing.expectEqual(@as(f32, 3), result.state.value);
+    try std.testing.expectEqual(@as(f32, 3), result.value.?.peek());
 }
 
 test "Rate: 默认用实心星图标（不再是 \"*\" 文本），亮/灭按 tint 区分" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     const root = try box(ctx, .{ .width = .{ .px = 300 }, .height = .{ .px = 100 } }, .{});
     ctx.root = root;
@@ -352,14 +389,14 @@ test "Rate: 默认用实心星图标（不再是 \"*\" 文本），亮/灭按 ti
         const ic = star.children.items[0].getIcon() orelse return error.TestExpectedIcon;
         try std.testing.expectEqual(styles.starColor(i < 2, ctx.tokens), ic.tint);
     }
-    // setValue / hover 走 updateDisplay：必须真的改到图标 tint。
-    result.state.setValue(4);
+    // External write must really change icon tint.
+    result.value.?.set(4);
     const lit = result.wrapper.children.items[3].children.items[0].getIcon().?;
     try std.testing.expectEqual(styles.starColor(true, ctx.tokens), lit.tint);
 }
 
 test "Rate: click changes value" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 300 }, .height = .{ .px = 100 } }, .{});
@@ -372,17 +409,17 @@ test "Rate: click changes value" {
 
     try root.appendChild(std.testing.allocator, result.wrapper);
 
-    // 模拟点击第 3 颗星
+    // Simulate clicking 3rd star
     const star3 = result.wrapper.children.items[2];
     if (star3.behavior.events.on_event) |handler| {
         _ = handler(.{ .click = .{ .x = 0, .y = 0 } }, star3.behavior.events.event_context);
     }
 
-    try std.testing.expectEqual(@as(f32, 3), result.state.value);
+    try std.testing.expectEqual(@as(f32, 3), result.value.?.peek());
 }
 
 test "Rate: disabled" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 300 }, .height = .{ .px = 100 } }, .{});
@@ -395,13 +432,14 @@ test "Rate: disabled" {
 
     try root.appendChild(std.testing.allocator, result.wrapper);
 
-    // disabled 时没有事件处理
+    // When disabled, click doesn't change score
     const star = result.wrapper.children.items[0];
-    try std.testing.expect(star.behavior.events.on_event == null);
+    try std.testing.expectEqual(EventResult.ignored, star.behavior.events.on_event.?(.{ .click = .{ .x = 0, .y = 0 } }, star.behavior.events.event_context));
+    try std.testing.expectEqual(@as(f32, 4), result.value.?.peek());
 }
 
 test "Rate: 方向键调分 + clamp + on_change" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 300 }, .height = .{ .px = 100 } }, .{});
@@ -411,15 +449,11 @@ test "Rate: 方向键调分 + clamp + on_change" {
     defer scope.dispose();
 
     var change_count: u32 = 0;
-    const on_change = core.HandlerRef{
-        .callback = struct {
-            fn cb(p: *anyopaque) void {
-                const c: *u32 = @ptrCast(@alignCast(p));
-                c.* += 1;
-            }
-        }.cb,
-        .context = @ptrCast(&change_count),
-    };
+    const on_change = ctx.on(u32, &change_count, struct {
+        fn cb(c: *u32, _: f32) void {
+            c.* += 1;
+        }
+    }.cb);
 
     const result = try Rate(.{ .count = 5, .value = 4, .on_change = on_change }).mount(scope, ctx);
     try root.appendChild(std.testing.allocator, result.wrapper);
@@ -429,31 +463,31 @@ test "Rate: 方向键调分 + clamp + on_change" {
     const kh = node.behavior.events.on_key_down.?;
     const kctx = node.behavior.events.key_context;
 
-    // Right/Up 加
+    // Right/Up increment
     try std.testing.expectEqual(EventResult.handled, kh(.right, .{}, kctx));
-    try std.testing.expectEqual(@as(f32, 5), result.state.value);
-    // clamp 到 max：值没变，不触发 on_change
+    try std.testing.expectEqual(@as(f32, 5), result.value.?.peek());
+    // Clamp to max: value unchanged, no on_change trigger
     try std.testing.expectEqual(EventResult.handled, kh(.up, .{}, kctx));
-    try std.testing.expectEqual(@as(f32, 5), result.state.value);
+    try std.testing.expectEqual(@as(f32, 5), result.value.?.peek());
     try std.testing.expectEqual(@as(u32, 1), change_count);
 
-    // Left/Down 减
+    // Left/Down decrement
     try std.testing.expectEqual(EventResult.handled, kh(.left, .{}, kctx));
     try std.testing.expectEqual(EventResult.handled, kh(.down, .{}, kctx));
-    try std.testing.expectEqual(@as(f32, 3), result.state.value);
+    try std.testing.expectEqual(@as(f32, 3), result.value.?.peek());
     try std.testing.expectEqual(@as(u32, 3), change_count);
 
-    // clamp 到 0
-    result.state.setValue(0);
+    // Clamp to 0
+    result.value.?.set(0);
     try std.testing.expectEqual(EventResult.handled, kh(.down, .{}, kctx));
-    try std.testing.expectEqual(@as(f32, 0), result.state.value);
+    try std.testing.expectEqual(@as(f32, 0), result.value.?.peek());
 
-    // 无关按键 ignored
+    // Unrelated key ignored
     try std.testing.expectEqual(EventResult.ignored, kh(.a, .{}, kctx));
 }
 
-test "Rate: disabled 无键盘接线" {
-    var ctx = try Cx.init(std.testing.allocator);
+test "Rate: disabled 不响应键盘、不可聚焦" {
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 300 }, .height = .{ .px = 100 } }, .{});
@@ -464,43 +498,98 @@ test "Rate: disabled 无键盘接线" {
 
     const result = try Rate(.{ .count = 5, .value = 2, .disabled = true }).mount(scope, ctx);
     try root.appendChild(std.testing.allocator, result.wrapper);
-    try std.testing.expect(result.wrapper.behavior.events.on_key_down == null);
+    try std.testing.expectEqual(EventResult.ignored, onRateKey(.right, .{}, result.wrapper.behavior.events.key_context));
     try std.testing.expect(!result.wrapper.behavior.interaction.focusable);
 }
 
-test "Rate.setValue: 程序化设值会重绘星星（此前 updateDisplay 私有，写字段无效）" {
-    var ctx = try Cx.init(std.testing.allocator);
+test "Rate: bound value — external writes are displayed clamped and not written back" {
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
-    ctx.setViewport(400, 200);
-    const root = try box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 200 } }, .{});
-    ctx.root = root;
     const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
     defer scope.dispose();
 
-    const result = try Rate(.{ .count = 5, .value = 2 }).mount(scope, ctx);
-    try root.appendChild(std.testing.allocator, result.wrapper);
-    ctx.layout();
-    _ = ctx.render();
-
-    const st = result.state;
-    try std.testing.expectEqual(@as(f32, 2), st.getValue());
-
-    st.setValue(4);
-    try std.testing.expectEqual(@as(f32, 4), st.getValue());
-
-    // clamp 到 [0, count]
-    st.setValue(99);
-    try std.testing.expectEqual(@as(f32, 5), st.getValue());
-    st.setValue(-3);
-    try std.testing.expectEqual(@as(f32, 0), st.getValue());
+    const score = try scope.createSignal(f32, 2);
+    const result = try Rate(.{ .count = 5, .value = score }).mount(scope, ctx);
+    defer ctx.freeNode(result.wrapper);
+    try std.testing.expect(starLit(result, 1, ctx.tokens) and !starLit(result, 2, ctx.tokens));
+    score.set(99);
+    try std.testing.expectEqual(@as(f32, 5), runtimeOf(result).shown);
+    try std.testing.expectEqual(@as(f32, 99), score.peek());
+    try std.testing.expect(starLit(result, 4, ctx.tokens));
+    try std.testing.expectEqual(@as(f32, 5), result.wrapper.behavior.interaction.a11y.?.value_now);
 }
 
-// styles.zig 的测试收集，这行是必需的，见 docs/STYLING.md
+test "Rate: hover previews without touching the value; clicking the current score clears the preview" {
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
+    const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
+    defer scope.dispose();
+
+    const score = try scope.createSignal(f32, 2);
+    var changes: u32 = 0;
+    const result = try Rate(.{ .count = 5, .value = score, .on_change = ctx.on(u32, &changes, struct {
+        fn cb(c: *u32, _: f32) void {
+            c.* += 1;
+        }
+    }.cb) }).mount(scope, ctx);
+    defer ctx.freeNode(result.wrapper);
+    const star = struct {
+        fn send(r: RateResult, i: usize, e: Event) void {
+            const n = r.wrapper.children.items[i];
+            _ = n.behavior.events.on_event.?(e, n.behavior.events.event_context);
+        }
+    }.send;
+    star(result, 3, .{ .mouse_enter = {} });
+    try std.testing.expect(starLit(result, 3, ctx.tokens));
+    try std.testing.expectEqual(@as(f32, 2), score.peek());
+    try std.testing.expectEqual(@as(f32, 2), result.wrapper.behavior.interaction.a11y.?.value_now);
+    score.set(1); // External change during preview: a11y speaks landed value, not preview
+    try std.testing.expectEqual(@as(f32, 1), result.wrapper.behavior.interaction.a11y.?.value_now);
+    score.set(2);
+    star(result, 1, .{ .click = .{ .x = 0, .y = 0 } }); // Click on current score: doesn't land
+    try std.testing.expectEqual(@as(u32, 0), changes);
+    try std.testing.expect(!starLit(result, 3, ctx.tokens)); // Preview ended
+    star(result, 4, .{ .click = .{ .x = 0, .y = 0 } });
+    try std.testing.expectEqual(@as(f32, 5), score.peek());
+    try std.testing.expectEqual(@as(u32, 1), changes);
+}
+
+test "Rate: dynamic disabled" {
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
+    const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
+    defer scope.dispose();
+
+    const off = try scope.createSignal(bool, false);
+    const result = try Rate(.{ .count = 5, .value = 1, .disabled = off }).mount(scope, ctx);
+    defer ctx.freeNode(result.wrapper);
+    try std.testing.expect(result.wrapper.behavior.interaction.focusable);
+    off.set(true);
+    try std.testing.expect(!result.wrapper.behavior.interaction.focusable);
+    try std.testing.expect(result.wrapper.behavior.interaction.a11y.?.readonly);
+    try std.testing.expect(!setA11yRateValue(runtimeOf(result), 4));
+    off.set(false);
+    try std.testing.expect(setA11yRateValue(runtimeOf(result), 4));
+    try std.testing.expectEqual(@as(f32, 4), result.value.?.peek());
+}
+
+test "rate: 动态值 / disabled 的 mount 在任意分配点失败时不泄漏（sweep）" {
+    const sw = @import("../oom_sweep.zig");
+    try sw.sweepMount("rate(dynamic)", struct {
+        fn m(scope: *sw.Scope, cx: *sw.Cx) anyerror!?*sw.Node {
+            const v = try scope.createSignal(f32, 3);
+            const off = try scope.createSignal(bool, false);
+            return (try Rate(.{ .count = 5, .value = v, .disabled = off }).mount(scope, cx)).wrapper;
+        }
+    }.m);
+}
+
+// styles.zig test collection, this line required, see docs/STYLING.md
 test {
     _ = @import("styles.zig");
 }
 
-// 逐分配点 OOM sweep，见 src/ui/components/oom_sweep.zig
+// Per-alloc OOM sweep, see src/ui/components/oom_sweep.zig
 test "rate: mount 在任意分配点失败时不泄漏（sweep）" {
     const sw = @import("../oom_sweep.zig");
     try sw.sweepMount("rate", struct {

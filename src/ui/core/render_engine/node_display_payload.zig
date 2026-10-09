@@ -1,20 +1,20 @@
-//! 节点 display payload 的**只读取址**，从 display_list_lowering.zig 析出
-//! （2026-08-05），延续 bracket_debug.zig 的拆分先例（本文件聚焦 lowering 核心）。
+//! Node display payload **read-only access**, split out of display_list_lowering.zig (which keeps
+//! the lowering core).
 //!
-//! 这一簇回答同一个问题：给定 node_id 和 own/subtree 作用域，
-//! 它的 DisplayItem / TextLayoutBlob 切片在哪。共同点是**只读、不分配、
-//! 不改 cx**：只在 scene_runtime 的 runtime 记录上做下标算术，再到
-//! display_list / text_blob_store 上切片。
+//! This cluster answers one question: given node_id and own/subtree scope, where are its
+//! DisplayItem/TextLayoutBlob slices. Common trait: **read-only, no allocation, doesn't change
+//! cx**: index arithmetic on scene_runtime runtime records, then slicing
+//! display_list/text_blob_store.
 //!
-//! 与 lowering 主路径的分工：那边**写**（把 display_list lower 进
-//! lowering_buffer_paint，有缓冲区状态与分配）；这边只**读已经写好的
-//! 结果**。两者混在一个文件里时，"哪些函数会动 buffer"要靠逐个读实现才能
-//! 判断，分开后这一整个文件的零副作用性质是文件级保证。
+//! Division with the lowering main path: that side **writes** (lowers display_list into
+//! lowering_buffer_paint, owns buffer state and allocation); this side **reads already-written
+//! results**. Keeping them in separate files makes the zero-side-effect property a file-level
+//! guarantee.
 //!
-//! own vs subtree：own 只含节点自己产出的 item；subtree 含它整棵子树的
-//! 连续区间（lowering 时按前序保证连续，所以子树也能用一个 start+count 表达）。
-//! count==0 返回 null 而不是空切片，调用方据此区分"没有 payload"与
-//! "有 payload 但为空"，跨帧 splice 路径依赖这个区分。
+//! own vs subtree: own contains only the node's own items; subtree is its whole subtree's
+//! contiguous range (lowering preserves preorder, so a subtree is start+count). count==0 returns
+//! null, not an empty slice: callers distinguish "no payload" from "payload but empty", and
+//! cross-frame splice depends on it.
 
 const render_context_mod = @import("render_context.zig");
 const display_list_mod = @import("../display_list.zig");
@@ -73,8 +73,8 @@ pub fn getNodeTextBlobs(
     return cx.text_blob_store.slice(start, count);
 }
 
-/// items + blobs 一起取。blobs 缺失时退化为空切片而非整体 null,
-/// 纯图形节点没有文本 blob 是正常情况，不该让整个 payload 变成"不存在"。
+/// items + blobs together. Missing blobs degrade to empty slice not whole null; pure-graphic nodes
+/// lacking text blob normal, shouldn't make whole payload "nonexistent".
 pub fn getNodeDisplayPayload(
     cx: *RenderContext,
     node_id: u32,

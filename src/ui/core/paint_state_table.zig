@@ -1,12 +1,12 @@
-//! PaintStateTable, v0.9-§b paint state SoA, dense by ElementId
+//! PaintStateTable: paint state SoA, dense by ElementId
 //!
-//! 持有 Node.style 内的 paint-state 字段 (background, opacity, border 等)。
-//! Stage 1: 基建 + Node accessor + Cx.init 注册 read/write callback。
-//! 本表当前为镜像；style.background 等仍是 source of truth (类似 §a stage 1)。
-//! Stage 2+: caller 全切 getter，Stage 3 删 Node.style 字段。
+//! Holds paint-state fields of Node.style (background, opacity, border, etc).
+//! Stage 1: infrastructure + Node accessor + Cx.init registers read/write callback.
+//! Table currently mirrors; style.background etc are still the source of truth.
+//! Stage 2+: switch all callers to getter, Stage 3 deletes Node.style fields.
 //!
-//! TODO: 字段集仍在 design 中；初版只覆盖 background + opacity 验证机制。
-//! 后续按 caller 频度逐个搬。
+//! TODO: field set still in design; initial version covers background + opacity to validate
+//! the mechanism. Migrate fields by caller frequency.
 
 const std = @import("std");
 const testing = std.testing;
@@ -27,7 +27,7 @@ pub const PaintStateTable = struct {
     items: std.ArrayListUnmanaged(PaintStateData),
 
     pub fn init(allocator: std.mem.Allocator) PaintStateTable {
-        return .{ .allocator = allocator, .items = .{} };
+        return .{ .allocator = allocator, .items = .empty };
     }
 
     pub fn deinit(self: *PaintStateTable) void {

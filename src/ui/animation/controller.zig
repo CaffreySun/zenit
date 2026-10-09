@@ -1,26 +1,27 @@
-/// AnimationController，统一播放控制器
+/// AnimationController: unified playback controller.
 ///
-/// 包装 Tween/Spring/Keyframes 三种驱动器，提供 GSAP 风格的统一播放控制：
-/// play / pause / resume / reverse / seek / restart
+/// Wraps Tween/Spring/Keyframes drivers and provides GSAP-style unified playback
+/// control: play / pause / resume / reverse / seek / restart
 ///
-/// 用法:
+/// Usage:
 /// ```zig
-/// // Tween 动画
+/// // Tween animation
 /// var ctrl = AnimationController.initTween(.{ .from = 0, .to = 100, .duration = 0.5 });
 /// ctrl.play();
-/// // 每帧:
+/// // per frame:
 /// if (ctrl.tick(now_ms)) node.markRenderDirty();
-/// const v = ctrl.value; // 当前值
+/// const v = ctrl.value; // current value
 ///
-/// // Spring 动画
-/// var ctrl2 = AnimationController.initSpring(.{ .from = 0, .to = 100, .stiffness = 200, .damping = 20 });
+/// // Spring animation
+/// var ctrl2 = AnimationController.initSpring(.{ .from = 0, .to = 100, .stiffness = 200, .damping =
+/// 20 });
 /// ctrl2.play();
 ///
-/// // 播放控制
+/// // Playback control
 /// ctrl.pause();
 /// ctrl.unpause();
 /// ctrl.reverse();
-/// ctrl.seek(0.5); // 跳到 50%
+/// ctrl.seek(0.5); // jump to 50%
 /// ```
 const std = @import("std");
 const values = @import("value.zig");
@@ -31,7 +32,7 @@ const KeyframeAnimation = @import("keyframes.zig").KeyframeAnimation;
 const Keyframe = @import("keyframes.zig").Keyframe;
 const render_engine = @import("../core/render_engine/mod.zig");
 
-/// 播放状态
+/// Play state.
 pub const PlayState = enum {
     idle,
     playing,
@@ -39,11 +40,11 @@ pub const PlayState = enum {
     completed,
 };
 
-/// 回调函数类型
+/// Callback function type.
 pub const CallbackFn = *const fn (*anyopaque) void;
 pub const UpdateCallbackFn = *const fn (f32, *anyopaque) void;
 
-/// Tween 驱动配置
+/// Tween driver config.
 pub const TweenConfig = struct {
     from: f32 = 0,
     to: f32 = 1,
@@ -52,7 +53,7 @@ pub const TweenConfig = struct {
     delay: f32 = 0,
 };
 
-/// Spring 驱动配置
+/// Spring driver config.
 pub const SpringAnimConfig = struct {
     from: f32 = 0,
     to: f32 = 1,
@@ -101,7 +102,7 @@ pub const ScopeLifetime = struct {
     }
 };
 
-/// 统一动画控制器
+/// Unified animation controller.
 pub const AnimationController = struct {
     // Hooks bind their allocation to a Scope. Tick holds that owner until all
     // callback dispatch and controller access has finished.
@@ -117,37 +118,37 @@ pub const AnimationController = struct {
     /// be replaced and cannot be borrowed by a Timeline.
     node_owned: bool = false,
 
-    /// 底层驱动
+    /// Underlying driver.
     driver: Driver,
-    /// 播放状态
+    /// Play state.
     play_state: PlayState = .idle,
-    /// 播放方向 (1.0 = 正向, -1.0 = 反向)
+    /// Play direction (1.0=forward, -1.0=reverse).
     direction: f32 = 1.0,
-    /// 总进度 [0, 1]
+    /// Overall progress [0, 1].
     progress: f32 = 0,
-    /// 当前值
+    /// Current value.
     value: f32 = 0,
-    /// 首次对外可见的 tick 只建立时间锚点，不消耗该帧的时间片。
+    /// First tick visible to outside only anchors time, doesn't consume this frame's time.
     pending_first_tick: bool = false,
     /// Preserve an explicit stopped/completed seek when play later arms time.
     seek_on_play: bool = false,
     /// Local driver elapsed time of a stopped seek. Unlike normalized progress,
     /// this retains delay, cycle remainder and nonconverging Spring time.
     seek_elapsed_ms: f64 = 0,
-    /// 循环次数 (0 = 无限)
+    /// Loop count (0 = infinite).
     loops: u32 = 1,
-    /// 来回模式
+    /// Yoyo mode.
     yoyo: bool = false,
     current_loop: u32 = 0,
-    /// 暂停时记录的时间戳（用于 unpause 时偏移 start_time_ms）
+    /// Pause-time timestamp (offset start_time_ms on unpause).
     pause_time_ms: f64 = 0,
-    /// 回调
+    /// Callbacks.
     on_complete: ?CallbackFn = null,
     on_complete_ctx: ?*anyopaque = null,
     on_update: ?UpdateCallbackFn = null,
     on_update_ctx: ?*anyopaque = null,
 
-    /// 驱动类型
+    /// Driver type.
     pub const Driver = union(enum) {
         tween: TweenDriver,
         spring: Spring,
@@ -156,7 +157,7 @@ pub const AnimationController = struct {
 
     const TweenVelocityPhase = struct { progress: f32, direction: f32 };
 
-    /// Tween 驱动内部状态
+    /// Tween driver internal state.
     pub const TweenDriver = struct {
         from: f32,
         to: f32,
@@ -169,9 +170,9 @@ pub const AnimationController = struct {
         velocity_phase: ?TweenVelocityPhase = null,
     };
 
-    // ============ 构造函数 ============
+    // ============ Constructors ============
 
-    /// 创建 Tween 驱动的控制器
+    /// Create Tween-driven controller.
     pub fn initTween(config: TweenConfig) AnimationController {
         const from = values.finiteOr(config.from, 0);
         const to = values.finiteOr(config.to, from);
@@ -187,7 +188,7 @@ pub const AnimationController = struct {
         };
     }
 
-    /// 创建 Spring 驱动的控制器
+    /// Create Spring-driven controller.
     pub fn initSpring(config: SpringAnimConfig) AnimationController {
         const spring = Spring.init(config.from, config.to, .{
             .stiffness = config.stiffness,
@@ -200,7 +201,7 @@ pub const AnimationController = struct {
         return .{ .driver = .{ .spring = spring }, .value = spring.current_value, .spring_parameter_revision = spring.parameter_revision };
     }
 
-    /// 创建 Keyframes 驱动的控制器
+    /// Create Keyframes-driven controller.
     pub fn initKeyframes(kf: []const Keyframe, duration_ms: f32) AnimationController {
         const kf_anim = KeyframeAnimation.init(kf, duration_ms, 1);
         const initial = kf_anim.current_value;
@@ -210,14 +211,12 @@ pub const AnimationController = struct {
         };
     }
 
-    // ============ 播放控制 ============
+    // ============ Playback control ============
 
-    /// 开始播放
-    ///
-    /// Phase 7 修复：原 `if (tw.start_time_ms == 0) tw.start_time_ms = now_ms`
-    /// 守卫在 boot/test 场景（current_frame_time_ms 真为 0）误激活，第二次
-    /// play 永远从原点开始，看上去"不前进"。改用 play_state 显式管理：
-    /// 进入 .playing 时无条件锚定 start_time_ms。
+    /// Start playback. Phase 7 fix: old `if (tw.start_time_ms == 0) tw.start_time_ms = now_ms`
+    /// guard triggered during boot/test (current_frame_time_ms truly 0), second play always from
+    /// origin, looks 'not advancing'. Explicit play_state management: entering .playing
+    /// unconditionally anchors start_time_ms.
     pub fn play(self: *AnimationController) void {
         if (self.play_state == .playing) return;
         if (self.play_state == .paused) {
@@ -263,17 +262,18 @@ pub const AnimationController = struct {
         self.recordTweenStart();
     }
 
-    /// 用 (current_value, velocity) 接管动画，interruption-safe 续衔。
-    /// 当 NodeAnimations.set 替换 controller 时，从老 controller 取 current/velocity
-    /// 调这个；新 controller 据此从老的"当前位置"开始而非 from_value 跳变。
+    /// Adopt an animation from (current_value, velocity), for interruption-safe continuation. When
+    /// NodeAnimations.set replaces a controller, extract current/velocity from the old one and call
+    /// this; the new controller starts from the old 'current', not a from_value jump.
     ///
-    /// 驱动行为:
-    /// - spring: from := current_value, initial_velocity := velocity, 重 precompute
-    ///   + 锚定 start_time_ms = now -> 下一 tick 真从 (current, velocity) 续衔
-    /// - tween: from := current_value (起点续衔)，velocity 忽略 (tween 没有速度参数)
-    /// - keyframes: 不支持任意点续衔；只更新 self.value 给应用层用
+    /// Driver behavior:
+    /// - spring: from := current_value, initial_velocity := velocity, re-precompute + anchor
+    ///   start_time_ms = now, so the next tick continues from (current, velocity)
+    /// - tween: from := current_value (continuation start); velocity ignored (tween has no
+    ///   velocity)
+    /// - keyframes: no arbitrary-point adoption, only updates self.value for app-layer use
     ///
-    /// 调用约定: 必须在 play() 之后调，否则 spring.start() 会重 reset。
+    /// Call contract: must call after play(), else spring.start() resets.
     pub fn seed(self: *AnimationController, current_value: f32, velocity: f32) void {
         if (!std.math.isFinite(current_value)) return;
         if (self.driver == .spring and !std.math.isFinite(velocity)) return;
@@ -283,7 +283,7 @@ pub const AnimationController = struct {
         self.value = current_value;
         switch (self.driver) {
             .spring => |*sp| {
-                // 修改 from + initial_velocity 让 precompute 用新值算 ODE 系数
+                // Modify from + initial_velocity for precompute to use new ODE coefficients.
                 sp.from = current_value;
                 sp.config.initial_velocity = velocity;
                 sp.current_value = current_value;
@@ -292,7 +292,7 @@ pub const AnimationController = struct {
                 self.spring_parameter_revision = sp.parameter_revision;
                 self.current_loop = 0;
                 self.direction = 1;
-                // 重锚定 start_time，让 t_s=0 即"现在"
+                // Re-anchor start_time, t_s=0 means 'now'.
                 sp.start_time_ms = render_engine.current_frame_time_ms;
                 sp.state = .running;
                 self.progress = 0;
@@ -306,7 +306,7 @@ pub const AnimationController = struct {
                 self.recordTweenStart();
             },
             .keyframes => {
-                // keyframes 没有内连续语义；只更新 value
+                // Keyframes no internal-continuity semantics; update value only.
             },
         }
     }
@@ -344,7 +344,7 @@ pub const AnimationController = struct {
         if (self.driver == .tween) self.recordTweenVelocity(if (self.direction < 0) 1 else 0, self.direction, self.driver.tween.delay <= 0 and self.driver.tween.duration > 0);
     }
 
-    /// 开始播放，但首个对外可见 tick 仅建立时间锚点，不消耗该帧时间片。
+    /// Start playback, but first visible tick only anchors time, doesn't consume this frame's time.
     pub fn playPendingFirstTick(self: *AnimationController) void {
         const resume_seek = self.seek_on_play;
         self.play();
@@ -365,7 +365,7 @@ pub const AnimationController = struct {
         self.pending_first_tick = true;
     }
 
-    /// 暂停
+    /// Pause.
     pub fn pause(self: *AnimationController) void {
         self.control_revision +%= 1;
         if (self.play_state == .playing) {
@@ -374,12 +374,12 @@ pub const AnimationController = struct {
         }
     }
 
-    /// 恢复播放
+    /// Resume.
     pub fn unpause(self: *AnimationController) void {
         if (self.play_state == .paused) {
             self.control_revision +%= 1;
             self.play_state = .playing;
-            // 偏移 start_time_ms 以补偿暂停期间的时间流逝（仅 Tween/Keyframes）
+            // Offset start_time_ms to compensate pause elapsed (Tween/Keyframes only).
             const paused_duration = render_engine.current_frame_time_ms - self.pause_time_ms;
             switch (self.driver) {
                 .tween => |*tw| tw.start_time_ms += paused_duration,
@@ -392,13 +392,13 @@ pub const AnimationController = struct {
         }
     }
 
-    /// 反转方向
+    /// Reverse direction.
     pub fn reverse(self: *AnimationController) void {
         self.control_revision +%= 1;
         self.direction = -self.direction;
     }
 
-    /// 跳转到指定进度 [0, 1]
+    /// Seek to progress [0, 1].
     pub fn seek(self: *AnimationController, target_progress: f32) void {
         if (!std.math.isFinite(target_progress)) return;
         if (self.driver == .spring and target_progress > 0 and !std.math.isFinite(self.driver.spring.settlingDuration())) return;
@@ -566,8 +566,7 @@ pub const AnimationController = struct {
         return @floatCast(cycle * @as(f64, @floatFromInt(self.loops)) / 1000);
     }
 
-    /// 设置时间缩放
-    /// 停止（重置到初始状态）
+    /// Stop (reset to initial state).
     pub fn stop(self: *AnimationController) void {
         self.control_revision +%= 1;
         self.play_state = .idle;
@@ -581,21 +580,19 @@ pub const AnimationController = struct {
         self.value = self.evaluateAt(0);
     }
 
-    /// 重新开始
+    /// Restart.
     pub fn restart(self: *AnimationController) void {
         self.stop();
         self.play();
     }
 
-    // ============ 帧驱动 ============
+    // ============ Frame drive ============
 
-    /// 推进动画一帧，返回 true 表示仍在播放
-    /// now_ms: 当前帧的绝对时间戳（毫秒）
-    /// Non-hook callers must keep this controller alive and at a stable address
-    /// through tick, including callbacks. Playback methods are callback-safe;
-    /// replacing the whole struct while it is ticking is not supported. When a
-    /// Timeline or node owns the driver, this entry point reports active state
-    /// without advancing; only its host adapter can supply the playback clock.
+    /// Advance one frame, return true if still playing. now_ms: current frame absolute timestamp
+    /// (ms). Non-hook callers must keep this controller alive and at stable address through tick,
+    /// including callbacks. Playback methods callback-safe; replacing whole struct while ticking
+    /// unsupported. When Timeline or node owns the driver, this entry point reports active state
+    /// without advancing; only host adapter supplies playback clock.
     pub fn tick(self: *AnimationController, now_ms: f64) bool {
         if (self.timeline_owner != null or self.node_owned) return !self.scopeIsRetiring() and self.isActive();
         return self.tickImpl(now_ms, AlwaysCurrent{}, false, false);
@@ -755,7 +752,7 @@ pub const AnimationController = struct {
             },
         }
 
-        // 触发 update 回调
+        // Trigger update callback.
         if (self.on_update) |cb| {
             if (self.on_update_ctx) |ctx| {
                 if (@hasDecl(@TypeOf(guard), "beforeCallback")) guard.beforeCallback();
@@ -792,17 +789,17 @@ pub const AnimationController = struct {
         return true;
     }
 
-    /// 是否正在活跃
+    /// Is actively playing.
     pub fn isActive(self: *const AnimationController) bool {
         return self.play_state == .playing;
     }
 
-    /// 是否已完成
+    /// Is complete.
     pub fn isCompleted(self: *const AnimationController) bool {
         return self.play_state == .completed;
     }
 
-    /// 获取估算时长（秒）
+    /// Estimated duration (seconds).
     pub fn estimatedDuration(self: *const AnimationController) f32 {
         return switch (self.driver) {
             .tween => |tw| tw.duration + tw.delay,
@@ -811,7 +808,7 @@ pub const AnimationController = struct {
         };
     }
 
-    // ============ 内部 ============
+    // ============ Internal ============
 
     // Preserve the public f32 seconds-to-ms boundary (0.3s -> 300ms).
     // Use a wide fallback only when the f32 product cannot represent it.
@@ -933,7 +930,7 @@ pub const AnimationController = struct {
         }
     }
 
-    /// 在给定进度 [0, 1] 处求值（用于 seek）
+    /// Evaluate at progress [0, 1] (used for seek).
     fn evaluateAt(self: *const AnimationController, progress: f32) f32 {
         return switch (self.driver) {
             .tween => |tw| {
@@ -951,9 +948,9 @@ pub const AnimationController = struct {
     }
 };
 
-// ========== 测试 ==========
+// ========== Tests ==========
 
-/// 测试辅助：设置全局模拟时间
+/// Test helper: set global mock time.
 fn setTestTime(ms: f64) void {
     render_engine.current_frame_time_ms = ms;
 }
@@ -970,12 +967,12 @@ test "AnimationController: tween basic" {
     ctrl.play();
     try std.testing.expect(ctrl.isActive());
 
-    // 半秒后
+    // Half second later.
     setTestTime(1500.0);
     _ = ctrl.tick(1500.0);
     try std.testing.expectApproxEqAbs(@as(f32, 50.0), ctrl.value, 1.0);
 
-    // 完成
+    // Complete.
     setTestTime(2000.0);
     _ = ctrl.tick(2000.0);
     try std.testing.expect(ctrl.isCompleted());
@@ -1021,7 +1018,7 @@ test "AnimationController: pause and resume" {
     ctrl.pause();
     try std.testing.expect(!ctrl.isActive());
 
-    // tick 不应该改变值（paused 状态 tick 返回 false）
+    // Tick shouldn't change value (paused state tick returns false).
     setTestTime(1750.0);
     _ = ctrl.tick(1750.0);
     try std.testing.expectEqual(paused_value, ctrl.value);
@@ -1066,12 +1063,12 @@ test "AnimationController: yoyo" {
 
     ctrl.play();
 
-    // 第一次正向
+    // First forward.
     setTestTime(1500.0);
     _ = ctrl.tick(1500.0);
     try std.testing.expectApproxEqAbs(@as(f32, 100.0), ctrl.value, 1.0);
 
-    // 第二次反向 (yoyo), resetDriver 会重置 start_time_ms 到 current_frame_time_ms
+    // Second reverse (yoyo), resetDriver re-anchors start_time_ms to current_frame_time_ms.
     setTestTime(2000.0);
     _ = ctrl.tick(2000.0);
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), ctrl.value, 1.0);
@@ -1080,9 +1077,9 @@ test "AnimationController: yoyo" {
 }
 
 test "AnimationController: yoyo 完成后裸 play() 重放必须从 from 正向开始" {
-    // 回归：yoyo 结束时 direction 停在 -1，play() 的 was_completed 块只复位
-    // progress/current_loop 不复位 direction，重放从 to 倒播到 from。
-    // （restart() 因 stop() 复位 direction 而幸免，裸 play() 中招）
+    // Regression: yoyo end leaves direction=-1, play()'s was_completed block resets
+    // progress/current_loop not direction, replay starts from to backwards. (restart() safe via
+    // stop()'s direction reset.)
     setTestTime(1000.0);
     var ctrl = AnimationController.initTween(.{
         .from = 0,
@@ -1100,8 +1097,8 @@ test "AnimationController: yoyo 完成后裸 play() 重放必须从 from 正向�
     _ = ctrl.tick(2000.0);
     try std.testing.expect(ctrl.isCompleted());
 
-    // 裸 play() 重放：中点应在 from->to 的正向路径上（≈50），倒播则 ≈50 也一样……
-    // 所以采样 1/5 处：正向 ≈20，倒播 ≈80
+    // Bare play() replay: midpoint should be on from->to forward (≈50), reverse is same ≈50… sample
+    // at 1/5: forward ≈20, reverse ≈80.
     setTestTime(3000.0);
     ctrl.play();
     setTestTime(3100.0);
@@ -1110,9 +1107,9 @@ test "AnimationController: yoyo 完成后裸 play() 重放必须从 from 正向�
 }
 
 test "AnimationController: 绝对时间模型下 Tween 正确完成" {
-    // time_scale/setTimeScale 已删除：绝对时间戳模型下它是写入无人读的
-    // 死代码（tick 全程从 now_ms 派生），setTimeScale(2.0) 静默无效比
-    // 没有这个 API 更糟。倍速语义由 Timeline.time_scale 承担。
+    // time_scale/setTimeScale removed: absolute timestamp model makes it dead code (tick derives
+    // entirely from now_ms), setTimeScale(2.0) silently no-op worse than no API. Playback speed
+    // owned by Timeline.time_scale.
     setTestTime(1000.0);
     var ctrl = AnimationController.initTween(.{
         .from = 0,
@@ -1139,7 +1136,7 @@ test "AnimationController: spring driver" {
     ctrl.play();
     try std.testing.expect(ctrl.isActive());
 
-    // 运行足够帧（Spring 用绝对时间戳）
+    // Run enough frames (Spring uses absolute timestamp).
     const dt_ms: f32 = 1000.0 / 60.0;
     var now: f64 = 1000.0;
     var i: usize = 0;
@@ -1163,7 +1160,7 @@ test "AnimationController: keyframes driver" {
 
     ctrl.play();
 
-    // 25% (在 [0, 0.5] 段，局部 50%) -> value ≈ 50
+    // 25% (in [0, 0.5] segment, local 50%) -> value ≈ 50.
     setTestTime(1250.0);
     _ = ctrl.tick(1250.0);
     try std.testing.expectApproxEqAbs(@as(f32, 50.0), ctrl.value, 2.0);
@@ -1235,7 +1232,7 @@ test "AnimationController: infinite loops" {
         .duration = 0.1,
         .easing = .linear,
     });
-    ctrl.loops = 0; // 无限
+    ctrl.loops = 0; // Infinite.
 
     ctrl.play();
     const dt_ms: f32 = 1000.0 / 60.0;
@@ -1246,7 +1243,7 @@ test "AnimationController: infinite loops" {
         setTestTime(now);
         _ = ctrl.tick(now);
     }
-    // 应该仍在播放
+    // Should still play.
     try std.testing.expect(ctrl.isActive());
 }
 

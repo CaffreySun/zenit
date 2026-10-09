@@ -1,36 +1,31 @@
-//! Null Backend，无设备的确定性参考实现。
+//! Null Backend: deterministic reference impl without device.
 //!
-//! ## 它存在的理由
+//! ## Why it exists
 //!
-//! `gpu.Backend` 曾经是 `@import("metal/backend.zig")` 这一个编译期 alias。
-//! 只有一个实现时，没人能回答这个问题：`gpu.Backend.*` 的签名到底是
-//! backend-neutral 的，还是无意中把 Metal 语义焊死在了里面？
+//! With a single (Metal) impl it is unanswerable whether `gpu.Backend.*` signatures are
+//! backend-neutral or accidentally welded to Metal semantics.
 //!
-//! 本后端就是那个答案。它**与 Metal 后端共用同一份渲染器代码**,
-//! `src/render`、`src/ui`、`src/zenit_app` 一行不改，只把 `-Dgpu-backend=null`
-//! 打开。能编译通过，抽象才算被证伪过一次；编译不过的地方，就是抽象漏了。
+//! This backend runs the **exact same renderer code as Metal**; `src/render`, `src/ui`,
+//! `src/zenit_app` are unchanged, only `-Dgpu-backend=null` is on.
+//! Compiles: abstraction holds. Compile fails: abstraction leaks.
 //!
-//! 写这个实现的过程本身已经抓出三个真实泄漏（见
-//! `docs/internal/RHI_SECOND_BACKEND_ASSESSMENT.md`），其中
-//! `Surface.init(*CAMetalLayer)` 是硬阻塞，已改成 `*anyopaque`。
+//! ## What it verifies, what it doesn't
 //!
-//! ## 它验证什么、不验证什么
+//! **Verifies**: symbol completeness, signature compat, resource lifecycle (alloc/free pairs),
+//! pass nesting & type (render/blit non-interleaved), stale pass rejection.
 //!
-//! **验证**：符号完整性、签名兼容性、资源生命周期（分配/释放配对）、
-//! pass 嵌套与类型（render/blit 不可交错）、stale pass 拒绝。
-//!
-//! **不验证**：像素。这里不做光栅化。像素正确性永远是 Metal 集成测试与
-//! 真窗口 E2E 的责任（同 `RENDERER_RHI_PLAN.md` §6 对 Null/Reference 的定位）。
+//! **Doesn't verify**: pixels. No rasterization. Pixel correctness is the job of Metal
+//! integration tests and real-window E2E.
 const std = @import("std");
 const gpu = @import("../gpu.zig");
 
-/// 进程级分配器。Null 后端的资源是真实内存（这样 `getMappedRange` 返回的
-/// 切片可以被真的写入，渲染器的 flush 路径才能跑到底），但不涉及 GPU。
+/// Process-scope allocator. Null backend resources are real memory (so getMappedRange returns
+/// writable slice, renderer flush path runs to end), but GPU-uninvolved.
 const alloc = std.heap.page_allocator;
 
-/// 每像素字节数。`gpu.TextureFormat` 本身不带这个查询（Metal 后端靠
-/// `conv.zig` 转成 MTLPixelFormat 后由 Metal 负责），Null 后端要自己算
-/// 分配大小，故在此补一张最小映射表，只覆盖渲染器实际用到的格式。
+/// Bytes-per-pixel. `gpu.TextureFormat` itself lacks this query (Metal backend uses
+/// `conv.zig` to MTLPixelFormat, Metal handles it); Null backend self-computes
+/// alloc size, needs minimal map here, covers only formats renderer uses.
 fn bytesPerPixel(format: gpu.TextureFormat) u32 {
     return switch (format) {
         .r8_unorm, .r8_snorm, .r8_uint, .r8_sint => 1,
@@ -43,10 +38,10 @@ fn bytesPerPixel(format: gpu.TextureFormat) u32 {
 }
 
 // ============================================================================
-// 诊断计数器，让"抽象被跑过"这件事可观测
+// Diagnostic counters to make abstract bypassing observable
 // ============================================================================
 
-/// 跨后端一致的实例统计。测试用它断言资源被成对释放（泄漏检测）。
+/// Cross-backend instance counts. Tests assert resources paired-freed (leak detection).
 pub var stats: Stats = .{};
 
 pub const Stats = struct {
@@ -64,7 +59,7 @@ pub const Stats = struct {
         stats = .{};
     }
 
-    /// 资源是否收支平衡。用于断言渲染器没漏资源。
+    /// Resource balance. Assertion that renderer didn't leak.
     pub fn balanced() bool {
         return stats.buffers_created == stats.buffers_destroyed and
             stats.textures_created == stats.textures_destroyed;
@@ -72,7 +67,7 @@ pub const Stats = struct {
 };
 
 // ============================================================================
-// 资源
+// Resources
 // ============================================================================
 
 pub const Buffer = struct {
@@ -80,8 +75,9 @@ pub const Buffer = struct {
     size: u64,
 
     pub fn getMappedRange(self: *Buffer, offset: u64, size: u64) ![]u8 {
-        // 与 Metal 后端同样的边界语义：越界是错误而不是 UB。这条断言在
-        // Null 后端下是**确定性可测**的，Metal 下则依赖真实设备。
+        // Same boundary semantics as Metal backend: out-of-bounds is error not UB. Assertion here
+        // is
+        // **deterministically testable** in Null backend, device-dependent in Metal.
         if (offset + size > self.size) return error.OutOfBounds;
         return self.bytes[@intCast(offset)..@intCast(offset + size)];
     }
@@ -98,8 +94,8 @@ pub const Buffer = struct {
 };
 
 pub const TextureBinding = struct {
-    /// 不透明标识。Metal 后端这里是 `*MTLTexture`；Null 后端用一个单调 id，
-    /// 语义上只需要"可比较", `eql` 是渲染器唯一依赖的性质。
+    /// Opaque id. Metal backend here `*MTLTexture`; Null backend uses monotonic id,
+    /// semantically only needs 'comparable', `eql` is renderer's only dependency.
     id: u64,
     width: u32,
     height: u32,
@@ -112,7 +108,7 @@ pub const TextureBinding = struct {
         return .{ .id = self.id };
     }
 
-    /// 见 Metal 后端同名函数：后端中立的测试构造器。
+    /// See Metal backend same-name function: backend-neutral test constructor.
     pub fn testBinding(token: u64, width: u32, height: u32) TextureBinding {
         return .{ .id = token, .width = width, .height = height };
     }
@@ -148,8 +144,8 @@ pub const Texture = struct {
         bytes_per_row: u32,
     ) !void {
         _ = mip_level;
-        // 与 Metal 后端一致：device-local 纹理不可直接写。保留这条错误，
-        // 渲染器里依赖它的分支才能在 Null 后端下被覆盖到。
+        // Matches Metal backend: device-local textures not directly writable. Keep this error;
+        // renderer branches depending on it get coverage in Null backend.
         if (self.memory != .host_upload) return error.TextureNotHostWritable;
         if (width == 0 or height == 0) return;
         if (x + width > self.size.width or y + height > self.size.height)
@@ -184,8 +180,8 @@ pub const Texture = struct {
         return null;
     }
 
-    /// 仅供测试：构造只有元数据的假纹理（与 Metal 后端同名同义）。
-    /// `bytes` 为空切片，故 `destroy` 不会误 free。
+    /// Test-only: construct metadata-only fake texture (matches Metal backend intent).
+    /// `bytes` empty slice, so `destroy` doesn't mistakenly free.
     pub fn fakeForTesting(width: u32, height: u32, format: gpu.TextureFormat) Texture {
         const id = next_texture_id;
         next_texture_id += 1;
@@ -345,10 +341,10 @@ pub const Instance = struct {
 // ============================================================================
 
 pub const ShaderFunction = struct {
-    /// 函数名的稳定副本。Metal 后端这里是 `*MTLFunction`；Null 后端保留名字，
-    /// 让 pipeline 创建能做出有意义的区分（也顺带证明按"名字"而非"对象地址"
-    /// 标识 shader 是可行的，见 pipeline.zig 里 PSO 缓存翻车的教训）。
-    name: [64]u8 = [_]u8{0} ** 64,
+    /// Stable copy of function name. Metal backend here `*MTLFunction`; Null backend keeps name,
+    /// letting pipeline creation discriminate meaningfully (also proves 'name'-based shader
+    /// identification works, see pipeline.zig PSO cache flip lesson).
+    name: [64]u8 = @as([64]u8, @splat(0)),
     name_len: usize = 0,
 
     pub fn deinit(self: *ShaderFunction) void {
@@ -357,9 +353,9 @@ pub const ShaderFunction = struct {
 };
 
 pub const ShaderModule = struct {
-    /// 源码长度。Null 后端不编译 MSL，它只需要证明"模块->函数"的生命周期
-    /// 契约成立。真正的第二个**图形**后端才需要另一套 shader 源，那是比
-    /// 本任务大得多的工程（见 RHI_SECOND_BACKEND_ASSESSMENT.md §四）。
+    /// Source length. Null backend doesn't compile MSL; only proves module->function lifecycle
+    /// contract holds. Real second **graphics** backend needs another shader source, way bigger
+    /// scope.
     source_len: usize,
 
     pub fn initFromSource(device: *Device, source: []const u8) !ShaderModule {
@@ -390,8 +386,9 @@ pub const RenderPipeline = struct {
     }
 };
 
-/// 与 Metal 后端逐字段对齐的描述符族。刻意各后端自带一份而非放进 gpu.zig：
-/// 它们含 `?*const ShaderFunction` 这种**后端自有类型**的引用，无法中立化。
+/// Descriptor family aligned per-field with Metal backend. Intentionally each backend
+/// carries own copy not in gpu.zig: they hold `?*const ShaderFunction` references to
+/// backend-specific types.
 pub const BlendFactor = enum(c_ulong) {
     zero = 0,
     one = 1,
@@ -470,16 +467,15 @@ pub fn createRenderPipeline(device: *Device, desc: RenderPipelineDescriptor) !Re
 }
 
 // ============================================================================
-// 命令编码，pass 状态机是本后端最有价值的部分
+// Command encoding; pass state machine is the most valuable part of this backend
 // ============================================================================
 
 const PassKind = enum { none, render, blit };
 
-/// 与 Metal 后端同构的 pass 状态机。
-///
-/// Metal 后端靠 `generation` 拒绝 stale pass（ObjC 对象地址会被立即复用，
-/// 那正是 GlassBox blit crash 的根因）。Null 后端复刻同一套语义，于是这条
-/// 不变式可以在**无设备的确定性测试**里被验证，而不必依赖真窗口 E2E。
+/// Pass state machine isomorphic to Metal backend. Metal backend uses `generation` to reject stale
+/// pass (ObjC object addresses are immediately reused, the root cause of GlassBox blit crash). Null
+/// backend replicates same semantics, allowing this invariant to be verified in **device-free
+/// deterministic tests** instead of relying on real window E2E.
 pub const CommandEncoder = struct {
     state: PassKind = .none,
     next_generation: u64 = 1,
@@ -543,8 +539,9 @@ pub const RenderPass = struct {
     command_encoder: *CommandEncoder,
     generation: u64,
 
-    /// 与 Metal 后端同名同类型的类型级计数器（`src/render/command_encoder.zig`
-    /// 每帧把它清零）。跨后端必须存在，否则渲染器编译不过。
+    /// type-level counter with same name and type as Metal backend
+    /// (`src/render/command_encoder.zig` zeroes it each frame). Must exist across backends, else
+    /// renderer fails to compile.
     pub var frame_draw_call_count: u32 = 0;
 
     fn assertActive(self: *const RenderPass) void {
@@ -645,7 +642,8 @@ pub const BlitPass = struct {
         destination_y: u32,
     ) !void {
         self.assertActive();
-        // 与 Metal 后端逐字对齐的区域校验，这条契约在 Null 后端下可确定性测试。
+        // region validation aligned byte-for-byte with Metal backend; this contract is
+        // deterministically testable in Null backend.
         if (width == 0 or height == 0 or
             source_x > source.width or width > source.width - source_x or
             source_y > source.height or height > source.height - source_y or
@@ -687,7 +685,8 @@ pub const CommandBuffer = struct {
         return null;
     }
 
-    /// 与 Metal 后端同名的类型级错误计数（cmd buffer 提交失败观测点）。
+    /// type-level error counter with same name as Metal backend (observation point for cmd buffer
+    /// submit failure).
     pub var error_count: std.atomic.Value(u64) = .init(0);
 
     pub fn presentDrawable(self: *CommandBuffer, drawable: *anyopaque) void {
@@ -738,8 +737,8 @@ pub const Surface = struct {
     format: ?gpu.TextureFormat = null,
     extent: gpu.Extent3D = .{ .width = 0, .height = 0, .depth = 1 },
 
-    /// 平台句柄被忽略，这正是 `*anyopaque` 签名的意义：Null 后端不需要
-    /// 知道 CAMetalLayer 是什么。
+    /// platform handle is ignored, which is the point of `*anyopaque` signature: Null backend need
+    /// not know what CAMetalLayer is.
     pub fn init(layer: *anyopaque) Surface {
         _ = layer;
         return .{};
@@ -785,47 +784,49 @@ pub const Surface = struct {
 // FrameSync
 // ============================================================================
 
-/// Metal 后端用 `dispatch_semaphore_t`（Darwin 专属）。接口本身没泄漏类型，
-/// 所以这里用可移植的 `std.Thread.Semaphore` 即可，这也顺带证明了
-/// FrameSync 的抽象是干净的。
+/// Metal backend uses `dispatch_semaphore_t` (Darwin-specific). Interface itself leaks no type, so
+/// we can use portable `std.Io.Semaphore` here, which also proves FrameSync's abstraction is
+/// clean.
 pub const FrameSync = struct {
-    sem: std.Thread.Semaphore,
+    sem: std.Io.Semaphore,
+    io: std.Io,
 
-    pub fn init(max_frames_in_flight: u32) FrameSync {
-        return .{ .sem = .{ .permits = max_frames_in_flight } };
+    pub fn init(max_frames_in_flight: u32, io: std.Io) FrameSync {
+        return .{ .io = io, .sem = .{ .permits = max_frames_in_flight } };
     }
 
-    pub fn waitForNextFrame(self: *FrameSync) void {
-        self.sem.wait();
+    pub fn waitForNextFrame(self: *FrameSync) error{}!void {
+        self.sem.waitUncancelable(self.io);
     }
 
     pub fn signalOnCompletion(self: *FrameSync, command_buffer: *const CommandBuffer) void {
         _ = command_buffer;
-        self.sem.post();
+        self.sem.post(self.io);
     }
 
     pub fn signal(self: *FrameSync) void {
-        self.sem.post();
+        self.sem.post(self.io);
     }
 
-    /// 与 Metal 后端对齐：drain 后释放同步原语（std 信号量无系统资源，no-op 语义）
+    /// aligned with Metal backend: drain then release sync primitive (std semaphore has no system
+    /// resources, no-op semantics).
     pub fn deinit(self: *FrameSync) void {
         _ = self;
     }
 
     pub fn drain(self: *FrameSync, max_frames: u32) void {
         var i: u32 = 0;
-        while (i < max_frames) : (i += 1) self.sem.wait();
+        while (i < max_frames) : (i += 1) self.sem.waitUncancelable(self.io);
         i = 0;
-        while (i < max_frames) : (i += 1) self.sem.post();
+        while (i < max_frames) : (i += 1) self.sem.post(self.io);
     }
 };
 
 // ============================================================================
-// 杂项
+// Miscellaneous
 // ============================================================================
 
-/// 与 GPU 无关的诊断工具（截图落盘）。Null 后端不写文件。
+/// GPU-agnostic diagnostic tool (screenshot dump). Null backend does not write files.
 pub fn writePngRgba(path: [:0]const u8, rgba: []const u8, width: u32, height: u32, bytes_per_row: u32) bool {
     _ = .{ path, rgba, width, height, bytes_per_row };
     return false;

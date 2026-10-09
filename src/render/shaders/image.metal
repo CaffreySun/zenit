@@ -1,20 +1,19 @@
-/// Image Shader
-///
-/// Metal Shading Language 实现的图片渲染
-/// 支持：纹理采样、SDF 圆角裁剪、alpha 混合
-/// 每个 instance 对应一个纹理化矩形
+/// Image Shader.
+/// Metal Shading Language implementation of image rendering.
+/// Supports: texture sampling, SDF rounded corner clipping, alpha blending.
+/// Each instance corresponds to one textured rectangle.
 
 #include <metal_stdlib>
 using namespace metal;
 
 // ============================================================================
-// Uniforms 和顶点数据结构
+// Uniforms and vertex data structures
 // ============================================================================
 
-/// 全局 Uniforms
+/// Global uniforms.
 struct Uniforms {
-    float2 viewport_size;  // 视口尺寸（物理像素）
-    float scale_factor;    // DPI 缩放因子 (Retina=2.0)
+    float2 viewport_size; // Viewport size (physical pixels).
+    float scale_factor; // DPI scale factor (Retina=2.0).
     uint clip_shape_kind;
     float4 clip_rect;
     float clip_radius;
@@ -25,32 +24,32 @@ struct Uniforms {
     float2 clip_polygon_points[32];
 };
 
-/// 实例数据（每个图片一个）— 64 bytes
+/// Per-instance data (one per image) - 64 bytes.
 struct ImageInstanceData {
-    float4 rect;          // x, y, width, height（逻辑像素）
-    float4 uv_rect;       // u0, v0, u1, v1 (纹理坐标范围)
-    float4 tint_color;    // 着色颜色 RGBA (1,1,1,1 = 无着色)
-    float4 transform_linear; // a, b, c, d（逻辑像素 affine）
-    float2 transform_translation; // tx, ty（逻辑像素 affine）
-    float corner_radius;  // 圆角半径
-    float opacity;        // 不透明度 (0-1)
-    float source_premultiplied; // 是否为预乘 alpha 源纹理（离屏 layer 回贴）
-    float4 rect_clip;     // x, y, w, h（逻辑像素）；0-size = disabled
+    float4 rect; // x, y, width, height (logical pixels).
+    float4 uv_rect; // u0, v0, u1, v1 (texture coordinate range).
+    float4 tint_color; // Tint color RGBA (1,1,1,1 = no tint).
+    float4 transform_linear; // a, b, c, d (logical pixel affine).
+    float2 transform_translation; // tx, ty (logical pixel affine).
+    float corner_radius; // Corner radius.
+    float opacity; // Opacity (0-1).
+    float source_premultiplied; // Whether source is premultiplied alpha texture (offscreen layer composite).
+    float4 rect_clip; // x, y, w, h (logical pixels); zero-size = disabled.
 };
 
-/// 顶点输出
+/// Vertex output.
 struct ImageVertexOutput {
     float4 position [[position]];
-    float2 uv;            // 纹理坐标
-    float2 local_pos;     // 相对于图元中心的位置
-    float2 size;          // 图元尺寸的一半
-    float2 screen_pos;    // 当前片元的物理像素坐标
+    float2 uv; // Texture coordinate.
+    float2 local_pos; // Position relative to primitive center.
+    float2 size; // Half of primitive size.
+    float2 screen_pos; // Current fragment physical pixel coordinate.
     float4 rect_clip;
     uint instance_id;
 };
 
 // ============================================================================
-// SDF 函数 (用于圆角裁剪)
+// SDF functions (for rounded corner clipping)
 // ============================================================================
 
 float sdf_rounded_rect_image(float2 p, float2 size, float radius) {
@@ -183,7 +182,7 @@ float clip_alpha(float2 screen_pos, float4 rect_clip, constant Uniforms& uniform
 }
 
 // ============================================================================
-// 顶点着色器
+// Vertex shader
 // ============================================================================
 
 vertex ImageVertexOutput image_vertex_main(
@@ -221,10 +220,11 @@ vertex ImageVertexOutput image_vertex_main(
 
     out.position = float4(ndc, 0.0, 1.0);
 
-    // 纹理坐标插值
+    // Texture coordinate interpolation.
     out.uv = mix(inst.uv_rect.xy, inst.uv_rect.zw, corner);
 
-    // SDF 裁剪用的本地坐标保持在未变换空间，圆角跟随内容本身而不是跟随屏幕 AABB。
+    // Local coords for SDF clipping stay in untransformed space; corners follow content geometry,
+    // not screen AABB.
     out.local_pos = (local_pos - center_local) * s;
     out.size = inst.rect.zw * s * 0.5;
     out.screen_pos = pixel_pos;
@@ -236,7 +236,7 @@ vertex ImageVertexOutput image_vertex_main(
 }
 
 // ============================================================================
-// 片段着色器
+// Fragment shader
 // ============================================================================
 
 fragment float4 image_fragment_main(
@@ -249,15 +249,15 @@ fragment float4 image_fragment_main(
     ImageInstanceData inst = instances[in.instance_id];
     const float corner_radius = inst.corner_radius * uniforms.scale_factor;
 
-    // 采样纹理
+    // Sample texture.
     float4 color = tex.sample(smp, in.uv);
 
-    // 着色
+    // Apply tint.
     color *= inst.tint_color;
 
     float coverage = 1.0;
 
-    // 圆角裁剪
+    // Rounded corner clipping.
     if (corner_radius > 0.0) {
         float sdf = sdf_rounded_rect_image(in.local_pos, in.size, corner_radius);
         float aa = fwidth(sdf) * 0.5;

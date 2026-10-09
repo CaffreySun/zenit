@@ -39,30 +39,33 @@ static BOOL input_debug_enabled(void) {
     return v && v[0] != '\0' && v[0] != '0';
 }
 
-// 拖放桥接层排障开关：ZENIT_DEBUG_DRAG=1 时把 NSDraggingDestination
-// 四个回调（kind 0/1/2/3）逐条打到 stderr。kind=3 才带 paths。
-// 真机验证（从 Finder 拖文件进窗口）唯一可信判据就是这里出现 kind=3。
+// Drag debug switch: ZENIT_DEBUG_DRAG=1 logs NSDraggingDestination
+// four callbacks (kind 0/1/2/3) to stderr. kind=3 only carries paths.
+// Real machine truth (drag file from Finder) is kind=3 appearing.
 static BOOL drag_debug_enabled(void) {
     const char *v = getenv("ZENIT_DEBUG_DRAG");
     return v && v[0] != '\0' && v[0] != '0';
 }
 
-// ==== IME ↔ a11y 文档文本查询（NSTextInputClient 补全用） ====
+// ==== IME <-> a11y document text query (NSTextInputClient) ====
 //
-// NSTextInputClient 的 range/point 查询都以"聚焦文本框的文档内容"为参照，
-// 桥接层自己不持文本 —— 复用 a11y 桥接（zenit_a11y_focused / _value /
-// _text_range_at_point）从 Zig 侧按需拉取。声明前置：实现在 a11y 节
-// （zenitA11yUTF16OffsetForUTF8 等），MetalView 实现在它们之前。
+// NSTextInputClient range/point queries are relative to the focused text box document.
+// The bridge holds no text; it pulls from Zig on demand through the a11y bridge
+// (zenit_a11y_focused / _value / _text_range_at_point). Forward declared: the impls
+// (zenitA11yUTF16OffsetForUTF8 etc) live in the a11y node, after MetalView.
+// AX element identity matches Zig a11y.tree.AXId.raw() (64-bit {payload, kind}). Node handle is
+// value-equal to ElementId zero-extended; collection items use a separate kind namespace.
+typedef uint64_t ZenitAXHandle;
 static uint32_t zenitA11yWindowIdForView(NSView *view);
-static NSString *zenitA11yCopyString(int (*fetch)(uint32_t, uint32_t, char *, int),
-                                     uint32_t window_id, uint32_t handle);
+static NSString *zenitA11yCopyString(int (*fetch)(uint32_t, ZenitAXHandle, char *, int),
+                                     uint32_t window_id, ZenitAXHandle handle);
 static NSUInteger zenitA11yUTF16OffsetForUTF8(NSString *text, uint32_t utf8Offset);
 static NSString *zenitA11yStringFromUTF8(const void *bytes, NSUInteger len);
 static uint32_t zenitA11yUTF8OffsetForUTF16(NSString *text, NSUInteger utf16Offset);
-extern uint32_t zenit_a11y_focused(uint32_t window_id);
-extern int zenit_a11y_value(uint32_t window_id, uint32_t handle, char *buf, int buf_len);
-extern int zenit_a11y_text_selection(uint32_t window_id, uint32_t handle, uint32_t *start, uint32_t *end, uint32_t *caret);
-extern int zenit_a11y_text_range_at_point(uint32_t window_id, uint32_t handle, float x, float y, uint32_t *start_utf8, uint32_t *end_utf8);
+extern ZenitAXHandle zenit_a11y_focused(uint32_t window_id);
+extern int zenit_a11y_value(uint32_t window_id, ZenitAXHandle handle, char *buf, int buf_len);
+extern int zenit_a11y_text_selection(uint32_t window_id, ZenitAXHandle handle, uint32_t *start, uint32_t *end, uint32_t *caret);
+extern int zenit_a11y_text_range_at_point(uint32_t window_id, ZenitAXHandle handle, float x, float y, uint32_t *start_utf8, uint32_t *end_utf8);
 extern uint64_t zenit_text_input_length(uint32_t window_id);
 extern int zenit_text_input_copy(uint32_t window_id, uint64_t start_utf8, char *buf, int buf_len);
 extern int zenit_text_input_selection(uint32_t window_id, uint32_t *start, uint32_t *end, uint32_t *caret);
@@ -181,8 +184,9 @@ static void zenitEnqueueImeCommit(id wrapper, NSString *text,
     [wrapper setValue:@(YES) forKey:@"hasImeCommit"];
 }
 
-// replacementRange（UTF-16，相对文档）→ UTF-8 字节区间。
-// 直接查询实时 TextInputClient，不依赖上一次 render 的 a11y 快照。
+// replacementRange (UTF-16, relative document) -> UTF-8 byte
+// range. Query live TextInputClient directly, not dependent on last
+// render's a11y snapshot.
 static BOOL zenitImeConvertReplacementRange(NSView *view, NSRange range,
                                             uint32_t *out_start, uint32_t *out_end) {
     *out_start = ZENIT_IME_NO_REPLACEMENT;
@@ -341,7 +345,7 @@ static BOOL isPointerEventType(NSEventType type) {
     }
 }
 
-// Metal 视图 - 在 live resize 时保持渲染
+// Metal view - continue rendering during live resize
 typedef void (*RenderCallback)(void* ctx);
 static NSString * const ZenitInternalDragType = @"dev.zenit.internal-drag";
 
@@ -356,10 +360,11 @@ static NSString * const ZenitInternalDragType = @"dev.zenit.internal-drag";
 @property (nonatomic, strong) NSTextInputContext *zenitInputContext;
 @property (nonatomic, assign) RenderCallback renderCallback;
 @property (nonatomic, assign) void* renderContext;
-// live resize 期间 AppKit 在自己的 tracking loop 里跑，应用主循环不转；只有
-// setFrameSize: 触发渲染，拖动停住（按住未松）就一帧都没有 —— 所有动画冻结。
-// 这个 ticker 挂在 NSRunLoopCommonModes（含 tracking mode）上持续驱动渲染回调；
-// Zig 侧按 wantsFrame 门控，静止内容不重画。
+// During live resize AppKit runs in own tracking loop, app main
+// loop doesn't; only setFrameSize: triggers render, drag pause leaves
+// no frame - all animations freeze. Ticker runs on
+// NSRunLoopCommonModes (includes tracking) to drive render; Zig gates
+// on wantsFrame, static content doesn't redraw.
 @property (nonatomic, strong) NSTimer *liveResizeTicker;
 @property (nonatomic, strong) NSMutableAttributedString *markedTextStorage;
 @property (nonatomic, assign) BOOL discardingMarkedText;
@@ -368,7 +373,7 @@ static NSString * const ZenitInternalDragType = @"dev.zenit.internal-drag";
 // NSTextInputClient ranges are UTF-16 offsets in the complete client document,
 // not offsets local to the marked string.
 @property (nonatomic, assign) NSRange markedDocumentRange;
-// 拖放事件队列：kind 0..3=destination, 4=source completion.
+// Drag event queue: kind 0..3 = destination, 4 = source completion.
 @property (nonatomic, strong) NSMutableArray<NSDictionary *> *dragEventQueue;
 @property (nonatomic, strong) NSOperationQueue *filePromiseQueue;
 @property (nonatomic, assign) BOOL zenitDragSessionActive;
@@ -378,8 +383,12 @@ static NSString * const ZenitInternalDragType = @"dev.zenit.internal-drag";
 // AppKit requires the vendor of virtual NSAccessibilityElement objects to
 // retain them for as long as the represented UI exists.
 @property (nonatomic, strong) NSMutableDictionary<NSNumber *, id> *zenitA11yElementCache;
-- (id)zenitA11yElementForHandle:(uint32_t)handle accessibilityParent:(id)parent;
-- (id)zenitA11yElementForHandle:(uint32_t)handle;
+// Per-window pending LayoutChanged targets this flush
+// (deduplicated by object identity). Attached to host view, cohabits
+// element cache: windows don't interfere, destroy releases with it.
+@property (nonatomic, strong) NSMutableArray *zenitA11yPendingLayoutTargets;
+- (id)zenitA11yElementForHandle:(ZenitAXHandle)handle accessibilityParent:(id)parent;
+- (id)zenitA11yElementForHandle:(ZenitAXHandle)handle;
 @end
 
 @implementation MetalView
@@ -394,7 +403,7 @@ static NSString * const ZenitInternalDragType = @"dev.zenit.internal-drag";
 - (instancetype)initWithFrame:(NSRect)frameRect {
     self = [super initWithFrame:frameRect];
     if (self) {
-        // 创建 Metal 设备
+        // Create Metal device
         self.device = createBestMetalDevice();
         if (!self.device) {
             NSLog(@"[MetalView] Metal device creation failed (mainThread=%@, screen=%@)",
@@ -403,7 +412,7 @@ static NSString * const ZenitInternalDragType = @"dev.zenit.internal-drag";
             return nil;
         }
 
-        // 拖放：接收文件 / 图片 / URL 拖入（Finder、浏览器）
+        // Drag: receive file/image/URL drag (Finder, browser)
         self.dragEventQueue = [NSMutableArray array];
         self.zenitDropAllowedOperations = NSDragOperationCopy;
         self.filePromiseQueue = [[NSOperationQueue alloc] init];
@@ -418,32 +427,44 @@ static NSString * const ZenitInternalDragType = @"dev.zenit.internal-drag";
         [dragTypes addObjectsFromArray:NSFilePromiseReceiver.readableDraggedTypes];
         [self registerForDraggedTypes:dragTypes];
 
-        // 创建 Metal layer 并设置为 view 的 layer
+        // Create Metal layer and set as view's layer
         self.wantsLayer = YES;
-        // 关键：live resize 时不要缩放旧内容，而是允许持续重绘
+        // Critical: during live resize don't scale old content, allow
+        // continuous redraw
         self.layerContentsRedrawPolicy = NSViewLayerContentsRedrawDuringViewResize;
 
         CAMetalLayer *layer = [CAMetalLayer layer];
         layer.device = self.device;
-        layer.pixelFormat = MTLPixelFormatBGRA8Unorm_sRGB;
+        // Blending on sRGB encoded values, consistent with
+        // AppKit/Core Animation (docs/SRGB_BLENDING_PLAN.md): non-_sRGB
+        // format + explicit sRGB colorspace (omit = sRGB values treated as
+        // P3 native on P3 screen).
+        layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+        CGColorSpaceRef srgb_space = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+        layer.colorspace = srgb_space;
+        CGColorSpaceRelease(srgb_space);
 
-        // 性能优化（参考 wgpu-hal surface.rs）
-        layer.framebufferOnly = YES;  // 纯渲染，不读取纹理（性能更好）
+        // Performance optimization (reference wgpu-hal surface.rs) initial
+        // value; Surface.configure overrides by usage. App uses
+        // color_target_and_read (framebufferOnly = NO): glass reads drawable
+        // backdrop, framebufferOnly can't blit-source or sample.
+        layer.framebufferOnly = YES;
 
-        // 防止 drawable 超时阻塞（关键！解决拖拽黑屏问题）
-        // 参考: https://github.com/gfx-rs/wgpu/blob/trunk/wgpu-hal/src/metal/surface.rs#L101-104
+        // Prevents drawable timeout blocking (fixes black screen while dragging). Reference:
+        // https://github.com/gfx-rs/wgpu/blob/trunk/wgpu-hal/src/metal/surface.rs#L101-104
         //
-        // ⚠️ 别改成 YES。2026-08-07 实测：允许超时会让重 blur 场景
-        // （storybook glasslab）反复吃 ~1s 超时并跳帧，e2e 87/87 → 78/87。
-        // 完整理由见 src/gpu/metal/surface.zig 的同名配置注释。
+        // WARNING: do not change to YES. With timeouts allowed, heavy-blur scenes (storybook
+        // glasslab)
+        // repeatedly eat the ~1s timeout and skip frames. Full rationale in the same-name config
+        // comment in src/gpu/metal/surface.zig.
         if (@available(macOS 10.13, *)) {
             layer.allowsNextDrawableTimeout = NO;
         }
 
-        // 控制帧缓冲队列深度（典型值 2-3）
+        // Control framebuffer queue depth (typical 2-3)
         layer.maximumDrawableCount = 3;
 
-        // 启用 VSync（流畅渲染）
+        // Enable VSync (smooth rendering)
         if (@available(macOS 10.13, *)) {
             layer.displaySyncEnabled = YES;
         }
@@ -479,14 +500,15 @@ static NSString * const ZenitInternalDragType = @"dev.zenit.internal-drag";
               newSize.width, newSize.height);
     }
 
-    // 更新 Metal layer 尺寸
+    // Update Metal layer size
     CGSize drawableSize = self.bounds.size;
     CGFloat scale = currentScreenScale(self.window);
     drawableSize.width *= scale;
     drawableSize.height *= scale;
     self.metalLayer.drawableSize = drawableSize;
 
-    // 直接调用渲染回调，不依赖 drawRect（layer-backed view 不触发 drawRect）
+    // Direct render callback invocation, not drawRect-dependent
+    // (layer-backed view doesn't trigger drawRect)
     if (self.renderCallback != NULL) {
         self.renderCallback(self.renderContext);
     }
@@ -494,7 +516,8 @@ static NSString * const ZenitInternalDragType = @"dev.zenit.internal-drag";
 
 - (void)viewWillStartLiveResize {
     [super viewWillStartLiveResize];
-    // 关键：resize 期间启用同步 present，避免 CoreAnimation 拉伸旧帧
+    // Critical: enable sync present during resize, prevent
+    // CoreAnimation from stretching old frame
     self.metalLayer.presentsWithTransaction = YES;
 
     [self.liveResizeTicker invalidate];
@@ -521,20 +544,22 @@ static NSString * const ZenitInternalDragType = @"dev.zenit.internal-drag";
     [self.liveResizeTicker invalidate];
     self.liveResizeTicker = nil;
 
-    // 恢复异步 present（延迟一帧，确保最后一帧也同步呈现）
-    // 使用 weak 引用避免窗口关闭后 block 访问已释放的对象
+    // Restore async present (one-frame delayed, ensures final frame
+    // syncs). Use weak reference to avoid block accessing released object
+    // after close.
     __weak MetalView *weakSelf = self;
     dispatch_async(dispatch_get_main_queue(), ^{
         MetalView *strongSelf = weakSelf;
         if (strongSelf) {
             strongSelf.metalLayer.presentsWithTransaction = NO;
 
-            // setFrameSize: 的回调发生在 AppKit live-resize tracking loop 内。
-            // retained UI 的外层布局与依赖其 rect 的子组件会相差一个 layout
-            // pass；最后一次 resize 后若没有新输入，就没有下一帧来消费最终
-            // contentView bounds，画面会一直停在倒数一个尺寸，直到 hover/click。
-            // 回到主队列后 bounds 已提交，直接补交最终帧（单纯 post 空事件并
-            // 不会把任一 WindowContext 标成 needs_redraw，因此不足以修复）。
+            // setFrameSize: callback in AppKit live-resize tracking loop.
+            // Retained UI outer layout and child components depending on rect
+            // differ by one layout pass; after final resize without new input, no
+            // next frame consumes final bounds, screen stays at penultimate size
+            // until hover/click. Back to main queue, bounds committed, directly
+            // flush final frame (post-empty-event won't mark WindowContext
+            // needs_redraw, insufficient).
             if (strongSelf.renderCallback != NULL) {
                 strongSelf.renderCallback(strongSelf.renderContext);
             }
@@ -543,7 +568,8 @@ static NSString * const ZenitInternalDragType = @"dev.zenit.internal-drag";
 }
 
 - (BOOL)preservesContentDuringLiveResize {
-    // 禁止系统缩放旧内容，避免“先变形后恢复”
+    // Don't allow system to scale old content, avoid scale-then-
+    // recover visual.
     return NO;
 }
 
@@ -596,13 +622,14 @@ static NSString * const ZenitInternalDragType = @"dev.zenit.internal-drag";
     return YES;
 }
 
-// NSView 的默认实现对非 opaque 视图返回 YES，于是 movableByWindowBackground
-// 会把落在"背景"上的 mouseDown 转成窗口拖拽。但 zenit 的控件全部由 Metal 绘制
-// 在这一个视图里，没有任何 NSView 子视图 —— AppKit 无从知道指针底下是不是
-// 输入框，只能把整面板当背景，导致输入框内的按下-拖动变成拖窗口，文本选不中。
-//
-// 窗口拖拽改由 titlebarDragHeight + titlebarHitCallback 那条链负责：它会回调
-// Zig 侧做真实 hit-test，点在控件上正常下发事件，只有空白才拖窗。
+// NSView default returns YES for non-opaque, so
+// movableByWindowBackground turns mouseDown on background into drag.
+// But zenit controls all Metal-rendered on this view, no NSView
+// subviews - AppKit doesn't know if pointer over input, treats whole
+// panel as background, press-drag in input becomes window drag, text
+// unselectable. Handled by titlebarDragHeight +
+// titlebarHitCallback: calls Zig for real hit-test, events on control
+// normal, space-only drags window.
 - (BOOL)mouseDownCanMoveWindow {
     return NO;
 }
@@ -698,8 +725,9 @@ static NSString * const ZenitInternalDragType = @"dev.zenit.internal-drag";
                                ZENIT_IME_NO_REPLACEMENT);
     }
     if (hadMarkedText || hasReplacement) {
-        // 带 replacement 的直接 insertText（无 marked text 的再変換提交）也走
-        // commit 通道 —— text_input 事件没有 replacement 语义。
+        // A direct insertText with a replacement range (a reconversion commit
+        // without marked text) also goes through the commit channel - text_input
+        // events have no replacement semantics.
         zenitEnqueueImeCommit(wrapper, text_copy,
                               replace_start_utf8,
                               replace_end_utf8);
@@ -847,7 +875,8 @@ static NSString * const ZenitInternalDragType = @"dev.zenit.internal-drag";
 }
 
 - (void)doCommandBySelector:(SEL)selector {
-    // 按键命令由 Zig 侧 key event 处理；这里吞掉系统默认命令，避免 NSBeep。
+    // Key commands handled by Zig side key event; swallow system
+    // default command here, avoid NSBeep.
     if (input_debug_enabled()) {
         NSLog(@"[bridge-input] doCommandBySelector %@", NSStringFromSelector(selector));
     }
@@ -858,16 +887,18 @@ static NSString * const ZenitInternalDragType = @"dev.zenit.internal-drag";
 }
 
 - (NSAttributedString *)attributedSubstringForProposedRange:(NSRange)range actualRange:(NSRangePointer)actualRange {
-    // 系统词典查询 (Ctrl-Cmd-D) / 日文再変換都靠这里读文档文本。
-    // 文档内容从聚焦节点的实时 TextInputClient 拉取；NSRange 是 UTF-16
-    // 单位，桥接层按 Unicode scalar 边界钳制并映射到 UTF-8 模型。
+    // System dictionary lookup (Ctrl-Cmd-D) and Japanese reconversion (saihenkan)
+    // both read the document text through this method. Content from live TextInputClient of
+    // focused node; NSRange UTF-16 units, bridge clamps to Unicode
+    // scalar boundary and maps to UTF-8 model.
     return zenitImeCopyAttributedRange(self, range, actualRange);
 }
 
 - (NSUInteger)characterIndexForPoint:(NSPoint)point {
-    // point 是屏幕坐标（左下原点）。屏幕 → 窗口 → 视图 → zenit 内容坐标
-    // （左上原点，与 accessibilityHitTest 同一换算），再走实时文本客户端
-    // 命中拿 UTF-8 offset，换算回 UTF-16 返回。
+    // point is screen coordinate (lower-left origin). Screen ->
+    // window -> view -> zenit content (upper-left origin, same as
+    // accessibilityHitTest), then live text client hit for UTF-8 offset,
+    // convert back UTF-16 to return.
     if (!self.window) return NSNotFound;
     const uint32_t wid = zenitA11yWindowIdForView(self);
     NSPoint window_point = [self.window convertPointFromScreen:point];
@@ -938,7 +969,8 @@ static NSString * const ZenitInternalDragType = @"dev.zenit.internal-drag";
         const CGFloat caret_h = raw_h > 0 ? raw_h : 18;
         const CGFloat caret_x = [[wrapper valueForKey:@"imeCursorX"] floatValue];
         const CGFloat caret_y = [[wrapper valueForKey:@"imeCursorY"] floatValue];
-        // Zig/UI 侧坐标是左上原点；Cocoa contentView 是左下原点
+        // Zig/UI coordinates upper-left origin; Cocoa contentView lower-
+        // left origin
         NSRect content_rect = NSMakeRect(
             caret_x,
             content_bounds.size.height - caret_y - caret_h,
@@ -961,7 +993,7 @@ static NSString * const ZenitInternalDragType = @"dev.zenit.internal-drag";
     return [self.window convertRectToScreen:window_rect];
 }
 
-// ==== 拖放（NSDraggingDestination）====
+// ==== Drag and drop (NSDraggingDestination) ====
 
 - (void)enqueueDragEventAtX:(float)x
                           y:(float)y
@@ -985,7 +1017,7 @@ static NSString * const ZenitInternalDragType = @"dev.zenit.internal-drag";
 
 - (void)pushDragEvent:(id<NSDraggingInfo>)sender kind:(uint8_t)kind withPaths:(BOOL)withPaths {
     NSPoint loc = [sender draggingLocation];
-    // 左下原点 → 左上原点
+    // lower-left origin -> upper-left origin
     float x = (float)loc.x;
     float y = (float)(self.bounds.size.height - loc.y);
     NSString *paths = @"";
@@ -995,8 +1027,9 @@ static NSString * const ZenitInternalDragType = @"dev.zenit.internal-drag";
         NSPasteboard *pb = [sender draggingPasteboard];
         NSArray<NSURL *> *urls = [pb readObjectsForClasses:@[ [NSURL class] ] options:nil];
         for (NSURL *url in urls) {
-            // file promise 等来源 url.path 可能为 nil，addObject:nil 会抛
-            // NSInvalidArgumentException 取消整个拖拽会话（下游回归）
+            // file promise source url.path may be nil, addObject:nil throws
+            // NSInvalidArgumentException canceling entire drag session
+            // (downstream regression)
             if (url.isFileURL) {
                 // Finder may vend a file-reference URL (`/.file/id=...`).
                 // filePathURL resolves it to the usable filesystem URL.
@@ -1183,67 +1216,71 @@ static NSString * const ZenitInternalDragType = @"dev.zenit.internal-drag";
 
 @end
 
-// ========================================================================
-// v0.6 §2.1: NSAccessibility 真接管
-// ------------------------------------------------------------------------
-// zig 端 src/ui/a11y/macos_bridge.zig exports the retained-tree pull ABI;
-// 本节用 ObjC 实装 NSAccessibilityElement 子类 ZenitA11yElement，每个对应
-// zig 侧 a11y_tree.A11yNode (持 element_handle u32 = ElementId.raw())。
+// ==== NSAccessibility implementation (retained-tree pull ABI)
 //
-// MetalView 实现 accessibilityChildren 协议返回顶级 ZenitA11yElement 数组；
-// 子层级递归走 ZenitA11yElement.accessibilityChildren。VoiceOver 因此能
-// navigate 整个 zenit widget 树。
+// Zig side exports from src/ui/a11y/macos_bridge.zig; ObjC implements the NSAccessibilityElement
+// subclass ZenitA11yElement corresponding to zig a11y_tree.A11yNode (holds element_handle u32
+// = ElementId.raw()).
 //
-// 生命周期: ObjC autorelease 池管理；每次 VoiceOver 拉 children 重新生成
-// 代理对象。代理只持 u32 handle 不持 zig 内存，过时调用 zenit_a11y_role
-// 等会拿不到节点（返 0）—— 这正是 generational handle 的设计目的。
+// MetalView implements accessibilityChildren, returning the top-level ZenitA11yElement array;
+// child levels recurse via the element's accessibilityChildren.
+//
+// Lifecycle: the ObjC autorelease pool manages proxies; each VoiceOver fetch regenerates them.
+// A proxy holds a u32 handle, not zig memory; a stale call to zenit_a11y_role returns 0
+// (generational handle by design).
 
-// zig 端 export 声明
-// 每个 export 的首参是 window_id —— zig 端按它路由到该窗口自己的 a11y 树。
-// window_id 与 zig 侧 Cx.window_id / macos_window_id() 同源 = NSWindow.windowNumber。
-// 传 0 (ZENIT_A11Y_ANY_WINDOW) 退化成"第一个已注册窗口"。
+// Zig exports (first param window_id - zig routes to that
+// window's a11y tree). window_id matches Zig Cx.window_id /
+// macos_window_id() = NSWindow.windowNumber. Pass 0
+// (ZENIT_A11Y_ANY_WINDOW) degrades to first registered window.
 #define ZENIT_A11Y_ANY_WINDOW ((uint32_t)0)
 extern int zenit_a11y_root_count(uint32_t window_id);
-extern uint32_t zenit_a11y_root_at(uint32_t window_id, int idx);
-extern int zenit_a11y_exists(uint32_t window_id, uint32_t handle);
-extern int zenit_a11y_children_count(uint32_t window_id, uint32_t parent_raw);
-extern uint32_t zenit_a11y_children_at(uint32_t window_id, uint32_t parent_raw, int idx);
-extern int zenit_a11y_role(uint32_t window_id, uint32_t handle);
-extern uint32_t zenit_a11y_state(uint32_t window_id, uint32_t handle);
-extern int zenit_a11y_label(uint32_t window_id, uint32_t handle, char *buf, int buf_len);
-extern int zenit_a11y_description(uint32_t window_id, uint32_t handle, char *buf, int buf_len);
-extern int zenit_a11y_value(uint32_t window_id, uint32_t handle, char *buf, int buf_len);
-extern int zenit_a11y_numeric_value(uint32_t window_id, uint32_t handle, float *now, float *min, float *max);
-extern int zenit_a11y_frame(uint32_t window_id, uint32_t handle, float *x, float *y, float *width, float *height);
-extern uint8_t zenit_a11y_actions(uint32_t window_id, uint32_t handle);
-extern int zenit_a11y_perform_action(uint32_t window_id, uint32_t handle, uint8_t action);
-extern int zenit_a11y_text_selection(uint32_t window_id, uint32_t handle, uint32_t *start, uint32_t *end, uint32_t *caret);
-extern uint8_t zenit_a11y_text_capabilities(uint32_t window_id, uint32_t handle);
-extern int zenit_a11y_set_text_selection(uint32_t window_id, uint32_t handle, uint32_t start_utf8, uint32_t end_utf8);
-extern int zenit_a11y_set_focus(uint32_t window_id, uint32_t handle, int focused);
-extern int zenit_a11y_set_text_value(uint32_t window_id, uint32_t handle, const char *bytes, int len);
-extern int zenit_a11y_text_visible_range(uint32_t window_id, uint32_t handle, uint32_t *start, uint32_t *end);
-extern int zenit_a11y_text_frame(uint32_t window_id, uint32_t handle, uint32_t start_utf8, uint32_t end_utf8, float *x, float *y, float *width, float *height);
-extern int zenit_a11y_text_range_at_point(uint32_t window_id, uint32_t handle, float x, float y, uint32_t *start_utf8, uint32_t *end_utf8);
-extern int zenit_a11y_set_numeric_value(uint32_t window_id, uint32_t handle, float value);
-extern uint8_t zenit_a11y_numeric_capabilities(uint32_t window_id, uint32_t handle);
-extern uint32_t zenit_a11y_parent(uint32_t window_id, uint32_t handle);
-extern uint32_t zenit_a11y_focused(uint32_t window_id);
-extern uint32_t zenit_a11y_active_descendant(uint32_t window_id, uint32_t handle);
-extern uint32_t zenit_a11y_hit_test(uint32_t window_id, float x, float y);
-extern uint8_t zenit_a11y_orientation(uint32_t window_id, uint32_t handle);
-extern uint8_t zenit_a11y_sort_direction(uint32_t window_id, uint32_t handle);
-extern uint16_t zenit_a11y_level(uint32_t window_id, uint32_t handle);
-extern int zenit_a11y_row_index_range(uint32_t window_id, uint32_t handle, uint32_t *index, uint32_t *span);
-extern int zenit_a11y_column_index_range(uint32_t window_id, uint32_t handle, uint32_t *index, uint32_t *span);
-extern int zenit_a11y_placeholder(uint32_t window_id, uint32_t handle, char *buf, int buf_len);
-extern int zenit_a11y_identifier(uint32_t window_id, uint32_t handle, char *buf, int buf_len);
+extern ZenitAXHandle zenit_a11y_root_at(uint32_t window_id, int idx);
+extern int zenit_a11y_exists(uint32_t window_id, ZenitAXHandle handle);
+extern int zenit_a11y_children_count(uint32_t window_id, ZenitAXHandle parent_raw);
+extern ZenitAXHandle zenit_a11y_children_at(uint32_t window_id, ZenitAXHandle parent_raw, int idx);
+extern int zenit_a11y_role(uint32_t window_id, ZenitAXHandle handle);
+extern uint32_t zenit_a11y_state(uint32_t window_id, ZenitAXHandle handle);
+extern int zenit_a11y_label(uint32_t window_id, ZenitAXHandle handle, char *buf, int buf_len);
+extern int zenit_a11y_description(uint32_t window_id, ZenitAXHandle handle, char *buf, int buf_len);
+extern int zenit_a11y_value(uint32_t window_id, ZenitAXHandle handle, char *buf, int buf_len);
+extern int zenit_a11y_numeric_value(uint32_t window_id, ZenitAXHandle handle, float *now, float *min, float *max);
+extern int zenit_a11y_frame(uint32_t window_id, ZenitAXHandle handle, float *x, float *y, float *width, float *height);
+extern uint8_t zenit_a11y_actions(uint32_t window_id, ZenitAXHandle handle);
+extern int zenit_a11y_perform_action(uint32_t window_id, ZenitAXHandle handle, uint8_t action);
+extern int zenit_a11y_text_selection(uint32_t window_id, ZenitAXHandle handle, uint32_t *start, uint32_t *end, uint32_t *caret);
+extern uint8_t zenit_a11y_text_capabilities(uint32_t window_id, ZenitAXHandle handle);
+extern int zenit_a11y_set_text_selection(uint32_t window_id, ZenitAXHandle handle, uint32_t start_utf8, uint32_t end_utf8);
+extern int zenit_a11y_set_focus(uint32_t window_id, ZenitAXHandle handle, int focused);
+extern int zenit_a11y_set_text_value(uint32_t window_id, ZenitAXHandle handle, const char *bytes, int len);
+extern int zenit_a11y_text_visible_range(uint32_t window_id, ZenitAXHandle handle, uint32_t *start, uint32_t *end);
+extern int zenit_a11y_text_frame(uint32_t window_id, ZenitAXHandle handle, uint32_t start_utf8, uint32_t end_utf8, float *x, float *y, float *width, float *height);
+extern int zenit_a11y_text_range_at_point(uint32_t window_id, ZenitAXHandle handle, float x, float y, uint32_t *start_utf8, uint32_t *end_utf8);
+extern int zenit_a11y_set_numeric_value(uint32_t window_id, ZenitAXHandle handle, float value);
+extern uint8_t zenit_a11y_numeric_capabilities(uint32_t window_id, ZenitAXHandle handle);
+extern ZenitAXHandle zenit_a11y_parent(uint32_t window_id, ZenitAXHandle handle);
+extern ZenitAXHandle zenit_a11y_focused(uint32_t window_id);
+extern ZenitAXHandle zenit_a11y_active_descendant(uint32_t window_id, ZenitAXHandle handle);
+extern ZenitAXHandle zenit_a11y_hit_test(uint32_t window_id, float x, float y);
+extern uint8_t zenit_a11y_orientation(uint32_t window_id, ZenitAXHandle handle);
+extern uint8_t zenit_a11y_sort_direction(uint32_t window_id, ZenitAXHandle handle);
+extern uint16_t zenit_a11y_level(uint32_t window_id, ZenitAXHandle handle);
+extern uint32_t zenit_a11y_set_size(uint32_t window_id, ZenitAXHandle handle);
+extern int zenit_a11y_row_index_range(uint32_t window_id, ZenitAXHandle handle, uint32_t *index, uint32_t *span);
+extern int zenit_a11y_column_index_range(uint32_t window_id, ZenitAXHandle handle, uint32_t *index, uint32_t *span);
+extern int zenit_a11y_placeholder(uint32_t window_id, ZenitAXHandle handle, char *buf, int buf_len);
+extern int zenit_a11y_identifier(uint32_t window_id, ZenitAXHandle handle, char *buf, int buf_len);
+// Semantic collection (docs/A11Y_ARCHITECTURE.md section 12).
+extern int zenit_a11y_collection_info(uint32_t window_id, ZenitAXHandle handle, uint32_t *count, uint32_t *first_visible, uint32_t *visible_len);
+extern ZenitAXHandle zenit_a11y_collection_row_at(uint32_t window_id, ZenitAXHandle handle, uint32_t index);
+extern int zenit_a11y_commit_scroll_to_visible(uint32_t window_id, ZenitAXHandle handle);
 
 enum {
     ZenitA11yActionPress = 0,
     ZenitA11yActionToggle = 1,
     ZenitA11yActionIncrement = 2,
     ZenitA11yActionDecrement = 3,
+    ZenitA11yActionScrollToVisible = 4,
 };
 
 enum {
@@ -1253,10 +1290,18 @@ enum {
     ZenitA11yActionBitDecrement = 1 << 3,
 };
 
-// zig 端"永不命中"的哨兵（macos_bridge.INVALID/NO_RETAINED 同族 maxInt(u32)，
-// 但 a11y 表的键域是 windowNumber，任何真实窗口都不会是 maxInt）。
+// Zig never-hit sentinel (macos_bridge.INVALID/NO_RETAINED same
+// family maxInt(u32), but a11y table key domain is windowNumber, no
+// real window is maxInt).
 #define ZENIT_A11Y_DEAD_WINDOW ((uint32_t)0xFFFFFFFFu)
-#define ZENIT_A11Y_INVALID_HANDLE ((uint32_t)0xFFFFFFFFu)
+#define ZENIT_A11Y_INVALID_HANDLE ((ZenitAXHandle)0xFFFFFFFFu)
+
+// AXId kind in 8 bits above payload (Zig a11y.tree.AXId uses
+// comptime assert pinning this). Non-zero = semantic collection item
+// element (row/cell/compound text), not Node projection.
+static inline BOOL zenitA11yIsItemHandle(ZenitAXHandle handle) {
+    return ((handle >> 32) & 0xFFu) != 0;
+}
 
 enum {
     ZenitA11yDirtyRole = 1 << 0,
@@ -1269,6 +1314,7 @@ enum {
     ZenitA11yDirtyActiveDescendant = 1 << 7,
     ZenitA11yDirtyGeometry = 1 << 8,
     ZenitA11yDirtySelection = 1 << 9,
+    ZenitA11yDirtyRowCount = 1 << 10,
 };
 
 enum {
@@ -1293,21 +1339,20 @@ enum {
     ZenitA11yStateExpandedPresent = 1u << 18,
 };
 
-// NSView → 所属窗口的 a11y 路由键。
-//
-// window == nil 时返回 DEAD 哨兵而**不是** ANY_WINDOW 通配（2026-07-30 审查
-// 修正）：窗口关闭后 VoiceOver 可能仍持有该窗口的 ZenitA11yElement 代理
-// （它 retain 了 parentView），通配会让这些残留代理去读**另一个仍存活窗口**
-// 的树 —— handle raw 值在别人的树里还会假匹配（ElementId 不含 world 标识），
-// VoiceOver 读到完全无关的 role/label。正确语义是"元素已失效"→ 全部查空。
+// NSView -> owning window's a11y routing key. When window == nil return the DEAD sentinel,
+// NOT ANY_WINDOW: after a window closes VoiceOver may still hold its ZenitA11yElement proxy,
+// and a wildcard would read another live window's tree, where the handle raw value
+// false-matches (ElementId lacks world identity) and VoiceOver sees an unrelated role/label.
+// Correct behavior is element invalid -> queries empty.
 static uint32_t zenitA11yWindowIdForView(NSView *view) {
     NSWindow *win = view.window;
     if (!win) return ZENIT_A11Y_DEAD_WINDOW;
     return (uint32_t)((NSInteger)[win windowNumber]);
 }
 
-// a11y_tree.Role enum 值（与 src/ui/a11y/tree.zig pub const Role 顺序对齐；
-// 改 zig 端 enum 顺序需同步这里。）
+// a11y_tree.Role enum values (aligned with
+// src/ui/a11y/tree.zig pub const Role order; changing zig enum needs
+// sync here).
 typedef NS_ENUM(int, ZenitA11yTreeRole) {
     ZenitA11yTreeRoleNone = 0,
     ZenitA11yTreeRoleApplication = 1,
@@ -1361,6 +1406,9 @@ typedef NS_ENUM(int, ZenitA11yTreeRole) {
     ZenitA11yTreeRoleBanner = 49,
     ZenitA11yTreeRoleContentinfo = 50,
     ZenitA11yTreeRoleGeneric = 51,
+    ZenitA11yTreeRoleStaticText = 52,
+    ZenitA11yTreeRoleSwitchControl = 53,
+    ZenitA11yTreeRoleScrollArea = 54,
 };
 
 static NSAccessibilityRole zenitA11yMapRoleToNS(int role_int) {
@@ -1392,20 +1440,29 @@ static NSAccessibilityRole zenitA11yMapRoleToNS(int role_int) {
         case ZenitA11yTreeRoleMenuitem: return NSAccessibilityMenuItemRole;
         case ZenitA11yTreeRoleMenuitemcheckbox: return NSAccessibilityMenuItemRole;
         case ZenitA11yTreeRoleMenuitemradio: return NSAccessibilityMenuItemRole;
-        case ZenitA11yTreeRoleDialog: return NSAccessibilitySheetRole;
-        case ZenitA11yTreeRoleAlertdialog: return NSAccessibilitySheetRole;
-        case ZenitA11yTreeRoleAlert: return NSAccessibilityStaticTextRole;
-        case ZenitA11yTreeRoleStatus: return NSAccessibilityStaticTextRole;
-        case ZenitA11yTreeRoleLog: return NSAccessibilityListRole;
+        // Dialog/alert/status/log: AXGroup + AXApplication* subrole (see
+        // zenitA11ySubroleForRole). AXSheet is window-docked; alert/status
+        // mapped to AXStaticText lose live region and can't hold subelements.
+        case ZenitA11yTreeRoleDialog: return NSAccessibilityGroupRole;
+        case ZenitA11yTreeRoleAlertdialog: return NSAccessibilityGroupRole;
+        case ZenitA11yTreeRoleAlert: return NSAccessibilityGroupRole;
+        case ZenitA11yTreeRoleStatus: return NSAccessibilityGroupRole;
+        case ZenitA11yTreeRoleLog: return NSAccessibilityGroupRole;
         case ZenitA11yTreeRoleTabs: return NSAccessibilityTabGroupRole;
-        case ZenitA11yTreeRoleTab: return NSAccessibilityRadioButtonRole; // tab 在 AX 用 radio
+        case ZenitA11yTreeRoleTab: return NSAccessibilityRadioButtonRole; // tab uses radio in AX
         case ZenitA11yTreeRoleTabpanel: return NSAccessibilityGroupRole;
+        case ZenitA11yTreeRoleSwitchControl: return NSAccessibilityCheckBoxRole;
+        case ZenitA11yTreeRoleScrollArea: return NSAccessibilityScrollAreaRole;
         case ZenitA11yTreeRoleTooltip: return NSAccessibilityHelpTagRole;
-        case ZenitA11yTreeRoleHeading: return NSAccessibilityStaticTextRole;
+        // AXHeading: macOS 26 SDK public NSAccessibilityHeadingRole, but
+        // string value WebKit/Chromium use, old VoiceOver title rotor
+        // recognizes it.
+        case ZenitA11yTreeRoleHeading: return @"AXHeading";
         case ZenitA11yTreeRoleParagraph: return NSAccessibilityStaticTextRole;
         case ZenitA11yTreeRoleImage: return NSAccessibilityImageRole;
         case ZenitA11yTreeRoleList: return NSAccessibilityListRole;
         case ZenitA11yTreeRoleSeparator: return NSAccessibilitySplitterRole;
+        case ZenitA11yTreeRoleStaticText: return NSAccessibilityStaticTextRole;
         case ZenitA11yTreeRoleGeneric:
         case ZenitA11yTreeRoleGroup:
         case ZenitA11yTreeRoleRegion:
@@ -1422,8 +1479,9 @@ static NSAccessibilityRole zenitA11yMapRoleToNS(int role_int) {
     }
 }
 
-// initWithBytes 会吃掉开头的 UTF-8 BOM（U+FEFF），而 Zig 侧的 a11y 偏移按
-// 原始 UTF-8 字节计 —— 少了 U+FEFF 所有 UTF-8↔UTF-16 换算整体错 3 字节。
+// initWithBytes strips leading UTF-8 BOM (U+FEFF), but Zig a11y
+// offsets count original UTF-8 bytes - missing U+FEFF throws all
+// UTF-8<->UTF-16 conversion off by 3 bytes.
 static NSString *zenitA11yStringFromUTF8(const void *bytes, NSUInteger len) {
     NSString *s = [[NSString alloc] initWithBytes:bytes length:len encoding:NSUTF8StringEncoding];
     const unsigned char *b = (const unsigned char *)bytes;
@@ -1434,8 +1492,8 @@ static NSString *zenitA11yStringFromUTF8(const void *bytes, NSUInteger len) {
     return s;
 }
 
-static NSString *zenitA11yCopyString(int (*fetch)(uint32_t, uint32_t, char *, int),
-                                     uint32_t window_id, uint32_t handle) {
+static NSString *zenitA11yCopyString(int (*fetch)(uint32_t, ZenitAXHandle, char *, int),
+                                     uint32_t window_id, ZenitAXHandle handle) {
     int needed = fetch(window_id, handle, NULL, 0);
     if (needed <= 0) return nil;
     char stack_buf[256];
@@ -1494,8 +1552,8 @@ static NSRange zenitA11yClampedRange(NSRange range, NSUInteger length) {
     return NSMakeRange(range.location, MIN(range.length, length - range.location));
 }
 
-static BOOL zenitA11yHandleIsWithin(uint32_t window_id, uint32_t handle, uint32_t ancestor) {
-    uint32_t cursor = handle;
+static BOOL zenitA11yHandleIsWithin(uint32_t window_id, ZenitAXHandle handle, ZenitAXHandle ancestor) {
+    ZenitAXHandle cursor = handle;
     // A valid retained tree is acyclic. The bound keeps malformed application
     // data from hanging an AppKit accessibility callback.
     for (NSUInteger depth = 0; depth < 4096 && cursor != ZENIT_A11Y_INVALID_HANDLE; depth++) {
@@ -1505,18 +1563,112 @@ static BOOL zenitA11yHandleIsWithin(uint32_t window_id, uint32_t handle, uint32_
     return NO;
 }
 
+// Subroles: match Chromium ax_platform_node_cocoa table. Landmark
+// subroles let VoiceOver landmark rotor jump to navigation/main/
+// footer.
+static NSAccessibilitySubrole zenitA11ySubroleForRole(int role) {
+    switch (role) {
+        case ZenitA11yTreeRoleSearchbox: return NSAccessibilitySearchFieldSubrole;
+        case ZenitA11yTreeRoleTreeitem: return NSAccessibilityOutlineRowSubrole;
+        case ZenitA11yTreeRoleRow: return NSAccessibilityTableRowSubrole;
+        case ZenitA11yTreeRoleSwitchControl: return NSAccessibilitySwitchSubrole;
+        case ZenitA11yTreeRoleTab: return NSAccessibilityTabButtonSubrole;
+        case ZenitA11yTreeRoleTabpanel: return @"AXTabPanel";
+        case ZenitA11yTreeRoleDialog: return @"AXApplicationDialog";
+        case ZenitA11yTreeRoleAlertdialog: return @"AXApplicationAlertDialog";
+        case ZenitA11yTreeRoleAlert: return @"AXApplicationAlert";
+        case ZenitA11yTreeRoleStatus: return @"AXApplicationStatus";
+        case ZenitA11yTreeRoleLog: return @"AXApplicationLog";
+        case ZenitA11yTreeRoleNavigation: return @"AXLandmarkNavigation";
+        case ZenitA11yTreeRoleMain: return @"AXLandmarkMain";
+        case ZenitA11yTreeRoleBanner: return @"AXLandmarkBanner";
+        case ZenitA11yTreeRoleContentinfo: return @"AXLandmarkContentInfo";
+        case ZenitA11yTreeRoleRegion: return @"AXLandmarkRegion";
+        case ZenitA11yTreeRoleForm: return @"AXLandmarkForm";
+        case ZenitA11yTreeRoleArticle: return @"AXDocumentArticle";
+        default: return nil;
+    }
+}
+
+// AppKit NSAccessibilityRoleDescription doesn't recognize WebKit
+// subroles (AXHeading, AXApplicationDialog, landmarks), returns empty
+// so VoiceOver only speaks name. Provide fallback descriptions here;
+// AppKit-recognized combos use system localization.
+static NSString *zenitA11yFallbackRoleDescription(int role) {
+    switch (role) {
+        case ZenitA11yTreeRoleHeading: return @"heading";
+        case ZenitA11yTreeRoleDialog: return @"dialog";
+        case ZenitA11yTreeRoleAlertdialog: return @"alert dialog";
+        case ZenitA11yTreeRoleAlert: return @"alert";
+        case ZenitA11yTreeRoleStatus: return @"status";
+        case ZenitA11yTreeRoleLog: return @"log";
+        case ZenitA11yTreeRoleTabpanel: return @"tab panel";
+        case ZenitA11yTreeRoleNavigation: return @"navigation";
+        case ZenitA11yTreeRoleMain: return @"main";
+        case ZenitA11yTreeRoleBanner: return @"banner";
+        case ZenitA11yTreeRoleContentinfo: return @"content information";
+        case ZenitA11yTreeRoleRegion: return @"region";
+        case ZenitA11yTreeRoleForm: return @"form";
+        case ZenitA11yTreeRoleArticle: return @"article";
+        case ZenitA11yTreeRoleSwitchControl: return @"switch";
+        default: return nil;
+    }
+}
+
+// AX in-frame service (metal_bridge.m): main thread waiting drawable
+// only turns AX run loop mode. Frame not ended, AX actions
+// (press/focus/value/range) can't sync, queue to g_zenit_ax_deferred,
+// next pump start (zenitDrainDeferredA11yMutations, before event
+// dispatch) executes in order. Don't use dispatch_async(main):
+// continuous render pump enters nextEventMatchingMask, gets display-
+// link immediately returns, run loop doesn't turn, main queue starves.
+// Read-only queries sync-answer.
+extern int zenit_ax_in_frame_service(void);
+static NSMutableArray *g_zenit_ax_deferred;
+
+// Defer returns YES immediately: accepted semantics, matching AppKit
+// press contract; actual execution next pump after frame end.
+static BOOL zenitA11yRunMutation(BOOL (^mutation)(void)) {
+    if (zenit_ax_in_frame_service()) {
+        if (!g_zenit_ax_deferred) g_zenit_ax_deferred = [NSMutableArray array];
+        [g_zenit_ax_deferred addObject:[mutation copy]];
+        // Wake possible nextEventMatchingMask-blocked pump (idle has no
+        // display-link).
+        macos_post_empty_event();
+        return YES;
+    }
+    return mutation();
+}
+
+// Non-reentrant: nested event loop (press opens file dialog etc) may
+// run nested pump, later-queued action runs before batch remainder
+// (cross review spotted). Leave to outer next turn; don't drain in-
+// frame service (action must run outside frame).
+static void zenitDrainDeferredA11yMutations(void) {
+    static BOOL draining = NO;
+    if (draining || zenit_ax_in_frame_service() || g_zenit_ax_deferred.count == 0) return;
+    draining = YES;
+    @try {
+        NSArray *pending = g_zenit_ax_deferred;
+        g_zenit_ax_deferred = nil;
+        for (BOOL (^mutation)(void) in pending) (void)mutation();
+    } @finally {
+        draining = NO;
+    }
+}
+
 @interface ZenitA11yElement : NSAccessibilityElement
-@property (nonatomic, assign) uint32_t handle;
+@property (nonatomic, assign) ZenitAXHandle handle;
 @property (nonatomic, weak) NSView *parentView;
 @property (nonatomic, weak) id accessibilityParentObject;
-+ (instancetype)elementForHandle:(uint32_t)handle
++ (instancetype)elementForHandle:(ZenitAXHandle)handle
                       parentView:(NSView *)parentView
              accessibilityParent:(id)accessibilityParent;
 @end
 
 @implementation ZenitA11yElement
 
-+ (instancetype)elementForHandle:(uint32_t)handle
++ (instancetype)elementForHandle:(ZenitAXHandle)handle
                       parentView:(NSView *)parentView
              accessibilityParent:(id)accessibilityParent {
     ZenitA11yElement *el = [[ZenitA11yElement alloc] init];
@@ -1532,8 +1684,8 @@ static BOOL zenitA11yHandleIsWithin(uint32_t window_id, uint32_t handle, uint32_
         (zenit_a11y_state(wid, self.handle) & ZenitA11yStateHidden) == 0;
 }
 
-// 代理只持 handle + parentView，window_id 每次从 parentView 现取 —— 窗口关闭或
-// view 换窗口时不会留下过时的 id。
+// Proxy holds handle + parentView, window_id live-fetched each from
+// parentView - stale id not left when window closes or view switches.
 - (uint32_t)zenitWindowId {
     return zenitA11yWindowIdForView(self.parentView);
 }
@@ -1543,15 +1695,10 @@ static BOOL zenitA11yHandleIsWithin(uint32_t window_id, uint32_t handle, uint32_
 }
 
 - (NSAccessibilitySubrole)accessibilitySubrole {
-    int role = zenit_a11y_role([self zenitWindowId], self.handle);
-    if ((zenit_a11y_state([self zenitWindowId], self.handle) & ZenitA11yStateSecure) != 0)
+    uint32_t wid = [self zenitWindowId];
+    if ((zenit_a11y_state(wid, self.handle) & ZenitA11yStateSecure) != 0)
         return NSAccessibilitySecureTextFieldSubrole;
-    if (role == ZenitA11yTreeRoleSearchbox) return NSAccessibilitySearchFieldSubrole;
-    if (role == ZenitA11yTreeRoleTreeitem) return NSAccessibilityOutlineRowSubrole;
-    if (role == ZenitA11yTreeRoleRow) return NSAccessibilityTableRowSubrole;
-    if (role == ZenitA11yTreeRoleDialog || role == ZenitA11yTreeRoleAlertdialog)
-        return NSAccessibilityDialogSubrole;
-    return nil;
+    return zenitA11ySubroleForRole(zenit_a11y_role(wid, self.handle));
 }
 
 - (NSString *)accessibilityLabel {
@@ -1571,13 +1718,22 @@ static BOOL zenitA11yHandleIsWithin(uint32_t window_id, uint32_t handle, uint32_
 }
 
 - (NSString *)accessibilityRoleDescription {
-    return NSAccessibilityRoleDescription([self accessibilityRole], [self accessibilitySubrole]);
+    NSString *system = NSAccessibilityRoleDescription([self accessibilityRole], [self accessibilitySubrole]);
+    NSString *fallback = zenitA11yFallbackRoleDescription(zenit_a11y_role([self zenitWindowId], self.handle));
+    // AppKit falls back unrecognized subrole to parent role
+    // description (dialog becomes group), so roles with fallback use it.
+    if (fallback) return fallback;
+    return system;
 }
 
 - (id)accessibilityValue {
     uint32_t wid = [self zenitWindowId];
     int role = zenit_a11y_role(wid, self.handle);
-    if (role == ZenitA11yTreeRoleCheckbox || role == ZenitA11yTreeRoleRadio ||
+    if (role == ZenitA11yTreeRoleTab) {
+        // Tab value is selected (AppKit tab button matches Chromium).
+        return @((zenit_a11y_state(wid, self.handle) & ZenitA11yStateSelected) != 0 ? 1 : 0);
+    }
+    if (role == ZenitA11yTreeRoleCheckbox || role == ZenitA11yTreeRoleSwitchControl || role == ZenitA11yTreeRoleRadio ||
         role == ZenitA11yTreeRoleMenuitemcheckbox || role == ZenitA11yTreeRoleMenuitemradio) {
         // AppKit check controls publish 0=off, 1=on, 2=mixed.
         uint32_t state = zenit_a11y_state(wid, self.handle);
@@ -1609,12 +1765,17 @@ static BOOL zenitA11yHandleIsWithin(uint32_t window_id, uint32_t handle, uint32_
     uint8_t textCaps = zenit_a11y_text_capabilities(wid, self.handle);
     if ((textCaps & 0x4) != 0 && [value isKindOfClass:[NSString class]]) {
         NSData *bytes = [(NSString *)value dataUsingEncoding:NSUTF8StringEncoding];
+        ZenitAXHandle handle = self.handle;
         if (bytes.length <= INT_MAX)
-            (void)zenit_a11y_set_text_value(wid, self.handle, bytes.bytes, (int)bytes.length);
+            (void)zenitA11yRunMutation(^BOOL {
+                return zenit_a11y_set_text_value(wid, handle, bytes.bytes, (int)bytes.length) != 0;
+            });
         return;
     }
     if ([value isKindOfClass:[NSNumber class]]) {
-        (void)zenit_a11y_set_numeric_value(wid, self.handle, [(NSNumber *)value floatValue]);
+        ZenitAXHandle handle = self.handle;
+        float number = [(NSNumber *)value floatValue];
+        (void)zenitA11yRunMutation(^BOOL { return zenit_a11y_set_numeric_value(wid, handle, number) != 0; });
     }
 }
 
@@ -1629,7 +1790,9 @@ static BOOL zenitA11yHandleIsWithin(uint32_t window_id, uint32_t handle, uint32_
 }
 
 - (void)setAccessibilityFocused:(BOOL)focused {
-    (void)zenit_a11y_set_focus([self zenitWindowId], self.handle, focused ? 1 : 0);
+    uint32_t wid = [self zenitWindowId];
+    ZenitAXHandle handle = self.handle;
+    (void)zenitA11yRunMutation(^BOOL { return zenit_a11y_set_focus(wid, handle, focused ? 1 : 0) != 0; });
 }
 
 - (BOOL)isAccessibilitySelected {
@@ -1689,7 +1852,7 @@ static BOOL zenitA11yHandleIsWithin(uint32_t window_id, uint32_t handle, uint32_
     if (n <= 0) return @[];
     NSMutableArray *kids = [NSMutableArray arrayWithCapacity:(NSUInteger)n];
     for (int i = 0; i < n; i++) {
-        uint32_t h = zenit_a11y_children_at(wid, self.handle, i);
+        ZenitAXHandle h = zenit_a11y_children_at(wid, self.handle, i);
         if (h == ZENIT_A11Y_INVALID_HANDLE) continue;
         MetalView *host = (MetalView *)self.parentView;
         [kids addObject:[host zenitA11yElementForHandle:h accessibilityParent:self]];
@@ -1702,12 +1865,17 @@ static BOOL zenitA11yHandleIsWithin(uint32_t window_id, uint32_t handle, uint32_
 }
 
 - (NSArray *)accessibilityVisibleChildren {
+    // Collection table: only rows intersecting viewport (full rows in
+    // AXChildren/AXRows fetched by segment).
+    uint32_t count = 0, first = 0, len = 0;
+    if ([self zenitCollectionCount:&count first:&first visible:&len])
+        return [self zenitCollectionRowsFrom:first count:len];
     return [self accessibilityChildren];
 }
 
 - (NSArray *)accessibilitySelectedChildren {
     uint32_t wid = [self zenitWindowId];
-    uint32_t active = zenit_a11y_active_descendant(wid, self.handle);
+    ZenitAXHandle active = zenit_a11y_active_descendant(wid, self.handle);
     MetalView *host = (MetalView *)self.parentView;
     if (active != ZENIT_A11Y_INVALID_HANDLE)
         return @[[host zenitA11yElementForHandle:active]];
@@ -1720,10 +1888,10 @@ static BOOL zenitA11yHandleIsWithin(uint32_t window_id, uint32_t handle, uint32_
 
 - (id)accessibilityFocusedUIElement {
     uint32_t wid = [self zenitWindowId];
-    uint32_t active = zenit_a11y_active_descendant(wid, self.handle);
+    ZenitAXHandle active = zenit_a11y_active_descendant(wid, self.handle);
     if (active != ZENIT_A11Y_INVALID_HANDLE)
         return [(MetalView *)self.parentView zenitA11yElementForHandle:active];
-    uint32_t focused = zenit_a11y_focused(wid);
+    ZenitAXHandle focused = zenit_a11y_focused(wid);
     if (focused == ZENIT_A11Y_INVALID_HANDLE ||
         !zenitA11yHandleIsWithin(wid, focused, self.handle)) return nil;
     if (focused == self.handle) return self;
@@ -1740,12 +1908,77 @@ static BOOL zenitA11yHandleIsWithin(uint32_t window_id, uint32_t handle, uint32_
     return result;
 }
 
+// Semantic collection (docs/A11Y_ARCHITECTURE.md section 12):
+// table exposes all rows (matches NSTableView: AXRows/AXChildren =
+// all, offscreen have real frame). Items materialize on fetch;
+// segment fetch only materializes requested segment.
+
+- (BOOL)zenitCollectionCount:(uint32_t *)count first:(uint32_t *)first visible:(uint32_t *)len {
+    return zenit_a11y_collection_info([self zenitWindowId], self.handle, count, first, len) != 0;
+}
+
+- (NSArray *)zenitCollectionRowsFrom:(uint32_t)first count:(uint32_t)n {
+    uint32_t wid = [self zenitWindowId];
+    MetalView *host = (MetalView *)self.parentView;
+    NSMutableArray *rows = [NSMutableArray arrayWithCapacity:n];
+    for (uint32_t i = 0; i < n; i++) {
+        ZenitAXHandle h = zenit_a11y_collection_row_at(wid, self.handle, first + i);
+        if (h == ZENIT_A11Y_INVALID_HANDLE) break;
+        [rows addObject:[host zenitA11yElementForHandle:h accessibilityParent:self]];
+    }
+    return rows;
+}
+
+static BOOL zenitA11yIsRowListAttribute(NSAccessibilityAttributeName attribute) {
+    return [attribute isEqualToString:NSAccessibilityRowsAttribute] ||
+        [attribute isEqualToString:NSAccessibilityChildrenAttribute] ||
+        [attribute isEqualToString:NSAccessibilityChildrenInNavigationOrderAttribute];
+}
+
+- (NSUInteger)accessibilityArrayAttributeCount:(NSAccessibilityAttributeName)attribute {
+    uint32_t count = 0;
+    if (zenitA11yIsRowListAttribute(attribute) && [self zenitCollectionCount:&count first:NULL visible:NULL])
+        return count;
+    return [super accessibilityArrayAttributeCount:attribute];
+}
+
+- (NSArray *)accessibilityArrayAttributeValues:(NSAccessibilityAttributeName)attribute
+                                          index:(NSUInteger)index
+                                       maxCount:(NSUInteger)maxCount {
+    uint32_t count = 0;
+    if (zenitA11yIsRowListAttribute(attribute) && [self zenitCollectionCount:&count first:NULL visible:NULL]) {
+        if (index >= count) return @[];
+        NSUInteger n = MIN(maxCount, (NSUInteger)count - index);
+        return [self zenitCollectionRowsFrom:(uint32_t)index count:(uint32_t)n];
+    }
+    return [super accessibilityArrayAttributeValues:attribute index:index maxCount:maxCount];
+}
+
+- (NSUInteger)accessibilityIndexOfChild:(id)child {
+    uint32_t count = 0;
+    if ([child isKindOfClass:[ZenitA11yElement class]] &&
+        [self zenitCollectionCount:&count first:NULL visible:NULL]) {
+        uint32_t index = 0, span = 0;
+        ZenitA11yElement *element = child;
+        if (zenit_a11y_parent([self zenitWindowId], element.handle) == self.handle &&
+            zenit_a11y_row_index_range([self zenitWindowId], element.handle, &index, &span))
+            return index;
+        return NSNotFound;
+    }
+    return [super accessibilityIndexOfChild:child];
+}
+
 - (NSArray *)accessibilityRows {
+    uint32_t count = 0;
+    if ([self zenitCollectionCount:&count first:NULL visible:NULL])
+        return [self zenitCollectionRowsFrom:0 count:count];
     uint32_t wid = [self zenitWindowId];
     NSMutableArray *rows = [NSMutableArray array];
     for (ZenitA11yElement *child in [self accessibilityChildren]) {
         int role = zenit_a11y_role(wid, child.handle);
-        if (role == ZenitA11yTreeRoleTreeitem) {
+        // listitem on macOS is AXRow: if not counted, list AXRowCount = 0,
+        // VoiceOver speaks 0 items (VirtualList measured).
+        if (role == ZenitA11yTreeRoleTreeitem || role == ZenitA11yTreeRoleListitem) {
             [rows addObject:child];
             continue;
         }
@@ -1763,6 +1996,8 @@ static BOOL zenitA11yHandleIsWithin(uint32_t window_id, uint32_t handle, uint32_
 }
 
 - (NSArray *)accessibilitySelectedRows {
+    // Collection has no selection model: don't iterate all rows.
+    if ([self zenitCollectionCount:NULL first:NULL visible:NULL]) return @[];
     NSMutableArray *rows = [NSMutableArray array];
     for (ZenitA11yElement *row in [self accessibilityRows])
         if ([row isAccessibilitySelected]) [rows addObject:row];
@@ -1770,6 +2005,8 @@ static BOOL zenitA11yHandleIsWithin(uint32_t window_id, uint32_t handle, uint32_
 }
 
 - (NSArray *)accessibilityColumns {
+    // Collection is single column, no header: don't iterate all rows.
+    if ([self zenitCollectionCount:NULL first:NULL visible:NULL]) return @[];
     NSMutableArray *columns = [NSMutableArray array];
     for (ZenitA11yElement *child in [self accessibilityChildren]) {
         int role = zenit_a11y_role([self zenitWindowId], child.handle);
@@ -1785,9 +2022,20 @@ static BOOL zenitA11yHandleIsWithin(uint32_t window_id, uint32_t handle, uint32_
     return columns;
 }
 
-- (NSArray *)accessibilityVisibleRows { return [self accessibilityRows]; }
+- (NSArray *)accessibilityVisibleRows {
+    uint32_t count = 0, first = 0, len = 0;
+    if ([self zenitCollectionCount:&count first:&first visible:&len])
+        return [self zenitCollectionRowsFrom:first count:len];
+    return [self accessibilityRows];
+}
 - (NSArray *)accessibilityVisibleColumns { return [self accessibilityColumns]; }
-- (NSInteger)accessibilityRowCount { return (NSInteger)[[self accessibilityRows] count]; }
+- (NSInteger)accessibilityRowCount {
+    // Virtualized collection declares logical total, report total (tree
+    // has only visible rows).
+    uint32_t declared = zenit_a11y_set_size([self zenitWindowId], self.handle);
+    if (declared > 0) return (NSInteger)declared;
+    return (NSInteger)[[self accessibilityRows] count];
+}
 - (NSInteger)accessibilityColumnCount { return (NSInteger)[[self accessibilityColumns] count]; }
 
 - (NSInteger)accessibilityIndex {
@@ -1803,7 +2051,9 @@ static BOOL zenitA11yHandleIsWithin(uint32_t window_id, uint32_t handle, uint32_
 - (NSArray *)accessibilityVisibleCells {
     NSMutableArray *cells = [NSMutableArray array];
     uint32_t wid = [self zenitWindowId];
-    for (ZenitA11yElement *row in [self accessibilityRows]) {
+    uint32_t count = 0;
+    BOOL collection = [self zenitCollectionCount:&count first:NULL visible:NULL];
+    for (ZenitA11yElement *row in (collection ? [self accessibilityVisibleRows] : [self accessibilityRows])) {
         for (ZenitA11yElement *cell in [row accessibilityChildren]) {
             int role = zenit_a11y_role(wid, cell.handle);
             if (role == ZenitA11yTreeRoleCell || role == ZenitA11yTreeRoleRowheader)
@@ -1815,6 +2065,12 @@ static BOOL zenitA11yHandleIsWithin(uint32_t window_id, uint32_t handle, uint32_
 
 - (id)accessibilityCellForColumn:(NSInteger)column row:(NSInteger)row {
     if (column < 0 || row < 0) return nil;
+    uint32_t count = 0;
+    if ([self zenitCollectionCount:&count first:NULL visible:NULL]) {
+        if (column != 0 || (uint64_t)row >= count) return nil;
+        ZenitA11yElement *rowElement = [[self zenitCollectionRowsFrom:(uint32_t)row count:1] firstObject];
+        return [[rowElement accessibilityChildren] firstObject];
+    }
     uint32_t wid = [self zenitWindowId];
     for (ZenitA11yElement *rowElement in [self accessibilityRows]) {
         uint32_t rowIndex = 0, rowSpan = 0;
@@ -1829,6 +2085,12 @@ static BOOL zenitA11yHandleIsWithin(uint32_t window_id, uint32_t handle, uint32_
         }
     }
     return nil;
+}
+
+// AXScrollArea AXContents (NSScrollView reports documentView):
+// scroll content is subelements.
+- (NSArray *)accessibilityContents {
+    return [self accessibilityChildren];
 }
 
 - (NSArray *)accessibilityTabs {
@@ -1862,7 +2124,64 @@ static BOOL zenitA11yHandleIsWithin(uint32_t window_id, uint32_t handle, uint32_
     return [(MetalView *)self.parentView accessibilityHitTest:point];
 }
 
+// Cull attributes by role. NSAccessibilityElement reports all
+// implemented accessors as attributes, pre-refactor text box had
+// AXRows/AXTabs/AXCellForColumnAndRow (axprobe measured), assistive
+// tech asks as table/tab group. Gate by role like AccessKit.
+- (BOOL)zenitAllowsStructuralSelector:(SEL)selector handled:(BOOL *)handled {
+    *handled = YES;
+    uint32_t wid = [self zenitWindowId];
+    int role = zenit_a11y_role(wid, self.handle);
+    NSAccessibilityRole nsRole = [self accessibilityRole];
+    BOOL isTable = [nsRole isEqualToString:NSAccessibilityTableRole];
+    BOOL isCollection = isTable || [nsRole isEqualToString:NSAccessibilityListRole] ||
+        [nsRole isEqualToString:NSAccessibilityOutlineRole];
+    if (selector == @selector(accessibilityRows) || selector == @selector(accessibilityVisibleRows) ||
+        selector == @selector(accessibilitySelectedRows) || selector == @selector(accessibilityRowCount))
+        return isCollection;
+    if (selector == @selector(accessibilityColumns) || selector == @selector(accessibilityVisibleColumns) ||
+        selector == @selector(accessibilityColumnCount) || selector == @selector(accessibilityColumnHeaderUIElements) ||
+        selector == @selector(accessibilityVisibleCells) || selector == @selector(accessibilityCellForColumn:row:))
+        return isTable;
+    if (selector == @selector(accessibilityTabs))
+        return [nsRole isEqualToString:NSAccessibilityTabGroupRole];
+    if (selector == @selector(accessibilityContents))
+        return [nsRole isEqualToString:NSAccessibilityScrollAreaRole];
+    if (selector == @selector(accessibilitySelectedChildren))
+        return isCollection || role == ZenitA11yTreeRoleTabs || role == ZenitA11yTreeRoleRadioGroup ||
+            role == ZenitA11yTreeRoleMenu || role == ZenitA11yTreeRoleMenubar || role == ZenitA11yTreeRoleCombobox;
+    if (selector == @selector(accessibilityIndex)) {
+        uint32_t index = 0, span = 0;
+        return [nsRole isEqualToString:NSAccessibilityRowRole] ||
+            zenit_a11y_row_index_range(wid, self.handle, &index, &span) ||
+            zenit_a11y_column_index_range(wid, self.handle, &index, &span);
+    }
+    if (selector == @selector(accessibilityRowIndexRange)) {
+        uint32_t index = 0, span = 0;
+        return zenit_a11y_row_index_range(wid, self.handle, &index, &span) != 0;
+    }
+    if (selector == @selector(accessibilityColumnIndexRange)) {
+        uint32_t index = 0, span = 0;
+        return zenit_a11y_column_index_range(wid, self.handle, &index, &span) != 0;
+    }
+    if (selector == @selector(accessibilitySortDirection))
+        return role == ZenitA11yTreeRoleColumnheader || role == ZenitA11yTreeRoleRowheader;
+    if (selector == @selector(accessibilityDisclosureLevel))
+        return role == ZenitA11yTreeRoleTreeitem || role == ZenitA11yTreeRoleRow || role == ZenitA11yTreeRoleHeading;
+    if (selector == @selector(accessibilityMinValue) || selector == @selector(accessibilityMaxValue))
+        return zenit_a11y_numeric_value(wid, self.handle, NULL, NULL, NULL) != 0;
+    if (selector == @selector(isAccessibilityModal))
+        return role == ZenitA11yTreeRoleDialog || role == ZenitA11yTreeRoleAlertdialog;
+    if (selector == @selector(accessibilityPlaceholderValue))
+        return (zenit_a11y_text_capabilities(wid, self.handle) & 0x1) != 0 || role == ZenitA11yTreeRoleCombobox;
+    *handled = NO;
+    return NO;
+}
+
 - (BOOL)isAccessibilitySelectorAllowed:(SEL)selector {
+    BOOL handled = NO;
+    BOOL allowed = [self zenitAllowsStructuralSelector:selector handled:&handled];
+    if (handled) return allowed;
     uint8_t actions = zenit_a11y_actions([self zenitWindowId], self.handle);
     if (selector == @selector(accessibilityPerformPress))
         return (actions & (ZenitA11yActionBitPress | ZenitA11yActionBitToggle)) != 0;
@@ -1907,19 +2226,146 @@ static BOOL zenitA11yHandleIsWithin(uint32_t window_id, uint32_t handle, uint32_
     return [super isAccessibilitySelectorAllowed:selector];
 }
 
+// New accessor coverage gaps: invalid/busy/haspopup, macOS 26
+// heading level. Use old property interface, other attributes via
+// AppKit from new accessors (Chromium AXPlatformNodeCocoa mixes).
+static NSString *const kZenitAXInvalid = @"AXInvalid";
+static NSString *const kZenitAXElementBusy = @"AXElementBusy";
+static NSString *const kZenitAXHasPopup = @"AXHasPopup";
+
+- (NSArray *)accessibilityAttributeNames {
+    NSMutableArray *names = [[super accessibilityAttributeNames] mutableCopy] ?: [NSMutableArray array];
+    uint32_t wid = [self zenitWindowId];
+    uint32_t state = zenit_a11y_state(wid, self.handle);
+    if ((state & ZenitA11yStateInvalid) != 0) [names addObject:kZenitAXInvalid];
+    if ((state & ZenitA11yStateBusy) != 0) [names addObject:kZenitAXElementBusy];
+    if ((state & ZenitA11yStateHasPopup) != 0) [names addObject:kZenitAXHasPopup];
+    if (@available(macOS 26.0, *)) {
+        if (zenit_a11y_role(wid, self.handle) == ZenitA11yTreeRoleHeading && zenit_a11y_level(wid, self.handle) > 0)
+            [names addObject:NSAccessibilityHeadingLevelAttribute];
+    }
+    if ([self zenitExposesScrollToVisibleAttribute]) [names addObject:@"AXScrollToVisible"];
+    return names;
+}
+
+// Parameterized attribute names skip isAccessibilitySelectorAllowed:,
+// separately filter table-specific items.
+- (NSArray *)accessibilityParameterizedAttributeNames {
+    NSArray *names = [super accessibilityParameterizedAttributeNames] ?: @[];
+    if ([[self accessibilityRole] isEqualToString:NSAccessibilityTableRole]) return names;
+    return [names filteredArrayUsingPredicate:[NSPredicate predicateWithBlock:^BOOL(NSString *name, NSDictionary *bindings) {
+        (void)bindings;
+        return ![name isEqualToString:NSAccessibilityCellForColumnAndRowParameterizedAttribute];
+    }]];
+}
+
+static BOOL zenitAXTraceEnabled(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("ZENIT_DEBUG_AXTRACE") ? 1 : 0;
+    return on == 1;
+}
+
+- (id)accessibilityAttributeValue:(NSAccessibilityAttributeName)attribute forParameter:(id)parameter {
+    if (zenitAXTraceEnabled())
+        fprintf(stderr, "[AXTRACE] %.3f h=%llu param %s\n", CACurrentMediaTime(), (unsigned long long)self.handle, attribute.UTF8String);
+    return [super accessibilityAttributeValue:attribute forParameter:parameter];
+}
+
+- (id)accessibilityAttributeValue:(NSAccessibilityAttributeName)attribute {
+    if (zenitAXTraceEnabled()) {
+        NSString *label = [self accessibilityLabel] ?: ([[self accessibilityValue] isKindOfClass:[NSString class]] ? [self accessibilityValue] : @"");
+        fprintf(stderr, "[AXTRACE] %.3f h=%llu role=%s name=%s attr %s\n", CACurrentMediaTime(), (unsigned long long)self.handle,
+                [[self accessibilityRole] UTF8String], label.UTF8String, attribute.UTF8String);
+    }
+    uint32_t wid = [self zenitWindowId];
+    if ([attribute isEqualToString:kZenitAXInvalid])
+        return (zenit_a11y_state(wid, self.handle) & ZenitA11yStateInvalid) != 0 ? @"true" : @"false";
+    if ([attribute isEqualToString:kZenitAXElementBusy])
+        return @((zenit_a11y_state(wid, self.handle) & ZenitA11yStateBusy) != 0);
+    if ([attribute isEqualToString:kZenitAXHasPopup])
+        return @((zenit_a11y_state(wid, self.handle) & ZenitA11yStateHasPopup) != 0);
+    if (@available(macOS 26.0, *)) {
+        if ([attribute isEqualToString:NSAccessibilityHeadingLevelAttribute]) {
+            uint16_t level = zenit_a11y_level(wid, self.handle);
+            return level > 0 ? @(level) : nil;
+        }
+    }
+    return [super accessibilityAttributeValue:attribute];
+}
+
+// AXScrollToVisible: VoiceOver calls when cursor to offscreen
+// element. macOS 26 SDK public NSAccessibilityScrollToVisibleAction,
+// string value valid old systems. New protocol no method, use old
+// action interface. Any element supports (static text, disabled).
+static NSString *const kZenitAXScrollToVisible = @"AXScrollToVisible";
+
+- (NSArray *)accessibilityActionNames {
+    NSArray *names = [super accessibilityActionNames] ?: @[];
+    return [names arrayByAddingObject:kZenitAXScrollToVisible];
+}
+
+- (void)accessibilityPerformAction:(NSAccessibilityActionName)action {
+    if ([action isEqualToString:kZenitAXScrollToVisible]) {
+        [self zenitScrollToVisible];
+        return;
+    }
+    [super accessibilityPerformAction:action];
+}
+
+// Collection items: offset committed here (AX callback) to a11y
+// layer, same service window frame/visible row reads immediately
+// reflect new position; component scroll state in deferred
+// perform_action. Normal nodes: commit returns 0, deferred scroll.
+- (void)zenitScrollToVisible {
+    uint32_t wid = [self zenitWindowId];
+    ZenitAXHandle handle = self.handle;
+    (void)zenit_a11y_commit_scroll_to_visible(wid, handle);
+    (void)zenitA11yRunMutation(^BOOL {
+        return zenit_a11y_perform_action(wid, handle, ZenitA11yActionScrollToVisible) != 0;
+    });
+}
+
+// NSTableView cell exposes AXScrollToVisible as settable property,
+// VoiceOver each step sets it (lldb breakpoint measured, docs
+// section 12.2). Collection items expose same; other properties back
+// to AppKit.
+- (BOOL)zenitExposesScrollToVisibleAttribute {
+    return zenitA11yIsItemHandle(self.handle) &&
+        zenit_a11y_role([self zenitWindowId], self.handle) == ZenitA11yTreeRoleCell;
+}
+
+- (BOOL)accessibilityIsAttributeSettable:(NSAccessibilityAttributeName)attribute {
+    if ([attribute isEqualToString:kZenitAXScrollToVisible] && [self zenitExposesScrollToVisibleAttribute])
+        return YES;
+    return [super accessibilityIsAttributeSettable:attribute];
+}
+
+- (void)accessibilitySetValue:(id)value forAttribute:(NSAccessibilityAttributeName)attribute {
+    if ([attribute isEqualToString:kZenitAXScrollToVisible] && [self zenitExposesScrollToVisibleAttribute]) {
+        [self zenitScrollToVisible];
+        return;
+    }
+    [super accessibilitySetValue:value forAttribute:attribute];
+}
+
 - (BOOL)accessibilityPerformPress {
     uint32_t wid = [self zenitWindowId];
     uint8_t actions = zenit_a11y_actions(wid, self.handle);
     uint8_t action = (actions & ZenitA11yActionBitToggle) ? ZenitA11yActionToggle : ZenitA11yActionPress;
-    return zenit_a11y_perform_action(wid, self.handle, action) != 0;
+    ZenitAXHandle handle = self.handle;
+    return zenitA11yRunMutation(^BOOL { return zenit_a11y_perform_action(wid, handle, action) != 0; });
 }
 
 - (BOOL)accessibilityPerformIncrement {
-    return zenit_a11y_perform_action([self zenitWindowId], self.handle, ZenitA11yActionIncrement) != 0;
+    uint32_t wid = [self zenitWindowId];
+    ZenitAXHandle handle = self.handle;
+    return zenitA11yRunMutation(^BOOL { return zenit_a11y_perform_action(wid, handle, ZenitA11yActionIncrement) != 0; });
 }
 
 - (BOOL)accessibilityPerformDecrement {
-    return zenit_a11y_perform_action([self zenitWindowId], self.handle, ZenitA11yActionDecrement) != 0;
+    uint32_t wid = [self zenitWindowId];
+    ZenitAXHandle handle = self.handle;
+    return zenitA11yRunMutation(^BOOL { return zenit_a11y_perform_action(wid, handle, ZenitA11yActionDecrement) != 0; });
 }
 
 - (NSRange)accessibilitySelectedTextRange {
@@ -1940,7 +2386,8 @@ static BOOL zenitA11yHandleIsWithin(uint32_t window_id, uint32_t handle, uint32_
     if (safe.location == NSNotFound) return;
     uint32_t start = zenitA11yUTF8OffsetForUTF16(text, safe.location);
     uint32_t end = zenitA11yUTF8OffsetForUTF16(text, NSMaxRange(safe));
-    (void)zenit_a11y_set_text_selection(wid, self.handle, start, end);
+    ZenitAXHandle handle = self.handle;
+    (void)zenitA11yRunMutation(^BOOL { return zenit_a11y_set_text_selection(wid, handle, start, end) != 0; });
 }
 
 - (NSString *)accessibilitySelectedText {
@@ -2071,11 +2518,29 @@ static BOOL zenitA11yHandleIsWithin(uint32_t window_id, uint32_t handle, uint32_
 @end
 
 @interface MetalView (ZenitA11y)
+- (id)zenitA11yRootParent;
 @end
 
 @implementation MetalView (ZenitA11y)
 
-- (id)zenitA11yElementForHandle:(uint32_t)handle accessibilityParent:(id)parent {
+// Debug switch ZENIT_DEBUG_AXTRACE=1: each property/parameterized
+// request from assistive tech to stderr. Real machine VoiceOver
+// debug (2026-10-01 confirmed 'only reach first' is host grouping
+// structure not data). No env var = one static check.
+- (id)accessibilityAttributeValue:(NSAccessibilityAttributeName)attribute {
+    if (zenitAXTraceEnabled())
+        fprintf(stderr, "[AXTRACE] %.3f HOST attr %s\n", CACurrentMediaTime(), attribute.UTF8String);
+    return [super accessibilityAttributeValue:attribute];
+}
+
+- (id)accessibilityAttributeValue:(NSAccessibilityAttributeName)attribute forParameter:(id)parameter {
+    if (zenitAXTraceEnabled())
+        fprintf(stderr, "[AXTRACE] %.3f HOST param %s %s\n", CACurrentMediaTime(), attribute.UTF8String,
+                [[parameter description] UTF8String]);
+    return [super accessibilityAttributeValue:attribute forParameter:parameter];
+}
+
+- (id)zenitA11yElementForHandle:(ZenitAXHandle)handle accessibilityParent:(id)parent {
     if (handle == ZENIT_A11Y_INVALID_HANDLE) return nil;
     NSNumber *key = @(handle);
     ZenitA11yElement *element = self.zenitA11yElementCache[key];
@@ -2091,17 +2556,17 @@ static BOOL zenitA11yHandleIsWithin(uint32_t window_id, uint32_t handle, uint32_
     return element;
 }
 
-- (id)zenitA11yElementForHandle:(uint32_t)handle {
+- (id)zenitA11yElementForHandle:(ZenitAXHandle)handle {
     if (handle == ZENIT_A11Y_INVALID_HANDLE) return nil;
     uint32_t wid = zenitA11yWindowIdForView(self);
     if (!zenit_a11y_exists(wid, handle)) return nil;
-    uint32_t parentHandle = zenit_a11y_parent(wid, handle);
-    id parent = self;
+    ZenitAXHandle parentHandle = zenit_a11y_parent(wid, handle);
+    id parent = [self zenitA11yRootParent];
     if (parentHandle != ZENIT_A11Y_INVALID_HANDLE) {
         // Prefer an already retained parent; recursive creation is bounded by
         // the valid retained tree and gives focus notifications the right AX
         // ancestry even before VoiceOver has pulled children.
-        parent = [self zenitA11yElementForHandle:parentHandle] ?: self;
+        parent = [self zenitA11yElementForHandle:parentHandle] ?: [self zenitA11yRootParent];
     }
     return [self zenitA11yElementForHandle:handle accessibilityParent:parent];
 }
@@ -2111,20 +2576,20 @@ static BOOL zenitA11yHandleIsWithin(uint32_t window_id, uint32_t handle, uint32_
     // Retain live virtual elements, but never let handles from an earlier tree
     // accumulate or alias a later generational handle.
     for (NSNumber *key in [self.zenitA11yElementCache.allKeys copy]) {
-        if (!zenit_a11y_exists(wid, key.unsignedIntValue)) {
+        if (!zenit_a11y_exists(wid, (ZenitAXHandle)key.unsignedLongLongValue)) {
             [self.zenitA11yElementCache removeObjectForKey:key];
         }
     }
     int n = zenit_a11y_root_count(wid);
     if (n <= 0) {
-        // 没注册 a11y_tree (test mode 或 cx 未挂)，落 super 行为
+        // No registered a11y_tree (test mode or cx unhooked), fall to super.
         return [super accessibilityChildren];
     }
     NSMutableArray *kids = [NSMutableArray arrayWithCapacity:(NSUInteger)n];
     for (int i = 0; i < n; i++) {
-        uint32_t h = zenit_a11y_root_at(wid, i);
+        ZenitAXHandle h = zenit_a11y_root_at(wid, i);
         if (h == ZENIT_A11Y_INVALID_HANDLE) continue;
-        [kids addObject:[self zenitA11yElementForHandle:h accessibilityParent:self]];
+        [kids addObject:[self zenitA11yElementForHandle:h accessibilityParent:[self zenitA11yRootParent]]];
     }
     return kids;
 }
@@ -2142,34 +2607,34 @@ static BOOL zenitA11yHandleIsWithin(uint32_t window_id, uint32_t handle, uint32_
 }
 
 - (id)accessibilityFocusedUIElement {
-    uint32_t focused = zenit_a11y_focused(zenitA11yWindowIdForView(self));
+    ZenitAXHandle focused = zenit_a11y_focused(zenitA11yWindowIdForView(self));
     return focused == ZENIT_A11Y_INVALID_HANDLE ? nil : [self zenitA11yElementForHandle:focused];
 }
 
 - (id)accessibilityHitTest:(NSPoint)point {
-    if (!self.window) return self;
+    if (!self.window) return [self zenitA11yRootParent];
     NSPoint windowPoint = [self.window convertPointFromScreen:point];
     NSPoint local = [self convertPoint:windowPoint fromView:nil];
-    uint32_t handle = zenit_a11y_hit_test(
+    ZenitAXHandle handle = zenit_a11y_hit_test(
         zenitA11yWindowIdForView(self),
         (float)local.x,
         (float)(self.bounds.size.height - local.y)
     );
-    return handle == ZENIT_A11Y_INVALID_HANDLE ? self : [self zenitA11yElementForHandle:handle];
+    return handle == ZENIT_A11Y_INVALID_HANDLE ? [self zenitA11yRootParent] : [self zenitA11yElementForHandle:handle];
 }
 
+// Host view is transparent to assistive tech (ignored): AppKit elevates accessibilityChildren
+// directly to the window, like a native AppKit content view. Exposing it as an AXGroup would
+// make VoiceOver at window level see only the group + traffic lights (needing VO+Shift+Down
+// to enter), and add a meaningless nesting level with a hardcoded English name.
 - (BOOL)isAccessibilityElement {
-    // Virtual Zenit children are not NSView descendants, so keep the hosting
-    // view in the AX hierarchy as their explicit group parent.
-    return YES;
+    return NO;
 }
 
-- (NSAccessibilityRole)accessibilityRole {
-    return NSAccessibilityGroupRole;
-}
-
-- (NSString *)accessibilityLabel {
-    return @"Zenit content";
+/// Virtual subelements parent after transparency: nearest non-
+/// transparent ancestor (usually window).
+- (id)zenitA11yRootParent {
+    return NSAccessibilityUnignoredAncestor(self) ?: self.window;
 }
 
 @end
@@ -2189,9 +2654,10 @@ typedef struct {
     float y;
     int button;  // 0=left, 1=right, 2=middle
     BOOL pressed;
-    // 原始 NSEventModifierFlags。⇧ 加选、⌘ 深选、ctrl 框选这类交互全靠它，
-    // 少了这个字段，修饰键在真机上永远读到 false（合成事件路径反而正常，
-    // 因为它绕过本桥——这正是"自动化测试全绿、真机全废"的成因）。
+    // Original NSEventModifierFlags. Shift-add-select, Cmd-deep-select,
+    // Ctrl-frame-select depend; missing reads false on real machine
+    // (synthetic path works bypasses bridge - why e2e all green, real
+    // broken).
     uint32_t modifiers;
 } MouseButtonPacket;
 
@@ -2206,8 +2672,9 @@ typedef struct {
     uint32_t modifiers;
 } ScrollEventPacket;
 
-// 与 system_sdk.events.ScrollPhase 对齐：0 none, 1 may_begin, 2 began,
-// 3 changed, 4 ended, 5 cancelled。惯性事件的 phase 是 None（由 momentumPhase 标记）。
+// Align with system_sdk.events.ScrollPhase: 0 none, 1 may_begin,
+// 2 began, 3 changed, 4 ended, 5 cancelled. Momentum phase none
+// (marked by momentumPhase).
 static uint8_t zenitScrollPhaseCode(NSEvent *event) {
     switch (event.phase) {
         case NSEventPhaseNone: return 0;
@@ -2217,19 +2684,21 @@ static uint8_t zenitScrollPhaseCode(NSEvent *event) {
         case NSEventPhaseStationary: return 3;
         case NSEventPhaseEnded: return 4;
         case NSEventPhaseCancelled: return 5;
-        // NSEventPhase 是位掩码：组合位或新值仍表示手势进行中，不能当成鼠标滚轮
+        // NSEventPhase bitmask: OR combined bits still in-gesture, not
+        // mouse wheel.
         default: return 3;
     }
 }
 
-// 与 system_sdk.events.MomentumPhase 对齐：0 none, 1 began, 2 changed, 3 ended。
+// Align with system_sdk.events.MomentumPhase: 0 none, 1 began,
+// 2 changed, 3 ended.
 static uint8_t zenitMomentumPhaseCode(NSEvent *event) {
     switch (event.momentumPhase) {
         case NSEventPhaseNone: return 0;
         case NSEventPhaseBegan: return 1;
         case NSEventPhaseEnded:
         case NSEventPhaseCancelled: return 3;
-        // Changed / Stationary / 未知组合：惯性仍在进行
+        // Changed/Stationary/unknown combo: momentum still ongoing
         default: return 2;
     }
 }
@@ -2251,8 +2720,14 @@ typedef struct {
     BOOL pressed;
 } KeyEventPacket;
 
-// 窗口包装器 (同时作为 NSWindowDelegate 处理关闭事件)
-@interface WindowWrapper : NSObject <NSWindowDelegate>
+// window wrapper (also NSWindowDelegate for close event)
+@interface WindowWrapper : NSObject <NSWindowDelegate> {
+@public
+    // One CVDisplayLink writer, main-thread cadence/timing snapshots.
+    _Atomic(uint64_t) displayTickSequence;
+    _Atomic(uint64_t) displayTickCallbackHostTime;
+    _Atomic(uint64_t) displayTickTargetHostTime;
+}
 @property (nonatomic, strong) NSWindow *window;
 @property (nonatomic, strong) MetalView *metalView;
 @property (nonatomic) BOOL shouldClose;
@@ -2265,21 +2740,22 @@ typedef struct {
 @property (nonatomic) BOOL nativeCloseObserved;
 @property (nonatomic) BOOL nativeCloseRetentionElapsed;
 @property (nonatomic) BOOL nativeCloseCompleted;
-// 鼠标状态
+// mouse state
 @property (nonatomic) NSPoint mouseLocation;
 @property (nonatomic) BOOL leftButtonPressed;
 @property (nonatomic) BOOL rightButtonPressed;
 @property (nonatomic) BOOL middleButtonPressed;
-// 键盘状态
+// keyboard state
 @property (nonatomic, strong) NSMutableArray<NSValue *> *keyEventQueue;
 @property (nonatomic, strong) NSString *inputText;
 @property (nonatomic, strong) NSMutableArray<ZenitTextEventPacket *> *inputTextQueue;
-// IME 状态
+// IME state
 @property (nonatomic, strong) NSString *imePreeditText;
 @property (nonatomic) uint32_t imePreeditCursorUtf16;
 @property (nonatomic, strong) NSMutableArray<ZenitTextEventPacket *> *imePreeditQueue;
-// preedit/commit 的 replacementRange（UTF-8 字节区间，相对文档）。
-// ZENIT_IME_NO_REPLACEMENT 哨兵 = 本次无 replacement。
+// preedit/commit replacementRange (UTF-8 byte range, relative
+// document). ZENIT_IME_NO_REPLACEMENT sentinel = no replacement this
+// time.
 @property (nonatomic) uint32_t imePreeditReplaceStartUtf8;
 @property (nonatomic) uint32_t imePreeditReplaceEndUtf8;
 @property (nonatomic) BOOL hasImePreedit;
@@ -2305,37 +2781,43 @@ typedef struct {
 @property (nonatomic) unsigned long long lastInsertKeyDispatchSeq;
 @property (nonatomic, strong) NSString *lastInsertText;
 @property (nonatomic) BOOL lastInsertHadMarked;
-// 原生 mouse moved/dragged 队列；压力下只合并相邻 move。
+// native mouse moved/dragged queue; under pressure only merge
+// adjacent moves.
 @property (nonatomic, strong) NSMutableArray<NSValue *> *mouseMoveQueue;
-// 鼠标按键事件队列（避免轮询 miss 同帧按下+松开）
+// mouse button event queue (avoid polling miss same-frame press+
+// release)
 @property (nonatomic, strong) NSMutableArray<NSValue *> *mouseButtonQueue;
-// 滚轮状态
+// scroll wheel state
 @property (nonatomic, strong) NSMutableArray<NSValue *> *scrollEventQueue;
 @property (nonatomic, strong) NSMutableArray<NSValue *> *magnifyEventQueue;
-// Inspector pick 模式：非 key window 时也接受鼠标移动（用于跨窗口 hover）
+// Inspector pick mode: accept mouse move even when not key window
+// (for cross-window hover)
 @property (nonatomic) BOOL acceptsMouseMovedWhileInactive;
-// 自定义 TitleBar 拖拽区域高度（逻辑像素，从窗口顶部算起）
-// 设为 > 0 时，mouseDown 落在此区域内会触发 performWindowDragWithEvent
+// custom titlebar drag height (logical px from window top). >0
+// mouseDown in this area triggers performWindowDragWithEvent
 @property (nonatomic) float titlebarDragHeight;
-// TitleBar 右侧排除拖拽的宽度（逻辑像素）。用于让 titlebar 右侧的 action buttons
-// 正常接收 click，而不是被 performWindowDragWithEvent 吃掉。
+// titlebar right exclude width (logical px). For titlebar right
+// action buttons to receive click without performWindowDragWithEvent.
 @property (nonatomic) float titlebarDragRightInset;
-// 命中驱动拖拽区：mouseDown 落入拖拽带时先问 Zig 侧该点是否有交互控件；
-// 返回非 0 = 有控件，事件正常下发不触发窗口拖拽。NULL = 退回矩形模型。
+// hit-driven drag area: mouseDown in band asks Zig if point has
+// interactive control; non-zero = has, event normal not window drag.
+// NULL = fall back to rect model.
 @property (nonatomic, assign) int (*titlebarHitCallback)(void* ctx, float x, float y);
 @property (nonatomic, assign) void* titlebarHitContext;
-// 失焦回调：窗口从 key 变为非 key 时触发（附带新 key window 是否属于本进程）。
-// 浮窗（find/palette）用它实现"点回宿主窗口就关掉自己，点到别的 app 则保留"。
+// Resign-key callback: fires when the window goes from key to non-key, and
+// reports whether the new key window belongs to this process. Floating (find/palette) closes when host
+// focused, keeps when other app focused.
 @property (nonatomic, assign) void (*resignKeyCallback)(void* ctx, int new_key_is_owner);
 @property (nonatomic, assign) void* resignKeyContext;
-// 归属窗口（addChildWindow 的 parent）。仅用于 resignKey 时判断新 key window
-// 是不是自己的宿主 —— 子窗口关系本身由 AppKit 维护。
+// owner window (addChildWindow parent). Only for resignKey checking
+// new key window is own host - child maintained by AppKit.
 @property (nonatomic, weak) NSWindow* ownerWindow;
 // CVDisplayLink for vsync-driven frame scheduling (C6)
 @property (nonatomic) CVDisplayLinkRef displayLink;
 @property (nonatomic) BOOL displayLinkRunning;
-// 自定义 traffic lights 位置：AppKit 在 resize/全屏切换时会重排 titlebar
-// 按钮，需要记住 inset 并在 windowDidResize 等时机重新应用
+// custom traffic lights position: AppKit resorts titlebar on
+// resize/fullscreen, need remember inset and reapply on
+// windowDidResize etc.
 @property (nonatomic) BOOL hasTrafficLightsInset;
 @property (nonatomic) float trafficLightsInsetX;
 @property (nonatomic) float trafficLightsInsetY;
@@ -2350,7 +2832,7 @@ typedef struct {
         return YES;
     }
     self.shouldClose = YES;
-    return NO;  // 先让 Zig 处理 dirty tabs；确认后会再次走 performClose:
+    return NO; // let Zig handle dirty tabs; will retry performClose after confirm
 }
 
 - (void)windowWillClose:(NSNotification *)notification {
@@ -2367,7 +2849,8 @@ typedef struct {
 }
 
 - (void)windowDidChangeScreen:(NSNotification *)notification {
-    // 拖到另一块显示器（60Hz↔120Hz）时把 display link 重绑到新屏，刷新率跟随
+    // drag to different monitor (60Hz<->120Hz) rebind display link to
+    // new screen, refresh rate follows
     if (self.displayLink) {
         CGDirectDisplayID did = (CGDirectDisplayID)[self.window.screen
             .deviceDescription[@"NSScreenNumber"] unsignedIntValue];
@@ -2386,7 +2869,7 @@ typedef struct {
     NSButton *zoomButton = [window standardWindowButton:NSWindowZoomButton];
     if (!closeButton || !miniButton || !zoomButton) return;
 
-    // 全屏下 titlebar 自动隐藏，交给系统摆放
+    // fullscreen titlebar auto-hides, system arranges
     if (window.styleMask & NSWindowStyleMaskFullScreen) return;
 
     NSView *titlebarView = closeButton.superview;
@@ -2395,24 +2878,26 @@ typedef struct {
     CGFloat button_size = closeButton.frame.size.height;
     CGFloat inset_x = self.trafficLightsInsetX;
 
-    // NSTitlebarContainerView 会**裁剪**子树：按钮画得出去（layer 不受
-    // 裁剪约束），但 hit-test 出不去。系统默认容器只有 ~32px 高，往下摆
-    // inset_y=36 的按钮时 origin.y 会算成负数，14px 的按钮只剩顶部 3px
-    // 落在容器内——用户看到完整的红绿灯，却只有最上面一条能点中/hover
-    // （实测：按钮画在 window-y 795..809，hit 只在 806..808 成立）。
-    // 所以先把容器撑到"能装下按钮"，再在容器内摆位；不能只挪按钮。
+    // NSTitlebarContainerView clips subviews: buttons drawn outside
+    // (layer escapes clip), hit-test doesn't. System default ~32px high,
+    // placing inset_y=36 button makes origin.y negative, so the 14px button has
+    // only its top 3px inside the container: the user sees the full traffic
+    // lights but only the topmost strip is clickable/hoverable (measured: buttons
+    // drawn at window-y 795..809, hit only works in 806..808).
+    // Expand container to fit button, place inside; can't just move button.
     NSView *containerView = titlebarView.superview;
     CGFloat needed_h = self.trafficLightsInsetY + button_size / 2.0;
     if (containerView && [containerView isKindOfClass:NSClassFromString(@"NSTitlebarContainerView")]) {
         NSRect cf = containerView.frame;
         if (needed_h > cf.size.height) {
-            // 容器在 NSThemeFrame 里是**顶对齐**的（origin.y 越大越靠上），
-            // 长高要同时下移 origin，否则整条会顶出窗口外。
+            // Container in NSThemeFrame top-aligned (higher origin.y higher),
+            // growing height must shift origin down or whole thing tops outside
+            // window.
             CGFloat delta = needed_h - cf.size.height;
             cf.origin.y -= delta;
             cf.size.height = needed_h;
             containerView.frame = cf;
-            // titlebarView 自身也要跟着填满容器，否则按钮仍会掉出它的 bounds
+            // titlebarView itself fills container or buttons drop out bounds
             NSRect tf = titlebarView.frame;
             tf.origin.y = 0;
             tf.size.height = needed_h;
@@ -2420,7 +2905,8 @@ typedef struct {
         }
     }
 
-    // 此时 titlebarView 的高度已 >= needed_h，button_y 保证非负
+    // titlebarView height now >= needed_h, button_y guaranteed non-
+    // negative
     CGFloat button_y = titlebarView.frame.size.height - self.trafficLightsInsetY - button_size / 2.0;
     if (button_y < 0) button_y = 0;
 
@@ -2451,13 +2937,15 @@ typedef struct {
 
 - (void)windowDidResignKey:(NSNotification *)notification {
     if (!self.resignKeyCallback) return;
-    // 谁抢走了 key？这决定浮窗该不该关：
-    //   - 新 key window 是自己的 owner（或本进程其它窗口）→ 用户回到了应用本体，
-    //     浮窗关掉，符合 IDE 里"点回编辑器就收起搜索框"的直觉。
-    //   - 新 key window 为 nil 或属于别的 app → 用户只是切走了，浮窗保留，
-    //     切回来时内容还在。
-    // 关键：必须延后一拍再判断。resignKey 发出时新窗口往往还没成为 key，
-    // 此刻读 [NSApp keyWindow] 会拿到 nil，把"点宿主窗口"误判成"切到别的 app"。
+    // who got key? decides float close:
+    // - New key window is our owner (or any other window of this process): the
+    //   user is back in the app, so close the float, matching the IDE intuition
+    //   that clicking back into the editor dismisses the search box.
+    // - New key window is nil or belongs to another app: the user merely switched
+    //   away, so keep the float so its content is still there on return.
+    // Critical: defer one beat. resignKey fires before new
+    // window key, [NSApp keyWindow] nil now, 'click host' misread as
+    // 'switch app'.
     __weak WindowWrapper *weakWrapper = self;
     dispatch_async(dispatch_get_main_queue(), ^{
         WindowWrapper *strongWrapper = weakWrapper;
@@ -2469,7 +2957,7 @@ typedef struct {
         NSWindow *newKey = [NSApp keyWindow];
         int is_owner = 0;
         if (newKey != nil) {
-            // 本进程的任意窗口都算"回到应用本体"；owner 命中时更明确。
+            // any process window counts back to app; owner clearer.
             is_owner = (owner != nil && newKey == owner) ? 1 : ([NSApp isActive] ? 1 : 0);
         }
         cb(ctx, is_owner);
@@ -2573,9 +3061,19 @@ static NSString *zenitAccessibilityMessage(
     return [parts componentsJoinedByString:@", "];
 }
 
-static id zenitAccessibilityTarget(WindowWrapper *wrapper) {
+// host view transparent (MetalView isAccessibilityElement),
+// notification can't target: transparent element notification dropped
+// by AppKit. Always target nearest non-transparent ancestor (usually
+// window).
+static id zenitA11yHostTarget(WindowWrapper *wrapper) {
     if (!wrapper) return nil;
-    return wrapper.metalView ?: wrapper.window.contentView ?: wrapper.window;
+    NSView *host = wrapper.metalView ?: wrapper.window.contentView;
+    id unignored = host ? NSAccessibilityUnignoredAncestor(host) : nil;
+    return unignored ?: wrapper.window;
+}
+
+static id zenitAccessibilityTarget(WindowWrapper *wrapper) {
+    return zenitA11yHostTarget(wrapper);
 }
 
 static int zenitPostAccessibilityAnnouncementWithPriority(
@@ -2603,9 +3101,10 @@ static int zenitPostAccessibilityAnnouncement(WindowWrapper *wrapper, NSString *
     return zenitPostAccessibilityAnnouncementWithPriority(wrapper, message, NSAccessibilityPriorityHigh);
 }
 
-// 全局窗口注册表：NSWindow -> WindowWrapper (支持多窗口事件路由)
+// global window registry: NSWindow -> WindowWrapper (support multi-
+// window event routing)
 static NSMapTable *g_window_registry = nil;
-// 全局窗口列表（快速遍历，用于 Cmd+` 窗口切换）
+// global window list (fast iterate, for Cmd+` switch)
 static NSMutableArray<NSWindow *> *g_window_list = nil;
 // AppKit events from every window share one monotonically increasing sequence.
 // The Zig backend drains type-specific native queues, then merges by this value
@@ -2644,10 +3143,10 @@ static WindowWrapper* wrapperForWindow(NSWindow *window) {
     return [g_window_registry objectForKey:window];
 }
 
-// C API 导出
+// C API export
 
-// 创建窗口
-// 内部共享：根据 styleMask 创建并完成 wrapper 注册
+// window creation. internal shared: create by styleMask and
+// complete wrapper registration
 static void* macos_create_window_internal(int width, int height, const char* title, NSWindowStyleMask styleMask, BOOL borderless) {
     @autoreleasepool {
         NSRect frame = NSMakeRect(0, 0, width, height);
@@ -2664,24 +3163,24 @@ static void* macos_create_window_internal(int width, int height, const char* tit
         if (borderless) {
             window.titlebarAppearsTransparent = YES;
             window.titleVisibility = NSWindowTitleHidden;
-            // 不用 movableByWindowBackground：它的作用域是整个窗口背景，会连
-            // 输入框一起吃掉（见 MetalView.mouseDownCanMoveWindow 的说明）。
-            // 拖拽区由上层用 setTitlebarDragHeight 显式声明。
+            // don't use movableByWindowBackground: scope entire window, swallows
+            // input too (see MetalView.mouseDownCanMoveWindow). Drag declared
+            // explicit via setTitlebarDragHeight.
             window.movableByWindowBackground = NO;
             window.hasShadow = YES;
-            // 浮岛风格：圆角 + 关闭按 Esc 由上层处理
+            // floating island style: rounded + close via Esc by app
             window.backgroundColor = [NSColor whiteColor];
             window.opaque = NO;
-            // 不设 NSFloatingWindowLevel：那是**全局**层级，会连别的 app 的窗口
-            // 一起压住 —— 用户切到浏览器，浮窗还赖在最上面。正确的"永远压在宿主
-            // 窗口之上"应由 addChildWindow 表达（见 macos_add_child_window），
-            // 那是 app 内的相对关系，切走时会跟着宿主一起沉下去。
-            //
-            // 宿主没挂子窗口关系时保持普通层级即可；真需要 Spotlight 那种全局浮动
-            // 的场景应显式要求，而不是让 borderless 这个外观标志顺带决定。
+            // don't set NSFloatingWindowLevel: that's global level, presses
+            // other app windows - user switches browser, float still on top.
+            // Correct 'always above host' via addChildWindow
+            // (macos_add_child_window), app-local relation, sinks with host on
+            // switch. Host without child keeps normal level; need Spotlight global
+            // float, ask explicit, don't let borderless appearance dictate.
             window.level = NSNormalWindowLevel;
         } else {
-            // 透明标题栏 — 内容延伸到标题栏区域，由 App 自绘 TitleBar
+            // transparent titlebar - content extends to titlebar, app renders
+            // TitleBar
             window.titlebarAppearsTransparent = YES;
             window.titleVisibility = NSWindowTitleHidden;
         }
@@ -2689,7 +3188,7 @@ static void* macos_create_window_internal(int width, int height, const char* tit
         [window setTitle:[NSString stringWithUTF8String:title]];
         [window center];
 
-        // 创建 Metal 视图
+        // create Metal view
         MetalView *metalView = [[MetalView alloc] initWithFrame:frame];
         if (!metalView) {
             NSLog(@"[macos_create_window] Failed to create MetalView");
@@ -2699,7 +3198,7 @@ static void* macos_create_window_internal(int width, int height, const char* tit
 
         [window setContentView:metalView];
 
-        // 包装窗口和视图
+        // wrap window and view
         WindowWrapper *wrapper = [[WindowWrapper alloc] init];
         wrapper.window = window;
         wrapper.metalView = metalView;
@@ -2761,7 +3260,7 @@ static void* macos_create_window_internal(int width, int height, const char* tit
     }
 }
 
-// 公共入口：标准窗口（带标题栏 + traffic light）
+// public entry: standard window (with titlebar + traffic light)
 void* macos_create_window(int width, int height, const char* title) {
     NSWindowStyleMask styleMask = NSWindowStyleMaskTitled |
                                   NSWindowStyleMaskClosable |
@@ -2771,9 +3270,10 @@ void* macos_create_window(int width, int height, const char* title) {
     return macos_create_window_internal(width, height, title, styleMask, NO);
 }
 
-// 显式提升窗口为 key window（borderless 浮窗 focus 易丢）
-// 最近一次被要求成为 key 的窗口号。应用不在前台时 AppKit 拒绝换 key/main window，
-// 多窗口 e2e（以及快捷键路由）需要一个不依赖前台状态的"逻辑焦点窗口"。
+// Explicitly elevate window to key window (borderless float easily
+// loses focus). Last window requested to be key. AppKit rejects
+// key/main change when app backgrounded; multi-window e2e (and
+// shortcut routing) need logical focus independent of foreground.
 
 static NSWindow *macos_find_window_by_number(NSInteger number) {
     if (number == 0) return nil;
@@ -2796,38 +3296,34 @@ void macos_make_key_window(void* window_ptr) {
     }
 }
 
-// 把 child 挂成 parent 的子窗口：z 序永远跟随、随 parent 一起前置/最小化，
-// parent 关闭时 AppKit 自动带走 child。这是 IDE 里"搜索框永远压在项目窗口之上、
-// 且和项目窗口一起活动"的原生做法 —— 比 NSFloatingWindowLevel 正确得多，后者是
-// **全局**层级，会连别的 app 的窗口一起压住。
+// Child attached to parent: z follows parent, fronts/minimizes with
+// it, AppKit auto-closes on parent close. IDE native 'search always
+// above project, moves with it' - much more correct than
+// NSFloatingWindowLevel (global, presses other app windows).
 void macos_add_child_window(void* parent_ptr, void* child_ptr) {
     @autoreleasepool {
         WindowWrapper *parent = (__bridge WindowWrapper*)parent_ptr;
         WindowWrapper *child = (__bridge WindowWrapper*)child_ptr;
         if (!parent || !child || !parent.window || !child.window) return;
-        // 子窗口一旦挂上就不该再自带全局浮动层级，否则仍会压住别的 app。
+        // Child once attached shouldn't have global float level, else still
+        // presses other apps.
         child.window.level = NSNormalWindowLevel;
         [parent.window addChildWindow:child.window ordered:NSWindowAbove];
         child.ownerWindow = parent.window;
     }
 }
 
-// 把 child 居中到 parent 的**窗口**上，而不是屏幕。
+// Center the child on the parent's window, not the screen. [window center] is screen-centered:
+// right for the main window, wrong for Command Palette/Quick Open/Find docked to an editor
+// (moved, multi-monitor, half-screen: the float lands far away or on another screen).
+// Users expect 'panel belongs to this window'.
 //
-// 建窗时统一走 `[window center]`（居中到屏幕），对主窗口是对的，但对
-// Command Palette / Quick Open / Find 这类依附于某个编辑器窗口的浮层是错的：
-// 编辑器窗口一旦不在屏幕正中（用户挪过、或多显示器、或半屏），浮层就会飞到
-// 离它很远的地方，甚至落在另一块屏幕上。用户的心智是「这个面板属于这个窗口」，
-// 所以它必须出现在那个窗口的中间。
+// == Why only get/store, not arithmetic ==
 //
-// == 为什么这里只做取值与落盘，不做算术 ==
-// 居中公式（含纵向偏上、屏幕夹取）全部放在 Zig 侧的纯函数里算，
-// 见下游编辑器的窗口居中实现。ObjC 这层碰不到单元测试，
-// 把判断逻辑留在这儿等于永远只能靠肉眼验。这里只负责两件 ObjC 才能做的事：
-// 读出宿主/浮层/屏幕可见区域的几何，以及把算好的原点写回窗口。
-//
-// 几何通过 out 参数回传（NSRect 不适合跨 C ABI 直接传）。
-// 返回 0 表示拿不到窗口，调用方应放弃定位而不是拿零值去算。
+// Centering (vertical bias, screen clip) is computed in a pure Zig function (see downstream
+// editor); ObjC has no tests. ObjC only reads the visible geometry of host/float/screen and
+// writes the computed origin back to the window. Geometry goes via out param (NSRect crosses
+// the C ABI poorly). Return 0 = window unavailable; caller must abandon, not use zeros.
 int macos_get_centering_geometry(
     void* child_ptr, void* parent_ptr,
     double* host_x, double* host_y, double* host_w, double* host_h,
@@ -2845,8 +3341,8 @@ int macos_get_centering_geometry(
         *host_w = host.size.width; *host_h = host.size.height;
         *panel_w = panel.size.width; *panel_h = panel.size.height;
 
-        // visibleFrame 已排除菜单栏与 Dock。取宿主所在那块屏幕：
-        // 多显示器下浮层必须留在宿主那一块，不能跳到主屏。
+        // visibleFrame excludes menu bar and Dock. Get host's screen:
+        // multi-monitor, float stays on host screen, can't jump to main.
         NSScreen *screen = parent.window.screen ?: [NSScreen mainScreen];
         NSRect vis = screen ? screen.visibleFrame : host;
         *vis_x = vis.origin.x; *vis_y = vis.origin.y;
@@ -2855,7 +3351,7 @@ int macos_get_centering_geometry(
     }
 }
 
-// 把窗口左下角（AppKit 坐标系）设到指定点。
+// Set window bottom-left (AppKit coords) to point.
 void macos_set_window_origin(void* window_ptr, double x, double y) {
     @autoreleasepool {
         WindowWrapper *wrapper = (__bridge WindowWrapper*)window_ptr;
@@ -2874,8 +3370,9 @@ void macos_remove_child_window(void* parent_ptr, void* child_ptr) {
     }
 }
 
-// 注册失焦回调（NULL 清除）。回调参数 new_key_is_owner：
-// 1 = 焦点回到了本应用（通常是宿主窗口），0 = 焦点去了别的 app 或没有 key window。
+// Register resign key callback (NULL clears). Param
+// new_key_is_owner: 1 = focus back to app (usually host), 0 =
+// other app or no key window.
 void macos_set_resign_key_callback(void* window_ptr, void (*cb)(void* ctx, int is_owner), void* ctx) {
     @autoreleasepool {
         WindowWrapper *wrapper = (__bridge WindowWrapper*)window_ptr;
@@ -2885,8 +3382,9 @@ void macos_set_resign_key_callback(void* window_ptr, void (*cb)(void* ctx, int i
     }
 }
 
-// 公共入口：无标题栏浮层窗口（看起来无标题栏 / 无 traffic light，但保留 NSWindow 自带 resize）
-// 实现：仍用 Titled/Resizable/FullSizeContentView，仅隐藏 traffic light 三按钮 + titlebar 视觉。
+// Public entry: borderless float (appears no titlebar/traffic lights
+// but keeps NSWindow resize). Impl: still Titled/Resizable/
+// FullSizeContentView, only hide lights + titlebar visual.
 void* macos_create_window_borderless(int width, int height, const char* title) {
     NSWindowStyleMask styleMask = NSWindowStyleMaskTitled |
                                   NSWindowStyleMaskResizable |
@@ -2895,26 +3393,25 @@ void* macos_create_window_borderless(int width, int height, const char* title) {
     if (result) {
         WindowWrapper *wrapper = (__bridge WindowWrapper*)result;
         NSWindow *w = wrapper.window;
-        // 隐藏 traffic light 三按钮
+        // Hide traffic lights three buttons
         [[w standardWindowButton:NSWindowCloseButton] setHidden:YES];
         [[w standardWindowButton:NSWindowMiniaturizeButton] setHidden:YES];
         [[w standardWindowButton:NSWindowZoomButton] setHidden:YES];
-        // Titled + FullSizeContentView 会在内容顶部留一条**不可见但仍可拖**的
-        // 系统标题栏（NSThemeFrame，实测约 32px）。宿主若把可交互控件直接摆在
-        // 窗口最顶部，控件就会被它盖住：框内按下-拖动变成拖窗口，文本选不中。
-        //
-        // 这里只关掉"整窗背景可拖"。那条隐形标题栏不归 MetalView 管，关不掉，
-        // 也**不应该**在这里关 —— setMovable:NO 会连带废掉
-        // performWindowDragWithEvent 之外的一切拖拽，让没有自绘标题条的宿主
-        // 窗口彻底移动不了。正确的做法是宿主在顶部留出自己的标题条（见
-        // 下游编辑器的标题栏拖拽区组件），把控件推到那条
-        // 隐形标题栏之下。
+        // Titled + FullSizeContentView leaves invisible-but-draggable
+        // system titlebar (NSThemeFrame, ~32px) at top. Host putting control
+        // at window top gets covered: press-drag = window drag, text
+        // unselectable. Only turns off whole-window-draggable. Invisible
+        // titlebar not under MetalView control, can't turn off, shouldn't -
+        // setMovable:NO would also break every drag other than
+        // performWindowDragWithEvent, leaving a host window that has no
+        // self-drawn title strip completely unmovable. Correct: host reserves titlebar at
+        // top (see downstream titlebar drag), pushes controls below invisible.
         w.movableByWindowBackground = NO;
     }
     return result;
 }
 
-// 获取 Metal 视图
+// get Metal view
 void* macos_get_metal_view(void* window_ptr) {
     @autoreleasepool {
         WindowWrapper *wrapper = (__bridge WindowWrapper*)window_ptr;
@@ -2922,7 +3419,7 @@ void* macos_get_metal_view(void* window_ptr) {
     }
 }
 
-// 设置 live resize 渲染回调
+// set live resize render callback
 void macos_set_render_callback(void* window_ptr, RenderCallback callback, void* ctx) {
     @autoreleasepool {
         WindowWrapper *wrapper = (__bridge WindowWrapper*)window_ptr;
@@ -2956,7 +3453,7 @@ int macos_perform_haptic_feedback(int pattern) {
     return 1;
 }
 
-// 请求重绘
+// request redraw
 void macos_request_redraw(void* window_ptr) {
     @autoreleasepool {
         WindowWrapper *wrapper = (__bridge WindowWrapper*)window_ptr;
@@ -3048,21 +3545,20 @@ int macos_accessibility_notify_property_change(
     }
 }
 
-// ========================================================================
-// v0.6 §2.4: a11y_router.flushToBridge push-side C ABI
-// ------------------------------------------------------------------------
-// zig 端 src/ui/a11y/macos_bridge.zig extern 调进来；window_id 路由到
-// g_window_list 中的对应 wrapper (当前 single-window 实现走第一个；
-// window_id = NSWindow.windowNumber，与 zig 侧 Cx.window_id 同源)。
+// ==== a11y_router.flushToBridge push C ABI
 //
-// Retained-tree notifications target the exact virtual element. The legacy
-// SystemSdk snapshot calls remain a public compatibility API, but Cx suppresses
-// their automatic focus path to avoid duplicate host-view announcements.
+// Zig src/ui/a11y/macos_bridge.zig externs in; window_id routes to the g_window_list wrapper
+// (single-window impl takes the first; window_id = NSWindow.windowNumber, same source as zig
+// Cx.window_id).
+//
+// Retained-tree notifications target the exact virtual element. Legacy SystemSdk snapshot calls
+// remain as a compatibility API; Cx suppresses the automatic focus path to avoid duplicate
+// host-view announcements.
 
 static WindowWrapper *zenitWrapperForWindowId(uint32_t window_id) {
     if (!g_window_list) return nil;
-    // window_id == NSWindow.windowNumber（zig 侧 Cx.window_id 同源）。
-    // 0 = 通配（未接线的调用方），退化成第一个有效 wrapper。
+    // window_id == NSWindow.windowNumber (zig Cx.window_id source).
+    // 0 = wildcard (unwired caller), degrades to first valid wrapper.
     for (NSWindow *win in g_window_list) {
         WindowWrapper *w = wrapperForWindow(win);
         if (!w) continue;
@@ -3072,36 +3568,63 @@ static WindowWrapper *zenitWrapperForWindowId(uint32_t window_id) {
     return nil;
 }
 
-static id zenitA11yTargetForHandle(WindowWrapper *wrapper, uint32_t handle) {
-    if (!wrapper || !wrapper.metalView) return nil;
-    if (handle == ZENIT_A11Y_INVALID_HANDLE) return wrapper.metalView;
-    return [wrapper.metalView zenitA11yElementForHandle:handle] ?: wrapper.metalView;
+// Cache-only query, no creation: assistive tech never saw element,
+// can't care about attrs/geometry. Property/geometry only to cached,
+// others skip, kills scroll/animation whole-tree Moved/Resized. Focus
+// and structure don't here.
+static id zenitA11yCachedElement(WindowWrapper *wrapper, ZenitAXHandle handle) {
+    if (!wrapper || !wrapper.metalView || handle == ZENIT_A11Y_INVALID_HANDLE) return nil;
+    return wrapper.metalView.zenitA11yElementCache[@(handle)];
 }
 
-int zenit_a11y_push_property_changed(uint32_t window_id, uint32_t element_raw, uint16_t flags) {
+// Structure change: notify nearest cached ancestor (else host view).
+static id zenitA11yNearestKnownAncestor(WindowWrapper *wrapper, uint32_t window_id, ZenitAXHandle handle) {
+    ZenitAXHandle cursor = handle;
+    for (NSUInteger depth = 0; depth < 4096 && cursor != ZENIT_A11Y_INVALID_HANDLE; depth++) {
+        id cached = zenitA11yCachedElement(wrapper, cursor);
+        if (cached) return cached;
+        cursor = zenit_a11y_parent(window_id, cursor);
+    }
+    return zenitA11yHostTarget(wrapper);
+}
+
+static id zenitA11yTargetForHandle(WindowWrapper *wrapper, ZenitAXHandle handle) {
+    if (!wrapper || !wrapper.metalView) return nil;
+    if (handle == ZENIT_A11Y_INVALID_HANDLE) return zenitA11yHostTarget(wrapper);
+    return [wrapper.metalView zenitA11yElementForHandle:handle] ?: zenitA11yHostTarget(wrapper);
+}
+
+int zenit_a11y_push_property_changed(uint32_t window_id, ZenitAXHandle element_raw, uint16_t flags) {
     @autoreleasepool {
         WindowWrapper *wrapper = zenitWrapperForWindowId(window_id);
         if (!wrapper) return 0;
-        id target = zenitA11yTargetForHandle(wrapper, element_raw);
-        if (!target) return 0;
+        if ((flags & ZenitA11yDirtyRole) != 0) {
+            NSAccessibilityPostNotification(
+                zenitA11yNearestKnownAncestor(wrapper, window_id, zenit_a11y_parent(window_id, element_raw)),
+                NSAccessibilityLayoutChangedNotification);
+        }
+        id target = zenitA11yCachedElement(wrapper, element_raw);
+        if (!target) return 1;
         if ((flags & ZenitA11yDirtyLabel) != 0)
             NSAccessibilityPostNotification(target, NSAccessibilityTitleChangedNotification);
         if ((flags & (ZenitA11yDirtyValue | ZenitA11yDirtyState)) != 0)
             NSAccessibilityPostNotification(target, NSAccessibilityValueChangedNotification);
         if ((flags & ZenitA11yDirtySelection) != 0)
             NSAccessibilityPostNotification(target, NSAccessibilitySelectedTextChangedNotification);
-        if ((flags & ZenitA11yDirtyGeometry) != 0) {
+        if ((flags & ZenitA11yDirtyRowCount) != 0)
+            NSAccessibilityPostNotification(target, NSAccessibilityRowCountChangedNotification);
+        // Geometry notification only to focused element (VoiceOver cursor
+        // box follows); others' motion picked up naturally next frame fetch.
+        if ((flags & ZenitA11yDirtyGeometry) != 0 &&
+            (zenit_a11y_state(window_id, element_raw) & ZenitA11yStateFocused) != 0) {
             NSAccessibilityPostNotification(target, NSAccessibilityMovedNotification);
             NSAccessibilityPostNotification(target, NSAccessibilityResizedNotification);
         }
-        if ((flags & ZenitA11yDirtyRole) != 0)
-            NSAccessibilityPostNotification([target accessibilityParent] ?: wrapper.metalView,
-                                            NSAccessibilityLayoutChangedNotification);
         return 1;
     }
 }
 
-int zenit_a11y_push_focus_changed(uint32_t window_id, uint32_t element_raw) {
+int zenit_a11y_push_focus_changed(uint32_t window_id, ZenitAXHandle element_raw) {
     @autoreleasepool {
         WindowWrapper *wrapper = zenitWrapperForWindowId(window_id);
         if (!wrapper) return 0;
@@ -3112,13 +3635,33 @@ int zenit_a11y_push_focus_changed(uint32_t window_id, uint32_t element_raw) {
     }
 }
 
-int zenit_a11y_push_children_changed(uint32_t window_id, uint32_t element_raw) {
+// Layout notifications are deduplicated by target per flush and sent at flush_end. A single
+// story switch deletes hundreds of nodes; folding parents to the nearest-known ancestor makes
+// nearly all the same content root (one navigation produced 80 LayoutChanged).
+// Targets are bucketed by window (MetalView.zenitA11yPendingLayoutTargets): flush_end must not
+// ignore window_id, or window A's notifications appear in window B's flush.
+int zenit_a11y_push_children_changed(uint32_t window_id, ZenitAXHandle element_raw) {
     @autoreleasepool {
         WindowWrapper *wrapper = zenitWrapperForWindowId(window_id);
-        if (!wrapper) return 0;
-        id target = zenitA11yTargetForHandle(wrapper, element_raw);
+        if (!wrapper || !wrapper.metalView) return 0;
+        id target = zenitA11yNearestKnownAncestor(wrapper, window_id, element_raw);
         if (!target) return 0;
-        NSAccessibilityPostNotification(target, NSAccessibilityLayoutChangedNotification);
+        MetalView *view = wrapper.metalView;
+        if (!view.zenitA11yPendingLayoutTargets) view.zenitA11yPendingLayoutTargets = [NSMutableArray array];
+        if ([view.zenitA11yPendingLayoutTargets indexOfObjectIdenticalTo:target] == NSNotFound)
+            [view.zenitA11yPendingLayoutTargets addObject:target];
+        return 1;
+    }
+}
+
+int zenit_a11y_push_flush_end(uint32_t window_id) {
+    @autoreleasepool {
+        WindowWrapper *wrapper = zenitWrapperForWindowId(window_id);
+        if (!wrapper || !wrapper.metalView) return 0;
+        NSArray *targets = wrapper.metalView.zenitA11yPendingLayoutTargets;
+        wrapper.metalView.zenitA11yPendingLayoutTargets = nil;
+        for (id target in targets)
+            NSAccessibilityPostNotification(target, NSAccessibilityLayoutChangedNotification);
         return 1;
     }
 }
@@ -3135,11 +3678,12 @@ int zenit_a11y_push_announce(uint32_t window_id, const char *text, int len, uint
     }
 }
 
-// aria-activedescendant 投影：容器持焦但视觉焦点落在 active 子元素。
+// aria-activedescendant projection: the container holds focus but visual focus is on the active
+// child.
 // NSAccessibility has no one-to-one active-descendant property. Expose the
 // relation through selectedChildren/focusedUIElement and notify both exact
 // virtual elements so VoiceOver re-pulls those attributes.
-int zenit_a11y_push_active_descendant(uint32_t window_id, uint32_t container_raw, uint32_t active_raw) {
+int zenit_a11y_push_active_descendant(uint32_t window_id, ZenitAXHandle container_raw, ZenitAXHandle active_raw) {
     @autoreleasepool {
         WindowWrapper *wrapper = zenitWrapperForWindowId(window_id);
         if (!wrapper) return 0;
@@ -3154,6 +3698,58 @@ int zenit_a11y_push_active_descendant(uint32_t window_id, uint32_t container_raw
     }
 }
 
+// System a11y preferences (src/ui/a11y/preferences.zig): bit layout
+// match Zig: bit0 reduce motion, bit1 reduce transparency, bit2
+// increase contrast, bit3 no color difference, bit4 invert.
+extern void zenit_a11y_preferences_changed(void);
+
+uint32_t zenit_a11y_display_options(void) {
+    NSWorkspace *ws = [NSWorkspace sharedWorkspace];
+    uint32_t bits = 0;
+    if (ws.accessibilityDisplayShouldReduceMotion) bits |= 1u << 0;
+    if (ws.accessibilityDisplayShouldReduceTransparency) bits |= 1u << 1;
+    if (ws.accessibilityDisplayShouldIncreaseContrast) bits |= 1u << 2;
+    if (ws.accessibilityDisplayShouldDifferentiateWithoutColor) bits |= 1u << 3;
+    if (ws.accessibilityDisplayShouldInvertColors) bits |= 1u << 4;
+    return bits;
+}
+
+// Register once: system settings change refreshes Zig prefs, wakes
+// main loop (Cx.wantsFrame requests frame on version change, whole
+// tree invalid at render start).
+void zenit_a11y_observe_display_options(void) {
+    // App.init on main thread; static flag ok. Don't use dispatch_once:
+    // inline macro triggers Zig Debug UBSan (e2e startup abort, see
+    // image_bridge.m same).
+    static BOOL registered = NO;
+    if (registered) return;
+    registered = YES;
+    {
+        [[[NSWorkspace sharedWorkspace] notificationCenter]
+            addObserverForName:NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification
+                        object:nil
+                         queue:[NSOperationQueue mainQueue]
+                    usingBlock:^(NSNotification *note) {
+                        (void)note;
+                        zenit_a11y_preferences_changed();
+                        macos_post_empty_event();
+                    }];
+    }
+}
+
+int zenit_a11y_push_element_destroyed(uint32_t window_id, ZenitAXHandle element_raw) {
+    @autoreleasepool {
+        WindowWrapper *wrapper = zenitWrapperForWindowId(window_id);
+        id element = zenitA11yCachedElement(wrapper, element_raw);
+        if (!element) return 1;
+        NSAccessibilityPostNotification(element, NSAccessibilityUIElementDestroyedNotification);
+        [wrapper.metalView.zenitA11yElementCache removeObjectForKey:@(element_raw)];
+        // Destroyed elements can't receive this flush's layout notifications.
+        [wrapper.metalView.zenitA11yPendingLayoutTargets removeObjectIdenticalTo:element];
+        return 1;
+    }
+}
+
 int zenit_a11y_push_window_cleared(uint32_t window_id) {
     @autoreleasepool {
         WindowWrapper *wrapper = zenitWrapperForWindowId(window_id);
@@ -3162,7 +3758,8 @@ int zenit_a11y_push_window_cleared(uint32_t window_id) {
         for (id element in stale)
             NSAccessibilityPostNotification(element, NSAccessibilityUIElementDestroyedNotification);
         [wrapper.metalView.zenitA11yElementCache removeAllObjects];
-        NSAccessibilityPostNotification(wrapper.metalView, NSAccessibilityLayoutChangedNotification);
+        wrapper.metalView.zenitA11yPendingLayoutTargets = nil;
+        NSAccessibilityPostNotification(zenitA11yHostTarget(wrapper), NSAccessibilityLayoutChangedNotification);
         return 1;
     }
 }
@@ -3237,9 +3834,10 @@ void macos_set_text_input_enabled(void* window_ptr, int enabled) {
     }
 }
 
-// 放弃当前 IME 合成：关闭候选窗、清 marked text 与 preedit 状态，但不改变
-// enabled 状态。文本客户端 A→B 直接切换需要 discard A 后继续为 B 接收输入；
-// 只有 macos_set_text_input_enabled(false) 拥有关闭原生闸的权限。
+// Abort current IME composition: close candidate window, clear marked
+// text/preedit, don't change enabled. Text client A->B needs discard A
+// then continue B; only macos_set_text_input_enabled(false) owns
+// closing native gate.
 void macos_ime_discard(void* window_ptr) {
     @autoreleasepool {
         WindowWrapper *wrapper = (__bridge WindowWrapper*)window_ptr;
@@ -3269,7 +3867,7 @@ void macos_ime_discard(void* window_ptr) {
     }
 }
 
-// 查询是否处于 live resize
+// query live resize state
 int macos_is_live_resize(void* window_ptr) {
     @autoreleasepool {
         WindowWrapper *wrapper = (__bridge WindowWrapper*)window_ptr;
@@ -3277,7 +3875,7 @@ int macos_is_live_resize(void* window_ptr) {
     }
 }
 
-// 获取 Metal Layer
+// get Metal Layer
 void* macos_get_metal_layer(void* view_ptr) {
     @autoreleasepool {
         MetalView *view = (__bridge MetalView*)view_ptr;
@@ -3285,7 +3883,7 @@ void* macos_get_metal_layer(void* view_ptr) {
     }
 }
 
-// 获取 Metal Device
+// get Metal Device
 void* macos_get_metal_device(void* view_ptr) {
     @autoreleasepool {
         MetalView *view = (__bridge MetalView*)view_ptr;
@@ -3293,19 +3891,20 @@ void* macos_get_metal_device(void* view_ptr) {
     }
 }
 
-// ========== 全局退出标志（多窗口架构用） ==========
+// ==== Global exit flag (multi-window architecture) ====
 static BOOL zenitHasPendingMenuCommands(void);
 void macos_menu_discard_window_commands(uint64_t window_id);
 
 static BOOL g_app_should_quit = NO;
-// App 从后台切换到前台时置 YES，由 Zig 侧消费后重置，触发所有窗口重绘
+// Set to YES when the app switches from background to foreground; the Zig side
+// consumes it and resets it, triggering a redraw of all windows.
 static BOOL g_app_became_active = NO;
 
-// ========== 全局菜单动作队列 ==========
-// 菜单动作枚举（与 Zig 侧 MenuAction 一一对应）
+// ==== Global menu action queue; menu action enum (1-1 with Zig
+// MenuAction) ====
 typedef enum {
     MenuActionNone = 0,
-    MenuActionNewFile = 1,         // New Text File (Cmd+N) — 已有快捷键，菜单仅冗余
+    MenuActionNewFile = 1, // New Text File (Cmd+N) - already has shortcut, menu redundant
     MenuActionNewFileDialog = 2,   // New File... (Ctrl+Alt+Cmd+N)
     MenuActionNewWindow = 3,       // New Window (Shift+Cmd+N)
     MenuActionOpenFile = 4,        // Open... (Cmd+O)
@@ -3313,9 +3912,9 @@ typedef enum {
     MenuActionOpenRecent = 6,      // Open Recent (placeholder)
     MenuActionSave = 7,            // Save (Cmd+S)
     MenuActionSaveAs = 8,          // Save As... (Shift+Cmd+S)
-    MenuActionCloseTab = 9,        // Close Tab (Cmd+W) — 已有快捷键
+    MenuActionCloseTab = 9, // Close Tab (Cmd+W) - already has shortcut
     MenuActionCloseWindow = 10,    // Close Window (Shift+Cmd+W)
-    MenuActionInstallCli = 11,     // Install Command Line Tool（应用菜单）
+    MenuActionInstallCli = 11, // Install Command Line Tool (app menu)
 } MenuActionType;
 
 static NSMutableArray<NSDictionary *> *g_menu_actions;
@@ -3347,7 +3946,8 @@ static MenuActionType popMenuAction(void) {
     return macos_get_menu_action_event(&window_id, &action) ? (MenuActionType)action : MenuActionNone;
 }
 
-// 将事件中的鼠标/键盘/滚轮状态路由到正确的 WindowWrapper
+// Route mouse/keyboard/scroll state in event to correct
+// WindowWrapper
 static WindowWrapper* targetWrapperForEvent(NSEvent *event, WindowWrapper *fallback) {
     NSWindow *eventWindow = event.window;
     if (!eventWindow && event.windowNumber > 0) {
@@ -3358,8 +3958,8 @@ static WindowWrapper* targetWrapperForEvent(NSEvent *event, WindowWrapper *fallb
         if (target) return target;
     }
 
-    // 鼠标类事件在某些场景下 event.window 可能为空（例如窗口切换瞬间）；
-    // 此时按当前鼠标屏幕坐标命中最上层可见窗口，避免误路由到旧 key window。
+    // Mouse events sometimes event.window empty (window switch instant);
+    // hit topmost visible by screen coords, avoid wrong route to old key.
     if (isPointerEventType(event.type) && [NSApp isActive]) {
         const NSPoint p = [NSEvent mouseLocation];
         for (NSWindow *w in [NSApp orderedWindows]) {
@@ -3421,7 +4021,8 @@ static void enqueueMouseMove(WindowWrapper *target, NSEvent *event) {
     target.mouseLocation = NSMakePoint(packet.x, packet.y);
 }
 
-// 将鼠标按键事件推入目标窗口的事件队列（避免轮询 miss 同帧按下+松开）
+// Push button event into target window queue (avoid polling miss
+// same-frame press+release)
 static void enqueueMouseButton(WindowWrapper *target, int button, BOOL pressed, NSEvent *event) {
     NSPoint locInWindow = [event locationInWindow];
     NSRect contentFrame = [target.window.contentView frame];
@@ -3483,20 +4084,18 @@ static BOOL viewCanPresentCursor(NSView *view) {
     return YES;
 }
 
-/// 修饰键单独按下/松开时 macOS 派发的是 NSEventTypeFlagsChanged，**不是**
-/// keyDown/keyUp。按下与松开是同一个事件类型，靠"该键对应的 flag 位是否
-/// 仍然置位"区分。
-///
-/// 少了这条分支，"按住 ⌘ 时高亮穿透到 group 成员"这类**只依赖修饰键本身**
-/// 的交互永远收不到事件（⌘+G 这类组合键不受影响，它们走 keyDown）。
+/// Modifier alone press/release macOS dispatches
+/// NSEventTypeFlagsChanged, NOT keyDown/keyUp. Same event type,
+/// distinguish by flag-bit still set. Without: modifier-only interactions
+/// (highlight-under-Cmd) never fire (Cmd+G combos fine, they're keyDown).
 static BOOL flagsChangedPressed(NSEvent *event) {
     unsigned short kc = event.keyCode;
     NSEventModifierFlags flags = event.modifierFlags;
     switch (kc) {
-        case 54: case 55: return (flags & NSEventModifierFlagCommand) != 0;   // ⌘ 右/左
-        case 56: case 60: return (flags & NSEventModifierFlagShift) != 0;     // ⇧ 左/右
-        case 59: case 62: return (flags & NSEventModifierFlagControl) != 0;   // ctrl 左/右
-        case 58: case 61: return (flags & NSEventModifierFlagOption) != 0;    // ⌥ 左/右
+        case 54: case 55: return (flags & NSEventModifierFlagCommand) != 0; // Cmd right/left
+        case 56: case 60: return (flags & NSEventModifierFlagShift) != 0; // Shift left/right
+        case 59: case 62: return (flags & NSEventModifierFlagControl) != 0; // ctrl left/right
+        case 58: case 61: return (flags & NSEventModifierFlagOption) != 0; // Option left/right
         case 57: return (flags & NSEventModifierFlagCapsLock) != 0;
         default: return NO;
     }
@@ -3563,7 +4162,8 @@ static void enqueueKeyEvent(WindowWrapper *target, NSEvent *event) {
                      (event.type == NSEventTypeFlagsChanged ? flagsChangedPressed(event) : NO);
     packet.character = 0;
 
-    // ⚠ flagsChanged 事件上访问 `characters` 会抛 NSInternalInconsistencyException。
+    // WARNING: accessing characters on flagsChanged throws
+    // NSInternalInconsistencyException.
     NSString *chars = (event.type == NSEventTypeKeyDown) ? event.characters : nil;
     if (event.type == NSEventTypeKeyDown && chars.length > 0) {
         unichar ch = [chars characterAtIndex:0];
@@ -3576,7 +4176,7 @@ static void enqueueKeyEvent(WindowWrapper *target, NSEvent *event) {
     [target.keyEventQueue addObject:[NSValue valueWithBytes:&packet objCType:@encode(KeyEventPacket)]];
 }
 
-// 轮询事件
+// poll events
 int macos_poll_events(void* window_ptr) {
     // Legacy single-window callers share the exact same dispatcher as the
     // multi-window runtime. Keeping two AppKit loops caused years of drift in
@@ -3602,9 +4202,10 @@ int macos_poll_events(void* window_ptr) {
             }
         }
 
-        // 处理所有待处理的事件
+        // handle all pending events
         while (true) {
-            // live resize 时切换到 NSEventTrackingRunLoopMode，避免事件丢失
+            // live resize switch to NSEventTrackingRunLoopMode, avoid lost
+            // events
             NSString *mode = (wrapper.window && wrapper.window.inLiveResize) ? NSEventTrackingRunLoopMode : NSDefaultRunLoopMode;
             NSEvent *event = [NSApp nextEventMatchingMask:NSEventMaskAny
                                                 untilDate:[NSDate distantPast]
@@ -3612,12 +4213,11 @@ int macos_poll_events(void* window_ptr) {
                                                   dequeue:YES];
             if (!event) break;
 
-            // 确定事件属于哪个窗口
+            // determine event belongs to which window
             WindowWrapper *target = targetWrapperForEvent(event, wrapper);
 
-            // 处理键盘事件
-            // FlagsChanged 走独立分支：它没有 characters，也不该参与
-            // menu keyEquivalent / firstResponder 那套 keyDown 专属逻辑。
+            // handle keyboard events. FlagsChanged separate: no characters,
+            // skip menu keyEquivalent/firstResponder keyDown logic.
             if (event.type == NSEventTypeFlagsChanged) {
                 enqueueKeyEvent(target, event);
                 // Caps Lock / Shift can switch an IME between native and ASCII
@@ -3634,14 +4234,14 @@ int macos_poll_events(void* window_ptr) {
                 BOOL isCmd = (event.modifierFlags & NSEventModifierFlagCommand) != 0;
                 NSString *key = event.charactersIgnoringModifiers;
 
-                // Cmd+Q: 退出应用（主窗口 shouldClose）
+                // Cmd+Q: exit app (main window shouldClose)
                 if (event.type == NSEventTypeKeyDown && isCmd &&
                     [key isEqualToString:@"q"]) {
                     wrapper.shouldClose = YES;
                 }
 
-                // Shift+Cmd+W: 关闭当前聚焦窗口。
-                // 裸 Cmd+W 不拦截，让 key event 传到 Zig 侧由 islandKeyHandler 处理（关当前 tab）。
+                // Shift+Cmd+W: close current focused window. Bare Cmd+W
+                // unintercepted, let go to Zig islandKeyHandler (close current tab).
                 if (event.type == NSEventTypeKeyDown && isCmd &&
                     (event.modifierFlags & NSEventModifierFlagShift) != 0 &&
                     [key.lowercaseString isEqualToString:@"w"]) {
@@ -3649,7 +4249,7 @@ int macos_poll_events(void* window_ptr) {
                     continue;
                 }
 
-                // Cmd+`: 同 App 窗口切换
+                // Cmd+`: same-app window switch
                 if (event.type == NSEventTypeKeyDown && isCmd &&
                     event.keyCode == 50) {
                     NSWindow *keyWindow = [NSApp keyWindow];
@@ -3662,10 +4262,9 @@ int macos_poll_events(void* window_ptr) {
                     continue;
                 }
 
-                // 菜单快捷键：我们从不调 sendEvent（避免系统警告音），而
-                // keyEquivalent 派发恰恰住在 sendEvent 里 —— 不补这一步，
-                // 自定义菜单快捷键（如 Cmd+P）永远不触发（verify_menu.sh 逮到）。
-                // 菜单消费掉的按键不再进 zig 键队列（与 AppKit 语义一致）。
+                // Menu shortcuts: never call sendEvent (avoid beep), keyEquivalent
+                // dispatch in sendEvent - skip, custom menu shortcuts (Cmd+P) never
+                // fire (verify_menu.sh caught). Menu-consumed keys skip zig queue.
                 const bool has_cmd_or_ctrl = (event.modifierFlags & (NSEventModifierFlagCommand | NSEventModifierFlagControl)) != 0;
                 if (event.type == NSEventTypeKeyDown && has_cmd_or_ctrl) {
                     BOOL menu_ate = [NSApp.mainMenu performKeyEquivalent:event];
@@ -3675,7 +4274,7 @@ int macos_poll_events(void* window_ptr) {
                     if (menu_ate) continue;
                 }
 
-                // 记录按键事件到目标窗口（队列式，避免高输入速率覆盖）
+                // record key event to target window (queue, avoid high-input clobber)
                 enqueueKeyEvent(target, event);
                 if (event.type == NSEventTypeKeyDown) {
                     NSResponder *fr = [target.window firstResponder];
@@ -3703,16 +4302,15 @@ int macos_poll_events(void* window_ptr) {
                     }
                 }
 
-                // 不调用 sendEvent，避免系统警告音
-                // 我们自己处理了按键事件
+                // don't call sendEvent, avoid beep. We handled key ourselves.
                 continue;
             }
 
-            // 跟踪鼠标按钮状态 (路由到目标窗口) + 推入事件队列
+            // track mouse button state (route to target) + push queue
             switch (event.type) {
                 case NSEventTypeLeftMouseDown: {
-                    // 自定义 TitleBar 拖拽：如果点击位置在拖拽区域内，
-                    // 直接触发窗口拖拽而不把事件传给 Zig 侧
+                    // custom TitleBar drag: if click in drag area, trigger window drag
+                    // not pass to Zig
                     if (target.titlebarDragHeight > 0) {
                         NSRect contentFrame = [target.window.contentView frame];
                         NSPoint loc = [event locationInWindow];
@@ -3720,9 +4318,9 @@ int macos_poll_events(void* window_ptr) {
                         if (y_from_top < target.titlebarDragHeight && y_from_top >= 0) {
                             float x = (float)loc.x;
                             float w = (float)contentFrame.size.width;
-                            // 排除 traffic lights 区域（左侧 78px）、
-                            // 窗口边缘 resize 热区（各边 5px，避免拦截系统 resize），
-                            // 以及右侧 action buttons 区域（titlebarDragRightInset）。
+                            // exclude traffic lights (left 78px), window edge resize zones (each
+                            // 5px, avoid system resize), right action buttons
+                            // (titlebarDragRightInset).
                             float resize_inset = 5.0f;
                             float right_inset = target.titlebarDragRightInset > 0 ? target.titlebarDragRightInset : resize_inset;
                             if (x > 78 && x < (w - right_inset)) {
@@ -3779,8 +4377,8 @@ int macos_poll_events(void* window_ptr) {
                 case NSEventTypeLeftMouseDragged:
                 case NSEventTypeRightMouseDragged:
                 case NSEventTypeOtherMouseDragged:
-                    // 拖拽时系统只发 Dragged，不发 MouseMoved；两者进入同一
-                    // native motion queue，保留相对 key/button/scroll 的顺序。
+                    // drag sends Dragged not MouseMoved; both in native motion queue,
+                    // preserve relative order with key/button/scroll.
                     enqueueMouseMove(target, event);
                     break;
                 case NSEventTypeScrollWheel:
@@ -3833,43 +4431,42 @@ int macos_poll_events(void* window_ptr) {
             }
         }
 
-        // [NSApp run] 每处理完一个事件都会 updateWindows —— 它是 AppKit 激活
-        // key window 首响应者的 NSTextInputContext、并把 per-context 输入法
-        // 绑定挂上的正门。自建事件泵漏掉这一步的后果：开了「为每个 App 使用
-        // 不同输入法」(TextInputGlobalPropertyPerContextInput=1) 的机器上，
-        // 切到中文输入法后本窗口的 input context 仍旧用旧源，按键以 ASCII
-        // 直落（setMarkedText 一次都不来）——「CJK 完全打不进」且时好时坏。
-        // 直接 [ic activate] 是私有生命周期，会在 InputMethodKit 里同步卡住，
-        // 不能用；updateWindows 是受支持的等价物。
+        // [NSApp run] after event calls updateWindows - AppKit activates
+        // key window firstResponder's NSTextInputContext, per-context input
+        // method binding. Custom pump skips: on 'different IM per App' machine,
+        // switch Chinese, this window InputContext still old source, keys
+        // ASCII-fall, CJK totally broken flaky. Direct [ic activate] private,
+        // sync-stalls InputMethodKit, unusable; updateWindows equivalent.
         [NSApp updateWindows];
 
-        // 仅给当前可交互窗口更新鼠标位置，避免后台/被遮挡窗口继续吃 hover
-        // 特例: acceptsMouseMovedWhileInactive 时（inspector pick 模式），
-        // 即使不是 key window 也更新鼠标位置（用于跨窗口 hover 高亮）
-        // 注意: 拖拽时 mouseLocation 已在 switch 里用事件坐标更新，此处直接使用，
-        //       不再调用 mouseLocationOutsideOfEventStream（拖拽期间该 API 可能返回旧值）。
+        // update mouse position only current interactive window, avoid
+        // background/occluded hover. Exception: acceptsMouseMovedWhileInactive
+        // (inspector pick), update non-key (cross-window hover). Note: drag
+        // mouseLocation already by event, use directly, don't query
+        // mouseLocationOutsideOfEventStream (may stale during drag).
         BOOL canAccept = windowCanAcceptPointerInput(wrapper);
         BOOL inactiveHover = !canAccept && wrapper.acceptsMouseMovedWhileInactive
                              && wrapper.window && [NSApp isActive];
         BOOL isDragging = wrapper.leftButtonPressed || wrapper.rightButtonPressed || wrapper.middleButtonPressed;
         if (canAccept || inactiveHover) {
             if (!isDragging) {
-                // 非拖拽时用系统 API 查询实时位置（支持无事件时的 hover 更新）
+                // non-drag use system API query real-time (support hover without
+                // events)
                 NSPoint mouseInWindow = [wrapper.window mouseLocationOutsideOfEventStream];
                 NSRect contentFrame = [wrapper.window.contentView frame];
                 wrapper.mouseLocation = NSMakePoint(mouseInWindow.x,
                                                     contentFrame.size.height - mouseInWindow.y);
             }
-            // 拖拽时 mouseLocation 已由 LeftMouseDragged 事件更新，保持不变
+            // drag mouseLocation already by LeftMouseDragged, unchanged
             if (inactiveHover) {
-                // 非 key window 时不跟踪按钮状态（避免误触）
+                // non-key window don't track button (avoid mis-trigger)
                 wrapper.leftButtonPressed = NO;
                 wrapper.rightButtonPressed = NO;
                 wrapper.middleButtonPressed = NO;
             }
         } else {
-            // 拖拽时（按钮仍按下）保留位置和按钮状态，不清零
-            // 拖拽期间 isKeyWindow 可能为 NO，但我们仍需要处理拖拽事件
+            // drag (button down) retain position/button, don't zero. isKeyWindow
+            // may be NO during drag, handle drag events anyway.
             if (!isDragging) {
                 wrapper.mouseLocation = NSMakePoint(-1, -1);
                 wrapper.leftButtonPressed = NO;
@@ -3878,7 +4475,7 @@ int macos_poll_events(void* window_ptr) {
             }
         }
 
-        // 检查窗口是否已被销毁
+        // check window destroyed
         if (!wrapper.window) {
             wrapper.shouldClose = YES;
         }
@@ -3888,7 +4485,7 @@ int macos_poll_events(void* window_ptr) {
 #endif
 }
 
-// 获取窗口尺寸
+// get window size
 void macos_get_window_size(void* window_ptr, int* width, int* height) {
     @autoreleasepool {
         WindowWrapper *wrapper = (__bridge WindowWrapper*)window_ptr;
@@ -3899,9 +4496,8 @@ void macos_get_window_size(void* window_ptr, int* width, int* height) {
     }
 }
 
-// 设置窗口尺寸（content size，与 macos_get_window_size / 建窗时的
-// initWithContentRect: 同一坐标系）。保持窗口中心不动，避免改尺寸时
-// 窗口在屏幕上"跳"到别处。
+// set window size (content size, same coords as macos_get_window_size/
+// initWithContentRect:). Keep center fixed, avoid jump.
 void macos_set_window_size(void* window_ptr, int width, int height) {
     @autoreleasepool {
         WindowWrapper *wrapper = (__bridge WindowWrapper*)window_ptr;
@@ -3910,7 +4506,7 @@ void macos_set_window_size(void* window_ptr, int width, int height) {
         NSWindow *w = wrapper.window;
         NSRect old_frame = w.frame;
         [w setContentSize:NSMakeSize((CGFloat)width, (CGFloat)height)];
-        // setContentSize: 锚定左上角；重新居中到原中心点。
+        // setContentSize: anchors upper-left; recenter to original center.
         NSRect new_frame = w.frame;
         new_frame.origin.x = old_frame.origin.x + (old_frame.size.width - new_frame.size.width) / 2.0;
         new_frame.origin.y = old_frame.origin.y + (old_frame.size.height - new_frame.size.height) / 2.0;
@@ -3918,23 +4514,24 @@ void macos_set_window_size(void* window_ptr, int width, int height) {
     }
 }
 
-// 获取 DPI 缩放因子 (Retina: 2.0, 普通: 1.0)
+// get DPI scale (Retina: 2.0, normal: 1.0)
 double macos_get_scale_factor(void* window_ptr) {
     @autoreleasepool {
         WindowWrapper *wrapper = (__bridge WindowWrapper*)window_ptr;
         CGFloat forced = zenitRenderScaleOverride();
         if (forced > 0) return (double)forced;
-        if (!wrapper.window) return 2.0;  // 默认 Retina
+        if (!wrapper.window) return 2.0; // default Retina
         CGFloat scale = wrapper.window.backingScaleFactor;
         return (double)scale;
     }
 }
 
-// 获取 drawable 尺寸 (考虑 retina 缩放)
+// get drawable size (considers retina scale)
 void macos_get_drawable_size(void* view_ptr, int* width, int* height) {
     @autoreleasepool {
         MetalView *view = (__bridge MetalView*)view_ptr;
-        // 直接用 view bounds * scale，避免 live resize 期间 drawableSize 不更新
+        // use view bounds * scale direct, avoid drawableSize stale during
+        // live resize
         CGSize size = view.bounds.size;
         CGFloat scale = zenitRenderScaleOverride();
         if (scale <= 0) scale = view.window ? view.window.backingScaleFactor : [[NSScreen mainScreen] backingScaleFactor];
@@ -3943,7 +4540,7 @@ void macos_get_drawable_size(void* view_ptr, int* width, int* height) {
     }
 }
 
-// 获取鼠标位置（逻辑像素，相对于窗口内容，Y 轴向下）
+// get mouse position (logical px, relative window content, Y down)
 void macos_get_mouse_position(void* window_ptr, float* x, float* y) {
     @autoreleasepool {
         WindowWrapper *wrapper = (__bridge WindowWrapper*)window_ptr;
@@ -3952,7 +4549,7 @@ void macos_get_mouse_position(void* window_ptr, float* x, float* y) {
     }
 }
 
-// 获取原生 mouse moved/dragged 事件（队列式，每次消费一个）。
+// get native mouse moved/dragged (queue, consume one each).
 int macos_get_mouse_move_event(void* window_ptr, float* x, float* y,
                                float* dx, float* dy, uint32_t* modifiers,
                                unsigned long long* sequence) {
@@ -3987,13 +4584,11 @@ void macos_get_input_queue_metrics(unsigned long long* mouse_move_coalesced,
     if (ime_preedit_coalesced) *ime_preedit_coalesced = g_ime_preedit_coalesced_count;
 }
 
-// 设置鼠标光标形状
-// shape 值与 Zig CursorShape 枚举一致:
+// Set mouse cursor shape. shape matches the Zig CursorShape enum:
 // 0=inherit(noop), 1=default, 2=pointer, 3=text, 4=crosshair,
-// 5=move, 6=not_allowed, 7=grab, 8=grabbing,
-// 9=ew_resize, 10=ns_resize, 11=nwse_resize, 12=nesw_resize,
-// 13=col_resize, 14=row_resize, 15=wait, 16=progress,
-// 17=help, 18=none
+// 5=move, 6=not_allowed, 7=grab, 8=grabbing, 9=ew_resize,
+// 10=ns_resize, 11=nwse_resize, 12=nesw_resize, 13=col_resize,
+// 14=row_resize, 15=wait, 16=progress, 17=help, 18=none
 void macos_set_cursor_shape(void *window_ptr, int shape) {
     @autoreleasepool {
         if (!window_ptr) return;
@@ -4005,21 +4600,21 @@ void macos_set_cursor_shape(void *window_ptr, int shape) {
             case 2:  cursor = [NSCursor pointingHandCursor]; break;
             case 3:  cursor = [NSCursor IBeamCursor]; break;
             case 4:  cursor = [NSCursor crosshairCursor]; break;
-            case 5:  // move — macOS 无直接对应，用 openHand
+            case 5: // move - macOS no direct, use openHand
             case 7:  cursor = [NSCursor openHandCursor]; break;
             case 6:  cursor = [NSCursor operationNotAllowedCursor]; break;
             case 8:  cursor = [NSCursor closedHandCursor]; break;
             case 9:  cursor = [NSCursor resizeLeftRightCursor]; break;
             case 10: cursor = [NSCursor resizeUpDownCursor]; break;
-            case 11: // nwse_resize — macOS 无直接 API，用 arrow
+            case 11: // nwse_resize - macOS no direct API, use arrow
             case 12: // nesw_resize
                      cursor = [NSCursor arrowCursor]; break;
             case 13: cursor = [NSCursor resizeLeftRightCursor]; break;  // col_resize
             case 14: cursor = [NSCursor resizeUpDownCursor]; break;     // row_resize
-            case 15: // wait — 使用系统忙碌光标 (私有 API 不可用，fallback arrow)
+            case 15: // wait - use system busy cursor (private API unavailable, arrow)
             case 16: // progress
                      cursor = [NSCursor arrowCursor]; break;
-            case 17: cursor = [NSCursor arrowCursor]; break; // help (macOS 无 help cursor)
+            case 17: cursor = [NSCursor arrowCursor]; break; // help (macOS no help cursor)
             case 18: { // Transparent image; never imbalance NSCursor hide/unhide.
                 NSImage *image = [[NSImage alloc] initWithSize:NSMakeSize(1, 1)];
                 cursor = [[NSCursor alloc] initWithImage:image hotSpot:NSZeroPoint];
@@ -4035,14 +4630,12 @@ void macos_set_cursor_shape(void *window_ptr, int shape) {
     }
 }
 
-// 自定义位图光标：预乘 RGBA8 → NSCursor(image + hotSpot)。
-// key 为调用方的内容寻址键：同一位图同键，进程级缓存 NSCursor 对象，
-// 高频 set 只做字典查找不重解码。rgba 调用期借用（CGImage 创建时即拷贝）。
-// hot_x/hot_y 为左上原点像素坐标；NSCursor hotSpot 同为左上原点（Apple 文档：
-// y 自图像顶边起算），故只需 /scale 换成 points，**不能翻转 y**。曾经写成
-// `size_h - hot_y/scale`，让热点沿图像中线镜像：笔尖(y=21.8)的热点跑到顶部、
-// 节点箭头尖(y=4.7)的热点跑到底部，两支光标都指不准；剪刀(y=12=中线)恰好
-// 是翻转不动点，所以唯独它看起来正常——这正是定位该 bug 的反证。
+// Custom bitmap cursor: premultiply RGBA8 -> NSCursor(image + hotSpot). key is the caller's
+// content-addressed key (same bitmap, same key); NSCursor is cached process-wide so frequent
+// sets are a dict lookup. rgba is caller-borrowed (CGImage copies). hot_x/hot_y are top-left
+// pixels; NSCursor hotSpot is also top-left (y from image top), so only divide by scale to get
+// points; do not flip y (size_h - hot_y/scale mirrors the hotspot about the midline and
+// mispoints every cursor except those with y at the midline).
 static NSMutableDictionary<NSNumber *, NSCursor *> *g_custom_cursor_cache = nil;
 
 void macos_set_custom_cursor(void *window_ptr,
@@ -4094,8 +4687,7 @@ void macos_set_custom_cursor(void *window_ptr,
     }
 }
 
-// 检查鼠标按钮状态
-// button: 0=left, 1=right, 2=middle
+// check mouse button state; button: 0=left, 1=right, 2=middle
 int macos_is_mouse_button_pressed(void* window_ptr, int button) {
     @autoreleasepool {
         WindowWrapper *wrapper = (__bridge WindowWrapper*)window_ptr;
@@ -4108,8 +4700,7 @@ int macos_is_mouse_button_pressed(void* window_ptr, int button) {
     }
 }
 
-// 获取按键事件
-// 返回: 1 如果有按键事件，0 如果没有
+// get key event; return: 1 if have, 0 if not
 int macos_get_key_event(void* window_ptr, uint16_t* keycode, uint32_t* modifiers, char* character, int* pressed, unsigned long long* sequence) {
     @autoreleasepool {
         WindowWrapper *wrapper = (__bridge WindowWrapper*)window_ptr;
@@ -4273,9 +4864,8 @@ int macos_get_ime_commit(void *window_ptr, char *buffer, int buffer_size, int *o
     return zenitReadTextEvent(window_ptr, 2, buffer, buffer_size, out_len, &cursor, start, end, sequence ?: &local_sequence);
 }
 
-// 获取滚轮事件
-// 返回: 1 如果有滚轮事件，0 如果没有
-// phase: zenitScrollPhaseCode; momentum: zenitMomentumPhaseCode
+// get scroll event; return: 1 if have, 0 if not; phase:
+// zenitScrollPhaseCode; momentum: zenitMomentumPhaseCode
 int macos_get_scroll_event(void* window_ptr, float* x, float* y, float* dx, float* dy, uint8_t* phase, uint8_t* momentum, uint32_t* modifiers, unsigned long long* sequence) {
     @autoreleasepool {
         WindowWrapper *wrapper = (__bridge WindowWrapper*)window_ptr;
@@ -4308,9 +4898,9 @@ int macos_get_scroll_event(void* window_ptr, float* x, float* y, float* dx, floa
     }
 }
 
-// 获取触控板捏合（magnify）事件
-// magnification 是相对增量：new_scale = old_scale * (1 + magnification)
-// phase: 0=began 1=changed 2=ended 3=cancelled
+// get trackpad pinch (magnify) event. magnification is relative
+// increment: new_scale = old_scale * (1 + magnification). phase: 0=began
+// 1=changed 2=ended 3=cancelled
 int macos_get_magnify_event(void* window_ptr, float* x, float* y, float* magnification, uint8_t* phase, unsigned long long* sequence) {
     @autoreleasepool {
         WindowWrapper *wrapper = (__bridge WindowWrapper*)window_ptr;
@@ -4336,9 +4926,9 @@ int macos_get_magnify_event(void* window_ptr, float* x, float* y, float* magnifi
     }
 }
 
-// 获取拖放事件（队列式，每次消费一个）
-// A peek lends immutable bytes until the matching queue head is consumed.
-// The token is opaque identity, compared only while the queue owns the packet.
+// get drag event (queue, consume one each). A peek lends
+// immutable bytes until matching queue head consumed. Token opaque
+// identity, compared only while queue owns packet.
 int macos_peek_drag_event(void *window_ptr, float *x, float *y, uint8_t *kind,
                          const uint8_t **bytes, size_t *length, const void **token,
                          uint8_t *payload_kind, uint64_t *source_token, uint8_t *operation) {
@@ -4520,11 +5110,10 @@ int macos_begin_drag(
     }
 }
 
-// 获取鼠标按键事件（队列式，每次消费一个）
-// 返回: 1 如果有事件，0 如果没有
-// button: 0=left, 1=right, 2=middle
-// pressed: 1=按下, 0=释放
-/// `modifiers` 可为 NULL（旧调用方）；非 NULL 时写回原始 NSEventModifierFlags。
+// get mouse button event (queue, consume one each); return: 1 have, 0
+// not; button: 0=left, 1=right, 2=middle; pressed: 1=down, 0=up
+/// modifiers can be NULL (old caller); non-NULL write back original
+/// NSEventModifierFlags.
 int macos_get_mouse_button_event_ex(void* window_ptr, float* x, float* y, int* button, int* pressed, uint32_t* modifiers, unsigned long long* sequence) {
     @autoreleasepool {
         WindowWrapper *wrapper = (__bridge WindowWrapper*)window_ptr;
@@ -4552,7 +5141,7 @@ int macos_get_mouse_button_event(void* window_ptr, float* x, float* y, int* butt
     return macos_get_mouse_button_event_ex(window_ptr, x, y, button, pressed, NULL, NULL);
 }
 
-// 查询窗口是否应该关闭（不消费事件）
+// query window should close (don't consume event)
 int macos_should_close(void* window_ptr) {
     @autoreleasepool {
         WindowWrapper *wrapper = (__bridge WindowWrapper*)window_ptr;
@@ -4560,7 +5149,7 @@ int macos_should_close(void* window_ptr) {
     }
 }
 
-// 更新窗口鼠标位置（给非 key window 用）
+// update window mouse position (for non-key window)
 void macos_update_mouse_position(void* window_ptr) {
     @autoreleasepool {
         WindowWrapper *wrapper = (__bridge WindowWrapper*)window_ptr;
@@ -4572,7 +5161,7 @@ void macos_update_mouse_position(void* window_ptr) {
     }
 }
 
-// 检查窗口是否需要 GPU present（可见且未被完全遮挡）
+// check window needs GPU present (visible and not fully occluded)
 int macos_should_render_window(void* window_ptr) {
     @autoreleasepool {
         WindowWrapper *wrapper = (__bridge WindowWrapper*)window_ptr;
@@ -4584,7 +5173,8 @@ int macos_should_render_window(void* window_ptr) {
     }
 }
 
-// 设置非活跃窗口是否接受鼠标移动（inspector pick 模式跨窗口 hover）
+// set non-active window accept mouse move (inspector pick cross-
+// window hover)
 void macos_set_accepts_mouse_while_inactive(void* window_ptr, int accepts) {
     @autoreleasepool {
         WindowWrapper *wrapper = (__bridge WindowWrapper*)window_ptr;
@@ -4592,14 +5182,11 @@ void macos_set_accepts_mouse_while_inactive(void* window_ptr, int accepts) {
     }
 }
 
-// 销毁窗口
-// 获取系统标题栏高度（traffic lights 所在区域高度）
-/// 系统里有没有能打开这个文件的应用(Launch Services 判据)。
-///
-/// 宿主用它区分两种失败:「没装编辑器」(该提示用户去安装)与「装了但起不来」
-/// (磁盘/权限/沙箱)。**不能靠 `open(1)` 的返回值判断** —— `open` 只负责把
-/// 请求投递给 Launch Services,即使没有任何 handler 它通常也返回成功,
-/// 于是"双击没反应"会变成静默失败。
+// destroy window. get system titlebar height (traffic lights area)
+/// The system has an app to open this file (Launch Services judgment).
+/// Host distinguishes two failures: no editor (prompt install) vs installed but won't start
+/// (disk/perms/sandbox). **Can't rely on open(1) return**: it only delivers to Launch Services
+/// and typically succeeds even with no handler, turning a double-click into a silent failure.
 int macos_has_handler_for_file(const char* path) {
     @autoreleasepool {
         if (!path) return 0;
@@ -4616,15 +5203,15 @@ float macos_get_titlebar_height(void* window_ptr) {
     @autoreleasepool {
         WindowWrapper *wrapper = (__bridge WindowWrapper*)window_ptr;
         NSWindow *window = wrapper.window;
-        // contentLayoutRect 是排除标题栏后的内容区域
-        // 窗口总高度 - contentLayoutRect 高度 = 标题栏高度
+        // contentLayoutRect is content area excluding titlebar; window total
+        // height - contentLayoutRect height = titlebar height
         CGFloat content_height = window.contentLayoutRect.size.height;
         CGFloat frame_height = [window.contentView frame].size.height;
         return (float)(frame_height - content_height);
     }
 }
 
-// 开始窗口拖拽（TitleBar 自定义拖拽区域调用）
+// begin window drag (TitleBar custom drag area calls)
 void macos_perform_window_drag(void* window_ptr) {
     @autoreleasepool {
         WindowWrapper *wrapper = (__bridge WindowWrapper*)window_ptr;
@@ -4636,8 +5223,8 @@ void macos_perform_window_drag(void* window_ptr) {
     }
 }
 
-// 设置 traffic lights (红黄绿按钮) 在自绘标题栏中的垂直居中位置
-// inset_y: 按钮中心距离窗口顶部的距离（逻辑像素）
+// set traffic lights (red/yellow/green buttons) vertical center in
+// custom titlebar. inset_y: button center distance from top (logical px)
 void macos_set_traffic_lights_inset(void* window_ptr, float inset_x, float inset_y) {
     @autoreleasepool {
         WindowWrapper *wrapper = (__bridge WindowWrapper*)window_ptr;
@@ -4648,7 +5235,8 @@ void macos_set_traffic_lights_inset(void* window_ptr, float inset_x, float inset
     }
 }
 
-// 注册命中驱动拖拽区回调（NULL 清除，退回纯矩形模型）
+// register hit-driven drag area callback (NULL clear, fall back pure
+// rect)
 void macos_set_titlebar_hit_callback(void* window_ptr, int (*cb)(void* ctx, float x, float y), void* ctx) {
     @autoreleasepool {
         WindowWrapper *wrapper = (__bridge WindowWrapper*)window_ptr;
@@ -4657,7 +5245,7 @@ void macos_set_titlebar_hit_callback(void* window_ptr, int (*cb)(void* ctx, floa
     }
 }
 
-// 设置自定义 TitleBar 拖拽区域高度
+// set custom TitleBar drag area height
 void macos_set_titlebar_drag_height(void* window_ptr, float height) {
     @autoreleasepool {
         WindowWrapper *wrapper = (__bridge WindowWrapper*)window_ptr;
@@ -4665,7 +5253,7 @@ void macos_set_titlebar_drag_height(void* window_ptr, float height) {
     }
 }
 
-// 设置 TitleBar 右侧排除拖拽区域宽度（给 action buttons 让出点击区）
+// set TitleBar right exclude drag width (for action buttons click)
 void macos_set_titlebar_drag_right_inset(void* window_ptr, float inset) {
     @autoreleasepool {
         WindowWrapper *wrapper = (__bridge WindowWrapper*)window_ptr;
@@ -4753,8 +5341,8 @@ void macos_destroy_window(void* window_ptr) {
     @autoreleasepool {
         if (!window_ptr) return;
         WindowWrapper *wrapper = (__bridge_transfer WindowWrapper*)window_ptr;
-        // 先停并释放 display link：CVDisplayLinkStop 同步等待回调线程退出，
-        // 防止销毁后回调经悬垂 wrapper 指针 post 事件
+        // stop and release display link: CVDisplayLinkStop sync-waits
+        // callback thread exit, prevent destroy-after callback via dangling
         if (wrapper.displayLink) {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
@@ -4810,12 +5398,16 @@ void macos_destroy_window(void* window_ptr) {
     }
 }
 
-// ========== 多窗口架构 API ==========
+// ========== multi-window architecture API ==========
 
-// 纯事件泵：拉取所有 NSApp 事件，分发到各 WindowWrapper
-// 不绑定任何特定窗口，由各窗口独立调用 macos_update_window_mouse 更新鼠标
+// pure event pump: fetch all NSApp events, dispatch to
+// WindowWrappers. not bound any window, each independently calls
+// macos_update_window_mouse
 static void pumpAppEventsWithTimeout(uint32_t timeout_ms) {
     @autoreleasepool {
+        // previous frame AX service window deferred actions: frame ended,
+        // execute before this round input events.
+        zenitDrainDeferredA11yMutations();
         g_text_input_wake_posted = NO;
         atomic_store(&g_display_link_wake_pending, false);
         // First-responder assignment is the supported input-context activation
@@ -4824,7 +5416,7 @@ static void pumpAppEventsWithTimeout(uint32_t timeout_ms) {
         if (!didForceActivate) {
             didForceActivate = YES;
             zenitActivateApplication();
-            // 找到第一个注册的窗口建立 responder 链。
+            // find first registered window establish responder chain.
             if (g_window_list.count > 0) {
                 NSWindow *firstWin = g_window_list[0];
                 WindowWrapper *wrapper = wrapperForWindow(firstWin);
@@ -4848,7 +5440,7 @@ static void pumpAppEventsWithTimeout(uint32_t timeout_ms) {
         if (zenitHasPendingMenuCommands()) return;
         BOOL shouldBlockForFirstEvent = timeout_ms != 0;
         for (NSUInteger batch = 0; batch < 256; batch++) {
-            // 检查是否有任何窗口在 live resize 中
+            // check any window in live resize
             NSString *mode = NSDefaultRunLoopMode;
             for (NSWindow *w in g_window_list) {
                 if (w.inLiveResize) {
@@ -4880,7 +5472,7 @@ static void pumpAppEventsWithTimeout(uint32_t timeout_ms) {
                 atomic_store(&g_display_link_wake_pending, false);
             }
 
-            // 找到 fallback wrapper（key window 或第一个窗口）
+            // find fallback wrapper (key window or first)
             WindowWrapper *fallback = nil;
             NSWindow *keyWin = [NSApp keyWindow];
             if (keyWin) fallback = wrapperForWindow(keyWin);
@@ -4894,9 +5486,8 @@ static void pumpAppEventsWithTimeout(uint32_t timeout_ms) {
                 break;
             }
 
-            // 键盘事件处理
-            // FlagsChanged 走独立分支：它没有 characters，也不该参与
-            // menu keyEquivalent / firstResponder 那套 keyDown 专属逻辑。
+            // keyboard event handling. FlagsChanged separate branch: no
+            // characters, skip menu keyEquivalent/firstResponder keyDown logic.
             if (event.type == NSEventTypeFlagsChanged) {
                 enqueueKeyEvent(target, event);
                 BOOL imeHandled = NO;
@@ -4922,14 +5513,14 @@ static void pumpAppEventsWithTimeout(uint32_t timeout_ms) {
                 BOOL isCmd = (event.modifierFlags & NSEventModifierFlagCommand) != 0;
                 NSString *key = event.charactersIgnoringModifiers;
 
-                // Cmd+Q: 全局退出
+                // Cmd+Q: global exit
                 if (event.type == NSEventTypeKeyDown && isCmd &&
                     [key isEqualToString:@"q"]) {
                     g_app_should_quit = YES;
                 }
 
-                // Shift+Cmd+W: 关闭目标窗口。
-                // 裸 Cmd+W 不拦截，让 key event 传到 Zig 侧处理（关当前 tab）。
+                // Shift+Cmd+W: close target window. Bare Cmd+W unintercepted, go to
+                // Zig (close current tab).
                 if (event.type == NSEventTypeKeyDown && isCmd &&
                     (event.modifierFlags & NSEventModifierFlagShift) != 0 &&
                     [key.lowercaseString isEqualToString:@"w"]) {
@@ -4938,7 +5529,7 @@ static void pumpAppEventsWithTimeout(uint32_t timeout_ms) {
                     break;
                 }
 
-                // Cmd+`: 窗口切换
+                // Cmd+`: window switch
                 if (event.type == NSEventTypeKeyDown && isCmd &&
                     event.keyCode == 50) {
                     NSWindow *kw = [NSApp keyWindow];
@@ -4952,9 +5543,9 @@ static void pumpAppEventsWithTimeout(uint32_t timeout_ms) {
                     break;
                 }
 
-                // 菜单快捷键：本循环从不调 sendEvent，而 keyEquivalent 派发
-                // 恰恰住在 sendEvent 里 —— 不补这一步，自定义菜单快捷键永远
-                // 不触发（verify_menu.sh 逮到；macos_poll_events 的旧循环同款）。
+                // menu shortcuts: this loop never calls sendEvent, keyEquivalent
+                // dispatch in sendEvent - skip it, custom menu (Cmd+P) never fire
+                // (verify_menu.sh caught; macos_poll_events old loop same).
                 const bool has_cmd_or_ctrl = (event.modifierFlags & (NSEventModifierFlagCommand | NSEventModifierFlagControl)) != 0;
                 if (event.type == NSEventTypeKeyDown && has_cmd_or_ctrl) {
                     BOOL menu_ate = [NSApp.mainMenu performKeyEquivalent:event];
@@ -4967,10 +5558,11 @@ static void pumpAppEventsWithTimeout(uint32_t timeout_ms) {
                     }
                 }
 
-                // 记录按键事件到目标窗口（队列式，避免高输入速率覆盖）
+                // record key event to target window (queue, avoid high-input
+                // clobber)
                 enqueueKeyEvent(target, event);
 
-                // IME 处理
+                // IME handling
                 if (event.type == NSEventTypeKeyDown) {
                     NSResponder *fr = [target.window firstResponder];
                     if (fr != target.metalView) {
@@ -4992,7 +5584,7 @@ static void pumpAppEventsWithTimeout(uint32_t timeout_ms) {
                 break;
             }
 
-            // 鼠标/滚轮事件处理（路由到目标窗口）
+            // mouse/scroll event handling (route to target)
             switch (event.type) {
                 case NSEventTypeLeftMouseDown: {
                     if (target.titlebarDragHeight > 0) {
@@ -5110,19 +5702,19 @@ static void pumpAppEventsWithTimeout(uint32_t timeout_ms) {
             if (event.type != NSEventTypeMouseMoved) break;
         }
 
-        // 同 macos_poll_events：补上 [NSApp run] 的 updateWindows 职责，
-        // 否则 NSTextInputContext 激活/per-context 输入法绑定不生效。
+        // same as macos_poll_events: fill updateWindows, else
+        // NSTextInputContext activation/per-context IM doesn't work.
         [NSApp updateWindows];
 
-        // 非阻塞泵（timeout 0：有窗口要帧 / test_mode）下 nextEventMatchingMask
-        // 用 distantPast 只摘事件，run loop **一趟都不跑**：主队列之外的 run loop
-        // 源、观察者（AVFoundation 的 AVPlayerItem 准备、NSURLSession 回调、
-        // 通知投递……）全部饿死 —— 应用连续渲染期间视频永远 loading（下游编辑器
-        // 第152轮：e2e media_viewer T3 15s 内 item.status 恒 Unknown，独立探针里
-        // 同一份代码 3 次迭代就绪）。这里补一趟零等待的 run loop pass：不睡、不等，
-        // 只把已就绪的源/观察者跑掉；放在事件批次之后，保持「先事件后回调」的顺序。
-        // mode 与批次内 nextEvent 一致：live resize 期间是 NSEventTrackingRunLoopMode
-        //（交叉审查坐实：固定 default mode 会让 tracking-only 源在 resize 中继续饿死）。
+        // Non-blocking pump (timeout 0: wants frame / test_mode).
+        // nextEventMatchingMask with distantPast only fetches; the run loop never runs, so
+        // non-main-queue sources and observers (AVFoundation AVPlayerItem prep, NSURLSession,
+        // notifications...) starve, and continuous rendering leaves video loading forever.
+        // Fill in one zero-wait run loop pass here: no sleep/wait, only ready sources/observers;
+        // after the event batch, keep event-then-callback order. The mode matches the batch
+        // nextEvent:
+        // during live resize it is NSEventTrackingRunLoopMode (a fixed default mode would starve
+        // tracking-only sources during resize).
         if (timeout_ms == 0) {
             NSString *passMode = NSDefaultRunLoopMode;
             for (NSWindow *w in g_window_list) {
@@ -5144,12 +5736,13 @@ void macos_pump_app_events_timeout(unsigned int timeout_ms) {
     pumpAppEventsWithTimeout(timeout_ms);
 }
 
-// 检查全局退出标志
+// check global exit flag
 int macos_should_quit(void) {
     return g_app_should_quit ? 1 : 0;
 }
 
-// 消费"app 变为前台"标志：返回 1 且重置为 NO（下次激活前不会再返回 1）
+// consume 'app became foreground' flag: return 1 and reset to NO
+// (won't return 1 again until next activation)
 int macos_consume_app_became_active(void) {
     if (g_app_became_active) {
         g_app_became_active = NO;
@@ -5158,9 +5751,10 @@ int macos_consume_app_became_active(void) {
     return 0;
 }
 
-// 查询当前系统是否为暗色模式
-// 每次 pump 都会被 collectGlobalEvents 调到，且在主循环 pool 之外也可能被调，
-// effectiveAppearance 返回 autoreleased 的 NSCompositeAppearance —— 自带 pool。
+// query current system is dark mode. each pump called by
+// collectGlobalEvents, may also called outside main pool,
+// effectiveAppearance returns autoreleased NSCompositeAppearance - has
+// own pool.
 int macos_is_dark_mode(void) {
     @autoreleasepool {
         NSAppearanceName appearance = [[NSApp effectiveAppearance] bestMatchFromAppearancesWithNames:@[
@@ -5171,7 +5765,7 @@ int macos_is_dark_mode(void) {
     }
 }
 
-// 检查窗口是否请求关闭（不消费）
+// check window requested close (don't consume)
 int macos_check_window_should_close(void *window_ptr) {
     @autoreleasepool {
         WindowWrapper *wrapper = (__bridge WindowWrapper*)window_ptr;
@@ -5179,7 +5773,7 @@ int macos_check_window_should_close(void *window_ptr) {
     }
 }
 
-// 重置窗口关闭请求标志
+// reset window close request flag
 void macos_reset_window_should_close(void *window_ptr) {
     @autoreleasepool {
         WindowWrapper *wrapper = (__bridge WindowWrapper*)window_ptr;
@@ -5187,7 +5781,8 @@ void macos_reset_window_should_close(void *window_ptr) {
     }
 }
 
-// Per-window 鼠标位置更新（从 macos_poll_events 末尾提取）
+// per-window mouse position update (extracted from
+// macos_poll_events end)
 void macos_update_window_mouse(void *window_ptr) {
     @autoreleasepool {
         WindowWrapper *wrapper = (__bridge WindowWrapper*)window_ptr;
@@ -5221,8 +5816,9 @@ void macos_update_window_mouse(void *window_ptr) {
     }
 }
 
-// 当前硬件修饰键状态（进程级，非某次事件的快照）。轮询式 mouse_move
-// 没有对应 NSEvent 可取 flags，用它给移动事件补真实修饰键。
+// current hardware modifier state (process-level, not event
+// snapshot). poll-style mouse_move no NSEvent for flags, use to
+// augment modifier.
 uint32_t macos_current_modifier_flags(void) {
     return (uint32_t)[NSEvent modifierFlags];
 }
@@ -5233,8 +5829,9 @@ int macos_is_window_focused(void *window_ptr) {
         if (!wrapper.window) return 0;
         if (zenitBackgroundE2E()) return wrapper.window.windowNumber == g_requested_key_window;
         if (wrapper.window.isKeyWindow) return 1;
-        // 应用不在前台时没有 key window：以"最近被要求成为 key 的窗口"为焦点窗口，
-        // 多窗口 e2e / 快捷键路由才不会在用户切去别的 app 时退化成"第一个窗口"。
+        // app not foreground no key window: use 'last requested key' as
+        // focus, multi-window e2e/shortcut routing don't degrade to first
+        // when user switches app.
         if (![NSApp isActive]) {
             NSWindow *req = macos_find_window_by_number(g_requested_key_window);
             if (req) return req == wrapper.window ? 1 : 0;
@@ -5244,7 +5841,20 @@ int macos_is_window_focused(void *window_ptr) {
     }
 }
 
-// 初始化 Cocoa 应用（无菜单栏，开发模式兼容）
+// system appearance sense active: app foreground and window key
+// (non-active window Liquid Glass tint desaturated). Background e2e
+// app not foreground: default active not change all baselines; set
+// ZENIT_E2E_REAL_ACTIVATION use actual (for non-active appearance).
+int macos_window_appears_active(void *window_ptr) {
+    @autoreleasepool {
+        WindowWrapper *wrapper = (__bridge WindowWrapper*)window_ptr;
+        if (!wrapper.window) return 1;
+        if (zenitBackgroundE2E() && getenv("ZENIT_E2E_REAL_ACTIVATION") == NULL) return 1;
+        return ([NSApp isActive] && wrapper.window.isKeyWindow) ? 1 : 0;
+    }
+}
+
+// init Cocoa app (no menubar, dev compat)
 void macos_init_app(void) {
     @autoreleasepool {
         [NSApplication sharedApplication];
@@ -5255,25 +5865,28 @@ void macos_init_app(void) {
     }
 }
 
-// ========== ZenitAppDelegate + 菜单栏 ==========
+// ========== ZenitAppDelegate + menubar ==========
 
 @interface ZenitAppDelegate : NSObject <NSApplicationDelegate>
 @end
 
 static ZenitAppDelegate *g_app_delegate = nil;
 
-// 全局 pending open file 路径（Finder 双击 / open -a / 拖到 Dock 图标）
+// global pending open file path (Finder double-click / open -a /
+// drag to Dock)
 static NSMutableArray<NSString *> *g_pending_open_files = nil;
 
-// 前置声明：定义在下方菜单 API 段（static 重复声明是合法的 tentative definition）
+// forward declare: defined below menu API (static redeclaration legal
+// tentative)
 static NSMutableDictionary<NSNumber *, NSMenu *> *zenitMenuById;
 
 @implementation ZenitAppDelegate
 
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
-    // setMenuModel 可能在 finishLaunching 之前就被应用调用（zenitMenuById
-    // 非空即是）。此前无条件 setupMenuBar 会把自定义主菜单静默整个覆盖 ——
-    // launch 前设置的菜单凭空消失且无任何报错（verify_menu.sh 逮到）。
+    // setMenuModel may be called before finishLaunching (zenitMenuById
+    // non-empty means so). Before unconditional setupMenuBar silently
+    // overwrites custom main menu - set before launch vanishes no error
+    // (verify_menu.sh caught).
     if (!zenitMenuById) {
         [self setupMenuBar];
     }
@@ -5295,7 +5908,8 @@ static NSMutableDictionary<NSNumber *, NSMenu *> *zenitMenuById;
 }
 
 - (void)applicationDidBecomeActive:(NSNotification *)notification {
-    // App 从后台切换到前台：标记需重绘，Zig 侧下一帧 pump 时消费
+    // App switched from background to foreground: mark for redraw; the Zig side
+    // consumes it on the next frame pump.
     g_app_became_active = YES;
     NSLog(@"[ZenitAppDelegate] applicationDidBecomeActive");
 }
@@ -5307,7 +5921,7 @@ static NSMutableDictionary<NSNumber *, NSMenu *> *zenitMenuById;
     return NO;
 }
 
-// Finder 双击 / "打开方式" / open -a / 拖到 Dock 图标
+// Finder double-click / open with / open -a / drag to Dock
 - (BOOL)application:(NSApplication *)sender openFile:(NSString *)filename {
     if (filename.length == 0) return NO;
     NSLog(@"[ZenitAppDelegate] openFile: %@", filename);
@@ -5331,7 +5945,7 @@ static NSMutableDictionary<NSNumber *, NSMenu *> *zenitMenuById;
 - (void)setupMenuBar {
     NSMenu *mainMenu = [[NSMenu alloc] init];
 
-    // === Zenit 菜单（应用菜单）===
+    // === Zenit menu (app menu) ===
     {
         NSMenuItem *appMenuItem = [[NSMenuItem alloc] init];
         NSMenu *appMenu = [[NSMenu alloc] initWithTitle:@"Zenit"];
@@ -5342,9 +5956,8 @@ static NSMutableDictionary<NSNumber *, NSMenu *> *zenitMenuById;
 
         [appMenu addItem:[NSMenuItem separatorItem]];
 
-        // 安装命令行启动器。放在 About 之后、Hide 之前 —— 与 VSCode
-        // (Shell Command: Install 'code') / Zed (Install CLI) 的位置一致，
-        // 用户在应用菜单里找这类"一次性设置"是既有习惯。
+        // Install command line launcher. After About, before Hide - match
+        // VSCode/Zed position, user habit finding one-time setup in app menu.
         [appMenu addItemWithTitle:@"Install Command Line Tool"
                            action:@selector(zenitInstallCli:)
                     keyEquivalent:@""];
@@ -5374,7 +5987,7 @@ static NSMutableDictionary<NSNumber *, NSMenu *> *zenitMenuById;
         [mainMenu addItem:appMenuItem];
     }
 
-    // === File 菜单 ===
+    // === File menu ===
     {
         NSMenuItem *fileMenuItem = [[NSMenuItem alloc] init];
         NSMenu *fileMenu = [[NSMenu alloc] initWithTitle:@"File"];
@@ -5408,12 +6021,12 @@ static NSMutableDictionary<NSNumber *, NSMenu *> *zenitMenuById;
                             action:@selector(zenitOpenFolder:)
                      keyEquivalent:@""];
 
-        // Open Recent → (子菜单占位)
+        // Open Recent -> (submenu placeholder)
         NSMenuItem *openRecentItem = [[NSMenuItem alloc] initWithTitle:@"Open Recent"
                                                                 action:nil
                                                          keyEquivalent:@""];
         NSMenu *recentMenu = [[NSMenu alloc] initWithTitle:@"Open Recent"];
-        // TODO: 动态填充最近文件列表
+        // TODO: dynamically populate recent files
         [recentMenu addItemWithTitle:@"(empty)"
                               action:nil
                        keyEquivalent:@""];
@@ -5450,7 +6063,7 @@ static NSMutableDictionary<NSNumber *, NSMenu *> *zenitMenuById;
         [mainMenu addItem:fileMenuItem];
     }
 
-    // === Edit 菜单 ===
+    // === Edit menu ===
     {
         NSMenuItem *editMenuItem = [[NSMenuItem alloc] init];
         NSMenu *editMenu = [[NSMenu alloc] initWithTitle:@"Edit"];
@@ -5486,7 +6099,7 @@ static NSMutableDictionary<NSNumber *, NSMenu *> *zenitMenuById;
         [mainMenu addItem:editMenuItem];
     }
 
-    // === Window 菜单 ===
+    // === Window menu ===
     {
         NSMenuItem *windowMenuItem = [[NSMenuItem alloc] init];
         NSMenu *windowMenu = [[NSMenu alloc] initWithTitle:@"Window"];
@@ -5511,7 +6124,7 @@ static NSMutableDictionary<NSNumber *, NSMenu *> *zenitMenuById;
         [NSApp setWindowsMenu:windowMenu];
     }
 
-    // === Help 菜单 ===
+    // === Help menu ===
     {
         NSMenuItem *helpMenuItem = [[NSMenuItem alloc] init];
         NSMenu *helpMenu = [[NSMenu alloc] initWithTitle:@"Help"];
@@ -5527,7 +6140,7 @@ static NSMutableDictionary<NSNumber *, NSMenu *> *zenitMenuById;
 
 @end
 
-// MetalView 菜单 action 方法 — 将 Edit 菜单操作转发为按键事件
+// MetalView menu action method - forward Edit menu to key events
 @implementation MetalView (MenuActions)
 
 - (void)_simulateKeyEventWithCode:(uint16_t)keyCode character:(char)ch modifiers:(uint32_t)mods {
@@ -5575,7 +6188,7 @@ static NSMutableDictionary<NSNumber *, NSMenu *> *zenitMenuById;
     [self _simulateKeyEventWithCode:0 character:'a' modifiers:NSEventModifierFlagCommand];
 }
 
-// ===== File 菜单 actions =====
+// ===== File menu actions =====
 
 // Cmd+N → New Text File (keycode 45 = 'n')
 - (void)zenitNewFile:(id)sender {
@@ -5603,11 +6216,10 @@ static NSMutableDictionary<NSNumber *, NSMenu *> *zenitMenuById;
     pushMenuAction(MenuActionOpenFolder);
 }
 
-// Install Command Line Tool
-// 不绑窗口：装 CLI 是进程级的一次性设置，没有 key window 时（比如只剩
-// Welcome 窗口、或全部窗口最小化）也该能点。用 pushMenuActionForWindow(…, 0)
-// 而不是 pushMenuAction()，后者会在没有 key window 时把 window_id 填 0 之外
-// 还让 Zig 侧按"目标窗口找不到"提前 return。
+// Install Command Line Tool. Not bound to a window: CLI install is process-level and one-time,
+// and must work even with no key window (Welcome only, or all minimized). Use
+// pushMenuActionForWindow(..., 0), not pushMenuAction(): the latter fills window_id 0 and Zig
+// returns early on target not found.
 - (void)zenitInstallCli:(id)sender {
     pushMenuActionForWindow(MenuActionInstallCli, 0);
 }
@@ -5634,22 +6246,23 @@ static NSMutableDictionary<NSNumber *, NSMenu *> *zenitMenuById;
 
 @end
 
-// 获取下一个待处理的菜单动作（0 = 无）
+// get next pending menu action (0 = none)
 int macos_get_menu_action(void) {
     return (int)popMenuAction();
 }
 
-// 初始化 Cocoa 应用 + AppDelegate + 菜单栏
+// init Cocoa app + AppDelegate + menubar
 void macos_init_app_with_delegate(void) {
     @autoreleasepool {
         [NSApplication sharedApplication];
         [NSApp setActivationPolicy:zenitBackgroundE2E() ? NSApplicationActivationPolicyProhibited : NSApplicationActivationPolicyRegular];
 
-        // 创建并设置 delegate
+        // create and set delegate
         g_app_delegate = [[ZenitAppDelegate alloc] init];
         [NSApp setDelegate:g_app_delegate];
 
-        // 立即设置菜单栏（不等 applicationDidFinishLaunching，因为我们不走 [NSApp run]）
+        // immediately setup menubar (don't wait
+        // applicationDidFinishLaunching, we don't use [NSApp run])
         [g_app_delegate setupMenuBar];
 
         [NSApp finishLaunching];
@@ -5677,19 +6290,18 @@ void macos_show_blocking_alert(const char *title, const char *message) {
     }
 }
 
-// ========== 剪贴板 API ==========
+// ========== Clipboard API ==========
 
-// 返回码：1 = 写入成功；0 = setString 拒绝；-1 = 文本不是合法 UTF-8。
+// Return: 1 = success, 0 = setString rejected, -1 = invalid UTF-8.
 //
-// 曾经这个函数返回 void，且顺序是「先 clearContents 再构造 NSString」：
-//   - str 为 nil（非法 UTF-8）时，用户的旧剪贴板**已经被清空**，新内容却没进去
-//     —— 先毁旧状态再做可失败操作，失败即不可恢复；
-//   - setString: 的 BOOL 被整个丢弃，调用方一路收到"成功"。
-// 两条合起来的症状是"复制静默失效"：changeCount 涨了（clearContents 生效），
-// 内容却还是上一次的。
+// Construct the new content first, then clear: if construction fails (invalid UTF-8) the
+// original clipboard stays unchanged. Clearing first would destroy the old content
+// unrecoverably, and a dropped setString BOOL would report success while changeCount rose
+// but content stayed stale (silent copy failure).
 int macos_clipboard_set_text(const char* text, int len) {
     @autoreleasepool {
-        // 先构造再清空：构造失败就原样保留用户的剪贴板，不做任何破坏。
+        // construct then clear: construction fails, user's clipboard
+        // unchanged, no corruption.
         NSString *str = [[NSString alloc] initWithBytes:text
                                                  length:(NSUInteger)len
                                                encoding:NSUTF8StringEncoding];
@@ -5938,7 +6550,7 @@ int macos_menu_poll_command(uint64_t *out_window_id, uint64_t *out_command_id) {
     return 1;
 }
 
-// ========== 文件对话框 API ==========
+// ========== File dialog API ==========
 
 int macos_pick_folder(char* path_buffer, int buffer_size) {
     @autoreleasepool {
@@ -5950,7 +6562,7 @@ int macos_pick_folder(char* path_buffer, int buffer_size) {
         panel.prompt = @"Open";
 
         NSModalResponse response = [panel runModal];
-        if (response != NSModalResponseOK) return 0;  // 用户取消
+        if (response != NSModalResponseOK) return 0; // user cancel
 
         NSURL *url = panel.URL;
         if (!url) return -1;
@@ -5964,7 +6576,8 @@ int macos_pick_folder(char* path_buffer, int buffer_size) {
     }
 }
 
-// 弹出 NSOpenPanel 选择文件（返回路径长度，0=取消，-1=错误）
+// pop NSOpenPanel select file (return path length, 0=cancel,
+// -1=error)
 int macos_open_file_panel(char* path_buffer, int buffer_size) {
     @autoreleasepool {
 
@@ -5974,7 +6587,7 @@ int macos_open_file_panel(char* path_buffer, int buffer_size) {
         panel.allowsMultipleSelection = NO;
         panel.title = @"Open File";
         panel.prompt = @"Open";
-        // 不设置 allowedContentTypes — 允许所有文件类型
+        // don't set allowedContentTypes - allow all file types
 
         NSModalResponse response = [panel runModal];
         if (response != NSModalResponseOK) return 0;
@@ -5991,7 +6604,8 @@ int macos_open_file_panel(char* path_buffer, int buffer_size) {
     }
 }
 
-// 弹出 NSOpenPanel 选择图片文件（返回路径长度，0=取消，-1=错误）
+// pop NSOpenPanel select image (return path length, 0=cancel,
+// -1=error)
 int macos_pick_image_file_panel(char* path_buffer, int buffer_size) {
     @autoreleasepool {
         NSLog(@"[ImageReplacePanel] opening image picker isMainThread=%d", [NSThread isMainThread]);
@@ -6041,7 +6655,7 @@ int macos_save_panel(const char* suggested_name, const char* default_directory, 
         }
 
         NSModalResponse response = [panel runModal];
-        if (response != NSModalResponseOK) return 0;  // 用户取消
+        if (response != NSModalResponseOK) return 0; // user cancel
 
         NSURL *url = panel.URL;
         if (!url) return -1;
@@ -6092,7 +6706,7 @@ int macos_get_pending_open_file(char* buffer, int buffer_size) {
     }
 }
 
-// Metal 渲染辅助函数
+// Metal render helper functions
 
 void* metal_create_command_queue(void* device_ptr) {
     @autoreleasepool {
@@ -6165,10 +6779,10 @@ void metal_commit_command_buffer(void* command_buffer_ptr) {
     }
 }
 
-/// 返回当前 key window 的 CGWindowID（供 screencapture -l 使用）
-/// 无窗口时返回 0
-// 某个具体窗口的 id（= NSWindow.windowNumber）。zig 侧 App 用它设 Cx.window_id，
-// 让 a11y / 系统 API 路由到本窗口而不是"第一个窗口"。
+/// return current key window CGWindowID (for screencapture -l). 0
+/// if no window
+// specific window id (= NSWindow.windowNumber). zig App uses to set
+// Cx.window_id, route a11y/system API to this window not first.
 uint32_t macos_window_id(void *window_ptr) {
     if (!window_ptr) return 0;
     WindowWrapper *wrapper = (__bridge WindowWrapper *)window_ptr;
@@ -6185,7 +6799,8 @@ int64_t macos_get_key_window_id(void) {
         // Background RPC focus must agree with macos_is_window_focused. AppKit
         // can retain an old key window even after a logical palette activation.
         NSWindow *w = zenitBackgroundE2E() ? macos_find_window_by_number(g_requested_key_window) : [NSApp keyWindow];
-        // 应用不在前台时 keyWindow 为 nil：先退到最近被要求成为 key 的窗口，再退到 mainWindow，再退到第一个窗口
+        // app not foreground keyWindow nil: fall back last-requested-key,
+        // then mainWindow, then first
         if (!w) w = macos_find_window_by_number(g_requested_key_window);
         if (!w) w = [NSApp mainWindow];
         if (!w) w = [[NSApp windows] firstObject];
@@ -6204,8 +6819,8 @@ int64_t macos_get_window_id_by_title(const char *title) {
     return 0;
 }
 
-/// 向 NSApp 事件队列 post 一个空事件，唤醒 runloop
-/// 用于动画帧：当 needs_redraw=true 但没有外部事件时，保证下一帧 pumpAppEvents 不会空等
+/// post empty event to NSApp queue, wake runloop. for animation:
+/// needs_redraw=true but no event, ensure next pump doesn't empty-wait
 void macos_post_empty_event(void) {
     @autoreleasepool {
         NSEvent *event = [NSEvent otherEventWithType:NSEventTypeApplicationDefined
@@ -6223,7 +6838,59 @@ void macos_post_empty_event(void) {
 
 // ==================== CVDisplayLink (C6) ====================
 
-/// CVDisplayLink vsync 回调（运行在专用高优先级线程）
+static BOOL glassClockTraceEnabled(void) {
+    static _Atomic(int) cached = -1;
+    const int enabled = atomic_load_explicit(&cached, memory_order_acquire);
+    if (enabled >= 0) return enabled != 0;
+    const char *value = getenv("ZENIT_GLASS_CLOCK_TRACE");
+    const int initial = value && strcmp(value, "1") == 0;
+    atomic_store_explicit(&cached, initial, memory_order_release);
+    return initial != 0;
+}
+
+// [borrowed] Reads timing scalars from the live window; no ownership change.
+// The target can be stale after idle. Consumers must inspect its host time,
+// not treat the last callback as a prediction for every input-driven frame.
+uint64_t macos_get_presentation_clock(void *window_ptr, double *times) {
+    times[0] = 0;
+    times[1] = 0;
+    const double frequency = CVGetHostClockFrequency();
+    times[2] = (double)CVGetCurrentHostTime() / frequency;
+    if (!window_ptr) return 0;
+    WindowWrapper *wrapper = (__bridge WindowWrapper *)window_ptr;
+    for (unsigned int attempt = 0; attempt < 4; attempt++) {
+        const uint64_t before = atomic_load_explicit(&wrapper->displayTickSequence, memory_order_seq_cst);
+        if (before & 1) continue;
+        const uint64_t callback = atomic_load_explicit(&wrapper->displayTickCallbackHostTime, memory_order_seq_cst);
+        const uint64_t target = atomic_load_explicit(&wrapper->displayTickTargetHostTime, memory_order_seq_cst);
+        if (before != atomic_load_explicit(&wrapper->displayTickSequence, memory_order_seq_cst)) continue;
+        times[0] = (double)callback / frequency;
+        times[1] = (double)target / frequency;
+        return before / 2;
+    }
+    return atomic_load_explicit(&wrapper->displayTickSequence, memory_order_seq_cst) / 2;
+}
+
+uint64_t macos_glass_clock_trace_display_tick(void *window_ptr, double *times) {
+    times[0] = 0;
+    times[1] = 0;
+    if (!glassClockTraceEnabled()) return 0;
+    double snapshot[3];
+    const uint64_t tick = macos_get_presentation_clock(window_ptr, snapshot);
+    times[0] = snapshot[0];
+    times[1] = snapshot[1];
+    return tick;
+}
+
+// A callback being written (odd sequence) still reports the previous completed
+// tick. This is a per-window cadence token, not a predicted animation time.
+uint64_t macos_get_display_tick(void *window_ptr) {
+    WindowWrapper *wrapper = (__bridge WindowWrapper *)window_ptr;
+    return atomic_load_explicit(&wrapper->displayTickSequence, memory_order_seq_cst) / 2;
+}
+
+/// CVDisplayLink vsync callback (runs dedicated high-priority
+/// thread)
 static CVReturn displayLinkCallback(
     CVDisplayLinkRef displayLink,
     const CVTimeStamp *inNow,
@@ -6234,18 +6901,24 @@ static CVReturn displayLinkCallback(
 ) {
     (void)displayLink;
     (void)inNow;
-    (void)inOutputTime;
     (void)flagsIn;
     (void)flagsOut;
-    (void)displayLinkContext;
-    // 在 vsync 时刻唤醒主线程渲染；上一个唤醒还没被 pump 取走就不再叠加。
+    WindowWrapper *wrapper = (__bridge WindowWrapper *)displayLinkContext;
+    atomic_fetch_add_explicit(&wrapper->displayTickSequence, 1, memory_order_seq_cst);
+    atomic_store_explicit(&wrapper->displayTickCallbackHostTime, CVGetCurrentHostTime(), memory_order_seq_cst);
+    atomic_store_explicit(&wrapper->displayTickTargetHostTime,
+                          (inOutputTime->flags & kCVTimeStampHostTimeValid) ? inOutputTime->hostTime : 0,
+                          memory_order_seq_cst);
+    atomic_fetch_add_explicit(&wrapper->displayTickSequence, 1, memory_order_seq_cst);
+    // at vsync instant wake main thread render; previous unwaken still
+    // not taken don't stack.
     if (!atomic_exchange(&g_display_link_wake_pending, true)) {
         macos_post_empty_event();
     }
     return kCVReturnSuccess;
 }
 
-/// 启动 CVDisplayLink — 动画活跃时调用
+/// start CVDisplayLink - when animations active
 void macos_start_display_link(void* window_ptr) {
     @autoreleasepool {
         WindowWrapper *wrapper = (__bridge WindowWrapper*)window_ptr;
@@ -6268,7 +6941,7 @@ void macos_start_display_link(void* window_ptr) {
     }
 }
 
-/// 停止 CVDisplayLink — 无动画时调用（节省 CPU）
+/// stop CVDisplayLink - when idle (save CPU)
 void macos_stop_display_link(void* window_ptr) {
     @autoreleasepool {
         WindowWrapper *wrapper = (__bridge WindowWrapper*)window_ptr;
@@ -6280,7 +6953,7 @@ void macos_stop_display_link(void* window_ptr) {
     }
 }
 
-/// 获取屏幕刷新率（Hz）
+/// get screen refresh rate (Hz)
 float macos_get_display_refresh_rate(void* window_ptr) {
     @autoreleasepool {
         WindowWrapper *wrapper = (__bridge WindowWrapper*)window_ptr;

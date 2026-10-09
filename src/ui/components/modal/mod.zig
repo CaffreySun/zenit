@@ -1,14 +1,15 @@
 /// Modal Component
 ///
-/// 模态对话框组件，基于 OverlayStack 框架
+/// Modal dialog component, based on the OverlayStack framework
 ///
-/// 特性:
-/// - Signal(bool) 控制显示/隐藏
-/// - OverlayStack 自动管理 z-index、遮罩、焦点陷阱、Escape/outside-click 关闭
-/// - 支持标题和关闭按钮
-/// - fade 入场/退场动画
+/// Features:
+/// - Signal(bool) controls show/hide
+/// - OverlayStack auto-manages z-index, mask, focus trap, Escape/outside-click close
+/// - Supports title and close button
+/// - fade in/out animation
 const std = @import("std");
 const core = @import("../../core.zig");
+const view = @import("../../view.zig");
 const Cx = core.Cx;
 const Node = core.Node;
 const box = core.box;
@@ -17,88 +18,86 @@ const Padding = core.Padding;
 const theme = core.theme;
 const Signal = core.Signal;
 const svg_assets = @import("../../svg_assets.zig");
-const Scope = @import("../../reactive.zig").Scope;
+const reactive = @import("../../reactive.zig");
+const Scope = reactive.Scope;
+const Source = reactive.Source;
+const Model = reactive.Model;
+const Handler = core.Handler;
+const bind_mod = @import("../../bind.zig");
 const overlay_stack = @import("../../overlay_stack.zig");
 const render_engine = @import("../../core/render_engine/mod.zig");
 
-/// Modal 属性
+/// Modal props (Signal-first, docs/SIGNAL_API_DESIGN.md)
 pub const ModalProps = struct {
-    /// 标题
-    title: ?[]const u8 = null,
-    /// 宽度
+    /// Open/close state. `*Signal(bool)` controlled (interaction writes directly) (typical usage);
+    /// `bool` self-held by component (via `ModalResult.open` access signal to drive);
+    /// `ui.split(read, cx.on(...))` lets parent intercept close (X/Esc/mask-click only propose,
+    /// parent refuse keeps open).
+    open: Model(bool) = .{ .local = false },
+    /// Title; empty string and static doesn't build titlebar (no close button either).
+    title: Source([]const u8) = .{ .value = "" },
+    /// Width
     width: f32 = 480,
-    /// 最大高度
+    /// Max height
     max_height: f32 = 600,
-    /// 遮罩颜色 (null = 使用主题 overlay)
+    /// Mask color (null = use theme overlay)
     overlay_color: ?Color = null,
-    /// 对话框背景
+    /// Dialog background
     background: ?Color = null,
-    /// 点击遮罩关闭
+    /// Click mask to close
     close_on_overlay: bool = true,
-    /// 显示控制 Signal（外部传入）
-    visible: ?*Signal(bool) = null,
-    /// 关闭按钮 SVG 资产（可选，null 则回退文本 ✕）
+    /// Close button SVG asset (optional, null fallback text X)
     close_icon_asset: ?svg_assets.Asset = null,
+    /// User-initiated toggle (X/Esc/mask-click) fires after settling, param is settled toggle
+    /// state.
+    on_open_change: ?Handler(bool) = null,
 };
 
-// ── 样式层在 styles.zig ──
-const styles = @import("styles.zig");
-const close_icon_size = styles.close_icon_size;
-const dialogStyle = styles.dialogStyle;
-const dialogAmbientShadow = styles.dialogAmbientShadow;
-const headerStyle = styles.headerStyle;
-const titleBoxStyle = styles.titleBoxStyle;
-const titleTextStyle = styles.titleTextStyle;
-const closeBtnStyle = styles.closeBtnStyle;
-const closeGlyphBoxStyle = styles.closeGlyphBoxStyle;
-const closeGlyphTextStyle = styles.closeGlyphTextStyle;
-const bodyStyle = styles.bodyStyle;
+// ── Style layer in styles.yss ──
+const styles = @import("_styles.yss.zig");
+const views = @import("_modal.yix.zig");
 
-/// 创建 Modal
-pub fn Modal(props: ModalProps) ModalBuilder {
-    return ModalBuilder{ .props = props };
+/// Create Modal: `W.Modal(.{ .title = "Settings", .open = settings_open })`
+pub fn Modal(props: anytype) ModalBuilder {
+    return .{ .props = reactive.props.coerce(ModalProps, props) };
 }
 
-/// ModalBuilder.mount 的返回结果
-pub const ModalResult = struct { overlay: *Node, dialog: *Node, body: *Node, portaled: bool };
+/// ModalBuilder.mount result. `open` is parsed toggle signal (local/bound non-null when present).
+pub const ModalResult = struct {
+    overlay: *Node,
+    dialog: *Node,
+    body: *Node,
+    portaled: bool,
+    open: ?*Signal(bool),
+
+    /// `ui.view` intake: when portal overlay already hung at window root, nothing in parent.
+    pub fn viewParts(self: ModalResult) core.ViewParts {
+        return .{ .root = if (self.portaled) null else self.overlay, .slot = self.body };
+    }
+};
+
+/// Modal runtime state (scope owns)
+const ModalRuntime = struct {
+    open: reactive.Bound(bool),
+    on_open_change: ?Handler(bool),
+
+    /// X/Esc/mask-click: only propose close, data-source settle then open effect drives exit
+    fn requestClose(context: *anyopaque) void {
+        const self: *ModalRuntime = @ptrCast(@alignCast(context));
+        self.open.propose(false, self.on_open_change);
+    }
+};
 
 pub const ModalBuilder = struct {
     props: ModalProps,
 
-    pub fn title(self: ModalBuilder, t: []const u8) ModalBuilder {
-        var new = self;
-        new.props.title = t;
-        return new;
-    }
-
-    pub fn width(self: ModalBuilder, w: f32) ModalBuilder {
-        var new = self;
-        new.props.width = w;
-        return new;
-    }
-
-    pub fn maxHeight(self: ModalBuilder, h: f32) ModalBuilder {
-        var new = self;
-        new.props.max_height = h;
-        return new;
-    }
-
-    pub fn visible(self: ModalBuilder, sig: *Signal(bool)) ModalBuilder {
-        var new = self;
-        new.props.visible = sig;
-        return new;
-    }
-
-    pub fn closeOnOverlay(self: ModalBuilder, c: bool) ModalBuilder {
-        var new = self;
-        new.props.close_on_overlay = c;
-        return new;
-    }
-
-    /// 保留模式: mount
-    /// portaled=true 时 overlay 已自动挂到 cx.popover_portal_root（覆盖整窗口），
-    /// caller 不要再 appendChild(overlay)；false 时（无 portal，如单测）caller 仍需 append。
+    /// Retained mode: mount
+    /// portaled=true overlay already auto-hung to cx.popover_portal_root (covers whole window),
+    /// caller don't appendChild(overlay) again; false (no portal, like unit tests) caller still
+    /// needs append.
     pub fn mount(self: ModalBuilder, scope: *Scope, cx: *Cx) !ModalResult {
+        cx.owner.enterMount();
+        defer cx.owner.exitMount();
         const my_scope = try scope.childScope();
         var scope_bound = false;
         errdefer if (!scope_bound) my_scope.dispose();
@@ -106,10 +105,23 @@ pub const ModalBuilder = struct {
         const t = cx.tokens;
         const p = self.props;
 
-        // 通过 OverlayStack 创建 modal 层
+        // Parse Model first then allocate rt: rt given to scope before can't have fail calls
+        // between
+        // (else leak)
+        const open = try reactive.resolveModel(bool, my_scope, p.open);
+        const rt = try my_scope.allocator.create(ModalRuntime);
+        rt.* = .{ .open = open, .on_open_change = p.on_open_change };
+        try my_scope.adoptResource(@ptrCast(rt), struct {
+            fn destroy(ptr: *anyopaque, alloc: std.mem.Allocator) void {
+                alloc.destroy(@as(*ModalRuntime, @ptrCast(@alignCast(ptr))));
+            }
+        }.destroy);
+        const has_title = !(p.title.isStatic() and p.title.peek().len == 0);
+
+        // Create modal layer via OverlayStack
         const ol = try overlay_stack.overlay(my_scope, cx, .{
             .kind = .modal,
-            .barrier = .{ .color = p.overlay_color orelse t.color.overlay },
+            .barrier = .{ .color = p.overlay_color orelse t.tokens.color.overlay },
             .dismiss = .{
                 .outside_click = if (p.close_on_overlay) .close else .none,
                 .escape = true,
@@ -117,14 +129,14 @@ pub const ModalBuilder = struct {
             .enter_transition = .scale_fade,
             .exit_transition = .scale_fade,
             .focus = .{ .trap = true, .auto_focus = true, .restore = true },
-            .on_dismiss = p.visible,
-            .a11y = .{ .role = .dialog, .label = p.title, .modal = true },
+            .on_dismiss_request = core.Cx.simpleHandler(ModalRuntime.requestClose, rt),
         });
 
-        // barrier 节点作为 overlay（包含 dialog 的容器）
+        // barrier node as overlay (container holding dialog)
         const barrier = ol.barrier.?;
-        // overlay() 把 focus_scope 配在 ol.content 上，但本组件不用 ol.content，
-        // 真正 pushScope 的是 barrier，不在 barrier 上配，trap/auto_focus 全是空操作。
+        // overlay() sets focus_scope on ol.content, but this component doesn't use ol.content;
+        // the node that actually does pushScope is barrier, so unless configured on barrier,
+        // trap/auto_focus are all no-ops.
         barrier.setFocusScope(.{ .trap = true, .auto_focus = true });
         barrier.meta.ownership.meta.component_name = "Modal";
         try core.bindScopeToNode(my_scope, barrier);
@@ -134,77 +146,53 @@ pub const ModalBuilder = struct {
             cx.freeNode(barrier);
         }
 
-        // dialog 容器
-        const dialog = try box(cx, dialogStyle(p.width, p.max_height, p.background, t), .{});
-        try appendModalChild(cx, barrier, dialog);
-        const dialog_ext = try dialog.style.ensureExtFallible(allocator);
-        dialog_ext.setShadows(t.shadow.lg, dialogAmbientShadow());
-
-        // 将 OverlayStack 层的真实 content_node 绑定到 dialog，
-        // 让 tick() 中的入场/退场动画（fade）作用在 dialog 上。
-        cx.overlay_stack.bindContentNode(allocator, ol.handle, dialog);
-
-        // header（如果有标题）
-        if (p.title) |title_text| {
-            const header = try box(cx, headerStyle(t), .{});
-            try appendModalChild(cx, dialog, header);
-
-            var title_node = try box(cx, titleBoxStyle(t), .{});
-            try appendModalChild(cx, header, title_node);
-            var title_txt = titleTextStyle(t);
-            title_txt.content = title_text;
-            title_node.setText(title_txt);
-
-            if (p.visible) |vis| {
-                const close_btn = try box(cx, closeBtnStyle(t), .{});
-                try appendModalChild(cx, header, close_btn);
-                if (p.close_icon_asset) |asset| {
-                    const close_icon = try core.iconTint(cx, asset, t.color.fg_secondary, .{
-                        .width = .{ .px = close_icon_size },
-                        .height = .{ .px = close_icon_size },
-                    });
-                    try appendModalChild(cx, close_btn, close_icon);
-                } else {
-                    var text_btn = try box(cx, closeGlyphBoxStyle(t), .{});
-                    try appendModalChild(cx, close_btn, text_btn);
-                    var glyph_txt = closeGlyphTextStyle(t);
-                    glyph_txt.content = "\xe2\x9c\x95";
-                    text_btn.setText(glyph_txt);
-                }
-
-                close_btn.behavior.events.on_click = core.Cx.simpleHandler(
-                    struct {
-                        fn handler(context: *anyopaque) void {
-                            const sig: *Signal(bool) = @ptrCast(@alignCast(context));
-                            sig.set(false);
-                        }
-                    }.handler,
-                    @ptrCast(vis),
-                );
-                close_btn.meta.ownership.meta.test_id = "modal.close";
-            }
+        // Dialog panel (view in modal.yix; titlebar present/absent static structure at mount-time)
+        const panel = try views.ModalPanel(.{
+            .title = p.title.peek(),
+            .has_title = has_title,
+            .width = p.width,
+            .max_height = p.max_height,
+            .background = p.background,
+            .close_icon_asset = p.close_icon_asset,
+            .on_close = core.Cx.simpleHandler(ModalRuntime.requestClose, rt),
+        }).viewMount(my_scope, cx);
+        const dialog = panel.root.?;
+        barrier.appendChild(allocator, dialog) catch |err| {
+            cx.freeNode(dialog);
+            return err;
+        };
+        const body = panel.slot.?;
+        // Post-title change and dialog a11y name: name points to titlebar text node self-copy
+        // (titlebar first child of panel, title first child of titlebar)
+        if (has_title) {
+            const title_node = dialog.children.items[0].children.items[0];
+            if (dialog.behavior.interaction.a11y) |*a| a.label = title_node.getText().?.content;
+            try bind_mod.bindTextLabel(cx, my_scope, p.title, title_node, dialog);
         }
 
-        // body
-        const body = try box(cx, bodyStyle(t), .{});
-        try appendModalChild(cx, dialog, body);
+        // Bind OverlayStack layer's real content_node to dialog,
+        // let tick() in-out animation (fade) apply on dialog.
+        cx.overlay_stack.bindContentNode(allocator, ol.handle, dialog);
 
-        // visible Signal 控制显隐（通过 Effect 驱动 OverlayStack）
-        if (p.visible) |vis| {
+        // open controls show/hide (via Effect drive OverlayStack)
+        {
+            const open_src = rt.open.read;
             const fm = &cx.focus_manager;
             const scope_pushed = try my_scope.createSignal(bool, false);
-            // 打开状态下直接卸载（Show 切走 / 父 scope dispose）不会再跑 visible
-            // effect 的 pop 分支 -> focus scope 栈残留指向已释放 barrier 的条目。
+            // Open unload direct (Show cut away/parent scope dispose) won't run visible effect pop
+            // branch
+            // -> focus scope stack leaks entry pointing to freed barrier.
             const scope_guard = try my_scope.allocator.create(FocusScopeGuard);
             scope_guard.* = .{ .fm = fm, .pushed = scope_pushed, .barrier = barrier, .barrier_id = barrier.id };
             try my_scope.adoptResource(@ptrCast(scope_guard), FocusScopeGuard.destroy);
             try my_scope.onCleanup(FocusScopeGuard, scope_guard, FocusScopeGuard.cleanup);
 
-            // 初始隐藏：barrier 缩成 0 + 层挂起（直接设 suspended，不走 commitExit）。
-            // 还必须整棵摘出 hit-test：overflow_hidden 只裁视觉不裁命中，
-            // 溢出 0×0 barrier 的 dialog 内容会在窗口左上角留下一片
-            // 不可见热区，吃掉底下控件的 hover/click。
-            if (!vis.peek()) {
+            // Initial hide: barrier shrink 0 + layer suspend (direct set suspended, don't run
+            // commitExit).
+            // Must also whole-tree remove from hit-test: overflow_hidden only clips visual not hit,
+            // dialog content overflowing 0x0 barrier leaves unvisible hot-zone at window top-left,
+            // eats hover/click of controls below.
+            if (!open_src.peek()) {
                 barrier.style.width = .{ .px = 0 };
                 barrier.style.height = .{ .px = 0 };
                 barrier.style.overflow_hidden = true;
@@ -214,9 +202,10 @@ pub const ModalBuilder = struct {
                 }
             }
 
+            reactive.checkBorrow(my_scope, open_src);
             try my_scope.createEffect(.{
                 .barrier = barrier,
-                .visible = vis,
+                .visible = open_src,
                 .fm = fm,
                 .scope_pushed = scope_pushed,
                 .cx = cx,
@@ -258,13 +247,13 @@ pub const ModalBuilder = struct {
             }.update);
         }
 
-        return .{ .overlay = barrier, .dialog = dialog, .body = body, .portaled = ol.portaled };
+        return .{ .overlay = barrier, .dialog = dialog, .body = body, .portaled = ol.portaled, .open = rt.open.asSignal() };
     }
 };
 
-/// 卸载时弹出本组件仍压着的 focus scope。只在栈顶确实是自己时弹
-/// （popScope 只弹栈顶；嵌套时乱弹会把上层浮层的 scope 弹掉）。
-/// 只比 id / 指针，不解引用 barrier（cleanup 时它可能已在释放途中）。
+/// Unload pop this component's still-pushed focus scope. Only pop if stack-top truly self
+/// (popScope only top; nested wrong-pop eats upper float layer scope).
+/// Only compare id/pointer, don't dereference barrier (cleanup may be mid-release).
 const FocusScopeGuard = struct {
     fm: *@FieldType(core.Cx, "focus_manager"),
     pushed: *Signal(bool),
@@ -290,17 +279,10 @@ const FocusScopeGuard = struct {
     }
 };
 
-fn appendModalChild(cx: *Cx, parent: *Node, child: *Node) !void {
-    parent.appendChild(cx.allocator, child) catch |err| {
-        cx.freeNode(child);
-        return err;
-    };
-}
-
-// ========== 测试 ==========
+// ========== Tests ==========
 
 test "Modal: basic structure" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 800 }, .height = .{ .px = 600 } }, .{});
@@ -316,16 +298,16 @@ test "Modal: basic structure" {
 
     try root.appendChild(std.testing.allocator, result.overlay);
 
-    // overlay(barrier) 包含 dialog
+    // overlay(barrier) contains dialog
     try std.testing.expectEqual(@as(usize, 1), result.overlay.children.items.len);
-    // dialog 包含 header + body
+    // dialog contains header + body
     try std.testing.expectEqual(@as(usize, 2), result.dialog.children.items.len);
-    // absolute 定位
+    // absolutely positioned
     try std.testing.expectEqual(core.Position.absolute, result.overlay.style.position);
 }
 
 test "Modal: visible signal control" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 800 }, .height = .{ .px = 600 } }, .{});
@@ -333,22 +315,23 @@ test "Modal: visible signal control" {
 
     const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
     defer scope.dispose();
-    const vis = try ctx.createSignal(bool, false);
+    const vis = try scope.createSignal(bool, false);
 
     const result = try Modal(.{
         .title = "Toggle Modal",
-    }).visible(vis).mount(scope, ctx);
+        .open = vis,
+    }).mount(scope, ctx);
 
     try root.appendChild(std.testing.allocator, result.overlay);
 
-    // 初始隐藏
+    // initially hidden
     try std.testing.expectEqual(core.Sizing{ .px = 0 }, result.overlay.style.width);
 
-    // 显示
+    // shown
     vis.set(true);
     try std.testing.expectEqual(core.Sizing{ .grow = .{} }, result.overlay.style.width);
 
-    // 隐藏
+    // hidden
     vis.set(false);
     try std.testing.expectEqual(core.Sizing{ .grow = .{} }, result.overlay.style.width);
 
@@ -374,16 +357,16 @@ test "Modal: visible signal control" {
 }
 
 test "Modal: 打开状态下卸载会弹出自己的 focus scope" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     const root = try box(ctx, .{ .width = .{ .px = 800 }, .height = .{ .px = 600 } }, .{});
     ctx.root = root;
     const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
     defer scope.dispose();
-    const vis = try ctx.createSignal(bool, true);
+    const vis = try scope.createSignal(bool, true);
 
     const sub = try scope.childScope();
-    const result = try Modal(.{ .title = "Unmount open" }).visible(vis).mount(sub, ctx);
+    const result = try Modal(.{ .title = "Unmount open", .open = vis }).mount(sub, ctx);
     if (!result.portaled) try root.appendChild(std.testing.allocator, result.overlay);
     const fm = &ctx.focus_manager;
     try std.testing.expectEqual(@as(u8, 1), fm.scope_count);
@@ -394,20 +377,20 @@ test "Modal: 打开状态下卸载会弹出自己的 focus scope" {
 }
 
 test "Modal: 打开时 focus trap 生效并自动聚焦到对话框内" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     const root = try box(ctx, .{ .width = .{ .px = 800 }, .height = .{ .px = 600 } }, .{});
     ctx.root = root;
     ctx.setViewport(800, 600);
     const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
     defer scope.dispose();
-    const vis = try ctx.createSignal(bool, false);
+    const vis = try scope.createSignal(bool, false);
 
     const outside = try box(ctx, .{ .width = .{ .px = 100 }, .height = .{ .px = 30 } }, .{});
     outside.behavior.interaction.focusable = true;
     try root.appendChild(std.testing.allocator, outside);
 
-    const result = try Modal(.{ .title = "Trap" }).visible(vis).mount(scope, ctx);
+    const result = try Modal(.{ .title = "Trap", .open = vis }).mount(scope, ctx);
     if (!result.portaled) try root.appendChild(std.testing.allocator, result.overlay);
     const inside = try box(ctx, .{ .width = .{ .px = 100 }, .height = .{ .px = 30 } }, .{});
     inside.behavior.interaction.focusable = true;
@@ -424,7 +407,7 @@ test "Modal: 打开时 focus trap 生效并自动聚焦到对话框内" {
 }
 
 test "Modal: exiting keeps overlay visible until commit" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 800 }, .height = .{ .px = 600 } }, .{});
@@ -432,11 +415,12 @@ test "Modal: exiting keeps overlay visible until commit" {
 
     const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
     defer scope.dispose();
-    const vis = try ctx.createSignal(bool, true);
+    const vis = try scope.createSignal(bool, true);
 
     const result = try Modal(.{
         .title = "Exit Modal",
-    }).visible(vis).mount(scope, ctx);
+        .open = vis,
+    }).mount(scope, ctx);
 
     try root.appendChild(std.testing.allocator, result.overlay);
 
@@ -457,7 +441,7 @@ test "Modal: exiting keeps overlay visible until commit" {
 }
 
 test "Modal: first 10 open frames progress from enter state instead of flashing" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     ctx.setViewport(800, 600);
 
@@ -466,12 +450,13 @@ test "Modal: first 10 open frames progress from enter state instead of flashing"
 
     const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
     defer scope.dispose();
-    const vis = try ctx.createSignal(bool, false);
+    const vis = try scope.createSignal(bool, false);
 
     const result = try Modal(.{
         .title = "Animated Modal",
         .width = 400,
-    }).visible(vis).mount(scope, ctx);
+        .open = vis,
+    }).mount(scope, ctx);
     try root.appendChild(std.testing.allocator, result.overlay);
 
     ctx.layout();
@@ -516,7 +501,7 @@ test "Modal: first 10 open frames progress from enter state instead of flashing"
 }
 
 test "Modal: long title wraps instead of overflowing dialog" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     ctx.setViewport(800, 600);
 
@@ -539,14 +524,16 @@ test "Modal: long title wraps instead of overflowing dialog" {
     const title_rect = title_box.rectFromWorldOrFallback();
     const dialog_rect = result.dialog.rectFromWorldOrFallback();
 
-    // 标题盒宽被约束在 dialog 内（旧行为：fit 内容宽 -> 水平溢出 dialog）
+    // titlebox width constrained in dialog (old behavior: fit content width -> horizontal overflow
+    // dialog)
     try std.testing.expect(title_rect.w <= dialog_rect.w);
-    // 折行后高度超过单行（14px * 1.4 ≈ 19.6；旧行为固定 20px 裁掉第二行）
+    // after wrap height exceeds single line (14px*1.4 ~19.6; old behavior fixed 20px clipped second
+    // line)
     try std.testing.expect(title_rect.h > 30);
 }
 
 test "Modal: no title" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 800 }, .height = .{ .px = 600 } }, .{});
@@ -559,13 +546,34 @@ test "Modal: no title" {
 
     try root.appendChild(std.testing.allocator, result.overlay);
 
-    // 无标题: dialog 只有 body
+    // no title: dialog only body
     try std.testing.expectEqual(@as(usize, 1), result.dialog.children.items.len);
 }
 
-// styles.zig 的测试收集，这行是必需的，见 docs/STYLING.md
+test "Modal: dialog exposes role=dialog and a label that follows a dynamic title" {
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
+    const root = try box(ctx, .{ .width = .{ .px = 800 }, .height = .{ .px = 600 } }, .{});
+    ctx.root = root;
+    const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
+    defer scope.dispose();
+
+    const title = try scope.createText("Delete file?", .{});
+    const result = try Modal(.{ .title = title, .open = true }).mount(scope, ctx);
+    try root.appendChild(std.testing.allocator, result.overlay);
+    const a11y = &result.dialog.behavior.interaction.a11y;
+    try std.testing.expectEqual(core.A11yRole.dialog, a11y.*.?.role);
+    try std.testing.expectEqualStrings("Delete file?", a11y.*.?.label.?);
+    title.set("Delete 3 files?");
+    // label must point to node currently-held text, not replaced old buffer
+    const title_node = result.dialog.children.items[0].children.items[0];
+    try std.testing.expectEqual(title_node.getText().?.content.ptr, a11y.*.?.label.?.ptr);
+    try std.testing.expectEqualStrings("Delete 3 files?", a11y.*.?.label.?);
+}
+
+// styles.yss test collection, this line required, see docs/STYLING.md
 test {
-    _ = @import("styles.zig");
+    _ = @import("_styles.yss.zig");
 }
 
 test "Modal: mount 在任意分配点失败时不泄漏（sweep）" {
@@ -575,4 +583,41 @@ test "Modal: mount 在任意分配点失败时不泄漏（sweep）" {
             return r.overlay;
         }
     }.m);
+}
+
+test "Modal: split open — ✕ and Esc are proposals the parent can reject" {
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
+    const root = try box(ctx, .{ .width = .{ .px = 800 }, .height = .{ .px = 600 } }, .{});
+    ctx.root = root;
+    const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
+    defer scope.dispose();
+
+    const open = try scope.createSignal(bool, true);
+    const Gate = struct {
+        open: *Signal(bool),
+        allow: bool = false,
+        asked: u32 = 0,
+        fn propose(self: *@This(), v: bool) void {
+            self.asked += 1;
+            if (self.allow) self.open.set(v);
+        }
+    };
+    var gate = Gate{ .open = open };
+    const result = try Modal(.{ .title = "Unsaved changes", .open = reactive.split(open, ctx.on(Gate, &gate, Gate.propose)) }).mount(scope, ctx);
+    if (!result.portaled) try root.appendChild(std.testing.allocator, result.overlay);
+    try std.testing.expect(result.open == null); // split: toggle owned by parent
+
+    const close_btn = result.dialog.children.items[0].children.items[1];
+    close_btn.behavior.events.on_click.?.invoke(); // X: rejected
+    ctx.handleKeyDown(.escape, .{}); // Esc: rejected
+    try std.testing.expectEqual(@as(u32, 2), gate.asked);
+    try std.testing.expect(open.peek());
+    try std.testing.expect(result.overlay.style.width != .px); // still open
+    try std.testing.expect(!ctx.overlay_stack.anyExiting()); // layer also no self-exit
+
+    gate.allow = true;
+    ctx.handleKeyDown(.escape, .{});
+    try std.testing.expect(!open.peek());
+    try std.testing.expect(ctx.overlay_stack.anyExiting()); // settle then open effect drive exit
 }

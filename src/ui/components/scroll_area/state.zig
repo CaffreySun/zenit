@@ -1,6 +1,6 @@
-/// ScrollArea 滚动状态
+/// ScrollArea scroll state
 ///
-/// ScrollState 结构体 + ScrollTuning 参数 + 所有 state 方法
+/// ScrollState struct + ScrollTuning params + all state methods
 const std = @import("std");
 const core = @import("../../core.zig");
 const Cx = core.Cx;
@@ -10,7 +10,7 @@ const physics = @import("../../physics.zig");
 const debug = @import("debug.zig");
 const logScroll = debug.logScroll;
 
-/// 滚动方向
+/// Scroll direction
 pub const ScrollDirection = enum(u8) {
     vertical,
     horizontal,
@@ -18,10 +18,10 @@ pub const ScrollDirection = enum(u8) {
 };
 
 pub const ScrollbarVisual = struct {
-    // macOS overlay scrollbar thumb: 6px 固定宽
+    // macOS overlay scrollbar thumb: 6px fixed width
     pub const idle_thickness: f32 = 6;
     pub const active_thickness: f32 = 6;
-    // 外层容器贴边，thumb 等效左右/上下 3px 内缩
+    // Outer container edge, thumb effectively inset 3px left/right or top/bottom
     pub const edge_inset: f32 = 3;
     pub const hover_slop: f32 = 6;
     pub const cross_axis_clearance: f32 = 12;
@@ -35,9 +35,9 @@ pub const ScrollbarAxisMetrics = struct {
     length: f32,
 };
 
-/// 滚动状态（通过 StateStore 持久化）
+/// Scroll state (persisted via StateStore)
 pub const ScrollState = struct {
-    /// clamped 滚动偏移，始终在 [0, max] 范围内
+    /// Clamped scroll offset, always in [0, max] range
     scroll_y: f32 = 0,
     scroll_x: f32 = 0,
     content_height: f32 = 0,
@@ -45,49 +45,55 @@ pub const ScrollState = struct {
     viewport_height: f32 = 0,
     viewport_width: f32 = 0,
 
-    /// 由外部（如 VirtualList）管理 content_height，scrollbarBeforeRender 不再用 rect.h 覆盖
+    /// External content_height management (e.g., VirtualList), scrollbarBeforeRender no longer
+    /// overrides with rect.h
     external_content_height: bool = false,
-    /// 由外部管理 content_width，scrollbarBeforeRender 不再用 rect.w 覆盖
+    /// External content_width management, scrollbarBeforeRender no longer overrides with rect.w
     external_content_width: bool = false,
 
-    /// 垂直方向 rubber band（果冻回弹）开关
+    /// Vertical rubber band (jelly rebound) toggle
     rubber_band_y_enabled: bool = true,
-    /// 水平方向 rubber band（果冻回弹）开关
+    /// Horizontal rubber band (jelly rebound) toggle
     rubber_band_x_enabled: bool = true,
 
-    /// 实例级调参覆盖（非 null 时优先于全局 scroll_tuning）
+    /// Instance-level tuning override (non-null preferred over global scroll_tuning)
     tuning_override: ?ScrollTuning = null,
 
-    /// 橡皮筋 bonus：边界外的视觉偏移（正=超过底部，负=超过顶部）
+    /// Rubber band bonus: visual offset beyond boundary (positive=past bottom, negative=past top)
     bonus_y: f32 = 0,
-    /// bonus 速度（弹簧物理，px/s）
+    /// Bonus speed (spring physics, px/s)
     bonus_velocity: f32 = 0,
-    /// 水平 bonus
+    /// Horizontal bonus
     bonus_x: f32 = 0,
     bonus_velocity_x: f32 = 0,
-    /// 手指在触控板上且本层持有这个手势（began/changed 起，到 ended/cancelled 止）。
-    /// 期间不跑回弹弹簧。鼠标滚轮没有手势，不会置位。
+    /// Finger on trackpad and this layer owns the gesture (began/changed through ended/cancelled).
+    /// No spring rebound during this window. Mouse wheel has no gesture, won't set.
     touching: bool = false,
-    /// 本层正在接收一段惯性（momentum began/changed 起，到 momentum ended 或新手势止）
+    /// This layer receiving momentum (momentum began/changed through momentum ended or new gesture)
     momentum_active: bool = false,
-    /// 本段惯性已在该轴越界（或松手时已越界）：之后朝外的惯性交给弹簧，不再推内容。
-    /// 下一个手势开始时清除。
+    /// This momentum already overshot this axis (or already overshot when released):
+    /// outward momentum thereafter handed to spring, no longer pushes content.
+    /// Cleared when next gesture begins.
     momentum_spent_y: bool = false,
     momentum_spent_x: bool = false,
-    /// 每次实际应用一次用户滚动输入（滚轮/手势/惯性/滚动条拖拽）加一。
-    /// 宿主比较前后两帧的值即可知道这帧有没有滚动输入。
+    /// Incremented each time actual user scroll input is applied (wheel/gesture/momentum/scrollbar
+    /// drag).
+    /// Host can compare values between frames to detect if this frame has scroll input.
     input_serial: u64 = 0,
-    /// 关联的 PropertyTree.scrolls id（maxInt = 未注册到 World）
+    /// Associated PropertyTree.scrolls id (maxInt = not registered to World)
     world_scroll_id: u32 = std.math.maxInt(u32),
-    /// World 引用（写 scroll offset 用）；不持有所有权
+    /// World reference (write scroll offset); doesn't own
     world_ref: ?*anyopaque = null,
-    /// macOS 手势 latching：本层是否是当前手势的归属者。
-    /// 手势首帧决定归属后中途不换手（NSScrollView 10.9+ 语义），momentum 跟随 latch。
+    /// macOS gesture latching: whether this layer is current gesture owner.
+    /// First frame determines ownership, no mid-gesture hand-off (NSScrollView 10.9+ semantics),
+    /// momentum follows latch.
     latched: bool = false,
-    /// 回弹动画：临界阻尼弹簧（native NSScrollView 手感），闭式解由绝对时间戳驱动。
+    /// Rebound animation: critical damping spring (native NSScrollView feel), closed-form solution
+    /// driven by absolute timestamp.
     bounce_start_time_y: f64 = 0,
     bounce_from_y: f32 = 0,
-    /// 弹簧初速度（px/s，越界方向为正向 bonus 增长方向），携带入射惯性
+    /// Spring initial velocity (px/s, outward direction is positive bonus growth direction),
+    /// carries incoming momentum
     bounce_v0_y: f32 = 0,
     bounce_active_y: bool = false,
     bounce_start_time_x: f64 = 0,
@@ -95,24 +101,24 @@ pub const ScrollState = struct {
     bounce_v0_x: f32 = 0,
     bounce_active_x: bool = false,
 
-    // 垂直滚动条动画 (委托给 FadeIndicator)
+    // Vertical scrollbar animation (delegated to FadeIndicator)
     scrollbar_fade: physics.FadeIndicator = .{},
     scrollbar_hovered: bool = false,
 
-    // 垂直滚动条拖拽
+    // Vertical scrollbar drag
     scrollbar_dragging: bool = false,
-    scrollbar_last_mouse_y: f32 = 0, // 上一帧鼠标 Y，用于算增量
+    scrollbar_last_mouse_y: f32 = 0, // previous frame mouse Y, used for delta calculation
 
-    // 水平滚动条动画
+    // Horizontal scrollbar animation
     scrollbar_fade_h: physics.FadeIndicator = .{},
     scrollbar_hovered_h: bool = false,
 
-    // 水平滚动条拖拽
+    // Horizontal scrollbar drag
     scrollbar_dragging_h: bool = false,
-    scrollbar_last_mouse_x: f32 = 0, // 上一帧鼠标 X，用于算增量
+    scrollbar_last_mouse_x: f32 = 0, // previous frame mouse X, used for delta calculation
 
-    /// 屏幕物理像素倍率（Retina=2, 普通=1）。
-    /// translate_y/x 量化到物理像素网格，消除文字滚动抖动。
+    /// Screen physical pixel ratio (Retina=2, standard=1).
+    /// translate_y/x quantized to physical pixel grid, eliminates text scroll jitter.
     pixel_scale: f32 = 2.0,
     /// Optional horizontal translate rebasing for very large scroll_x values.
     /// Default 0 keeps the regular `translate_x = -effectiveScrollX()` behavior.
@@ -122,18 +128,19 @@ pub const ScrollState = struct {
     /// small residual `scroll_y - base` into layout/GPU f32 coordinates.
     vertical_translate_rebase_base: f32 = 0,
 
-    // 橡皮筋物理 (委托给 RubberBand)
+    // Rubber band physics (delegated to RubberBand)
     rubber_band: physics.RubberBand = .{},
-    /// 水平方向与垂直同系数（native NSScrollView 两轴一致，均为 0.55）
+    /// Horizontal axis same coefficient as vertical (native NSScrollView both axes identical, both
+    /// 0.55)
     rubber_band_x: physics.RubberBand = .{},
 
-    /// 默认帧间隔（秒）
+    /// Default frame interval (seconds)
     pub const default_dt: f32 = 1.0 / 60.0;
 
-    /// 可调参数（用于演示调参）
+    /// Tunable parameters (for demo adjustment)
     pub const ScrollTuning = ScrollTuningT;
 
-    /// 全局调参（demo 可修改）
+    /// Global tuning (demo can modify)
     pub var scroll_tuning = ScrollTuningT{};
 
     pub fn maxScrollY(self: *const ScrollState) f32 {
@@ -146,14 +153,15 @@ pub const ScrollState = struct {
         return if (max > 0) max else 0;
     }
 
-    /// 用户是否正在滚动：手指在触控板上、惯性进行中或正在拖滚动条。
-    /// 全部由确定的开始/结束信号维护，不含任何超时。
+    /// Is user scrolling: finger on trackpad, momentum in progress, or dragging scrollbar.
+    /// All driven by definite start/end signals, no timeout involved.
     pub fn inputActive(self: *const ScrollState) bool {
         return self.touching or self.momentum_active or self.scrollbar_dragging or self.scrollbar_dragging_h;
     }
 
-    /// 本层开始持有一个新的触控板手势：接住进行中的回弹（保留当前越界量，
-    /// 内容停在手指按住的位置），并结束上一段惯性。
+    /// This layer begins holding a new trackpad gesture: catch in-progress rebound (keep current
+    /// overshoot,
+    /// content stops at finger position), end previous momentum.
     pub fn beginTouch(self: *ScrollState) void {
         if (self.touching) return;
         self.touching = true;
@@ -166,23 +174,23 @@ pub const ScrollState = struct {
         self.bonus_velocity_x = 0;
     }
 
-    /// 返回实例级 tuning（有 override 用 override，否则用全局）
+    /// Return instance-level tuning (use override if exists, else global)
     pub fn tuning(self: *const ScrollState) ScrollTuningT {
         return self.tuning_override orelse scroll_tuning;
     }
 
-    /// 实际视觉偏移 = scroll_y + bonus_y
+    /// actual visual offset = scroll_y + bonus_y
     pub fn effectiveScrollY(self: *const ScrollState) f32 {
         return self.scroll_y + self.bonus_y;
     }
 
-    /// 实际水平视觉偏移 = scroll_x + bonus_x
+    /// actual horizontal visual offset = scroll_x + bonus_x
     pub fn effectiveScrollX(self: *const ScrollState) f32 {
         return self.scroll_x + self.bonus_x;
     }
 
-    /// 将逻辑像素值量化到物理像素网格（消除文字滚动抖动）。
-    /// 例: pixel_scale=2 时，12.3 -> 12.5（= 25 物理像素 / 2）。
+    /// Snap logical pixel value to physical pixel grid (eliminates text scroll jitter).
+    /// Example: pixel_scale=2, 12.3 -> 12.5 (= 25 physical pixels / 2).
     pub fn snapToPixel(self: *const ScrollState, v: f32) f32 {
         const s = self.pixel_scale;
         return @round(v * s) / s;
@@ -209,15 +217,16 @@ pub const ScrollState = struct {
         return -self.snapToPixel(scroll - base);
     }
 
-    /// 入射初速度上限（px/s），防止极端 fling 把弹簧推得过深
+    /// Incoming velocity cap (px/s), prevent extreme fling from pushing spring too deep
     const max_bounce_v0: f32 = 2500;
-    /// 弹簧收敛判定：位移与速度都足够小才算 settle
+    /// Spring convergence criteria: both displacement and velocity sufficiently small to settle
     const bounce_settle_pos: f32 = 0.4;
     const bounce_settle_vel: f32 = 24.0;
 
-    /// 临界阻尼弹簧闭式解：b(t) = (b0 + (v0 + λ·b0)·t)·e^{-λt}。
-    /// v0 携带入射惯性：fling 冲进边界会先短暂加深再平滑回弹（native 手感），
-    /// 且与 rubber-band 阶段速度连续，没有换挡感。
+    /// Critical damping spring closed-form: b(t) = (b0 + (v0 + lambda*b0)*t)*e^(-lambda*t).
+    /// v0 carries incoming momentum: fling into boundary first overshoots briefly then smoothly
+    /// rebounds (native feel),
+    /// continuous velocity with rubber-band phase, no shift jolt.
     fn springAt(b0: f32, v0: f32, lambda: f32, t: f32) struct { pos: f32, vel: f32 } {
         const c1 = v0 + lambda * b0;
         const decay = @exp(-lambda * t);
@@ -226,7 +235,7 @@ pub const ScrollState = struct {
         return .{ .pos = pos, .vel = vel };
     }
 
-    /// 启动垂直回弹动画（从当前 bonus_y / bonus_velocity 出发弹回 0）
+    /// Start vertical rebound animation (spring from current bonus_y / bonus_velocity back to 0)
     pub fn startBounceY(self: *ScrollState, now_ms: f64) void {
         if (self.bonus_y == 0) return;
         self.bounce_from_y = self.bonus_y;
@@ -236,7 +245,7 @@ pub const ScrollState = struct {
         logScroll("bounce START Y: from={d:.2} v0={d:.1}", .{ self.bonus_y, self.bounce_v0_y });
     }
 
-    /// 启动水平回弹动画
+    /// Start horizontal rebound animation
     pub fn startBounceX(self: *ScrollState, now_ms: f64) void {
         if (self.bonus_x == 0) return;
         self.bounce_from_x = self.bonus_x;
@@ -246,11 +255,11 @@ pub const ScrollState = struct {
         logScroll("bounce START X: from={d:.2} v0={d:.1}", .{ self.bonus_x, self.bounce_v0_x });
     }
 
-    /// 每帧回弹：临界阻尼弹簧，绝对时间戳驱动。
-    /// 回弹 active 期间 outward momentum 被 event handler 拒绝。
+    /// Per-frame rebound: critical damping spring, absolute timestamp-driven.
+    /// During rebound active outward momentum rejected by event handler.
     pub fn tickBonus(self: *ScrollState, now_ms: f64) void {
         if (!self.bounce_active_y) {
-            // 非动画状态：有 bonus 且手指不在板上，启动回弹
+            // Non-animation state: has bonus and finger off pad, start rebound
             if (self.bonus_y != 0 and !self.touching) {
                 self.startBounceY(now_ms);
             } else {
@@ -258,7 +267,7 @@ pub const ScrollState = struct {
             }
         }
         if (self.touching) {
-            // 手指按住 -> 中断回弹
+            // Finger down -> interrupt rebound
             self.bounce_active_y = false;
             logScroll("tickBonus INTERRUPTED: bonus_y={d:.2} touching", .{self.bonus_y});
             return;
@@ -279,7 +288,7 @@ pub const ScrollState = struct {
         }
     }
 
-    /// 水平回弹
+    /// Horizontal rebound
     pub fn tickBonusX(self: *ScrollState, now_ms: f64) void {
         if (!self.bounce_active_x) {
             if (self.bonus_x != 0 and !self.touching) {
@@ -308,19 +317,19 @@ pub const ScrollState = struct {
         }
     }
 
-    /// 内容是否超出视口
+    /// Content overflows viewport
     pub fn needsScrollbar(self: *const ScrollState) bool {
         return self.content_height > self.viewport_height and self.viewport_height > 0;
     }
 
-    /// 滚动条高度（最小 30px）
+    /// Scrollbar height (min 30px)
     pub fn scrollbarHeight(self: *const ScrollState) f32 {
         if (self.content_height <= 0) return 30;
         const ratio = self.viewport_height / self.content_height;
         return @max(30, ratio * self.viewport_height);
     }
 
-    /// 滚动条 Y 位置
+    /// Scrollbar Y position
     pub fn scrollbarY(self: *const ScrollState) f32 {
         const max_scroll = self.maxScrollY();
         if (max_scroll <= 0) return 2;
@@ -329,12 +338,12 @@ pub const ScrollState = struct {
         return (self.scroll_y / max_scroll) * track_h + 2;
     }
 
-    /// 水平内容是否超出视口
+    /// Horizontal content overflows viewport
     pub fn needsHScrollbar(self: *const ScrollState) bool {
         return self.content_width > self.viewport_width and self.viewport_width > 0;
     }
 
-    /// 水平滚动条宽度（最小 30px）
+    /// Horizontal scrollbar width (min 30px)
     pub fn hScrollbarWidth(self: *const ScrollState) f32 {
         if (self.content_width <= 0) return 30;
         const ratio = self.viewport_width / self.content_width;
@@ -342,16 +351,16 @@ pub const ScrollState = struct {
     }
 
     pub fn onScrollActivity(self: *ScrollState) void {
-        // 默认两个轴都激活（用于无 axis 信息的场景：drag、hover）
+        // Default both axes active (for scenarios without axis info: drag, hover)
         self.onScrollActivityAxes(true, true);
     }
 
-    /// 按轴激活 scrollbar fade。
-    /// VSCode/Zed 标准：纯 Y 滚动只显示 Y scrollbar；纯 X 同理。
+    /// Per-axis scrollbar fade activation.
+    /// VSCode/Zed standard: pure Y scroll shows only Y scrollbar; pure X likewise.
     pub fn onScrollActivityAxes(self: *ScrollState, axis_y: bool, axis_x: bool) void {
         if (axis_y) self.scrollbar_fade.onActivity();
         if (axis_x) self.scrollbar_fade_h.onActivity();
-        // 同步调参到实例（有 override 时优先）
+        // Sync tuning to instance (override preferred when present)
         self.rubber_band.coefficient = self.tuning().rubber_band_coeff;
     }
 
@@ -367,61 +376,59 @@ pub const ScrollState = struct {
     }
 };
 
-/// 可调参数（用于演示调参）
+/// Tunable parameters (for demo adjustment)
 pub const ScrollTuningT = struct {
-    /// 越界拖拽阻尼系数 (Apple UIScrollView 标准 = 0.55)
-    /// 运行时同步到 state.rubber_band.coefficient
+    /// Overshoot drag damping coefficient (Apple UIScrollView standard = 0.55)
+    /// runtime sync to state.rubber_band.coefficient
     rubber_band_coeff: f32 = 0.55,
-    /// 抖动消除用的微小阈值（px）
+    /// Tiny threshold for jitter elimination (px)
     jitter_snap_epsilon: f32 = 0.35,
-    /// 进入边界前的预阻力区域（px）。
-    /// native macOS 到边界前是 1:1 无阻力（rubber band 只作用于越界后），默认关闭；
-    /// 保留参数供特殊场景 opt-in。
+    /// Pre-drag resistance zone before boundary (px).
+    /// Native macOS: 1:1 frictionless until boundary (rubber band only acts past boundary), default
+    /// off;
+    /// retain parameter for special scenario opt-in.
     edge_resistance_zone_px: f32 = 0.0,
-    /// 回弹弹簧临界阻尼系数 λ（1/s）。settle ≈ 6.6/λ ≈ 470ms，对齐 NSScrollView。
+    /// Rebound spring critical damping coefficient lambda (1/s). settle ~= 6.6/lambda ~= 470ms,
+    /// aligned with NSScrollView.
     bounce_spring_lambda: f32 = 14.0,
-    /// 边界处最小通过比例（用户主动滚动）
+    /// Minimum throughput ratio at boundary (user-driven scroll)
     edge_resistance_min_factor: f32 = 0.16,
-    /// 边界处最小通过比例（momentum，阻力更大）
+    /// Minimum throughput ratio at boundary (momentum, higher resistance)
     momentum_edge_resistance_min_factor: f32 = 0.12,
 };
 
-/// 节点 on_cleanup 与 ScrollEventCtx 之间的中转格。
-///
-/// 为什么必须有这一层：节点的 on_cleanup 回调要把 ctx 上的节点指针清成 null，
-/// 但**节点可能比 ctx 活得久，且解绑够不着它**,
-///   1. VirtualList 回收 slot 走 `detachChild + cx.freeNode`（`Node.destroy`
-///      只剩扩容 errdefer 一处）：invoke on_cleanup 但**不** dispose scope，
-///      于是 ctx 上四个字段被清空、ctx 本身却还活着；
-///   2. 保留模式下节点复用，同一 ctx 可能被装到**多个**节点上（陈旧重复的
-///      content 节点），而 `detachScrollAreaBindings` 只认 ctx 上那四格，
-///      清不到重复的那个；
-///   3. 于是 scope.dispose() 释放 ctx 后，那个够不着的节点稍后 freeNode 时
-///      invoke 回调 -> 写已释放内存 -> SIGSEGV。
-///      （下游应用实测：进板滚动 Layers 列表后返回首页，必崩。）
-///
-/// 所以回调一律改写本格，而**本格由 Cx 独占持有**（Cx.scroll_ctx_cells）：
-/// ctx 释放时只把 `ctx` 置 null，格子本身留到 Cx.deinit 统一回收。节点与
-/// scope 都不参与本格的生命周期，也就无从失衡；够不着的陈旧节点只会看到
-/// ctx == null，安全空转。
-///
-/// 代价：格子按 ScrollArea 挂载次数累积，直到 Cx 关闭才回收（每个仅 8 字节）。
-/// 实测下游应用跑 10 轮 board↔home 往返（含 Layers 列表滚动）总数 < 5 个,
-/// 保留模式下节点复用，重挂并不会新建。换来的是"任何释放顺序都不会 UAF"。
+/// Intermediate cell between Node on_cleanup and ScrollEventCtx.
+/// Why: on_cleanup must null the node pointer on ctx, but **a node may outlive ctx and be
+/// unreachable
+/// by detachChild**: (1) VirtualList recycles slots via `detachChild + cx.freeNode`: on_cleanup
+/// runs
+/// but the scope is **not** disposed, ctx's four fields are cleared, ctx lives on. (2) In retain
+/// mode
+/// one ctx may mount on **multiple** nodes (stale duplicates) that `detachScrollAreaBindings` can't
+/// reach (it only sees ctx's four slots). (3) scope.dispose() then frees ctx, and the unreachable
+/// node's
+/// callback later writes freed memory at freeNode -> SIGSEGV.
+/// So callbacks target this cell, **exclusively held by Cx** (Cx.scroll_ctx_cells): ctx release
+/// only
+/// nulls its `ctx` slot, the cell lives until Cx.deinit, stale nodes see ctx==null (safe no-op).
+/// Cost: one 8-byte cell per ScrollArea mount until Cx closes; accepted so no release order can
+/// UAF.
 pub const ScrollCtxCell = struct {
-    /// scope 释放 ScrollEventCtx 后置 null。
+    /// scope dispose of ScrollEventCtx nulls this.
     ctx: ?*ScrollEventCtx = null,
 };
 
 pub const ScrollEventCtx = struct {
     state: *ScrollState = undefined,
-    /// 节点指针在 ScrollArea 关联节点被 freeNode 时由 Node.ownership.hooks.on_cleanup 钩子清成 null。
-    /// 这样 scope.dispose() 在节点 *已经* 释放后才触发的清理回调也能安全地跳过悬垂指针。
+    /// Node pointer cleared by Node.ownership.hooks.on_cleanup when associated ScrollArea node
+    /// freeNode.
+    /// So scope.dispose() cleanup callbacks after node **already** released still safely skip
+    /// dangling pointer.
     content: ?*Node = null,
     container: ?*Node = null,
     scrollbar: ?*Node = null,
     scrollbar_h: ?*Node = null,
-    /// 节点 on_cleanup 实际写的中转格（见 ScrollCtxCell）。
+    /// Node on_cleanup actually writes to this intermediate cell (see ScrollCtxCell).
     cell: ?*ScrollCtxCell = null,
     cx: *Cx = undefined,
     scroll_speed: f32 = 1,

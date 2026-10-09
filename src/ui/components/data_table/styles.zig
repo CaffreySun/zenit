@@ -1,4 +1,4 @@
-//! DataTable 样式层，全部视觉决策集中在这里，mod.zig 的 mount 只消费。
+//! DataTable style layer, all visual decisions here, mod.zig's mount only consumes.
 const core = @import("../../core.zig");
 const Padding = core.Padding;
 
@@ -16,8 +16,8 @@ pub fn dataTableBorderWrapStyle(w: f32, t: *const core.ThemeTokens) core.BoxStyl
         .width = .{ .px = w },
         .height = .{ .fit = .{} },
         .direction = .column,
-        .background = t.color.bg_primary,
-        .border = .{ .width = 1, .color = t.color.border, .radius = t.radius.sm },
+        .background = t.tokens.color.bg_primary,
+        .border = .{ .width = 1, .color = t.tokens.color.border, .radius = t.tokens.radius.sm },
         .padding = Padding.all(1),
     };
 }
@@ -28,7 +28,7 @@ pub fn dataTableHeaderStyle(header_height: f32, t: *const core.ThemeTokens) core
         .height = .{ .px = header_height },
         .direction = .row,
         .align_items = .center,
-        .background = t.color.bg_secondary,
+        .background = t.tokens.color.bg_secondary,
     };
 }
 
@@ -42,10 +42,9 @@ pub fn dataTableHeaderCellStyle(w: f32) core.BoxStyle {
     };
 }
 
-pub fn dataTableHeaderTextProps(t: *const core.ThemeTokens) core.TextProps {
+pub fn dataTableHeaderTextStyle(t: *const core.ThemeTokens) core.TextStyle {
     return .{
-        .content = "",
-        .color = t.color.fg_secondary,
+        .color = t.tokens.color.fg_secondary,
         .font_size = 13,
         .font_weight = 600,
     };
@@ -59,14 +58,14 @@ pub fn resizeHandleStyle() core.BoxStyle {
     };
 }
 
-/// 行底色三元组（选中 / 偶行 / 奇行），striped 决定奇行是否用 bg_secondary
+/// Row background triple (selected / even / odd), striped determines if odd uses bg_secondary
 pub const RowColors = struct { selection: core.Color, even: core.Color, odd: core.Color };
 
 pub fn dataTableRowColors(striped: bool, t: *const core.ThemeTokens) RowColors {
     return .{
-        .selection = t.color.list_selection_bg,
-        .even = t.color.bg_primary,
-        .odd = if (striped) t.color.bg_secondary else t.color.bg_primary,
+        .selection = t.tokens.color.list_selection_bg,
+        .even = t.tokens.color.bg_primary,
+        .odd = if (striped) t.tokens.color.bg_secondary else t.tokens.color.bg_primary,
     };
 }
 
@@ -91,10 +90,9 @@ pub fn dataTableCellStyle(w: f32) core.BoxStyle {
     };
 }
 
-pub fn dataTableCellTextProps(t: *const core.ThemeTokens) core.TextProps {
+pub fn dataTableCellTextStyle(t: *const core.ThemeTokens) core.TextStyle {
     return .{
-        .content = "",
-        .color = t.color.fg_primary,
+        .color = t.tokens.color.fg_primary,
         .font_size = 13,
     };
 }
@@ -109,10 +107,9 @@ pub fn dataTablePagerStyle() core.BoxStyle {
     };
 }
 
-pub fn dataTablePageLabelText(t: *const core.ThemeTokens) core.TextProps {
+pub fn dataTablePageLabelText(t: *const core.ThemeTokens) core.TextStyle {
     return .{
-        .content = "Page 1 / 1",
-        .color = t.color.fg_secondary,
+        .color = t.tokens.color.fg_secondary,
         .font_size = 13,
     };
 }

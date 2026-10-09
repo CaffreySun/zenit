@@ -1,6 +1,6 @@
 const std = @import("std");
 
-/// 可探测的系统能力
+/// Detectable system capabilities
 pub const Capability = enum {
     clipboard,
     clipboard_image,
@@ -20,7 +20,7 @@ pub const Capability = enum {
     haptic_feedback,
 };
 
-/// 后端能力位
+/// Backend capability bits
 pub const Capabilities = struct {
     clipboard: bool = false,
     clipboard_image: bool = false,
@@ -111,7 +111,7 @@ pub const contracts = [_]Contract{
 };
 
 pub fn contractFor(capability: Capability) Contract {
-    return contracts[@intFromEnum(capability)];
+    return contracts[@backingInt(capability)];
 }
 
 pub fn implementationPresent(capability: Capability, vtable: anytype) bool {
@@ -137,8 +137,8 @@ pub fn implementationPresent(capability: Capability, vtable: anytype) bool {
 }
 
 pub fn validateAdvertised(caps: Capabilities, vtable: anytype) !void {
-    inline for (std.meta.fields(Capability)) |field| {
-        const capability: Capability = @enumFromInt(field.value);
+    inline for (@import("zenit_reflection").fields(Capability)) |field| {
+        const capability: Capability = @fromBackingInt(@intCast(field.value));
         if (caps.has(capability) and !implementationPresent(capability, vtable)) {
             return error.CapabilityContractMismatch;
         }
@@ -156,9 +156,9 @@ test "Capabilities.has" {
 }
 
 test "capability contracts cover every enum in declaration order" {
-    try std.testing.expectEqual(std.meta.fields(Capability).len, contracts.len);
+    try std.testing.expectEqual(@import("zenit_reflection").fields(Capability).len, contracts.len);
     inline for (contracts, 0..) |contract, i| {
-        try std.testing.expectEqual(@as(usize, @intFromEnum(contract.capability)), i);
+        try std.testing.expectEqual(@as(usize, @backingInt(contract.capability)), i);
         try std.testing.expect(contract.lifetime.len > 0);
     }
 }

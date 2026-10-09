@@ -20,9 +20,95 @@ const ToggleState = hooks.ToggleState;
 const useFocusRing = hooks.useFocusRing;
 const FocusRingAnimState = hooks.FocusRingAnimState;
 
+test "removeAllChildren cleanup reentry preserves siblings and World links" {
+    const Mode = enum { self_detach, sibling_detach, reparent, recursive_clear, reorder };
+    const Probe = struct {
+        cx: *Cx,
+        parent: *core.Node,
+        destination: *core.Node,
+        nodes: [3]*core.Node,
+        calls: [3]u32 = .{ 0, 0, 0 },
+        mode: Mode,
+        fn first(raw: *anyopaque) void {
+            const p: *@This() = @ptrCast(@alignCast(raw));
+            p.calls[0] += 1;
+            switch (p.mode) {
+                .self_detach => p.cx.detachChild(p.parent, p.nodes[0]),
+                .sibling_detach => p.cx.detachChild(p.parent, p.nodes[1]),
+                .reparent => p.destination.appendChild(p.cx.allocator, p.nodes[0]) catch unreachable,
+                .recursive_clear => p.parent.removeAllChildren(),
+                .reorder => {},
+            }
+        }
+        fn second(raw: *anyopaque) void {
+            const p: *@This() = @ptrCast(@alignCast(raw));
+            p.calls[1] += 1;
+            if (p.mode == .reorder and p.nodes[0].parent == p.parent) {
+                // B stays at index 1 and length stays 3, but unvisited C moves
+                // behind the traversal cursor. Slot/length checks miss it.
+                p.parent.replaceChildOrder(p.cx.allocator, &.{ p.nodes[2], p.nodes[1], p.nodes[0] }) catch unreachable;
+            }
+        }
+        fn third(raw: *anyopaque) void {
+            const p: *@This() = @ptrCast(@alignCast(raw));
+            p.calls[2] += 1;
+        }
+    };
+    for ([_]bool{ false, true }) |nested| {
+        for (std.enums.values(Mode)) |mode| {
+            const cx = try Cx.init(std.testing.allocator, std.testing.io);
+            defer cx.deinit();
+            const root = try core.box(cx, .{}, .{});
+            cx.root = root;
+            const parent = try core.box(cx, .{}, .{});
+            const destination = try core.box(cx, .{}, .{});
+            try root.appendChild(cx.allocator, parent);
+            try root.appendChild(cx.allocator, destination);
+            var outer: ?*core.Node = null;
+            if (nested) {
+                outer = try core.box(cx, .{}, .{});
+                try root.appendChild(cx.allocator, outer.?);
+                try outer.?.appendChild(cx.allocator, parent);
+            }
+            var nodes: [3]*core.Node = undefined;
+            for (&nodes) |*slot| {
+                slot.* = try core.box(cx, .{}, .{});
+                try parent.appendChild(cx.allocator, slot.*);
+                slot.*.frame_state.state_bits.flags.is_mounted = true;
+            }
+            var probe = Probe{ .cx = cx, .parent = parent, .destination = destination, .nodes = nodes, .mode = mode };
+            onCleanup(nodes[0], Cx.simpleHandler(Probe.first, &probe));
+            onCleanup(nodes[1], Cx.simpleHandler(Probe.second, &probe));
+            onCleanup(nodes[2], Cx.simpleHandler(Probe.third, &probe));
+            (outer orelse parent).removeAllChildren();
+            try std.testing.expectEqualSlices(u32, &.{ 1, 1, 1 }, &probe.calls);
+            if (nested) {
+                try std.testing.expect(parent.parent == null);
+                // Detaching a subtree cleans descendants but retains their links.
+                parent.removeAllChildren();
+            }
+            try std.testing.expectEqual(@as(usize, 0), parent.children.items.len);
+            const parent_eid = core.world.ElementId.fromRaw(parent.element_id_raw);
+            try std.testing.expectEqual(@as(u32, 0), cx.world.elements.childCount(parent_eid));
+            for (nodes, 0..) |node, i| {
+                const expected_parent: ?*core.Node = if (mode == .reparent and i == 0) destination else null;
+                try std.testing.expect(node.parent == expected_parent);
+                const links = cx.world.elements.links(core.world.ElementId.fromRaw(node.element_id_raw)).?;
+                if (expected_parent) |p| {
+                    try std.testing.expect(links.parent.eql(core.world.ElementId.fromRaw(p.element_id_raw)));
+                } else {
+                    try std.testing.expect(links.parent.isNull());
+                    cx.freeNode(node);
+                }
+            }
+            if (nested) cx.freeNode(parent);
+        }
+    }
+}
+
 test "useHover: basic" {
     const box = core.box;
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 200 }, .height = .{ .px = 100 } }, .{});
@@ -36,14 +122,14 @@ test "useHover: basic" {
 
     const is_hovered = try useHover(scope, node);
 
-    // 初始状态
+    // initial state
     try std.testing.expect(!is_hovered.get());
 
-    // 模拟 hover
+    // simulate hover
     node.behavior.events.on_hover.?.invoke();
     try std.testing.expect(is_hovered.get());
 
-    // 模拟 leave
+    // simulate leave
     node.behavior.events.on_leave.?.invoke();
     try std.testing.expect(!is_hovered.get());
 }
@@ -51,7 +137,7 @@ test "useHover: basic" {
 test "useHoverHighlight: border_color with animation" {
     const box = core.box;
     const t = &core.theme.dark;
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 200 }, .height = .{ .px = 100 } }, .{});
@@ -61,7 +147,7 @@ test "useHoverHighlight: border_color with animation" {
     const inner = try box(ctx, .{
         .width = .{ .px = 80 },
         .height = .{ .px = 30 },
-        .border = .{ .width = 1, .color = t.color.checkbox_border },
+        .border = .{ .width = 1, .color = t.tokens.color.checkbox_border },
     }, .{});
     try root.appendChild(std.testing.allocator, container);
     try container.appendChild(std.testing.allocator, inner);
@@ -71,15 +157,15 @@ test "useHoverHighlight: border_color with animation" {
     const render_engine = @import("core/render_engine/mod.zig");
     var now_ms: f64 = 0;
 
-    _ = try useHoverHighlight(scope, container, inner, .border_color, t.color.checkbox_border, t.color.accent, .{});
+    _ = try useHoverHighlight(scope, container, inner, .border_color, t.tokens.color.checkbox_border, t.tokens.color.accent, .{});
 
-    // 初始: normal 色
-    try std.testing.expect(Color.eql(inner.style.border.color, t.color.checkbox_border));
+    // initial: normal color
+    try std.testing.expect(Color.eql(inner.style.border.color, t.tokens.color.checkbox_border));
 
-    // hover -> 触发动画，tick 足够帧后应收敛到 accent 色。
-    // 注意：setTarget 用 render_engine.current_frame_time_ms 作为动画起点
-    // （hooks.zig:609），所以必须**先把帧时钟设成当前值再 invoke**，否则
-    // 动画起点停在 0 而后续 tick 从 16ms 起跳，进度计算错位。
+    // hover -> animation triggered, after enough ticks should converge to accent color. note:
+    // setTarget uses render_engine.current_frame_time_ms as animation start (hooks.zig:609), so
+    // must **set frame clock to current value first then invoke**, else start at 0 but ticks from
+    // 16ms, progress misaligned.
     render_engine.current_frame_time_ms = now_ms;
     render_engine.current_frame_dt_ms = 16.0;
     container.behavior.events.on_hover.?.invoke();
@@ -91,9 +177,9 @@ test "useHoverHighlight: border_color with animation" {
             if (cb_opt) |cb| cb(inner);
         }
     }
-    try std.testing.expect(Color.eql(inner.style.border.color, t.color.accent));
+    try std.testing.expect(Color.eql(inner.style.border.color, t.tokens.color.accent));
 
-    // leave -> tick 足够帧后恢复 normal 色（同样先对齐帧时钟）
+    // leave -> after enough frames restore normal color (align frame clock first too)
     render_engine.current_frame_time_ms = now_ms;
     container.behavior.events.on_leave.?.invoke();
     for (0..30) |_| {
@@ -104,12 +190,12 @@ test "useHoverHighlight: border_color with animation" {
             if (cb_opt) |cb| cb(inner);
         }
     }
-    try std.testing.expect(Color.eql(inner.style.border.color, t.color.checkbox_border));
+    try std.testing.expect(Color.eql(inner.style.border.color, t.tokens.color.checkbox_border));
 }
 
 test "onMount: triggered after layout" {
     const box = core.box;
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 200 }, .height = .{ .px = 100 } }, .{});
@@ -126,25 +212,25 @@ test "onMount: triggered after layout" {
         }
     }.handler, &mounted));
 
-    // 布局前不触发
+    // doesn't trigger before layout
     try std.testing.expect(!mounted);
     try std.testing.expect(!child.frame_state.state_bits.flags.is_mounted);
 
-    // 布局后触发
+    // triggers after layout
     ctx.layout();
     try std.testing.expect(mounted);
     try std.testing.expect(child.frame_state.state_bits.flags.is_mounted);
 
-    // 再次布局不会重复触发
+    // re-layout doesn't trigger again
     mounted = false;
     root.markLayoutDirty();
     ctx.layout();
-    try std.testing.expect(!mounted); // 不重复
+    try std.testing.expect(!mounted); // not duplicate
 }
 
 test "onCleanup: triggered on removeChild" {
     const box = core.box;
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 200 }, .height = .{ .px = 100 } }, .{});
@@ -153,8 +239,8 @@ test "onCleanup: triggered on removeChild" {
     const child = try box(ctx, .{ .width = .{ .px = 50 }, .height = .{ .px = 50 } }, .{});
     try root.appendChild(std.testing.allocator, child);
 
-    // 计数器而非 bool：双触发时第二次写 true 无感，历史上因此漏掉
-    // detachChild -> freeNode 链上的 on_cleanup 二次 invoke（refcount 下溢级 bug）
+    // counter not bool: double-trigger's second write true has no effect, history missed on_cleanup
+    // second invoke on detachChild -> freeNode chain (refcount underflow bug)
     var clean_count: u32 = 0;
     onCleanup(child, core.Cx.simpleHandler(struct {
         fn handler(c: *anyopaque) void {
@@ -163,25 +249,25 @@ test "onCleanup: triggered on removeChild" {
         }
     }.handler, &clean_count));
 
-    // 先布局使其 mounted
+    // layout first to mount
     ctx.layout();
     try std.testing.expect(child.frame_state.state_bits.flags.is_mounted);
     try std.testing.expectEqual(@as(u32, 0), clean_count);
 
-    // 移除触发 cleanup
+    // remove triggers cleanup
     ctx.detachChild(root, child);
     try std.testing.expectEqual(@as(u32, 1), clean_count);
     try std.testing.expect(!child.frame_state.state_bits.flags.is_mounted);
 
-    // 手动释放被移除的节点 (不在树中, ctx.deinit 不会释放)
-    // freeNode 不得再次触发 on_cleanup，一次性消费
+    // manually free removed node (not in tree, ctx.deinit won't free). freeNode must not trigger
+    // on_cleanup again, one-time consume.
     ctx.freeNode(child);
     try std.testing.expectEqual(@as(u32, 1), clean_count);
 }
 
 test "onCleanup: recursive for nested children" {
     const box = core.box;
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 200 }, .height = .{ .px = 100 } }, .{});
@@ -209,12 +295,12 @@ test "onCleanup: recursive for nested children" {
 
     ctx.layout();
 
-    // 移除 parent_node 应同时触发子节点的 cleanup
+    // removing parent_node should also trigger child cleanup
     ctx.detachChild(root, parent_node);
     try std.testing.expectEqual(@as(u32, 1), parent_clean_count);
     try std.testing.expectEqual(@as(u32, 1), child_clean_count);
 
-    // 手动释放被移除的节点；子树各节点的 on_cleanup 不得二次触发
+    // manually free removed node; subtree nodes' on_cleanup must not trigger twice
     ctx.freeNode(parent_node);
     try std.testing.expectEqual(@as(u32, 1), parent_clean_count);
     try std.testing.expectEqual(@as(u32, 1), child_clean_count);
@@ -223,28 +309,28 @@ test "onCleanup: recursive for nested children" {
 test "useAnimatedBackground: creates state and hover signal" {
     const box = core.box;
     const t = &core.theme.dark;
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 200 }, .height = .{ .px = 100 } }, .{});
     ctx.root = root;
 
-    const node = try box(ctx, .{ .width = .{ .px = 100 }, .height = .{ .px = 50 }, .background = t.color.accent }, .{});
+    const node = try box(ctx, .{ .width = .{ .px = 100 }, .height = .{ .px = 50 }, .background = t.tokens.color.accent }, .{});
     try root.appendChild(std.testing.allocator, node);
 
     const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
     defer scope.dispose();
 
     const is_hovered = try useAnimatedBackground(scope, ctx, node, .{
-        .normal = t.color.accent,
-        .hover = t.color.accent_hover,
+        .normal = t.tokens.color.accent,
+        .hover = t.tokens.color.accent_hover,
     });
 
-    // 初始状态
+    // initial state
     try std.testing.expect(!is_hovered.get());
     try std.testing.expect(node.meta.per_frame.hooks.before_render.main != null or node.meta.per_frame.hooks.before_render.count > 0);
 
-    // hover -> 设置 Signal
+    // hover -> set Signal
     node.behavior.events.on_hover.?.invoke();
     try std.testing.expect(is_hovered.get());
 }
@@ -252,7 +338,7 @@ test "useAnimatedBackground: creates state and hover signal" {
 test "useAnimatedBackground: normal override survives recipe color refresh" {
     const box = core.box;
     const t = &core.theme.dark;
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const node = try box(ctx, .{ .width = .{ .px = 100 }, .height = .{ .px = 50 } }, .{});
@@ -260,15 +346,15 @@ test "useAnimatedBackground: normal override survives recipe color refresh" {
     const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
     defer scope.dispose();
     _ = try useAnimatedBackground(scope, ctx, node, .{
-        .normal = t.color.accent,
-        .hover = t.color.accent_hover,
+        .normal = t.tokens.color.accent,
+        .hover = t.tokens.color.accent_hover,
     });
 
     const state: *AnimBgState = @ptrCast(@alignCast(node.meta.per_frame.hooks.slots.animated_bg_state.?));
     const override = Color.hex(0x123456);
     const refreshed_recipe = Color.hex(0x654321);
     state.setNormalOverride(override);
-    state.setColors(refreshed_recipe, t.color.bg_hover);
+    state.setColors(refreshed_recipe, t.tokens.color.bg_hover);
     try std.testing.expect(Color.eql(state.normal_bg, override));
     try std.testing.expect(Color.eql(state.recipe_normal_bg, refreshed_recipe));
 
@@ -280,21 +366,21 @@ test "useAnimatedBackground: uses dedicated node slot" {
     const box = core.box;
     const render_engine = @import("core/render_engine/mod.zig");
     const t = &core.theme.dark;
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 200 }, .height = .{ .px = 100 } }, .{});
     ctx.root = root;
 
-    const node = try box(ctx, .{ .width = .{ .px = 100 }, .height = .{ .px = 50 }, .background = t.color.accent }, .{});
+    const node = try box(ctx, .{ .width = .{ .px = 100 }, .height = .{ .px = 50 }, .background = t.tokens.color.accent }, .{});
     try root.appendChild(std.testing.allocator, node);
 
     const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
     defer scope.dispose();
 
     _ = try useAnimatedBackground(scope, ctx, node, .{
-        .normal = t.color.accent,
-        .hover = t.color.accent_hover,
+        .normal = t.tokens.color.accent,
+        .hover = t.tokens.color.accent_hover,
     });
 
     var dummy: u8 = 0;
@@ -318,19 +404,19 @@ test "useAnimatedBackground: uses dedicated node slot" {
 test "useAnimatedBackground: scope dispose removes hook state" {
     const box = core.box;
     const t = &core.theme.dark;
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 200 }, .height = .{ .px = 100 } }, .{});
     ctx.root = root;
 
-    const node = try box(ctx, .{ .width = .{ .px = 100 }, .height = .{ .px = 50 }, .background = t.color.accent }, .{});
+    const node = try box(ctx, .{ .width = .{ .px = 100 }, .height = .{ .px = 50 }, .background = t.tokens.color.accent }, .{});
     try root.appendChild(std.testing.allocator, node);
 
     const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
     _ = try useAnimatedBackground(scope, ctx, node, .{
-        .normal = t.color.accent,
-        .hover = t.color.accent_hover,
+        .normal = t.tokens.color.accent,
+        .hover = t.tokens.color.accent_hover,
     });
 
     try std.testing.expect(node.meta.per_frame.hooks.slots.animated_bg_state != null);
@@ -346,21 +432,21 @@ test "useAnimatedBackground: beforeRender clears stale hover state from detached
     const box = core.box;
     const render_engine = @import("core/render_engine/mod.zig");
     const t = &core.theme.dark;
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 200 }, .height = .{ .px = 100 } }, .{});
     ctx.root = root;
 
-    const node = try box(ctx, .{ .width = .{ .px = 100 }, .height = .{ .px = 50 }, .background = t.color.accent }, .{});
+    const node = try box(ctx, .{ .width = .{ .px = 100 }, .height = .{ .px = 50 }, .background = t.tokens.color.accent }, .{});
     try root.appendChild(std.testing.allocator, node);
 
     const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
     defer scope.dispose();
 
     const is_hovered = try useAnimatedBackground(scope, ctx, node, .{
-        .normal = t.color.accent,
-        .hover = t.color.accent_hover,
+        .normal = t.tokens.color.accent,
+        .hover = t.tokens.color.accent_hover,
     });
 
     node.behavior.events.on_hover.?.invoke();
@@ -376,29 +462,29 @@ test "useAnimatedBackground: beforeRender clears stale hover state from detached
     }
 
     try std.testing.expect(!is_hovered.get());
-    try std.testing.expect(Color.eql(node.getBackground(), t.color.accent));
+    try std.testing.expect(Color.eql(node.getBackground(), t.tokens.color.accent));
 }
 
 test "useAnimatedBackground: beforeRender reacts to pressed state release without hover signal change" {
     const box = core.box;
     const render_engine = @import("core/render_engine/mod.zig");
     const t = &core.theme.dark;
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 200 }, .height = .{ .px = 100 } }, .{});
     ctx.root = root;
 
-    const node = try box(ctx, .{ .width = .{ .px = 100 }, .height = .{ .px = 50 }, .background = t.color.accent }, .{});
+    const node = try box(ctx, .{ .width = .{ .px = 100 }, .height = .{ .px = 50 }, .background = t.tokens.color.accent }, .{});
     try root.appendChild(std.testing.allocator, node);
 
     const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
     defer scope.dispose();
 
     _ = try useAnimatedBackground(scope, ctx, node, .{
-        .normal = t.color.accent,
-        .hover = t.color.accent_hover,
-        .pressed = t.color.bg_active,
+        .normal = t.tokens.color.accent,
+        .hover = t.tokens.color.accent_hover,
+        .pressed = t.tokens.color.bg_active,
     });
 
     node.behavior.events.on_hover.?.invoke();
@@ -413,7 +499,7 @@ test "useAnimatedBackground: beforeRender reacts to pressed state release withou
             if (cb_opt) |cb| cb(node);
         }
     }
-    try std.testing.expect(Color.eql(node.getBackground(), t.color.bg_active));
+    try std.testing.expect(Color.eql(node.getBackground(), t.tokens.color.bg_active));
 
     ctx.pressed_node = null;
     for (0..30) |_| {
@@ -424,13 +510,13 @@ test "useAnimatedBackground: beforeRender reacts to pressed state release withou
         }
     }
 
-    try std.testing.expect(Color.eql(node.getBackground(), t.color.accent_hover));
+    try std.testing.expect(Color.eql(node.getBackground(), t.tokens.color.accent_hover));
 }
 
 test "invalidateSubtreeHookState detaches hook back-pointers before scope dispose" {
     const box = core.box;
     const t = &core.theme.dark;
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 200 }, .height = .{ .px = 100 } }, .{});
@@ -438,13 +524,13 @@ test "invalidateSubtreeHookState detaches hook back-pointers before scope dispos
 
     const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
 
-    const node = try box(ctx, .{ .width = .{ .px = 100 }, .height = .{ .px = 50 }, .background = t.color.accent }, .{});
+    const node = try box(ctx, .{ .width = .{ .px = 100 }, .height = .{ .px = 50 }, .background = t.tokens.color.accent }, .{});
     node.setFocusable(true);
     try root.appendChild(std.testing.allocator, node);
 
     _ = try useAnimatedBackground(scope, ctx, node, .{
-        .normal = t.color.accent,
-        .hover = t.color.accent_hover,
+        .normal = t.tokens.color.accent,
+        .hover = t.tokens.color.accent_hover,
     });
     try useFocusRing(scope, ctx, node, .{});
 
@@ -463,10 +549,47 @@ test "invalidateSubtreeHookState detaches hook back-pointers before scope dispos
     try std.testing.expect(node.meta.per_frame.hooks.slots.focus_ring_anim == null);
 }
 
+test "invalidateSubtreeHookState unhooks focus-ring handlers so blur after scope dispose is safe" {
+    // reproduce Notification in-place convert: invalidate hook, dispose scope first, then unlink
+    // while focus still on node (clearFocus -> on_blur). pre-fix on_blur reads/writes FocusRingCtx
+    // / signal freed with scope.
+    const box = core.box;
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
+    const root = try box(ctx, .{ .width = .{ .px = 200 }, .height = .{ .px = 100 } }, .{});
+    ctx.root = root;
+    const node = try box(ctx, .{ .width = .{ .px = 100 }, .height = .{ .px = 50 } }, .{});
+    node.setFocusable(true);
+    try root.appendChild(std.testing.allocator, node);
+
+    const Prev = struct {
+        var blurs: u32 = 0;
+        fn onBlur(_: *anyopaque) void {
+            blurs += 1;
+        }
+    };
+    Prev.blurs = 0;
+    var dummy: u8 = 0;
+    node.behavior.events.on_blur = Cx.simpleHandler(Prev.onBlur, &dummy);
+
+    const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
+    try useFocusRing(scope, ctx, node, .{});
+    ctx.focus_manager.setFocus(node);
+
+    invalidateSubtreeHookState(node);
+    // focus ring handler removed, restore original handler
+    try std.testing.expect(node.behavior.events.on_focus == null);
+    try std.testing.expect(node.behavior.events.on_blur.?.callback == &Prev.onBlur);
+    scope.dispose();
+    ctx.detachChildRetained(root, node); // clearFocus -> on_blur: only call original handler
+    try std.testing.expectEqual(@as(u32, 1), Prev.blurs);
+    ctx.freeNode(node);
+}
+
 test "freeNode detaches hook back-pointers for nodes owned by external scope" {
     const box = core.box;
     const t = &core.theme.dark;
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 200 }, .height = .{ .px = 100 } }, .{});
@@ -475,7 +598,7 @@ test "freeNode detaches hook back-pointers for nodes owned by external scope" {
     const parent = try box(ctx, .{ .width = .{ .px = 120 }, .height = .{ .px = 80 } }, .{});
     try root.appendChild(std.testing.allocator, parent);
 
-    const node = try box(ctx, .{ .width = .{ .px = 100 }, .height = .{ .px = 50 }, .background = t.color.accent }, .{});
+    const node = try box(ctx, .{ .width = .{ .px = 100 }, .height = .{ .px = 50 }, .background = t.tokens.color.accent }, .{});
     try parent.appendChild(std.testing.allocator, node);
 
     const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
@@ -483,8 +606,8 @@ test "freeNode detaches hook back-pointers for nodes owned by external scope" {
     defer if (!scope_disposed) scope.dispose();
 
     _ = try useAnimatedBackground(scope, ctx, node, .{
-        .normal = t.color.accent,
-        .hover = t.color.accent_hover,
+        .normal = t.tokens.color.accent,
+        .hover = t.tokens.color.accent_hover,
     });
 
     const anim_state: *AnimBgState = @ptrCast(@alignCast(node.meta.per_frame.hooks.slots.animated_bg_state.?));
@@ -544,7 +667,7 @@ test "useToggle: callback fires" {
 test "useFocusRing: tab focus shows outline with animation, blur fades out" {
     const box = core.box;
     const t = &core.theme.dark;
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 200 }, .height = .{ .px = 100 } }, .{});
@@ -559,10 +682,10 @@ test "useFocusRing: tab focus shows outline with animation, blur fades out" {
 
     try useFocusRing(scope, ctx, node, .{});
 
-    // 初始: 无 outline
+    // initial: no outline
     try std.testing.expect(node.style.outline() == null);
 
-    // Tab focus -> tick 足够帧后 outline 出现 (opacity -> 1.0)
+    // Tab focus -> after enough frames outline appears (opacity -> 1.0)
     ctx.focus_manager.last_focus_reason = .tab;
     node.behavior.events.on_focus.?.invoke();
     for (0..30) |_| {
@@ -571,13 +694,13 @@ test "useFocusRing: tab focus shows outline with animation, blur fades out" {
         }
     }
     try std.testing.expect(node.style.outline() != null);
-    // outline color alpha 应该接近 focus_ring 的原始 alpha
+    // outline color alpha should be close to focus_ring original alpha
     try std.testing.expectEqual(@as(f32, 1.5), node.style.outline().?.width);
     try std.testing.expectEqual(@as(f32, 2), node.style.outline().?.offset);
-    // 颜色应该接近 focus_ring (alpha 可能因为 opacity=1.0 而完全一致)
-    try std.testing.expect(Color.eql(node.style.outline().?.color, t.color.focus_ring));
+    // color should be close to focus_ring (alpha may be identical due to opacity=1.0)
+    try std.testing.expect(Color.eql(node.style.outline().?.color, t.tokens.color.focus_ring));
 
-    // blur -> tick 足够帧后 outline 消失 (opacity -> 0.0)
+    // blur -> after enough frames outline disappears (opacity -> 0.0)
     node.behavior.events.on_blur.?.invoke();
     for (0..30) |_| {
         for (node.meta.per_frame.hooks.before_render.hooks[0..node.meta.per_frame.hooks.before_render.count]) |cb_opt| {
@@ -589,7 +712,7 @@ test "useFocusRing: tab focus shows outline with animation, blur fades out" {
 
 test "useFocusRing: click focus does NOT show outline" {
     const box = core.box;
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 200 }, .height = .{ .px = 100 } }, .{});
@@ -604,7 +727,7 @@ test "useFocusRing: click focus does NOT show outline" {
 
     try useFocusRing(scope, ctx, node, .{});
 
-    // 鼠标点击 focus -> tick 后仍不显示 outline
+    // mouse click focus -> outline still not shown after tick
     ctx.focus_manager.last_focus_reason = .click;
     node.behavior.events.on_focus.?.invoke();
     for (0..30) |_| {
@@ -616,12 +739,13 @@ test "useFocusRing: click focus does NOT show outline" {
 }
 
 test "useFocusRing: focused input scrolled out of ScrollArea does not steal clicks" {
-    // 方案 §9.2 第 14 条（附录 A 探针 3 的组件版）。useFocusRing 在 focus-visible 时把
-    // 控件提到 z_index=1（压住同级兄弟）。旧实现里 z>0 让命中清空祖先 clip 链并拿到全局
-    // stacking_z：控件滚出 ScrollArea 视口后，像素被裁掉了，却仍抢走视口外 header 的点击。
+    // spec $9.2 item 14 (appendix A probe 3 component version). useFocusRing on focus-visible
+    // raises control to z_index=1 (over siblings). old impl z>0 cleared ancestor clip chain, got
+    // global stacking_z: control scrolled outside ScrollArea viewport, pixels clipped, yet stole
+    // header outside-viewport clicks.
     const box = core.box;
     const scroll_area = @import("components/scroll_area/mod.zig");
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     ctx.setViewport(300, 300);
 
@@ -635,7 +759,7 @@ test "useFocusRing: focused input scrolled out of ScrollArea does not steal clic
     header.setFocusable(true);
     try root.appendChild(std.testing.allocator, header);
 
-    const area = try scroll_area.mountScrollArea(.{ .width = 300, .height = 200, .content_height = 600 }, scope, ctx);
+    const area = try scroll_area.ScrollArea(.{ .width = 300, .height = 200, .content_height = 600 }).mount(scope, ctx);
     try root.appendChild(std.testing.allocator, area.container);
 
     const lead = try box(ctx, .{ .width = .{ .px = 300 }, .height = .{ .px = 150 } }, .{});
@@ -651,7 +775,7 @@ test "useFocusRing: focused input scrolled out of ScrollArea does not steal clic
     ctx.layout();
     _ = ctx.render();
 
-    // Tab 聚焦 -> focus-visible -> z_index 提升到 1。
+    // Tab focus -> focus-visible -> z_index raised to 1.
     ctx.focus_manager.last_focus_reason = .tab;
     field.behavior.events.on_focus.?.invoke();
     try std.testing.expectEqual(@as(i16, 1), field.style.z_index());
@@ -659,10 +783,10 @@ test "useFocusRing: focused input scrolled out of ScrollArea does not steal clic
     ctx.layout();
     _ = ctx.render();
 
-    // 未滚动：field 在视口内（世界 y = 100+150 = 250..290），点得到。
+    // not scrolled: field in viewport (world y = 100+150 = 250..290), hittable.
     try std.testing.expectEqual(field, ctx.hitTest(20, 260).?);
 
-    // 滚动 200：field 世界 y = 50..90，整个在视口（y ≥ 100）之上，落在 header 区。
+    // scroll 200: field world y = 50..90, entire above viewport (y >= 100), in header area.
     scroll_area.setScrollY(area.state, area.content, 200);
     ctx.frame_time_ms += 16;
     ctx.layout();
@@ -670,13 +794,13 @@ test "useFocusRing: focused input scrolled out of ScrollArea does not steal clic
     try std.testing.expectApproxEqAbs(@as(f32, 50), field.globalRect().y, 0.5);
     try std.testing.expectEqual(@as(i16, 1), field.style.z_index());
 
-    // 视口外的 header 区必须命中 header，而不是被裁掉、看不见的 field。
+    // header area outside viewport must hit header, not clipped-invisible field.
     try std.testing.expectEqual(header, ctx.hitTest(20, 60).?);
 }
 
 test "useFocusRing: custom config with tab" {
     const box = core.box;
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 200 }, .height = .{ .px = 100 } }, .{});
@@ -697,7 +821,7 @@ test "useFocusRing: custom config with tab" {
 
     ctx.focus_manager.last_focus_reason = .tab;
     node.behavior.events.on_focus.?.invoke();
-    // tick 足够帧让动画收敛
+    // tick enough frames for animation convergence
     for (0..30) |_| {
         for (node.meta.per_frame.hooks.before_render.hooks[0..node.meta.per_frame.hooks.before_render.count]) |cb_opt| {
             if (cb_opt) |cb| cb(node);
@@ -711,7 +835,7 @@ test "useFocusRing: custom config with tab" {
 
 test "useFocusRing: scope dispose removes hook state" {
     const box = core.box;
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 200 }, .height = .{ .px = 100 } }, .{});
@@ -730,4 +854,81 @@ test "useFocusRing: scope dispose removes hook state" {
 
     try std.testing.expect(node.meta.per_frame.hooks.slots.focus_ring_anim == null);
     try std.testing.expectEqual(@as(u8, 0), node.meta.per_frame.hooks.before_render.count);
+}
+
+test "hover subscriptions detach independently and survive callback disposal" {
+    const cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    const scope = try Scope.init(std.testing.allocator, null, cx.owner);
+    defer scope.dispose();
+    const a = try scope.childScope();
+    const b = try scope.childScope();
+    const node = try core.box(cx, .{}, .{});
+    cx.root = node;
+    _ = try useHover(a, node);
+    const second = try useHover(b, node);
+    a.dispose(); // oldest listener first; newer listener stays wired
+    try std.testing.expectEqual(@as(u8, 1), node.meta.ownership.debug_slots.signal_count);
+    try std.testing.expectEqual(@as(*anyopaque, @ptrCast(second)), node.meta.ownership.debug_slots.signals[0].?.ptr);
+    node.behavior.events.on_hover.?.invoke();
+    try std.testing.expect(second.peek());
+    b.dispose();
+    try std.testing.expectEqual(@as(u8, 0), node.meta.ownership.debug_slots.signal_count);
+    try std.testing.expect(node.behavior.events.on_hover == null);
+    const c = try scope.childScope();
+    _ = try useHover(c, node);
+    const Callback = struct {
+        scope: ?*Scope,
+        node: *core.Node,
+        calls: usize = 0,
+        fn remove(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.scope) |child| {
+                self.scope = null;
+                child.dispose();
+                // Cleanup is deferred. A reentrant event must skip pending scopes.
+                self.node.behavior.events.on_hover.?.invoke();
+            }
+        }
+    };
+    const callback = try scope.createState(Callback, .{ .scope = c, .node = node });
+    hooks.setHoverHandler(node, true, Cx.simpleHandler(Callback.remove, callback));
+    node.behavior.events.on_hover.?.invoke();
+    try std.testing.expectEqual(@as(usize, 1), callback.calls);
+    try std.testing.expect(node.meta.per_frame.hooks.slots.hover_listeners == null);
+    try std.testing.expectEqual(@as(u8, 0), node.meta.ownership.debug_slots.signal_count);
+    node.behavior.events.on_hover = null;
+}
+
+test "hover handler replacement preserves subscriptions and cleanup preserves a later writer" {
+    const cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    const scope = try Scope.init(std.testing.allocator, null, cx.owner);
+    defer scope.dispose();
+    const child = try scope.childScope();
+    const node = try core.box(cx, .{}, .{});
+    cx.root = node;
+    const hover = try useHover(child, node);
+    const Callback = struct {
+        fn run(raw: *anyopaque) void {
+            const count: *usize = @ptrCast(@alignCast(raw));
+            count.* += 1;
+        }
+    };
+    var calls: usize = 0;
+    const callback = Cx.simpleHandler(Callback.run, &calls);
+    hooks.setHoverHandler(node, true, callback);
+    try std.testing.expect(hooks.hoverHandlersIntact(node));
+    node.behavior.events.on_hover.?.invoke();
+    try std.testing.expect(hover.peek());
+    try std.testing.expectEqual(@as(usize, 1), calls);
+    // Deliberate contract violation: detected before native dispatch, but cleanup
+    // still must not clobber the later callback in builds without assertions.
+    node.behavior.events.on_hover = callback;
+    try std.testing.expect(!hooks.hoverHandlersIntact(node));
+    child.dispose();
+    node.behavior.events.on_hover.?.invoke();
+    try std.testing.expectEqual(@as(usize, 2), calls);
+    try std.testing.expect(node.behavior.events.on_leave == null);
 }

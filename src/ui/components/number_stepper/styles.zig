@@ -1,4 +1,4 @@
-//! NumberStepper 样式层。
+//! NumberStepper style layer.
 const core = @import("../../core.zig");
 
 pub fn stepBtnStyle(t: *const core.ThemeTokens) core.BoxStyle {
@@ -7,14 +7,13 @@ pub fn stepBtnStyle(t: *const core.ThemeTokens) core.BoxStyle {
         .height = .{ .grow = .{} },
         .justify = .center,
         .align_items = .center,
-        .background = t.color.bg_secondary,
+        .background = t.tokens.color.bg_secondary,
     };
 }
 
-pub fn stepBtnLabelStyle(disabled: bool, t: *const core.ThemeTokens) core.TextProps {
+pub fn stepBtnLabelStyle(disabled: bool, t: *const core.ThemeTokens) core.TextStyle {
     return .{
-        .content = "",
-        .color = if (disabled) t.color.fg_disabled else t.color.fg_primary,
+        .color = if (disabled) t.tokens.color.fg_disabled else t.tokens.color.fg_primary,
         .font_size = 16,
         .font_weight = 600,
     };
@@ -26,15 +25,14 @@ pub fn stepperWrapperStyle(width: f32, t: *const core.ThemeTokens) core.BoxStyle
         .height = .{ .px = 32 },
         .direction = .row,
         .align_items = .center,
-        .background = t.color.bg_primary,
-        .border = .{ .width = 1, .color = t.color.input_border, .radius = 6 },
+        .background = t.tokens.color.bg_primary,
+        .border = .{ .width = 1, .color = t.tokens.color.input_border, .radius = 6 },
     };
 }
 
-pub fn stepperValueStyle(disabled: bool, t: *const core.ThemeTokens) core.TextProps {
+pub fn stepperValueStyle(disabled: bool, t: *const core.ThemeTokens) core.TextStyle {
     return .{
-        .content = "0",
-        .color = if (disabled) t.color.fg_disabled else t.color.fg_primary,
+        .color = if (disabled) t.tokens.color.fg_disabled else t.tokens.color.fg_primary,
         .font_size = 14,
     };
 }

@@ -71,15 +71,15 @@ test "SVG numeric helpers reject malformed and non-finite input" {
     try std.testing.expectEqual(@as(usize, 4), boundedSegmentCount(std.math.inf(f32), 4, 128));
 }
 
-// ── 模糊测试 ───────────────────────────────────────────────────────────
+// -- Fuzz test -----
 //
-// 这里是**外部输入的解析边界**（SVG 文件内容），所以除了「结果对不对」还要
-// 锁两条更基本的不变式，否则畸形输入能把整个宿主进程带走：
+// This is the **parse boundary for external input** (SVG file content), so beyond result
+// correctness two more invariants must hold, else malformed input crashes the whole host process:
 //
-//   1. 任何字节序列都不得 panic / 越界 / 死循环
-//   2. index 只能前进或不变，**绝不能倒退**，调用方普遍写成
-//      `while (i < s.len) { ... parseFiniteNumber(s, &i) ... }`，
-//      index 倒退一次就是无限循环（挂死，不是崩溃，更难查）
+//   1. Any byte sequence must not panic / go out of bounds / loop forever
+//   2. index only advances or stays, **never regresses**; callers commonly write
+//      `while (i < s.len) { ... parseFiniteNumber(s, &i) ... }`,
+//      so a regressing index is an infinite loop (a hang, not a crash, harder to find)
 
 fn fuzzOne(bytes: []const u8) void {
     var i: usize = 0;
@@ -88,14 +88,14 @@ fn fuzzOne(bytes: []const u8) void {
         const before = i;
         _ = nextIsNumber(bytes, i);
         _ = parseFiniteNumber(bytes, &i);
-        // 不变式 2：index 不得倒退
+        // Invariant 2: index must not regress
         std.debug.assert(i >= before);
         if (i == before) {
-            // 解析不动就手工推进一格，模拟真实调用方的跳过逻辑
+            // If can't parse, manually advance one char, simulate real caller skip logic
             i += 1;
         }
         guard += 1;
-        // 不变式 1 的推论：循环次数不可能超过输入长度
+        // Invariant 1 corollary: loop count never exceed input length
         std.debug.assert(guard <= bytes.len + 1);
     }
 }
@@ -109,8 +109,8 @@ test "fuzz: parseFiniteNumber 对任意字节序列不崩溃且 index 不倒退"
     while (round < 20000) : (round += 1) {
         const len = rand.uintLessThan(usize, buf.len);
         for (buf[0..len]) |*b| {
-            // 偏向数字语法字符，让输入更容易走进深层分支，而不是几乎全被
-            // 首字符判据挡掉（纯随机字节里 99% 的用例连第一个 if 都进不去）
+            // Bias toward digit-syntax chars, let input easier reach deep branches, not blocked by
+            // ~99% of random bytes at first char check
             b.* = switch (rand.uintLessThan(u8, 10)) {
                 0...5 => "0123456789+-.eE, \t".*[rand.uintLessThan(usize, 19)],
                 else => rand.int(u8),
@@ -129,7 +129,7 @@ test "fuzz: 已知的畸形形状不得通过" {
         var i: usize = 0;
         const r = parseFiniteNumber(b, &i);
         if (r) |v| {
-            // 允许解析成功的必须是有限值（如 "1..2" 会吃掉前面的 "1."）
+            // Allow parse success only for finite values (e.g., "1..2" consumes preceding "1.")
             try std.testing.expect(std.math.isFinite(v));
         }
     }

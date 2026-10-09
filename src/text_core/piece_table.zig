@@ -1,62 +1,61 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-/// Piece 的来源类型
+/// Where a piece's text comes from.
 pub const Source = enum {
-    original, // 原始文件内容
-    add, // 新增内容
+    original, // original file content
+    add, // newly added content
 };
 
-/// Piece 表示文本的一个片段
+/// A piece is one fragment of the text.
 pub const Piece = struct {
     source: Source,
-    start: usize, // 在对应 buffer 中的起始位置
-    length: usize, // 片段长度
+    start: usize, // start offset in the corresponding buffer
+    length: usize, // fragment length
 
     pub fn end(self: Piece) usize {
         return self.start + self.length;
     }
 };
 
-/// Piece 链表节点
+/// Piece linked-list node.
 const PieceNode = struct {
     data: Piece,
     next: ?*PieceNode = null,
     prev: ?*PieceNode = null,
 };
 
-/// Piece Table 文本存储引擎
-/// 支持高效的插入、删除和 O(1) 时间复杂度的 Undo/Redo
+/// Piece Table text storage engine; efficient insert/delete and O(1) Undo/Redo.
 pub const PieceTable = struct {
     allocator: Allocator,
 
-    /// 只读的原始文件内容
+    /// read-only original file content
     original_buffer: []const u8,
 
-    /// 存储所有新增内容的缓冲区
+    /// buffer holding all added content
     add_buffer: std.ArrayList(u8),
 
-    /// 片段链表的头节点
+    /// head node of piece list
     head: ?*PieceNode,
 
-    /// 片段链表的尾节点
+    /// tail node of piece list
     tail: ?*PieceNode,
 
-    /// 总字符数
+    /// total character count
     total_length: usize,
 
-    /// 行索引缓存 (存储每行的起始字节偏移)
+    /// line index cache (start byte offset of each line)
     line_index: std.ArrayList(usize),
 
-    /// 初始化空的 Piece Table
+    /// initialize an empty Piece Table
     pub fn init(allocator: Allocator) !PieceTable {
-        var line_index = std.ArrayList(usize){};
-        try line_index.append(allocator, 0); // 第一行从偏移 0 开始
+        var line_index = @as(std.ArrayList(usize), .empty);
+        try line_index.append(allocator, 0); // the first line starts at offset 0
 
         return PieceTable{
             .allocator = allocator,
             .original_buffer = &[_]u8{},
-            .add_buffer = std.ArrayList(u8){},
+            .add_buffer = @as(std.ArrayList(u8), .empty),
             .head = null,
             .tail = null,
             .total_length = 0,
@@ -64,9 +63,10 @@ pub const PieceTable = struct {
         };
     }
 
-    /// 从文件内容初始化。
-    /// content 会被拷贝一份，由 PieceTable 持有并在 deinit 时释放；
-    /// 本函数返回后调用方即可自由释放 content。
+    /// Initialize from file content.
+    ///
+    /// Content is copied once, owned by PieceTable, freed on deinit;
+    /// caller can freely release content after this function returns.
     pub fn initFromBuffer(allocator: Allocator, content: []const u8) !PieceTable {
         var self = try init(allocator);
         errdefer self.deinit();
@@ -74,7 +74,7 @@ pub const PieceTable = struct {
         if (content.len > 0) {
             self.original_buffer = try allocator.dupe(u8, content);
 
-            // 创建初始 piece
+            // create initial piece
             const node = try allocator.create(PieceNode);
             node.* = PieceNode{
                 .data = Piece{
@@ -90,7 +90,7 @@ pub const PieceTable = struct {
             self.tail = node;
             self.total_length = content.len;
 
-            // 构建行索引
+            // build line index
             try self.rebuildLineIndex();
         }
 
@@ -98,7 +98,7 @@ pub const PieceTable = struct {
     }
 
     pub fn deinit(self: *PieceTable) void {
-        // 清理链表节点
+        // free list nodes
         var current = self.head;
         while (current) |node| {
             const next = node.next;
@@ -106,19 +106,19 @@ pub const PieceTable = struct {
             current = next;
         }
 
-        // original_buffer 由本表持有（initFromBuffer 拷贝而来）；
-        // 空表时是 len=0 字面量，Allocator.free 对 len=0 是 no-op。
+        // original_buffer is owned by this table (copied by initFromBuffer);
+        // empty table is len=0 literal, Allocator.free is no-op for len=0.
         self.allocator.free(self.original_buffer);
         self.add_buffer.deinit(self.allocator);
         self.line_index.deinit(self.allocator);
     }
 
-    /// 在指定位置插入文本
+    /// Insert text at the given position.
     pub fn insert(self: *PieceTable, pos: usize, text: []const u8) !void {
         if (text.len == 0) return;
         if (pos > self.total_length) return error.InvalidPosition;
 
-        // 将文本追加到 add_buffer
+        // append text to add_buffer
         const add_start = self.add_buffer.items.len;
         try self.add_buffer.appendSlice(self.allocator, text);
 
@@ -129,23 +129,23 @@ pub const PieceTable = struct {
         };
 
         if (pos == 0) {
-            // 在开头插入
+            // insert at head
             try self.insertAtHead(new_piece);
         } else if (pos == self.total_length) {
-            // 在末尾插入
+            // insert at tail
             try self.insertAtTail(new_piece);
         } else {
-            // 在中间插入，需要分割 piece
+            // insert in the middle (must split a piece)
             try self.insertInMiddle(pos, new_piece);
         }
 
         self.total_length += text.len;
 
-        // 更新行索引
+        // update line index
         try self.updateLineIndexAfterInsert(pos, text);
     }
 
-    /// 删除指定范围的文本
+    /// Delete text in the given range.
     pub fn delete(self: *PieceTable, start: usize, length: usize) !void {
         if (length == 0) return;
         if (start + length > self.total_length) return error.InvalidRange;
@@ -154,12 +154,12 @@ pub const PieceTable = struct {
         var current_pos: usize = 0;
         var current = self.head;
 
-        // 找到包含 start 的 piece
+        // find the piece containing start
         while (current) |node| {
             const piece_end = current_pos + node.data.length;
 
             if (piece_end > start) {
-                // 这个 piece 包含删除的起始位置
+                // deletion starts here
                 break;
             }
 
@@ -167,31 +167,31 @@ pub const PieceTable = struct {
             current = node.next;
         }
 
-        // 从当前位置开始删除
+        // delete the range piece by piece
         while (current) |node| {
             const piece_end = current_pos + node.data.length;
 
             if (current_pos >= end_pos) {
-                // 删除完成
+                // deletion finished
                 break;
             }
 
             if (current_pos < start and piece_end > end_pos) {
-                // 删除范围完全在一个 piece 内部，需要分割成两部分
+                // range inside one piece: split into two
                 const offset_start = start - current_pos;
                 const offset_end = end_pos - current_pos;
 
-                // 创建后半部分
+                // create the right half
                 const right_piece = Piece{
                     .source = node.data.source,
                     .start = node.data.start + offset_end,
                     .length = node.data.length - offset_end,
                 };
 
-                // 修改当前 piece 为前半部分
+                // shrink the current piece to the left half
                 node.data.length = offset_start;
 
-                // 插入后半部分
+                // insert the right half
                 const right_node = try self.allocator.create(PieceNode);
                 right_node.* = PieceNode{
                     .data = right_piece,
@@ -208,7 +208,7 @@ pub const PieceTable = struct {
                 node.next = right_node;
                 break;
             } else if (current_pos >= start and piece_end <= end_pos) {
-                // 整个 piece 都在删除范围内，移除它
+                // whole piece inside the range: remove it
                 const next = node.next;
 
                 if (node.prev) |prev| {
@@ -228,11 +228,11 @@ pub const PieceTable = struct {
                 current = next;
                 continue;
             } else if (current_pos < start) {
-                // 删除起点在这个 piece 中间
+                // start is in the middle of the piece
                 const offset = start - current_pos;
                 node.data.length = offset;
             } else if (piece_end > end_pos) {
-                // 删除终点在这个 piece 中间
+                // end is in the middle of the piece
                 const offset = end_pos - current_pos;
                 node.data.start += offset;
                 node.data.length -= offset;
@@ -245,11 +245,11 @@ pub const PieceTable = struct {
 
         self.total_length -= length;
 
-        // 更新行索引
+        // update line index
         try self.updateLineIndexAfterDelete(start, length);
     }
 
-    /// 获取指定范围的文本
+    /// Get text in the given range.
     pub fn getText(self: *const PieceTable, start: usize, length: usize, buffer: []u8) ![]const u8 {
         if (start + length > self.total_length) return error.InvalidRange;
         if (buffer.len < length) return error.BufferTooSmall;
@@ -262,18 +262,18 @@ pub const PieceTable = struct {
             const piece = node.data;
             const piece_end = current_pos + piece.length;
 
-            // 跳过不相关的 piece
+            // skip irrelevant pieces
             if (piece_end <= start) {
                 current_pos = piece_end;
                 continue;
             }
 
-            // 计算需要复制的部分
+            // compute the part to copy
             const copy_start = if (current_pos < start) start - current_pos else 0;
             const copy_end = @min(piece.length, copy_start + (length - copied));
             const copy_len = copy_end - copy_start;
 
-            // 从对应的 buffer 复制数据
+            // copy from the corresponding buffer
             const source_buffer = if (piece.source == .original)
                 self.original_buffer
             else
@@ -293,12 +293,12 @@ pub const PieceTable = struct {
         return buffer[0..copied];
     }
 
-    /// 获取总行数
+    /// Get the total line count.
     pub fn lineCount(self: *const PieceTable) usize {
         return self.line_index.items.len;
     }
 
-    /// 获取指定行的内容
+    /// Get the content of the given line.
     pub fn getLine(self: *const PieceTable, line: usize, buffer: []u8) ![]const u8 {
         if (line >= self.line_index.items.len) return error.InvalidLine;
 
@@ -311,7 +311,7 @@ pub const PieceTable = struct {
         return self.getText(start, end - start, buffer);
     }
 
-    // ===== 私有辅助函数 =====
+    // ===== private helpers =====
 
     fn insertAtHead(self: *PieceTable, piece: Piece) !void {
         const node = try self.allocator.create(PieceNode);
@@ -356,7 +356,7 @@ pub const PieceTable = struct {
             const piece_end = current_pos + piece.length;
 
             if (pos == piece_end) {
-                // 刚好在当前 piece 和下一个 piece 之间 -> 在此处插入新节点
+                // right between the current and next piece: insert the new node here
                 const new_node = try self.allocator.create(PieceNode);
                 new_node.* = PieceNode{
                     .data = new_piece,
@@ -373,20 +373,20 @@ pub const PieceTable = struct {
             }
 
             if (pos > current_pos and pos < piece_end) {
-                // 需要分割当前 piece
+                // must split the current piece
                 const offset = pos - current_pos;
 
-                // 创建后半部分
+                // right half
                 const right_piece = Piece{
                     .source = piece.source,
                     .start = piece.start + offset,
                     .length = piece.length - offset,
                 };
 
-                // 修改当前 piece 为前半部分
+                // shrink the current piece to the left half
                 node.data.length = offset;
 
-                // 插入新 piece 和后半部分
+                // create the new node and the right-half node
                 const new_node = try self.allocator.create(PieceNode);
                 const right_node = try self.allocator.create(PieceNode);
 
@@ -442,16 +442,16 @@ pub const PieceTable = struct {
         }
     }
 
-    /// 增量更新行索引（插入）
-    /// 直接 rebuild，简单可靠，避免增量偏移的潜在边界 bug
+    /// Incremental line index update after insert: just rebuild, simple and reliable, and it avoids
+    /// incremental-offset edge bugs.
     fn updateLineIndexAfterInsert(self: *PieceTable, pos: usize, text: []const u8) !void {
         _ = pos;
         _ = text;
         try self.rebuildLineIndex();
     }
 
-    /// 增量更新行索引（删除）
-    /// 安全策略: 直接 rebuild（避免增量更新的边界 bug）
+    /// Incremental line index update after delete: just rebuild, simple and reliable, and it avoids
+    /// incremental-offset edge bugs.
     fn updateLineIndexAfterDelete(self: *PieceTable, start: usize, length: usize) !void {
         _ = start;
         _ = length;
@@ -459,7 +459,7 @@ pub const PieceTable = struct {
     }
 };
 
-// ===== 单元测试 =====
+// ===== unit tests =====
 
 test "PieceTable: init and deinit" {
     var table = try PieceTable.init(std.testing.allocator);
@@ -483,8 +483,8 @@ test "PieceTable: initFromBuffer 拷贝内容,调用方释放原 buffer 后仍�
     var table = try PieceTable.initFromBuffer(std.testing.allocator, content);
     defer table.deinit();
 
-    // 调用方立即释放自己的 buffer，若 initFromBuffer 借用该指针,
-    // 之后的读取全是 use-after-free（testing.allocator 会把释放内存涂成 0xAA）。
+    // Caller frees their buffer immediately; if initFromBuffer borrowed that pointer,
+    // all reads after are use-after-free (testing.allocator paints freed memory 0xAA).
     std.testing.allocator.free(content);
 
     try std.testing.expectEqual(@as(usize, 12), table.total_length);
@@ -494,7 +494,7 @@ test "PieceTable: initFromBuffer 拷贝内容,调用方释放原 buffer 后仍�
     const text = try table.getText(0, 12, &buffer);
     try std.testing.expectEqualStrings("Hello\nWorld\n", text);
 
-    // 编辑路径也要走一遍：rebuildLineIndex 会重新扫描 original piece。
+    // editing still works on the copied content
     try table.insert(5, "!");
     const after = try table.getText(0, 13, &buffer);
     try std.testing.expectEqualStrings("Hello!\nWorld\n", after);
@@ -560,7 +560,7 @@ test "PieceTable: delete from middle" {
     defer table.deinit();
 
     try table.insert(0, "Hello World");
-    try table.delete(5, 1); // 删除空格
+    try table.delete(5, 1); // delete the space
     try std.testing.expectEqual(@as(usize, 10), table.total_length);
 
     var buffer: [100]u8 = undefined;
@@ -573,7 +573,7 @@ test "PieceTable: delete from beginning" {
     defer table.deinit();
 
     try table.insert(0, "Hello World");
-    try table.delete(0, 6); // 删除 "Hello "
+    try table.delete(0, 6); // delete "Hello "
     try std.testing.expectEqual(@as(usize, 5), table.total_length);
 
     var buffer: [100]u8 = undefined;
@@ -586,7 +586,7 @@ test "PieceTable: delete from end" {
     defer table.deinit();
 
     try table.insert(0, "Hello World");
-    try table.delete(5, 6); // 删除 " World"
+    try table.delete(5, 6); // delete " World"
     try std.testing.expectEqual(@as(usize, 5), table.total_length);
 
     var buffer: [100]u8 = undefined;
@@ -602,8 +602,8 @@ test "PieceTable: delete across pieces" {
     try table.insert(5, " World");
     try table.insert(11, "!");
 
-    // 现在有 3 个 pieces: "Hello", " World", "!"
-    try table.delete(3, 5); // 删除 "lo Wo" 跨越两个 pieces
+    // 3 pieces now
+    try table.delete(3, 5); // delete "lo Wo" spanning two pieces
     try std.testing.expectEqual(@as(usize, 7), table.total_length);
 
     var buffer: [100]u8 = undefined;
@@ -618,7 +618,7 @@ test "PieceTable: incremental line index after insert newline" {
     try table.insert(0, "Hello World");
     try std.testing.expectEqual(@as(usize, 1), table.lineCount());
 
-    // 在中间插入换行符
+    // insert a newline in the middle
     try table.insert(5, "\n");
     try std.testing.expectEqual(@as(usize, 2), table.lineCount());
 
@@ -634,8 +634,8 @@ test "PieceTable: incremental line index after insert multiple newlines" {
     defer table.deinit();
 
     try table.insert(0, "ABCD");
-    try table.insert(2, "\n\n"); // 插入两个换行符
-    // 现在是: "AB\n\nCD"
+    try table.insert(2, "\n\n"); // insert two newlines
+    // now: "AB\n\nCD"
     try std.testing.expectEqual(@as(usize, 3), table.lineCount());
 
     var buffer: [100]u8 = undefined;
@@ -654,9 +654,9 @@ test "PieceTable: incremental line index after delete newline" {
 
     try std.testing.expectEqual(@as(usize, 3), table.lineCount());
 
-    // 删除第一个换行符 (位置 6, 长度 1)
+    // delete the newline
     try table.delete(6, 1);
-    // 现在是: "Line 1Line 2\nLine 3"
+    // the two lines merged
     try std.testing.expectEqual(@as(usize, 2), table.lineCount());
 
     var buffer: [100]u8 = undefined;
@@ -673,9 +673,9 @@ test "PieceTable: incremental line index after delete across lines" {
 
     try std.testing.expectEqual(@as(usize, 4), table.lineCount());
 
-    // 删除 "BBB\nCCC\n" (位置 4, 长度 8)
+    // delete across lines
     try table.delete(4, 8);
-    // 现在是: "AAA\nDDD"
+    // the lines merged
     try std.testing.expectEqual(@as(usize, 2), table.lineCount());
 
     var buffer: [100]u8 = undefined;
@@ -689,7 +689,7 @@ test "PieceTable: line index consistency through multiple edits" {
     var table = try PieceTable.init(std.testing.allocator);
     defer table.deinit();
 
-    // 逐步构建多行文本
+    // build up several lines step by step
     try table.insert(0, "Line 1\n");
     try std.testing.expectEqual(@as(usize, 2), table.lineCount());
 
@@ -699,7 +699,7 @@ test "PieceTable: line index consistency through multiple edits" {
     try table.insert(14, "Line 3");
     try std.testing.expectEqual(@as(usize, 3), table.lineCount());
 
-    // 验证所有行
+    // check each line
     var buffer: [100]u8 = undefined;
     const l0 = try table.getLine(0, &buffer);
     try std.testing.expectEqualStrings("Line 1\n", l0);
@@ -708,15 +708,15 @@ test "PieceTable: line index consistency through multiple edits" {
     const l2 = try table.getLine(2, &buffer);
     try std.testing.expectEqualStrings("Line 3", l2);
 
-    // 验证删除前全文
+    // check the full text
     const full_before = try table.getText(0, table.total_length, &buffer);
     try std.testing.expectEqualStrings("Line 1\nLine 2\nLine 3", full_before);
 
-    // 删除中间行
-    try table.delete(7, 7); // 删除 "Line 2\n"
+    // delete the middle line
+    try table.delete(7, 7); // delete "Line 2\n"
     try std.testing.expectEqual(@as(usize, 13), table.total_length);
 
-    // 验证删除后全文
+    // check the text after deletion
     const full_after = try table.getText(0, table.total_length, &buffer);
     try std.testing.expectEqualStrings("Line 1\nLine 3", full_after);
 
@@ -726,15 +726,14 @@ test "PieceTable: line index consistency through multiple edits" {
 }
 
 test "PieceTable: consecutive newline inserts (simulating Enter key)" {
-    // 模拟用户场景: 初始文本 "Press hello"，在行尾连续按回车
+    // start from text that ends with a newline
     var table = try PieceTable.initFromBuffer(std.testing.allocator, "Press hello\n");
     defer table.deinit();
 
     var buffer: [256]u8 = undefined;
     try std.testing.expectEqual(@as(usize, 2), table.lineCount());
 
-    // 光标在 "Press hello\n" 的 \n 位置 (offset 11)，按回车
-    // 插入 \n 在 offset 11 -> "Press hello\n\n"
+    // press Enter at the end
     try table.insert(11, "\n");
     try std.testing.expectEqual(@as(usize, 3), table.lineCount());
     const l0 = try table.getLine(0, &buffer);
@@ -742,7 +741,7 @@ test "PieceTable: consecutive newline inserts (simulating Enter key)" {
     const l1 = try table.getLine(1, &buffer);
     try std.testing.expectEqualStrings("\n", l1);
 
-    // 光标现在在 offset 12（第3行开头），再按回车
+    // Cursor now at offset 12 (start of line 3), press Enter again
     try table.insert(12, "\n");
     try std.testing.expectEqual(@as(usize, 4), table.lineCount());
     const l1b = try table.getLine(1, &buffer);
@@ -752,23 +751,23 @@ test "PieceTable: consecutive newline inserts (simulating Enter key)" {
     const l3b = try table.getLine(3, &buffer);
     try std.testing.expectEqualStrings("", l3b);
 
-    // 再按回车 offset 13
+    // Press Enter again, offset 13
     try table.insert(13, "\n");
     try std.testing.expectEqual(@as(usize, 5), table.lineCount());
 
-    // 验证全文
+    // Verify full text
     const full = try table.getText(0, table.total_length, &buffer);
     try std.testing.expectEqualStrings("Press hello\n\n\n\n", full);
 }
 
 test "PieceTable: insert newline at line start" {
-    // 模拟场景: 文本 "ABC"，在 offset 0 连续插入 \n
+    // Test scenario: text 'ABC', insert \n at offset 0 repeatedly
     var table = try PieceTable.initFromBuffer(std.testing.allocator, "ABC");
     defer table.deinit();
 
     var buffer: [256]u8 = undefined;
 
-    // 在 offset 0 插入 \n -> "\nABC"
+    // Insert \n at offset 0 -> '\nABC'
     try table.insert(0, "\n");
     try std.testing.expectEqual(@as(usize, 2), table.lineCount());
     const l0 = try table.getLine(0, &buffer);
@@ -776,7 +775,7 @@ test "PieceTable: insert newline at line start" {
     const l1 = try table.getLine(1, &buffer);
     try std.testing.expectEqualStrings("ABC", l1);
 
-    // 光标在 offset 1 (第二行开头)，再插入 \n -> "\n\nABC"
+    // Cursor at offset 1 (start of line 2), insert \n again -> '\n\nABC'
     try table.insert(1, "\n");
     try std.testing.expectEqual(@as(usize, 3), table.lineCount());
     const l1b = try table.getLine(1, &buffer);

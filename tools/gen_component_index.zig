@@ -41,30 +41,40 @@ const Entry = struct {
 /// Recursively AST-scan `root` for `<expr>.component_name = "<literal>"`.
 fn scanRoot(
     alloc: std.mem.Allocator,
+    io: std.Io,
     root: []const u8,
     label: []const u8,
     path_prefix: []const u8,
     out: *std.ArrayList(Entry),
     stats: *Stats,
 ) !void {
-    var dir = std.fs.cwd().openDir(root, .{ .iterate = true }) catch |err| {
+    var dir = std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true }) catch |err| {
         std.debug.print("WARN: open {s}: {s} — skipped\n", .{ root, @errorName(err) });
         return;
     };
-    defer dir.close();
+    defer dir.close(io);
 
     var walker = try dir.walk(alloc);
     defer walker.deinit();
 
-    while (try walker.next()) |entry| {
+    while (try walker.next(io)) |entry| {
         if (entry.kind != .file) continue;
-        if (!std.mem.endsWith(u8, entry.basename, ".zig")) continue;
+        const is_yix = std.mem.endsWith(u8, entry.basename, ".yix");
+        if (!is_yix and !std.mem.endsWith(u8, entry.basename, ".zig")) continue;
+        // Yix artifact: component definition site in same-name .yix (scanned separately), not
+        // pointing at generated file.
+        if (std.mem.endsWith(u8, entry.basename, "_generated.zig")) {
+            const stem = entry.basename[0 .. entry.basename.len - "_generated.zig".len];
+            const yix_name = try std.fmt.allocPrint(alloc, "{s}.yix", .{stem});
+            defer alloc.free(yix_name);
+            if (entry.dir.access(io, yix_name, .{})) |_| continue else |_| {}
+        }
 
         const src = entry.dir.readFileAllocOptions(
-            alloc,
+            io,
             entry.basename,
-            MAX_FILE_BYTES,
-            null,
+            alloc,
+            .limited(MAX_FILE_BYTES),
             .of(u8),
             0,
         ) catch |err| {
@@ -79,7 +89,7 @@ fn scanRoot(
         // Path recorded in the table: prefix + path relative to the scan root,
         // so the running app can resolve it without knowing the build layout.
         const rel = try std.fs.path.join(alloc, &.{ path_prefix, entry.path });
-        try scanFile(alloc, src, rel, label, out, stats);
+        if (is_yix) try scanYix(alloc, src, rel, label, out) else try scanFile(alloc, src, rel, label, out, stats);
     }
 }
 
@@ -100,7 +110,7 @@ fn scanFile(
     out: *std.ArrayList(Entry),
     stats: *Stats,
 ) !void {
-    var ast = std.zig.Ast.parse(alloc, src, .zig) catch |err| {
+    var ast = std.zig.Ast.parse(alloc, src, .{}) catch |err| {
         std.debug.print("WARN: parse {s}: {s} — skipped\n", .{ rel_path, @errorName(err) });
         stats.parse_errors += 1;
         return;
@@ -122,13 +132,13 @@ fn scanFile(
         if (tag != .assign) continue;
         const pair = datas[i].node_and_node;
 
-        const lhs = @intFromEnum(pair[0]);
+        const lhs = @backingInt(pair[0]);
         if (tags[lhs] != .field_access) continue;
         // `.field_access` stores the field-name token as the token half.
         const field_tok = datas[lhs].node_and_token[1];
         if (!std.mem.eql(u8, ast.tokenSlice(field_tok), "component_name")) continue;
 
-        const rhs = @intFromEnum(pair[1]);
+        const rhs = @backingInt(pair[1]);
         if (tags[rhs] != .string_literal) {
             // Runtime-computed name, nothing to point an editor at.
             stats.dynamic += 1;
@@ -162,6 +172,54 @@ fn scanFile(
     }
 }
 
+/// Yix component: fn Name(...) View declaration point (generated code sets component_name to same).
+/// Scan with Zig tokenizer: template tags aren't valid Zig, but only looking at fn decl header
+/// unaffected.
+fn scanYix(
+    alloc: std.mem.Allocator,
+    src: [:0]const u8,
+    rel_path: []const u8,
+    label: []const u8,
+    out: *std.ArrayList(Entry),
+) !void {
+    var z = std.zig.Tokenizer.init(src);
+    while (true) {
+        const t = z.next();
+        if (t.tag == .eof) return;
+        if (t.tag != .keyword_fn) continue;
+        const name_tok = z.next();
+        if (name_tok.tag != .identifier) continue;
+        if (z.next().tag != .l_paren) continue;
+        var depth: usize = 1;
+        while (depth > 0) {
+            const x = z.next();
+            switch (x.tag) {
+                .eof => return,
+                .l_paren => depth += 1,
+                .r_paren => depth -= 1,
+                else => {},
+            }
+        }
+        const ret = z.next();
+        if (ret.tag != .identifier or !std.mem.eql(u8, src[ret.loc.start..ret.loc.end], "View")) continue;
+        var line: u32 = 1;
+        var col: u32 = 1;
+        for (src[0..name_tok.loc.start]) |c| {
+            if (c == '\n') {
+                line += 1;
+                col = 1;
+            } else col += 1;
+        }
+        try out.append(alloc, .{
+            .name = try alloc.dupe(u8, src[name_tok.loc.start..name_tok.loc.end]),
+            .file = try alloc.dupe(u8, rel_path),
+            .line = line,
+            .col = col,
+            .label = label,
+        });
+    }
+}
+
 fn lessThan(_: void, a: Entry, b: Entry) bool {
     // Primary key: name (binary-searched at runtime). Ties broken by location so
     // regeneration is byte-stable and duplicate names keep a deterministic order.
@@ -176,8 +234,9 @@ fn lessThan(_: void, a: Entry, b: Entry) bool {
     };
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
 
     // Entry names/paths live until the file is written; an arena frees them in
@@ -186,8 +245,8 @@ pub fn main() !void {
     defer arena_state.deinit();
     const alloc = arena_state.allocator();
 
-    const args = try std.process.argsAlloc(alloc);
-    defer std.process.argsFree(alloc, args);
+    const args = try init.minimal.args.toSlice(alloc);
+    defer alloc.free(args);
 
     if (args.len < 3) {
         std.debug.print(
@@ -199,7 +258,7 @@ pub fn main() !void {
 
     const output_path = args[1];
 
-    var entries = std.ArrayList(Entry){};
+    var entries = @as(std.ArrayList(Entry), .empty);
     defer entries.deinit(alloc);
 
     var stats: Stats = .{};
@@ -207,7 +266,7 @@ pub fn main() !void {
     // --entry-from=<module>: reuse that module's Entry type instead of
     // declaring a local one (see the emit site for why this matters).
     var entry_from: ?[]const u8 = null;
-    var roots = std.ArrayList([]const u8){};
+    var roots = @as(std.ArrayList([]const u8), .empty);
     defer roots.deinit(alloc);
     for (args[2..]) |a| {
         if (std.mem.startsWith(u8, a, "--entry-from=")) {
@@ -223,7 +282,7 @@ pub fn main() !void {
         const root = it.next().?;
         const label = it.next() orelse std.fs.path.basename(root);
         const path_prefix = it.next() orelse root;
-        try scanRoot(alloc, root, label, path_prefix, &entries, &stats);
+        try scanRoot(alloc, io, root, label, path_prefix, &entries, &stats);
     }
 
     std.mem.sort(Entry, entries.items, {}, lessThan);
@@ -312,9 +371,9 @@ pub fn main() !void {
 
     const out_bytes = aw.written();
     if (std.fs.path.dirname(output_path)) |d| {
-        std.fs.cwd().makePath(d) catch {};
+        std.Io.Dir.cwd().createDirPath(io, d) catch {};
     }
-    try std.fs.cwd().writeFile(.{ .sub_path = output_path, .data = out_bytes });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = output_path, .data = out_bytes });
 
     std.debug.print(
         "gen_component_index: {d} entries from {d} files -> {s}" ++

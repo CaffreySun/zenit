@@ -1,32 +1,28 @@
-//! 帧性能采样历史，从 `Cx` 析出的独立值类型。
+//! Frame perf sample history, an independent value type used by `Cx`.
 //!
-//! 背景：`Cx` 里原本铺着四组一模一样的环形缓冲（frame total / frame interval /
-//! drawable acquire / CPU-only frame），每组三个字段（`_us` / `_write` / `_len`）
-//! 共 14 个字段，外加 17 个方法，push / percentile / avg / max 的逻辑各抄了一遍。
-//! 这些方法不碰 `Cx` 的任何其它状态，是纯数据结构，却占着 `Cx` 的字段与方法面。
-//!
-//! 析出之后：`Sampler` 是一个可独立单测的环形缓冲，`FramePerf` 把四条链路聚在
-//! 一起。`Cx` 只留一个 `frame_perf: FramePerf` 字段。
+//! `Sampler` is an independently testable ring buffer; `FramePerf` gathers four of them (frame
+//! total / frame interval / drawable acquire / CPU-only frame). Touches no other `Cx` state;
+//! `Cx` holds a single `frame_perf: FramePerf` field.
 
 const std = @import("std");
 
-/// 每条链路保留的采样数。120 帧 ≈ 2 秒 @60Hz。
+/// Samples retained per path. 120 frames ~= 2 seconds @60Hz.
 pub const history_size: usize = 120;
 
-/// 固定容量环形缓冲 + 分位数/均值/极值统计。
+/// Fixed-capacity ring buffer + percentile/mean/extremum stats.
 ///
-/// 写满后覆盖最旧样本；`len` 在填满前单调增长，之后恒为 `history_size`。
+/// After full overwrite oldest; `len` monotone-grows until full, then constant at `history_size`.
 pub const Sampler = struct {
-    samples: [history_size]u64 = [_]u64{0} ** history_size,
-    /// 下一个写入位置，**始终已对 samples.len 取模**。
+    samples: [history_size]u64 = @as([history_size]u64, @splat(0)),
+    /// Next write position, **always modulo samples.len**.
     ///
-    /// ⚠ 这里曾经是 u8 并靠 `+%= 1` 回绕（2026-09-22 交叉审查发现是 bug）：
-    /// u8 在 256 处回绕，而 samples.len = 120，**120 不整除 256**。于是
-    /// push 超过 256 次后 `write % 120` 不再等于真实写入位置，latest() 与
-    /// atFromOldest() 会读到错位的槽，60fps 下约 4.3 秒即触发，DevTools
-    /// 的帧间隔读数会静默串到旧样本上。
+    /// WARNING - don't make this u8 relying on `+%= 1` wrap: u8 wraps at 256, but samples.len = 120
+    /// and **120 doesn't divide 256**. After 256+ pushes `write % 120` no longer equals the true
+    /// write
+    /// position, so latest()/atFromOldest() read wrong slots (60fps: ~4.3 seconds), and DevTools
+    /// frame interval readings silently alias to old samples.
     ///
-    /// 改成在 push 时显式对 len 取模，回绕点与容量对齐，宽度也不再是隐含前提。
+    /// push takes an explicit modulo len, so wrap aligns with capacity regardless of width.
     write: usize = 0,
     len: u8 = 0,
 
@@ -50,7 +46,7 @@ pub const Sampler = struct {
         return self.count() == 0;
     }
 
-    /// 第 `percentile` 百分位（0-100，超过 100 按 100 处理）。空时返回 null。
+    /// The `percentile` percentile (0-100, over 100 treated 100). null if empty.
     pub fn percentile(self: *const Sampler, pct: u8) ?u64 {
         const len = self.count();
         if (len == 0) return null;
@@ -77,15 +73,15 @@ pub const Sampler = struct {
         return result;
     }
 
-    /// 最近一次写入的样本。
+    /// Most recent write sample.
     pub fn latest(self: *const Sampler) ?u64 {
         if (self.count() == 0) return null;
         const cap = self.samples.len;
         return self.samples[(self.write + cap - 1) % cap];
     }
 
-    /// 按「从最旧到最新」的顺序取第 `idx` 个样本，越界返回 null。
-    /// DevTools 的帧间隔柱状图靠它按时间轴顺序读。
+    /// Get Nth sample in 'oldest to newest' order, null if out of bounds.
+    /// DevTools frame interval bar chart uses this to read time-axis order.
     pub fn atFromOldest(self: *const Sampler, idx: usize) ?u64 {
         const len = self.count();
         if (idx >= len) return null;
@@ -95,26 +91,27 @@ pub const Sampler = struct {
     }
 };
 
-/// 一帧渲染的四条耗时链路。
+/// Four time cost paths for one frame render.
 pub const FramePerf = struct {
-    /// 最近一帧 frame_start->frame_end 的墙钟总耗时（us）。
+    /// Most recent frame frame_start->frame_end wall clock total cost (us).
     frame_total_us: u64 = 0,
-    /// 最近一帧真实呈现节奏间隔（us，按显示器刷新率下限钳制）。
+    /// Most recent frame true presentation rhythm interval (us, clamped per display refresh rate
+    /// floor).
     frame_interval_us: u64 = 0,
 
-    /// 完整帧总耗时历史。含 vsync 等待、drawable 获取与帧末空转。
+    /// Full frame total cost history. Includes vsync wait, drawable acquire, frame-end idle.
     total: Sampler = .{},
-    /// 真实呈现节奏历史。
+    /// True presentation rhythm history.
     interval: Sampler = .{},
-    /// drawable acquire 耗时历史。
+    /// drawable acquire cost history.
     acquire: Sampler = .{},
-    /// **只含 CPU 段**的耗时历史。
+    /// **CPU section only** cost history.
     ///
-    /// 与 `total` 的区别是这条链路的关键：后者存的是墙钟总耗时，里面含 vsync
-    /// 等待、drawable 获取，以及"这一帧画完之后什么都没发生"的那段空转。用它
-    /// 算 P95 时，一个 CPU 只花 8ms 却被显示节奏或（e2e 里）RPC 往返拖到 26ms
-    /// 的帧，会报成 26ms 的"CPU P95"，看起来像卡顿，实则 CPU 空闲。
-    /// 判断"渲染工作有没有超预算"必须用这一条。
+    /// Differs from `total`, which stores wall clock including vsync wait, drawable acquire, and
+    /// idle gaps after rendering. A P95 over `total` reports 26ms 'CPU P95' when the CPU spent 8ms
+    /// but was stretched by display rhythm or (e2e) RPC round-trip; it looks like a stall but the
+    /// CPU
+    /// was idle. Judge 'render work within budget' with this one.
     cpu: Sampler = .{},
 
     pub fn pushFrameTotalUs(self: *FramePerf, value: u64) void {
@@ -163,7 +160,7 @@ test "Sampler: 写满后覆盖最旧，len 封顶" {
     for (0..history_size + 10) |i| s.push(@intCast(i));
     try std.testing.expectEqual(history_size, s.count());
     try std.testing.expectEqual(@as(?u64, history_size + 9), s.latest());
-    // 最旧的样本应是第 10 个（0..9 已被覆盖）
+    // Oldest sample should be 10th (0..9 overwritten)
     try std.testing.expectEqual(@as(?u64, 10), s.atFromOldest(0));
     try std.testing.expectEqual(@as(?u64, null), s.atFromOldest(history_size));
 }
@@ -215,25 +212,23 @@ test "FramePerf: push 同时更新 latest 标量与历史" {
 }
 
 test "Sampler: write 计数器回绕 256 之后仍指向正确样本" {
-    // 回归测试（2026-09-22，glmx 交叉审查发现）：
+    // Regression test: write is u8 and wraps at 256, but samples length is 120 and
+    // **120 doesn't divide 256**. After 256+ pushes `write % 120` no longer equals the
+    // true write position, so latest()/atFromOldest() read wrong slots.
     //
-    // write 是 u8，在 256 处 wrapping 回绕；但 samples 长度是 120，而
-    // **120 不整除 256**。于是 push 超过 256 次以后，`write % 120` 不再等于
-    // 「真实写入位置」，latest()/atFromOldest() 会读到错位的槽。
-    //
-    // 60fps 下 257 帧 ≈ 4.3 秒，任何跑过几秒的真实应用都必然踩到。
-    // DevTools 的帧间隔读数因此会静默串到旧样本上。
+    // At 60fps this hits after 257 frames (~4.3 seconds); DevTools frame interval readings
+    // silently alias to old samples.
     var s = Sampler{};
     for (0..300) |i| s.push(@intCast(i));
 
-    // 第 300 次 push 写的是值 299
+    // 300th push writes value 299
     try std.testing.expectEqual(@as(?u64, 299), s.latest());
 
-    // 最旧的应是 300-120 = 180
+    // Oldest should be 300-120 = 180
     try std.testing.expectEqual(@as(?u64, 180), s.atFromOldest(0));
     try std.testing.expectEqual(@as(?u64, 299), s.atFromOldest(119));
 
-    // 从最旧到最新必须严格递增（回绕不得打乱时间序）
+    // Oldest to newest must strictly increase (wrap can't scramble time)
     var prev: u64 = 0;
     for (0..s.count()) |i| {
         const v = s.atFromOldest(i).?;

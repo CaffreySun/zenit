@@ -1,12 +1,12 @@
-//! Notification 设计令牌（设计稿 16.9）。
+//! Notification design tokens (design 16.9).
 //!
-//! 语义色在 oklch 下同明度同色度、只换色相：L≈0.55 的图形档只做图标底 /
-//! 圆点 / 进度条 / 生命条；承载文字必须换 -ink 档（L≈0.47，≥4.5:1）。
-//! 操作按钮按 macOS 原生做法用中性灰底，不上语义色。
-//! 禁止用 alpha 稀释文字表达「次要」：层级靠 ink / ink-2 / ink-3 三档墨色。
-//!
-//! 深色方案不在设计稿里，这里给出按同一结构推导的对应值（暖深灰玻璃 +
-//! 提亮的墨色 / ink 档），保证换主题不出现白底白字。
+//! Semantic colors in oklch same lightness same chroma, vary hue only: L~0.55 graphic tier
+//! icons/dots/progress/healthbar only; text-carrying colors must use the -ink tier (L~0.47,
+//! contrast >= 4.5:1).
+//! Action buttons use neutral gray background per macOS native, no semantic color. Prohibit
+//! alpha-diluting text for "secondary": tier by ink / ink-2 / ink-3 three-stop ink. Dark scheme not
+//! in design, here computed per structure (warm dark gray glass + brightened ink/ink tiers),
+//! guarantee theme switch no white-on-white.
 const core = @import("../../core.zig");
 const theme = core.theme;
 const Color = core.Color;
@@ -18,36 +18,27 @@ fn hexA(rgb: u24, alpha: f32) Color {
 }
 
 pub const Palette = struct {
-    // 语义色 · 图形档
+    // Semantic color - graphic tier.
     success: Color,
     @"error": Color,
     warning: Color,
     info: Color,
     violet: Color,
     quiet: Color,
-    // 语义色 · 文字档
+    // Semantic color - text tier.
     success_ink: Color,
     error_ink: Color,
     warning_ink: Color,
     info_ink: Color,
     violet_ink: Color,
     quiet_ink: Color,
-    // 中性墨色
+    // Neutral ink.
     ink: Color,
     ink_2: Color,
     ink_3: Color,
-    // 玻璃
-    glass_rgb: u24,
-    glass_edge: Color,
-    glass_outline: Color,
-    sheen_top: Color,
-    sheen_bottom: Color,
-    highlight: Color,
-    inset_top: Color,
-    inset_bottom: Color,
-    inset_glow: Color,
+    // Close button shadow (glass material and shadow by GlassBox).
     shadow_rgb: u24,
-    // 控件
+    // Controls.
     track: Color,
     separator: Color,
     button_primary: Color,
@@ -63,11 +54,10 @@ pub const Palette = struct {
     close_light_glyph: Color,
     avatar_bg: Color,
     avatar_fg: Color,
-    pill_bg: Color,
     pill_fg: Color,
     pill_icon: Color,
     on_semantic: Color,
-    // 文案提示（16.13）
+    // Copy hint (16.13).
     keycap_bg: Color,
     keycap_edge: Color,
     hint_kbd_bg: Color,
@@ -94,13 +84,9 @@ pub const Palette = struct {
         };
     }
 
-    /// 生命条：语义色 50% 透明；静默类型 28%（16.2）。
+    /// Healthbar: semantic color 50% opacity; silent type 28% (16.2).
     pub fn lifeBar(self: *const Palette, t: model.Tone) Color {
         return self.tone(t).withAlpha(if (t == .quiet) 72 else 128);
-    }
-
-    pub fn glass(self: *const Palette, alpha: f32) Color {
-        return hexA(self.glass_rgb, alpha);
     }
 
     pub fn shadow(self: *const Palette, alpha: f32) Color {
@@ -124,16 +110,6 @@ pub const light = Palette{
     .ink = Color.hex(0x2B2724),
     .ink_2 = Color.hex(0x4A4643),
     .ink_3 = Color.hex(0x6F6B67),
-    // 玻璃底：中性白（与编辑器浮条 media_glass 同一套材质），不带暖色。
-    .glass_rgb = 0xFFFFFF,
-    .glass_edge = hexA(0xFFFFFF, 0.87),
-    .glass_outline = hexA(0x182034, 0.0),
-    .sheen_top = hexA(0xFFFFFF, 0.12),
-    .sheen_bottom = hexA(0xFFFFFF, 0.0),
-    .highlight = hexA(0xFFFFFF, 0.25),
-    .inset_top = hexA(0xFFFFFF, 0.95),
-    .inset_bottom = hexA(0x182034, 0.06),
-    .inset_glow = hexA(0xFFFFFF, 0.18),
     .shadow_rgb = 0x182034,
     .track = hexA(0x5A544F, 0.12),
     .separator = hexA(0x5A544F, 0.12),
@@ -150,7 +126,6 @@ pub const light = Palette{
     .close_light_glyph = Color.hex(0x6F6B67),
     .avatar_bg = Color.hex(0xF0E7DF),
     .avatar_fg = Color.hex(0x7C614C),
-    .pill_bg = hexA(0x20242E, 0.80),
     .pill_fg = hexA(0xFFFFFF, 0.94),
     .pill_icon = hexA(0xFFFFFF, 0.72),
     .on_semantic = Color.hex(0xFFFFFF),
@@ -175,15 +150,6 @@ pub const dark = Palette{
     .ink = Color.hex(0xF3EFEB),
     .ink_2 = Color.hex(0xD3CDC7),
     .ink_3 = Color.hex(0xA8A29C),
-    .glass_rgb = 0x20242E,
-    .glass_edge = hexA(0xFFFFFF, 0.14),
-    .glass_outline = hexA(0x000000, 0.40),
-    .sheen_top = hexA(0xFFFFFF, 0.07),
-    .sheen_bottom = hexA(0x000000, 0.06),
-    .highlight = hexA(0xFFFFFF, 0.10),
-    .inset_top = hexA(0xFFFFFF, 0.14),
-    .inset_bottom = hexA(0x000000, 0.30),
-    .inset_glow = hexA(0xFFFFFF, 0.05),
     .shadow_rgb = 0x000000,
     .track = hexA(0xFFFFFF, 0.14),
     .separator = hexA(0xFFFFFF, 0.10),
@@ -200,7 +166,6 @@ pub const dark = Palette{
     .close_light_glyph = Color.hex(0xC9C3BD),
     .avatar_bg = Color.hex(0x4A3E34),
     .avatar_fg = Color.hex(0xE9D6C4),
-    .pill_bg = hexA(0xF3EFEB, 0.86),
     .pill_fg = hexA(0x2B2724, 0.94),
     .pill_icon = hexA(0x2B2724, 0.72),
     .on_semantic = Color.hex(0xFFFFFF),
@@ -216,7 +181,7 @@ pub fn palette(t: *const theme.ThemeTokens) *const Palette {
     };
 }
 
-/// 尺寸（设计稿 16.2 / 16.9）。
+/// Dimensions (design 16.2 / 16.9).
 pub const Metrics = struct {
     pub const radius: f32 = 18;
     pub const row_padding = core.Padding{ .top = 14, .right = 16, .bottom = 14, .left = 14 };
@@ -233,7 +198,7 @@ pub const Metrics = struct {
     pub const quiet_dot: f32 = 9;
     pub const title_size: f32 = 13;
     pub const title_weight: u16 = 600;
-    /// 设计稿实测行框：标题 19 / 时间戳 17 / 进度元信息 15。
+    /// Design measured line frames: title 19 / timestamp 17 / progress metadata 15.
     pub const title_line_height: f32 = 19.0 / 13.0;
     pub const timestamp_line_height: f32 = 17.0 / 11.5;
     pub const meta_line_height: f32 = 15.0 / 10.5;
@@ -263,21 +228,21 @@ pub const Metrics = struct {
     pub const close_inset: f32 = 5;
     pub const pill_height: f32 = 24;
     pub const pill_gap: f32 = 12;
-    /// 角标与「全部清除」圆钮之间的间距。
+    /// Badge and "clear all" round button spacing.
     pub const clear_gap: f32 = 6;
     pub const pill_font: f32 = 10.8;
     pub const pill_icon: f32 = 11;
 };
 
-/// 文案提示尺寸（设计稿 16.13）：没写到的数值与卡片一致。
+/// Copy hint dimensions (design 16.13): unmeasured values match card.
 pub const HintMetrics = struct {
     pub const height: f32 = 36;
     pub const radius: f32 = 18;
     pub const max_width: f32 = 480;
     pub const pad_plain: f32 = 16;
-    /// 有标记（芯片 / 圆环）时左侧收窄。
+    /// With badge (chip / ring) left narrows.
     pub const pad_marked: f32 = 14;
-    /// 有按钮时右侧收到 5，按钮与胶囊同心。
+    /// With button right narrows to 5, button and pill concentric.
     pub const pad_action: f32 = 5;
     pub const gap: f32 = 8;
     pub const keycap_gap: f32 = 6;
@@ -286,7 +251,7 @@ pub const HintMetrics = struct {
     pub const chip: f32 = 18;
     pub const glyph: f32 = 12;
     pub const spinner: f32 = 16;
-    /// 圆环 innerRadius 0.76 -> 线宽 = 8 × 0.24。
+    /// Ring innerRadius 0.76 -> stroke width = 8 x 0.24.
     pub const spinner_stroke: f32 = 1.92;
     pub const spinner_sweep_deg: f32 = 110;
     pub const keycap_height: f32 = 20;
@@ -299,9 +264,9 @@ pub const HintMetrics = struct {
     pub const action_kbd_height: f32 = 16;
     pub const action_kbd_radius: f32 = 4;
     pub const action_kbd_font: f32 = 10.5;
-    /// 按钮前额外留白（gap 8 + 4 + gap 8）。
+    /// Extra whitespace before button (gap 8 + 4 + gap 8).
     pub const action_lead: f32 = 4;
-    /// 单独出现：底边离内容区底沿；与卡片堆叠同在底部正中时离堆叠上沿。
+    /// Solo: bottom edge to content bottom; stacked with cards both bottom-center from stack top.
     pub const bottom_inset: f32 = 16;
     pub const stack_gap: f32 = 12;
 };

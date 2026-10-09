@@ -1,5 +1,5 @@
-/// Retained 元数据：向 PropertyTree 写入 transform/clip/effect 节点，
-/// 并更新 SceneRuntime 中该节点的运行时状态。
+/// Retained metadata: write transform/clip/effect nodes into PropertyTree, update SceneRuntime
+/// runtime state for that node.
 const std = @import("std");
 const types = @import("../types.zig");
 const node_mod = @import("../node.zig");
@@ -23,24 +23,25 @@ const hasActiveCompositeAnimation = anim_checks.hasActiveCompositeAnimation;
 const hasActiveTransformAnimation = anim_checks.hasActiveTransformAnimation;
 const hasActiveOpacityAnimation = anim_checks.hasActiveOpacityAnimation;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 调试工具
-// ─────────────────────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------
+// Debug tools
+// ---------------------------------------------------------------------
 
-/// ZENIT_DEBUG_OVERLAY 进程级缓存：shouldDebugOverlayNode 由 renderNodeTransform
-/// 每节点每帧（经 debugOverlayPlan）调用，sample 剖析里 posix.getenv 占主线程 ~1%。
+/// ZENIT_DEBUG_OVERLAY process-level cache: shouldDebugOverlayNode called by renderNodeTransform
+/// per-node per-frame (via debugOverlayPlan), in sample profile posix.getenv accounts for ~1% of
+/// main thread.
 var debug_overlay_env_cache: ?bool = null;
 
 fn debugOverlayEnvEnabled() bool {
     if (debug_overlay_env_cache) |v| return v;
-    const v = std.posix.getenv("ZENIT_DEBUG_OVERLAY") != null;
+    const v = @import("zenit_environment").has("ZENIT_DEBUG_OVERLAY");
     debug_overlay_env_cache = v;
     return v;
 }
 
 pub fn shouldDebugOverlayNode(node: *Node) bool {
     if (!debugOverlayEnvEnabled()) return false;
-    if (node.style.composited_group()) return true;
+    if (node.style.composited_group() or node.style.contentWarp() != null) return true;
     const name = node.meta.ownership.meta.component_name orelse return false;
     return std.mem.eql(u8, name, "Select") or
         std.mem.eql(u8, name, "Popover") or
@@ -99,16 +100,17 @@ pub fn debugOverlayPlan(
     );
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 内容标志收集
-// ─────────────────────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------
+// Content flags collection
+// ---------------------------------------------------------------------
 
 pub fn collectContentFlags(node: *Node) scene_runtime_mod.ContentFlags {
     const bws = node.style.border.resolvedWidths();
     return .{
-        // O(1)：读 NodeFlags.has_text_subtree（setText 置位 + appendChild 并入
-        // + 沿祖先冒泡维护，保守不清位），替代旧 subtreeHasText 每节点递归下钻
-        // （整帧 O(n·depth)，深层文本树的 renderNodeTransform 主热点之一）。
+        // O(1): read NodeFlags.has_text_subtree (setText sets bit + appendChild merges + bubble
+        // along ancestors maintain, conservatively don't clear), replaces old subtreeHasText
+        // per-node recursion (whole frame O(n*depth), deep text trees' renderNodeTransform top
+        // hotspot).
         .has_text = node.frame_state.state_bits.flags.has_text_subtree,
         .has_image = node.getImage() != null,
         .has_icon = node.getIcon() != null,
@@ -119,9 +121,9 @@ pub fn collectContentFlags(node: *Node) scene_runtime_mod.ContentFlags {
     };
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// PropertyTree + SceneRuntime 写入
-// ─────────────────────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------
+// PropertyTree + SceneRuntime writes
+// ---------------------------------------------------------------------
 
 fn hasExternalClip(cx: *RenderContext, node: *Node) bool {
     const ext_map = cx.external_clip_rects orelse return false;
@@ -136,11 +138,11 @@ pub fn appendRetainedMetadata(
     parent_clip_id: u32,
     parent_effect_id: u32,
     render_state: NodeRenderState,
-    /// Stage B S5.2: 当前 surface 的 inverse_world transform，把世界坐标
-    /// 投回 surface-local 坐标系。outer (无 surface) 时 = identity。surface
-    /// 内 child 时 = surface_owner.world_transform.invert()。让 lower 路径
-    /// 从 content (= surface_inverse * world) 直接产出 surface-local 坐标，
-    /// 与 paint pass subtree replay (inverse_replay_base * world) 字节等价。
+    /// Stage B S5.2: current surface's inverse_world transform, project world coords back to
+    /// surface-local coord system. outer (no surface) = identity. surface child =
+    /// surface_owner.world_transform.invert(). let lower path from content (= surface_inverse *
+    /// world) directly produce surface-local coords, byte-equivalent to paint pass subtree replay
+    /// (inverse_replay_base * world).
     surface_inverse: Transform2D,
 ) RetainedIds {
     const inverse_world = render_state.world_transform.invert();
@@ -149,11 +151,12 @@ pub fn appendRetainedMetadata(
         .include_scale = false,
         .include_rotation = false,
     });
-    // effect.local_bounds 必须是 **unscaled owner-local 帧的常量**（动画期不变）：
-    // surface src = owner_world⁻¹·(owner_world·local_bounds) = local_bounds，texture
-    // 覆盖区随之稳定，M_composite 独自承担 scale。早先用"含 scale 的 world opacity_bounds
-    // × unscaled 逆"换算 -> 动画期逐帧漂移（texture 帧 = 反向缩放帧），children 的静态
-    // content 在其中被反向缩放，composite 的 scale 恰好抵消 -> 内容视觉上不参与 scale 动画。
+    // effect.local_bounds must be **unscaled owner-local frame constant** (unchanged during
+    // animation): surface src = owner_world^-1 * (owner_world * local_bounds) = local_bounds,
+    // texture coverage stabilizes, M_composite alone bears scale. earlier used 'scaled world
+    // opacity_bounds * unscaled inverse' -> drifted per-frame during animation (texture frame =
+    // reverse-scaled frame), children's static content reverse-scaled within it, composite's scale
+    // exactly cancels -> content visually doesn't participate in scale animation.
     const local_rect_full = cx.rectFromWorld(node);
     const opacity_local_bounds = geometry.computeOpacityLayerBounds(
         node,
@@ -205,9 +208,11 @@ pub fn appendRetainedMetadata(
             .parent = effect_id,
             .transform_id = transform_id,
             .node_id = node.id,
-            .kind = if (node.style.composited_group()) .composited_group else .opacity,
+            .kind = if (node.style.composited_group() or node.style.contentWarp() != null) .composited_group else .opacity,
             .opacity = render_state.node_opacity,
             .blend_mode = node.style.blendMode(),
+            .warp = node.style.contentWarp() orelse .{},
+            // (a content_warp alone promotes: see mod.zig needsOpacityLayer)
             .requires_offscreen = true,
             .local_bounds = opacity_local_bounds,
         }) catch effect_id;
@@ -215,9 +220,9 @@ pub fn appendRetainedMetadata(
     if (render_state.use_blur) {
         const cr4 = node.style.effectiveRadii();
         const gp = node.style.glass_params() orelse types.GlassParams{};
-        // 玻璃矩形必须是节点自身 rect：local_rect 来自 clip_world_rect，
-        // shadow/outline 会把它撑大 -> glass SDF/采样按大矩形算，视觉上
-        // 出现比节点大一圈的"矩形玻璃切块"。
+        // glass rect must be node's own rect: local_rect from clip_world_rect, shadow/outline
+        // expands it -> glass SDF/sample computed from large rect, visually shows 'rectangular
+        // glass section' one circle wider than node.
         const glass_local_bounds = inverse_world.transformRect(render_state.world_rect);
         effect_id = cx.property_tree.appendEffect(.{
             .parent = effect_id,
@@ -231,22 +236,25 @@ pub fn appendRetainedMetadata(
         }) catch effect_id;
     }
     if (render_state.use_rounded_clip) {
-        // Stage 3 fold：同节点 opacity/composited_group + rounded_clip 合并为单个
-        // offscreen，把圆角写进刚 append 的 opacity effect，composite blit 时同时
-        // 施加 mask 与 opacity（逐像素标量乘可交换，与"先裁再淡"视觉等价）。
-        // 前提：无 blur（blur 的 corner_radius 裁背景采样，语义不同）、opacity
-        // bounds 与 clip rect 一致（mask 作用于整个合成 quad，bounds 不一致时
-        // mask 位置/尺寸错误，shadow/overflow padding 场景在此回退）。
-        // 不变量：rounded_clip 恒为链最内层，本合并不改变链序。
+        // Stage 3 fold: same-node opacity/composited_group + rounded_clip merge into single
+        // offscreen, write rounded_clip into just-appended opacity effect, composite blit applies
+        // mask and opacity simultaneously (per-pixel scalar multiply is commutative, visually
+        // equivalent to 'clip then fade').
+        // precondition: no blur (blur's corner_radius clips background sample, different
+        // semantics), opacity bounds and clip rect match (mask acts on entire composite quad,
+        // bounds mismatch causes mask position/size error, shadow/overflow padding scenarios fall
+        // back here).
+        // invariant: rounded_clip always innermost in chain, merge doesn't change chain order.
         const opacity_effect_appended = render_state.use_opacity_layer and effect_id != parent_effect_id and !render_state.use_blur;
-        // computeOpacityLayerBounds 末尾恒定 +2px pad；允许该常量超集（composite mask
-        // 是 surface 内 apply_clip 精确圆角裁剪的超集，多裁不掉任何有效像素）。
-        // shadow/outline/children 溢出会扩得更多 -> mismatch -> 回退独立 rounded_clip。
+        // computeOpacityLayerBounds always +2px pad at end; allow that constant superset (composite
+        // mask is superset of surface-internal apply_clip precise rounded_clip, overcutting doesn't
+        // discard valid pixels). shadow/outline/children overflow expands more -> mismatch -> fall
+        // back to independent rounded_clip.
         const bounds_match = std.math.approxEqAbs(f32, opacity_local_bounds.x, local_rect.x - 2, 0.5) and
             std.math.approxEqAbs(f32, opacity_local_bounds.y, local_rect.y - 2, 0.5) and
             std.math.approxEqAbs(f32, opacity_local_bounds.w, local_rect.w + 4, 0.5) and
             std.math.approxEqAbs(f32, opacity_local_bounds.h, local_rect.h + 4, 0.5);
-        if (std.posix.getenv("ZENIT_DEBUG_PASSCOUNT") != null and !(opacity_effect_appended and bounds_match)) {
+        if (@import("zenit_environment").has("ZENIT_DEBUG_PASSCOUNT") and !(opacity_effect_appended and bounds_match)) {
             std.debug.print("[nofold] node={d} comp={s} op_layer={} blur={} bounds_match={} ob=({d:.1},{d:.1},{d:.1},{d:.1}) lr=({d:.1},{d:.1},{d:.1},{d:.1})\n", .{
                 node.id,                        node.meta.ownership.meta.component_name orelse "?",
                 render_state.use_opacity_layer, render_state.use_blur,
@@ -272,8 +280,8 @@ pub fn appendRetainedMetadata(
         }
     }
 
-    // 从 World.LayoutTable 读 rect（shadow-sync 保证与 node.rect 一致）。
-    // 这是 SoT inversion 的第一处 callsite 切换；invariant gate 保证不会读到 stale 数据。
+    // read rect from World.LayoutTable (shadow-sync guarantees match node.rect). this is first
+    // callsite of SoT inversion switch; invariant gate ensures no stale data read.
     const world_rect = cx.rectFromWorld(node);
     cx.scene_runtime.put(.{
         .node_id = node.id,
@@ -302,9 +310,9 @@ pub fn appendRetainedMetadata(
         .promoted_surface_bounds = if (node.meta.per_frame.caches.commands.promoted) |cache| cache.world_bounds else ComputedRect.init(0, 0, 0, 0),
         .promoted_surface_transform = if (node.meta.per_frame.caches.commands.promoted) |cache| cache.world_transform else Transform2D.identity(),
         .promoted_surface_flags = .{},
-        // 不可降级：transform_id / clip_id / effect_id 已经写进 property_tree
-        // 并作为本函数返回值继续被使用，唯独 scene_runtime 里没有这个节点,
-        // 后续 layerize / hit-test 按 node_id 查 runtime 会静默 miss。
+        // cannot downgrade: transform_id / clip_id / effect_id already written into property_tree
+        // and used as this function's return value, only scene_runtime missing this node, later
+        // layerize / hit-test query runtime by node_id will silently miss.
     }) catch @panic("OOM: scene_runtime.put (node metadata dropped)");
 
     return .{

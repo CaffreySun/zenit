@@ -1,6 +1,5 @@
-//! Cx 输入事件入口：鼠标 down/up/move（含 pointer capture 回同步、按下聚焦决策）、
-//! click / command / action、键盘、文本输入与 IME、滚轮 / 缩放手势、拖放。
-//! 事件分发本体在 event_dispatcher.zig；这里负责命中、状态记账与路由。
+//! Cx input event entry: mouse down/up/move (including pointer capture resync, focus decision on
+//! press), click / command / action, keyboard, text input & IME, wheel / zoom gestures, drag-drop.
 
 const std = @import("std");
 const core = @import("../core.zig");
@@ -44,18 +43,17 @@ pub fn handleMouseDownEx(self: *Cx, x: f32, y: f32, button: MouseButton, modifie
     self.cursor_state.pointer_valid = true;
     defer cx_cursor.updateCursorShape(self);
     self.needs_redraw = true;
-    // 同一按键的新一次按下意味着上一次被吞按下的抬起已经丢了（同键不可能
-    // 连按两次而中间没有抬起）；残留标记会把这次正常按下的抬起吞掉。
+    // New press of same key means previous press's up (if swallowed) is lost (can't have two
+    // unpaired downs of same key); stale flag would swallow this press's normal up.
     if (self.swallowed_press_button == button) self.swallowed_press_button = null;
     if (button == .left and self.inspector.handleMouseDown(self, x, y)) {
         return;
     }
-    // feed gesture_arena。只对 left button (主键) 启 gesture
-    // arena，右键 / 中键各自走 dispatcher 但不参与手势识别 (UIKit 同样
-    // 只把 primary touch 入 arena)。
+    // Feed gesture_arena. Only left button gets gesture arena, right/middle buttons dispatch
+    // individually but don't participate in gesture recognition (UIKit same).
     if (button == .left) {
         self.gesture_arena.reset();
-        self.gesture_arena.onTouchDown(x, y, std.time.nanoTimestamp());
+        self.gesture_arena.onTouchDown(x, y, @import("zenit_time").nanoTimestamp(self.io));
     }
     cx_render.ensureHitTestSceneFresh(self);
     if (self.root != null) {
@@ -78,8 +76,8 @@ pub fn handleMouseDownEx(self: *Cx, x: f32, y: f32, button: MouseButton, modifie
             logDebugNodeSummary("pointer_hit", target);
         }
 
-        // `.close_and_consume` 的浮层：面板外的这一下只负责关闭，按下与随后的
-        // 抬起都不分发（不合成 click，不改焦点）。
+        // `close_and_consume` overlay: outside the panel, this press only closes; both press and
+        // following release don't dispatch (no click synthesis, no focus change).
         if (self.overlay_stack.consumeOutsidePress(target)) {
             self.swallowed_press_button = button;
             if (button == .left) self.gesture_arena.reset();
@@ -93,8 +91,8 @@ pub fn handleMouseDownEx(self: *Cx, x: f32, y: f32, button: MouseButton, modifie
         }
 
         self.interaction_index.setMouseDownResult(hit);
-        // 焦点决策在分发前按当时的树做出：handler 可能重建子树，事后再沿父链
-        // 查找会读到新树（或悬垂节点）。
+        // Focus decision made before dispatch, based on current tree: handler can rebuild subtree,
+        // later parent-chain lookup may read new tree (or dangling nodes).
         const focus_decision = resolvePointerDownFocus(target);
         const preserve_overlay_focus = shouldPreserveFocusForOverlayPointerTarget(self, target);
         const focus_target_handle_pre = switch (focus_decision) {
@@ -102,7 +100,8 @@ pub fn handleMouseDownEx(self: *Cx, x: f32, y: f32, button: MouseButton, modifie
             .preserve, .clear => null,
         };
 
-        // 分发前记下按下所属的浮层：handler 可能当场关闭它并失效这批引用。
+        // Record which overlay this press belongs to before dispatch: handler may close it
+        // immediately, invalidating references.
         const press_owner = self.overlay_stack.findPressOwner(target);
         _ = self.dispatcher.dispatchMouseDownButton(x, y, target, .left, modifiers);
         rebuildRuntimeIndexesIfCurrentRootDirty(self);
@@ -119,6 +118,7 @@ pub fn handleMouseDownEx(self: *Cx, x: f32, y: f32, button: MouseButton, modifie
 
         self.pressed_node = self.node_registry.resolve(target_handle, &self.perf);
         self.pressed_handle = target_handle;
+        self.notifyPressWatchers();
         self.press_overlay_owner = press_owner;
         self.last_mouse_down_target = self.pressed_node;
         self.last_mouse_down_handle = target_handle;
@@ -131,22 +131,22 @@ pub fn handleMouseDownEx(self: *Cx, x: f32, y: f32, button: MouseButton, modifie
     }
 }
 
-/// 节点是否可聚焦 (focusable 或 tab_index != null)
+/// Is node focusable (has focusable or tab_index != null)
 fn isNodeFocusable(n: *Node) bool {
     return n.behavior.interaction.focusable or n.behavior.interaction.tab_index != null;
 }
 
 const PointerDownFocusDecision = union(enum) {
-    /// 焦点交给该节点（命中节点自身或最近的 focusable 祖先）。
+    /// Transfer focus to this node (hit node itself or nearest focusable ancestor).
     focus: *Node,
-    /// 父链上先遇到了 `pointer_down_focus = .preserve`：焦点保持不变。
+    /// Found `pointer_down_focus = .preserve` in parent chain: focus stays.
     preserve,
-    /// 父链上既无 focusable 也无 preserve：清空焦点（overlay 例外另判）。
+    /// Neither focusable nor preserve in parent chain: clear focus (overlay exempt, separate rule).
     clear,
 };
 
-/// 从命中节点沿父链向上，取最先出现的 `.preserve` 或 focusable 节点。
-/// 同一节点上 `.preserve` 优先于 focusable。
+/// Traverse parent chain from hit node upward, take first `.preserve` or focusable node.
+/// `.preserve` takes priority if same node has both.
 fn resolvePointerDownFocus(node_opt: ?*Node) PointerDownFocusDecision {
     var current = node_opt;
     while (current) |n| {
@@ -167,9 +167,9 @@ pub fn handleMouseUpEx(self: *Cx, x: f32, y: f32, button: MouseButton, modifiers
     self.cursor_state.pointer_valid = true;
     defer cx_cursor.updateCursorShape(self);
     self.needs_redraw = true;
-    // feed gesture_arena (只 primary button)
+    // Feed gesture_arena (primary button only)
     if (button == .left) {
-        self.gesture_arena.onTouchUp(x, y, std.time.nanoTimestamp());
+        self.gesture_arena.onTouchUp(x, y, @import("zenit_time").nanoTimestamp(self.io));
     }
     if (self.swallowed_press_button) |swallowed| {
         if (swallowed == button) {
@@ -196,8 +196,9 @@ pub fn handleMouseUpEx(self: *Cx, x: f32, y: f32, button: MouseButton, modifiers
         }
     }
     if (button == .left) {
-        self.pressed_node = null; // 释放按下状态
+        self.pressed_node = null; // Release press state
         self.pressed_handle = null;
+        self.notifyPressWatchers();
     }
 }
 
@@ -219,24 +220,25 @@ pub fn resyncPointerAfterCaptureRelease(self: *Cx, x: f32, y: f32, fallback_hand
     cx_cursor.updateCursorShape(self);
 }
 
-/// 索引重建的 OOM 一律 panic，不吞。
+/// OOM during index rebuild always panics, never silenced.
 ///
-/// rebuildRuntimeStateRecursive 是**先清 dirty 位、再做可失败的
-/// node_registry.put / focus_order.append**。所以中途 OOM 会留下
-/// 「节点已标记为干净、但不在 node_registry / focus_order 里」的状态：
-/// 该节点从此 hit-test 打不中、Tab 走不到，而且再没有 dirty 位能触发重试
-/// 静默且永久的错乱。fullRebuildRuntimeIndexes 更糟：它先 clear()，
-/// OOM 会让整棵树的索引空掉而所有节点都是干净的。
+/// rebuildRuntimeStateRecursive **clears dirty first, then does fallible
+/// node_registry.put / focus_order.append**. OOM midway leaves a node marked clean but missing
+/// from node_registry / focus_order: it fails hit-test, Tab can't reach it, and no dirty bit
+/// triggers a retry (silent permanent corruption). fullRebuildRuntimeIndexes is worse: it clears
+/// first, and OOM leaves the whole tree's index empty while all nodes are clean.
 ///
-/// 这些调用点位于 handleMouse* / render 等 Stable 签名（见
-/// docs/API_STABILITY.md）之下，无法传播 `!`，故 panic。
+/// These callsites sit under Stable signatures like handleMouse*/render
+/// (see docs/API_STABILITY.md) and can't propagate `!`, so panic.
 pub fn rebuildRuntimeIndexesIfCurrentRootDirty(self: *Cx) void {
     const root = self.root orelse return;
     if (!root.frame_state.state_bits.dirty.runtime.subtree_dirty) return;
-    // 结构变更几乎总伴随布局脏（新换入的子树 rect 还是 0）。此时直接重建会按未布局的
-    // 几何建出空命中代理（0 尺寸不出代理，但 plannedProxyCount 不看尺寸，partial 校验照样通过），
-    // 随后 clearInteractionDirtyRecursive 把整棵子树的 hit 脏位消费掉，之后的布局不会再
-    // 触发命中重建，这些节点永久点不中。先布局再重建：与事件入口 ensureHitTestSceneFresh 同一路径。
+    // Structure change almost always comes with layout dirty (newly swapped-in subtree still has
+    // rect 0). Rebuilding directly now would build empty hit proxies from unlaid-out geometry
+    // (0-size emits no proxy, but plannedProxyCount ignores size, so partial validation still
+    // passes); clearInteractionDirtyRecursive then consumes the whole subtree's hit dirty bits,
+    // later layout will not trigger a hit rebuild again, and these nodes can never be hit. Lay out
+    // first, then rebuild: same path as event entry ensureHitTestSceneFresh.
     if ((root.frame_state.state_bits.dirty.core.layout or root.frame_state.state_bits.dirty.core.subtree_layout) and
         self.tick_depth == 0 and !self.draining_deferred_frees)
     {
@@ -251,8 +253,9 @@ pub fn handleMouseMove(self: *Cx, x: f32, y: f32) void {
 }
 
 pub fn handleMouseMoveEx(self: *Cx, x: f32, y: f32, modifiers: Modifiers) void {
-    // R4a: 只在鼠标实际移动时标脏，hover 命中随指针位置变化，需要一帧
-    // 重新 dispatch；位置不变的 move 事件不该唤醒新帧（idle 停帧门控依赖这一点）
+    // R4a: mark dirty only when mouse actually moves, hover hit changes with cursor position, needs
+    // frame to re-dispatch; stationary move events shouldn't wake new frame (idle frame-gating
+    // depends on this).
     const hit_tests_before = self.perf.hit_test_count;
     cx_render.ensureHitTestSceneFresh(self);
     if (x != self.mouse_x or y != self.mouse_y) {
@@ -262,7 +265,7 @@ pub fn handleMouseMoveEx(self: *Cx, x: f32, y: f32, modifiers: Modifiers) void {
     self.mouse_y = y;
     // feed gesture_arena
     self.cursor_state.pointer_valid = true;
-    self.gesture_arena.onTouchMove(x, y, std.time.nanoTimestamp());
+    self.gesture_arena.onTouchMove(x, y, @import("zenit_time").nanoTimestamp(self.io));
     if (self.root != null) {
         const has_capture = self.dispatcher.hasPointerCapture();
         const hit = if (has_capture)
@@ -275,12 +278,13 @@ pub fn handleMouseMoveEx(self: *Cx, x: f32, y: f32, modifiers: Modifiers) void {
             });
         self.interaction_index.setHoveredResult(hit);
         var raw_hovered = if (hit) |result| self.node_registry.resolve(result.handle, &self.perf) else null;
-        // Hover 滞回：partial interaction rebuild 在子树重建的间隙对新节点
-        // 的收录有缺口（多处 app 侧撞过的同一堵墙），移动中的查询会在
-        // 有效坐标上间歇 MISS。MISS 时若上一个 hovered 节点仍存活且几何
-        // 上仍包含指针，保持 hover，否则光标会在 pointer↔default 之间
-        // 抖（实弹：file tab 关闭按钮附近 hover 状态机最活跃，逐事件标脏
-        // 场景，光标持续闪烁）。真离开时旧节点 rect 不再包含指针，照常清。
+        // Hover hysteresis: partial interaction rebuild has gaps in collecting new nodes between
+        // subtree rebuilds (hit in several apps), so queries during motion intermittently MISS at
+        // valid coordinates. On MISS, if the previous hovered node is still alive and geometrically
+        // still contains the pointer, keep hover; otherwise the cursor flickers between pointer and
+        // default (seen near file-tab close buttons, where the hover state machine is busiest and
+        // every event marks dirty). On a real leave the old node's rect no longer contains the
+        // pointer and hover is cleared as usual.
         if (raw_hovered == null and !has_capture) {
             if (self.hovered_handle) |h| {
                 if (self.node_registry.resolve(h, &self.perf)) |prev| {
@@ -310,24 +314,24 @@ pub fn handleMouseMoveEx(self: *Cx, x: f32, y: f32, modifiers: Modifiers) void {
         self.hovered_handle = if (self.hovered_node) |n| self.node_registry.handleFor(n) else null;
     }
     std.debug.assert(self.perf.hit_test_count - hit_tests_before <= 1);
-    // 更新系统光标
+    // Update system cursor
     cx_cursor.updateCursorShape(self);
     self.inspector.handleMouseMove(self, x, y);
 }
 
 pub fn cancelPointerInteractions(self: *Cx, reason: interaction_drag.CancelReason) void {
     self.drag_manager.cancel(self, reason);
-    // 被 consume 吞掉的按下随交互一起作废：它的抬起不会再来（或来了也不该再吞），
-    // 标记留着会吞掉下一次正常点击的抬起。
+    // Press swallowed by consume becomes invalid with interaction: its release won't come again (or
+    // shouldn't), flag left standing would swallow next normal click's release.
     self.swallowed_press_button = null;
     self.dispatcher.cancelClickSynthesisForActivePointer();
     self.dispatcher.releasePointerCapture();
     self.cursor_state.leases.clearRetainingCapacity();
     self.cursor_override = null;
-    // gesture：中断把 began/changed 转 cancelled（此前无人写 .cancelled，
-    // 系统级中断后识别器卡死在中途态）
-    self.gesture_arena.onTouchCancel(std.time.nanoTimestamp());
-    // 进行中的触控板滚动同理：结束信号可能永远不会来，主动补发
+    // Gesture: abort converts began/changed -> cancelled (no one wrote .cancelled before,
+    // system-level abort left recognizer stuck mid-state)
+    self.gesture_arena.onTouchCancel(@import("zenit_time").nanoTimestamp(self.io));
+    // Same for in-flight trackpad scroll: end signal may never come, proactively emit end
     self.dispatcher.cancelScrollGesture();
     cx_cursor.updateCursorShape(self);
 }
@@ -381,10 +385,11 @@ pub fn handleCommand(self: *Cx, command_id: u64) void {
     const action = self.action_dispatcher.matchCommand(command_id) orelse return;
     const target = self.focus_manager.getFocused() orelse self.root orelse return;
     const delivery = self.action_dispatcher.dispatchActionWithDelivery(action, target);
-    // 焦点链上没人接：菜单命令是 app 级的，不能因为"当前没聚焦到绑定
-    // 上下文里"就静默丢弃（实锤：cx.root 是 App 的内部 wrapper，用户
-    // mount root 绑的 context 在向上遍历里永远走不到，真菜单点击
-    // verify_menu.sh 逮到）。降级为全树找第一个匹配 context 的节点。
+    // No handler in the focus chain: menu commands are app-level and must not be silently dropped
+    // just because focus is not inside a binding context (cx.root is App's internal wrapper, so a
+    // context bound on the user's mount root is never reached walking upward; caught by
+    // verify_menu.sh on real menu clicks). Fall back to searching the whole tree for the first node
+    // matching the context.
     if (delivery.result == .ignored and !delivery.delivered) {
         if (self.root) |root| {
             if (findActionContextNode(root, action.context)) |node| {
@@ -417,15 +422,15 @@ pub fn handleKeyDown(self: *Cx, key: KeyCode, modifiers: Modifiers) void {
         }
         return;
     }
-    // Drag session 优先消费 Escape（必须在 overlay stack 之前，否则一次
-    // Escape 会同时取消 drag 并 dismiss 顶层浮层）。pending 静默清理、
-    // active 发 cancel，两者都吞掉本次 Escape。
+    // Drag session consumes Escape first (must be before overlay stack, else one Escape both
+    // cancels the drag and dismisses the top overlay). Pending is silently cleaned, active emits
+    // cancel; both swallow this Escape.
     if (key == .escape and self.drag_manager.handleEscape(self)) return;
-    // OverlayStack: Escape 只关闭最顶层浮层
+    // OverlayStack: Escape only closes topmost overlay
     if (key == .escape and self.overlay_stack.handleEscape()) return;
 
     if (key == .tab) {
-        // 先分发给 focused 节点（编辑器等组件需要拦截 tab 做缩进）
+        // Dispatch to focused node first (editors need to intercept Tab for indent)
         if (self.focus_manager.getFocused()) |focused| {
             const result = self.dispatcher.dispatchKeyDown(focused, .{
                 .key = key,
@@ -433,7 +438,7 @@ pub fn handleKeyDown(self: *Cx, key: KeyCode, modifiers: Modifiers) void {
             });
             if (events_mod.preventsDefault(result)) return;
         }
-        // 节点未处理，执行默认的焦点切换
+        // Node unhandled, execute default focus switch
         if (modifiers.shift) {
             self.focus_manager.focusPrev();
         } else {
@@ -446,14 +451,14 @@ pub fn handleKeyDown(self: *Cx, key: KeyCode, modifiers: Modifiers) void {
         self.focused_node = focused;
         self.focused_handle = self.node_registry.handleFor(focused);
         const keyboard_target = self.focused_handle;
-        // 先查询 Action 绑定
+        // Query Action binding first
         if (self.action_dispatcher.matchKey(key, modifiers)) |action| {
             const result = self.action_dispatcher.dispatchAction(action, focused);
             if (events_mod.preventsDefault(result)) return;
             if (resolveKeyboardTarget(self, keyboard_target) == null) return;
         }
 
-        // Space/Enter: 先 dispatch key_down，如果节点未处理则合成 click
+        // Space/Enter: dispatch key_down first, if unhandled synthesize click
         if (key == .space or key == .@"return") {
             const key_result = self.dispatcher.dispatchKeyDown(focused, .{
                 .key = key,
@@ -478,7 +483,7 @@ pub fn handleKeyDown(self: *Cx, key: KeyCode, modifiers: Modifiers) void {
             .modifiers = modifiers,
         });
     } else if (self.root) |root| {
-        // 没 focused 时 fallback 到 root，让 app/island 级别的快捷键也能工作
+        // No focused node, fallback to root to let app/island-level shortcuts work
         _ = self.dispatcher.dispatchKeyDown(root, .{
             .key = key,
             .modifiers = modifiers,
@@ -579,11 +584,12 @@ pub fn scrollEventFromSdk(wheel: system_sdk_mod.events.MouseWheel) events_mod.Sc
 }
 
 pub fn handleScroll(self: *Cx, scroll: events_mod.ScrollEvent) void {
-    // pinch 手势进行中抑制 trackpad 滚动派发（捏合与双指平移同源，
-    // 同时派发会导致缩放时画面乱跳），同一手势期间不同时收到 pan/scroll。
+    // During pinch suppress trackpad scroll dispatch (pinch and two-finger pan share source,
+    // dispatch both causes screen jump during zoom), same gesture session doesn't receive
+    // pan/scroll simultaneously.
     if (self.magnify_target_handle != null and scroll.isTrackpad()) return;
     self.needs_redraw = true;
-    // 先结束丢失了 ended 的上一个手势，再做命中测试
+    // Finish previous gesture that lost ended, then run hit-test
     self.dispatcher.beginScrollEvent(scroll);
     cx_render.ensureHitTestSceneFresh(self);
     if (self.root != null) {
@@ -665,34 +671,70 @@ pub fn handlePlatformDrag(self: *Cx, x: f32, y: f32, kind: u8, paths: []const u8
 
 fn handleDragPayload(self: *Cx, x: f32, y: f32, kind: u8, paths: []const u8, payload_kind_raw: u8, payload_truncated: bool, payload_is_untrusted: bool) void {
     self.needs_redraw = true;
-    // kind=4 = 拖拽源完成回执（beginDrag 的 completion/cancellation，带
-    // source_token/operation），不是指针位置事件，不进 hit-test 派发。
-    // 未来更大的 kind 同样防御性忽略：@enumFromInt 对未知值是 checked
-    // panic（实锤：verify_interop_probe.sh 里拖出松手即整个 app abort）。
-    if (kind > @intFromEnum(events_mod.DragEvent.Kind.dropped)) return;
+    // kind=4 = drag-source completion receipt (beginDrag's completion/cancellation, carries
+    // source_token/operation), not a pointer position event, so it does not go through hit-test
+    // dispatch. Larger future kinds are likewise ignored defensively: @enumFromInt on an unknown
+    // value is a checked panic (verify_interop_probe.sh: releasing a drag-out aborted the whole
+    // app).
+    if (kind > @backingInt(events_mod.DragEvent.Kind.dropped)) return;
+    // Take sequence number before any step that can run user code (hit refresh runs before_render
+    // hooks): if drag-drop event re-enters during refresh, this event is replaced by it (see
+    // re-entry semantics below).
+    self.drag_event_seq +%= 1;
+    const seq = self.drag_event_seq;
+    const superseded = struct {
+        fn check(cx: *const Cx, s: u64) bool {
+            return cx.drag_event_seq != s;
+        }
+    }.check;
     cx_render.ensureHitTestSceneFresh(self);
     if (self.root == null) return;
 
-    const drag_kind: events_mod.DragEvent.Kind = @enumFromInt(kind);
-    const payload_kind = std.meta.intToEnum(events_mod.DragEvent.PayloadKind, payload_kind_raw) catch .none;
+    const drag_kind: events_mod.DragEvent.Kind = @fromBackingInt(@intCast(kind));
+    const payload_kind = std.enums.fromInt(events_mod.DragEvent.PayloadKind, payload_kind_raw) orelse .none;
 
-    // 上一个目标：走 handle resolve，节点已释放时自动得到 null。
-    const prev: ?*Node = if (self.drag_hover_handle) |h|
-        self.node_registry.resolve(h, &self.perf)
-    else
-        null;
+    // Re-entry semantics: a handler (even a hook inside hit refresh) can synchronously re-enter the
+    // next drag-drop event (same Cx); the inner one carries newer pointer state. Each event takes a
+    // sequence number on entry; once a newer drag-drop event starts (sequence changed), this event
+    // is superseded: it no longer writes drag_hover_handle (a stale hit must not overwrite the
+    // inner result), no longer emits boundary events, and no longer dispatches stale
+    // updated/entered. The one exception is dropped: it carries the payload and is the session's
+    // terminal state, so even when superseded it is still delivered to the live target, otherwise
+    // the payload is lost.
 
-    // exited（离开窗口）不做命中：光标已经在窗口外，此时的坐标无意义。
-    const target: ?*Node = if (drag_kind == .exited) null else blk: {
+    // exited (left window) doesn't hit-test: cursor already outside window, coordinates
+    // meaningless.
+    const target_handle: ?NodeHandle = if (drag_kind == .exited) null else blk: {
         const hit = self.hitTestQuery(.{ .kind = .pointer, .world_x = x, .world_y = y });
-        break :blk if (hit) |result|
-            self.node_registry.resolve(result.handle, &self.perf)
-        else
-            null;
+        break :blk if (hit) |result| result.handle else null;
     };
+    // Previous target: resolve via handle; yields null if the node was released. Must be fetched
+    // **after** the hit query: hitTestQuery internally refreshes the hit scene again, and if the
+    // tree is still dirty it still runs before_render hooks, closes the batch and
+    // drainDeferredFrees, so a raw pointer taken earlier may be freed here.
+    const prev: ?*Node = self.node_registry.resolve(self.drag_hover_handle, &self.perf);
+    const target: ?*Node = self.node_registry.resolve(target_handle, &self.perf);
+    // At most three fires per call (old target exited, new target entered, new target's own event).
+    // Each dispatch may synchronously free nodes in its handler (handler calls freeNode directly,
+    // or synchronously drives another window's host entry whose effect frees this window's nodes),
+    // so between dispatches trust only handles: target identity is fixed before dispatch,
+    // re-resolve before every use, and the raw pointer is only used for the pre-dispatch
+    // comparison.
+    const crossed = prev != target;
+    const live = struct {
+        fn get(cx: *Cx, h: ?NodeHandle) ?*Node {
+            return cx.node_registry.resolve(h, &cx.perf);
+        }
+    }.get;
 
-    // 跨节点边界：给旧目标补 exited，给新目标补 entered。
-    if (prev != target) {
+    // Cross node boundary: emit exited to the old target, entered to the new target. Hover is set
+    // to the post-dispatch state **before** each dispatch (commit-before-callback), and re-entering
+    // events use it to determine their own boundary: while leaving prev, hover is empty (prev will
+    // not get a second exited, nor will a not-yet-entered target get exited); while entering
+    // target, hover is target (target already received entered, so it should receive exited on
+    // leave).
+    if (crossed and !superseded(self, seq)) {
+        self.drag_hover_handle = null;
         if (prev) |p| {
             _ = self.dispatcher.dispatch(.{ .drag = .{
                 .x = x,
@@ -703,7 +745,8 @@ fn handleDragPayload(self: *Cx, x: f32, y: f32, kind: u8, paths: []const u8, pay
                 .payload_is_untrusted = payload_is_untrusted,
             } }, p);
         }
-        if (target) |t| {
+        if (!superseded(self, seq)) if (live(self, target_handle)) |t| {
+            self.drag_hover_handle = target_handle;
             _ = self.dispatcher.dispatch(.{ .drag = .{
                 .x = x,
                 .y = y,
@@ -712,16 +755,15 @@ fn handleDragPayload(self: *Cx, x: f32, y: f32, kind: u8, paths: []const u8, pay
                 .payload_truncated = payload_truncated,
                 .payload_is_untrusted = payload_is_untrusted,
             } }, t);
-        }
+        };
     }
+    if (superseded(self, seq) and drag_kind != .dropped) return;
 
-    self.drag_hover_handle = if (target) |t| self.node_registry.handleFor(t) else null;
-
-    // 已经在上面补发过的 entered/exited 不重复派发。
-    if (target) |t| {
-        if (drag_kind == .updated or drag_kind == .dropped or
-            (drag_kind == .entered and prev == target))
-        {
+    // Already-emitted entered/exited don't re-fire.
+    if (drag_kind == .updated or drag_kind == .dropped or
+        (drag_kind == .entered and !crossed))
+    {
+        if (live(self, target_handle)) |t| {
             _ = self.dispatcher.dispatch(.{ .drag = .{
                 .x = x,
                 .y = y,
@@ -733,9 +775,16 @@ fn handleDragPayload(self: *Cx, x: f32, y: f32, kind: u8, paths: []const u8, pay
             } }, t);
         }
     }
+    if (superseded(self, seq)) return;
 
-    // 会话结束（放下或离开窗口）：清掉悬停态，避免下次拖拽误判为"仍在原目标"。
-    if (drag_kind == .dropped or drag_kind == .exited) {
-        self.drag_hover_handle = null;
-    }
+    // Session end (drop or leave window): clear hover state so the next drag is not mistaken for
+    // 'still on the old target'. Otherwise hover is this event's target; if the target was freed in
+    // this event's handler, record null and let the next position event start over from a fresh
+    // hit.
+    self.drag_hover_handle = if (drag_kind == .dropped or drag_kind == .exited)
+        null
+    else if (live(self, target_handle) != null)
+        target_handle
+    else
+        null;
 }

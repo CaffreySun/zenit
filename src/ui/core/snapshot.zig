@@ -68,11 +68,11 @@ pub const Snapshot = struct {
         const duped = try node_mod.duplicateDisplayItems(cx.allocator, commands);
         errdefer node_mod.freeDuplicatedDisplayItems(cx.allocator, duped);
 
-        // Stage B S6 R3a: resolve text_run.content from BlobStore, paint pass emit
-        // text_run 时 content="" 内容在 blob_store。Snapshot 跨帧持有，blob_store
-        // 可能 reset，必须把 content 真拷过来。duplicateDisplayItems 已对 content
-        // 字段做过 dupe，但若原 content="" 则 duped content="". 这里覆盖 dupe 一次
-        // 真内容（free 旧空字符串前先 alloc 新内容）。
+        // Stage B S6 R3a: resolve text_run.content from BlobStore, paint pass emits text_run with
+        // content="" content in blob_store. Snapshot spans frames, blob_store may reset, must truly
+        // copy content over. duplicateDisplayItems already dupes content field, but if original
+        // content="" then duped content="". Here override dupe once with real content (free old
+        // empty string before alloc new).
         if (blob_store) |bs| {
             for (duped) |*item| {
                 switch (item.*) {
@@ -163,10 +163,10 @@ pub const Snapshot = struct {
         if (node.frame_state.state_bits.dirty.core.layout) return null;
         if (node_rect.w <= 0.001 or node_rect.h <= 0.001) return null;
 
-        var render_list: std.ArrayList(DisplayItem) = .{};
+        var render_list: std.ArrayList(DisplayItem) = .empty;
         defer render_list.deinit(cx.allocator);
         const paint_table_mod = @import("paint_table.zig");
-        var render_list_paint: std.ArrayList(paint_table_mod.DisplayItem) = .{};
+        var render_list_paint: std.ArrayList(paint_table_mod.DisplayItem) = .empty;
         defer render_list_paint.deinit(cx.allocator);
 
         var display_list = display_list_mod.DisplayList.init(cx.allocator);
@@ -231,9 +231,9 @@ pub const Snapshot = struct {
             const start: usize = runtime.subtree_display_item_start;
             const end = start + runtime.subtree_display_item_count;
             if (end > start and end <= cx.display_list.items.items.len) {
-                var frozen: std.ArrayList(DisplayItem) = .{};
+                var frozen: std.ArrayList(DisplayItem) = .empty;
                 defer frozen.deinit(cx.allocator);
-                var paint: std.ArrayList(@import("paint_table.zig").DisplayItem) = .{};
+                var paint: std.ArrayList(@import("paint_table.zig").DisplayItem) = .empty;
                 defer paint.deinit(cx.allocator);
                 var arena = std.heap.ArenaAllocator.init(cx.allocator);
                 defer arena.deinit();
@@ -287,19 +287,17 @@ pub const Snapshot = struct {
     ) !void {
         if (opacity <= 0.001 or scale <= 0.001 or self.commands.commands.len == 0) return;
 
-        // Snapshot 内部 IR = DisplayItem (local 坐标，被 offsetDisplayItem 拉到 (0,0)
-        // 起点)。appendTo 同时写两条出口：
-        // (1) display_list 端，splice 到 draw_ctx.display_list
-        // (2) lowering_buffer_paint 端，翻译成 paint_table.DisplayItem
-        // **两端都必须用 begin/end_opacity_layer 包裹**以应用 origin + scale + opacity。
+        // Snapshot internal IR = DisplayItem (local coords, pulled by offsetDisplayItem to (0,0)
+        // origin). appendTo writes two outlets:
+        // (1) display_list side, splice to draw_ctx.display_list
+        // (2) lowering_buffer_paint side, translate to paint_table.DisplayItem
+        // **both must wrap with begin/end_opacity_layer** to apply origin + scale + opacity.
         //
-        // 历史 bug（2026-07-29 修）：(1) 只 splice 裸 commands，没有包裹层。
-        // 而 cx.render() 末尾会 `main_paint.clearRetainingCapacity()` 再由
-        // appendAllDisplayItemsToRenderList 从 display_list **重建**整个
-        // paint 列表（core.zig:3087-3089），于是 (2) 精心写入的 begin/end
-        // 包裹连同 origin 一起被丢弃，snapshot 恒绘制在 local (0,0) 而非 anchor。
-        // 这就是 "SnapshotLayer mounts as a pure draw overlay" 长期 QUARANTINE
-        // 的真因（rect 出现在 (0,0) 而非期望的 anchor 坐标）。
+        // Pitfall: at the end of cx.render(), `main_paint.clearRetainingCapacity()` then
+        // appendAllDisplayItemsToRenderList rebuilds the whole paint list from display_list
+        // (core.zig:3087-3089). If (1) splices bare commands without the wrapper, the wrapper
+        // written to (2) and its origin are discarded and the snapshot draws at local (0,0) instead
+        // of its anchor.
         const gpu_draw_shadow = @import("render_engine/gpu_draw_shadow.zig");
         const paint_table_mod = @import("paint_table.zig");
         // Keep all literal snapshot commands in the host's effect scope; an
@@ -347,8 +345,8 @@ pub const Snapshot = struct {
             };
         }
 
-        // (1) display_list 端，同样带包裹层，否则 render 末尾从 display_list
-        // 重建 paint 列表时 origin/scale/opacity 全部丢失。
+        // (1) display_list side, must also wrap, else render end rebuilds paint list from
+        // display_list losing all origin/scale/opacity.
         if (draw_ctx.display_list) |dl| {
             if (begin_item) |begin| try dl.append(begin);
             for (self.commands.commands) |command| {
@@ -361,13 +359,13 @@ pub const Snapshot = struct {
             }
         }
 
-        // (2) lowering_buffer_paint 端
+        // (2) lowering_buffer_paint side
         if (begin_item) |begin| {
             try draw_ctx.lowering_buffer_paint.?.append(draw_ctx.allocator, gpu_draw_shadow.lowerDisplayItem(begin));
         }
         for (self.commands.commands) |item| {
             var paint_item = gpu_draw_shadow.lowerDisplayItem(item);
-            // inline payload (polygon / glass / icon_rep), spill 到 frame_arena 取稳定地址
+            // inline payload (polygon / glass / icon_rep), spill to frame_arena for stable address
             switch (item) {
                 .push_clip => |it| {
                     if (it.shape_kind == .polygon) {

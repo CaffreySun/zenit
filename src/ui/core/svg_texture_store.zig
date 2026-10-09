@@ -1,18 +1,20 @@
-//! SVG 贴图缓存与命中几何，从 `Cx` 析出的有状态子系统。
+//! SVG texture cache and hit geometry, stateful subsystem split from `Cx`.
 //!
-//! 管两张表：
-//!   - `hit_shapes`   texture_id -> PathGeometry，贴图的精确命中形状
-//!   - `texture_cache` (svg 内容哈希, w, h) -> texture_id，避免同一张图重复栅格化
+//! Manages two tables:
+//!  - `hit_shapes`   texture_id -> PathGeometry (texture's precise hit shape)
+//!  - `texture_cache` (svg content hash, w, h) -> texture_id (avoid re-rasterize)
 //!
-//! 这两张表加上 `loader` 原本是 `Cx` 上的三个字段 + 六个方法。它们自成一个
-//! 所有权闭环（geometry 要 free、texture 要经 loader 的 unload 回调释放），
-//! 和 `Cx` 的其余状态没有耦合，所以整体搬出来。
+//! These two tables plus `loader` form a self-contained ownership closure (geometry
+//! needs free; textures need the loader's unload callback), with no coupling to the
+//! rest of Cx state.
 //!
-//! **所有权合同**：
-//!   - `hit_shapes` 里的每个 PathGeometry 由本 store 拥有，覆盖与清空时负责释放
-//!   - `texture_cache` 里的 texture_id 由 `loader` 拥有；store 只在清空缓存时
-//!     调 `unload_fn` 通知它，自己不做别的假设
-//!   - 换 loader 必须先清缓存，否则旧 loader 发的 id 会被新 loader 误 unload
+//! **Ownership contract**:
+//!  - Each PathGeometry in `hit_shapes` is owned by this store; clear/replace must
+//!    free it
+//!  - texture_id in `texture_cache` is owned by `loader`; the store only calls
+//!    unload_fn on cache clear
+//!  - Swapping loaders requires clearing the cache first; otherwise the new loader
+//!    unloads the old loader's ids
 
 const std = @import("std");
 const types = @import("types.zig");
@@ -21,7 +23,7 @@ const svg_geometry = @import("svg_geometry.zig");
 
 const PathGeometry = types.PathGeometry;
 
-/// 宿主提供的 SVG 栅格化后端。
+/// Host-provided SVG rasterization backend.
 pub const SvgTextureLoader = struct {
     context: ?*anyopaque = null,
     load_fn: *const fn (context: ?*anyopaque, svg_data: []const u8, width: u32, height: u32) anyerror!u32,
@@ -55,7 +57,8 @@ pub const SvgTextureStore = struct {
         self.hit_shapes.deinit();
     }
 
-    /// 解析 SVG 的 path 几何并登记为该贴图的命中形状。重复登记会释放旧几何。
+    /// Parse SVG path geometry and register as hit shape for texture. Reregistering
+    /// frees old geometry.
     pub fn registerHit(self: *SvgTextureStore, texture_id: u32, svg_data: []const u8) !void {
         var geometry = try svg_path.createSvgDocumentPathGeometry(self.allocator, svg_data, .nonzero);
         errdefer svg_path.freePathGeometry(self.allocator, &geometry);
@@ -72,7 +75,7 @@ pub const SvgTextureStore = struct {
         return self.hit_shapes.get(texture_id);
     }
 
-    /// 摘掉单个贴图的命中几何并释放它。没有该条目时是 no-op。
+    /// Unlink and free hit geometry for one texture. No-op if entry absent.
     pub fn dropHit(self: *SvgTextureStore, texture_id: u32) void {
         if (self.hit_shapes.fetchRemove(texture_id)) |kv| {
             var geometry = kv.value;
@@ -89,8 +92,8 @@ pub const SvgTextureStore = struct {
         self.hit_shapes.clearRetainingCapacity();
     }
 
-    /// 换 loader 前必须先清空缓存：缓存里的 texture_id 属于旧 loader，
-    /// 留给新 loader 会导致它 unload 一个自己没发过的 id。
+    /// Must clear cache before swapping loader: cached texture_ids belong to old
+    /// loader; leaving them for new loader causes it to unload an id it never issued.
     pub fn setLoader(self: *SvgTextureStore, loader: ?SvgTextureLoader) void {
         self.clearTextureCache();
         self.loader = loader;
@@ -106,7 +109,8 @@ pub const SvgTextureStore = struct {
         self.texture_cache.clearRetainingCapacity();
     }
 
-    /// 取（或栅格化）一张 SVG 贴图。命中缓存时顺带补齐可能缺失的命中形状。
+    /// Get (or rasterize) an SVG texture. On cache hit, also fill in any missing hit
+    /// shape.
     pub fn load(self: *SvgTextureStore, svg_data: []const u8, width: u32, height: u32) !u32 {
         if (width == 0 or height == 0) return error.InvalidSvgRasterSize;
         const loader = self.loader orelse return error.SvgTextureLoaderUnavailable;
@@ -125,18 +129,18 @@ pub const SvgTextureStore = struct {
         const texture_id = try loader.load_fn(loader.context, svg_data, width, height);
         errdefer if (loader.unload_fn) |unload_fn| unload_fn(loader.context, texture_id);
         try self.registerHit(texture_id, svg_data);
-        // put 失败时必须连命中几何一起摘掉：errdefer 已经把 texture_id 还给
-        // loader 了，几何再留在表里就是一条「指向已卸载贴图」的残留条目。
-        // loader 若复用 id（完全合法，它就是个 u32 句柄），下一张 SVG 拿到
-        // 同一个 id 时 lookupHit 会命中**上一张图的几何**，命中区域错位，
-        // 不崩不报错。
+        // On put failure, hit geometry must also be unlinked: errdefer already returned
+        // texture_id to the loader, so a leftover geometry entry is orphaned and points to
+        // an unloaded texture. If the loader reuses the id (legal, it is just a u32 handle),
+        // the next SVG gets the same id and lookupHit returns the **previous image's
+        // geometry**: misaligned hit region, no crash/error.
         errdefer self.dropHit(texture_id);
         try self.texture_cache.put(key, texture_id);
         return texture_id;
     }
 };
 
-// ── 测试 ───────────────────────────────────────────────────────────────
+// ── Tests ──────────────────────────────────────────────────────────
 
 const TestLoader = struct {
     var next_id: u32 = 1;
@@ -237,7 +241,7 @@ test "换 loader 先清旧缓存，避免新 loader 收到不属于它的 id" {
     store.setLoader(TestLoader.loader());
 
     const id = try store.load(test_svg, 16, 16);
-    store.setLoader(null); // 换 loader
+    store.setLoader(null); // Swap loader.
     try std.testing.expectEqual(@as(usize, 1), TestLoader.unload_count);
     try std.testing.expectEqual(id, TestLoader.unloaded[0]);
     try std.testing.expectEqual(@as(u32, 0), store.texture_cache.count());
@@ -246,7 +250,7 @@ test "换 loader 先清旧缓存，避免新 loader 收到不属于它的 id" {
 test "重复登记同一 texture_id 的命中几何不泄漏" {
     var store = SvgTextureStore.init(std.testing.allocator);
     defer store.deinit();
-    // 第二次登记必须释放第一次的几何；泄漏会被 testing.allocator 抓到
+    // Second registration must free first geometry; leak caught by testing.allocator.
     try store.registerHit(7, test_svg);
     try store.registerHit(7, "<svg><path d=\"M0 0 L20 20 L30 5\"/></svg>");
     try std.testing.expectEqual(@as(u32, 1), store.hit_shapes.count());
@@ -265,25 +269,30 @@ test "loader 失败时不写缓存也不留命中几何" {
 }
 
 test "put 失败时不留下指向已卸载贴图的残留命中条目" {
-    // glmx 交叉审查发现（2026-09-22，既有行为非重构引入）：
-    // load() 的 errdefer 只把 texture_id 还给 loader，命中几何却留在
-    // hit_shapes 里。loader 复用 id（它就是个 u32 句柄，复用完全合法）时，
-    // 下一张 SVG 拿到同一 id 会命中上一张图的几何，命中区域错位，不崩不报错。
+    // GLM cross-review found (2026-09-22, pre-existing not from refactor): load()'s
+    // errdefer only returns texture_id to loader; hit geometry left in hit_shapes.
+    // Loader reuses id (u32 handle, completely legal) and next SVG gets same id,
+    // lookupHit hits previous image's geometry, hit region misaligned, no crash/error.
     TestLoader.reset();
 
-    // 让 texture_cache.put 的那次分配失败：前面的分配都放行，之后失败
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 5 });
+    // Measure hit registration first so the next allocation is cache publication,
+    // independent of ArrayList growth policies in the Zig standard library.
+    var counting = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    var probe = SvgTextureStore.init(counting.allocator());
+    defer probe.deinit();
+    try probe.registerHit(1, test_svg);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        .fail_index = counting.alloc_index,
+        .resize_fail_index = 0,
+    });
     var store = SvgTextureStore.init(failing.allocator());
     defer store.deinit();
     store.setLoader(TestLoader.loader());
 
-    // fail_index=5 是实测选的：2..5 命中 texture_cache.put 那次分配，7+ 会在
-    // 更早的分配就失败导致走不到断言。这里**直接断言 load 必须失败**而不是
-    // 在成功时 SkipZigTest，若将来分配次数变了，这个测试要当场红，好过
-    // 悄悄变成永远跳过的空壳。
     try std.testing.expectError(error.OutOfMemory, store.load(test_svg, 16, 16));
 
-    // 失败后两张表必须一致：贴图已还给 loader，几何不得留下
+    // After failure both tables must match: texture returned to loader, geometry
+    // must not remain.
     try std.testing.expect(TestLoader.unload_count >= 1);
     try std.testing.expectEqual(@as(u32, 0), store.hit_shapes.count());
     try std.testing.expectEqual(@as(u32, 0), store.texture_cache.count());

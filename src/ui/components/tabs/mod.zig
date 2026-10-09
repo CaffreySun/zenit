@@ -1,18 +1,21 @@
-/// Tabs Component
+/// Tabs component with multiple variants and keyboard navigation.
 ///
-/// 标签页组件，支持多种变体和键盘导航
-///
-/// 特性:
-/// - 状态管理: 通过 Scope 分配 TabsState，on_before_render 脏检测更新
-/// - 事件驱动: 通过 on_event 处理 click 事件切换 Tab
-/// - 焦点支持: 可聚焦, 键盘左右切换
-/// - 变体: underline, pill, icon (× size: sm, md)
-/// - icon 变体支持 Lucide SVG 图标
-/// - 可关闭标签
-/// - on_change / on_close 回调
+/// Features:
+/// - Signal-first: items as Source, active as Model (string uncontrolled / signal controlled /
+///   split)
+/// - View = f(items, active): an effect rebuilds tabs and selected state;
+///   highlight box geometry follows layout in before_render
+/// - Event-driven: click events via on_event switch tabs
+/// - Focusable, keyboard left/right navigation
+/// - Variants: underline, pill, icon (x size: sm, md)
+/// - Icon variant supports Lucide SVG icons
+/// - Closeable tabs
+/// - on_change / on_close callbacks
+const control_shell = @import("../control_shell/mod.zig");
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const core = @import("../../core.zig");
+const ui_view = @import("../../view.zig");
 const Cx = core.Cx;
 const Node = core.Node;
 const box = core.box;
@@ -23,113 +26,240 @@ const events = @import("../../events.zig");
 const Event = events.Event;
 const EventResult = events.EventResult;
 const hooks = @import("../../hooks.zig");
-const Scope = @import("../../reactive.zig").Scope;
+const reactive = @import("../../reactive.zig");
+const bind_mod = @import("../../bind.zig");
+const Scope = reactive.Scope;
+const Source = reactive.Source;
+const Model = reactive.Model;
+const Handler = core.Handler;
 const ConditionalStyle = core.ConditionalStyle;
 const StyleOverride = core.StyleOverride;
 const recipe_mod = @import("../../recipe.zig");
 const svg_assets = @import("../../svg_assets.zig");
 
-// ============================================================================
-// 类型定义
-// ============================================================================
+// Type definitions
 
-/// Tabs 变体
+/// Tabs variant
 pub const TabsVariant = enum {
     underline,
     pill,
     tab,
 };
 
-/// Tabs 尺寸，统一使用 ControlSize 4 档
-pub const TabsSize = theme.ControlSize;
+/// Tabs size, uniformly uses ControlSize 4-step
+pub const TabsSize = control_shell.ControlSize;
 
-/// Tab 项目
+/// Tab item
 pub const TabItem = struct {
     id: []const u8,
-    label_text: []const u8,
+    label: []const u8,
     icon_asset: ?svg_assets.Asset = null,
     disabled: bool = false,
     closable: bool = false,
     badge: ?u32 = null,
 };
 
-// 样式层（TabsSlotRecipe + variant×size spec 表 + EditorTabs 样式函数）
-// 析出至 styles.zig；重导出保持公共 API 不变。
+// Style layer (TabsSlotRecipe + variant×size spec table)
+// exported from styles.zig; re-export keeps public API stable.
 const styles = @import("styles.zig");
 pub const TabsSlotRecipe = styles.TabsSlotRecipe;
 
-// ============================================================================
-// TabsState，内部状态
-// ============================================================================
+// Tabs runtime (Signal-first, docs/SIGNAL_API_DESIGN.md)
 
-pub const TabsState = struct {
-    active_index: usize = 0,
-    tab_count: usize = 0,
-
-    /// 2026-07-31 并轨：统一 ?core.HandlerRef，用 invokeWithStr 触发
-    /// （payload = tab id）。
-    on_change: ?core.HandlerRef = null,
-    on_close: ?core.HandlerRef = null,
-
-    tab_ids: [32]?[]const u8 = [_]?[]const u8{null} ** 32,
-
-    pub fn setActive(self: *TabsState, index: usize) void {
-        if (index >= self.tab_count) return;
-        if (index == self.active_index) return;
-
-        self.active_index = index;
-
-        if (self.on_change) |h| {
-            if (self.tab_ids[index]) |id| h.invokeWithStr(id);
-        }
-    }
-
-    pub fn moveNext(self: *TabsState) void {
-        if (self.tab_count == 0) return;
-        const next = (self.active_index + 1) % self.tab_count;
-        self.setActive(next);
-    }
-
-    pub fn movePrev(self: *TabsState) void {
-        if (self.tab_count == 0) return;
-        const prev = if (self.active_index == 0) self.tab_count - 1 else self.active_index - 1;
-        self.setActive(prev);
-    }
-
-    pub fn getActiveId(self: *const TabsState) ?[]const u8 {
-        if (self.active_index < self.tab_count) {
-            return self.tab_ids[self.active_index];
-        }
-        return null;
-    }
-};
-
-/// 每个 Tab 的点击上下文
+/// Click context per Tab (belongs to current tab subtree scope)
 pub const TabClickContext = struct {
-    tabs_state: *TabsState,
+    rt: *TabsRuntime,
     tab_index: usize,
-    tab_row: *Node,
 };
 
-/// Tabs on_before_render 渲染上下文
-const TabsRenderContext = struct {
-    state: *TabsState,
+/// Tabs runtime state (owned by scope)
+///
+/// View = f(items, active): effect rebuilds tabs on items change, parses active id to index,
+/// refreshes text/icon/a11y; highlight box geometry depends on layout, still tracked each frame in
+/// before_render.
+pub const TabsRuntime = struct {
+    active: reactive.Bound(?[]const u8),
+    items: Source([]const TabItem),
+    /// Shallow copy of static items (re-read at click; caller array may be stack-allocated)
+    owned_items: []TabItem = &.{},
+    on_change: ?Handler([]const u8),
+    on_close: ?Handler([]const u8),
     variant: TabsVariant,
     size: TabsSize,
+    closable: bool,
     tokens: *const theme.ThemeTokens,
     allocator: Allocator,
-    item_count: usize,
-    has_icons: bool,
+    cx: *Cx,
+    scope: *Scope,
+    tab_row: *Node,
     highlight_box: *Node,
-    last_rendered_index: usize = std.math.maxInt(usize), // 首帧 highlight 定位需要
-    first_render: bool = true, // 首帧跳过 transition 动画，直接定位
+    slots: TabsSlotRecipe.Slots,
+    /// Scope of current tab subtree (hover hook, click context), whole rebuild when items change
+    tabs_scope: ?*Scope = null,
+    item_count: usize = 0,
+    built_key: ?u64 = null,
+    /// Current active index (highlight box in before_render reads it)
+    active_index: usize = 0,
+    /// Index text style applied to
+    shown_index: usize = std.math.maxInt(usize),
+    /// Skip highlight box transition on first frame, position directly
+    first_render: bool = true,
+
+    /// Rebuild key: content + string address. Nodes borrow label slice itself; derived source
+    /// recomputation may return same content, different address (old freed later), must rebuild
+    /// then.
+    fn itemsKey(items: []const TabItem) u64 {
+        var h = std.hash.Wyhash.init(0);
+        h.update(std.mem.asBytes(&items.len));
+        for (items) |it| {
+            h.update(std.mem.asBytes(&it.id.len));
+            h.update(it.id);
+            h.update(std.mem.asBytes(&it.label.len));
+            h.update(it.label);
+            h.update(std.mem.asBytes(&@intFromPtr(it.id.ptr)));
+            h.update(std.mem.asBytes(&@intFromPtr(it.label.ptr)));
+            h.update(std.mem.asBytes(&it.badge));
+            h.update(&[_]u8{ @intFromBool(it.disabled), @intFromBool(it.closable), @intFromBool(it.icon_asset != null) });
+        }
+        return h.final();
+    }
+
+    fn indexOf(items: []const TabItem, id: ?[]const u8) usize {
+        const want = id orelse return 0;
+        for (items, 0..) |it, i| {
+            if (std.mem.eql(u8, it.id, want)) return i;
+        }
+        return 0;
+    }
+
+    /// View = f(items, active). mount snapshot passes false, effect passes true.
+    fn view(self: *TabsRuntime, comptime tracked: bool) !void {
+        const items = self.items.read(tracked);
+        const index = indexOf(items, self.active.readAs(tracked));
+        const key = itemsKey(items);
+        if (self.built_key == null or self.built_key.? != key) {
+            // Clear first: if rebuild fails partway, next view must retry
+            self.built_key = null;
+            try self.cx.owner.untrack(rebuild, .{ self, items, index });
+            self.built_key = key;
+            self.shown_index = index;
+        }
+        self.active_index = index;
+        if (index != self.shown_index) {
+            self.applyActiveStyles(items, index);
+            self.shown_index = index;
+        }
+        self.tab_row.markRenderDirty();
+    }
+
+    fn viewEffect(self: *TabsRuntime) void {
+        self.view(true) catch |err| std.log.err("[Tabs] update failed: {}", .{err});
+    }
+
+    fn applyActiveStyles(self: *TabsRuntime, items: []const TabItem, index: usize) void {
+        const t = self.tokens;
+        const tab_style = self.slots.tab.resolve(.{});
+        const active_style = self.slots.tab.resolve(.{ .is_selected = true });
+        const children = self.tab_row.children.items;
+        const count = @min(self.item_count, children.len -| 1);
+        for (children[1 .. 1 + count], 0..) |tab_node, i| {
+            const is_active = i == index;
+            // aria-selected tracks current active tab: VoiceOver uses it to determine 'which tab am
+            // I on'
+            if (tab_node.behavior.interaction.a11y) |*a| a.selected = is_active;
+            if (i < items.len and items[i].disabled) continue;
+            const resolved = if (is_active) active_style else tab_style;
+            const text_color = resolved.text_color orelse t.tokens.color.fg_secondary;
+            const icon_tint = if (is_active and self.variant == .tab) t.tokens.color.accent else t.tokens.color.fg_secondary;
+            updateTabDescendants(tab_node, text_color, icon_tint, is_active);
+        }
+    }
+
+    fn rebuild(args: struct { *TabsRuntime, []const TabItem, usize }) !void {
+        const self = args[0];
+        const items = args[1];
+        const index = args[2];
+        self.teardownTabs();
+        const tabs_scope = try self.scope.childScope();
+        self.tabs_scope = tabs_scope;
+        // Failure partway: half-built tabs unload with their hooks
+        errdefer self.teardownTabs();
+        try ui_view.mount(tabs_scope, self.cx, self.tab_row, ui_view.items(TabRowCtx{ .rt = self, .active = index }, items, tabElement));
+        self.item_count = items.len;
+        // New tab geometry unknown: highlight box positioned directly on first frame
+        self.first_render = true;
+    }
+
+    const TabRowCtx = struct { rt: *TabsRuntime, active: usize };
+
+    fn tabElement(c: TabRowCtx, item: TabItem, i: usize) ui_view.ComponentOf(buildTab) {
+        const self = c.rt;
+        return ui_view.component(buildTab, TabBuildArgs{
+            .rt = self,
+            .tab_index = i,
+            .variant = self.variant,
+            .size = self.size,
+            .item = item,
+            .is_active = i == c.active,
+            .is_disabled = item.disabled,
+            .show_close = item.closable or self.closable,
+            .slots = self.slots,
+        });
+    }
+
+    /// Unload current tab (standard order: invalidate hooks -> dispose scope -> unlink free)
+    fn teardownTabs(self: *TabsRuntime) void {
+        const children = self.tab_row.children.items;
+        const count = @min(self.item_count, children.len -| 1);
+        for (children[1 .. 1 + count]) |tab_node| hooks.invalidateSubtreeHookState(tab_node);
+        if (self.tabs_scope) |sc| sc.dispose();
+        self.tabs_scope = null;
+        var i = count;
+        while (i > 0) : (i -= 1) {
+            const tab_node = self.tab_row.children.items[i];
+            core.clearNodeScopes(tab_node);
+            self.cx.detachChild(self.tab_row, tab_node);
+            self.cx.freeNode(tab_node);
+        }
+        self.item_count = 0;
+    }
+
+    fn select(self: *TabsRuntime, index: usize) void {
+        const items = self.items.peek();
+        if (index >= items.len or items[index].disabled) return;
+        // Click on what's already shown as selected (including active null / not in items, falls
+        // back to first): visual unchanged, no proposal, no on_change
+        if (index == self.active_index) return;
+        if (self.active.commit(items[index].id)) |landed| {
+            if (landed) |id| {
+                if (self.on_change) |h| h.call(id);
+            }
+        }
+    }
+
+    /// Arrow keys: skip disabled items, cycle
+    fn move(self: *TabsRuntime, forward: bool) void {
+        const items = self.items.peek();
+        if (items.len == 0) return;
+        // active_index from last successful view: within same batch items may shrink or rebuild
+        // fails, may exceed current items, reverse branch has no modulo guard
+        var i = @min(self.active_index, items.len - 1);
+        for (0..items.len) |_| {
+            i = if (forward) (i + 1) % items.len else (if (i == 0) items.len - 1 else i - 1);
+            if (!items[i].disabled) return self.select(i);
+        }
+    }
+
+    fn close(self: *TabsRuntime, index: usize) void {
+        const items = self.items.peek();
+        if (index >= items.len) return;
+        if (self.on_close) |h| h.call(items[index].id);
+    }
 };
 
-// ============================================================================
-// tabsBeforeRender, highlight box + 文字样式更新
-// ============================================================================
+// tabsBeforeRender, highlight box follows
 
-/// 更新 tab 后代节点的文字颜色、图标 tint 和 font_weight
+/// Update text color, icon tint, and font_weight of tab descendant nodes
 fn updateTabDescendants(parent: *Node, text_color: Color, icon_tint: Color, is_active: bool) void {
     const target_weight: u16 = if (is_active) 600 else 500;
     for (parent.children.items) |child| {
@@ -154,114 +284,80 @@ fn sizingPxValue(sizing: core.Sizing) ?f32 {
     };
 }
 
+/// Highlight box follows active tab's layout rect each frame (geometry depends on previous frame's
+/// layout, can only do here)
 fn tabsBeforeRender(node: *Node) void {
-    const render_ctx: *TabsRenderContext = @ptrCast(@alignCast(node.behavior.events.event_context orelse return));
-    const state = render_ctx.state;
-    const t = render_ctx.tokens;
-    const v = render_ctx.variant;
-    const s = render_ctx.size;
-
-    const hbox = render_ctx.highlight_box;
+    const rt: *TabsRuntime = @ptrCast(@alignCast(node.behavior.events.event_context orelse return));
+    const hbox = rt.highlight_box;
     const children = node.children.items;
+    if (rt.item_count == 0 or rt.active_index >= rt.item_count or rt.active_index + 1 >= children.len) return;
 
-    // ---- 1. 每帧更新 highlight box 位置/大小（依赖上一帧 layout rect） ----
-    // 用 translate_x 做水平位移（支持 transition 动画），margin.top 做垂直定位
-    if (children.len > 1 and state.active_index + 1 < children.len) {
-        const active_tab = children[state.active_index + 1];
-        const tab_rect = active_tab.rectFromWorldOrFallback();
+    const active_tab = children[rt.active_index + 1];
+    const tab_rect = active_tab.rectFromWorldOrFallback();
+    if (tab_rect.w <= 0) return;
 
-        if (tab_rect.w > 0) {
-            var layout_changed = false;
-            if (render_ctx.first_render) {
-                // 首帧：立即定位、同步 slot、不触发动画（snapTransition 统一处理，
-                // 组件不再直接改写引擎 transition slot 内部状态）。
-                render_ctx.first_render = false;
-                hbox.snapTransition(render_ctx.allocator, .width, tab_rect.w);
-                hbox.snapTransition(render_ctx.allocator, .translate_x, tab_rect.x);
-            } else {
-                hbox.setWidth(tab_rect.w);
-                // translate_x 做水平动画位移
-                hbox.setTranslateX(tab_rect.x);
-            }
-            switch (v) {
-                .underline => {
-                    const old_h = sizingPxValue(hbox.style.height);
-                    // 全局 hook 读 rect。
-                    const r = node.rectFromWorldOrFallback();
-                    const row_h = r.h;
-                    const new_margin = row_h - 2;
-                    hbox.style.height = .{ .px = 2 };
-                    hbox.setMarginTop(new_margin);
-                    layout_changed = layout_changed or old_h == null or old_h.? != 2;
-                },
-                .pill, .tab => {
-                    const old_h = sizingPxValue(hbox.style.height);
-                    hbox.style.height = .{ .px = tab_rect.h };
-                    hbox.setMarginTop(tab_rect.y);
-                    layout_changed = layout_changed or old_h == null or old_h.? != tab_rect.h;
-                },
-            }
-            if (layout_changed) hbox.markLayoutDirty();
-        }
+    var layout_changed = false;
+    if (rt.first_render) {
+        // First frame: position immediately without triggering animation
+        rt.first_render = false;
+        hbox.snapTransition(rt.allocator, .width, tab_rect.w);
+        hbox.snapTransition(rt.allocator, .translate_x, tab_rect.x);
+    } else {
+        hbox.setWidth(tab_rect.w);
+        hbox.setTranslateX(tab_rect.x);
     }
-
-    // ---- 2. 文字颜色 + font_weight 仅在 active_index 变化时更新 ----
-    if (state.active_index != render_ctx.last_rendered_index) {
-        render_ctx.last_rendered_index = state.active_index;
-
-        const slots = TabsSlotRecipe.resolve(.{ .variant = v, .size = s }, t);
-        const tab_style = slots.tab.resolve(.{});
-        const active_style = slots.tab.resolve(.{ .is_selected = true });
-
-        const tab_start: usize = 1;
-        const tab_end = @min(children.len, render_ctx.item_count + 1);
-
-        for (children[tab_start..tab_end], 0..) |tab_node, i| {
-            const is_active = (i == state.active_index);
-            const is_disabled = (tab_node.behavior.events.on_event == null);
-            const resolved = if (is_active) active_style else tab_style;
-
-            // aria-selected 必须跟着 active_index 走：VoiceOver 在 tablist 里
-            // 靠 selected 位判断"当前是第几个标签页"，只在 mount 写一次的话
-            // 切页后播报的永远是初始那一个。注意这里放在 is_disabled 判断
-            // 之外，禁用的 tab 同样需要正确的 selected 位。
-            if (tab_node.behavior.interaction.a11y) |*a| a.selected = is_active;
-
-            if (!is_disabled) {
-                const text_color = resolved.text_color orelse t.color.fg_secondary;
-                const icon_tint = if (is_active and v == .tab) t.color.accent else t.color.fg_secondary;
-                updateTabDescendants(tab_node, text_color, icon_tint, is_active);
-            }
-        }
+    switch (rt.variant) {
+        .underline => {
+            const old_h = sizingPxValue(hbox.style.height);
+            const r = node.rectFromWorldOrFallback();
+            hbox.style.height = .{ .px = 2 };
+            hbox.setMarginTop(r.h - 2);
+            layout_changed = old_h == null or old_h.? != 2;
+        },
+        .pill, .tab => {
+            const old_h = sizingPxValue(hbox.style.height);
+            hbox.style.height = .{ .px = tab_rect.h };
+            hbox.setMarginTop(tab_rect.y);
+            layout_changed = old_h == null or old_h.? != tab_rect.h;
+        },
     }
+    if (layout_changed) hbox.markLayoutDirty();
 }
 
-/// Tab 点击事件处理器
+// Tabs always retain one active page. Accessible selection must follow the same
+// commit path as pointer activation, with single-selection rules.
+fn setAccessibleTabSelection(raw: *anyopaque, operation: core.A11yProps.ItemSelectionOperation) bool {
+    const ctx: *TabClickContext = @ptrCast(@alignCast(raw));
+    const rt = ctx.rt;
+    const items = rt.items.peek();
+    if (ctx.tab_index >= items.len or items[ctx.tab_index].disabled) return false;
+    const selected = rt.active_index == ctx.tab_index;
+    if (operation == .remove) return !selected;
+    if (selected) return true;
+    if (operation == .add) return false;
+    // Same proposal pipeline as click; result finalized before on_change (callback may unmount this
+    // component)
+    const id = items[ctx.tab_index].id;
+    const on_change = rt.on_change;
+    const landed = rt.active.commit(id) orelse return false;
+    const ok = if (landed) |l| std.mem.eql(u8, l, id) else false;
+    if (landed) |l| {
+        if (on_change) |h| h.call(l);
+    }
+    return ok;
+}
+
+/// Tab click / arrow keys: only propose; view effect refreshes after data source lands
 fn tabClickHandler(event: Event, context: ?*anyopaque) EventResult {
-    const click_ctx: *TabClickContext = @ptrCast(@alignCast(context orelse return .ignored));
-
-    // before_render hook 本就在事件之后、本帧渲染前由引擎统一执行；这里只需
-    // 请求重绘（历史上手动调 hook 是 hook 时序不稳时代的补丁）。
-    const syncVisuals = struct {
-        fn run(tab_row: *Node) void {
-            tab_row.markRenderDirty();
-        }
-    }.run;
-
+    const ctx: *TabClickContext = @ptrCast(@alignCast(context orelse return .ignored));
     switch (event) {
         .click => {
-            click_ctx.tabs_state.setActive(click_ctx.tab_index);
-            syncVisuals(click_ctx.tab_row);
+            ctx.rt.select(ctx.tab_index);
             return .handled;
         },
         .key_down => |e| {
-            if (e.key == .left) {
-                click_ctx.tabs_state.movePrev();
-                syncVisuals(click_ctx.tab_row);
-                return .handled;
-            } else if (e.key == .right) {
-                click_ctx.tabs_state.moveNext();
-                syncVisuals(click_ctx.tab_row);
+            if (e.key == .left or e.key == .right) {
+                ctx.rt.move(e.key == .right);
                 return .handled;
             }
             return .ignored;
@@ -270,433 +366,299 @@ fn tabClickHandler(event: Event, context: ?*anyopaque) EventResult {
     }
 }
 
-/// 方向键切换：挂在可聚焦的 container 上（焦点在 container，tab_node 不可聚焦，
-/// 键盘事件从焦点节点向上冒泡，永远到不了 tab_node 的 on_event）。
+/// Arrow keys attached to focusable container (focus on container, keyboard events don't bubble to
+/// tab_node)
 fn tabsKeyDown(key: core.KeyCode, _: core.Modifiers, context: ?*anyopaque) EventResult {
-    const ctx: *TabClickContext = @ptrCast(@alignCast(context orelse return .ignored));
+    const rt: *TabsRuntime = @ptrCast(@alignCast(context orelse return .ignored));
     switch (key) {
-        .left => ctx.tabs_state.movePrev(),
-        .right => ctx.tabs_state.moveNext(),
+        .left => rt.move(false),
+        .right => rt.move(true),
         else => return .ignored,
     }
-    ctx.tab_row.markRenderDirty();
     return .handled;
 }
 
-/// 关闭按钮：触发 on_close(tab id)，并 stop 冒泡，否则点 × 会冒泡到 tab_node 把它激活。
+/// Close button: trigger on_close(tab id) and stop propagation (else clicking x bubbles to tab_node
+/// and activates it)
 fn tabCloseHandler(event: Event, context: ?*anyopaque) EventResult {
     const ctx: *TabClickContext = @ptrCast(@alignCast(context orelse return .ignored));
     switch (event) {
         .click => {
-            if (ctx.tabs_state.on_close) |h| {
-                if (ctx.tab_index < ctx.tabs_state.tab_ids.len) {
-                    if (ctx.tabs_state.tab_ids[ctx.tab_index]) |id| h.invokeWithStr(id);
-                }
-            }
+            ctx.rt.close(ctx.tab_index);
             return .stop;
         },
         else => return .ignored,
     }
 }
 
-// ============================================================================
-// Tabs 属性 + Builder + mount
-// ============================================================================
+// Tabs properties + Builder + mount
 
 pub const TabsProps = struct {
-    items: []const TabItem,
-    active_id: ?[]const u8 = null,
-    default_active_id: ?[]const u8 = null,
+    /// Labels; changes in signal/derived values trigger rebuild. Strings owned by caller; must
+    /// remain valid while they are the current data source value (treated as immutable data).
+    items: Source([]const TabItem) = .{ .value = &.{} },
+    /// Currently active tab id. String / null for uncontrolled (null = first tab);
+    /// `*Signal(?[]const u8)` for controlled (interaction writes directly); `ui.split` parent
+    /// intercepts.
+    active: Model(?[]const u8) = .{ .local = null },
     variant: TabsVariant = .underline,
     size: TabsSize = .md,
     closable: bool = false,
-    /// 2026-07-31 并轨：统一 ?core.HandlerRef，用 invokeWithStr 触发
-    /// （payload = tab id）。
-    on_change: ?core.HandlerRef = null,
-    on_close: ?core.HandlerRef = null,
-    context: ?*anyopaque = null,
-    state_id: ?u64 = null,
+    /// Called after user switches and lands (the landed id)
+    on_change: ?Handler([]const u8) = null,
+    /// Click close button (tab id); closing itself is handled by caller updating items
+    on_close: ?Handler([]const u8) = null,
 };
 
-pub fn Tabs(props: TabsProps) TabsBuilder {
-    return TabsBuilder{ .props = props };
+/// Create Tabs: `W.Tabs(.{ .items = &items, .active = current_tab })`
+pub fn Tabs(props: anytype) TabsBuilder {
+    return .{ .props = reactive.props.coerce(TabsProps, props) };
 }
+
+const TabBuildArgs = struct {
+    variant: TabsVariant,
+    size: TabsSize,
+    item: TabItem,
+    is_active: bool,
+    is_disabled: bool,
+    show_close: bool,
+    rt: *TabsRuntime,
+    tab_index: usize,
+    slots: TabsSlotRecipe.Slots,
+};
 
 pub const TabsBuilder = struct {
     props: TabsProps,
 
-    pub fn variant(self: TabsBuilder, v: TabsVariant) TabsBuilder {
-        var new = self;
-        new.props.variant = v;
-        return new;
-    }
-
-    pub fn size(self: TabsBuilder, s: TabsSize) TabsBuilder {
-        var new = self;
-        new.props.size = s;
-        return new;
-    }
-
-    pub fn closable(self: TabsBuilder, c: bool) TabsBuilder {
-        var new = self;
-        new.props.closable = c;
-        return new;
-    }
-
-    pub fn onChange(self: TabsBuilder, handler_ref: core.HandlerRef) TabsBuilder {
-        var new = self;
-        new.props.on_change = handler_ref;
-        return new;
-    }
-
-    pub fn onClose(self: TabsBuilder, handler_ref: core.HandlerRef) TabsBuilder {
-        var new = self;
-        new.props.on_close = handler_ref;
-        return new;
-    }
-
     pub fn mount(self: TabsBuilder, scope: *Scope, cx: *Cx) !*Node {
+        cx.owner.enterMount();
+        defer cx.owner.exitMount();
         const my_scope = try scope.childScope();
-        // 绑定成功之前 my_scope 无人持有；绑定之后由 container 的守卫接手
-        // （freeNode 会顺带 dispose 绑定的 scope）。
+        // my_scope has no owner before binding succeeds; container takes ownership after
         var scope_bound = false;
         errdefer if (!scope_bound) my_scope.dispose();
         const allocator = cx.allocator;
         const t = cx.tokens;
         const p = self.props;
 
-        // Scope 分配 TabsState
-        const state = try my_scope.allocator.create(TabsState);
-        // 到下面 registerResource 之前 state 无人持有,
-        // my_scope.allocator 不是 arena，dispose 只释放已登记的资源。
-        // 中间的 blk 初始化与 signal 创建都可失败（sidebar sweep index 27 实测）。
-        var state_registered = false;
-        errdefer if (!state_registered) my_scope.allocator.destroy(state);
-        state.* = blk: {
-            var initial = TabsState{};
-            initial.tab_count = @min(p.items.len, 32);
-            for (p.items, 0..) |item, i| {
-                if (i >= 32) break;
-                initial.tab_ids[i] = item.id;
-            }
-            const default_id = p.default_active_id orelse
-                (if (p.items.len > 0) p.items[0].id else null);
-            if (default_id) |did| {
-                for (p.items, 0..) |item, i| {
-                    if (i >= 32) break;
-                    if (std.mem.eql(u8, item.id, did)) {
-                        initial.active_index = i;
-                        break;
-                    }
-                }
-            }
-            break :blk initial;
-        };
-        try my_scope.registerResource(@ptrCast(state), struct {
-            fn destroy(ptr: *anyopaque, alloc: std.mem.Allocator) void {
-                const s: *TabsState = @ptrCast(@alignCast(ptr));
-                alloc.destroy(s);
-            }
-        }.destroy);
-        state_registered = true;
-
-        state.on_change = p.on_change;
-        state.on_close = p.on_close;
-
-        if (p.active_id) |aid| {
-            for (p.items, 0..) |item, i| {
-                if (std.mem.eql(u8, item.id, aid)) {
-                    state.active_index = i;
-                    break;
-                }
-            }
-        }
-
-        // SlotRecipe resolve
         const slots = TabsSlotRecipe.resolve(.{ .variant = p.variant, .size = p.size }, t);
         const root_resolved = slots.root.resolve(.{});
-
-        // 检测是否有 icon
-        var has_icons = false;
-        for (p.items) |item| {
-            if (item.icon_asset != null) {
-                has_icons = true;
-                break;
-            }
-        }
-
         const is_underline = p.variant == .underline;
 
-        // tab_row: 所有 tab + highlight_box 的行容器，几何/背景全部来自 root slot
-        const tab_row = try box(cx, .{
+        // tab_row: row container for all tabs + highlight_box, geometry/background all from root
+        // slot
+        const tab_row_style: core.BoxStyle = .{
             .position = .relative,
-            .direction = .row,
             .gap = root_resolved.gap,
             .padding = root_resolved.padding,
             .align_items = .center,
-        }, .{});
-
-        // tab_row 直到下面才被 container 收走（underline 分支还要再包一层），
-        // 中间 ensureExtFallible / highlight_box / applyTransition 都可失败。
-        var tab_row_owned = true;
-        errdefer if (tab_row_owned) cx.freeNode(tab_row);
-        if (root_resolved.background) |bg| tab_row.setBackgroundRaw(bg);
-        if (root_resolved.corner_radius) |cr| {
-            if (cr > 0) {
-                (try tab_row.style.ensureExtFallible(allocator)).corner_radius = .{ .all = cr };
-            }
-        }
-
-        // ---- highlight_box: absolute 定位，跟随 active tab ----
-        // 外观（背景/阴影/圆角/underline 的 2px 高度）全部来自 highlight slot；
-        // 宽度与位移是运行时几何，由 tabsBeforeRender 每帧驱动。
+            .background = root_resolved.background,
+            .corner_radius = if (root_resolved.corner_radius) |cr| (if (cr > 0) cr else null) else null,
+        };
+        // highlight_box: absolute positioned, follows active tab (first child of tab_row)
         var hl_style = slots.highlight.resolve(.{});
         hl_style.position = .absolute;
-        // 建好即挂：applyTransition 会分配，挂在前面窗口就不存在。
-        // highlight_box 作为 tab_row 的第一个子节点（index 0）
-        const highlight_box = try adoptTabChild(cx, allocator, tab_row, try box(cx, hl_style, .{}));
-        // 选中态的唯一可观测出口：它的 translate_x 指向当前 active tab。
-        // e2e 要断言「点击真的切换了视觉选中态」，只靠 on_change 回调不够,
-        // setActive 的去重守卫会让 active_index 坏掉时回调照常触发。
-        highlight_box.meta.ownership.meta.test_id = "tabs.highlight";
+
+        var tab_row: *Node = undefined;
+        var highlight_box: *Node = undefined;
+        // Selected state's only observable exit: its translate_x points to current active tab (e2e
+        // assertion)
+        const highlight = ui_view.capture(&highlight_box, ui_view.box(.{ .style = hl_style, .test_id = "tabs.highlight" }, {}));
+        // Container is tablist node with button semantics: wraps tab_row + separator in column when
+        // underline, otherwise is tab_row
+        const tablist_a11y: core.A11yProps = .{ .role = .tablist, .required = true };
+        const container = try ui_view.render(my_scope, cx, ui_view.branch(is_underline, ui_view.col(.{
+            .tag = .button,
+            .focusable = true,
+            .a11y = tablist_a11y,
+        }, .{
+            ui_view.capture(&tab_row, ui_view.row(.{ .style = tab_row_style }, .{highlight})),
+            ui_view.box(.{ .style = .{
+                .width = .{ .grow = .{} },
+                .height = .{ .px = 1 },
+                .background = t.tokens.color.separator,
+            } }, {}),
+        }), ui_view.capture(&tab_row, ui_view.row(.{
+            .style = tab_row_style,
+            .tag = .button,
+            .focusable = true,
+            .a11y = tablist_a11y,
+        }, .{highlight}))));
+        // Guard stays armed until return: container remains unowned even after binding
+        errdefer cx.freeNode(container);
         highlight_box.meta.ownership.meta.component_name = "TabHighlight";
-        // translate_x transition: 弹簧般的滑动动画
         highlight_box.applyTransition(allocator, &comptime recipe_mod.transition("translate-x 150ms ease-out, width 150ms ease-out"));
 
-        // outer_container: underline 时包裹 column { tab_row, separator }
-        const container = if (is_underline) blk: {
-            const outer = try box(cx, .{
-                .direction = .column,
-            }, .{});
-            {
-                // outer 在接管 tab_row 之前/之后失败都得自己收拾（sweep 实测：
-                // separator 建好或挂载失败时 outer 连同 separator 一起漏）。接管之后
-                // tab_row 的守卫让位给 outer，否则同一棵子树会被释放两次。
-                errdefer cx.freeNode(outer);
-                try outer.appendChild(allocator, tab_row);
-                tab_row_owned = false;
-                _ = try core.adoptChild(cx, allocator, outer, try box(cx, .{
-                    .width = .{ .grow = .{} },
-                    .height = .{ .px = 1 },
-                    .background = t.color.separator,
-                }, .{}));
-            }
-            break :blk outer;
-        } else tab_row;
-        // 守卫交接紧跟在 container 定下来的那一行：tab_row 的守卫让位，container 的
-        // 守卫立刻武装，中间零窗口（交叉审查指出：此前隔着四行非可失败语句，
-        // 正确性只靠"这几行没有 try"维持，编译器不保护）。
-        // ⚠️ 这条守卫要一直武装到 return：ScopeBinding 只解绑不释放节点，
-        // 绑定之后 container 依然无人回收，而下面还有大量可失败构造
-        // （与 Tag.mount 同型，git_diff sidebar sweep index 27 实测）。
-        tab_row_owned = false; // container 已接管 tab_row（自身或作为其子节点）
-        errdefer cx.freeNode(container);
-
-        container.tag = .button;
-        container.setFocusable(true);
         container.meta.ownership.meta.component_name = "Tabs";
         try core.bindScopeToNode(my_scope, container);
         scope_bound = true;
-        container.behavior.interaction.a11y = .{ .role = .tablist };
-        container.addDebugState(@ptrCast(state));
-        const key_ctx = try my_scope.allocator.create(TabClickContext);
-        key_ctx.* = .{ .tabs_state = state, .tab_index = 0, .tab_row = tab_row };
-        try my_scope.adoptResource(@ptrCast(key_ctx), struct {
-            fn destroy(ptr: *anyopaque, alloc: std.mem.Allocator) void {
-                alloc.destroy(@as(*TabClickContext, @ptrCast(@alignCast(ptr))));
-            }
-        }.destroy);
-        container.behavior.events.on_key_down = tabsKeyDown;
-        container.behavior.events.key_context = key_ctx;
 
-        try hooks.useFocusRing(my_scope, cx, container, .{});
-
-        // on_before_render 渲染上下文
-        const render_ctx = try my_scope.allocator.create(TabsRenderContext);
-        render_ctx.* = .{
-            .state = state,
+        const active = try reactive.resolveModel(?[]const u8, my_scope, p.active);
+        // Shallow copy static items into scope (reversed after rt destroy, see RadioGroup)
+        var items = p.items;
+        var owned_items: []TabItem = &.{};
+        if (p.items == .value) {
+            owned_items = try my_scope.allocator.dupe(TabItem, p.items.value);
+            items = .{ .value = owned_items };
+        }
+        var items_adopted = false;
+        errdefer if (!items_adopted) my_scope.allocator.free(owned_items);
+        const rt = try my_scope.allocator.create(TabsRuntime);
+        rt.* = .{
+            .active = active,
+            .items = items,
+            .owned_items = owned_items,
+            .on_change = p.on_change,
+            .on_close = p.on_close,
             .variant = p.variant,
             .size = p.size,
+            .closable = p.closable,
             .tokens = t,
             .allocator = allocator,
-            .item_count = p.items.len,
-            .has_icons = has_icons,
+            .cx = cx,
+            .scope = my_scope,
+            .tab_row = tab_row,
             .highlight_box = highlight_box,
-            .last_rendered_index = state.active_index, // 首帧不触发文字更新（mount 已设好）
+            .slots = slots,
         };
-        try my_scope.adoptResource(@ptrCast(render_ctx), struct {
+        items_adopted = true;
+        try my_scope.adoptResource(@ptrCast(rt), struct {
             fn destroy(ptr: *anyopaque, alloc: std.mem.Allocator) void {
-                const s: *TabsRenderContext = @ptrCast(@alignCast(ptr));
-                alloc.destroy(s);
+                const r: *TabsRuntime = @ptrCast(@alignCast(ptr));
+                alloc.free(r.owned_items);
+                alloc.destroy(r);
             }
         }.destroy);
-        tab_row.behavior.events.event_context = render_ctx;
+        container.addDebugState(@ptrCast(rt));
+        container.behavior.events.on_key_down = tabsKeyDown;
+        container.behavior.events.key_context = rt;
+        try hooks.useFocusRing(my_scope, cx, container, .{});
+        tab_row.behavior.events.event_context = rt;
         tab_row.meta.per_frame.hooks.before_render.main = tabsBeforeRender;
 
-        // 构建每个 tab（不带背景色，背景由 highlight_box 提供）
-        for (p.items, 0..) |item, i| {
-            const is_active = (i == state.active_index);
-            const is_disabled = item.disabled;
-            const show_close = item.closable or p.closable;
-
-            const click_ctx = try my_scope.allocator.create(TabClickContext);
-            click_ctx.* = .{
-                .tabs_state = state,
-                .tab_index = i,
-                .tab_row = tab_row,
-            };
-            try my_scope.adoptResource(@ptrCast(click_ctx), struct {
-                fn destroy(ptr: *anyopaque, alloc: std.mem.Allocator) void {
-                    const s: *TabClickContext = @ptrCast(@alignCast(ptr));
-                    alloc.destroy(s);
-                }
-            }.destroy);
-
-            const tab_node = try buildTab(my_scope, cx, p, item, is_active, is_disabled, show_close, click_ctx, slots);
-            try tab_row.appendChild(allocator, tab_node);
-        }
-
+        try rt.view(false);
+        reactive.checkBorrow(my_scope, p.items);
+        // active is Model: local signal too, click changes it, needs effect
+        try my_scope.createEffect(rt, TabsRuntime.viewEffect);
         return container;
     }
 };
 
-fn buildTab(
-    scope: *Scope,
-    cx: *Cx,
-    props: TabsProps,
-    item: TabItem,
-    is_active: bool,
-    is_disabled: bool,
-    show_close: bool,
-    click_ctx: *TabClickContext,
-    slots: TabsSlotRecipe.Slots,
-) !*Node {
-    const allocator = cx.allocator;
+fn buildTab(args: TabBuildArgs, scope: *Scope, cx: *Cx) !*Node {
     const t = cx.tokens;
-    const v = props.variant;
-    const s = props.size;
+    const v = args.variant;
+    const s = args.size;
+    const item = args.item;
+    const is_active = args.is_active;
+    const is_disabled = args.is_disabled;
+    const show_close = args.show_close;
+    const slots = args.slots;
+    // Click context belongs to this tab's scope (freed together with tab rebuild)
+    const click_ctx = try scope.allocator.create(TabClickContext);
+    click_ctx.* = .{ .rt = args.rt, .tab_index = args.tab_index };
+    try scope.adoptResource(@ptrCast(click_ctx), struct {
+        fn destroy(ptr: *anyopaque, alloc: std.mem.Allocator) void {
+            alloc.destroy(@as(*TabClickContext, @ptrCast(@alignCast(ptr))));
+        }
+    }.destroy);
 
     const resolved = slots.tab.resolve(.{ .is_selected = is_active });
 
     const text_color = if (is_disabled)
-        t.color.fg_secondary
+        t.tokens.color.fg_secondary
     else
-        resolved.text_color orelse t.color.fg_secondary;
+        resolved.text_color orelse t.tokens.color.fg_secondary;
 
-    const font_sz = resolved.font_size orelse t.control.get(s).font_size;
+    const font_sz = resolved.font_size orelse control_shell.metrics(t, s).font_size;
 
-    // 所有变体统一: row { icon?, label, badge?, close? }
-    // 背景色由 highlight_box 提供，tab 自身透明；几何来自 tab slot 的 derived
-    const tab_node = try box(cx, .{
-        .padding = resolved.padding,
-        .direction = .row,
-        .align_items = .center,
-        .gap = resolved.gap,
-    }, .{});
-    // tab_node 是返回给调用方的子树根，返回成功前无人持有。
-    errdefer cx.freeNode(tab_node);
-    if (!is_disabled) tab_node.style.cursor = .pointer;
+    // Badge text on stack, copied into node when view.text mounts
+    var badge_buf: [8]u8 = undefined;
+    var badge_style: core.BoxStyle = .{};
+    var badge_content: []const u8 = "";
+    var badge_txt: core.TextStyle = .{};
+    if (item.badge) |badge_count| {
+        badge_style = slots.badge.resolve(.{});
+        badge_content = std.fmt.bufPrint(&badge_buf, "{d}", .{badge_count}) catch "0";
+        badge_txt = .{
+            .color = badge_style.text_color orelse t.tokens.color.button_primary_fg,
+            .font_size = badge_style.font_size orelse 10,
+        };
+        badge_style.text_color = null;
+        badge_style.font_size = null;
+    }
 
-    // 容器已是 role=tablist，但此前每个 tab 自身没有任何 a11y 声明，AT 看到的
-    // 是一个空 tablist，既不知道有几个标签页，也读不出哪个是当前页。
-    // role=tab + label + selected 三者缺一不可。
-    tab_node.behavior.interaction.a11y = .{
-        .role = .tab,
-        .label = item.label_text,
-        .selected = is_active,
-        .disabled = is_disabled,
+    var close_style = slots.close.resolve(.{});
+    const close_txt: core.TextStyle = .{
+        .color = close_style.text_color orelse t.tokens.color.fg_secondary,
+        .font_size = close_style.font_size orelse 12,
     };
+    close_style.text_color = null;
+    close_style.font_size = null;
+    if (!is_disabled) close_style.cursor = .pointer;
+
+    const icon_sz = styles.tabIconSize(s);
+    const icon_asset: ?svg_assets.Asset = if (v == .tab) item.icon_asset else null;
+
+    // All variants unified: row { icon?, label, badge?, close? }
+    // Background from highlight_box, tab transparent; geometry from tab slot's derived
+    var close_btn: ?*Node = null;
+    const tab_node = try ui_view.render(scope, cx, ui_view.row(.{
+        .style = .{
+            .padding = resolved.padding,
+            .align_items = .center,
+            .gap = resolved.gap,
+            .cursor = if (!is_disabled) core.CursorShape.pointer else null,
+        },
+        // role=tab + label + selected all required (container is role=tablist)
+        .a11y = core.A11yProps{
+            .role = .tab,
+            .label = item.label,
+            .selected = is_active,
+            .disabled = is_disabled,
+            .item_selection = if (is_disabled) null else .{ .context = @ptrCast(click_ctx), .set = setAccessibleTabSelection },
+        },
+    }, .{
+        // Tab variant: icon
+        if (icon_asset) |asset| ui_view.icon(.{
+            .style = .{ .width = .{ .px = icon_sz }, .height = .{ .px = icon_sz } },
+            .tint = if (is_active) t.tokens.color.accent else t.tokens.color.fg_secondary,
+        }, asset) else null,
+        // Label: ghost bold text (h=0, prevents jitter) + real text (font_weight switches
+        // instantly)
+        ui_view.col(.{}, .{
+            // Ghost text: bold weight reserves width, h=0 + overflow_hidden hides rendering
+            ui_view.attrs(.{ .style = core.BoxStyle{ .height = .{ .px = 0 }, .overflow_hidden = true } }, ui_view.text(.{ .style = core.TextStyle{
+                .color = Color.TRANSPARENT,
+                .font_size = font_sz,
+                .font_weight = 600,
+            } }, item.label)),
+            // Real text: font_weight switches instantly on change (no transition animation, avoid
+            // jitter/shadow)
+            ui_view.text(.{ .style = core.TextStyle{
+                .color = text_color,
+                .font_size = font_sz,
+                .font_weight = if (is_active) @as(u16, 600) else @as(u16, 500),
+            } }, item.label),
+        }),
+        // badge
+        if (item.badge != null) ui_view.attrs(.{ .style = badge_style }, ui_view.text(.{ .style = badge_txt }, badge_content)) else null,
+        // Close button
+        if (show_close) ui_view.capture(&close_btn, ui_view.attrs(.{
+            .style = close_style,
+            .a11y = core.A11yProps{ .role = .button, .label = "Close" },
+        }, ui_view.text(.{ .style = close_txt }, "×"))) else null,
+    }));
+    // tab_node is returned to caller, unowned before return succeeds
+    errdefer cx.freeNode(tab_node);
 
     if (!is_disabled) {
         tab_node.behavior.events.on_event = tabClickHandler;
         tab_node.behavior.events.event_context = click_ctx;
         _ = try hooks.useHover(scope, tab_node);
-    }
-
-    // tab variant: 图标
-    if (v == .tab) {
-        if (item.icon_asset) |asset| {
-            const icon_sz = styles.tabIconSize(s);
-            const tint = if (is_active) t.color.accent else t.color.fg_secondary;
-            const icon_node = try core.iconTint(cx, asset, tint, .{
-                .width = .{ .px = icon_sz },
-                .height = .{ .px = icon_sz },
-            });
-            try tab_node.appendChild(allocator, icon_node);
+        if (close_btn) |btn| {
+            btn.behavior.events.on_event = tabCloseHandler;
+            btn.behavior.events.event_context = click_ctx;
         }
-    }
-
-    // label: ghost bold text (h=0, 撑宽防抖动) + real text (font_weight 瞬间切换)
-    // 建好即挂：下面 ghost/label 的构造与 setText 都可失败。
-    const label_wrapper = try adoptTabChild(cx, allocator, tab_node, try box(cx, .{
-        .direction = .column,
-    }, .{}));
-
-    // ghost text: bold 字重撑宽度，h=0 + overflow_hidden 裁掉渲染
-    const ghost_node = try adoptTabChild(cx, allocator, label_wrapper, try box(cx, .{
-        .height = .{ .px = 0 },
-        .overflow_hidden = true,
-    }, .{}));
-    ghost_node.setText(.{
-        .content = item.label_text,
-        .color = Color.TRANSPARENT,
-        .font_size = font_sz,
-        .font_weight = 600,
-    });
-
-    // real text: font_weight 在切换时瞬间切换（不做 transition 动画，避免抖动/叠影）
-    const label_node = try adoptTabChild(cx, allocator, label_wrapper, try box(cx, .{}, .{}));
-    label_node.setText(.{
-        .content = item.label_text,
-        .color = text_color,
-        .font_size = font_sz,
-        .font_weight = if (is_active) @as(u16, 600) else @as(u16, 500),
-    });
-
-    // badge
-    if (item.badge) |badge_count| {
-        var badge_buf: [8]u8 = undefined;
-        const badge_text = std.fmt.bufPrint(&badge_buf, "{d}", .{badge_count}) catch "0";
-
-        var badge_style = slots.badge.resolve(.{});
-        const badge_fg = badge_style.text_color orelse t.color.button_primary_fg;
-        const badge_fs = badge_style.font_size orelse 10;
-        // 文本样式经 setText 走 TextProps，不留在 box ext 上
-        badge_style.text_color = null;
-        badge_style.font_size = null;
-        var badge_node = try box(cx, badge_style, .{});
-        // 关键：badge_text 指向栈上 badge_buf，函数返回后即失效。必须 setContent
-        // 拷贝（同 Badge 组件做法），否则跨帧渲染时 content 指针悬空 -> 只画出 accent 圆点、数字不绘。
-        var badge_txt = core.TextProps{
-            .content = "",
-            .color = badge_fg,
-            .font_size = badge_fs,
-        };
-        try badge_txt.setContent(cx.allocator, badge_text);
-        badge_node.setText(badge_txt);
-        try tab_node.appendChild(allocator, badge_node);
-    }
-
-    // close 按钮
-    if (show_close) {
-        var close_style = slots.close.resolve(.{});
-        const close_fg = close_style.text_color orelse t.color.fg_secondary;
-        const close_fs = close_style.font_size orelse 12;
-        close_style.text_color = null;
-        close_style.font_size = null;
-        const close_btn = try box(cx, close_style, .{});
-        close_btn.setText(.{
-            .content = "×",
-            .color = close_fg,
-            .font_size = close_fs,
-        });
-        close_btn.behavior.interaction.a11y = .{ .role = .button, .label = "Close" };
-        if (!is_disabled) {
-            close_btn.style.cursor = .pointer;
-            close_btn.behavior.events.on_event = tabCloseHandler;
-            close_btn.behavior.events.event_context = click_ctx;
-        }
-        try tab_node.appendChild(allocator, close_btn);
     }
 
     return tab_node;
@@ -707,148 +669,71 @@ fn buildTab(
 // ============================================================================
 
 pub const TabPanelProps = struct {
+    /// Panel identifier (a11y identifier, corresponds to Tabs item id)
     id: []const u8,
-    active: bool = true,
+    /// Is current panel: commonly written as `ui.eq(current_tab, "files")`
+    active: Source(bool) = .{ .value = true },
 };
 
-pub fn TabPanel(props: TabPanelProps) TabPanelBuilder {
-    return TabPanelBuilder{ .props = props };
+/// Create TabPanel: `W.TabPanel(.{ .id = "files", .active = ui.eq(tab, "files") }).mount(scope,
+/// cx)`,
+/// returned node is panel content container; non-current panel skips layout and hides from AT
+pub fn TabPanel(props: anytype) TabPanelBuilder {
+    return .{ .props = reactive.props.coerce(TabPanelProps, props) };
 }
 
 pub const TabPanelBuilder = struct {
     props: TabPanelProps,
 
-    pub fn active(self: TabPanelBuilder, a: bool) TabPanelBuilder {
-        var new = self;
-        new.props.active = a;
-        return new;
+    /// `ui.view.with(W.TabPanel(...), .{ children... })`: the panel itself holds the children.
+    pub fn viewMount(self: TabPanelBuilder, scope: *Scope, cx: *Cx) !ui_view.ViewParts {
+        const node = try self.mount(scope, cx);
+        return .{ .root = node, .slot = node };
     }
 
-    pub fn build(self: TabPanelBuilder, ctx: *Cx) !*Node {
+    pub fn mount(self: TabPanelBuilder, scope: *Scope, cx: *Cx) !*Node {
         const p = self.props;
-
-        if (!p.active) {
-            const node = try box(ctx, .{
-                .width = .{ .px = 0 },
-                .height = .{ .px = 0 },
-            }, .{});
-            node.meta.ownership.meta.component_name = "TabPanel";
-            node.behavior.interaction.a11y = .{
-                .role = .tabpanel,
-                .identifier = p.id,
-                .hidden = true,
-            };
-            return node;
-        }
-
-        const node = try box(ctx, .{
-            .width = .{ .grow = .{} },
-            .height = .{ .grow = .{} },
-            .direction = .column,
-        }, .{});
+        const node = try ui_view.render(scope, cx, ui_view.col(.{
+            .style = .{ .width = .{ .grow = .{} }, .height = .{ .grow = .{} } },
+            .a11y = .{ .role = .tabpanel, .identifier = p.id },
+        }, {}));
+        errdefer cx.freeNode(node);
         node.meta.ownership.meta.component_name = "TabPanel";
-        node.behavior.interaction.a11y = .{
-            .role = .tabpanel,
-            .identifier = p.id,
-        };
+        try bind_mod.bind(scope, p.active, node, struct {
+            fn apply(n: *Node, active: bool) void {
+                n.style.display = if (active) .flex else .none;
+                if (n.behavior.interaction.a11y) |*a| a.hidden = !active;
+                n.markLayoutDirty();
+            }
+        }.apply);
         return node;
     }
 };
 
-// ============================================================================
-// EditorTabs, VSCode 风格文件标签
-// ============================================================================
+// Tests
 
-pub const EditorTabItem = struct {
-    id: []const u8,
-    label_text: []const u8,
-    modified: bool = false,
-    closable: bool = true,
-};
-
-pub const EditorTabsProps = struct {
-    items: []const EditorTabItem,
-    active_id: ?[]const u8 = null,
-    default_active_id: ?[]const u8 = null,
-    /// 2026-07-31 并轨：统一 ?core.HandlerRef，用 invokeWithStr 触发
-    /// （payload = tab id）。
-    on_change: ?core.HandlerRef = null,
-    on_close: ?core.HandlerRef = null,
-    context: ?*anyopaque = null,
-};
-
-pub fn EditorTabs(props: EditorTabsProps) EditorTabsBuilder {
-    return EditorTabsBuilder{
-        .props = props,
-        .internal_active_id = props.default_active_id orelse if (props.items.len > 0) props.items[0].id else "",
-    };
+test "TabPanel: ui.view.with puts the children inside the panel, which follows active" {
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
+    const root = try box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
+    ctx.root = root;
+    const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
+    defer scope.dispose();
+    const active = try scope.createSignal(bool, false);
+    const panel = try ui_view.render(scope, ctx, ui_view.with(TabPanel(.{ .id = "files", .active = active }), .{
+        ui_view.text(.{}, "first"),
+        ui_view.text(.{}, "second"),
+    }));
+    try root.appendChild(std.testing.allocator, panel);
+    try std.testing.expectEqual(@as(usize, 2), panel.children.items.len);
+    try std.testing.expectEqualStrings("first", panel.children.items[0].getText().?.content);
+    try std.testing.expectEqual(core.Display.none, panel.style.display);
+    active.set(true);
+    try std.testing.expectEqual(core.Display.flex, panel.style.display);
 }
 
-pub const EditorTabsBuilder = struct {
-    props: EditorTabsProps,
-    internal_active_id: []const u8,
-
-    fn currentActiveId(self: *const EditorTabsBuilder) []const u8 {
-        return self.props.active_id orelse self.internal_active_id;
-    }
-
-    pub fn build(self: EditorTabsBuilder, ctx: *Cx) !*Node {
-        const allocator = ctx.allocator;
-        const t = ctx.tokens;
-        const p = self.props;
-
-        const container = try box(ctx, styles.editorTabsContainerStyle(t), .{});
-        container.meta.ownership.meta.component_name = "EditorTabs";
-
-        for (p.items) |item| {
-            const is_active = std.mem.eql(u8, item.id, self.currentActiveId());
-
-            const tab = try self.buildEditorTab(ctx, item, is_active);
-            try container.appendChild(allocator, tab);
-        }
-
-        return container;
-    }
-
-    fn buildEditorTab(
-        self: EditorTabsBuilder,
-        ctx: *Cx,
-        item: EditorTabItem,
-        is_active: bool,
-    ) !*Node {
-        const allocator = ctx.allocator;
-        const t = ctx.tokens;
-        _ = self;
-
-        const tab = try box(ctx, styles.editorTabStyle(is_active, t), .{});
-
-        const label_node = try box(ctx, .{}, .{});
-        var label_txt = styles.editorTabLabelStyle(is_active, t);
-        label_txt.content = item.label_text;
-        label_node.setText(label_txt);
-        try tab.appendChild(allocator, label_node);
-
-        if (item.modified) {
-            const dot = try box(ctx, styles.editorModifiedDotStyle(t), .{});
-            try tab.appendChild(allocator, dot);
-        }
-
-        if (item.closable) {
-            const close_btn = try box(ctx, styles.editorCloseStyle(t), .{});
-            close_btn.setText(styles.editorCloseLabelStyle(t));
-            try tab.appendChild(allocator, close_btn);
-        }
-
-        return tab;
-    }
-};
-
-// ============================================================================
-// 测试
-// ============================================================================
-
 test "Tabs: basic creation (underline default)" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
@@ -857,14 +742,14 @@ test "Tabs: basic creation (underline default)" {
     const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
     defer scope.dispose();
     const items = [_]TabItem{
-        .{ .id = "tab1", .label_text = "Tab 1" },
-        .{ .id = "tab2", .label_text = "Tab 2" },
-        .{ .id = "tab3", .label_text = "Tab 3" },
+        .{ .id = "tab1", .label = "Tab 1" },
+        .{ .id = "tab2", .label = "Tab 2" },
+        .{ .id = "tab3", .label = "Tab 3" },
     };
 
     const tabs_node = try Tabs(.{
         .items = &items,
-        .default_active_id = "tab1",
+        .active = "tab1",
     }).mount(scope, ctx);
 
     try root.appendChild(std.testing.allocator, tabs_node);
@@ -874,12 +759,12 @@ test "Tabs: basic creation (underline default)" {
     // tab_row children = [highlight_box, tab1, tab2, tab3]
     const tab_row = tabs_node.children.items[0];
     try std.testing.expectEqual(@as(usize, 4), tab_row.children.items.len);
-    // 第一个子节点是 highlight_box
+    // First child is highlight_box
     try std.testing.expectEqualStrings("TabHighlight", tab_row.children.items[0].meta.ownership.meta.component_name.?);
 }
 
 test "Tabs: pill variant" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 100 } }, .{});
@@ -888,8 +773,8 @@ test "Tabs: pill variant" {
     const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
     defer scope.dispose();
     const items = [_]TabItem{
-        .{ .id = "a", .label_text = "Option A" },
-        .{ .id = "b", .label_text = "Option B" },
+        .{ .id = "a", .label = "Option A" },
+        .{ .id = "b", .label = "Option B" },
     };
 
     const tabs_node = try Tabs(.{
@@ -900,36 +785,36 @@ test "Tabs: pill variant" {
     try root.appendChild(std.testing.allocator, tabs_node);
     // pill: tab_row children = [highlight_box, tab1, tab2]
     try std.testing.expectEqual(@as(usize, 3), tabs_node.children.items.len);
-    // pill 容器应该有背景色 (bg_secondary)
+    // Pill container should have background color (bg_secondary)
     try std.testing.expect(!Color.eql(tabs_node.getBackground(), Color.TRANSPARENT));
-    // highlight_box 应该有白色背景
+    // highlight_box should have white background
     const hbox = tabs_node.children.items[0];
-    try std.testing.expect(Color.eql(hbox.getBackground(), ctx.tokens.color.bg_primary));
+    try std.testing.expect(Color.eql(hbox.getBackground(), ctx.tokens.tokens.color.bg_primary));
 }
 
 test "Tabs: pill render emits highlight background" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     ctx.setViewport(320, 80);
 
     const root = try box(ctx, .{
         .width = .{ .px = 320 },
         .height = .{ .px = 80 },
-        .background = ctx.tokens.color.bg_primary,
+        .background = ctx.tokens.tokens.color.bg_primary,
     }, .{});
     ctx.root = root;
 
     const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
     defer scope.dispose();
     const items = [_]TabItem{
-        .{ .id = "a", .label_text = "One" },
-        .{ .id = "b", .label_text = "Two" },
+        .{ .id = "a", .label = "One" },
+        .{ .id = "b", .label = "Two" },
     };
 
     const tabs_node = try Tabs(.{
         .items = &items,
         .variant = .pill,
-        .default_active_id = "a",
+        .active = "a",
     }).mount(scope, ctx);
     try root.appendChild(std.testing.allocator, tabs_node);
 
@@ -940,7 +825,7 @@ test "Tabs: pill render emits highlight background" {
     var saw_highlight = false;
     for (commands) |cmd| if (cmd.isFillRect()) {
         const r = cmd;
-        if (Color.eql(r.color.toColor(), ctx.tokens.color.bg_primary) and r.geom.w >= 40 and r.geom.h >= 20) {
+        if (Color.eql(r.color.toColor(), ctx.tokens.tokens.color.bg_primary) and r.geom.w >= 40 and r.geom.h >= 20) {
             saw_highlight = true;
         }
     };
@@ -949,7 +834,7 @@ test "Tabs: pill render emits highlight background" {
 }
 
 test "Tabs: pill active tab text styling" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 100 } }, .{});
@@ -958,14 +843,14 @@ test "Tabs: pill active tab text styling" {
     const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
     defer scope.dispose();
     const items = [_]TabItem{
-        .{ .id = "a", .label_text = "Option A" },
-        .{ .id = "b", .label_text = "Option B" },
+        .{ .id = "a", .label = "Option A" },
+        .{ .id = "b", .label = "Option B" },
     };
 
     const tabs_node = try Tabs(.{
         .items = &items,
         .variant = .pill,
-        .default_active_id = "a",
+        .active = "a",
     }).mount(scope, ctx);
     try root.appendChild(std.testing.allocator, tabs_node);
 
@@ -976,7 +861,7 @@ test "Tabs: pill active tab text styling" {
     try std.testing.expect(active_label_wrapper.children.items.len >= 2);
     const active_label = active_label_wrapper.children.items[1]; // skip ghost
     try std.testing.expect(active_label.getText() != null);
-    try std.testing.expect(Color.eql(active_label.getText().?.color, ctx.tokens.color.fg_primary));
+    try std.testing.expect(Color.eql(active_label.getText().?.color, ctx.tokens.tokens.color.fg_primary));
 
     // inactive tab
     const inactive_tab = tabs_node.children.items[2]; // skip highlight
@@ -984,11 +869,11 @@ test "Tabs: pill active tab text styling" {
     try std.testing.expect(inactive_label_wrapper.children.items.len >= 2);
     const inactive_label = inactive_label_wrapper.children.items[1]; // skip ghost
     try std.testing.expect(inactive_label.getText() != null);
-    try std.testing.expect(Color.eql(inactive_label.getText().?.color, ctx.tokens.color.fg_secondary));
+    try std.testing.expect(Color.eql(inactive_label.getText().?.color, ctx.tokens.tokens.color.fg_secondary));
 }
 
 test "Tabs: icon variant" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 100 } }, .{});
@@ -997,29 +882,29 @@ test "Tabs: icon variant" {
     const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
     defer scope.dispose();
     const items = [_]TabItem{
-        .{ .id = "a", .label_text = "Files", .icon_asset = svg_assets.common.file_text },
-        .{ .id = "b", .label_text = "Search", .icon_asset = svg_assets.common.search },
+        .{ .id = "a", .label = "Files", .icon_asset = svg_assets.common.file_text },
+        .{ .id = "b", .label = "Search", .icon_asset = svg_assets.common.search },
     };
 
     const tabs_node = try Tabs(.{
         .items = &items,
         .variant = .tab,
-        .default_active_id = "a",
+        .active = "a",
     }).mount(scope, ctx);
     try root.appendChild(std.testing.allocator, tabs_node);
 
     // children = [highlight_box, tab_a, tab_b]
-    // highlight_box 应该有 accent_subtle 背景
+    // highlight_box should have accent_subtle background
     const hbox = tabs_node.children.items[0];
-    try std.testing.expect(Color.eql(hbox.getBackground(), ctx.tokens.color.accent_subtle));
+    try std.testing.expect(Color.eql(hbox.getBackground(), ctx.tokens.tokens.color.accent_subtle));
 
-    // 每个 tab 应该有 icon + label = 2 个子节点
+    // Each tab should have icon + label = 2 children
     const first_tab = tabs_node.children.items[1];
     try std.testing.expectEqual(@as(usize, 2), first_tab.children.items.len);
 }
 
 test "Tabs: small size" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 100 } }, .{});
@@ -1028,8 +913,8 @@ test "Tabs: small size" {
     const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
     defer scope.dispose();
     const items = [_]TabItem{
-        .{ .id = "a", .label_text = "A" },
-        .{ .id = "b", .label_text = "B" },
+        .{ .id = "a", .label = "A" },
+        .{ .id = "b", .label = "B" },
     };
 
     const tabs_node = try Tabs(.{
@@ -1050,7 +935,7 @@ test "Tabs: small size" {
 }
 
 test "Tabs: underline highlight box" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 100 } }, .{});
@@ -1059,14 +944,14 @@ test "Tabs: underline highlight box" {
     const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
     defer scope.dispose();
     const items = [_]TabItem{
-        .{ .id = "a", .label_text = "Tab A" },
-        .{ .id = "b", .label_text = "Tab B" },
+        .{ .id = "a", .label = "Tab A" },
+        .{ .id = "b", .label = "Tab B" },
     };
 
     const tabs_node = try Tabs(.{
         .items = &items,
         .variant = .underline,
-        .default_active_id = "a",
+        .active = "a",
     }).mount(scope, ctx);
     try root.appendChild(std.testing.allocator, tabs_node);
 
@@ -1075,13 +960,13 @@ test "Tabs: underline highlight box" {
     // tab_row children = [highlight_box, tab_a, tab_b]
     const hbox = tab_row.children.items[0];
     try std.testing.expectEqualStrings("TabHighlight", hbox.meta.ownership.meta.component_name.?);
-    // underline highlight = accent 背景, 2px 高
-    try std.testing.expect(Color.eql(hbox.getBackground(), ctx.tokens.color.accent));
+    // Underline highlight = accent background, 2px height
+    try std.testing.expect(Color.eql(hbox.getBackground(), ctx.tokens.tokens.color.accent));
     try std.testing.expectEqual(@as(f32, 2), hbox.style.height.px);
 }
 
 test "Tabs: with badge" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 100 } }, .{});
@@ -1090,8 +975,8 @@ test "Tabs: with badge" {
     const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
     defer scope.dispose();
     const items = [_]TabItem{
-        .{ .id = "inbox", .label_text = "Inbox", .badge = 5 },
-        .{ .id = "sent", .label_text = "Sent" },
+        .{ .id = "inbox", .label = "Inbox", .badge = 5 },
+        .{ .id = "sent", .label = "Sent" },
     };
 
     const tabs_node = try Tabs(.{
@@ -1104,18 +989,19 @@ test "Tabs: with badge" {
     const tab_row = tabs_node.children.items[0];
     // tab_row children = [highlight_box, tab_inbox, tab_sent]
     const first_tab = tab_row.children.items[1]; // skip highlight
-    // tab 应该有 label + badge = 2 children
+    // Tab should have label + badge = 2 children
     try std.testing.expectEqual(@as(usize, 2), first_tab.children.items.len);
 
-    // 回归：badge 文本曾指向栈上 buffer，函数返回后悬空 -> 渲染只剩 accent 圆点、
-    // 数字不绘。改用 setInlineContent 拷进 inline 存储后，content 必须仍是 "5"。
+    // Regression: badge text once pointed to stack buffer, dangling after function return -> render
+    // lost digits, only accent dot.
+    // After switch to setInlineContent copying to inline storage, content must still be "5".
     const badge_node = first_tab.children.items[1];
     try std.testing.expect(badge_node.getText() != null);
     try std.testing.expectEqualStrings("5", badge_node.getText().?.content);
 }
 
 test "Tabs: closable" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 100 } }, .{});
@@ -1124,7 +1010,7 @@ test "Tabs: closable" {
     const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
     defer scope.dispose();
     const items = [_]TabItem{
-        .{ .id = "file1", .label_text = "file.txt" },
+        .{ .id = "file1", .label = "file.txt" },
     };
 
     const tabs_node = try Tabs(.{
@@ -1138,12 +1024,12 @@ test "Tabs: closable" {
     const tab_row = tabs_node.children.items[0];
     // tab_row children = [highlight_box, tab]
     const tab = tab_row.children.items[1]; // skip highlight
-    // tab 应该有 label + close = 2 children
+    // Tab should have label + close = 2 children
     try std.testing.expectEqual(@as(usize, 2), tab.children.items.len);
 }
 
 test "Tabs: before_render updates on active change" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 100 } }, .{});
@@ -1152,19 +1038,19 @@ test "Tabs: before_render updates on active change" {
     const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
     defer scope.dispose();
     const items = [_]TabItem{
-        .{ .id = "a", .label_text = "Option A" },
-        .{ .id = "b", .label_text = "Option B" },
+        .{ .id = "a", .label = "Option A" },
+        .{ .id = "b", .label = "Option B" },
     };
 
     const tabs_node = try Tabs(.{
         .items = &items,
         .variant = .pill,
-        .default_active_id = "a",
+        .active = "a",
     }).mount(scope, ctx);
     try root.appendChild(std.testing.allocator, tabs_node);
 
     // children = [highlight_box, tab_a, tab_b]
-    // click 第二个 tab (index 2)
+    // click second tab (index 2)
     const second_tab = tabs_node.children.items[2];
     const click_result = tabClickHandler(.{ .click = .{
         .x = 10,
@@ -1174,7 +1060,7 @@ test "Tabs: before_render updates on active change" {
     } }, second_tab.behavior.events.event_context);
     try std.testing.expectEqual(EventResult.handled, click_result);
 
-    // 触发 before_render
+    // Trigger before_render
     if (tabs_node.meta.per_frame.hooks.before_render.main) |before_render| {
         before_render(tabs_node);
     }
@@ -1182,213 +1068,174 @@ test "Tabs: before_render updates on active change" {
         if (cb_opt) |cb| cb(tabs_node);
     }
 
-    // 验证文本颜色切换: tab -> [label_wrapper] -> [ghost, label_node(text)]
+    // Verify text color switch: tab -> [label_wrapper] -> [ghost, label_node(text)]
     const tab_b_wrapper = tabs_node.children.items[2].children.items[0];
     const tab_b_label = tab_b_wrapper.children.items[1]; // skip ghost
     try std.testing.expect(tab_b_label.getText() != null);
-    try std.testing.expect(Color.eql(tab_b_label.getText().?.color, ctx.tokens.color.fg_primary));
+    try std.testing.expect(Color.eql(tab_b_label.getText().?.color, ctx.tokens.tokens.color.fg_primary));
     const tab_a_wrapper = tabs_node.children.items[1].children.items[0];
     const tab_a_label = tab_a_wrapper.children.items[1]; // skip ghost
-    try std.testing.expect(Color.eql(tab_a_label.getText().?.color, ctx.tokens.color.fg_secondary));
+    try std.testing.expect(Color.eql(tab_a_label.getText().?.color, ctx.tokens.tokens.color.fg_secondary));
 }
 
-test "TabPanel: active" {
-    var ctx = try Cx.init(std.testing.allocator);
+test "TabPanel: follows its active source" {
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
+    const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
+    defer scope.dispose();
 
-    const root = try box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
-    ctx.root = root;
-
-    const panel = try TabPanel(.{ .id = "panel1", .active = true }).build(ctx);
-    try root.appendChild(std.testing.allocator, panel);
-
-    try std.testing.expect(panel.style.width == .grow);
+    const tab = try scope.createSignal(?[]const u8, "files");
+    const files = try TabPanel(.{ .id = "files", .active = reactive.eq(tab, "files") }).mount(scope, ctx);
+    defer ctx.freeNode(files);
+    const search = try TabPanel(.{ .id = "search", .active = reactive.eq(tab, "search") }).mount(scope, ctx);
+    defer ctx.freeNode(search);
+    try std.testing.expect(files.style.display != .none);
+    try std.testing.expect(search.style.display == .none);
+    try std.testing.expect(search.behavior.interaction.a11y.?.hidden);
+    tab.set("search");
+    try std.testing.expect(files.style.display == .none);
+    try std.testing.expect(!search.behavior.interaction.a11y.?.hidden);
 }
 
-test "TabPanel: inactive" {
-    var ctx = try Cx.init(std.testing.allocator);
-    defer ctx.deinit();
-
-    const root = try box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
-    ctx.root = root;
-
-    const panel = try TabPanel(.{ .id = "panel2", .active = false }).build(ctx);
-    try root.appendChild(std.testing.allocator, panel);
-
-    try std.testing.expectEqual(@as(f32, 0), panel.style.width.px);
+fn tabText(tabs_node: *Node, tab_index: usize) *Node {
+    return tabs_node.children.items[tab_index + 1].children.items[0].children.items[1];
 }
 
-test "EditorTabs: basic" {
-    var ctx = try Cx.init(std.testing.allocator);
+test "Tabs: bound active — external set and clicks, disabled tab skipped by arrows" {
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
-
-    const root = try box(ctx, .{ .width = .{ .px = 600 }, .height = .{ .px = 35 } }, .{});
+    const root = try box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 100 } }, .{});
     ctx.root = root;
+    const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
+    defer scope.dispose();
 
-    const items = [_]EditorTabItem{
-        .{ .id = "main.zig", .label_text = "main.zig" },
-        .{ .id = "build.zig", .label_text = "build.zig", .modified = true },
+    const items = [_]TabItem{ .{ .id = "a", .label = "A" }, .{ .id = "b", .label = "B", .disabled = true }, .{ .id = "c", .label = "C" } };
+    const current = try scope.createSignal(?[]const u8, "a");
+    const Rec = struct {
+        changes: u32 = 0,
+        fn changed(self: *@This(), _: []const u8) void {
+            self.changes += 1;
+        }
     };
-
-    const tabs_node = try EditorTabs(.{
-        .items = &items,
-        .default_active_id = "main.zig",
-    }).build(ctx);
-
+    var rec = Rec{};
+    const tabs_node = try Tabs(.{ .items = &items, .variant = .pill, .active = current, .on_change = ctx.on(Rec, &rec, Rec.changed) }).mount(scope, ctx);
     try root.appendChild(std.testing.allocator, tabs_node);
-    try std.testing.expectEqual(@as(usize, 2), tabs_node.children.items.len);
+    ctx.layout(); // Dispatcher resolves targets by handle, nodes register during layout
+    try std.testing.expect(tabs_node.children.items[1].behavior.interaction.a11y.?.selected);
+
+    current.set("c"); // External drive
+    try std.testing.expect(tabs_node.children.items[3].behavior.interaction.a11y.?.selected);
+    try std.testing.expect(!tabs_node.children.items[1].behavior.interaction.a11y.?.selected);
+    try std.testing.expect(Color.eql(tabText(tabs_node, 2).getText().?.color, ctx.tokens.tokens.color.fg_primary));
+    try std.testing.expectEqual(@as(u32, 0), rec.changes); // Programmatic write does not trigger on_change
+
+    _ = ctx.dispatcher.dispatchKeyDown(tabs_node, .{ .key = .left, .modifiers = .{} }); // Skip disabled b
+    try std.testing.expectEqualStrings("a", current.peek().?);
+    _ = tabClickHandler(.{ .click = .{ .x = 0, .y = 0, .button = .left, .click_count = 1 } }, tabs_node.children.items[3].behavior.events.event_context);
+    try std.testing.expectEqualStrings("c", current.peek().?);
+    try std.testing.expectEqual(@as(u32, 2), rec.changes);
 }
 
-test "TabsState: basic toggle" {
-    var state = TabsState{
-        .active_index = 0,
-        .tab_count = 3,
-    };
-    state.tab_ids[0] = "tab1";
-    state.tab_ids[1] = "tab2";
-    state.tab_ids[2] = "tab3";
+var swap_buf_a = "Files".*;
+var swap_buf_b = "Files".*;
+const swap_first = [_]TabItem{.{ .id = "f", .label = &swap_buf_a }};
+const swap_second = [_]TabItem{.{ .id = "f", .label = &swap_buf_b }};
 
-    try std.testing.expectEqual(@as(usize, 0), state.active_index);
-    try std.testing.expectEqualStrings("tab1", state.getActiveId().?);
+test "Tabs: a derived source returning an equal-content array at a new address rebinds labels" {
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
+    const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
+    defer scope.dispose();
 
-    state.setActive(1);
-    try std.testing.expectEqual(@as(usize, 1), state.active_index);
-    try std.testing.expectEqualStrings("tab2", state.getActiveId().?);
-
-    state.setActive(2);
-    try std.testing.expectEqual(@as(usize, 2), state.active_index);
-    try std.testing.expectEqualStrings("tab3", state.getActiveId().?);
+    // Signal compares by content, equal set doesn't land; derived values recompute but may return
+    // content-identical, address-different arrays (independent buffers: literals de-dup to same
+    // address).
+    const gen = try scope.createSignal(u32, 0);
+    const items = reactive.map(gen, struct {
+        fn f(g: u32) []const TabItem {
+            return if (g % 2 == 0) &swap_first else &swap_second;
+        }
+    }.f);
+    const tabs_node = try Tabs(.{ .items = items, .variant = .pill }).mount(scope, ctx);
+    defer ctx.freeNode(tabs_node);
+    // Text node owns label copy (ui.view.text copies content), borrowing caller's slice remains
+    // only in a11y label
+    try std.testing.expectEqualStrings("Files", tabText(tabs_node, 0).getText().?.content);
+    try std.testing.expectEqual(@as([*]const u8, &swap_buf_a), tabs_node.children.items[1].behavior.interaction.a11y.?.label.?.ptr);
+    gen.set(1);
+    try std.testing.expectEqualStrings("Files", tabText(tabs_node, 0).getText().?.content);
+    try std.testing.expectEqual(@as([*]const u8, &swap_buf_b), tabs_node.children.items[1].behavior.interaction.a11y.?.label.?.ptr);
 }
 
-test "TabsState: moveNext/movePrev circular" {
-    var state = TabsState{
-        .active_index = 0,
-        .tab_count = 3,
-    };
-    state.tab_ids[0] = "a";
-    state.tab_ids[1] = "b";
-    state.tab_ids[2] = "c";
+test "Tabs: clicking the tab shown as selected for a null active is a no-op" {
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
+    const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
+    defer scope.dispose();
 
-    state.moveNext();
-    try std.testing.expectEqual(@as(usize, 1), state.active_index);
-
-    state.moveNext();
-    try std.testing.expectEqual(@as(usize, 2), state.active_index);
-
-    state.moveNext();
-    try std.testing.expectEqual(@as(usize, 0), state.active_index);
-
-    state.movePrev();
-    try std.testing.expectEqual(@as(usize, 2), state.active_index);
+    const items = [_]TabItem{ .{ .id = "a", .label = "A" }, .{ .id = "b", .label = "B" } };
+    const current = try scope.createSignal(?[]const u8, null);
+    var changes: u32 = 0;
+    const tabs_node = try Tabs(.{ .items = &items, .variant = .pill, .active = current, .on_change = ctx.on(u32, &changes, struct {
+        fn f(n: *u32, _: []const u8) void {
+            n.* += 1;
+        }
+    }.f) }).mount(scope, ctx);
+    defer ctx.freeNode(tabs_node);
+    try std.testing.expect(tabs_node.children.items[1].behavior.interaction.a11y.?.selected); // Null falls back to first item
+    _ = tabClickHandler(.{ .click = .{ .x = 0, .y = 0, .button = .left, .click_count = 1 } }, tabs_node.children.items[1].behavior.events.event_context);
+    try std.testing.expect(current.peek() == null);
+    try std.testing.expectEqual(@as(u32, 0), changes);
 }
 
-test "TabsState: setActive fires on_change callback" {
-    const CallbackCtx = struct {
-        last_id: ?[]const u8 = null,
-        call_count: u32 = 0,
-    };
+test "Tabs: arrow key in the same batch as an items shrink stays in bounds" {
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
+    const root = try box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 100 } }, .{});
+    ctx.root = root;
+    const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
+    defer scope.dispose();
 
-    var cb_ctx = CallbackCtx{};
+    const three = [_]TabItem{ .{ .id = "a", .label = "A" }, .{ .id = "b", .label = "B" }, .{ .id = "c", .label = "C" } };
+    const one = [_]TabItem{.{ .id = "a", .label = "A" }};
+    const items = try scope.createSignal([]const TabItem, &three);
+    const current = try scope.createSignal(?[]const u8, "c");
+    const tabs_node = try Tabs(.{ .items = items, .variant = .pill, .active = current }).mount(scope, ctx);
+    try root.appendChild(std.testing.allocator, tabs_node);
+    ctx.layout();
 
-    var state = TabsState{
-        .active_index = 0,
-        .tab_count = 2,
-        .on_change = core.Cx.strHandlerFrom(CallbackCtx, &cb_ctx, struct {
-            fn handler(c: *CallbackCtx, id: []const u8) void {
-                c.last_id = id;
-                c.call_count += 1;
-            }
-        }.handler),
-    };
-    state.tab_ids[0] = "first";
-    state.tab_ids[1] = "second";
-
-    state.setActive(1);
-    try std.testing.expectEqual(@as(u32, 1), cb_ctx.call_count);
-    try std.testing.expectEqualStrings("second", cb_ctx.last_id.?);
-
-    state.setActive(1);
-    try std.testing.expectEqual(@as(u32, 1), cb_ctx.call_count);
+    // After items shrink, effect runs after batch ends; active_index still 2
+    ctx.owner.beginBatch();
+    items.set(&one);
+    _ = ctx.dispatcher.dispatchKeyDown(tabs_node, .{ .key = .left, .modifiers = .{} });
+    ctx.owner.endBatch();
+    try std.testing.expectEqualStrings("a", current.peek().?);
 }
 
-test "TabsState: out of bounds setActive is no-op" {
-    var state = TabsState{
-        .active_index = 0,
-        .tab_count = 2,
-    };
+test "Tabs: items from a signal rebuild the tabs (closable tab list)" {
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
+    const root = try box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 100 } }, .{});
+    ctx.root = root;
+    const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
+    defer scope.dispose();
 
-    state.setActive(5);
-    try std.testing.expectEqual(@as(usize, 0), state.active_index);
-}
-
-test "Tabs: event handler responds to click" {
-    const dummy_row = try Node.create(std.testing.allocator, 9001, .box, .{});
-    defer dummy_row.destroy(std.testing.allocator);
-
-    var state = TabsState{
-        .active_index = 0,
-        .tab_count = 3,
-    };
-    state.tab_ids[0] = "a";
-    state.tab_ids[1] = "b";
-    state.tab_ids[2] = "c";
-
-    var click_ctx = TabClickContext{
-        .tabs_state = &state,
-        .tab_index = 2,
-        .tab_row = dummy_row,
-    };
-
-    const result = tabClickHandler(.{ .click = .{
-        .x = 10,
-        .y = 10,
-        .button = .left,
-        .click_count = 1,
-    } }, @ptrCast(&click_ctx));
-
-    try std.testing.expectEqual(EventResult.handled, result);
-    try std.testing.expectEqual(@as(usize, 2), state.active_index);
-}
-
-test "Tabs: event handler responds to arrow keys" {
-    const dummy_row = try Node.create(std.testing.allocator, 9002, .box, .{});
-    defer dummy_row.destroy(std.testing.allocator);
-
-    var state = TabsState{
-        .active_index = 0,
-        .tab_count = 3,
-    };
-    state.tab_ids[0] = "a";
-    state.tab_ids[1] = "b";
-    state.tab_ids[2] = "c";
-
-    var click_ctx = TabClickContext{
-        .tabs_state = &state,
-        .tab_index = 0,
-        .tab_row = dummy_row,
-    };
-
-    const result1 = tabClickHandler(.{ .key_down = .{
-        .key = .right,
-        .raw_keycode = 124,
-        .modifiers = .{},
-    } }, @ptrCast(&click_ctx));
-
-    try std.testing.expectEqual(EventResult.handled, result1);
-    try std.testing.expectEqual(@as(usize, 1), state.active_index);
-
-    const result2 = tabClickHandler(.{ .key_down = .{
-        .key = .left,
-        .raw_keycode = 123,
-        .modifiers = .{},
-    } }, @ptrCast(&click_ctx));
-
-    try std.testing.expectEqual(EventResult.handled, result2);
-    try std.testing.expectEqual(@as(usize, 0), state.active_index);
+    const three = [_]TabItem{ .{ .id = "a", .label = "A" }, .{ .id = "b", .label = "B" }, .{ .id = "c", .label = "C" } };
+    const two = [_]TabItem{ .{ .id = "a", .label = "A" }, .{ .id = "c", .label = "C" } };
+    const items = try scope.createSignal([]const TabItem, &three);
+    const current = try scope.createSignal(?[]const u8, "c");
+    const tabs_node = try Tabs(.{ .items = items, .variant = .pill, .closable = true, .active = current }).mount(scope, ctx);
+    try root.appendChild(std.testing.allocator, tabs_node);
+    try std.testing.expectEqual(@as(usize, 4), tabs_node.children.items.len); // highlight + 3
+    items.set(&two); // Close b
+    try std.testing.expectEqual(@as(usize, 3), tabs_node.children.items.len);
+    try std.testing.expect(tabs_node.children.items[2].behavior.interaction.a11y.?.selected); // c still active (new index 1)
+    _ = tabClickHandler(.{ .click = .{ .x = 0, .y = 0, .button = .left, .click_count = 1 } }, tabs_node.children.items[1].behavior.events.event_context);
+    try std.testing.expectEqualStrings("a", current.peek().?);
 }
 
 test "Tabs: 点关闭按钮触发 on_close 且不激活该 tab；方向键在可聚焦 container 上生效" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     const root = try box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 100 } }, .{});
     ctx.root = root;
@@ -1407,16 +1254,16 @@ test "Tabs: 点关闭按钮触发 on_close 且不激活该 tab；方向键在可
     };
     var rec: Rec = .{};
     const items = [_]TabItem{
-        .{ .id = "a", .label_text = "A" },
-        .{ .id = "b", .label_text = "B" },
+        .{ .id = "a", .label = "A" },
+        .{ .id = "b", .label = "B" },
     };
     const tabs_node = try Tabs(.{
         .items = &items,
         .variant = .pill,
         .closable = true,
-        .default_active_id = "a",
-        .on_close = Cx.strHandlerFrom(Rec, &rec, Rec.onClose),
-        .on_change = Cx.strHandlerFrom(Rec, &rec, Rec.onChange),
+        .active = "a",
+        .on_close = ctx.on(Rec, &rec, Rec.onClose),
+        .on_change = ctx.on(Rec, &rec, Rec.onChange),
     }).mount(scope, ctx);
     try root.appendChild(std.testing.allocator, tabs_node);
     ctx.layout();
@@ -1426,9 +1273,9 @@ test "Tabs: 点关闭按钮触发 on_close 且不激活该 tab；方向键在可
     const close_b = tab_b.children.items[tab_b.children.items.len - 1];
     _ = ctx.dispatcher.dispatch(.{ .click = .{ .x = 0, .y = 0, .button = .left, .click_count = 1 } }, close_b);
     try std.testing.expectEqualStrings("b", rec.closed.?);
-    try std.testing.expectEqual(@as(usize, 0), rec.changed); // 未冒泡激活 tab_b
+    try std.testing.expectEqual(@as(usize, 0), rec.changed); // Didn't bubble activate tab_b
 
-    // 焦点在 container（唯一可聚焦节点）：方向键必须能切换
+    // Focus on container (only focusable node): arrow keys must switch
     try std.testing.expect(tabs_node.behavior.interaction.focusable);
     _ = ctx.dispatcher.dispatchKeyDown(tabs_node, .{ .key = .right, .modifiers = .{} });
     try std.testing.expectEqual(@as(usize, 1), rec.changed);
@@ -1436,27 +1283,21 @@ test "Tabs: 点关闭按钮触发 on_close 且不激活该 tab；方向键在可
     try std.testing.expectEqual(@as(usize, 2), rec.changed);
 }
 
-// styles.zig 的测试收集，这行是必需的，见 docs/STYLING.md
+// Test collection from styles.zig, this line required, see docs/STYLING.md
 test {
     _ = @import("styles.zig");
 }
 
-/// 一次性收养：append 失败时自己释放 child。
-fn adoptTabChild(cx: *Cx, allocator: std.mem.Allocator, parent: *Node, child: *Node) !*Node {
-    errdefer cx.freeNode(child);
-    try parent.appendChild(allocator, child);
-    return child;
-}
-
-// devtools mountPanel sweep 在 Tabs 内部抓到泄漏，夹具没走 underline + xs + on_change 分支。
+// devtools mountPanel sweep caught leak inside Tabs, fixture didn't hit underline + xs + on_change
+// branch
 test "Tabs: underline/xs/on_change 的 mount 在任意分配点失败时不泄漏（sweep）" {
     try @import("../oom_sweep.zig").sweepMount("tabs(underline)", struct {
         fn m(scope: *Scope, cx: *Cx) anyerror!?*Node {
             const items = [_]TabItem{
-                .{ .id = "elements", .label_text = "Elements" },
-                .{ .id = "components", .label_text = "Components" },
-                .{ .id = "console", .label_text = "Console" },
-                .{ .id = "performance", .label_text = "Performance" },
+                .{ .id = "elements", .label = "Elements" },
+                .{ .id = "components", .label = "Components" },
+                .{ .id = "console", .label = "Console" },
+                .{ .id = "performance", .label = "Performance" },
             };
             const Dummy = struct {
                 fn onChange(_: *@This(), _: []const u8) void {}
@@ -1464,10 +1305,10 @@ test "Tabs: underline/xs/on_change 的 mount 在任意分配点失败时不泄�
             var dummy: Dummy = .{};
             return try Tabs(.{
                 .items = &items,
-                .default_active_id = "elements",
+                .active = "elements",
                 .variant = .underline,
                 .size = .xs,
-                .on_change = Cx.strHandlerFrom(Dummy, &dummy, Dummy.onChange),
+                .on_change = cx.on(Dummy, &dummy, Dummy.onChange),
             }).mount(scope, cx);
         }
     }.m);
@@ -1476,8 +1317,41 @@ test "Tabs: underline/xs/on_change 的 mount 在任意分配点失败时不泄�
 test "Tabs: mount 在任意分配点失败时不泄漏（sweep）" {
     try @import("../oom_sweep.zig").sweepMount("tabs", struct {
         fn m(scope: *Scope, cx: *Cx) anyerror!?*Node {
-            const items = [_]TabItem{ .{ .id = "tab1", .label_text = "Tab 1" }, .{ .id = "tab2", .label_text = "Tab 2" } };
-            return try Tabs(.{ .items = &items, .default_active_id = "tab1" }).mount(scope, cx);
+            const items = [_]TabItem{ .{ .id = "tab1", .label = "Tab 1" }, .{ .id = "tab2", .label = "Tab 2" } };
+            return try Tabs(.{ .items = &items, .active = "tab1" }).mount(scope, cx);
         }
     }.m);
+}
+
+test "Tabs: a11y item_selection —— 受控拒绝时返回 false，接受时返回 true" {
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
+    const root = try box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
+    ctx.root = root;
+    const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
+    defer scope.dispose();
+    const items = [_]TabItem{
+        .{ .id = "tab1", .label = "Tab 1" },
+        .{ .id = "tab2", .label = "Tab 2" },
+        .{ .id = "tab3", .label = "Tab 3" },
+    };
+    const Parent = struct {
+        v: *reactive.Signal(?[]const u8),
+        allow: bool = false,
+        fn write(self: *@This(), x: ?[]const u8) void {
+            if (self.allow) self.v.set(x);
+        }
+    };
+    var parent = Parent{ .v = try scope.createSignal(?[]const u8, "tab1") };
+    const tabs_node = try Tabs(.{ .items = &items, .active = reactive.split(parent.v, ctx.on(Parent, &parent, Parent.write)) }).mount(scope, ctx);
+    try root.appendChild(std.testing.allocator, tabs_node);
+    const tab_row = tabs_node.children.items[0];
+    const sel = tab_row.children.items[2].behavior.interaction.a11y.?.item_selection.?;
+    try std.testing.expect(!sel.set(sel.context, .replace));
+    try std.testing.expectEqualStrings("tab1", parent.v.peek().?);
+    try std.testing.expect(!sel.set(sel.context, .add));
+    parent.allow = true;
+    try std.testing.expect(sel.set(sel.context, .replace));
+    try std.testing.expectEqualStrings("tab2", parent.v.peek().?);
+    try std.testing.expect(!sel.set(sel.context, .remove)); // Tab always keeps one item selected
 }

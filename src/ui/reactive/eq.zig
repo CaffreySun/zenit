@@ -1,22 +1,50 @@
-//! eqlValue, Phase 1 reactive 相等性判定
+//! eqlValue: reactive equality check, replacing std.meta.eql, which is wrong for zenit:
+//! - `[]const u8`: std.meta.eql compares (ptr, len), not content
+//! - `f32/f64 NaN`: std.meta.eql uses ==, so NaN != NaN is always "different" -> set never consumed
+//! - `0.0 == -0.0`: == is true, which is the correct result here
 //!
-//! 替代 std.meta.eql。后者对 zenit 是错的：
-//! - `[]const u8`：std.meta.eql 比较 (ptr, len) 而非内容
-//! - `f32/f64 NaN`：std.meta.eql 用 ==，NaN != NaN 永远视作不同 -> set 永远不被吞
-//! - `0.0 == -0.0`：std.meta.eql 用 ==，silently true -> 应视作 true（这个对的）
-//!
-//! 类型分发：
-//! - 整数 / bool / enum / pointer / fn：==
-//! - float：自定义（NaN bytewise 等价判断）
-//! - 切片 []T：长度 + 元素递归 eqlValue
-//! - 数组 [N]T：元素递归 eqlValue
-//! - struct（无 union 字段）：所有字段递归 eqlValue
-//! - struct 含 union：std.meta.eql 兼容路径
-//! - optional：null/null 同；其他递归
-//! - 其他：fallback std.meta.eql
+//! Type dispatch:
+//! - int / bool / enum / pointer / fn: ==
+//! - float: custom (bytewise NaN equivalence)
+//! - slice []T: length + elements recursive eqlValue
+//! - array [N]T: elements recursive eqlValue
+//! - struct (no union fields): all fields recursive eqlValue
+//! - struct with union: std.meta.eql compatible path
+//! - optional: null/null same; else recursive
+//! - other: fallback std.meta.eql
 
 const std = @import("std");
 const testing = std.testing;
+
+/// Key for "remember old value, compare later" scenarios. Slices record content hash not slice
+/// itself: owned text (`scope.createText`) is double-buffered; next write or resize overwrites /
+/// frees previous buffer, saved old slice dangles. Other types are values themselves.
+pub fn EqKey(comptime T: type) type {
+    return if (isSlice(T)) u64 else T;
+}
+
+pub fn eqKey(comptime T: type, v: T) EqKey(T) {
+    if (comptime isSlice(T)) {
+        const Child = @typeInfo(T).pointer.child;
+        var h = std.hash.Wyhash.init(0);
+        h.update(std.mem.asBytes(&v.len));
+        if (@typeInfo(Child) == .int or @typeInfo(Child) == .bool or @typeInfo(Child) == .@"enum") {
+            h.update(std.mem.sliceAsBytes(v));
+        } else {
+            // Non-scalar elements: hash each element bytewise by value (pointers by address).
+            for (v) |*e| h.update(std.mem.asBytes(e));
+        }
+        return h.final();
+    }
+    return v;
+}
+
+fn isSlice(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .pointer => |p| p.size == .slice,
+        else => false,
+    };
+}
 
 pub fn eqlValue(comptime T: type, a: T, b: T) bool {
     const info = @typeInfo(T);
@@ -26,7 +54,7 @@ pub fn eqlValue(comptime T: type, a: T, b: T) bool {
         .float => eqlFloat(T, a, b),
         .pointer => |p| switch (p.size) {
             .slice => eqlSlice(p.child, a, b),
-            else => a == b, // 单指针 / many / c：identity 比较
+            else => a == b, // single pointer / many / c: identity comparison
         },
         .array => |arr| eqlArray(arr.child, arr.len, a, b),
         .vector => |v| eqlArray(v.child, v.len, @as([v.len]v.child, a), @as([v.len]v.child, b)),
@@ -42,15 +70,15 @@ pub fn eqlValue(comptime T: type, a: T, b: T) bool {
 }
 
 fn eqlFloat(comptime T: type, a: T, b: T) bool {
-    // NaN: bytewise 相同视作 equal（避免 NaN 永远 dirty 死循环）
-    // -0.0 vs +0.0: 视作 equal（== 同样视作 equal，与一般预期一致）
+    // NaN: bytewise same treated as equal (avoid NaN always dirty infinite loop)
+    // -0.0 vs +0.0: treat as equal (== also treats as equal, matches expectation)
     if (std.math.isNan(a) and std.math.isNan(b)) return true;
     return a == b;
 }
 
 fn eqlSlice(comptime Child: type, a: anytype, b: anytype) bool {
     if (a.len != b.len) return false;
-    if (a.ptr == b.ptr) return true; // alias 快路径
+    if (a.ptr == b.ptr) return true; // alias fast path
     if (Child == u8) {
         return std.mem.eql(u8, a, b);
     }
@@ -70,7 +98,7 @@ fn eqlArray(comptime Child: type, comptime len: usize, a: anytype, b: anytype) b
 }
 
 fn eqlStruct(comptime T: type, a: T, b: T) bool {
-    inline for (@typeInfo(T).@"struct".fields) |f| {
+    inline for (@import("zenit_reflection").fields(T)) |f| {
         if (!eqlValue(f.type, @field(a, f.name), @field(b, f.name))) return false;
     }
     return true;
@@ -112,7 +140,7 @@ test "eqlValue: []const u8 compares content not ptr" {
     const a: []const u8 = &buf1;
     const b: []const u8 = &buf2;
     try testing.expect(a.ptr != b.ptr);
-    try testing.expect(eqlValue([]const u8, a, b)); // 关键修复
+    try testing.expect(eqlValue([]const u8, a, b)); // critical fix
 }
 
 test "eqlValue: []const u8 different content" {

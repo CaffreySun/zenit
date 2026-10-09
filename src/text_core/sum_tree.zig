@@ -1,21 +1,21 @@
-/// SumTree，泛型 B-tree，支持 O(log N) 的随机位置 insert/remove/seek
+/// SumTree: generic B-tree supporting O(log N) random insert/remove/seek.
 ///
-/// 设计参考 Zed 编辑器的 SumTree：
-/// - B-Tree 结构保持平衡
-/// - 每个节点存储子树的聚合信息（Summary）
-/// - 支持按多种维度查找（通过 comptime Dimension）
-/// - COW (Copy-on-Write) 快照：节点引用计数，O(1) 快照
+/// Design follows Zed editor's SumTree:
+/// - B-Tree structure maintains balance
+/// - Each node stores aggregated child subtree info (Summary)
+/// - Seek by multiple dimensions (via comptime Dimension)
+/// - COW (Copy-on-Write) snapshot: ref-counted nodes, O(1) snapshot
 ///
-/// Item 协议: fn summary(self: Item) -> Summary
-/// Summary 协议: const ZERO: Summary; fn add(self, other) -> Summary
+/// Item protocol: fn summary(self: Item) -> Summary
+/// Summary protocol: const ZERO: Summary; fn add(self, other) -> Summary
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Atomic = std.atomic.Value;
 
-/// B-Tree 参数
+/// B-Tree parameters
 const BRANCHING_FACTOR = 8;
-const MIN_CHILDREN = BRANCHING_FACTOR / 4; // 合并阈值
-const SPLIT_AT = BRANCHING_FACTOR / 2; // 分裂点
+const MIN_CHILDREN = BRANCHING_FACTOR / 4; // merge threshold
+const SPLIT_AT = BRANCHING_FACTOR / 2; // split point
 
 pub fn SumTree(comptime Item: type, comptime Summary: type) type {
     return struct {
@@ -27,7 +27,7 @@ pub fn SumTree(comptime Item: type, comptime Summary: type) type {
         transaction_active: bool = false,
         transaction_failed: bool = false,
 
-        // ===== Node 定义 =====
+        // ===== Node definition =====
 
         pub const Node = struct {
             ref_count: Atomic(usize) = Atomic(usize).init(1),
@@ -65,7 +65,7 @@ pub fn SumTree(comptime Item: type, comptime Summary: type) type {
             }
         };
 
-        // ===== Node 方法 =====
+        // ===== Node methods =====
 
         fn nodeSummary(node: *const Node) Summary {
             return switch (node.data) {
@@ -111,14 +111,14 @@ pub fn SumTree(comptime Item: type, comptime Summary: type) type {
             }
         }
 
-        /// COW: 如果 ref_count > 1，克隆节点（浅拷贝，子节点 retain）
+        /// COW: if ref_count > 1, clone node (shallow, retain children)
         fn ensureUnique(self: *Self, node: *Node) !*Node {
             if (node.ref_count.load(.acquire) == 1) return node;
             // Clone
             const new_node = try self.allocator.create(Node);
             new_node.* = node.*;
             new_node.ref_count = Atomic(usize).init(1);
-            // 对子节点执行 retain（内部节点的子节点现在被两个父节点引用）
+            // Execute retain on children (internal node's children now referenced by two parents)
             switch (new_node.data) {
                 .internal => |*n| {
                     for (n.children[0..n.len]) |child| {
@@ -127,7 +127,7 @@ pub fn SumTree(comptime Item: type, comptime Summary: type) type {
                 },
                 .leaf => {},
             }
-            // 释放旧引用
+            // Release old reference
             const prev = node.ref_count.fetchSub(1, .acq_rel);
             std.debug.assert(prev > 0);
             if (prev == 1) {
@@ -154,7 +154,7 @@ pub fn SumTree(comptime Item: type, comptime Summary: type) type {
             return node;
         }
 
-        // ===== 公共 API =====
+        // ===== Public API =====
 
         pub fn init(allocator: Allocator) Self {
             return .{ .allocator = allocator };
@@ -200,7 +200,7 @@ pub fn SumTree(comptime Item: type, comptime Summary: type) type {
             return .{ .owner = self, .original = original };
         }
 
-        /// O(1) 获取整棵树的摘要
+        /// O(1) get entire tree summary
         pub fn summary(self: *const Self) Summary {
             if (self.root) |root| {
                 return nodeSummary(root);
@@ -208,17 +208,17 @@ pub fn SumTree(comptime Item: type, comptime Summary: type) type {
             return Summary.ZERO;
         }
 
-        /// O(1) item 总数
+        /// O(1) total items
         pub fn count(self: *const Self) usize {
             return self.item_count;
         }
 
-        /// O(log N) 在末尾追加
+        /// O(log N) append at end
         pub fn push(self: *Self, item: Item) !void {
             try self.insert(self.item_count, item);
         }
 
-        /// O(log N) 在指定 index 插入 item
+        /// O(log N) insert item at index
         pub fn insert(self: *Self, index: usize, item: Item) !void {
             if (self.transaction_active) {
                 std.debug.assert(!self.transaction_failed);
@@ -248,7 +248,7 @@ pub fn SumTree(comptime Item: type, comptime Summary: type) type {
             if (result.split) |split_node| {
                 // A split node is not owned by the root until attached.
                 errdefer self.release(split_node);
-                // 根节点分裂
+                // root node split
                 const new_root = try self.createInternal(self.root.?.height + 1);
                 new_root.data.internal.children[0] = self.root.?;
                 new_root.data.internal.summaries[0] = nodeSummary(self.root.?);
@@ -260,7 +260,7 @@ pub fn SumTree(comptime Item: type, comptime Summary: type) type {
             self.item_count += 1;
         }
 
-        /// O(log N) 删除指定 index 的 item
+        /// O(log N) remove item at index
         pub fn remove(self: *Self, index: usize) !void {
             if (self.transaction_active) {
                 std.debug.assert(!self.transaction_failed);
@@ -281,7 +281,7 @@ pub fn SumTree(comptime Item: type, comptime Summary: type) type {
             try self.removeInNode(self.root.?, index);
             self.item_count -= 1;
 
-            // 如果根是内部节点且只剩一个子节点，降低树高
+            // if root is internal with one child, lower height
             if (self.root) |root| {
                 if (root.data == .internal and root.data.internal.len == 1) {
                     const child = root.data.internal.children[0];
@@ -291,7 +291,7 @@ pub fn SumTree(comptime Item: type, comptime Summary: type) type {
                 }
             }
 
-            // 空树
+            // empty tree
             if (self.item_count == 0) {
                 if (self.root) |root| {
                     self.release(root);
@@ -300,14 +300,14 @@ pub fn SumTree(comptime Item: type, comptime Summary: type) type {
             }
         }
 
-        /// O(log N) 获取指定 index 的 item
+        /// O(log N) get item at index
         pub fn get(self: *const Self, index: usize) ?Item {
             if (index >= self.item_count) return null;
             if (self.root == null) return null;
             return self.getInNode(self.root.?, index);
         }
 
-        /// O(log N) 替换指定 index 的 item
+        /// O(log N) replace item at index
         pub fn replace(self: *Self, index: usize, item: Item) !void {
             if (self.transaction_active) {
                 std.debug.assert(!self.transaction_failed);
@@ -328,7 +328,7 @@ pub fn SumTree(comptime Item: type, comptime Summary: type) type {
             try self.replaceInNode(self.root.?, index, item);
         }
 
-        /// O(1) COW 快照（共享节点，引用计数）
+        /// O(1) COW snapshot (shared nodes, ref-counted)
         pub fn snapshot(self: *const Self) Self {
             if (self.root) |root| {
                 retain(root);
@@ -340,19 +340,18 @@ pub fn SumTree(comptime Item: type, comptime Summary: type) type {
             };
         }
 
-        /// Dimension-based seek: 按某个 Summary 维度查找 item
+        /// Dimension-based seek: find item by Summary dimension
         pub fn SeekResult(comptime Dim: type) type {
             _ = Dim;
             return struct {
                 index: usize = 0,
                 item: ?Item = null,
-                offset_in_item: usize = 0, // target - 前面所有 item 的 Dim 值之和
-                preceding: usize = 0, // 前面所有 item 的 Dim 值之和
+                offset_in_item: usize = 0, // target - sum of Dim values of preceding items
+                preceding: usize = 0, // sum of Dim values of preceding items
             };
         }
 
-        /// O(log N) 按 Dimension 查找
-        /// Dim 需要有 fn fromSummary(Summary) usize
+        /// O(log N) seek by Dimension. Dim needs fn fromSummary(Summary) usize
         pub fn seek(self: *const Self, comptime Dim: type, target: usize) SeekResult(Dim) {
             var result = SeekResult(Dim){};
             if (self.root == null) return result;
@@ -375,7 +374,7 @@ pub fn SumTree(comptime Item: type, comptime Summary: type) type {
                         }
                         acc += dim_val;
                     }
-                    // target 超出范围，指向最后一个 item 之后
+                    // target out of range, points after last item
                     result.index = base_index + leaf.len;
                     result.preceding += acc;
                 },
@@ -398,7 +397,7 @@ pub fn SumTree(comptime Item: type, comptime Summary: type) type {
             }
         }
 
-        /// 遍历所有 item
+        /// Iterate all items
         pub const Iterator = struct {
             tree: *const Self,
             stack: [32]StackEntry = undefined,
@@ -509,7 +508,7 @@ pub fn SumTree(comptime Item: type, comptime Summary: type) type {
             return .{ .tree = self };
         }
 
-        // ===== 内部实现 =====
+        // ===== Internal implementation =====
 
         const InsertResult = struct {
             split: ?*Node = null,
@@ -519,7 +518,7 @@ pub fn SumTree(comptime Item: type, comptime Summary: type) type {
             switch (node.data) {
                 .leaf => |*leaf| {
                     if (leaf.len < BRANCHING_FACTOR) {
-                        // 有空间，在 index 位置插入
+                        // Space available, insert at index
                         var i = leaf.len;
                         while (i > index) : (i -= 1) {
                             leaf.items[i] = leaf.items[i - 1];
@@ -528,12 +527,12 @@ pub fn SumTree(comptime Item: type, comptime Summary: type) type {
                         leaf.len += 1;
                         return .{};
                     } else {
-                        // 叶满，需要分裂
+                        // Leaf full, need split
                         return try self.splitLeafInsert(leaf, index, item);
                     }
                 },
                 .internal => |*internal| {
-                    // 找到目标子树
+                    // Find target subtree
                     var acc: usize = 0;
                     var child_idx: usize = 0;
                     while (child_idx < internal.len) : (child_idx += 1) {
@@ -544,16 +543,16 @@ pub fn SumTree(comptime Item: type, comptime Summary: type) type {
                         acc += child_count;
                     }
 
-                    // COW 子节点
+                    // COW child
                     internal.children[child_idx] = try self.ensureUnique(internal.children[child_idx]);
                     const result = try self.insertInNode(internal.children[child_idx], index - acc, item);
 
-                    // 更新 summary
+                    // Update summary
                     internal.summaries[child_idx] = nodeSummary(internal.children[child_idx]);
 
                     if (result.split) |split_child| {
                         if (internal.len < BRANCHING_FACTOR) {
-                            // 有空间，在 child_idx+1 位置插入分裂的子节点
+                            // Space available, insert split child at child_idx+1
                             var i = internal.len;
                             while (i > child_idx + 1) : (i -= 1) {
                                 internal.children[i] = internal.children[i - 1];
@@ -564,7 +563,7 @@ pub fn SumTree(comptime Item: type, comptime Summary: type) type {
                             internal.len += 1;
                             return .{};
                         } else {
-                            // 内部节点也满了，分裂
+                            // Internal node also full, split
                             errdefer self.release(split_child);
                             return try self.splitInternalInsert(internal, child_idx + 1, split_child);
                         }
@@ -576,7 +575,7 @@ pub fn SumTree(comptime Item: type, comptime Summary: type) type {
         }
 
         fn splitLeafInsert(self: *Self, leaf: *LeafData, index: usize, item: Item) !InsertResult {
-            // 收集所有 items（包括新 item），共 BRANCHING_FACTOR + 1 个
+            // Collect all items (including new), total BRANCHING_FACTOR + 1
             var all: [BRANCHING_FACTOR + 1]Item = undefined;
             var pos: usize = 0;
             for (0..leaf.len) |i| {
@@ -593,7 +592,7 @@ pub fn SumTree(comptime Item: type, comptime Summary: type) type {
             }
             std.debug.assert(pos == BRANCHING_FACTOR + 1);
 
-            // 分裂：前 SPLIT_AT 留在原节点，其余进新节点
+            // Split: first SPLIT_AT stay in original, rest in new
             const new_leaf = try self.createLeaf();
             leaf.len = SPLIT_AT;
             @memcpy(leaf.items[0..SPLIT_AT], all[0..SPLIT_AT]);
@@ -605,7 +604,7 @@ pub fn SumTree(comptime Item: type, comptime Summary: type) type {
         }
 
         fn splitInternalInsert(self: *Self, internal: *InternalData, insert_idx: usize, new_child: *Node) !InsertResult {
-            // 收集所有 children（包括新的），共 BRANCHING_FACTOR + 1 个
+            // Collect all children (including new), total BRANCHING_FACTOR + 1
             var all_children: [BRANCHING_FACTOR + 1]*Node = undefined;
             var all_summaries: [BRANCHING_FACTOR + 1]Summary = undefined;
             var pos: usize = 0;
@@ -652,7 +651,7 @@ pub fn SumTree(comptime Item: type, comptime Summary: type) type {
                     leaf.len -= 1;
                 },
                 .internal => |*internal| {
-                    // 找到目标子树
+                    // Find target subtree
                     var acc: usize = 0;
                     var child_idx: usize = 0;
                     while (child_idx < internal.len) : (child_idx += 1) {
@@ -667,10 +666,10 @@ pub fn SumTree(comptime Item: type, comptime Summary: type) type {
                     internal.children[child_idx] = try self.ensureUnique(internal.children[child_idx]);
                     try self.removeInNode(internal.children[child_idx], index - acc);
 
-                    // 更新 summary
+                    // Update summary
                     internal.summaries[child_idx] = nodeSummary(internal.children[child_idx]);
 
-                    // 检查是否需要合并（子节点过空）
+                    // Check if merge needed (child too sparse)
                     const child_len = switch (internal.children[child_idx].data) {
                         .leaf => |*l| l.len,
                         .internal => |*n| n.len,
@@ -683,9 +682,9 @@ pub fn SumTree(comptime Item: type, comptime Summary: type) type {
         }
 
         fn rebalanceChild(self: *Self, parent: *InternalData, child_idx: usize) !void {
-            // 尝试从兄弟借用或合并
+            // Try borrow from sibling or merge
             if (child_idx + 1 < parent.len) {
-                // 尝试从右兄弟借用
+                // Try borrow from right sibling
                 parent.children[child_idx + 1] = try self.ensureUnique(parent.children[child_idx + 1]);
                 const right = parent.children[child_idx + 1];
                 const right_len = switch (right.data) {
@@ -693,16 +692,16 @@ pub fn SumTree(comptime Item: type, comptime Summary: type) type {
                     .internal => |*n| n.len,
                 };
                 if (right_len > MIN_CHILDREN) {
-                    // 借用右兄弟的第一个元素
+                    // Borrow first element from right sibling
                     try self.borrowFromRight(parent, child_idx);
                     return;
                 }
-                // 合并到左边
+                // Merge to left
                 try self.mergeChildren(parent, child_idx);
                 return;
             }
             if (child_idx > 0) {
-                // 尝试从左兄弟借用
+                // Try borrow from left sibling
                 parent.children[child_idx - 1] = try self.ensureUnique(parent.children[child_idx - 1]);
                 const left = parent.children[child_idx - 1];
                 const left_len = switch (left.data) {
@@ -713,7 +712,7 @@ pub fn SumTree(comptime Item: type, comptime Summary: type) type {
                     try self.borrowFromLeft(parent, child_idx);
                     return;
                 }
-                // 合并：将 child_idx 合并到 child_idx-1
+                // Merge: merge child_idx to child_idx-1
                 try self.mergeChildren(parent, child_idx - 1);
                 return;
             }
@@ -727,7 +726,7 @@ pub fn SumTree(comptime Item: type, comptime Summary: type) type {
             switch (left.data) {
                 .leaf => |*left_leaf| {
                     const right_leaf = &right.data.leaf;
-                    // 将右兄弟的第一个 item 移到左边
+                    // Move first item from right sibling to left
                     left_leaf.items[left_leaf.len] = right_leaf.items[0];
                     left_leaf.len += 1;
                     // Shift right
@@ -806,13 +805,13 @@ pub fn SumTree(comptime Item: type, comptime Summary: type) type {
                 },
             }
 
-            // 更新 summary
+            // Update summary
             parent.summaries[left_idx] = nodeSummary(left);
 
-            // 释放右节点（不递归释放子节点，因为子节点已经被合并到左边）
+            // Release right node (children already merged to left, no recursive free)
             switch (right.data) {
                 .internal => {
-                    // 子节点已经被移到左边，不需要递归释放
+                    // Children already moved to left, no recursive free needed
                     self.allocator.destroy(right);
                 },
                 .leaf => {
@@ -820,7 +819,7 @@ pub fn SumTree(comptime Item: type, comptime Summary: type) type {
                 },
             }
 
-            // 从 parent 中移除右节点
+            // Remove right node from parent
             var i = left_idx + 1;
             while (i + 1 < parent.len) : (i += 1) {
                 parent.children[i] = parent.children[i + 1];
@@ -874,9 +873,9 @@ pub fn SumTree(comptime Item: type, comptime Summary: type) type {
     };
 }
 
-// ===== 向后兼容类型别名 =====
+// ===== Backward compatibility type aliases =====
 
-/// 文本摘要：存储子树的聚合统计信息
+/// Text summary: stores aggregated stats of subtree
 pub const TextSummary = struct {
     bytes: usize = 0,
     lines: usize = 0,
@@ -916,7 +915,7 @@ pub const TextSummary = struct {
     }
 };
 
-/// 文本块
+/// Text chunk
 pub const TextChunk = struct {
     start: usize,
     len: usize,
@@ -931,24 +930,24 @@ pub const TextChunk = struct {
     }
 };
 
-/// 向后兼容别名
+/// Backward compatible alias
 pub const TextSumTree = SumTree(TextChunk, TextSummary);
 
-/// Dimension: 按字节偏移查找
+/// Dimension: seek by byte offset
 pub const ByteDim = struct {
     pub fn fromSummary(s: TextSummary) usize {
         return s.bytes;
     }
 };
 
-/// Dimension: 按行号查找
+/// Dimension: seek by line number
 pub const LineDim = struct {
     pub fn fromSummary(s: TextSummary) usize {
         return s.lines;
     }
 };
 
-// ===== 单元测试 =====
+// ===== Unit tests =====
 
 test "TextSummary: fromText" {
     const text = "Hello\nWorld\n";
@@ -1024,13 +1023,13 @@ test "SumTree: seek by line" {
     try tree.push(TextChunk{ .start = 7, .len = 7, .newline_count = 1 });
     try tree.push(TextChunk{ .start = 14, .len = 7, .newline_count = 1 });
 
-    // seek(LineDim, 1): 找到包含第 1 行的 chunk
-    // chunk 0 有 1 行 (line 0)，chunk 1 有 1 行 (line 1)
+    // seek(LineDim, 1): find chunk containing line 1. chunk 0 has 1 line (line 0), chunk 1 has 1
+    // line (line 1)
     const result = tree.seek(LineDim, 1);
     try std.testing.expect(result.item != null);
     try std.testing.expectEqual(@as(usize, 1), result.index); // chunk 1
-    try std.testing.expectEqual(@as(usize, 1), result.preceding); // 前面有 1 行
-    try std.testing.expectEqual(@as(usize, 7), result.item.?.start); // chunk 1 的 start
+    try std.testing.expectEqual(@as(usize, 1), result.preceding); // 1 preceding line
+    try std.testing.expectEqual(@as(usize, 7), result.item.?.start); // chunk 1 start
 }
 
 test "SumTree: many chunks trigger split" {
@@ -1103,30 +1102,30 @@ test "SumTree: large tree with splits" {
     try std.testing.expect(line_result.item != null);
 }
 
-// ===== 新增测试：insert/remove/get/replace =====
+// ===== New tests: insert/remove/get/replace =====
 
 test "SumTree: insert at various positions" {
     var tree = TextSumTree.init(std.testing.allocator);
     defer tree.deinit();
 
-    // 头部插入
+    // head insert
     try tree.insert(0, TextChunk{ .start = 100, .len = 10, .newline_count = 0 });
     try std.testing.expectEqual(@as(usize, 1), tree.count());
     try std.testing.expectEqual(@as(usize, 100), tree.get(0).?.start);
 
-    // 尾部插入
+    // tail insert
     try tree.insert(1, TextChunk{ .start = 200, .len = 20, .newline_count = 1 });
     try std.testing.expectEqual(@as(usize, 2), tree.count());
     try std.testing.expectEqual(@as(usize, 200), tree.get(1).?.start);
 
-    // 中间插入
+    // middle insert
     try tree.insert(1, TextChunk{ .start = 150, .len = 15, .newline_count = 0 });
     try std.testing.expectEqual(@as(usize, 3), tree.count());
     try std.testing.expectEqual(@as(usize, 100), tree.get(0).?.start);
     try std.testing.expectEqual(@as(usize, 150), tree.get(1).?.start);
     try std.testing.expectEqual(@as(usize, 200), tree.get(2).?.start);
 
-    // Summary 正确
+    // summary correct
     try std.testing.expectEqual(@as(usize, 45), tree.summary().bytes);
     try std.testing.expectEqual(@as(usize, 1), tree.summary().lines);
 }
@@ -1135,14 +1134,14 @@ test "SumTree: remove at various positions" {
     var tree = TextSumTree.init(std.testing.allocator);
     defer tree.deinit();
 
-    // 插入 5 个
+    // insert 5
     var i: usize = 0;
     while (i < 5) : (i += 1) {
         try tree.push(TextChunk{ .start = i * 10, .len = 10, .newline_count = 1 });
     }
     try std.testing.expectEqual(@as(usize, 5), tree.count());
 
-    // 删除中间
+    // remove middle
     try tree.remove(2);
     try std.testing.expectEqual(@as(usize, 4), tree.count());
     try std.testing.expectEqual(@as(usize, 0), tree.get(0).?.start);
@@ -1150,12 +1149,12 @@ test "SumTree: remove at various positions" {
     try std.testing.expectEqual(@as(usize, 30), tree.get(2).?.start);
     try std.testing.expectEqual(@as(usize, 40), tree.get(3).?.start);
 
-    // 删除头部
+    // remove head
     try tree.remove(0);
     try std.testing.expectEqual(@as(usize, 3), tree.count());
     try std.testing.expectEqual(@as(usize, 10), tree.get(0).?.start);
 
-    // 删除尾部
+    // remove tail
     try tree.remove(2);
     try std.testing.expectEqual(@as(usize, 2), tree.count());
     try std.testing.expectEqual(@as(usize, 30), tree.get(1).?.start);
@@ -1193,22 +1192,22 @@ test "SumTree: COW snapshot" {
     try tree.push(TextChunk{ .start = 0, .len = 10, .newline_count = 1 });
     try tree.push(TextChunk{ .start = 10, .len = 20, .newline_count = 2 });
 
-    // 创建快照
+    // create snapshot
     var snap = tree.snapshot();
     defer snap.deinit();
 
     try std.testing.expectEqual(@as(usize, 2), snap.count());
     try std.testing.expectEqual(@as(usize, 30), snap.summary().bytes);
 
-    // 修改主树
+    // modify main tree
     try tree.push(TextChunk{ .start = 30, .len = 5, .newline_count = 0 });
     try tree.remove(0);
 
-    // 主树已变
+    // main tree changed
     try std.testing.expectEqual(@as(usize, 2), tree.count());
     try std.testing.expectEqual(@as(usize, 25), tree.summary().bytes);
 
-    // 快照不变
+    // snapshot unchanged
     try std.testing.expectEqual(@as(usize, 2), snap.count());
     try std.testing.expectEqual(@as(usize, 30), snap.summary().bytes);
     try std.testing.expectEqual(@as(usize, 0), snap.get(0).?.start);
@@ -1219,12 +1218,12 @@ test "SumTree: alternating insert and remove" {
     var tree = TextSumTree.init(std.testing.allocator);
     defer tree.deinit();
 
-    // 交替操作
+    // alternating operations
     try tree.push(TextChunk{ .start = 0, .len = 10, .newline_count = 1 });
     try tree.push(TextChunk{ .start = 10, .len = 10, .newline_count = 1 });
     try tree.push(TextChunk{ .start = 20, .len = 10, .newline_count = 1 });
 
-    try tree.remove(1); // 移除中间
+    try tree.remove(1); // remove middle
     try std.testing.expectEqual(@as(usize, 2), tree.count());
 
     try tree.insert(1, TextChunk{ .start = 50, .len = 5, .newline_count = 0 });
@@ -1242,7 +1241,7 @@ test "SumTree: many inserts trigger splits and removes trigger merges" {
     var tree = TextSumTree.init(std.testing.allocator);
     defer tree.deinit();
 
-    // 插入足够多的元素触发多层分裂
+    // insert enough elements to trigger multi-level split
     const n: usize = 50;
     var i: usize = 0;
     while (i < n) : (i += 1) {
@@ -1251,13 +1250,13 @@ test "SumTree: many inserts trigger splits and removes trigger merges" {
     try std.testing.expectEqual(n, tree.count());
     try std.testing.expectEqual(@as(usize, n * 10), tree.summary().bytes);
 
-    // 验证所有元素顺序正确
+    // verify all elements in order
     i = 0;
     while (i < n) : (i += 1) {
         try std.testing.expectEqual(i * 10, tree.get(i).?.start);
     }
 
-    // 逐个从头部删除
+    // remove from head one by one
     i = 0;
     while (i < n) : (i += 1) {
         try tree.remove(0);
@@ -1267,14 +1266,14 @@ test "SumTree: many inserts trigger splits and removes trigger merges" {
 }
 
 test "SumTree: fuzzy insert/remove vs ArrayList reference" {
-    // 用确定性种子的伪随机序列测试正确性
+    // test correctness with deterministic seed pseudo-random
     var tree = TextSumTree.init(std.testing.allocator);
     defer tree.deinit();
 
-    var ref = std.ArrayList(TextChunk){};
+    var ref = @as(std.ArrayList(TextChunk), .empty);
     defer ref.deinit(std.testing.allocator);
 
-    // 使用简单的 LCG 伪随机数
+    // use simple LCG pseudo-random
     var seed: u64 = 12345;
     const lcg = struct {
         fn next(s: *u64) u64 {
@@ -1299,9 +1298,9 @@ test "SumTree: fuzzy insert/remove vs ArrayList reference" {
             _ = ref.orderedRemove(idx);
         }
 
-        // 验证一致性
+        // verify consistency
         try std.testing.expectEqual(ref.items.len, tree.count());
-        // 每 10 步做一次全量验证
+        // full validation every 10 steps
         if (i % 10 == 0) {
             for (ref.items, 0..) |expected, j| {
                 const actual = tree.get(j);

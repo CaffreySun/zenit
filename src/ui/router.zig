@@ -1,21 +1,21 @@
-/// 声明式路由系统，基于 Signal + Match 的页面导航
+/// Declarative routing system for page navigation based on Signal + Match
 ///
-/// 用法:
+/// Usage:
 /// ```zig
 /// const Page = enum { welcome, editor, settings };
 /// var router = try Router(Page).init(scope, .welcome);
 /// var params: RouteParams = .{};
 /// try params.set("file", "test.md");
 /// router.navigate(.editor, params);
-/// router.back(); // 回到 welcome
-/// // mount 时内部自动用 Match 切换页面
+/// router.back(); // back to welcome
+/// // mount automatically switches pages using Match internally
 /// ```
 const std = @import("std");
 const Scope = @import("reactive/scope.zig").Scope;
 const Signal = @import("reactive/signal.zig").Signal;
 const SignalOwner = @import("reactive/owner.zig").SignalOwner;
 
-/// 路由参数
+/// Route parameters
 pub const RouteParams = struct {
     pub const max_params = 8;
     pub const max_key_len = 64;
@@ -26,13 +26,13 @@ pub const RouteParams = struct {
         ValueTooLong,
     };
 
-    entries: [max_params]ParamEntry = [_]ParamEntry{.{}} ** max_params,
+    entries: [max_params]ParamEntry = @as([max_params]ParamEntry, @splat(.{})),
     count: u8 = 0,
 
     const ParamEntry = struct {
-        key_buf: [max_key_len]u8 = [_]u8{0} ** max_key_len,
+        key_buf: [max_key_len]u8 = @as([max_key_len]u8, @splat(0)),
         key_len: u8 = 0,
-        value_buf: [max_value_len]u8 = [_]u8{0} ** max_value_len,
+        value_buf: [max_value_len]u8 = @as([max_value_len]u8, @splat(0)),
         value_len: u16 = 0,
 
         fn init(param_key: []const u8, param_value: []const u8) Error!ParamEntry {
@@ -67,7 +67,7 @@ pub const RouteParams = struct {
         if (key.len > max_key_len) return error.KeyTooLong;
         if (value.len > max_value_len) return error.ValueTooLong;
 
-        // 更新已有
+        // Update existing
         for (self.entries[0..self.count]) |*entry| {
             if (std.mem.eql(u8, entry.key(), key)) {
                 @memcpy(entry.value_buf[0..value.len], value);
@@ -75,7 +75,7 @@ pub const RouteParams = struct {
                 return;
             }
         }
-        // 添加新的
+        // Add new
         if (self.count >= max_params) return error.TooManyParams;
 
         self.entries[self.count] = try ParamEntry.init(key, value);
@@ -83,7 +83,7 @@ pub const RouteParams = struct {
     }
 };
 
-/// 历史记录条目
+/// History entry
 fn HistoryEntry(comptime PageEnum: type) type {
     return struct {
         page: PageEnum,
@@ -91,25 +91,25 @@ fn HistoryEntry(comptime PageEnum: type) type {
     };
 }
 
-/// 泛型路由器
+/// Generic router
 pub fn Router(comptime PageEnum: type) type {
     return struct {
         const Self = @This();
         const Entry = HistoryEntry(PageEnum);
 
-        /// 当前页面（响应式 Signal）
+        /// Current page (reactive Signal)
         current: *Signal(PageEnum),
-        /// 当前路由参数（响应式 Signal）
+        /// Current route parameters (reactive Signal)
         params: *Signal(RouteParams),
-        /// 导航历史栈
+        /// Navigation history stack
         history: [max_history]Entry = undefined,
         history_len: u16 = 0,
-        /// 当前在历史栈中的位置
+        /// Current position in history stack
         history_pos: u16 = 0,
 
         const max_history = 64;
 
-        /// 创建路由器
+        /// Create router
         pub fn init(scope: *Scope, initial_page: PageEnum) !Self {
             const current = try scope.createSignal(PageEnum, initial_page);
             const params = try scope.createSignal(RouteParams, .{});
@@ -118,14 +118,14 @@ pub fn Router(comptime PageEnum: type) type {
                 .params = params,
                 .history = undefined,
             };
-            // 初始页面压入历史
+            // Push initial page into history
             router.pushHistory(initial_page, .{});
             return router;
         }
 
-        /// 导航到新页面
+        /// Navigate to new page
         pub fn navigate(self: *Self, page: PageEnum, route_params: RouteParams) void {
-            // 如果不在历史栈顶（因为 back() 过），截断前面的历史
+            // If not at top of history stack (due to back()), truncate forward history
             if (self.history_pos + 1 < self.history_len) {
                 self.history_len = self.history_pos + 1;
             }
@@ -134,12 +134,12 @@ pub fn Router(comptime PageEnum: type) type {
             self.params.set(route_params);
         }
 
-        /// 导航到新页面（无参数）
+        /// Navigate to new page (no parameters)
         pub fn navigateTo(self: *Self, page: PageEnum) void {
             self.navigate(page, .{});
         }
 
-        /// 回退
+        /// Go back
         pub fn back(self: *Self) bool {
             if (self.history_pos == 0) return false;
             self.history_pos -= 1;
@@ -149,7 +149,7 @@ pub fn Router(comptime PageEnum: type) type {
             return true;
         }
 
-        /// 前进
+        /// Go forward
         pub fn forward(self: *Self) bool {
             if (self.history_pos + 1 >= self.history_len) return false;
             self.history_pos += 1;
@@ -159,19 +159,19 @@ pub fn Router(comptime PageEnum: type) type {
             return true;
         }
 
-        /// 是否可以回退
+        /// Can go back
         pub fn canGoBack(self: *const Self) bool {
             return self.history_pos > 0;
         }
 
-        /// 是否可以前进
+        /// Can go forward
         pub fn canGoForward(self: *const Self) bool {
             return self.history_pos + 1 < self.history_len;
         }
 
         fn pushHistory(self: *Self, page: PageEnum, route_params: RouteParams) void {
             if (self.history_len >= max_history) {
-                // 栈满：丢弃最旧的一半历史
+                // Stack full: discard oldest half of history
                 const keep = max_history / 2;
                 const discard = self.history_len - keep;
                 var i: u16 = 0;
@@ -215,8 +215,8 @@ test "RouteParams rejects overflow instead of truncating" {
 
 test "RouteParams validates key and value lengths" {
     var params: RouteParams = .{};
-    const long_key = [_]u8{'k'} ** (RouteParams.max_key_len + 1);
-    const long_value = [_]u8{'v'} ** (RouteParams.max_value_len + 1);
+    const long_key = @as([(RouteParams.max_key_len + 1)]u8, @splat('k'));
+    const long_value = @as([(RouteParams.max_value_len + 1)]u8, @splat('v'));
 
     try std.testing.expectError(error.KeyTooLong, params.set(long_key[0..], "value"));
     try std.testing.expectError(error.ValueTooLong, params.set("key", long_value[0..]));

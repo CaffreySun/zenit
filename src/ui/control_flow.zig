@@ -1,7 +1,7 @@
-/// 保留模式控制流原语
+/// Retained control flow primitives.
 ///
-/// Show: 条件渲染，condition 为 true 时挂载内容，false 时卸载并销毁
-/// For: 列表渲染，根据 data Signal 增量渲染列表（key-based diff）
+/// Show: conditional render, condition true mount content, false unmount and destroy.
+/// For: list render, increment-render list per data Signal (key-based diff).
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const core = @import("core.zig");
@@ -10,22 +10,44 @@ const Node = core.Node;
 const Cx = core.Cx;
 const Scope = core.Scope;
 const Signal = core.Signal;
-const clearNodeScopes = core.clearNodeScopes;
+const reactive = @import("reactive.zig");
 
-/// 控制流（Show / For / Match）内部错误上报。
+/// Build subtree in untrack: component mount reads don't become control flow effect
+/// dependencies (else any Signal child reads becomes Show/Match/For effect dep, Match may
+/// rebuild subtree). Mirrors Solid: component function body untracked.
+pub fn callUntracked(cx: *Cx, comptime f: anytype, args: anytype) @typeInfo(@TypeOf(f)).@"fn".return_type.? {
+    const Args = @TypeOf(args);
+    const R = @typeInfo(@TypeOf(f)).@"fn".return_type.?;
+    return cx.owner.untrack(struct {
+        fn call(a: Args) R {
+            return @call(.auto, f, a);
+        }
+    }.call, args);
+}
+
+/// Control flow drive source: *Signal(T) / *Memo(T) / derived value / Source(T) all
+/// work (docs/SIGNAL_API_DESIGN.md section 4.9), e.g. ui.Show(scope, root, ui.eq(page,
+/// .settings), ...).
+fn sourceArg(comptime T: type, comptime who: []const u8, x: anytype) reactive.Source(T) {
+    const X = @TypeOf(x);
+    if (X == T) return .{ .value = x };
+    const V = reactive.SourceValueOf(X);
+    if (V != T) @compileError(who ++ ": expected a source of " ++ @typeName(T) ++ ", got " ++ @typeName(X) ++ " (value type " ++ @typeName(V) ++ ")");
+    return reactive.toSource(x);
+}
+
+/// Control flow (Show/For/Match) internal error report.
 ///
-/// 这些回调由 reactive effect 驱动，签名不能返回 error，历史上一律
-/// `catch return`，于是 OOM / 构建失败被**完全吞掉**：UI 悄悄少一块，
-/// 没有日志、没有计数，排查时无从下手（审查报告 §3）。
+/// These callbacks are driven by reactive effects and their signature can't return an error, so
+/// OOM / build failures must not be silently swallowed (UI would silently miss a piece with no
+/// logs or counts).
 ///
-/// 在不改回调签名的前提下，至少做到：(1) 打日志带上出错位置与原始 error；
-/// (2) 计数供测试/诊断断言。真正的 error boundary 需要 effect 层支持
-/// error sink，属后续工作。
+/// Without changing the callback signature: (1) log with source + original error; (2) count for
+/// tests/diagnostic asserts. A true error boundary needs an effect-layer error sink (future work).
 pub var control_flow_error_count: u64 = 0;
 
-/// 测试期静音开关：Zig test runner 把 `std.log.err` 视为测试失败，
-/// 而"错误被上报"恰恰是我们要断言的行为，故给测试留一个静音旁路，
-/// 计数照常自增。
+/// Test silent switch: Zig test runner treats std.log.err as test failure, but "error
+/// reported" is exactly behavior we assert, so give tests silent bypass, count still increments.
 pub var control_flow_suppress_error_log: bool = false;
 
 fn reportControlFlowError(site: []const u8, err: anyerror) void {
@@ -37,218 +59,340 @@ fn reportControlFlowError(site: []const u8, err: anyerror) void {
     );
 }
 
-/// 挂载失败时回收一棵尚未交付的子树，顺序与正常卸载一致：
-/// 摘 hook 状态 -> dispose scope（cleanup 此刻还能看到活节点）-> 清节点上的
-/// scope 指针 -> destroyDetached（回收 ElementTable slot、清 Cx 裸引用）。
-/// 不能用 node.destroy：它既跳过上述清理，又在 scope dispose 之前就释放了节点。
+/// Cleanup never pre-clears whole-tree scope pointers: when the transaction scope is disposed,
+/// attached nodes (and descendants) are already unbound; still-non-null pointers come only from
+/// external live scopes (Node child elements) and are handed to freeNode to dispose together,
+/// else they leak until the caller scope is destroyed.
+///
+/// Mount failure cleans the unattached subtree in normal unmount order: unset hook state ->
+/// dispose scope (cleanup still sees live nodes) -> clear node scope pointers -> destroyDetached
+/// (free ElementTable slot, clear Cx refs). Don't use node.destroy: it skips the above and frees
+/// nodes before scope dispose.
 fn discardUnmountedSubtree(cx: *Cx, child_scope: *Scope, node: *Node) void {
     hooks.invalidateSubtreeHookState(node);
     if (!child_scope.disposed) child_scope.dispose();
-    clearNodeScopes(node);
     if (node.parent) |p| cx.detachChild(p, node);
     cx.destroyDetached(node);
 }
 
-/// For 的"建一个新条目"公共路径：childScope -> render -> append 三步，
-/// 任一步失败都逐级回滚（原实现是三行各自 `catch return`，
-/// 后一步失败会漏掉前一步产出的 scope / node）。
-/// 成功时把条目写进 new_entries 并转移所有权。
-fn appendForEntry(
-    s: anytype,
-    new_entries: anytype,
-    key: u64,
-    item: anytype,
-    idx: usize,
-    comptime renderItem: anytype,
-) !void {
-    const child_scope = s.parent_scope.childScope() catch |err| {
-        reportControlFlowError("For.create/childScope", err);
-        return err;
-    };
-    const node = renderItem(child_scope, s.cx_ptr, item, idx) catch |err| {
-        reportControlFlowError("For.create/render", err);
-        child_scope.dispose();
-        return err;
-    };
+// ============================================================================
+// Area: control flow content's insertion point in the parent node
+// ============================================================================
+//
+// Show / Match content created with `parent.appendChild` lands after all siblings when the
+// condition turns true later; For positions by 'non-For sibling count before it', which drifts
+// if earlier dynamic areas (Show open/close) change the count. Both only work when the parent
+// holds a single control flow.
+//
+// Mirrors Solid's marker: each area owns an anchor pair [start, end) in the parent
+// (ElementTag.anchor, display:none, no space/gap, no hit/a11y); content always inserts before
+// end. Area content can be several nodes, including nested areas: clearing by position drops
+// everything between start and end (nested anchors and content included), and nested areas'
+// own scopes are disposed recursively by the outer child scope.
 
-    new_entries.append(s.alloc, .{
-        .key = key,
-        .item = item,
-        .scope = child_scope,
-        .node = node,
-    }) catch |err| {
-        reportControlFlowError("For.create/append", err);
-        discardUnmountedSubtree(s.cx_ptr, child_scope, node);
-        return err;
-    };
-}
-
-/// 只重排 For 管理的那一段子节点，parent 里的其它兄弟（标题、Show 节点等）
-/// 原位保留。原实现把 parent.children 整体替换成 For 条目列表，
-/// replaceChildOrder 会把不在列表里的兄弟全部摘下，它们成了无人释放的孤儿。
+/// Node placement: insert before `before`, append to parent when `before == null`.
 ///
-/// 段位置用"段前的非 For 兄弟个数"表示：有 For 节点仍挂着时以其实际位置为准
-/// （兄弟可能被其它控制流增删），列表曾为空时沿用上次记录值。
-fn reorderForSegment(s: anytype) !void {
-    const parent = s.parent_node;
-    var owned: std.AutoHashMapUnmanaged(*Node, void) = .{};
-    defer owned.deinit(s.alloc);
-    try owned.ensureTotalCapacity(s.alloc, @intCast(s.entries.items.len));
-    for (s.entries.items) |entry| owned.putAssumeCapacity(entry.node, {});
+/// `parent == null` is capture mode (Sink.capture): a single root goes to the `root` slot,
+/// not attached to the tree; the slot holder (view.render root or For loop) delivers/cleans up.
+///
+/// Rollback contract: a mount (one 'transaction') stops on first error, so at most one
+/// 'built but failed-to-attach' node goes to the `stray` slot. The transaction owner cleans up
+/// in unload order: hook invalidation -> dispose scope (cleanup can still see live
+/// nodes) -> free attached content and stray. Child locations derive from `child()`,
+/// sharing the same stray slot.
+pub const Sink = struct {
+    parent: ?*Node,
+    before: ?*Node = null,
+    stray: ?*?*Node = null,
+    root: ?*?*Node = null,
 
-    var others: usize = 0;
-    var lead: ?usize = null;
-    for (parent.children.items) |child| {
-        if (owned.contains(child)) {
-            if (lead == null) lead = others;
-        } else others += 1;
+    pub fn capture(root: *?*Node, stray: ?*?*Node) Sink {
+        return .{ .parent = null, .root = root, .stray = stray };
     }
-    const segment_lead = lead orelse @min(s.segment_lead, others);
-    s.segment_lead = segment_lead;
 
-    var order: std.ArrayList(*Node) = .{};
-    defer order.deinit(s.alloc);
-    try order.ensureTotalCapacity(s.alloc, others + s.entries.items.len);
-    var seen: usize = 0;
-    var inserted = false;
-    for (parent.children.items) |child| {
-        if (owned.contains(child)) continue;
-        if (!inserted and seen == segment_lead) {
-            for (s.entries.items) |entry| order.appendAssumeCapacity(entry.node);
-            inserted = true;
+    /// Append child element location (same transaction).
+    pub fn child(self: Sink, parent: *Node) Sink {
+        return .{ .parent = parent, .stray = self.stray };
+    }
+
+    /// Mount a freshly-built detached node. On failure, node won't leak: either it goes to
+    /// stray slot awaiting transaction rollback, or (without stray slot) it gets freed
+    /// immediately.
+    pub fn insert(self: Sink, cx: *Cx, node: *Node) !void {
+        const parent = self.parent orelse {
+            const slot = self.root.?;
+            if (slot.* == null) {
+                slot.* = node;
+                return;
+            }
+            // Capture accepts only one root; extra nodes mean element implementation breach
+            // (single-node element emitted multiple).
+            self.park(cx, node);
+            return error.ViewMultipleRoots;
+        };
+        parent.insertChildBefore(cx.allocator, node, self.before) catch |err| {
+            self.park(cx, node);
+            return err;
+        };
+    }
+
+    fn park(self: Sink, cx: *Cx, node: *Node) void {
+        if (self.stray) |slot| {
+            if (slot.* == null) {
+                slot.* = node;
+                return;
+            }
         }
-        order.appendAssumeCapacity(child);
-        seen += 1;
+        cx.freeDetachedNodeAfterScopeDispose(node);
     }
-    if (!inserted) {
-        for (s.entries.items) |entry| order.appendAssumeCapacity(entry.node);
+};
+
+/// Cleanup after capture mount failure: hook invalidation -> dispose scope -> free
+/// root and stray.
+pub fn discardCaptured(cx: *Cx, scope: *Scope, root: ?*Node, stray: ?*Node) void {
+    if (root) |n| hooks.invalidateSubtreeHookState(n);
+    if (stray) |n| hooks.invalidateSubtreeHookState(n);
+    if (!scope.disposed) scope.dispose();
+    inline for (.{ root, stray }) |maybe| {
+        if (maybe) |n| {
+            if (n.parent) |p| cx.detachChild(p, n);
+            cx.destroyDetached(n);
+        }
     }
-    try parent.replaceChildOrder(s.alloc, order.items);
 }
 
-/// Show，条件渲染
+/// Dynamic region in parent, bounded by anchor pair [start, end).
+pub const Region = struct {
+    start: *Node,
+    end: *Node,
+    /// Failed-insertion nodes (see Sink.stray), freed by clear after scope dispose.
+    stray: ?*Node = null,
+
+    /// Place anchor pair at location. Region must fall in real parent (capture mode has
+    /// no location).
+    pub fn open(cx: *Cx, at: Sink) !Region {
+        const parent = at.parent orelse return error.ViewRegionNeedsParent;
+        const start = try core.anchorNode(cx);
+        try (Sink{ .parent = parent, .before = at.before }).insert(cx, start);
+        errdefer {
+            cx.detachChild(parent, start);
+            cx.freeNode(start);
+        }
+        const end = try core.anchorNode(cx);
+        try (Sink{ .parent = parent, .before = at.before }).insert(cx, end);
+        return .{ .start = start, .end = end };
+    }
+
+    /// Content location of region (before end).
+    pub fn sink(self: *Region) Sink {
+        return .{ .parent = self.end.parent.?, .before = self.end, .stray = &self.stray };
+    }
+
+    /// Content between anchors. Null if anchors no longer share a parent (parent was
+    /// rewritten externally).
+    fn contentRange(self: *const Region) ?struct { parent: *Node, lo: usize, hi: usize } {
+        const parent = self.end.parent orelse return null;
+        if (self.start.parent != parent) return null;
+        const items = parent.children.items;
+        const lo = std.mem.indexOfScalar(*Node, items, self.start) orelse return null;
+        const hi = std.mem.indexOfScalar(*Node, items, self.end) orelse return null;
+        if (hi <= lo) return null;
+        return .{ .parent = parent, .lo = lo + 1, .hi = hi };
+    }
+
+    pub fn isEmpty(self: *const Region) bool {
+        const r = self.contentRange() orelse return true;
+        return r.lo == r.hi and self.stray == null;
+    }
+
+    /// Unload region content, same order as single-node unload: strip hook state ->
+    /// dispose scope (cleanup sees live nodes) -> clear scope pointer -> strip tree/free.
+    /// No allocation: take siblings after start until end sequentially.
+    pub fn clear(self: *Region, cx: *Cx, content_scope: ?*Scope) void {
+        if (self.contentRange()) |r| {
+            for (r.parent.children.items[r.lo..r.hi]) |n| hooks.invalidateSubtreeHookState(n);
+        }
+        if (self.stray) |n| hooks.invalidateSubtreeHookState(n);
+        if (content_scope) |cs| {
+            if (!cs.disposed) cs.dispose();
+        }
+        if (self.contentRange()) |r| {
+            const parent = r.parent;
+            while (true) {
+                const i = std.mem.indexOfScalar(*Node, parent.children.items, self.start) orelse break;
+                if (i + 1 >= parent.children.items.len) break;
+                const n = parent.children.items[i + 1];
+                if (n == self.end) break;
+                cx.detachChild(parent, n);
+                cx.freeNode(n);
+            }
+            parent.markLayoutDirty();
+        }
+        if (self.stray) |n| {
+            self.stray = null;
+            cx.destroyDetached(n);
+        }
+        cx.needs_redraw = true;
+    }
+
+    /// Remove together with anchors (only for first-mount rollback; normal unload frees
+    /// anchors via parent).
+    pub fn close(self: *Region, cx: *Cx, content_scope: ?*Scope) void {
+        self.clear(cx, content_scope);
+        inline for (.{ self.end, self.start }) |a| {
+            if (a.parent) |p| cx.detachChild(p, a);
+            cx.freeNode(a);
+        }
+    }
+};
+
+/// Value-switch region: Show / Match / view DSL show/match share this core.
 ///
-/// 当 condition Signal 为 true 时，调用 buildFn 创建子树并挂载到 parent；
-/// 为 false 时，销毁子 Scope + 从 parent 移除子节点。
+/// A `value` change (eqlValue) unloads old content and rebuilds under a new child scope by
+/// calling `emit(ctx, child_scope, cx, sink, value)`. emit may place any number of nodes in
+/// sink (including nested regions) or none (Show false branch). emit runs untracked: reads
+/// during content mount don't become region dependencies.
+pub fn SwitchRegion(comptime T: type, comptime Ctx: type, comptime emit: anytype) type {
+    return struct {
+        const Self = @This();
+
+        region: Region,
+        content_scope: ?*Scope = null,
+        current: T,
+        parent_scope: *Scope,
+        cx: *Cx,
+        ctx: Ctx,
+
+        /// Static-value branch: emit directly to location, content belongs to caller scope,
+        /// no anchors/effects.
+        pub const emitOnce = emit;
+
+        /// Mount region at `at` and build content once at current value. On first-mount
+        /// failure, rollback with anchors; error propagates unchanged.
+        pub fn mount(scope: *Scope, cx: *Cx, at: Sink, value: reactive.Source(T), ctx: Ctx) !*Self {
+            reactive.checkBorrow(scope, value);
+            const self = try scope.allocator.create(Self);
+            self.* = .{
+                .region = undefined,
+                .current = value.peek(),
+                .parent_scope = scope,
+                .cx = cx,
+                .ctx = ctx,
+            };
+            // adoptResource registration failure frees with destroy; can't destroy again here.
+            try scope.adoptResource(@ptrCast(self), destroy);
+            self.region = try Region.open(cx, at);
+            self.build() catch |err| {
+                self.region.close(cx, self.content_scope);
+                self.content_scope = null;
+                return err;
+            };
+
+            // Effect build failure leaves region unresponsive: rollback anchors and content
+            // together, honoring 'first-mount failure leaves no remnants' contract.
+            scope.createEffect(.{ .value = value, .self = self }, struct {
+                fn update(c: anytype) void {
+                    const v = c.value.get();
+                    const s = c.self;
+                    if (@import("reactive/eq.zig").eqlValue(T, v, s.current)) return;
+                    s.current = v;
+                    s.rebuild();
+                }
+            }.update) catch |err| {
+                self.region.close(cx, self.content_scope);
+                self.content_scope = null;
+                return err;
+            };
+            return self;
+        }
+
+        fn destroy(ptr: *anyopaque, allocator: Allocator) void {
+            const s: *Self = @ptrCast(@alignCast(ptr));
+            allocator.destroy(s);
+        }
+
+        /// Build content; caller decides rollback granularity (first: with anchors; later:
+        /// content only).
+        fn build(self: *Self) !void {
+            const cs = try self.parent_scope.childScope();
+            self.content_scope = cs;
+            try callUntracked(self.cx, emit, .{ self.ctx, cs, self.cx, self.region.sink(), self.current });
+            self.region.end.parent.?.markLayoutDirty();
+            self.cx.needs_redraw = true;
+        }
+
+        /// Unload current content and rebuild at current (shared by effect and
+        /// MatchHandle.invalidate).
+        pub fn rebuild(self: *Self) void {
+            self.region.clear(self.cx, self.content_scope);
+            self.content_scope = null;
+            self.build() catch |err| {
+                reportControlFlowError("Switch.rebuild", err);
+                self.region.clear(self.cx, self.content_scope);
+                self.content_scope = null;
+            };
+        }
+
+        fn rebuildErased(ptr: *anyopaque) void {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            self.rebuild();
+        }
+
+        pub fn handle(self: *Self) MatchHandle {
+            return .{ .state = @ptrCast(self), .rebuild_fn = &rebuildErased };
+        }
+    };
+}
+
+/// Single-node build fn -> region emit adapter: build then mount.
+fn emitOne(sink: Sink, cx: *Cx, node: *Node) !void {
+    try sink.insert(cx, node);
+}
+
+/// Show, conditional render.
 ///
-/// 用法:
+/// When the condition is true, call buildFn to create the subtree and mount it to parent;
+/// when false, destroy the child scope and remove children from parent.
+/// Content stays fixed at the Show call position (later appended siblings won't pass it).
+///
+/// Usage:
 /// ```zig
 /// try Show(scope, parent, is_visible, cx, struct {
 ///     fn build(child_scope: *Scope, c: *Cx) anyerror!*Node {
-///         return try Button(.{}).label("Hello").mount(child_scope, c);
+///         return try Button(.{ .label = "Hello" }).mount(child_scope, c);
 ///     }
 /// }.build);
 /// ```
 pub fn Show(
     scope: *Scope,
     parent: *Node,
-    condition: *Signal(bool),
+    condition_arg: anytype,
     cx: *Cx,
     comptime buildFn: fn (*Scope, *Cx) anyerror!*Node,
 ) !void {
-    const State = struct {
-        child_scope: ?*Scope = null,
-        child_node: ?*Node = null,
-        parent_scope: *Scope,
-        parent_node: *Node,
-        cx_ptr: *Cx,
-    };
-
-    const state = try scope.allocator.create(State);
-    state.* = .{
-        .parent_scope = scope,
-        .parent_node = parent,
-        .cx_ptr = cx,
-    };
-    try scope.adoptResource(@ptrCast(state), struct {
-        fn destroy(ptr: *anyopaque, allocator: Allocator) void {
-            const s: *State = @ptrCast(@alignCast(ptr));
-            allocator.destroy(s);
+    const condition = sourceArg(bool, "Show", condition_arg);
+    const R = SwitchRegion(bool, void, struct {
+        fn emit(_: void, child_scope: *Scope, c: *Cx, sink: Sink, visible: bool) anyerror!void {
+            if (!visible) return;
+            try emitOne(sink, c, try buildFn(child_scope, c));
         }
-    }.destroy);
-
-    // 如果初始条件为 true，立即创建
-    if (condition.peek()) {
-        const child_scope = try scope.childScope();
-        const node = buildFn(child_scope, cx) catch |err| {
-            child_scope.dispose();
-            return err;
-        };
-        parent.appendChild(cx.allocator, node) catch |err| {
-            discardUnmountedSubtree(cx, child_scope, node);
-            return err;
-        };
-        state.child_scope = child_scope;
-        state.child_node = node;
-    }
-
-    // Effect: 响应 condition 变化
-    try scope.createEffect(.{
-        .condition = condition,
-        .state = state,
-    }, struct {
-        fn update(c: anytype) void {
-            const cond = c.condition.get();
-            const s = c.state;
-
-            if (cond and s.child_node == null) {
-                // 创建。三步都可能失败，且**后一步失败时前一步的产物无人回收**,
-                // 原实现三行各自 `catch return`：第 2 行失败漏掉 child_scope，
-                // 第 3 行失败则 node + scope 双双泄漏，且 UI 静默少一块、无任何日志。
-                // 改为逐级 errdefer 回滚，失败时至少不留垃圾。
-                const child_scope = s.parent_scope.childScope() catch |err| {
-                    reportControlFlowError("Show.create/childScope", err);
-                    return;
-                };
-                const node = buildFn(child_scope, s.cx_ptr) catch |err| {
-                    reportControlFlowError("Show.create/build", err);
-                    child_scope.dispose();
-                    return;
-                };
-
-                s.parent_node.appendChild(s.cx_ptr.allocator, node) catch |err| {
-                    reportControlFlowError("Show.create/appendChild", err);
-                    discardUnmountedSubtree(s.cx_ptr, child_scope, node);
-                    return;
-                };
-                s.child_scope = child_scope;
-                s.child_node = node;
-                s.parent_node.markLayoutDirty();
-                s.cx_ptr.needs_redraw = true;
-            } else if (!cond and s.child_node != null) {
-                // 销毁，先 dispose scope 再清除 scope 指针再 destroy node
-                const old = s.child_node.?;
-                hooks.invalidateSubtreeHookState(old);
-                if (s.child_scope) |cs| {
-                    if (!cs.disposed) cs.dispose();
-                }
-                clearNodeScopes(old);
-                s.cx_ptr.detachChild(s.parent_node, old);
-                // 必须走 cx.freeNode 而非 node.destroy：后者不回收 ElementTable
-                // slot（destroyElement 只在 freeNode 里调），且绕过 tick_depth
-                // 延迟释放守卫，before_render 里 set signal 会同步 drain 到
-                // 这里，此刻直接 free 会让上层遍历栈解引用已释放节点。
-                s.cx_ptr.freeNode(old);
-                s.child_scope = null;
-                s.child_node = null;
-                s.parent_node.markLayoutDirty();
-                s.cx_ptr.needs_redraw = true;
-            }
-        }
-    }.update);
+    }.emit);
+    _ = try R.mount(scope, cx, .{ .parent = parent }, condition, {});
 }
 
-/// For 控制流 options（v0.7 §2.4 拆出，key_fn 强制 + eq_props_fn 可选）
+/// For control flow options (key_fn required, eq_props_fn optional).
 ///
-/// 三类函数职责分离:
-/// - `key_fn`: item -> 唯一 key (必填)。**身份**判定，决定哪两个 item 是 "同一个"。
-///   推荐 `item.id` / `item.hash()`；不能用 index（增删时 index shift 会误匹配）。
-/// - `render_fn`: 渲染 fn (必填)。child_scope 持有 reactive 资源，回收时自动 dispose。
-/// - `eq_props_fn`: prev vs next 是否 **props 等价** (可选)。缺省 null -> eqlValue
-///   智能比较（[]const u8 比内容 / NaN bytewise / 嵌套 struct 递归）。
-///   true 时复用旧 node（不 rerender），false 时 destroy + create。
-///   caller 注 fast-path: 只比关键字段、跳过 cached_handle 等内部字段，或
-///   `fn(_, _) bool { return true; }` 强制永远复用（搭配 reactive signal 自管脏）。
+/// Three functions with separate responsibilities:
+/// - `key_fn`: item -> unique key (required). **Identity** check: which two items are
+///   'the same'. Use `item.id` / `item.hash()`; not index (shifts on add/delete).
+/// - `render_fn`: render function (required). child_scope holds reactive resources,
+///   auto-disposed on cleanup.
+/// - `eq_props_fn`: prev vs next **props equal** (optional). Default null ->
+///   eqlValue smart compare ([]const u8 by content / NaN bytewise / nested struct
+///   recursive). true = reuse old node (no rerender); false = destroy+create.
+///   Fast path: compare only key fields, skipping cached_handle and internals,
+///   or `fn(_, _) bool { return true; }` to always reuse (pair with a reactive signal
+///   for dirty tracking).
 pub fn ForOpts(comptime T: type) type {
     return struct {
         key_fn: fn (T) u64,
@@ -257,120 +401,268 @@ pub fn ForOpts(comptime T: type) type {
     };
 }
 
-/// For，列表渲染
+/// For core options: row render gets context (view DSL needs: row reads values from
+/// call site, Zig lacks closures), emit row root to capture slot not direct return --
+/// row internal mount failure leaves half-built tree in slot, recoverable by 'scope
+/// dispose then node free' cleanup order.
+pub fn ForCtxOpts(comptime T: type, comptime Ctx: type) type {
+    return struct {
+        key_fn: fn (T) u64,
+        /// Row render; usize is mount index for this row (unchanged after reorder).
+        render_fn: ?fn (Ctx, *Scope, *Cx, Sink, T, usize) anyerror!void = null,
+        /// Row render receiving own index signal: reused row after reorder gets new index
+        /// (one of three options).
+        render_index_fn: ?fn (Ctx, *Scope, *Cx, Sink, T, *reactive.Signal(usize)) anyerror!void = null,
+        /// Row render receiving own data source and index signals (third option): same-key
+        /// content unchanged doesn't rebuild, update this row's data source, row follows
+        /// (in-place update).
+        render_source_fn: ?fn (Ctx, *Scope, *Cx, Sink, *reactive.Signal(T), *reactive.Signal(usize)) anyerror!void = null,
+        eq_props_fn: ?fn (T, T) bool = null,
+    };
+}
+
+/// For: incremental list rendering.
 ///
-/// 根据 items slice Signal 增量渲染列表。
-/// 用 opts.key_fn 提取每 item 唯一 key 做身份匹配；opts.eq_props_fn 判 props
-/// 等价决定 reuse vs rebuild。
-/// parent 不必独占：For 条目在 parent 里占连续一段（挂载时位于末尾），
-/// 段前后的其它兄弟在增删重排时保持原位。
+/// Renders a list incrementally from an items slice Signal.
+/// opts.key_fn extracts a unique key per item for identity matching; opts.eq_props_fn decides
+/// props equivalence (reuse vs rebuild).
+/// Parent ownership is not exclusive: For items stay at the position where For is called
+/// (between anchor points); sibling additions/removals before/after (including other control flow
+/// areas) don't affect them.
 ///
-/// 用法:
+/// Usage:
 /// ```zig
 /// try For([]const u8, scope, parent, items_signal, cx, .{
 ///     .key_fn = struct { fn k(item: []const u8) u64 { return std.hash.Wyhash.hash(0, item); } }.k,
-///     .render_fn = struct { fn r(child_scope: *Scope, c: *Cx, item: []const u8, idx: usize) anyerror!*Node {
+///     .render_fn = struct { fn r(child_scope: *Scope, c: *Cx, item: []const u8, idx: usize)
+///     anyerror!*Node {
 ///         _ = idx;
 ///         return try ui.text(c, item, .{});
 ///     }}.r,
-///     // .eq_props_fn = null,  // 默认走 eqlValue
+///     // .eq_props_fn = null,  // default uses eqlValue
 /// });
 /// ```
 pub fn For(
     comptime T: type,
     scope: *Scope,
     parent: *Node,
-    data: *Signal([]const T),
+    data_arg: anytype,
     cx: *Cx,
     comptime opts: ForOpts(T),
 ) !void {
-    const keyFn = opts.key_fn;
-    const renderItem = opts.render_fn;
-    const eqProps = opts.eq_props_fn;
-    const ItemEntry = struct {
-        key: u64,
-        item: T,
-        scope: *Scope,
-        node: *Node,
-    };
+    const data = sourceArg([]const T, "For", data_arg);
+    _ = try ForRegion(T, void, .{
+        .key_fn = opts.key_fn,
+        .render_fn = struct {
+            fn r(_: void, s: *Scope, c: *Cx, sink: Sink, item: T, idx: usize) anyerror!void {
+                try emitOne(sink, c, try opts.render_fn(s, c, item, idx));
+            }
+        }.r,
+        .eq_props_fn = opts.eq_props_fn,
+    }).mount(scope, cx, .{ .parent = parent }, data, {});
+}
 
-    const State = struct {
+/// For core: entries are continuous nodes [start, end) in parent region, one per row.
+pub fn ForRegion(comptime T: type, comptime Ctx: type, comptime opts: ForCtxOpts(T, Ctx)) type {
+    const keyFn = opts.key_fn;
+    if (@as(u8, @intFromBool(opts.render_fn != null)) + @intFromBool(opts.render_index_fn != null) + @intFromBool(opts.render_source_fn != null) != 1)
+        @compileError("ForRegion: give exactly one of render_fn / render_index_fn / render_source_fn");
+    const eqProps = opts.eq_props_fn;
+    return struct {
+        const Self = @This();
+        const ItemEntry = struct {
+            key: u64,
+            item: T,
+            scope: *Scope,
+            node: *Node,
+            /// render_index_fn / render_source_fn row index signal (belongs to row scope).
+            index: ?*reactive.Signal(usize) = null,
+            /// render_source_fn row data source (belongs to row scope).
+            source: ?*reactive.Signal(T) = null,
+        };
+        const Rendered = struct { node: *Node, index: ?*reactive.Signal(usize), source: ?*reactive.Signal(T) = null };
+
         entries: std.ArrayList(ItemEntry),
-        /// For 段之前的非 For 兄弟个数（见 reorderForSegment）。
-        segment_lead: usize,
+        region: Region,
         parent_scope: *Scope,
-        parent_node: *Node,
         cx_ptr: *Cx,
         alloc: Allocator,
-    };
+        ctx: Ctx,
+        /// Last placeEntries failed: entries may have detached (not-on-tree) row nodes.
+        has_unplaced: bool = false,
 
-    const state = try scope.allocator.create(State);
-    state.* = .{
-        .entries = .{},
-        .segment_lead = parent.children.items.len,
-        .parent_scope = scope,
-        .parent_node = parent,
-        .cx_ptr = cx,
-        .alloc = scope.allocator,
-    };
-    try scope.adoptResource(@ptrCast(state), struct {
+        pub fn mount(scope: *Scope, cx: *Cx, at: Sink, data: reactive.Source([]const T), ctx: Ctx) !*Self {
+            reactive.checkBorrow(scope, data);
+            const state = try scope.allocator.create(Self);
+            state.* = .{
+                .entries = .empty,
+                .region = undefined,
+                .parent_scope = scope,
+                .cx_ptr = cx,
+                .alloc = scope.allocator,
+                .ctx = ctx,
+            };
+            // adoptResource registration failure frees with destroy; can't destroy again here.
+            try scope.adoptResource(@ptrCast(state), destroy);
+            state.region = try Region.open(cx, at);
+            state.mountInitial(data.peek()) catch |err| {
+                state.region.close(cx, null);
+                return err;
+            };
+
+            // Effect: respond to data changes, key-based diff incremental update. Fails to build ->
+            // rollback whole region. First run reconciles normally: can't skip by slice identity
+            // ('data unchanged') -- in-place-modified arrays / data sources synced back during
+            // render
+            // both miss; diff all when content equal to only pay reconcile cost.
+            scope.createEffect(.{ .data = data, .state = state }, struct {
+                fn update(c: anytype) void {
+                    c.state.reconcile(c.data.get());
+                }
+            }.update) catch |err| {
+                for (state.entries.items) |entry| hooks.invalidateSubtreeHookState(entry.node);
+                for (state.entries.items) |entry| {
+                    if (!entry.scope.disposed) entry.scope.dispose();
+                }
+                state.entries.clearRetainingCapacity();
+                state.region.close(cx, null);
+                return err;
+            };
+            return state;
+        }
+
         fn destroy(ptr: *anyopaque, allocator: Allocator) void {
-            const s: *State = @ptrCast(@alignCast(ptr));
+            const s: *Self = @ptrCast(@alignCast(ptr));
+            // After placeEntries fails, newly-built rows remain detached outside tree, only entries
+            // track them; scope cleanup can't release via parent. Entry scope is parent_scope
+            // child,
+            // already disposed. Only read node.parent when actually orphaned: normal path entries
+            // stay
+            // on tree, freed via parent.
+            if (s.has_unplaced) {
+                for (s.entries.items) |entry| {
+                    if (entry.node.parent != null) continue;
+                    hooks.invalidateSubtreeHookState(entry.node);
+                    s.cx_ptr.destroyDetached(entry.node);
+                }
+            }
             s.entries.deinit(allocator);
             allocator.destroy(s);
         }
-    }.destroy);
 
-    // 初始渲染
-    const initial_items = data.peek();
-    for (initial_items, 0..) |item, idx| {
-        const key = keyFn(item);
-        const child_scope = try scope.childScope();
-        const node = renderItem(child_scope, cx, item, idx) catch |err| {
-            child_scope.dispose();
-            return err;
-        };
-        // 先预留 entries 容量再挂树：两步之间不能再有可失败点，否则节点
-        // 已上树却不在 entries 里（后续 diff 永远摘不掉它）。
-        state.entries.ensureUnusedCapacity(scope.allocator, 1) catch |err| {
-            discardUnmountedSubtree(cx, child_scope, node);
-            return err;
-        };
-        parent.appendChild(cx.allocator, node) catch |err| {
-            discardUnmountedSubtree(cx, child_scope, node);
-            return err;
-        };
-        state.entries.appendAssumeCapacity(.{
-            .key = key,
-            .item = item,
-            .scope = child_scope,
-            .node = node,
-        });
-    }
+        /// Render one row. On failure, self-cleanup (scope before node); caller must NOT
+        /// dispose child_scope further.
+        fn render(self: *Self, child_scope: *Scope, item: T, idx: usize) !Rendered {
+            var root: ?*Node = null;
+            var stray: ?*Node = null;
+            var index: ?*reactive.Signal(usize) = null;
+            var source: ?*reactive.Signal(T) = null;
+            if (opts.render_source_fn) |f| {
+                const sig = child_scope.createSignal(usize, idx) catch |err| {
+                    child_scope.dispose();
+                    return err;
+                };
+                const src = child_scope.createSignal(T, item) catch |err| {
+                    child_scope.dispose();
+                    return err;
+                };
+                index = sig;
+                source = src;
+                callUntracked(self.cx_ptr, f, .{ self.ctx, child_scope, self.cx_ptr, Sink.capture(&root, &stray), src, sig }) catch |err| {
+                    discardCaptured(self.cx_ptr, child_scope, root, stray);
+                    return err;
+                };
+            } else if (opts.render_index_fn) |f| {
+                const sig = child_scope.createSignal(usize, idx) catch |err| {
+                    child_scope.dispose();
+                    return err;
+                };
+                index = sig;
+                callUntracked(self.cx_ptr, f, .{ self.ctx, child_scope, self.cx_ptr, Sink.capture(&root, &stray), item, sig }) catch |err| {
+                    discardCaptured(self.cx_ptr, child_scope, root, stray);
+                    return err;
+                };
+            } else {
+                callUntracked(self.cx_ptr, opts.render_fn.?, .{ self.ctx, child_scope, self.cx_ptr, Sink.capture(&root, &stray), item, idx }) catch |err| {
+                    discardCaptured(self.cx_ptr, child_scope, root, stray);
+                    return err;
+                };
+            }
+            return .{ .node = root orelse {
+                discardCaptured(self.cx_ptr, child_scope, null, stray);
+                return error.ForRowEmpty;
+            }, .index = index, .source = source };
+        }
 
-    // Effect: 响应 data 变化，key-based diff 增量更新
-    try scope.createEffect(.{
-        .data = data,
-        .state = state,
-    }, struct {
-        fn update(c: anytype) void {
-            const items = c.data.get();
-            const s = c.state;
+        /// First render. On failure, entries on-tree freed by region.close (scopes are
+        /// parent_scope children, dispose before detach nodes).
+        fn mountInitial(self: *Self, initial_items: []const T) !void {
+            errdefer {
+                for (self.entries.items) |entry| hooks.invalidateSubtreeHookState(entry.node);
+                for (self.entries.items) |entry| {
+                    if (!entry.scope.disposed) entry.scope.dispose();
+                }
+                self.entries.clearRetainingCapacity();
+            }
+            for (initial_items, 0..) |item, idx| {
+                const key = keyFn(item);
+                const child_scope = try self.parent_scope.childScope();
+                const rendered = try self.render(child_scope, item, idx);
+                const node = rendered.node;
+                // Pre-reserve entries capacity before attach-to-tree: can't fail between steps or
+                // node on-tree but missing entries (diff never removes it).
+                self.entries.ensureUnusedCapacity(self.alloc, 1) catch |err| {
+                    discardUnmountedSubtree(self.cx_ptr, child_scope, node);
+                    return err;
+                };
+                self.region.sink().insert(self.cx_ptr, node) catch |err| {
+                    // Failed-insertion nodes in region.stray; clean up in unload order.
+                    self.region.stray = null;
+                    discardUnmountedSubtree(self.cx_ptr, child_scope, node);
+                    return err;
+                };
+                self.entries.appendAssumeCapacity(.{
+                    .key = key,
+                    .item = item,
+                    .scope = child_scope,
+                    .node = node,
+                    .index = rendered.index,
+                    .source = rendered.source,
+                });
+            }
+        }
 
-            // Key-based diff: 保留 key 相同的条目，只销毁/创建变化的
-            // 1. 旧条目 -> HashMap<key, index>
+        /// Key-based diff: keep same-key entries, only destroy/create changes.
+        ///
+        /// Allocate-then-mutate: bookkeeping tables (old key map, reuse flags, new entries)
+        /// pre-allocate
+        /// capacity before any entry is mutated, so later inserts never fail. A missing reuse flag
+        /// would
+        /// destroy in-use nodes (dangling/double free). A pre-alloc failure changes nothing: log
+        /// the
+        /// error and keep the original rows.
+        fn reconcile(s: *Self, items: []const T) void {
             var old_map = std.AutoHashMap(u64, usize).init(s.alloc);
             defer old_map.deinit();
-            for (s.entries.items, 0..) |entry, i| {
-                // 不可降级：old_map 缺条目 -> 已存在的 key 被当成新建，
-                // 旧节点在步骤 3 被销毁而新节点重复创建 = 静默 UI 错乱。
-                old_map.put(entry.key, i) catch @panic("OOM: For keyed reconcile old_map.put");
-            }
-
-            // 2. 遍历新 items，匹配的复用，不匹配的创建
-            var new_entries: std.ArrayList(ItemEntry) = .{};
-            var reused = std.AutoHashMap(usize, void).init(s.alloc); // 标记被复用的旧索引
+            var reused = std.AutoHashMap(usize, void).init(s.alloc); // mark reused old indices
             defer reused.deinit();
+            var new_entries: std.ArrayList(ItemEntry) = .empty;
+            const reserved = blk: {
+                old_map.ensureTotalCapacity(@intCast(s.entries.items.len)) catch |err| break :blk err;
+                reused.ensureTotalCapacity(@intCast(s.entries.items.len)) catch |err| break :blk err;
+                new_entries.ensureTotalCapacity(s.alloc, items.len) catch |err| break :blk err;
+                break :blk {};
+            };
+            reserved catch |err| {
+                new_entries.deinit(s.alloc);
+                reportControlFlowError("For.update/reserve", err);
+                return;
+            };
+
+            // 1. old entries -> HashMap<key, index>
+            for (s.entries.items, 0..) |entry, i| old_map.putAssumeCapacity(entry.key, i);
+
+            // 2. iterate new items, reuse matches, create misses
 
             for (items, 0..) |item, idx| {
                 const key = keyFn(item);
@@ -381,71 +673,146 @@ pub fn For(
                     // that alias into UAF/double-free. Only the first occurrence
                     // may consume an old entry; render later duplicates afresh.
                     if (reused.contains(old_idx)) {
-                        appendForEntry(s, &new_entries, key, item, idx, renderItem) catch @panic("OOM: For keyed reconcile appendForEntry (duplicate key)");
+                        s.appendEntry(&new_entries, key, item, idx) catch {};
                         continue;
                     }
-                    const old_entry = s.entries.items[old_idx];
-                    // caller 可注 eq_props_fn 自定义 reuse 判定；缺省
-                    // 走 eqlValue（reactive/eq.zig 类型分发的内容比较，正确处理
-                    // []const u8 / NaN / 嵌套 struct）。key 命中但 props 不等仍重建。
+                    var old_entry = s.entries.items[old_idx];
+                    // row receives data source: same key reuses, content changed updates this row's
+                    // source
+                    // (in-place, preserves focus/hover/local state).
+                    if (old_entry.source) |src| {
+                        // same content also swaps to new value (no notification): borrowed strings
+                        // point to new
+                        // array; caller may free old soon after.
+                        if (@import("reactive/eq.zig").eqlValue(T, item, old_entry.item)) src.replaceSameContent(item) else src.set(item);
+                        old_entry.item = item;
+                        if (old_entry.index) |sig| if (sig.peek() != idx) sig.set(idx);
+                        new_entries.appendAssumeCapacity(old_entry);
+                        reused.putAssumeCapacity(old_idx, {});
+                        continue;
+                    }
+                    // caller can register eq_props_fn for custom reuse; defaults to eqlValue
+                    // (reactive/eq.zig
+                    // type-dispatch content compare, handles []const u8 / NaN / nested struct). key
+                    // match
+                    // but props unequal still rebuilds.
                     const can_reuse = if (eqProps) |f|
                         f(item, old_entry.item)
                     else
-                        @import("reactive/eq.zig").eqlValue(@TypeOf(item), item, old_entry.item);
+                        @import("reactive/eq.zig").eqlValue(T, item, old_entry.item);
                     if (can_reuse) {
-                        new_entries.append(s.alloc, old_entry) catch @panic("OOM: For keyed reconcile new_entries.append");
-                        // 不可降级：漏标 reused -> 步骤 3 会销毁一个仍挂在
-                        // new_entries 里的节点，留下悬垂 node 指针。
-                        reused.put(old_idx, {}) catch @panic("OOM: For keyed reconcile reused.put");
+                        // index signal = this item's position in items (data index, same coordinate
+                        // system as
+                        // new row mount; skipped failed rows don't shift).
+                        if (old_entry.index) |sig| if (sig.peek() != idx) sig.set(idx);
+                        // comparison baseline swaps to this batch's elements: old left behind, next
+                        // batch's
+                        // eqlValue reads already-swapped (possibly freed) old array.
+                        old_entry.item = item;
+                        new_entries.appendAssumeCapacity(old_entry);
+                        // reuse flag must record: miss -> step 3 destroys node still in
+                        // new_entries.
+                        reused.putAssumeCapacity(old_idx, {});
                         continue;
                     }
 
-                    hooks.invalidateSubtreeHookState(old_entry.node);
-                    if (!old_entry.scope.disposed) old_entry.scope.dispose();
-                    clearNodeScopes(old_entry.node);
-                    s.cx_ptr.detachChild(s.parent_node, old_entry.node);
-                    s.cx_ptr.freeNode(old_entry.node);
-                    // 不可降级：此处 old_entry.node 已被 freeNode，漏标 reused
-                    // 会让步骤 3 再次 dispose/free 同一节点 = double free。
-                    reused.put(old_idx, {}) catch @panic("OOM: For keyed reconcile reused.put (rebuilt entry)");
+                    s.discardEntry(old_entry);
+                    // here old_entry.node already freeNode; flag miss = step 3 dispose/free same
+                    // node
+                    // again.
+                    reused.putAssumeCapacity(old_idx, {});
 
-                    appendForEntry(s, &new_entries, key, item, idx, renderItem) catch @panic("OOM: For keyed reconcile appendForEntry");
+                    s.appendEntry(&new_entries, key, item, idx) catch {};
                 } else {
-                    // 新建: key 不在旧列表中
-                    appendForEntry(s, &new_entries, key, item, idx, renderItem) catch @panic("OOM: For keyed reconcile appendForEntry (new key)");
+                    // new: key not in old list.
+                    s.appendEntry(&new_entries, key, item, idx) catch {};
                 }
             }
 
-            // 3. 销毁旧 map 中未被复用的条目
+            // 3. destroy old map entries not reused.
             for (s.entries.items, 0..) |entry, i| {
                 if (reused.contains(i)) continue;
-                hooks.invalidateSubtreeHookState(entry.node);
-                if (!entry.scope.disposed) entry.scope.dispose();
-                clearNodeScopes(entry.node);
-                s.cx_ptr.detachChild(s.parent_node, entry.node);
-                s.cx_ptr.freeNode(entry.node);
+                s.discardEntry(entry);
             }
 
-            // 4. 替换 entries，必须无条件、且先于任何可失败的步骤：步骤 2/3
-            //    已释放旧节点，若在这之前 `catch return`，s.entries 会留着悬垂
-            //    节点（下次 diff double free），new_entries 则整批泄漏。
+            // 4. replace entries, must be unconditional and precede any fail-point: steps 2/3
+            //    freed old nodes; catch return before this leaves dangling in s.entries (next diff
+            //    double free), new_entries leak entire batch.
             s.entries.deinit(s.alloc);
             s.entries = new_entries;
             s.cx_ptr.needs_redraw = true;
 
-            // 5. 只重排 For 管理的那一段，保留 parent 里的其它兄弟。
-            //    失败时新节点暂未上树但归 s.entries 所有，下次 diff 会再挂。
-            reorderForSegment(s) catch |err| reportControlFlowError("For.update/reorder", err);
+            // 5. place entries in new order between anchors; out-of-anchor siblings stay put.
+            //    fail = new nodes not yet on-tree but owned by s.entries; next diff mounts them.
+            s.placeEntries() catch |err| {
+                s.has_unplaced = true;
+                reportControlFlowError("For.update/reorder", err);
+                return;
+            };
+            s.has_unplaced = false;
         }
-    }.update);
+
+        fn discardEntry(s: *Self, entry: ItemEntry) void {
+            hooks.invalidateSubtreeHookState(entry.node);
+            if (!entry.scope.disposed) entry.scope.dispose();
+            if (entry.node.parent) |p| s.cx_ptr.detachChild(p, entry.node);
+            s.cx_ptr.freeNode(entry.node);
+        }
+
+        /// For 'create new entry' common path: childScope -> render -> bookkeeping; any step
+        /// failure
+        /// cascades rollback (a bare `catch return` per line would leak prior scope/node). The new
+        /// node
+        /// is detached here and placed by placeEntries. reconcile downgrades failed entries to skip
+        /// (one
+        /// fewer row this run; the next diff rebuilds it by key), no panic: DSL rows are user
+        /// components
+        /// and a mount error shouldn't crash.
+        fn appendEntry(s: *Self, new_entries: *std.ArrayList(ItemEntry), key: u64, item: T, idx: usize) !void {
+            const child_scope = s.parent_scope.childScope() catch |err| {
+                reportControlFlowError("For.create/childScope", err);
+                return err;
+            };
+            const rendered = s.render(child_scope, item, idx) catch |err| {
+                reportControlFlowError("For.create/render", err);
+                return err;
+            };
+            // capacity pre-reserved in reconcile head per items.len.
+            new_entries.appendAssumeCapacity(.{
+                .key = key,
+                .item = item,
+                .scope = child_scope,
+                .node = rendered.node,
+                .index = rendered.index,
+                .source = rendered.source,
+            });
+        }
+
+        /// region content := entries (in order). siblings before start and after end untouched.
+        fn placeEntries(s: *Self) !void {
+            const parent = s.region.end.parent orelse return error.InvalidAnchor;
+            const items = parent.children.items;
+            const lo = std.mem.indexOfScalar(*Node, items, s.region.start) orelse return error.InvalidAnchor;
+            const hi = std.mem.indexOfScalar(*Node, items, s.region.end) orelse return error.InvalidAnchor;
+            if (hi <= lo) return error.InvalidAnchor;
+
+            var order: std.ArrayList(*Node) = .empty;
+            defer order.deinit(s.alloc);
+            try order.ensureTotalCapacity(s.alloc, (lo + 1) + s.entries.items.len + (items.len - hi));
+            order.appendSliceAssumeCapacity(items[0 .. lo + 1]);
+            for (s.entries.items) |entry| order.appendAssumeCapacity(entry.node);
+            order.appendSliceAssumeCapacity(items[hi..]);
+            try parent.replaceChildOrder(s.alloc, order.items);
+        }
+    };
 }
 
-/// Match，枚举/整数条件切换
+/// Match: enum/integer conditional switching.
 ///
-/// 类似 SolidJS 的 <Switch>/<Match>，根据枚举或整数 Signal 值切换子树。
-/// value 变化时，销毁旧子树，调用 buildFn 创建新子树。
+/// Like SolidJS <Switch>/<Match>: switches subtrees based on an enum or integer Signal.
+/// On value change, destroys the old subtree and calls buildFn to create the new one.
 ///
-/// 用法:
+/// Usage:
 /// ```zig
 /// try Match(Category, scope, parent, category_signal, cx,
 ///     struct {
@@ -458,12 +825,12 @@ pub fn For(
 ///     }.build,
 /// );
 /// ```
-/// Match 句柄，用于外部强制重建
+/// Match handle for externally forcing rebuild
 pub const MatchHandle = struct {
     state: *anyopaque,
     rebuild_fn: *const fn (*anyopaque) void,
 
-    /// 强制重建当前子树（主题切换等场景）
+    /// Force rebuild current subtree (theme switches etc).
     pub fn invalidate(self: MatchHandle) void {
         self.rebuild_fn(self.state);
     }
@@ -473,124 +840,46 @@ pub fn Match(
     comptime T: type,
     scope: *Scope,
     parent: *Node,
-    value: *Signal(T),
+    value_arg: anytype,
     cx: *Cx,
     comptime buildFn: fn (*Scope, *Cx, T) anyerror!*Node,
 ) !MatchHandle {
-    const State = struct {
-        child_scope: ?*Scope = null,
-        child_node: ?*Node = null,
-        current_value: T,
-        parent_scope: *Scope,
-        parent_node: *Node,
-        cx_ptr: *Cx,
-
-        fn rebuild(s: *@This()) void {
-            // 销毁旧子树
-            // 顺序重要：先 dispose scope（清理 effects/signals 等响应式资源），
-            // 再清除节点树上的 scope 指针（防止 destroy 访问已释放的 scope），
-            // 最后 destroy node（释放节点内存）。
-            if (s.child_scope) |cs| {
-                if (s.child_node) |old_node| hooks.invalidateSubtreeHookState(old_node);
-                if (!cs.disposed) cs.dispose();
-            }
-            if (s.child_node) |old_node| {
-                // scope 已 dispose 并释放内存，清除节点上的悬垂 scope 指针
-                clearNodeScopes(old_node);
-                s.cx_ptr.detachChild(s.parent_node, old_node);
-                s.cx_ptr.freeNode(old_node);
-            }
-            s.child_scope = null;
-            s.child_node = null;
-
-            // 创建新子树
-            // 与 Show.create 同构的逐级回滚（原实现三行各自 catch return，
-            // 后一步失败会漏掉前一步的 scope/node）。
-            const child_scope = s.parent_scope.childScope() catch |err| {
-                reportControlFlowError("Match.rebuild/childScope", err);
-                return;
-            };
-            const node = buildFn(child_scope, s.cx_ptr, s.current_value) catch |err| {
-                reportControlFlowError("Match.rebuild/build", err);
-                child_scope.dispose();
-                return;
-            };
-
-            s.parent_node.appendChild(s.cx_ptr.allocator, node) catch |err| {
-                reportControlFlowError("Match.rebuild/appendChild", err);
-                discardUnmountedSubtree(s.cx_ptr, child_scope, node);
-                return;
-            };
-            s.child_scope = child_scope;
-            s.child_node = node;
-            s.parent_node.markLayoutDirty();
-            s.cx_ptr.needs_redraw = true;
+    const value = sourceArg(T, "Match", value_arg);
+    const R = SwitchRegion(T, void, struct {
+        fn emit(_: void, child_scope: *Scope, c: *Cx, sink: Sink, v: T) anyerror!void {
+            try emitOne(sink, c, try buildFn(child_scope, c, v));
         }
-
-        fn rebuildErased(ptr: *anyopaque) void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.rebuild();
-        }
-    };
-
-    const state = try scope.allocator.create(State);
-    state.* = .{
-        .current_value = value.peek(),
-        .parent_scope = scope,
-        .parent_node = parent,
-        .cx_ptr = cx,
-    };
-    try scope.adoptResource(@ptrCast(state), struct {
-        fn destroy(ptr: *anyopaque, allocator: Allocator) void {
-            const s: *State = @ptrCast(@alignCast(ptr));
-            allocator.destroy(s);
-        }
-    }.destroy);
-
-    // 初始创建
-    {
-        const child_scope = try scope.childScope();
-        const node = buildFn(child_scope, cx, state.current_value) catch |err| {
-            child_scope.dispose();
-            return err;
-        };
-        parent.appendChild(cx.allocator, node) catch |err| {
-            discardUnmountedSubtree(cx, child_scope, node);
-            return err;
-        };
-        state.child_scope = child_scope;
-        state.child_node = node;
-    }
-
-    // Effect: 响应 value 变化 -> 销毁旧子树 + 创建新子树
-    try scope.createEffect(.{
-        .value = value,
-        .state = state,
-    }, struct {
-        fn update(c: anytype) void {
-            const new_val = c.value.get();
-            const s = c.state;
-
-            // 同值不切换 (v0.7 §2.4: eqlValue 替代 std.meta.eql，正确处理 NaN /
-            // []const u8 / 嵌套 struct，避免 Match(T=string) 时 ptr-equality 误判)
-            if (@import("reactive/eq.zig").eqlValue(@TypeOf(new_val), new_val, s.current_value) and s.child_node != null) return;
-            s.current_value = new_val;
-
-            s.rebuild();
-        }
-    }.update);
-
-    return .{
-        .state = @ptrCast(state),
-        .rebuild_fn = &State.rebuildErased,
-    };
+    }.emit);
+    const state = try R.mount(scope, cx, .{ .parent = parent }, value, {});
+    return state.handle();
 }
 
-// ===== 测试 =====
+// ===== test helpers =====
+
+/// helper: content child count in parent. Control flow region anchors are position
+/// bookkeeping, don't count as content.
+fn contentCount(parent: *Node) usize {
+    var n: usize = 0;
+    for (parent.children.items) |c| {
+        if (c.tag != .anchor) n += 1;
+    }
+    return n;
+}
+
+/// helper: i-th content child (skip anchors).
+fn contentAt(parent: *Node, i: usize) *Node {
+    var k: usize = 0;
+    for (parent.children.items) |c| {
+        if (c.tag == .anchor) continue;
+        if (k == i) return c;
+        k += 1;
+    }
+    @panic("contentAt: index out of range");
+}
 
 test "Show: basic toggle" {
     const allocator = std.testing.allocator;
-    var ctx = try Cx.init(allocator);
+    var ctx = try Cx.init(allocator, std.testing.io);
     defer ctx.deinit();
 
     const parent = try Node.create(allocator, ctx.nextId(), .box, .{ .width = .{ .px = 200 }, .height = .{ .px = 200 } });
@@ -613,25 +902,25 @@ test "Show: basic toggle" {
         }
     }.build);
 
-    // 初始: 不可见，无子节点
-    try std.testing.expectEqual(@as(usize, 0), parent.children.items.len);
+    // initial: invisible, no children.
+    try std.testing.expectEqual(@as(usize, 0), contentCount(parent));
 
-    // 设置可见
+    // set visible.
     visible.set(true);
-    try std.testing.expectEqual(@as(usize, 1), parent.children.items.len);
+    try std.testing.expectEqual(@as(usize, 1), contentCount(parent));
 
-    // 设置不可见
+    // set invisible.
     visible.set(false);
-    try std.testing.expectEqual(@as(usize, 0), parent.children.items.len);
+    try std.testing.expectEqual(@as(usize, 0), contentCount(parent));
 
-    // 再次可见
+    // visible again.
     visible.set(true);
-    try std.testing.expectEqual(@as(usize, 1), parent.children.items.len);
+    try std.testing.expectEqual(@as(usize, 1), contentCount(parent));
 }
 
 test "Show: initial true" {
     const allocator = std.testing.allocator;
-    var ctx = try Cx.init(allocator);
+    var ctx = try Cx.init(allocator, std.testing.io);
     defer ctx.deinit();
 
     const parent = try Node.create(allocator, ctx.nextId(), .box, .{ .width = .{ .px = 200 }, .height = .{ .px = 200 } });
@@ -651,17 +940,17 @@ test "Show: initial true" {
         }
     }.build);
 
-    // 初始即可见
-    try std.testing.expectEqual(@as(usize, 1), parent.children.items.len);
+    // initially visible.
+    try std.testing.expectEqual(@as(usize, 1), contentCount(parent));
 
-    // 隐藏
+    // hide.
     visible.set(false);
-    try std.testing.expectEqual(@as(usize, 0), parent.children.items.len);
+    try std.testing.expectEqual(@as(usize, 0), contentCount(parent));
 }
 
 test "Show: reactive teardown runs scope cleanups before freeing its node" {
     const allocator = std.testing.allocator;
-    const ctx = try Cx.init(allocator);
+    const ctx = try Cx.init(allocator, std.testing.io);
     defer ctx.deinit();
 
     const parent = try Node.create(allocator, ctx.nextId(), .box, .{
@@ -720,7 +1009,7 @@ test "Show: reactive teardown runs scope cleanups before freeing its node" {
 
 test "For: basic list" {
     const allocator = std.testing.allocator;
-    var ctx = try Cx.init(allocator);
+    var ctx = try Cx.init(allocator, std.testing.io);
     defer ctx.deinit();
 
     const parent = try Node.create(allocator, ctx.nextId(), .box, .{ .width = .{ .px = 300 }, .height = .{ .px = 400 } });
@@ -754,26 +1043,26 @@ test "For: basic list" {
         }.render,
     });
 
-    // 初始 3 个条目
-    try std.testing.expectEqual(@as(usize, 3), parent.children.items.len);
+    // initial 3 entries.
+    try std.testing.expectEqual(@as(usize, 3), contentCount(parent));
 
-    // 更新为 2 个条目
+    // update to 2 entries.
     const items_2 = [_]Item{
         .{ .id = 1, .value = 100 },
         .{ .id = 4, .value = 40 },
     };
     items.set(&items_2);
-    try std.testing.expectEqual(@as(usize, 2), parent.children.items.len);
+    try std.testing.expectEqual(@as(usize, 2), contentCount(parent));
 
-    // 更新为空
+    // clear to empty.
     const items_empty: []const Item = &.{};
     items.set(items_empty);
-    try std.testing.expectEqual(@as(usize, 0), parent.children.items.len);
+    try std.testing.expectEqual(@as(usize, 0), contentCount(parent));
 }
 
 test "For: key-based diff rebuilds nodes when item payload changes" {
     const allocator = std.testing.allocator;
-    var ctx = try Cx.init(allocator);
+    var ctx = try Cx.init(allocator, std.testing.io);
     defer ctx.deinit();
 
     const parent = try Node.create(allocator, ctx.nextId(), .box, .{ .width = .{ .px = 300 }, .height = .{ .px = 400 } });
@@ -807,12 +1096,12 @@ test "For: key-based diff rebuilds nodes when item payload changes" {
         }.render,
     });
 
-    // 保存初始节点指针
-    const node_1 = parent.children.items[0];
-    const node_2 = parent.children.items[1];
-    const node_3 = parent.children.items[2];
+    // save initial node pointers.
+    const node_1 = contentAt(parent, 0);
+    const node_2 = contentAt(parent, 1);
+    const node_3 = contentAt(parent, 2);
 
-    // 更新: 删除 id=2，id=1/id=3 的 payload 变化，新增 id=4
+    // update: remove id=2, id=1/id=3 payload changes, add id=4.
     const items_v2 = [_]Item{
         .{ .id = 1, .value = 100 },
         .{ .id = 3, .value = 300 },
@@ -820,28 +1109,28 @@ test "For: key-based diff rebuilds nodes when item payload changes" {
     };
     items.set(&items_v2);
 
-    try std.testing.expectEqual(@as(usize, 3), parent.children.items.len);
-    // id=1 / id=3 payload 变化后应重建，避免复用旧节点导致陈旧内容
-    try std.testing.expect(parent.children.items[0] != node_1);
-    try std.testing.expect(parent.children.items[1] != node_3);
-    // id=4 是新节点
-    try std.testing.expect(parent.children.items[2] != node_2);
+    try std.testing.expectEqual(@as(usize, 3), contentCount(parent));
+    // id=1 / id=3 payload changed should rebuild, avoid reusing stale node.
+    try std.testing.expect(contentAt(parent, 0) != node_1);
+    try std.testing.expect(contentAt(parent, 1) != node_3);
+    // id=4 is new node.
+    try std.testing.expect(contentAt(parent, 2) != node_2);
 
-    // 反向: 保留 id=4, 删除 id=1 和 id=3
-    const node_4 = parent.children.items[2];
+    // reverse: keep id=4, remove id=1 and id=3.
+    const node_4 = contentAt(parent, 2);
     const items_v3 = [_]Item{
         .{ .id = 4, .value = 400 },
     };
     items.set(&items_v3);
 
-    try std.testing.expectEqual(@as(usize, 1), parent.children.items.len);
-    // id=4 payload 从 40 -> 400，当前策略会重建
-    try std.testing.expect(parent.children.items[0] != node_4);
+    try std.testing.expectEqual(@as(usize, 1), contentCount(parent));
+    // id=4 payload 40 -> 400, current policy rebuilds.
+    try std.testing.expect(contentAt(parent, 0) != node_4);
 }
 
 test "Match: enum switch" {
     const allocator = std.testing.allocator;
-    var ctx = try Cx.init(allocator);
+    var ctx = try Cx.init(allocator, std.testing.io);
     defer ctx.deinit();
 
     const parent = try Node.create(allocator, ctx.nextId(), .box, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } });
@@ -867,33 +1156,33 @@ test "Match: enum switch" {
         }
     }.build);
 
-    // 初始: alpha -> 1 个子节点
-    try std.testing.expectEqual(@as(usize, 1), parent.children.items.len);
+    // initial: alpha -> 1 child.
+    try std.testing.expectEqual(@as(usize, 1), contentCount(parent));
 
-    // 切换到 beta
+    // switch to beta.
     mode.set(.beta);
-    try std.testing.expectEqual(@as(usize, 1), parent.children.items.len);
+    try std.testing.expectEqual(@as(usize, 1), contentCount(parent));
 
-    // 切换到 gamma
+    // switch to gamma.
     mode.set(.gamma);
-    try std.testing.expectEqual(@as(usize, 1), parent.children.items.len);
+    try std.testing.expectEqual(@as(usize, 1), contentCount(parent));
 
-    // 切回 alpha
+    // switch back to alpha.
     mode.set(.alpha);
-    try std.testing.expectEqual(@as(usize, 1), parent.children.items.len);
+    try std.testing.expectEqual(@as(usize, 1), contentCount(parent));
 
-    // 设同值不应触发重建 (只是验证不 crash)
+    // set same value shouldn't trigger rebuild (verify no crash).
     mode.set(.alpha);
-    try std.testing.expectEqual(@as(usize, 1), parent.children.items.len);
+    try std.testing.expectEqual(@as(usize, 1), contentCount(parent));
 }
 
-// ============================================================================
-// v0.7 §2.4, For 控制流 key-only + eq_props_fn tests
-// ============================================================================
+// ========================================================================
+// v0.7 §2.4, For control flow key-only + eq_props_fn tests
+// ========================================================================
 
 test "For eq_props_fn=true 强制复用，key 命中即不重建" {
     const allocator = std.testing.allocator;
-    var ctx = try Cx.init(allocator);
+    var ctx = try Cx.init(allocator, std.testing.io);
     defer ctx.deinit();
 
     const parent = try Node.create(allocator, ctx.nextId(), .box, .{ .width = .{ .px = 300 }, .height = .{ .px = 400 } });
@@ -917,7 +1206,8 @@ test "For eq_props_fn=true 强制复用，key 命中即不重建" {
                 return try Node.create(c.allocator, c.nextId(), .box, .{ .width = .{ .px = 10 }, .height = .{ .px = 10 } });
             }
         }.r,
-        // 强制永远 reuse，即使 payload 变了也不重建（caller 用 reactive signal 自管脏）
+        // force always reuse even when payload changed (caller self-manages dirty via
+        // reactive signal).
         .eq_props_fn = struct {
             fn eq(_: Item, _: Item) bool {
                 return true;
@@ -925,21 +1215,21 @@ test "For eq_props_fn=true 强制复用，key 命中即不重建" {
         }.eq,
     });
 
-    const node_1 = parent.children.items[0];
-    const node_2 = parent.children.items[1];
+    const node_1 = contentAt(parent, 0);
+    const node_2 = contentAt(parent, 1);
 
-    // payload 改变，但 eq_props_fn=true 强制复用
+    // payload changed, eq_props_fn=true forces reuse.
     const v2 = [_]Item{ .{ .id = 1, .payload = 999 }, .{ .id = 2, .payload = 888 } };
     items.set(&v2);
 
-    try std.testing.expectEqual(@as(usize, 2), parent.children.items.len);
-    try std.testing.expectEqual(node_1, parent.children.items[0]); // 同 ptr，未重建
-    try std.testing.expectEqual(node_2, parent.children.items[1]);
+    try std.testing.expectEqual(@as(usize, 2), contentCount(parent));
+    try std.testing.expectEqual(node_1, contentAt(parent, 0)); // same ptr, no rebuild.
+    try std.testing.expectEqual(node_2, contentAt(parent, 1));
 }
 
 test "For eq_props_fn=false 强制重建，每次 update 都换 node" {
     const allocator = std.testing.allocator;
-    var ctx = try Cx.init(allocator);
+    var ctx = try Cx.init(allocator, std.testing.io);
     defer ctx.deinit();
 
     const parent = try Node.create(allocator, ctx.nextId(), .box, .{ .width = .{ .px = 300 }, .height = .{ .px = 400 } });
@@ -963,7 +1253,7 @@ test "For eq_props_fn=false 强制重建，每次 update 都换 node" {
                 return try Node.create(c.allocator, c.nextId(), .box, .{ .width = .{ .px = 10 }, .height = .{ .px = 10 } });
             }
         }.r,
-        // 强制永远重建
+        // force always rebuild.
         .eq_props_fn = struct {
             fn eq(_: Item, _: Item) bool {
                 return false;
@@ -971,22 +1261,22 @@ test "For eq_props_fn=false 强制重建，每次 update 都换 node" {
         }.eq,
     });
 
-    const node_1 = parent.children.items[0];
+    const node_1 = contentAt(parent, 0);
 
-    // 改 payload，让 signal.set 检测到不等触发 effect。key 仍然=1，
-    // 默认走 eqlValue 会重建（payload 变了）；这里我们用 eq_props_fn=false 来
-    // 验 caller 显式 override，即使 eq_props_fn 总返 false 也成立重建。
-    // 反向 case 是 "payload 不变 + eq_props_fn=false"，信号检测到等会短路，
-    // effect 永不跑，所以无法在 fixture 内独立测；先用 payload 变化 + 强制 false
-    // 验 "eq_props_fn 真被调"。
+    // Change the payload so signal.set sees an unequal value. The key stays 1; default eqlValue
+    // would rebuild (payload changed); eq_props_fn=false here verifies the caller override is
+    // explicit even if eq_props_fn is always false. The reverse case 'payload unchanged +
+    // eq_props_fn=false' can't be tested standalone: the signal short-circuits on equality and the
+    // effect never runs. So use payload change + forced false to verify eq_props_fn is truly
+    // called.
     const v2 = [_]Item{.{ .id = 1, .payload = 999 }};
     items.set(&v2);
-    try std.testing.expect(parent.children.items[0] != node_1);
+    try std.testing.expect(contentAt(parent, 0) != node_1);
 }
 
 test "For eq_props_fn 选择性比较字段（忽略 cached_handle）" {
     const allocator = std.testing.allocator;
-    var ctx = try Cx.init(allocator);
+    var ctx = try Cx.init(allocator, std.testing.io);
     defer ctx.deinit();
 
     const parent = try Node.create(allocator, ctx.nextId(), .box, .{ .width = .{ .px = 300 }, .height = .{ .px = 400 } });
@@ -998,7 +1288,7 @@ test "For eq_props_fn 选择性比较字段（忽略 cached_handle）" {
     const Item = struct {
         id: u64,
         label: i32,
-        cached_handle: u64, // caller 内部缓存，每次 update 都变，但不影响渲染
+        cached_handle: u64, // caller internal cache changes every update, doesn't affect render.
     };
     const v1 = [_]Item{.{ .id = 1, .label = 10, .cached_handle = 0xABCD }};
     const items = try root_scope.createSignal([]const Item, &v1);
@@ -1014,7 +1304,7 @@ test "For eq_props_fn 选择性比较字段（忽略 cached_handle）" {
                 return try Node.create(c.allocator, c.nextId(), .box, .{ .width = .{ .px = 10 }, .height = .{ .px = 10 } });
             }
         }.r,
-        // 只比 label，忽略 cached_handle
+        // compare only label, ignore cached_handle.
         .eq_props_fn = struct {
             fn eq(a: Item, b: Item) bool {
                 return a.label == b.label;
@@ -1022,22 +1312,22 @@ test "For eq_props_fn 选择性比较字段（忽略 cached_handle）" {
         }.eq,
     });
 
-    const node_1 = parent.children.items[0];
+    const node_1 = contentAt(parent, 0);
 
-    // cached_handle 变了，但 label 没变 -> 复用
+    // cached_handle changed, label unchanged -> reuse.
     const v2 = [_]Item{.{ .id = 1, .label = 10, .cached_handle = 0xDEAD }};
     items.set(&v2);
-    try std.testing.expectEqual(node_1, parent.children.items[0]);
+    try std.testing.expectEqual(node_1, contentAt(parent, 0));
 
-    // label 真变了 -> 重建
+    // label truly changed -> rebuild.
     const v3 = [_]Item{.{ .id = 1, .label = 20, .cached_handle = 0xDEAD }};
     items.set(&v3);
-    try std.testing.expect(parent.children.items[0] != node_1);
+    try std.testing.expect(contentAt(parent, 0) != node_1);
 }
 
 test "For 默认 eq_props_fn=null 走 eqlValue (与历史行为一致)" {
     const allocator = std.testing.allocator;
-    var ctx = try Cx.init(allocator);
+    var ctx = try Cx.init(allocator, std.testing.io);
     defer ctx.deinit();
 
     const parent = try Node.create(allocator, ctx.nextId(), .box, .{ .width = .{ .px = 300 }, .height = .{ .px = 400 } });
@@ -1061,45 +1351,42 @@ test "For 默认 eq_props_fn=null 走 eqlValue (与历史行为一致)" {
                 return try Node.create(c.allocator, c.nextId(), .box, .{ .width = .{ .px = 10 }, .height = .{ .px = 10 } });
             }
         }.r,
-        // eq_props_fn = null -> 走 eqlValue 默认 (内容比较)
+        // eq_props_fn = null -> default eqlValue (content compare).
     });
 
-    const node_1 = parent.children.items[0];
+    const node_1 = contentAt(parent, 0);
 
-    // 不同 ptr 但内容相同的 []const u8, std.meta.eql 会误判不等 -> 重建；
-    // eqlValue 比内容 -> 视作等 -> 复用
+    // different ptr but same []const u8 content; std.meta.eql mismatch -> rebuild;
+    // eqlValue compares content -> equal -> reuse.
     var name_buf: [16]u8 = undefined;
     @memcpy(name_buf[0..5], "alpha");
     const v2 = [_]Item{.{ .id = 1, .name = name_buf[0..5] }};
     items.set(&v2);
-    try std.testing.expectEqual(node_1, parent.children.items[0]);
+    try std.testing.expectEqual(node_1, contentAt(parent, 0));
 
-    // 真改名 -> 重建
+    // truly renamed -> rebuild.
     const v3 = [_]Item{.{ .id = 1, .name = "beta" }};
     items.set(&v3);
-    try std.testing.expect(parent.children.items[0] != node_1);
+    try std.testing.expect(contentAt(parent, 0) != node_1);
 }
 
-// ============================================================================
-// v0.8 §2.3, For focus restoration e2e
-// ============================================================================
+// ========================================================================
+// For focus restoration e2e
+// ========================================================================
 //
-// v0.7 §2.4 退出标准里 "focus restoration on rerender: infrastructure 就位...
-// e2e 验证留 v0.8"。本 fixture 兑现：
+// 1. Mount For with eq_props_fn=true (force reuse)
+// 2. setFocus to the second node
+// 3. items signal.set a new array (same key, different payload)
+// 4. Assert: (a) Node ptr unchanged (eq_props_fn truly effective); (b) cx.isFocused still true
 //
-// 1. mount For 用 eq_props_fn=true (强制 reuse)
-// 2. setFocus 到第二个节点
-// 3. items signal.set 新数组 (相同 key, 不同 payload)
-// 4. 断言: (a) Node ptr 没变 (eq_props_fn 真生效)；(b) cx.isFocused 仍 true
-//
-// 如果 For 没复用同 Node ptr -> focus_manager 的 focused_node 指向被销毁的 Node ->
-// isFocused = false 或 segfault；这一刀真验 "key + eq_props_fn 的复用是
-// reactive focus restoration 的基础设施"。
-// ============================================================================
+// If For doesn't reuse the same Node ptr, focus_manager's focused_node points to a freed Node ->
+// isFocused = false or segfault; this validates that key + eq_props_fn reuse is the
+// infrastructure for reactive focus restoration.
+// ========================================================================
 
 test "For eq_props_fn=true 时 reactive rerender 保持焦点" {
     const allocator = std.testing.allocator;
-    var ctx = try Cx.init(allocator);
+    var ctx = try Cx.init(allocator, std.testing.io);
     defer ctx.deinit();
 
     const parent = try Node.create(allocator, ctx.nextId(), .box, .{ .width = .{ .px = 300 }, .height = .{ .px = 400 } });
@@ -1134,8 +1421,8 @@ test "For eq_props_fn=true 时 reactive rerender 保持焦点" {
                 return n;
             }
         }.r,
-        // 强制 reuse, caller 用 reactive signal 自管脏，eq_props_fn=true
-        // 让 key 命中即不重建
+        // force reuse, caller self-manages dirty via reactive signal, eq_props_fn=true key
+        // match skips rebuild.
         .eq_props_fn = struct {
             fn eq(_: Item, _: Item) bool {
                 return true;
@@ -1143,14 +1430,14 @@ test "For eq_props_fn=true 时 reactive rerender 保持焦点" {
         }.eq,
     });
 
-    try std.testing.expectEqual(@as(usize, 3), parent.children.items.len);
-    const node_2_before = parent.children.items[1];
+    try std.testing.expectEqual(@as(usize, 3), contentCount(parent));
+    const node_2_before = contentAt(parent, 1);
 
-    // 焦点落在第二个节点
+    // focus on second node.
     ctx.setFocus(node_2_before);
     try std.testing.expect(ctx.isFocused(node_2_before));
 
-    // 改 payload, signal 检测到不等触发 effect，For 走 reuse 分支
+    // change payload, signal detects unequal triggers effect, For uses reuse branch.
     const v2 = [_]Item{
         .{ .id = 1, .payload = 999 },
         .{ .id = 2, .payload = 888 },
@@ -1158,17 +1445,18 @@ test "For eq_props_fn=true 时 reactive rerender 保持焦点" {
     };
     items.set(&v2);
 
-    // (a) Node ptr 没变
-    const node_2_after = parent.children.items[1];
+    // (a) Node ptr unchanged.
+    const node_2_after = contentAt(parent, 1);
     try std.testing.expectEqual(node_2_before, node_2_after);
 
-    // (b) 焦点仍贴在原 Node 上，focus_manager 的 focused_node 没失效
+    // (b) focus still clings to original Node, focus_manager.focused_node didn't
+    // invalidate.
     try std.testing.expect(ctx.isFocused(node_2_after));
 }
 
 test "反向 case — eq_props_fn=false 时 Node 被销毁，焦点丢失" {
     const allocator = std.testing.allocator;
-    var ctx = try Cx.init(allocator);
+    var ctx = try Cx.init(allocator, std.testing.io);
     defer ctx.deinit();
 
     const parent = try Node.create(allocator, ctx.nextId(), .box, .{ .width = .{ .px = 300 }, .height = .{ .px = 400 } });
@@ -1198,31 +1486,31 @@ test "反向 case — eq_props_fn=false 时 Node 被销毁，焦点丢失" {
         }.r,
         .eq_props_fn = struct {
             fn eq(_: Item, _: Item) bool {
-                return false; // 强制重建
+                return false; // force rebuild.
             }
         }.eq,
     });
 
-    const node_1_before = parent.children.items[0];
+    const node_1_before = contentAt(parent, 0);
     ctx.setFocus(node_1_before);
     try std.testing.expect(ctx.isFocused(node_1_before));
 
-    // 改 payload, eq_props_fn=false 触发重建
+    // change payload, eq_props_fn=false triggers rebuild.
     const v2 = [_]Item{.{ .id = 1, .payload = 999 }};
     items.set(&v2);
 
-    const node_1_after = parent.children.items[0];
+    const node_1_after = contentAt(parent, 0);
     try std.testing.expect(node_1_after != node_1_before);
-    // 旧 node 已销毁；focus_manager 的 focused_node 不再指向当前 child
+    // old node destroyed; focus_manager.focused_node no longer points to current child.
     try std.testing.expect(!ctx.isFocused(node_1_after));
 }
 
 test "control flow: build failure is reported, not silently swallowed" {
-    // 审查报告 §3：Show/For/Match 的 effect 回调历史上一律 `catch return`，
-    // OOM/构建失败被**完全吞掉**, UI 悄悄少一块，无日志无计数。
-    // 现在至少会计数 + 打日志（真正的 error boundary 需 effect 层支持
-    // error sink，属后续工作）。本测试锁住"不再静默"这条不变量。
-    const ctx = try Cx.init(std.testing.allocator);
+    // review @3: Show/For/Match effect callbacks historically all `catch return`,
+    // OOM/build failure silently swallowed; no logging/counting. Now at least counts +
+    // logs (true error boundary needs effect-layer error sink, future work). This test
+    // locks 'no longer silent'.
+    const ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const parent = try core.box(ctx, .{ .width = .{ .px = 100 }, .height = .{ .px = 100 } }, .{});
@@ -1238,29 +1526,28 @@ test "control flow: build failure is reported, not silently swallowed" {
     const before = control_flow_error_count;
     try Show(scope, parent, visible, ctx, struct {
         fn build(_: *Scope, _: *Cx) anyerror!*Node {
-            return error.OutOfMemory; // 模拟构建失败
+            return error.OutOfMemory; // simulate build failure.
         }
     }.build);
 
-    // 翻开条件 -> effect 触发 build -> 必然失败。
+    // open condition -> effect fires build -> must fail.
     visible.set(true);
 
-    // 关键断言：失败被**记录**了（而不是静默 return）。
+    // key assert: failure logged (not silent return).
     try std.testing.expect(control_flow_error_count > before);
-    // 且没有半截子树被挂上去。
-    try std.testing.expectEqual(@as(usize, 0), parent.children.items.len);
+    // and no half-built subtree attached.
+    try std.testing.expectEqual(@as(usize, 0), contentCount(parent));
 }
 
-// 回归：Show/For/Switch 拆除子树必须走 cx.freeNode，而不是 node.destroy。
-//
-// node.destroy 只释放 Node 本身，不回收 ElementTable slot,
-// world.destroyElement 唯一的调用点在 Cx.freeNode 里。修复前每次 Show
-// 切换都漏一个 element slot（外加 interaction / dirty_set / content /
-// paint_state / layout_output 五张镜像表的残留行）。ElementTable index
-// 是 u24，长期跑列表型应用最终会 error.ElementTableFull。
+// Regression: Show/For/Switch subtree destruction must call cx.freeNode, not node.destroy.
+// node.destroy frees only the Node itself and doesn't reclaim the ElementTable slot;
+// world.destroyElement is called only from Cx.freeNode. Otherwise every Show switch leaks an
+// element slot (plus 5 mirror-table remnants: interaction / dirty_set / content / paint_state /
+// layout_output). ElementTable index is u24; long-running list apps eventually hit
+// error.ElementTableFull.
 test "regression: Show 反复切换不泄漏 ElementTable slot" {
     const allocator = std.testing.allocator;
-    var ctx = try Cx.init(allocator);
+    var ctx = try Cx.init(allocator, std.testing.io);
     defer ctx.deinit();
 
     const parent = try Node.create(allocator, ctx.nextId(), .box, .{ .width = .{ .px = 200 }, .height = .{ .px = 200 } });
@@ -1283,12 +1570,12 @@ test "regression: Show 反复切换不泄漏 ElementTable slot" {
         }
     }.build);
 
-    // 先切一轮，让稳定态的 element 数量落定（首次 mount 会新建 slot）。
+    // flip once to stabilize element count (first mount creates slots).
     visible.set(true);
     visible.set(false);
     const baseline = ctx.world.elements.count();
 
-    // 再切 50 轮：若 slot 未回收，count 会线性增长 50。
+    // flip 50 times: slot unreclaimed -> count grows 50.
     var i: usize = 0;
     while (i < 50) : (i += 1) {
         visible.set(true);
@@ -1298,37 +1585,21 @@ test "regression: Show 反复切换不泄漏 ElementTable slot" {
     try std.testing.expectEqual(baseline, ctx.world.elements.count());
 }
 
-// ----- OOM 不变式：For keyed reconcile -----
+// ----- OOM invariant: For keyed reconcile -----
 //
-// batch1 把 For 的 keyed reconcile 里 old_map.put / reused.put /
-// new_entries.append / appendForEntry 的 `catch {}` / `catch return` 全部
-// 改成了 @panic（漏标 reused -> 步骤 3 会 dispose/free 一个仍挂在
-// new_entries 里的节点 = 悬垂指针 / double free）。
-//
-// @panic 无法在进程内捕获。实测确认：只要 FailingAllocator 打中 reconcile
-// 内任一分配点，进程直接 abort（signal 6，panic 文案
-// "OOM: For keyed reconcile old_map.put"）。而 For 的首次挂载本身就是走
-// reconcile effect 完成的（栈：effect.runImpl -> update -> old_map.put），
-// 所以**无法**构造「挂载成功、随后 reconcile 才遇 OOM」的进程内场景,
-// 任何打中 reconcile 的 fail_index 都会在挂载阶段就 abort。
-//
-// 因此这里不做 fail_index 遍历（那只会让测试自杀），而是用**充足内存**
-// 跑一遍混合 keyed diff，锁住那些 @panic 所保护的可观测后果：
-// 复用 / 重建 / 新建 / 删除 四种分支同时发生后，parent 子节点必须与
-// items 一一对应，少了说明漏标 reused 导致旧节点被误销毁（悬垂），
-// 多了说明同 key 被重复创建。double free / 泄漏则由 GPA 在 deinit 处暴露。
-//
-// 反向验证（已实测）：把复用分支的 `reused.put(...)` 整行删掉（模拟漏标），
-// 本测试在「id=1 必须是同一个 Node 对象」那条断言上 abort，因为漏标导致
-// 仍在使用的节点被步骤 3 销毁。变异可编译，是真红不是编译错。
-// 注意充足内存下 `catch {}` 与 `@panic` 行为相同（那行永不失败），所以
-// 能让本测试变红的是漏标本身，而这正是那些 @panic 要防的后果。
-// 「OOM 时必 panic 而非静默错乱」那一面，由上述 abort 实测直接证实。
+// A missing reuse flag destroys in-use nodes (dangling/double free), so reconcile bookkeeping
+// inserts must never fail. Allocate-then-mutate: old key map, reuse flags and new entries
+// capacity are reserved before mutating any entry; all inserts use AssumeCapacity; a pre-alloc
+// failure changes nothing, logs the error and keeps the old rows. The effect's first run still
+// reconciles (no skip by slice identity; see mount note), and a pre-alloc failure there also
+// keeps old rows. Every alloc failure point is swept via RadioGroup (options from a signal).
+// With ample memory, a mixed diff (reuse/rebuild/create/delete together) must leave parent
+// children matching items 1:1.
 test "For keyed reconcile: 复用/重建/新建/删除混合后子节点与 items 一一对应" {
     const Item = struct { id: u64, value: i32 };
     const allocator = std.testing.allocator;
 
-    const ctx = try Cx.init(allocator);
+    const ctx = try Cx.init(allocator, std.testing.io);
     defer ctx.deinit();
 
     const parent = try Node.create(allocator, ctx.nextId(), .box, .{
@@ -1365,42 +1636,42 @@ test "For keyed reconcile: 复用/重建/新建/删除混合后子节点与 item
             }
         }.render,
     });
-    try std.testing.expectEqual(initial.len, parent.children.items.len);
+    try std.testing.expectEqual(initial.len, contentCount(parent));
 
-    // 记下 id=1 的节点指针：它必须被**原样复用**（不是销毁重建）。
-    const reused_node_before = parent.children.items[0];
+    // save id=1 node ptr: must be reused as-is (not destroy-rebuild).
+    const reused_node_before = contentAt(parent, 0);
 
-    // 混合四种分支：复用 id=1 / key 命中但 props 变而重建 id=3 /
-    // 新 key 新建 id=4 / id=2 消失被删除。
-    // 一次 update 同时踩到 reused.put 的两个分支 + appendForEntry 两个分支。
+    // mixed four: reuse id=1 / key match props changed rebuild id=3 / new key create
+    // id=4 / id=2 gone deleted. one update hits both reused.put branches + both
+    // appendForEntry branches.
     const updated = [_]Item{
-        .{ .id = 1, .value = 10 }, // 完全相同 → 复用
-        .{ .id = 3, .value = 999 }, // key 命中但 props 变 → 销毁重建
-        .{ .id = 4, .value = 40 }, // 新 key → 新建
+        .{ .id = 1, .value = 10 }, // identical -> reuse.
+        .{ .id = 3, .value = 999 }, // key match props change -> destroy rebuild.
+        .{ .id = 4, .value = 40 }, // new key -> create.
     };
     items.set(&updated);
 
-    // 少于 3 = 漏标 reused 导致仍在用的节点被销毁；多于 3 = 同 key 重复创建。
-    try std.testing.expectEqual(updated.len, parent.children.items.len);
-    // id=1 必须是同一个 Node 对象（真复用，而非销毁后重建的新节点）。
-    try std.testing.expectEqual(reused_node_before, parent.children.items[0]);
+    // < 3 = missed reuse flag destroyed in-use node; > 3 = duplicate create same key.
+    try std.testing.expectEqual(updated.len, contentCount(parent));
+    // id=1 must be same Node object (true reuse, not destroy-rebuild new).
+    try std.testing.expectEqual(reused_node_before, contentAt(parent, 0));
 
-    // 再删到只剩一个，确认删除路径也不多杀/少杀。
+    // remove down to one, confirm delete path exact.
     const shrunk = [_]Item{.{ .id = 4, .value = 40 }};
     items.set(&shrunk);
-    try std.testing.expectEqual(shrunk.len, parent.children.items.len);
+    try std.testing.expectEqual(shrunk.len, contentCount(parent));
 
-    // 全清空：所有节点都必须被回收（泄漏会由 GPA 在 ctx.deinit 处报出来）。
+    // clear all: all nodes must leak-free (GPA reports at ctx.deinit).
     const empty: []const Item = &.{};
     items.set(empty);
-    try std.testing.expectEqual(@as(usize, 0), parent.children.items.len);
+    try std.testing.expectEqual(@as(usize, 0), contentCount(parent));
 }
 
 test "For keyed reconcile: duplicate keys never alias node or scope ownership" {
     const Item = struct { id: u64, value: i32 };
     const allocator = std.testing.allocator;
 
-    const ctx = try Cx.init(allocator);
+    const ctx = try Cx.init(allocator, std.testing.io);
     defer ctx.deinit();
 
     const parent = try Node.create(allocator, ctx.nextId(), .box, .{
@@ -1437,8 +1708,8 @@ test "For keyed reconcile: duplicate keys never alias node or scope ownership" {
         }.render,
     });
 
-    try std.testing.expectEqual(@as(usize, 2), parent.children.items.len);
-    try std.testing.expect(parent.children.items[0] != parent.children.items[1]);
+    try std.testing.expectEqual(@as(usize, 2), contentCount(parent));
+    try std.testing.expect(contentAt(parent, 0) != contentAt(parent, 1));
 
     // Exercise duplicate -> duplicate -> single -> empty. The old algorithm
     // first inserted one node twice, then freed it through the other entry.
@@ -1447,25 +1718,25 @@ test "For keyed reconcile: duplicate keys never alias node or scope ownership" {
         .{ .id = 7, .value = 71 },
     };
     items.set(&duplicate_changed);
-    try std.testing.expectEqual(@as(usize, 2), parent.children.items.len);
-    try std.testing.expect(parent.children.items[0] != parent.children.items[1]);
+    try std.testing.expectEqual(@as(usize, 2), contentCount(parent));
+    try std.testing.expect(contentAt(parent, 0) != contentAt(parent, 1));
 
     const single = [_]Item{.{ .id = 7, .value = 70 }};
     items.set(&single);
-    try std.testing.expectEqual(@as(usize, 1), parent.children.items.len);
+    try std.testing.expectEqual(@as(usize, 1), contentCount(parent));
 
     const empty: []const Item = &.{};
     items.set(empty);
-    try std.testing.expectEqual(@as(usize, 0), parent.children.items.len);
+    try std.testing.expectEqual(@as(usize, 0), contentCount(parent));
 }
 
-// ----- 挂载失败路径：必须按正常卸载顺序回收 -----
+// ----- mount failure path: cleanup in proper unload order -----
 //
-// 失败回滚原先是两个 defer：node.destroy 先跑、child_scope.dispose 后跑。
-// 于是 (1) scope cleanup 看到的是已释放节点；(2) Node.destroy 不回收
-// ElementTable slot（destroyElement 只在 Cx.freeNode 里）。
-// FailingAllocator 的 fail_index 可运行期改写：build 末尾把它设成当前
-// alloc_index，让紧随其后的 appendChild / entries 扩容失败，测完再复原。
+// Failure rollback must not be two defers (node.destroy first, child_scope.dispose second):
+// (1) scope cleanup would see a freed node; (2) Node.destroy doesn't reclaim the ElementTable
+// slot (destroyElement only in Cx.freeNode). FailingAllocator fail_index is runtime-writable:
+// set to alloc_index at the build tail so the next appendChild/entries expansion fails, then
+// revert.
 const MountFailureHarness = struct {
     var failing: ?*std.testing.FailingAllocator = null;
     var order: ?*Order = null;
@@ -1479,10 +1750,12 @@ const MountFailureHarness = struct {
     fn armNextAllocFailure() void {
         const fa = failing.?;
         fa.fail_index = fa.alloc_index;
+        fa.resize_fail_index = fa.resize_index;
     }
 
     fn disarm() void {
         failing.?.fail_index = std.math.maxInt(usize);
+        failing.?.resize_fail_index = std.math.maxInt(usize);
     }
 
     fn buildTracked(child_scope: *Scope, c: *Cx) anyerror!*Node {
@@ -1512,7 +1785,7 @@ const MountFailureHarness = struct {
 test "Show: appendChild 失败时按卸载顺序回收（scope 先于节点、回收 element slot）" {
     var fa = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     const allocator = fa.allocator();
-    const ctx = try Cx.init(allocator);
+    const ctx = try Cx.init(allocator, std.testing.io);
     defer ctx.deinit();
 
     const parent = try Node.create(allocator, ctx.nextId(), .box, .{ .width = .{ .px = 100 }, .height = .{ .px = 100 } });
@@ -1531,6 +1804,9 @@ test "Show: appendChild 失败时按卸载顺序回收（scope 先于节点、�
 
     try Show(root_scope, parent, visible, ctx, MountFailureHarness.buildTracked);
     const baseline = ctx.world.elements.count();
+    // place anchors already expanded children; tighten to exact fit so post-build insert
+    // must allocate, truly hit 'built but failed-attach' rollback (else test empty-runs).
+    parent.children.shrinkAndFree(allocator, parent.children.items.len);
 
     control_flow_suppress_error_log = true;
     defer control_flow_suppress_error_log = false;
@@ -1539,7 +1815,7 @@ test "Show: appendChild 失败时按卸载顺序回收（scope 先于节点、�
     MountFailureHarness.disarm();
 
     try std.testing.expect(control_flow_error_count > errors_before);
-    try std.testing.expectEqual(@as(usize, 0), parent.children.items.len);
+    try std.testing.expectEqual(@as(usize, 0), contentCount(parent));
     try std.testing.expect(order.cleanup_ran);
     try std.testing.expect(order.cleanup_saw_live_node);
     try std.testing.expect(order.node_freed);
@@ -1550,7 +1826,7 @@ test "For: 首次挂载 entries/appendChild 失败不泄漏节点、不留半截
     const Item = struct { id: u64 };
     var fa = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     const allocator = fa.allocator();
-    const ctx = try Cx.init(allocator);
+    const ctx = try Cx.init(allocator, std.testing.io);
     defer ctx.deinit();
 
     const parent = try Node.create(allocator, ctx.nextId(), .box, .{ .width = .{ .px = 100 }, .height = .{ .px = 100 } });
@@ -1584,21 +1860,21 @@ test "For: 首次挂载 entries/appendChild 失败不泄漏节点、不留半截
     MountFailureHarness.disarm();
 
     try std.testing.expectError(error.OutOfMemory, result);
-    try std.testing.expectEqual(@as(usize, 0), parent.children.items.len);
+    try std.testing.expectEqual(@as(usize, 0), contentCount(parent));
     try std.testing.expect(order.cleanup_saw_live_node);
     try std.testing.expect(order.node_freed);
     try std.testing.expectEqual(baseline, ctx.world.elements.count());
 }
 
-// ----- For 与同 parent 兄弟共存 -----
+// ----- For and same-parent siblings coexist -----
 //
-// For 的 effect 每次（含首次）都 replaceChildOrder(parent, 仅 For 条目)，
-// 而 replaceChildOrder 会摘掉不在列表里的所有子节点，同一 parent 下的
-// 标题 / Show 节点被静默摘下成孤儿（不渲染 + 永不释放）。
+// For effect every time (first too) replaceChildOrder(parent, For entries only),
+// replaceChildOrder detaches all missing; same-parent title/Show nodes silent detach
+// orphaned (no render + never freed).
 test "For: 与同 parent 的前后兄弟共存，增删重排都不摘兄弟" {
     const Item = struct { id: u64 };
     const allocator = std.testing.allocator;
-    const ctx = try Cx.init(allocator);
+    const ctx = try Cx.init(allocator, std.testing.io);
     defer ctx.deinit();
 
     const parent = try Node.create(allocator, ctx.nextId(), .box, .{ .width = .{ .px = 100 }, .height = .{ .px = 300 } });
@@ -1635,39 +1911,40 @@ test "For: 与同 parent 的前后兄弟共存，增删重排都不摘兄弟" {
         }.r,
     });
 
-    try std.testing.expectEqual(@as(usize, 3), parent.children.items.len);
-    try std.testing.expectEqual(header, parent.children.items[0]);
+    try std.testing.expectEqual(@as(usize, 3), contentCount(parent));
+    try std.testing.expectEqual(header, contentAt(parent, 0));
     try std.testing.expectEqual(parent, header.parent.?);
 
-    // For 之后再挂一个兄弟
+    // attach sibling after For.
     const footer = try Node.create(allocator, ctx.nextId(), .box, .{ .width = .{ .px = 10 }, .height = .{ .px = 10 } });
     ctx.linkNodeToWorld(footer);
     try parent.appendChild(allocator, footer);
 
     const Expect = struct {
         fn names(p: *Node, h: *Node, f: *Node, comptime want: []const []const u8) !void {
-            try std.testing.expectEqual(want.len + 2, p.children.items.len);
-            try std.testing.expectEqual(h, p.children.items[0]);
-            try std.testing.expectEqual(f, p.children.items[p.children.items.len - 1]);
+            try std.testing.expectEqual(want.len + 2, contentCount(p));
+            try std.testing.expectEqual(h, contentAt(p, 0));
+            try std.testing.expectEqual(f, contentAt(p, contentCount(p) - 1));
             inline for (want, 0..) |w, i| {
-                try std.testing.expectEqualStrings(w, p.children.items[i + 1].meta.ownership.meta.component_name.?);
+                try std.testing.expectEqualStrings(w, contentAt(p, i + 1).meta.ownership.meta.component_name.?);
             }
         }
     };
 
-    // 插入
+    // insert.
     const inserted = [_]Item{ .{ .id = 1 }, .{ .id = 3 }, .{ .id = 2 } };
     items.set(&inserted);
     try Expect.names(parent, header, footer, &.{ "i1", "i3", "i2" });
-    // 重排
+    // reorder.
     const reordered = [_]Item{ .{ .id = 2 }, .{ .id = 1 }, .{ .id = 3 } };
     items.set(&reordered);
     try Expect.names(parent, header, footer, &.{ "i2", "i1", "i3" });
-    // 删除
+    // delete.
     const removed = [_]Item{.{ .id = 3 }};
     items.set(&removed);
     try Expect.names(parent, header, footer, &.{"i3"});
-    // 清空再恢复：段位置必须记住（列表为空时没有可参照的 For 节点）
+    // clear then restore: segment position must remember (no For node to reference when
+    // list empty).
     const empty: []const Item = &.{};
     items.set(empty);
     try Expect.names(parent, header, footer, &.{});
@@ -1675,14 +1952,13 @@ test "For: 与同 parent 的前后兄弟共存，增删重排都不摘兄弟" {
     try Expect.names(parent, header, footer, &.{ "i1", "i2" });
 }
 
-// 步骤 2/3 已释放旧节点后，重排若 OOM，原实现 `catch return` 跳过了
-// entries 替换：s.entries 留着已释放节点（下次 diff 再 free = double free），
-// new_entries 与新建节点整批泄漏。
-// 触发方式：key 相同但 props 变化 -> 步骤 2 释放旧节点并调 render 重建；
-// render 末尾武装 FailingAllocator，让随后的重排分配失败。（被删条目的
-// scope/node cleanup 在 reactive 回调内会延迟到 effect 之后，不能用来武装。）
-// new_entries 初始容量 ≥ 2（cache_line / @sizeOf(ItemEntry)），重建条目的
-// append 不再分配，失败必然落在重排上，下面断言错误计数确认打中了。
+// after steps 2/3 freed old nodes, reorder OOM, old impl `catch return` skipped entries
+// replace: s.entries left stale (next diff free = double free), new_entries + rebuilt
+// nodes leak. trigger: same key props change -> step 2 free old + render rebuild;
+// render tail arm FailingAllocator, next reorder alloc fails. (deleted entry scope/node
+// cleanup deferred in reactive callback, post-effect, can't arm.) new_entries initial
+// capacity >= 2 (cache_line / @sizeOf(ItemEntry)), rebuild append won't allocate, fail
+// lands on reorder, assert count confirms hit.
 test "For: 旧节点已释放后重排 OOM 不留悬垂 entries、不泄漏" {
     const Item = struct { id: u64, v: u32 };
     const H = struct {
@@ -1693,7 +1969,7 @@ test "For: 旧节点已释放后重排 OOM 不留悬垂 entries、不泄漏" {
     const allocator = fa.allocator();
     H.failing = &fa;
     defer H.failing = null;
-    const ctx = try Cx.init(allocator);
+    const ctx = try Cx.init(allocator, std.testing.io);
     defer ctx.deinit();
 
     const parent = try Node.create(allocator, ctx.nextId(), .box, .{ .width = .{ .px = 100 }, .height = .{ .px = 100 } });
@@ -1723,7 +1999,7 @@ test "For: 旧节点已释放后重排 OOM 不留悬垂 entries、不泄漏" {
             }
         }.r,
     });
-    try std.testing.expectEqual(@as(usize, 2), parent.children.items.len);
+    try std.testing.expectEqual(@as(usize, 2), contentCount(parent));
 
     control_flow_suppress_error_log = true;
     defer control_flow_suppress_error_log = false;
@@ -1733,14 +2009,229 @@ test "For: 旧节点已释放后重排 OOM 不留悬垂 entries、不泄漏" {
     items.set(&changed);
     H.arm_on_render = false;
     fa.fail_index = std.math.maxInt(usize);
-    // 确认确实打中了重排失败分支（否则本测试是假绿）。
+    // confirm truly hit reorder fail branch (else test fake-green).
     try std.testing.expect(control_flow_error_count > errors_before);
 
-    // 再走几轮 diff：若 entries 残留已释放节点，这里会 double free / UAF；
-    // 未上树的新节点归 entries 所有，下一轮 diff 要能把它挂回去。
+    // run diff a few more times: stale freed nodes in entries -> double free/UAF;
+    // unmounted new owned by entries, next diff must remount.
     const empty: []const Item = &.{};
     items.set(empty);
-    try std.testing.expectEqual(@as(usize, 0), parent.children.items.len);
+    try std.testing.expectEqual(@as(usize, 0), contentCount(parent));
     items.set(&initial);
-    try std.testing.expectEqual(@as(usize, 2), parent.children.items.len);
+    try std.testing.expectEqual(@as(usize, 2), contentCount(parent));
+}
+
+fn testLeaf(c: *Cx) anyerror!*Node {
+    const n = try Node.create(c.allocator, c.nextId(), .box, .{ .width = .{ .px = 10 }, .height = .{ .px = 10 } });
+    c.linkNodeToWorld(n);
+    return n;
+}
+
+test "Show / Match / For accept memos and derived values" {
+    const allocator = std.testing.allocator;
+    var ctx = try Cx.init(allocator, std.testing.io);
+    defer ctx.deinit();
+    const parent = try Node.create(allocator, ctx.nextId(), .box, .{ .width = .{ .px = 200 }, .height = .{ .px = 200 } });
+    ctx.root = parent;
+    const root_scope = try Scope.init(allocator, null, ctx.owner);
+    defer root_scope.dispose();
+
+    // Show driven by derived signal: one enum vs N bool signals.
+    const Page = enum { home, settings, about };
+    const page = try root_scope.createSignal(Page, .home);
+    try Show(root_scope, parent, reactive.eq(page, .settings), ctx, struct {
+        fn build(_: *Scope, c: *Cx) anyerror!*Node {
+            return testLeaf(c);
+        }
+    }.build);
+    try std.testing.expectEqual(@as(usize, 0), contentCount(parent));
+    page.set(.settings);
+    try std.testing.expectEqual(@as(usize, 1), contentCount(parent));
+    page.set(.about);
+    try std.testing.expectEqual(@as(usize, 0), contentCount(parent));
+
+    // Match driven by memo.
+    const n = try root_scope.createSignal(u32, 3);
+    const parity = try root_scope.createMemo(bool, .{ .n = n }, struct {
+        fn f(c: anytype) bool {
+            return c.n.get() % 2 == 0;
+        }
+    }.f);
+    const Seen = struct {
+        var builds: u32 = 0;
+    };
+    Seen.builds = 0;
+    _ = try Match(bool, root_scope, parent, parity, ctx, struct {
+        fn build(_: *Scope, c: *Cx, _: bool) anyerror!*Node {
+            Seen.builds += 1;
+            return testLeaf(c);
+        }
+    }.build);
+    try std.testing.expectEqual(@as(u32, 1), Seen.builds);
+    n.set(5); // odd/even unchanged: memo equal, no rebuild.
+    try std.testing.expectEqual(@as(u32, 1), Seen.builds);
+    n.set(6);
+    try std.testing.expectEqual(@as(u32, 2), Seen.builds);
+
+    // For driven by memo (filtered list).
+    const all = [_]u32{ 1, 2, 3, 4 };
+    const only_even = try root_scope.createSignal(bool, false);
+    const visible_items = try root_scope.createMemo([]const u32, .{ .only_even = only_even }, struct {
+        fn f(c: anytype) []const u32 {
+            return if (c.only_even.get()) all[1..2] else all[0..];
+        }
+    }.f);
+    const list = try Node.create(allocator, ctx.nextId(), .box, .{});
+    ctx.linkNodeToWorld(list);
+    try parent.appendChild(allocator, list);
+    try For(u32, root_scope, list, visible_items, ctx, .{
+        .key_fn = struct {
+            fn k(v: u32) u64 {
+                return v;
+            }
+        }.k,
+        .render_fn = struct {
+            fn r(_: *Scope, c: *Cx, _: u32, _: usize) anyerror!*Node {
+                return testLeaf(c);
+            }
+        }.r,
+    });
+    try std.testing.expectEqual(@as(usize, 4), contentCount(list));
+    only_even.set(true);
+    try std.testing.expectEqual(@as(usize, 1), contentCount(list));
+}
+
+test "control flow builds children untracked: reads during mount do not subscribe the control-flow effect" {
+    const allocator = std.testing.allocator;
+    var ctx = try Cx.init(allocator, std.testing.io);
+    defer ctx.deinit();
+    const parent = try Node.create(allocator, ctx.nextId(), .box, .{ .width = .{ .px = 200 }, .height = .{ .px = 200 } });
+    ctx.root = parent;
+    const root_scope = try Scope.init(allocator, null, ctx.owner);
+    defer root_scope.dispose();
+
+    const Env = struct {
+        var unrelated: *Signal(u32) = undefined;
+        var builds: u32 = 0;
+    };
+    Env.unrelated = try root_scope.createSignal(u32, 0);
+    Env.builds = 0;
+    const which = try root_scope.createSignal(u8, 1);
+    _ = try Match(u8, root_scope, parent, which, ctx, struct {
+        fn build(_: *Scope, c: *Cx, _: u8) anyerror!*Node {
+            Env.builds += 1;
+            _ = Env.unrelated.get(); // mount-time read.
+            return testLeaf(c);
+        }
+    }.build);
+    try std.testing.expectEqual(@as(u32, 1), Env.builds);
+    Env.unrelated.set(1); // shouldn't trigger Match rebuild.
+    try std.testing.expectEqual(@as(u32, 1), Env.builds);
+    which.set(2); // effect rebuilds: read inside build if tracked, unrelated gains observer.
+    try std.testing.expectEqual(@as(u32, 2), Env.builds);
+    const gid: @import("reactive/graph.zig").NodeId = @bitCast(Env.unrelated.base.graph_node_raw);
+    try std.testing.expectEqual(@as(usize, 0), ctx.owner.graph.getNode(gid).?.observers.items.len);
+}
+
+// ----- region positioning: content fixed at call site -----
+//
+// Show/Match content built with plain appendChild lands after all siblings once the condition
+// turns true; For locating by 'non-For sibling count before it' drifts when an upstream Show
+// opens/closes. Instead each region has an anchor pair and content inserts at its own end anchor.
+fn testTagged(c: *Cx, name: []const u8) !*Node {
+    const n = try testLeaf(c);
+    n.meta.ownership.meta.component_name = name;
+    return n;
+}
+
+fn expectContentNames(parent: *Node, want: []const []const u8) !void {
+    try std.testing.expectEqual(want.len, contentCount(parent));
+    for (want, 0..) |w, i| {
+        try std.testing.expectEqualStrings(w, contentAt(parent, i).meta.ownership.meta.component_name.?);
+    }
+}
+
+test "Show / Match / For: 后开合的区域与后追加的兄弟都不让内容漂移" {
+    const Item = struct { name: []const u8 };
+    const Page = enum { a, b };
+    const allocator = std.testing.allocator;
+    const ctx = try Cx.init(allocator, std.testing.io);
+    defer ctx.deinit();
+
+    const parent = try Node.create(allocator, ctx.nextId(), .box, .{ .width = .{ .px = 100 }, .height = .{ .px = 300 } });
+    ctx.linkNodeToWorld(parent);
+    ctx.root = parent;
+    const root_scope = try Scope.init(allocator, null, ctx.owner);
+    defer root_scope.dispose();
+
+    const show = try root_scope.createSignal(bool, false);
+    const page = try root_scope.createSignal(Page, .a);
+    const one = [_]Item{.{ .name = "i1" }};
+    const two = [_]Item{ .{ .name = "i1" }, .{ .name = "i2" } };
+    const items = try root_scope.createSignal([]const Item, &one);
+
+    try parent.appendChild(allocator, try testTagged(ctx, "head"));
+    try Show(root_scope, parent, show, ctx, struct {
+        fn b(_: *Scope, c: *Cx) anyerror!*Node {
+            return testTagged(c, "show");
+        }
+    }.b);
+    _ = try Match(Page, root_scope, parent, page, ctx, struct {
+        fn b(_: *Scope, c: *Cx, p: Page) anyerror!*Node {
+            return testTagged(c, @tagName(p));
+        }
+    }.b);
+    try For(Item, root_scope, parent, items, ctx, .{
+        .key_fn = struct {
+            fn k(it: Item) u64 {
+                return std.hash.Wyhash.hash(0, it.name);
+            }
+        }.k,
+        .render_fn = struct {
+            fn r(_: *Scope, c: *Cx, it: Item, _: usize) anyerror!*Node {
+                return testTagged(c, it.name);
+            }
+        }.r,
+    });
+    try parent.appendChild(allocator, try testTagged(ctx, "tail"));
+    try expectContentNames(parent, &.{ "head", "a", "i1", "tail" });
+
+    show.set(true);
+    try expectContentNames(parent, &.{ "head", "show", "a", "i1", "tail" });
+    items.set(&two);
+    try expectContentNames(parent, &.{ "head", "show", "a", "i1", "i2", "tail" });
+    page.set(.b);
+    try expectContentNames(parent, &.{ "head", "show", "b", "i1", "i2", "tail" });
+    show.set(false);
+    try expectContentNames(parent, &.{ "head", "b", "i1", "i2", "tail" });
+    items.set(&one);
+    show.set(true);
+    try expectContentNames(parent, &.{ "head", "show", "b", "i1", "tail" });
+
+    // World table sibling chain matches Node.children (insertChildBefore linked path).
+    const ElementId = @import("core/element_id.zig").ElementId;
+    var iter = ctx.world.elements.children(ElementId.fromRaw(parent.element_id_raw));
+    var k: usize = 0;
+    while (iter.next()) |eid| : (k += 1) {
+        try std.testing.expectEqual(parent.children.items[k].element_id_raw, eid.raw());
+    }
+    try std.testing.expectEqual(parent.children.items.len, k);
+}
+
+test "Node.insertChildBefore: 锚点不是该父节点的子节点时报错且不挂树" {
+    const allocator = std.testing.allocator;
+    const ctx = try Cx.init(allocator, std.testing.io);
+    defer ctx.deinit();
+    const parent = try testLeaf(ctx);
+    defer ctx.freeNode(parent);
+    const other = try testLeaf(ctx);
+    defer ctx.freeNode(other);
+    const stranger = try testLeaf(ctx);
+    try other.appendChild(allocator, stranger);
+    const child = try testLeaf(ctx);
+    defer ctx.freeNode(child);
+
+    try std.testing.expectError(error.InvalidAnchor, parent.insertChildBefore(allocator, child, stranger));
+    try std.testing.expect(child.parent == null);
+    try std.testing.expectEqual(@as(usize, 0), parent.children.items.len);
 }

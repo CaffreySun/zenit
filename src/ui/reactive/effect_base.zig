@@ -1,45 +1,44 @@
 const std = @import("std");
 
-/// EffectBase: 类型擦除的 Effect 基类
+/// EffectBase: type-erased Effect base class
 ///
-/// 为什么需要基类?
-/// - SignalOwner 需要统一管理所有 Effect
-/// - 通过虚函数表实现多态
+/// Why base class?
+/// - SignalOwner needs unified Effect management
+/// - Polymorphism via virtual function table
 ///
-/// 单轨追踪，依赖关系全部走 ReactiveGraph（src/ui/reactive/graph.zig）。
-/// 旧 dependencies / addDependency / clearDependencies / removeDependencyPointer
-/// 全部删除，graph.sources 是唯一依赖源。
+/// Single-track dependency: all relations go through ReactiveGraph (src/ui/reactive/graph.zig);
+/// graph.sources is the sole dependency source.
 pub const EffectBase = struct {
-    /// 虚函数表
+    /// Virtual function table
     vtable: *const VTable,
 
-    /// 用于 effect 自身分配（Scope 路径下为 scope.allocator；Arena 路径用 fallback）
+    /// For effect self-allocation (Scope path: scope.allocator; Arena path: fallback)
     scope_allocator: ?std.mem.Allocator = null,
 
-    /// Effect 是否在待执行队列中 (避免重复添加)
+    /// Effect in execution queue (avoid duplicate-add)
     is_queued: bool = false,
-    /// Effect 是否正在运行 (用于防止递归执行)
+    /// Effect running (prevent recursive execute)
     is_running: bool = false,
-    /// 运行中被再次触发时,标记需要重跑
+    /// Marked needs re-run when re-triggered mid-execution
     needs_rerun: bool = false,
 
-    /// 在 ReactiveGraph 中的对应 NodeId raw（0xFFFFFFFF = 未注册）。
-    /// Effect create 时注册；run 通过 graph 拓扑序调度走过来。
+    /// Corresponding NodeId raw in ReactiveGraph (0xFFFFFFFF = unregistered).
+    /// Register on effect create; run arrives via graph topological order.
     graph_node_raw: u32 = 0xFFFFFFFF,
 
     pub const VTable = struct {
-        /// 运行 Effect
+        /// Run Effect
         run: *const fn (*EffectBase) void,
 
-        /// 清理 Effect
+        /// Clean up Effect
         cleanup: *const fn (*EffectBase) void,
 
-        /// 释放具体类型内存（Scope dispose 时使用）
-        /// 为 null 表示由 Arena 管理（旧路径）
+        /// Free concrete type memory (Scope dispose uses this);
+        /// null means Arena-managed (old path)
         destroy: ?*const fn (*EffectBase, std.mem.Allocator) void = null,
     };
 
-    /// 初始化 EffectBase
+    /// Initialize EffectBase
     pub fn init(allocator: std.mem.Allocator, vtable: *const VTable) EffectBase {
         _ = allocator;
         return .{
@@ -47,28 +46,27 @@ pub const EffectBase = struct {
         };
     }
 
-    /// 运行 Effect
+    /// Run Effect
     pub fn run(self: *EffectBase) void {
         self.vtable.run(self);
     }
 
-    /// 清理 Effect
+    /// Clean Effect
     pub fn cleanup(self: *EffectBase) void {
         self.vtable.cleanup(self);
     }
 
-    /// 释放具体类型内存（由 Scope dispose 调用）
+    /// Free concrete type memory (Scope dispose calls)
     pub fn destroy(self: *EffectBase, allocator: std.mem.Allocator) void {
         if (self.vtable.destroy) |destroyFn| {
             destroyFn(self, allocator);
         }
     }
 
-    /// 运行 Effect 并重新收集依赖,带重入保护
+    /// Run Effect and re-collect dependencies, with reentry guard
     ///
-    /// runWithTrackingFast，跳过 graph.clearSources/pushTracking 设置。
-    /// 仅由 graph.recomputeNode -> graphRecomputeCb 路径调用，graph 已经做了
-    /// 这两步。省去 1k fanout 下每 effect ~30 ns 的重复 push/pop。
+    /// runWithTrackingFast skips graph.clearSources/pushTracking setup. Call it only from
+    /// graph.recomputeNode -> graphRecomputeCb, which already did those.
     pub fn runWithTrackingFast(self: *EffectBase, owner: anytype) void {
         if (self.is_running) {
             self.needs_rerun = true;
@@ -108,9 +106,11 @@ pub const EffectBase = struct {
         }
     }
 
-    /// 单轨追踪，push/pop graph.tracking_stack + clearSources。
-    /// 用于 (a) 创建时初次 run（effect.zig:50/75）和 (b) batch.flush 路径（batch.zig:93）。
-    /// graph.recomputeNode -> graphRecomputeCb 路径请用 runWithTrackingFast 跳过重复设置。
+    /// Single-track: push/pop graph.tracking_stack + clearSources.
+    /// For (a) effect create initial run (effect.zig:50/75) and (b) batch.flush path
+    /// (batch.zig:93).
+    /// graph.recomputeNode -> graphRecomputeCb path use runWithTrackingFast to skip duplicate
+    /// setup.
     pub fn runWithTracking(self: *EffectBase, owner: anytype, allocator: std.mem.Allocator) void {
         if (self.is_running) {
             self.needs_rerun = true;
@@ -131,12 +131,13 @@ pub const EffectBase = struct {
         while (true) {
             self.needs_rerun = false;
 
-            // 设置当前 Effect (兼容 untrack 检测，signal.get 还需要 owner.current_effect)
+            // Set current Effect (compatible with untrack detection; signal.get still needs
+            // owner.current_effect)
             const prev_effect = owner.current_effect;
             owner.current_effect = self;
             defer owner.current_effect = prev_effect;
 
-            // 单轨追踪：push graph node，让 signal.get -> graph.trackRead 加边
+            // Single-track: push graph node, let signal.get -> graph.trackRead add edge
             const has_graph = comptime @hasField(@TypeOf(owner.*), "graph");
             const has_node = has_graph and self.graph_node_raw != 0xFFFFFFFF;
             if (has_node) {
@@ -153,7 +154,7 @@ pub const EffectBase = struct {
             }
             defer if (has_node) owner.graph.popTracking();
 
-            // 执行 Effect
+            // Execute Effect
             self.run();
 
             if (!self.needs_rerun) break;

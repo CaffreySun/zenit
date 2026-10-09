@@ -1,36 +1,36 @@
-//! Layout Constraints, Taffy-style LayoutInput / AvailableSpace
+//! Layout Constraints, Taffy-style LayoutInput / AvailableSpace.
 //!
-//! 取代当前 layout_engine.zig 的"先 layout 后 fitResizeAfterLayout 回填"模型。
-//! 子算法接收 LayoutInput，返回 LayoutOutput；约束沿父->子方向单向流动，
-//! 不再有"父布完后回头读子尺寸再修正自己"的多遍。
+//! A child algorithm receives LayoutInput and returns LayoutOutput; constraints flow
+//! parent->child only, with no 'read child size after layout then revise self' extra passes.
 //!
-//! 历史债避免（吸取 zenit 当前 .fit 三遍修正 + Chromium 早期 layout-thrash 教训）：
-//! 1. AvailableSpace 三态枚举（Definite/MinContent/MaxContent）覆盖 CSS 全部约束语义
-//! 2. run_mode 区分"只测尺寸"和"真正 layout"两条路径，让 intrinsic 测量走 cache-friendly 短路径
-//! 3. known_dimensions 让父能直接传"已知值"避免子重算
+//! Design points:
+//! 1. AvailableSpace three-state enum (Definite/MinContent/MaxContent) covers CSS constraint
+//!    semantics
+//! 2. run_mode separates 'measure only' from 'real layout' (cache-friendly intrinsic measurement)
+//! 3. known_dimensions lets the parent pass known values so the child avoids recalculation
 //!
-//! 设计参照：
+//! design reference:
 //! - Taffy LayoutInput (DioxusLabs/taffy/src/tree/layout.rs)
 //! - Flutter BoxConstraints (flutter/lib/src/rendering/box.dart)
-//! - CSS § "Available space" / "Min/Max-content contributions"
+//! - CSS 'Available space' / 'Min/Max-content contributions'
 
 const std = @import("std");
 const testing = std.testing;
 
-/// 一个轴上的可用空间。CSS spec § "available space"。
+/// available space on one axis. CSS spec § 'available space'.
 pub const AvailableSpace = union(enum) {
-    /// 明确的浮点像素值
+    /// definite floating-point pixel value
     definite: f32,
-    /// "min-content"：内容最小所需（每个 child 取自身 min-content）
+    /// 'min-content': minimum content need (each child gets own min-content)
     min_content,
-    /// "max-content"：内容偏好（每个 child 取自身 max-content）
+    /// 'max-content': content preference (each child gets own max-content)
     max_content,
 
     pub fn isDefinite(self: AvailableSpace) bool {
         return self == .definite;
     }
 
-    /// 取出确定值；非 definite 返回 fallback
+    /// extract definite value; non-definite returns fallback
     pub fn definiteOr(self: AvailableSpace, fallback: f32) f32 {
         return switch (self) {
             .definite => |v| v,
@@ -38,7 +38,7 @@ pub const AvailableSpace = union(enum) {
         };
     }
 
-    /// 减一个确定值后的新 AvailableSpace（child padding/margin 扣除）
+    /// new AvailableSpace after subtracting definite value (child padding/margin deduction)
     pub fn subtractDefinite(self: AvailableSpace, x: f32) AvailableSpace {
         return switch (self) {
             .definite => |v| .{ .definite = @max(0, v - x) },
@@ -46,7 +46,7 @@ pub const AvailableSpace = union(enum) {
         };
     }
 
-    /// 与 max 取较小确定值；非确定不变
+    /// take min with max, definite; non-definite unchanged
     pub fn clampMax(self: AvailableSpace, max: f32) AvailableSpace {
         return switch (self) {
             .definite => |v| .{ .definite = @min(v, max) },
@@ -55,7 +55,7 @@ pub const AvailableSpace = union(enum) {
     }
 };
 
-/// 二维向量（与现 types.Size / Point 不耦合，避免循环 import）
+/// 2D vector (uncoupled from current types.Size / Point, avoid circular import)
 pub const Vec2 = struct {
     x: f32 = 0,
     y: f32 = 0,
@@ -78,7 +78,7 @@ pub const Size2D = struct {
     }
 };
 
-/// 二维 AvailableSpace
+/// 2D AvailableSpace
 pub const AvailableSpaceXY = struct {
     width: AvailableSpace,
     height: AvailableSpace,
@@ -92,7 +92,7 @@ pub const AvailableSpaceXY = struct {
     }
 };
 
-/// 已知维度（父已确定的 child 尺寸；让 child 不必重算自身）。null = 未知。
+/// known dimensions (parent-determined child size; child doesn't recalculate self). null = unknown.
 pub const KnownDimensions = struct {
     width: ?f32 = null,
     height: ?f32 = null,
@@ -100,26 +100,26 @@ pub const KnownDimensions = struct {
     pub const NONE: KnownDimensions = .{};
 };
 
-/// run_mode = layout 子算法运行模式
-/// - perform_layout：完整布局，写入 final_rect、bubble 子树
-/// - measure：仅测量返回尺寸；不写入持久化布局结果（用于 intrinsic 探测）
+/// run_mode = layout child-algorithm run mode
+/// - perform_layout: full layout, write final_rect, bubble subtree
+/// - measure: only measure return size; don't write persistent layout result (for intrinsic probe)
 pub const RunMode = enum(u8) {
     perform_layout,
     measure,
 };
 
-/// 父->子的布局输入。
+/// parent->child layout input.
 pub const LayoutInput = struct {
-    /// 父能给我多少空间（每轴一个 AvailableSpace）
+    /// how much space can parent give me (per axis one AvailableSpace)
     available_space: AvailableSpaceXY,
-    /// 父已经替我决定好的尺寸（我不再决定，直接用）
+    /// parent already determined size for me (I don't decide, use directly)
     known_dimensions: KnownDimensions = .{},
-    /// 父自身尺寸（用于百分比解析）
+    /// parent's own size (for percentage resolution)
     parent_size: Size2D = .{},
-    /// 主轴方向（flex/grid 子算法用）
-    /// 0 = horizontal/row，1 = vertical/column
+    /// primary-axis direction (flex/grid child algorithm use)
+    /// 0 = horizontal/row, 1 = vertical/column
     axis: u2 = 0,
-    /// 运行模式
+    /// run mode
     run_mode: RunMode = .perform_layout,
 
     pub fn forMeasure(available: AvailableSpaceXY) LayoutInput {
@@ -127,21 +127,20 @@ pub const LayoutInput = struct {
     }
 };
 
-/// 子->父的布局结果。
+/// child->parent layout output.
 pub const LayoutOutput = struct {
-    /// 测得的内容尺寸（不含 outer margin）
+    /// measured content size (no outer margin)
     size: Size2D,
-    /// 第一行 baseline 距离 size.height 的 y 偏移；null = 无 baseline 概念
+    /// first-line baseline distance from size.height's y offset; null = no baseline concept
     first_baseline: ?f32 = null,
-    /// 最后一行 baseline；用于 align-items: last baseline
+    /// last-line baseline; for align-items: last baseline
     last_baseline: ?f32 = null,
 
     pub const ZERO: LayoutOutput = .{ .size = Size2D.ZERO };
 };
 
-/// Intrinsic size cache，同一节点同输入的 measure 复用结果。
-/// 简单 4-entry direct-mapped cache（cache-line 友好；查找 O(1)）。
-/// Phase 3 拆 Node 时挂到 LayoutTable 旁。
+/// Intrinsic size cache, same node same input measure reuses result. simple 4-entry direct-mapped
+/// cache (cache-line friendly; lookup O(1)). Phase 3 unpacking Node hung by LayoutTable side.
 pub const IntrinsicCache = struct {
     pub const ENTRY_COUNT: usize = 4;
 
@@ -151,7 +150,7 @@ pub const IntrinsicCache = struct {
         output: LayoutOutput = .ZERO,
     };
 
-    entries: [ENTRY_COUNT]Entry = [_]Entry{.{}} ** ENTRY_COUNT,
+    entries: [ENTRY_COUNT]Entry = @as([ENTRY_COUNT]Entry, @splat(.{})),
 
     pub fn get(self: *const IntrinsicCache, input_hash: u64) ?LayoutOutput {
         const slot = @as(usize, input_hash) % ENTRY_COUNT;
@@ -174,7 +173,7 @@ pub const IntrinsicCache = struct {
     }
 };
 
-/// 计算 LayoutInput 的稳定 hash，用于 intrinsic cache 索引。
+/// compute LayoutInput stable hash, used for intrinsic cache index.
 pub fn hashLayoutInput(input: LayoutInput) u64 {
     var hasher = std.hash.Wyhash.init(0xCAFEBABE);
     hashAvailable(&hasher, input.available_space.width);
@@ -183,7 +182,7 @@ pub fn hashLayoutInput(input: LayoutInput) u64 {
     hashOptF32(&hasher, input.known_dimensions.height);
     hasher.update(std.mem.asBytes(&input.parent_size.width));
     hasher.update(std.mem.asBytes(&input.parent_size.height));
-    hasher.update(&[_]u8{ input.axis, @intFromEnum(input.run_mode) });
+    hasher.update(&[_]u8{ input.axis, @backingInt(input.run_mode) });
     return hasher.final();
 }
 
@@ -286,11 +285,11 @@ test "IntrinsicCache: collision overwrites slot" {
     const out_a = LayoutOutput{ .size = .{ .width = 100, .height = 50 } };
     const out_b = LayoutOutput{ .size = .{ .width = 200, .height = 60 } };
 
-    // 两个 hash 模 ENTRY_COUNT 相等 -> 后者覆盖
+    // two hash mod ENTRY_COUNT equal -> latter overwrites
     cache.put(0, out_a);
     cache.put(IntrinsicCache.ENTRY_COUNT, out_b);
 
-    try testing.expect(cache.get(0) == null); // 覆盖
+    try testing.expect(cache.get(0) == null); // overwrite
     const got = cache.get(IntrinsicCache.ENTRY_COUNT).?;
     try testing.expectEqual(@as(f32, 200), got.size.width);
 }

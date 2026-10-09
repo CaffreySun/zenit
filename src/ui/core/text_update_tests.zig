@@ -1,7 +1,7 @@
 const std = @import("std");
 const ui = @import("../core.zig");
 test "text publication: imperative label update relayouts" {
-    var cx = try ui.Cx.init(std.testing.allocator);
+    var cx = try ui.Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
     const label = try ui.text(cx, "a", .{ .font_size = 14 });
@@ -17,27 +17,28 @@ test "text publication: imperative label update relayouts" {
 }
 
 test "text publication: NumberStepper resizes after digit count change" {
-    const cx = try ui.Cx.init(std.testing.allocator);
+    const cx = try ui.Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
     const root = try ui.box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
     cx.root = root;
     const scope = try ui.Scope.init(cx.allocator, null, cx.owner);
     defer scope.dispose();
-    const stepper = try @import("../components/number_stepper/mod.zig").mountNumberStepper(.{ .value = 9 }, scope, cx);
+    const stepper = try @import("../components/number_stepper/mod.zig").NumberStepper(.{ .value = 9 }).mount(scope, cx);
+    const value_node: *ui.Node = @as(*@import("../components/number_stepper/mod.zig").NumberStepperRuntime, @ptrCast(@alignCast(stepper.wrapper.behavior.events.key_context.?))).value_node;
     try root.appendChild(cx.allocator, stepper.wrapper);
     cx.layout();
     _ = cx.render();
-    const before = stepper.state.value_node.rectFromWorldOrFallback().w;
-    stepper.state.setValue(10000);
+    const before = value_node.rectFromWorldOrFallback().w;
+    stepper.value.?.set(10000);
     cx.layout();
     _ = cx.render();
-    try std.testing.expectEqualStrings("10000", stepper.state.value_node.getText().?.content);
-    try std.testing.expect(stepper.state.value_node.rectFromWorldOrFallback().w > before + 10);
+    try std.testing.expectEqualStrings("10000", value_node.getText().?.content);
+    try std.testing.expect(value_node.rectFromWorldOrFallback().w > before + 10);
 }
 
 test "text publication: FormField error text updates measured width" {
-    const cx = try ui.Cx.init(std.testing.allocator);
+    const cx = try ui.Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
     const root = try ui.box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
@@ -63,7 +64,7 @@ test "text publication: FormField error text updates measured width" {
 }
 
 test "text publication: borrowed same-buffer edits change metrics and settle" {
-    const cx = try ui.Cx.init(std.testing.allocator);
+    const cx = try ui.Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
     // Deterministic proportional backend: headless default measurement assigns
@@ -76,7 +77,7 @@ test "text publication: borrowed same-buffer edits change metrics and settle" {
         }
     }.measure;
     defer @import("text_layout.zig").setMeasureFn(null);
-    var bytes = [_]u8{'i'} ** 5;
+    var bytes = @as([5]u8, @splat('i'));
     const label = try ui.text(cx, "", .{});
     label.setText(.{ .content = &bytes });
     cx.root = try ui.box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 100 }, .align_items = .start }, .{label});
@@ -95,7 +96,7 @@ test "text publication: borrowed same-buffer edits change metrics and settle" {
 }
 
 test "text publication: colors repaint and span metrics remeasure" {
-    const cx = try ui.Cx.init(std.testing.allocator);
+    const cx = try ui.Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
     const label = try ui.text(cx, "hello", .{});
@@ -129,7 +130,7 @@ test "text publication: colors repaint and span metrics remeasure" {
 }
 
 test "text publication: presence inline and owned replacements" {
-    const cx = try ui.Cx.init(std.testing.allocator);
+    const cx = try ui.Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
     const label = try ui.text(cx, "hello", .{});
@@ -154,7 +155,7 @@ test "text publication: presence inline and owned replacements" {
 }
 
 test "text publication: wrapped content remeasures height" {
-    const cx = try ui.Cx.init(std.testing.allocator);
+    const cx = try ui.Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
     const label = try ui.text(cx, "first", .{ .wrap = .newline_only });
@@ -170,7 +171,7 @@ test "text publication: wrapped content remeasures height" {
 
 test "text publication: setContent 长文本经节点替换 / 销毁不泄漏、不截断" {
     const alloc = std.testing.allocator;
-    const cx = try ui.Cx.init(alloc);
+    const cx = try ui.Cx.init(alloc, std.testing.io);
     defer cx.deinit();
     const node = try ui.text(cx, "", .{});
     defer cx.freeNode(node);

@@ -1,51 +1,31 @@
-/// devtools_probe, DevTools Performance 面板的真窗口验收探针
+/// devtools_probe: real-window acceptance probe for DevTools Performance panel.
 ///
-/// 两个原生窗口：target（可被强制驱动/停帧）+ DevTools panel（mountPanel，
-/// 切到 Performance 页）。`ZENIT_SMOKE_FRAMES=N` 下按阶段断言：
+/// Two native windows: target (force-driven/paused) + DevTools panel (mountPanel,
+/// switch to Performance page). Under `ZENIT_SMOKE_FRAMES=N`, assert by phase:
 ///
-///   Phase A（active）：每 tick 强制 target 重绘,
-///     a) target 帧间隔历史被回填（frame_perf.interval 非空）；
-///     b) DevTools FPS 文本离开 mount 初值（"FPS: {n}" 滚动均值且非 0）；
-///     c) DevTools 窗口自身持续渲染（保活链没断，历史 bug：target 活跃时
-///        DevTools 不调度下一次 poll，面板只有鼠标划过才动）。
+///   Phase A (active): force redraw target each tick:
+///     a) target frame interval history populated (frame_perf.interval non-empty);
+///     b) DevTools FPS text leaves mount initial ("FPS: {n}" rolling average, non-zero);
+///     c) DevTools window keeps rendering (keep-alive chain intact; it must schedule the next
+///        poll while target is active, not only move on mouse hover).
 ///
-///   Phase B（idle）：停止驱动 target ≥1.3s,
-///     d) target 真停帧（renderer.frame_count 基本不动）；
-///     e) DevTools 仍在自轮询渲染（frame_count 继续推进）；
-///     f) FPS 文本出现 idle 标注（区分「没在渲染」与「稳定高帧率」）。
+///   Phase B (idle): stop driving target for >= 1.3s:
+///     d) target truly stops (renderer.frame_count barely moves);
+///     e) DevTools still self-polling render (frame_count continues);
+///     f) FPS text shows idle annotation (distinguish "not rendering" from "stable high fps").
 ///
-/// 无 ZENIT_SMOKE_FRAMES 时作为普通 demo 常驻运行，供人工目检。
+/// Target UI is written in view.yix. Without ZENIT_SMOKE_FRAMES it runs as a normal demo
+/// for manual inspection.
 const std = @import("std");
 const ui = @import("ui");
 const zenit_app = @import("zenit_app");
 const MultiWindowApp = zenit_app.MultiWindowApp;
-
-const Padding = ui.Padding;
+const Target = @import("_view.yix.zig").Target;
 
 var g_target_cx: ?*ui.Cx = null;
 
 fn mountTarget(cx: *ui.Cx, scope: *ui.Scope) anyerror!*ui.Node {
-    _ = scope;
-    const root = try ui.box(cx, .{
-        .width = .fill(),
-        .height = .fill(),
-        .direction = .column,
-        .gap = 12,
-        .padding = Padding.all(32),
-        .background = cx.tokens.color.bg_primary,
-        .align_items = .center,
-        .justify = .center,
-    }, .{});
-    try root.appendChild(cx.allocator, try ui.text(cx, "devtools probe target", .{
-        .font_size = ui.arb.px(20),
-        .font_weight = 600,
-        .color = cx.tokens.color.fg_primary,
-    }));
-    try root.appendChild(cx.allocator, try ui.text(cx, "smoke 模式下由驱动线程强制重绘/停帧", .{
-        .font_size = ui.arb.px(12),
-        .color = cx.tokens.color.fg_secondary,
-    }));
-    return root;
+    return ui.view.render(scope, cx, Target(.{}));
 }
 
 fn mountDevtools(cx: *ui.Cx, scope: *ui.Scope) anyerror!*ui.Node {
@@ -71,22 +51,23 @@ fn fpsText(dev_cx: *ui.Cx) ?[]const u8 {
     return tp.content;
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+pub fn main(init: std.process.Init) !void {
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
     const smoke_frames: ?u64 = blk: {
-        const v = std.posix.getenv("ZENIT_SMOKE_FRAMES") orelse break :blk null;
-        break :blk std.fmt.parseInt(u64, v, 10) catch null;
+        const env = @import("zenit_environment").getBorrowed("ZENIT_SMOKE_FRAMES") orelse break :blk null;
+        break :blk std.fmt.parseInt(u64, env, 10) catch null;
     };
     const frame_pacing: zenit_app.runtime.FramePacing = if (smoke_frames != null) .poll else .display_link;
 
     var application = MultiWindowApp.init(allocator, .{ .pump_timeout_ms = 16 });
     defer application.deinit();
 
-    // idle 停帧必须开着：Phase B 验的就是「target 停帧后 DevTools 仍自轮询」。
+    // idle frame gating must be on: Phase B verifies "DevTools self-polls after target stops".
     const app_target = try application.createWindowWith(.{
+        .io = init.io,
         .window = .{ .width = 480, .height = 320, .title = "probe target" },
         .frame_pacing = frame_pacing,
         .idle_skip_frames = true,
@@ -94,6 +75,7 @@ pub fn main() !void {
     g_target_cx = app_target.cx;
 
     const app_dev = try application.createWindowWith(.{
+        .io = init.io,
         .window = .{ .width = 760, .height = 560, .title = "Probe DevTools" },
         .frame_pacing = frame_pacing,
         .idle_skip_frames = true,
@@ -105,7 +87,7 @@ pub fn main() !void {
     }
 
     if (smoke_frames) |limit| {
-        // ── Phase A: target 活跃 ──
+        // -- Phase A: target active --
         for (0..@max(limit, 60)) |_| {
             app_target.cx.needs_redraw = true;
             _ = try application.tick();
@@ -122,28 +104,29 @@ pub fn main() !void {
             std.log.err("[devtools_probe] FAIL: FPS 文本停在 mount 初值: '{s}'", .{fps_a});
             return error.FpsTextNeverUpdated;
         }
-        if (std.mem.startsWith(u8, fps_a, "FPS: 0")) {
-            std.log.err("[devtools_probe] FAIL: 活跃期 FPS 为 0: '{s}'", .{fps_a});
+        const live_a = ui.devtools.perfCurrentFps(app_dev.cx) orelse return error.DevtoolsStateMissing;
+        if (live_a == 0) {
+            std.log.err("[devtools_probe] FAIL: 活跃期监控 FPS 为 0: '{s}'", .{fps_a});
             return error.FpsStuckAtZero;
         }
         if (app_dev.renderer.frame_count < 3) {
             std.log.err("[devtools_probe] FAIL: DevTools 窗口活跃期几乎没渲染（保活断链） frames={d}", .{app_dev.renderer.frame_count});
             return error.DevtoolsStarvedWhileTargetActive;
         }
-        std.log.info("[devtools_probe] phase-A ok: target_frames={d} dev_frames={d} fps='{s}'", .{
-            app_target.renderer.frame_count, app_dev.renderer.frame_count, fps_a,
+        std.log.info("[devtools_probe] phase-A ok: target_frames={d} dev_frames={d} live_fps={d} fps='{s}'", .{
+            app_target.renderer.frame_count, app_dev.renderer.frame_count, live_a, fps_a,
         });
 
-        // ── Phase B: target 停帧 ──
+        // -- Phase B: target paused --
         const target_frames_before = app_target.renderer.frame_count;
         const dev_frames_before = app_dev.renderer.frame_count;
-        const idle_start = try std.time.Instant.now();
+        const idle_start = try @import("zenit_time").Instant.now(init.io);
         while (true) {
             _ = try application.tick();
-            const now = try std.time.Instant.now();
+            const now = try @import("zenit_time").Instant.now(init.io);
             if (now.since(idle_start) > 1_300_000_000) break;
         }
-        // 允许极少量收尾帧（脏标记消费），但不能持续渲染。
+        // Allow minimal trailing frames (dirty mark consumption); no sustained rendering.
         if (app_target.renderer.frame_count > target_frames_before + 5) {
             std.log.err("[devtools_probe] FAIL: target 未真正停帧 {d}→{d}", .{ target_frames_before, app_target.renderer.frame_count });
             return error.TargetNeverIdled;
@@ -157,16 +140,17 @@ pub fn main() !void {
             std.log.err("[devtools_probe] FAIL: 停帧 >1.3s 后无 idle 标注: '{s}'", .{fps_b});
             return error.IdleIndicatorMissing;
         }
-        // 滚动监控：停帧期间图表必须继续向前滚（当前 FPS 掉 0），
-        // 而不是把活跃期快照冻在屏上。
-        if (!std.mem.startsWith(u8, fps_b, "FPS: 0")) {
-            std.log.err("[devtools_probe] FAIL: 停帧后当前 FPS 未掉 0（监控没在滚动）: '{s}'", .{fps_b});
+        // Chart scroll: during pause, chart must advance (current FPS drops to 0), not
+        // freeze active snapshot. Assert monitor data itself; FPS line text only displays.
+        const live_b = ui.devtools.perfCurrentFps(app_dev.cx) orelse return error.DevtoolsStateMissing;
+        if (live_b != 0) {
+            std.log.err("[devtools_probe] FAIL: 停帧后监控 FPS 未掉 0（监控没在滚动）: {d} '{s}'", .{ live_b, fps_b });
             return error.MonitorNotRolling;
         }
-        std.log.info("[devtools_probe] phase-B ok: target {d}→{d} dev {d}→{d} fps='{s}'", .{
+        std.log.info("[devtools_probe] phase-B ok: target {d}->{d} dev {d}->{d} live_fps={d} fps='{s}'", .{
             target_frames_before, app_target.renderer.frame_count,
             dev_frames_before,    app_dev.renderer.frame_count,
-            fps_b,
+            live_b,               fps_b,
         });
         std.log.info("[devtools_probe] smoke ok", .{});
         return;

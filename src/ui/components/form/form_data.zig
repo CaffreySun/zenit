@@ -1,11 +1,11 @@
-/// FormOf(T), comptime 泛型表单数据 + 验证层
+/// FormOf(T), comptime generic form data + validation layer
 ///
-/// 基于 StoreOf(T) 实现细粒度表单状态管理：
-/// - 每字段独立 Signal（值 + error + touched + dirty）
-/// - comptime 提取 T.rules 声明，编译期生成验证函数
-/// - 验证时机可配置（onChange / onBlur / onSubmit）
+/// Implements fine-grained form state management based on StoreOf(T):
+/// - Each field has independent Signal (value + error + touched + dirty)
+/// - Extracts T.rules at comptime, generates validation functions at compile-time
+/// - Validation timing configurable (onChange / onBlur / onSubmit)
 ///
-/// 用法:
+/// Usage:
 /// ```zig
 /// const LoginForm = struct {
 ///     email: []const u8,
@@ -13,7 +13,7 @@
 ///     pub const rules = .{
 ///         .email = struct {
 ///             fn validate(v: []const u8) ValidationResult {
-///                 if (v.len == 0) return .{ .valid = false, .message = "必填" };
+///                 if (v.len == 0) return .{ .valid = false, .message = "required" };
 ///                 return .{ .valid = true };
 ///             }
 ///         }.validate,
@@ -21,7 +21,8 @@
 /// };
 ///
 /// const form = try FormOf(LoginForm).create(scope, .{ .email = "", .password = "" }, .{});
-/// form.setValue(.email, "test@example.com");
+/// form.setValue(.email, "test@example.com");   // text field copies content
+/// // field signal can be bound directly to component: W.Input(.{ .value = form.field(.email) })
 /// form.touchField(.email);
 /// if (form.validateAll()) { ... }
 /// ```
@@ -30,38 +31,38 @@ const Allocator = std.mem.Allocator;
 const core = @import("../../core.zig");
 const Scope = core.Scope;
 const Signal = core.Signal;
+const Handler = core.Handler;
 const StoreOf = @import("../../reactive/store.zig").StoreOf;
 
-/// 验证时机
+/// Validation timing
 pub const ValidateTrigger = enum {
-    /// 值变化时立即验证
+    /// Validate immediately on value change
     on_change,
-    /// 失焦时验证
+    /// Validate on blur
     on_blur,
-    /// 仅提交时验证
+    /// Validate only on submit
     on_submit,
 };
 
-/// 验证规则返回值
+/// Validation rule return value
 pub const ValidationResult = struct {
     valid: bool,
     message: ?[]const u8 = null,
 };
 
-/// 单字段元数据
+/// Per-field metadata
 pub const FieldMeta = struct {
-    /// 错误消息（null = 无错误）
+    /// Error message (null = no error)
     error_sig: *Signal(?[]const u8),
-    /// 是否被触碰过（blur 后为 true）
+    /// Whether touched (true after blur)
     touched_sig: *Signal(bool),
-    /// 是否被修改过（值 != 初始值）
+    /// Whether modified (value != initial)
     dirty_sig: *Signal(bool),
 };
 
-/// comptime 泛型表单
+/// comptime generic form
 pub fn FormOf(comptime T: type) type {
-    const info = @typeInfo(T).@"struct";
-    const field_count = info.fields.len;
+    const field_count = @import("zenit_reflection").fields(T).len;
     const has_rules = @hasDecl(T, "rules");
 
     return struct {
@@ -72,25 +73,24 @@ pub fn FormOf(comptime T: type) type {
         metas: [field_count]FieldMeta,
         scope: *Scope,
         trigger: ValidateTrigger,
+        /// Reset initial values; text fields are form's own copies (freed on destroy)
         initial_values: T,
-        /// setValueCopy 为 []const u8 字段持有的副本（form 生命周期内有效，destroy 时释放）。
-        owned_text: [field_count]?[]u8 = [_]?[]u8{null} ** field_count,
+        initial_text: [field_count]?[]u8 = @as([field_count]?[]u8, @splat(null)),
 
-        /// 提交回调
-        on_submit: ?*const fn (T, *anyopaque) void,
-        submit_context: ?*anyopaque,
+        /// Validated submission: snapshot of values (text slices valid only during callback)
+        on_submit: ?Handler(T),
 
-        /// 创建 Form 实例
+        /// Create Form instance
         pub fn create(
             scope: *Scope,
             initial: T,
             config: struct {
                 trigger: ValidateTrigger = .on_blur,
-                on_submit: ?*const fn (T, *anyopaque) void = null,
-                submit_context: ?*anyopaque = null,
+                on_submit: ?Handler(T) = null,
             },
         ) !*Self {
             const form_scope = try scope.childScope();
+            errdefer form_scope.dispose();
             const store = try StoreOf(T).create(form_scope, initial);
 
             var metas: [field_count]FieldMeta = undefined;
@@ -110,81 +110,79 @@ pub fn FormOf(comptime T: type) type {
                 .trigger = config.trigger,
                 .initial_values = initial,
                 .on_submit = config.on_submit,
-                .submit_context = config.submit_context,
             };
-
+            // On adopt failure, destroy self immediately (initial_text all empty at this point)
             try form_scope.adoptResource(@ptrCast(self), struct {
                 fn destroy(ptr: *anyopaque, alloc: Allocator) void {
                     const s: *Self = @ptrCast(@alignCast(ptr));
-                    for (s.owned_text) |buf| if (buf) |b| alloc.free(b);
+                    for (s.initial_text) |buf| if (buf) |b| alloc.free(b);
                     alloc.destroy(s);
                 }
             }.destroy);
+            // Copy text initial values: caller may pass temp buffer, needed for reset
+            inline for (@import("zenit_reflection").fields(T), 0..) |f, i| {
+                if (f.type == []const u8) {
+                    const copy = try form_scope.allocator.dupe(u8, @field(initial, f.name));
+                    self.initial_text[i] = copy;
+                    @field(self.initial_values, f.name) = copy;
+                }
+            }
 
             return self;
         }
 
-        /// 获取字段值（自动追踪依赖）
-        pub fn get(self: *const Self, comptime field: FieldEnum) FieldType(field) {
-            return self.store.get(field);
+        /// Get field value (auto-track dependencies)
+        pub fn get(self: *const Self, comptime fe: FieldEnum) FieldType(fe) {
+            return self.store.get(fe);
         }
 
-        /// 设置字段值 + 标记 dirty + 按策略验证
-        pub fn setValue(self: *Self, comptime field: FieldEnum, value: FieldType(field)) void {
-            self.store.set(field, value);
-            const idx = @intFromEnum(field);
+        /// Set field value + mark dirty + validate per strategy
+        pub fn setValue(self: *Self, comptime fe: FieldEnum, value: FieldType(fe)) void {
+            self.store.set(fe, value);
+            const idx = @backingInt(fe);
             self.metas[idx].dirty_sig.set(true);
             if (self.trigger == .on_change) {
-                self.validateField(field);
+                self.validateField(fe);
             }
         }
 
-        /// setValue 的拷贝版（仅 []const u8 字段）：value 只需在调用期间有效
-        /// （如 Input on_change 传入的内部缓冲切片），form 自持一份副本。
-        /// 先分配新副本、set、再释放旧副本，Signal 按内容比较，旧值必须仍可读。
-        pub fn setValueCopy(self: *Self, comptime field: FieldEnum, value: []const u8) !void {
-            comptime std.debug.assert(FieldType(field) == []const u8);
-            const idx = @intFromEnum(field);
-            const alloc = self.scope.allocator;
-            const copy = try alloc.dupe(u8, value);
-            const old = self.owned_text[idx];
-            self.owned_text[idx] = copy;
-            self.setValue(field, copy);
-            if (old) |b| alloc.free(b);
+        /// Field signal (owned text / regular value), can bind directly to component
+        pub fn field(self: *const Self, comptime f: FieldEnum) *Signal(FieldType(f)) {
+            return self.store.field(f);
         }
 
-        /// 标记字段 touched（blur 时调用）
-        pub fn touchField(self: *Self, comptime field: FieldEnum) void {
-            const idx = @intFromEnum(field);
+        /// Mark field touched (called on blur)
+        pub fn touchField(self: *Self, comptime fe: FieldEnum) void {
+            const idx = @backingInt(fe);
             self.metas[idx].touched_sig.set(true);
             if (self.trigger == .on_blur) {
-                self.validateField(field);
+                self.validateField(fe);
             }
         }
 
-        /// 验证单个字段（comptime 提取规则）
-        pub fn validateField(self: *Self, comptime field: FieldEnum) void {
-            const idx = @intFromEnum(field);
+        /// Validate single field (extract rules at comptime)
+        pub fn validateField(self: *Self, comptime fe: FieldEnum) void {
+            const idx = @backingInt(fe);
             if (has_rules) {
-                const field_name = info.fields[idx].name;
+                const field_name = @import("zenit_reflection").fields(T)[idx].name;
                 const RulesType = @TypeOf(T.rules);
                 if (@hasField(RulesType, field_name)) {
                     const rule_fn = @field(T.rules, field_name);
-                    const value = self.store.get(field);
+                    const value = self.store.get(fe);
                     const result = rule_fn(value);
                     self.metas[idx].error_sig.set(result.message);
                     return;
                 }
             }
-            // 无规则 -> 清空错误
+            // No rules -> clear error
             self.metas[idx].error_sig.set(null);
         }
 
-        /// 全量验证所有字段
+        /// Validate all fields
         pub fn validateAll(self: *Self) bool {
             var all_valid = true;
-            const values = self.store.snapshot(); // peek 所有字段，无依赖追踪
-            inline for (info.fields, 0..) |f, i| {
+            const values = self.store.snapshot(); // Peek all fields, no dependency tracking
+            inline for (@import("zenit_reflection").fields(T), 0..) |f, i| {
                 self.metas[i].touched_sig.set(true);
                 if (has_rules) {
                     const RulesType = @TypeOf(T.rules);
@@ -200,20 +198,26 @@ pub fn FormOf(comptime T: type) type {
             return all_valid;
         }
 
-        /// 提交处理：全量验证 -> 通过则回调
+        /// Submit handler: full validation -> on success call callback
         pub fn handleSubmit(self: *Self) void {
             if (!self.validateAll()) return;
-            if (self.on_submit) |cb| {
-                if (self.submit_context) |ctx| {
-                    cb(self.store.snapshot(), ctx);
-                }
-            }
+            if (self.on_submit) |h| h.call(self.store.snapshot());
         }
 
-        /// 重置为初始值，清空所有 meta
+        /// Handler for submit button: `.on_click = form.submitHandler()`
+        pub fn submitHandler(self: *Self) Handler(void) {
+            return core.Cx.simpleHandler(submitThunk, self);
+        }
+
+        fn submitThunk(ptr: *anyopaque) void {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            self.handleSubmit();
+        }
+
+        /// Reset to initial values, clear all meta
         pub fn reset(self: *Self) void {
-            inline for (info.fields, 0..) |f, i| {
-                const field_enum: FieldEnum = @enumFromInt(i);
+            inline for (@import("zenit_reflection").fields(T), 0..) |f, i| {
+                const field_enum: FieldEnum = @fromBackingInt(@intCast(i));
                 self.store.set(field_enum, @field(self.initial_values, f.name));
                 self.metas[i].error_sig.set(null);
                 self.metas[i].touched_sig.set(false);
@@ -221,12 +225,12 @@ pub fn FormOf(comptime T: type) type {
             }
         }
 
-        /// 获取字段的 FieldMeta（给 FormField 使用）
-        pub fn meta(self: *Self, comptime field: FieldEnum) *FieldMeta {
-            return &self.metas[@intFromEnum(field)];
+        /// Get field FieldMeta (for FormField use)
+        pub fn meta(self: *Self, comptime fe: FieldEnum) *FieldMeta {
+            return &self.metas[@backingInt(fe)];
         }
 
-        /// 整体是否有错误
+        /// Does entire form have errors
         pub fn hasErrors(self: *Self) bool {
             for (&self.metas) |*m| {
                 if (m.error_sig.peek() != null) return true;
@@ -234,7 +238,7 @@ pub fn FormOf(comptime T: type) type {
             return false;
         }
 
-        /// 整体是否 dirty
+        /// Is entire form dirty
         pub fn isDirty(self: *Self) bool {
             for (&self.metas) |*m| {
                 if (m.dirty_sig.peek()) return true;
@@ -242,14 +246,14 @@ pub fn FormOf(comptime T: type) type {
             return false;
         }
 
-        /// 获取字段的类型
-        fn FieldType(comptime field: FieldEnum) type {
-            return std.meta.fieldInfo(T, field).type;
+        /// Get field type
+        fn FieldType(comptime fe: FieldEnum) type {
+            return std.meta.fieldInfo(T, fe).type;
         }
     };
 }
 
-// ========== 测试 ==========
+// ========== Tests ==========
 
 test "FormOf: create and get/set" {
     const TestForm = struct {
@@ -267,15 +271,15 @@ test "FormOf: create and get/set" {
 
     const form = try FormOf(TestForm).create(scope, .{ .name = "Alice", .age = 25 }, .{});
 
-    // 读取初始值
+    // Read initial value
     try std.testing.expectEqualStrings("Alice", form.get(.name));
     try std.testing.expectEqual(@as(i32, 25), form.get(.age));
 
-    // 设置值
+    // Set value
     form.setValue(.name, "Bob");
     try std.testing.expectEqualStrings("Bob", form.get(.name));
 
-    // dirty 应自动标记
+    // dirty should auto-mark
     try std.testing.expect(form.meta(.name).dirty_sig.peek());
     try std.testing.expect(!form.meta(.age).dirty_sig.peek());
 }
@@ -305,16 +309,16 @@ test "FormOf: validation rules" {
 
     const form = try FormOf(TestForm).create(scope, .{ .email = "", .name = "Alice" }, .{});
 
-    // 空 email 应报错
+    // Empty email should error
     form.validateField(.email);
     try std.testing.expectEqualStrings("Required", form.meta(.email).error_sig.peek().?);
 
-    // 填写后应通过
+    // After filling should pass
     form.setValue(.email, "test@example.com");
     form.validateField(.email);
     try std.testing.expect(form.meta(.email).error_sig.peek() == null);
 
-    // name 没有规则，validateField 不应报错
+    // name has no rules, validateField should not error
     form.validateField(.name);
     try std.testing.expect(form.meta(.name).error_sig.peek() == null);
 }
@@ -345,11 +349,11 @@ test "FormOf: on_change trigger auto-validates" {
         .trigger = .on_change,
     });
 
-    // 设置空值 -> 自动验证报错
+    // Set empty value -> auto-validate error
     form.setValue(.email, "");
     try std.testing.expectEqualStrings("Required", form.meta(.email).error_sig.peek().?);
 
-    // 设置有效值 -> 自动清除错误
+    // Set valid value -> auto-clear error
     form.setValue(.email, "a@b.com");
     try std.testing.expect(form.meta(.email).error_sig.peek() == null);
 }
@@ -380,11 +384,11 @@ test "FormOf: on_blur trigger" {
         .trigger = .on_blur,
     });
 
-    // setValue 不触发验证（on_blur 模式）
+    // setValue does not trigger validation (on_blur mode)
     form.setValue(.email, "");
     try std.testing.expect(form.meta(.email).error_sig.peek() == null);
 
-    // touchField 触发验证
+    // touchField triggers validation
     form.touchField(.email);
     try std.testing.expectEqualStrings("Required", form.meta(.email).error_sig.peek().?);
     try std.testing.expect(form.meta(.email).touched_sig.peek());
@@ -421,19 +425,19 @@ test "FormOf: validateAll and hasErrors" {
 
     const form = try FormOf(TestForm).create(scope, .{ .email = "", .password = "123" }, .{});
 
-    // validateAll 应返回 false
+    // validateAll should return false
     try std.testing.expect(!form.validateAll());
     try std.testing.expect(form.hasErrors());
 
-    // 两个字段都应有错误
+    // Both fields should have errors
     try std.testing.expectEqualStrings("Email required", form.meta(.email).error_sig.peek().?);
     try std.testing.expectEqualStrings("Min 6 chars", form.meta(.password).error_sig.peek().?);
 
-    // 所有字段应被标记为 touched
+    // All fields should be marked touched
     try std.testing.expect(form.meta(.email).touched_sig.peek());
     try std.testing.expect(form.meta(.password).touched_sig.peek());
 
-    // 修正后应全部通过
+    // After fix should all pass
     form.setValue(.email, "a@b.com");
     form.setValue(.password, "123456");
     try std.testing.expect(form.validateAll());
@@ -456,7 +460,7 @@ test "FormOf: reset" {
 
     const form = try FormOf(TestForm).create(scope, .{ .name = "Alice", .age = 25 }, .{});
 
-    // 修改并标脏
+    // Modify and mark dirty
     form.setValue(.name, "Bob");
     form.touchField(.name);
     form.meta(.name).error_sig.set("some error");
@@ -465,7 +469,7 @@ test "FormOf: reset" {
     try std.testing.expect(form.meta(.name).touched_sig.peek());
     try std.testing.expect(form.meta(.name).error_sig.peek() != null);
 
-    // 重置
+    // Reset
     form.reset();
     try std.testing.expectEqualStrings("Alice", form.get(.name));
     try std.testing.expectEqual(@as(i32, 25), form.get(.age));
@@ -502,26 +506,65 @@ test "FormOf: handleSubmit" {
     };
     var cb_state = CallbackState{};
 
+    const Recv = struct {
+        fn submit(state: *CallbackState, values: TestForm) void {
+            state.submitted = true;
+            state.submitted_email = values.email;
+        }
+    };
     const form = try FormOf(TestForm).create(scope, .{ .email = "" }, .{
-        .on_submit = struct {
-            fn submit(values: TestForm, ctx: *anyopaque) void {
-                const state: *CallbackState = @ptrCast(@alignCast(ctx));
-                state.submitted = true;
-                state.submitted_email = values.email;
-            }
-        }.submit,
-        .submit_context = @ptrCast(&cb_state),
+        .on_submit = @import("../../reactive.zig").Callback(TestForm).from(CallbackState, &cb_state, Recv.submit),
     });
 
-    // 空 email -> 验证失败 -> 不提交
+    // Empty email -> validation fail -> not submit
     form.handleSubmit();
     try std.testing.expect(!cb_state.submitted);
 
-    // 填写有效值 -> 提交
+    // Fill valid value -> submit via submitHandler (button use)
     form.setValue(.email, "a@b.com");
-    form.handleSubmit();
+    form.submitHandler().invoke();
     try std.testing.expect(cb_state.submitted);
     try std.testing.expectEqualStrings("a@b.com", cb_state.submitted_email);
+}
+
+test "FormOf: 文本字段与初值都是 form 自己的副本（临时缓冲改了不影响值与 reset）" {
+    const TestForm = struct { name: []const u8 };
+    const allocator = std.testing.allocator;
+    const SignalOwner = @import("../../reactive/owner.zig").SignalOwner;
+    var owner = try SignalOwner.init(allocator);
+    defer owner.deinit();
+    const scope = try Scope.init(allocator, null, owner);
+    defer scope.dispose();
+
+    var init_buf = "Alice".*;
+    const form = try FormOf(TestForm).create(scope, .{ .name = &init_buf }, .{});
+    init_buf[0] = 'X';
+    var typed = "Bob".*;
+    form.setValue(.name, &typed);
+    typed[0] = 'Y';
+    try std.testing.expectEqualStrings("Bob", form.get(.name));
+    try std.testing.expect(form.field(.name) == form.store.field(.name));
+    form.reset();
+    try std.testing.expectEqualStrings("Alice", form.get(.name));
+}
+
+test "form: create 在任意分配点失败时不泄漏" {
+    const TestForm = struct { name: []const u8, age: i32 };
+    var k: usize = 0;
+    while (true) : (k += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = k });
+        const SignalOwner = @import("../../reactive/owner.zig").SignalOwner;
+        var owner = SignalOwner.init(failing.allocator()) catch continue;
+        defer owner.deinit();
+        const scope = Scope.init(failing.allocator(), null, owner) catch continue;
+        defer scope.dispose();
+        const before = scope.children.items.len;
+        if (FormOf(TestForm).create(scope, .{ .name = "a", .age = 1 }, .{})) |_| break else |_| {}
+        // Failed create cannot leave half-built child scope under parent (waits for parent scope
+        // release)
+        try std.testing.expectEqual(before, scope.children.items.len);
+        try std.testing.expect(k < 200);
+    }
 }
 
 test "FormOf: isDirty" {
@@ -565,7 +608,7 @@ test "FormOf: no rules struct" {
 
     const form = try FormOf(SimpleForm).create(scope, .{ .text = "hello", .count = 0 }, .{});
 
-    // 无规则 -> validateAll 应返回 true
+    // No rules -> validateAll should return true
     try std.testing.expect(form.validateAll());
     try std.testing.expect(!form.hasErrors());
 

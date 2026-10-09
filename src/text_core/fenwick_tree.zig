@@ -1,29 +1,29 @@
-/// FenwickTree, Binary Indexed Tree (BIT) 前缀和加速
+/// FenwickTree, Binary Indexed Tree (BIT) prefix sum acceleration
 ///
-/// 用于 WrapMap 的 display line 前缀和查询：
-/// - update(idx, delta): O(logN) 增量更新
-/// - prefixSum(idx): O(logN) 前缀和查询
-/// - find(target): O(logN) walk-down 查找
-/// - buildFrom(values): O(N) 初始化
+/// Used for WrapMap display line prefix-sum query:
+/// - update(idx, delta): O(logN) incremental update
+/// - prefixSum(idx): O(logN) prefix-sum query
+/// - find(target): O(logN) walk-down search
+/// - buildFrom(values): O(N) initialize
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-/// 计算 BIT 中的 lowbit: i & (-i)
-/// 对 usize 安全地执行此操作
+/// Calculate BIT lowbit: i & (-i)
+/// Safe on usize
 inline fn lowbit(x: usize) usize {
-    // x & (~x + 1) 等价于 x & (-x)，且对无符号安全
+    // x & (~x + 1) equivalent to x & (-x), safe on unsigned
     return x & (~x +% 1);
 }
 
 pub const FenwickTree = struct {
-    /// 1-indexed BIT 数组
+    /// 1-indexed BIT array
     tree: []i64,
-    /// 原始值数组（用于 set 时计算 delta）
+    /// Original values array (used to compute delta on set)
     values: []u32,
     n: usize,
     allocator: Allocator,
 
-    /// 创建大小为 size 的全零树
+    /// Create zero-filled tree of size
     pub fn init(allocator: Allocator, size: usize) !FenwickTree {
         const tree = try allocator.alloc(i64, try std.math.add(usize, size, 1));
         errdefer allocator.free(tree);
@@ -38,7 +38,7 @@ pub const FenwickTree = struct {
         };
     }
 
-    /// 从 u32 切片 O(N) 构建
+    /// Build O(N) from u32 slice
     pub fn buildFrom(allocator: Allocator, vals: []const u32) !FenwickTree {
         const n = vals.len;
         const tree = try allocator.alloc(i64, try std.math.add(usize, n, 1));
@@ -47,7 +47,7 @@ pub const FenwickTree = struct {
         const values = try allocator.alloc(u32, n);
         @memcpy(values, vals);
 
-        // O(N) 构建：每个位置向"父"传递贡献
+        // O(N) build: each position propagates contribution to 'parent'
         for (1..n + 1) |i| {
             tree[i] += @as(i64, @intCast(vals[i - 1]));
             const parent = i + lowbit(i);
@@ -64,7 +64,7 @@ pub const FenwickTree = struct {
         };
     }
 
-    /// 0-indexed 增量更新 O(logN)
+    /// 0-indexed incremental update O(logN)
     pub fn update(self: *FenwickTree, idx: usize, delta: i32) void {
         if (idx >= self.n) return;
         const next = @as(i64, self.values[idx]) + @as(i64, delta);
@@ -74,7 +74,7 @@ pub const FenwickTree = struct {
     }
 
     fn applyDelta(self: *FenwickTree, idx: usize, delta: i64) void {
-        // BIT 更新 (1-indexed)
+        // BIT update (1-indexed)
         var pos = idx + 1;
         while (pos <= self.n) {
             self.tree[pos] += delta;
@@ -82,7 +82,7 @@ pub const FenwickTree = struct {
         }
     }
 
-    /// 0-indexed 设置值
+    /// 0-indexed set value
     pub fn set(self: *FenwickTree, idx: usize, new_val: u32) void {
         if (idx >= self.n) return;
         const old = self.values[idx];
@@ -92,11 +92,11 @@ pub const FenwickTree = struct {
         self.applyDelta(idx, delta);
     }
 
-    /// 0-indexed 前缀和 [0..idx]，O(logN)
+    /// 0-indexed prefix-sum [0..idx], O(logN)
     pub fn prefixSum(self: *const FenwickTree, idx: usize) u32 {
         if (self.n == 0) return 0;
         var sum: i64 = 0;
-        var pos = @min(idx, self.n - 1) + 1; // 转 1-indexed
+        var pos = @min(idx, self.n - 1) + 1; // Convert to 1-indexed
         while (pos > 0) {
             sum += self.tree[pos];
             pos -= lowbit(pos);
@@ -104,23 +104,23 @@ pub const FenwickTree = struct {
         return @intCast(std.math.clamp(sum, 0, std.math.maxInt(u32)));
     }
 
-    /// 总和
+    /// Total sum
     pub fn total(self: *const FenwickTree) u32 {
         if (self.n == 0) return 0;
         return self.prefixSum(self.n - 1);
     }
 
-    /// Walk-down 查找: 找到最小的 idx 使得 prefixSum(idx) >= target
-    /// 用于 WrapMap.displayLineInfo: 给定 display_line -> 找到对应的 buffer_line
-    /// target 是 1-based (等价于 prefix_sums 数组中的 display_line + 1)
+    /// Walk-down find: smallest idx where prefixSum(idx) >= target
+    /// Used for WrapMap.displayLineInfo: given display_line -> find corresponding buffer_line
+    /// target is 1-based (equivalent to prefix_sums array display_line + 1)
     pub fn find(self: *const FenwickTree, target: u32) usize {
         if (self.n == 0 or target == 0) return 0;
 
-        // Walk-down: 从最高有效位开始逐位构建位置
+        // Walk-down: build position bitwise from MSB
         var pos: usize = 0;
         var remaining: i64 = @intCast(target);
 
-        // 找到 >= n 的最小的 2 的幂
+        // Find smallest power of 2 >= n
         var bit_mask: usize = 1;
         while (bit_mask <= self.n) bit_mask <<= 1;
         bit_mask >>= 1;
@@ -133,17 +133,17 @@ pub const FenwickTree = struct {
             }
         }
 
-        // pos 是最后一个 prefix < target 的 1-indexed 位置
-        // pos+1 是第一个 prefix >= target 的 1-indexed 位置
-        // 转回 0-indexed: pos (因为 1-indexed pos+1 -> 0-indexed pos)
+        // pos is last 1-indexed position where prefix < target;
+        // pos+1 is first 1-indexed position where prefix >= target;
+        // convert to 0-indexed: pos (because 1-indexed pos+1 -> 0-indexed pos)
         return @min(pos, self.n -| 1);
     }
 
-    /// 改变大小并用新值 O(N) 重建
+    /// Resize and O(N) rebuild with new values
     ///
-    /// 先分配新数组、都成功后才释放旧数组：反过来（先 free 后 alloc）在
-    /// alloc 失败时 self.tree/values 悬垂且 n 陈旧，后续任何读写都是 UAF，
-    /// deinit 再 free 一次就是 double free。
+    /// Allocate new array first, only free old after both succeed: reverse order
+    /// (free then alloc) on alloc failure leaves self.tree/values dangling and n stale,
+    /// subsequent read/write is UAF; deinit then free again is double-free.
     pub fn resize(self: *FenwickTree, new_size: usize, new_values: []const u32) !void {
         const tree = try self.allocator.alloc(i64, try std.math.add(usize, new_size, 1));
         errdefer self.allocator.free(tree);
@@ -161,7 +161,7 @@ pub const FenwickTree = struct {
         self.values = values;
         self.n = new_size;
 
-        // O(N) 构建
+        // O(N) build
         for (1..new_size + 1) |i| {
             self.tree[i] += @as(i64, @intCast(values[i - 1]));
             const parent = i + lowbit(i);

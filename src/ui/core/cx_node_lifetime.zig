@@ -1,6 +1,6 @@
-//! Cx 节点生命周期：detach / freeNode（含 tick 期间延迟释放）、
-//! 失效 hover/focus/pressed 等原始引用、scope 与节点绑定。
-//! 释放顺序与 UAF 防护的约束见各函数注释。
+//! Cx node lifetime: detach / freeNode (includes delayed release during tick),
+//! invalidate hover/focus/pressed etc raw references, scope bound to node.
+//! constraints on release order + UAF protection documented in each function.
 
 const std = @import("std");
 const core = @import("../core.zig");
@@ -17,21 +17,21 @@ const core_node = @import("node.zig");
 const hooks_mod = @import("../hooks.zig");
 const reactive = @import("../reactive.zig");
 const world = core.world;
+const a11y_tree = core.a11y_tree;
 
-/// 集中式悬垂指针清理，当一棵子树即将被销毁时调用
+/// Clear dangling Cx/EventDispatcher/FocusManager pointers into a subtree about to be destroyed.
 ///
-/// 清除 Cx/EventDispatcher/FocusManager 中所有可能指向该子树的指针。
-/// 替代散落在 control_flow.zig 中的 6 行重复检查代码。
-/// 清事件 state 对 subtree 的引用（focused/hovered/pressed 等）。
-/// `unregister = true` 时**同时**把 subtree 从 node_registry 中移除（节点真的销毁走这条）。
-/// `unregister = false` 时**只**清 state，节点还活着，pool 化复用（例如 VL slot pool 被 rebind）：
-///   - 若 unregister 了，下次 register 时 trackGeneration 会因 last_ptr==null 而 bump generation，
-///     导致之前 interaction_index 里 proxy 的 handle 瞬间过期，hit test 返回 null -> 事件被吞。
-///   - 不 unregister 则 generation 稳定，proxy handle 保持有效。
-/// 清掉 Cx 里指进 `subtree_root` 子树的裸交互引用（focused / hovered / pressed /
-/// last_mouse_down 及其 handle）。**不触发任何回调**：freeNode 的立即释放路径是静默拆除
-/// （freeNodeNow 用 unregisterFocusableSilent），那时 widget 的 state 可能已随 scope 释放，
-/// 走 clearFocus 会调 blur handler 写已释放内存。
+/// Clears event state references to the subtree (focused/hovered/pressed etc).
+/// `unregister = true` **also** removes the subtree from node_registry (true destroy);
+/// `unregister = false` **only** clears state; node stays alive, pool-recycled (e.g. VL slot
+/// rebind):
+///   - if unregistered, next register: trackGeneration bumps generation since last_ptr==null,
+///     the old interaction_index proxy handle expires, hit test returns null -> events swallowed;
+///   - not unregistered: generation stable, proxy handle stays valid.
+/// Bare interaction refs in Cx pointing into `subtree_root` (focused / hovered / pressed /
+/// last_mouse_down + handle) are cleared with **no callback**: freeNode's immediate-release path
+/// is a silent teardown (freeNodeNow uses unregisterFocusableSilent); widget state may already be
+/// freed with its scope, and clearFocus would call a blur handler writing freed memory.
 fn dropRawInteractionRefsInto(self: *Cx, subtree_root: *Node) void {
     const isDesc = struct {
         fn check(node: *Node, ancestor: *Node) bool {
@@ -44,14 +44,13 @@ fn dropRawInteractionRefsInto(self: *Cx, subtree_root: *Node) void {
         }
     }.check;
 
-    // ⚠ 裸 `*_node` 指针不能直接解引用（isDesc 会走 n.parent 链）：
-    // 它可能指向**已释放**的节点，实测 storybook 里 Popover 挂起时
-    // detachChildRetained -> invalidateReferencesTo 会踩到陈旧的
-    // hovered_node，segfault 于 core.zig:1572 `current = n.parent`。
+    // WARNING: a bare `*_node` pointer must not be dereferenced (isDesc walks the n.parent chain):
+    // it may point to a **freed** node (detachChildRetained -> invalidateReferencesTo hit a stale
+    // hovered_node and segfaulted at `current = n.parent`).
     //
-    // 配套的 `*_handle` 走 node_registry.resolve，天然带存活校验。
-    // 所以：**handle 在时以 handle 为准**（resolve 失败即说明节点已死，
-    // 直接清掉裸指针）；只有在没有 handle 的旧路径才回退到裸指针。
+    // The paired `*_handle` uses node_registry.resolve, which carries a liveness check.
+    // So: **use the handle when present** (resolve failure means node dead, clear the bare
+    // pointer directly); only legacy paths without a handle fall back to the bare pointer.
     const stale = struct {
         fn check(cx: *Cx, node: ?*Node, handle: ?NodeHandle) bool {
             const h = handle orelse return false;
@@ -79,10 +78,14 @@ fn dropRawInteractionRefsInto(self: *Cx, subtree_root: *Node) void {
         } else self.hovered_handle = null;
     }
 
+    const had_pressed = self.pressed_node != null;
     if (stale(self, self.pressed_node, self.pressed_handle)) self.pressed_node = null;
     if (self.pressed_node) |n| {
         if (isDesc(n, subtree_root)) self.pressed_node = null;
     }
+    // press target follows subtree release: observers outside subtree (buttons on ancestor) see
+    // press end
+    if (had_pressed and self.pressed_node == null) self.notifyPressWatchers();
     if (self.pressed_handle) |h| {
         if (self.node_registry.resolve(h, null)) |n| {
             if (isDesc(n, subtree_root)) self.pressed_handle = null;
@@ -112,17 +115,20 @@ pub fn invalidateReferencesToEx(self: *Cx, subtree_root: *Node, unregister: bool
             return false;
         }
     }.check;
-    // 批量层锚点是裸 `*Node`（见 setBulkQuads 的生命周期一节）。宿主契约
-    // 要求"锚点销毁前重新提交"，但**销毁路径本身必须兜底**：宿主可能在
-    // 摘树之后、下一次 setBulkQuads 之前就渲染一帧（下游应用的 goHome ->
-    // teardownChromeScreen 摘掉画布子树，而 applySnapshot 在 homepage 屏
-    // 直接早退不再提交 ⇒ 锚点永远停留在已释放的 canvas_host）。此时
-    // appendBulkQuads 会解引用 `anchor.id`，在 Cx.render 里读到未映射地址。
+    // The bulk layer anchor is a bare `*Node` (see setBulkQuads lifecycle section). The host
+    // contract
+    // requires "resubmit before anchor destroy", but the **destroy path must backstop it**: the
+    // host may
+    // render one frame after detach, before the next setBulkQuads (e.g. an early-return path that
+    // skips
+    // resubmit leaves the anchor on a freed node). appendBulkQuads would then deref `anchor.id`
+    // and read an unmapped address in Cx.render.
     //
-    // 锚点连同 quads 一起清掉：只清指针会让批量层退化成"追加末尾 + 不裁剪"
-    // （null anchor 的语义），那正是两万 quad 糊住 chrome 的破坏性回归。
-    // 实现在 core/bulk_quad_layer.zig 的 dropIfInsideSubtree（含 isDesc 的
-    // parent 链遍历）；这里经视图调用并写回。
+    // Clear the anchor together with the quads: clearing only the pointer degrades the bulk layer
+    // to
+    // "append-tail + no-clip" (null anchor semantics), e.g. 20k quads masking chrome.
+    // impl: core/bulk_quad_layer.zig dropIfInsideSubtree (parent chain walk in isDesc);
+    // called here via view and written back.
     {
         var layer = cx_bulk_quads.bulkQuadLayer(self);
         _ = layer.dropIfInsideSubtree(subtree_root);
@@ -144,9 +150,9 @@ pub fn invalidateReferencesTo(self: *Cx, subtree_root: *Node) void {
 }
 
 pub fn destroyDetached(self: *Cx, node: *Node) void {
-    // 契约检查用 @panic 而不是 assert：assert 在 ReleaseFast 下会被去掉，
-    // 而「把已上树节点当游离释放」正是本原语要拦的误用，它在 Debug 下
-    // 当场抓到过一次（下游编辑器 toolbar 漏门控）。这类检查必须在所有构建下存在。
+    // contract check uses @panic not assert: assert stripped in ReleaseFast,
+    // but "treat already-tree node as loose free" exactly what this primitive guards, caught once
+    // in Debug (downstream editor toolbar missing gating). checks like this must exist all builds.
     if (node.parent != null) @panic("destroyDetached: node 仍挂在树上；已上树的节点走 detachChild，不要走这里");
     self.invalidateReferencesTo(node);
     self.freeNode(node);
@@ -162,18 +168,17 @@ pub fn detachChildRetained(self: *Cx, parent: *Node, child: *Node) void {
     parent.removeChildRetained(child);
 }
 
-/// 释放节点树。
-/// 若子树根节点仍挂着 Scope，则先递归 dispose 对应的 scope 树，
-/// 再释放节点内存，避免保留模式组件的资源泄漏。
-/// 已经由调用方 clearNodeScopes + dispose 过的子树会直接跳过这一步。
-/// 消费 overlay 的待恢复焦点。
+/// Free a node tree.
+/// If the subtree root still has a Scope, first recursively dispose the scope tree, then free
+/// node memory, to prevent retained-mode component resource leaks.
+/// Skipped when the caller already did clearNodeScopes + dispose.
+/// Also consumes the overlay's pending focus restore.
 ///
-/// 关闭 Modal/Sheet/Popover 后，焦点应回到当初打开它的那个控件
-/// （`FocusConfig.restore`，默认 true）。此前 `previous_focus` 被写入
-/// 但**全仓无人读取**，焦点直接丢失。
+/// After closing Modal/Sheet/Popover, focus should return to the control that opened it
+/// (`FocusConfig.restore`, default true); `previous_focus` must be read here or focus is lost.
 ///
-/// handle 解析失败（触发控件本身已销毁）时静默跳过：这是合法情况，
-/// 比如整个表单连同触发按钮一起被 Show 卸载。
+/// Handle resolve failure (trigger control already destroyed) is silently skipped: legal,
+/// e.g. the whole form including the trigger button is dismounted together by Show.
 pub fn drainOverlayFocusRestore(self: *Cx) void {
     const h = self.overlay_stack.pending_focus_restore orelse return;
     self.overlay_stack.pending_focus_restore = null;
@@ -189,9 +194,9 @@ fn finishDeferredNodeFree(ptr: *anyopaque) void {
 }
 
 pub fn freeNode(self: *Cx, node: *Node) void {
-    // 哨兵必须在 freeing / pending_free_cx 之前检查（理由同 freeNodeNow）：
-    // 已释放的节点内存在 Debug 下是 0xaa，`freeing` 读出 true，外部二次
-    // freeNode 会在这里静默 return，freeNodeNow 里的哨兵根本到不了。
+    // sentinel must check before freeing / pending_free_cx (reason: freeNodeNow):
+    // freed node memory in Debug is 0xaa, `freeing` reads true, outside double-
+    // free silently returns, freeNodeNow sentinel never reached.
     if (node.alive_sentinel != core_node.ALIVE_SENTINEL) {
         @panic("freeNode: 节点已被释放（double free）或内存已损坏");
     }
@@ -211,12 +216,14 @@ pub fn freeNode(self: *Cx, node: *Node) void {
         }
         return;
     }
-    // Immediate external callers must detach first. Internal recursive
-    // teardown uses freeNodeNow directly and owns the entire child list.
-    // 释放前静默清掉 Cx 里指进这棵子树的裸引用（pressed / hovered / focused /
-    // last_mouse_down）。否则在"点击回调里释放被按下的行"之后、mouseUp 收尾清
-    // pressed_node 之前，任何 before_render hook（animBg 读 cx.pressed_node）都会解引用已释放节点。
-    // 只清指针不走 invalidateReferencesTo：后者会 clearFocus -> 调 blur handler（见 dropRawInteractionRefsInto）。
+    // Immediate external callers must detach first. Internal recursive teardown uses freeNodeNow
+    // directly and owns the entire child list.
+    // Silently clear Cx references into this subtree (pressed / hovered / focused /
+    // last_mouse_down) before free.
+    // Otherwise, after a click callback releases the pressed row and before mouseUp cleanup, any
+    // before_render hook (animBg reads cx.pressed_node) derefs a freed node.
+    // Only clear pointers; don't call invalidateReferencesTo: its clearFocus calls the blur handler
+    // (see dropRawInteractionRefsInto).
     dropRawInteractionRefsInto(self, node);
     freeNodeNow(self, node);
 }
@@ -235,10 +242,12 @@ pub fn deferDisposalLikeFreeNode(
         self.deferred_free_nodes.append(entry, ptr, dispose_fn);
         return;
     }
-    // 与 freeNode 刻意分叉的一处（二审）：深度已归零、但某条队列**正在 drain**,
-    // 这是 dispose 回调里同步拆除消费方（scope cleanup -> pool.deinit）的时刻，队列后段可能还排着
-    // 借用这份资源的节点。此时当场执行就是 UAF；追加到正在 drain 的那条队列末尾，
-    // `while (popFirst())` 会在同一次 drain 里把它弹到，且必然排在残余节点之后。
+    // fork from freeNode intentionally (secondary audit): depth zero'd but **queue actively
+    // draining**,
+    // this moment dispose callback sync dismantles consumer (scope cleanup -> pool.deinit), queue
+    // tail may still queue
+    // nodes borrowing resource. execute now = UAF; append to draining queue tail,
+    // `while (popFirst())` pops in same drain, necessarily after remaining.
     if (self.draining_deferred_frees) {
         self.deferred_free_nodes.append(entry, ptr, dispose_fn);
         return;
@@ -262,9 +271,8 @@ pub fn drainDeferredFrees(self: *Cx) void {
 }
 
 fn freeNodeNow(self: *Cx, node: *Node) void {
-    // 哨兵先于 freeing 检查：释放后的内存在 Debug 下被写成 0xaa，
-    // `freeing` 会读出 true 从而静默 early-return，那样 double free
-    // 就变成了无声的 no-op。这里让它当场 panic。
+    // sentinel before freeing check: freed memory in Debug written 0xaa,
+    // `freeing` reads true silent early-return, double free becomes silent no-op. here it panics.
     if (node.alive_sentinel != core_node.ALIVE_SENTINEL) {
         @panic("freeNode: 节点已被释放（double free）或内存已损坏");
     }
@@ -272,10 +280,10 @@ fn freeNodeNow(self: *Cx, node: *Node) void {
     node.freeing = true;
     node.deferred_disposal.cancel();
     node.pending_free_cx = null;
-    // 焦点注册表持裸 *Node：释放前必须摘除，否则后续任何
-    // unregisterFocusableSubtree 的 isDescendantOf 沿 parent 链走到已释放
-    // 内存 -> segfault（2026-07-30 实测：Modal body 放 Button，story 切换
-    // 经 scope/freeNode 路径释放子树绕过了 detachChild 的 subtree 摘除）。
+    // focus registry holds bare *Node: must remove before free, else any
+    // unregisterFocusableSubtree isDescendantOf parent chain walks freed
+    // memory -> segfault (2026-07-30 real: Modal body Button, story switch,
+    // scope/freeNode path released subtree bypassing detachChild subtree removal).
     self.focus_manager.unregisterFocusableSilent(node);
     // Silent teardown intentionally skips widget blur handlers, but it
     // must still close the native session before its client is destroyed.
@@ -283,8 +291,9 @@ fn freeNodeNow(self: *Cx, node: *Node) void {
     if (self.text_input_session.active_node) |active| {
         if (active.id == node.id) cx_platform.deactivateTextInputSession(self);
     }
-    // Hook 资源可能注册在外部 Scope 上，而不是当前子树根节点的 scope 字段。
-    // 节点释放前统一断开这些回指，避免稍后外部 Scope.dispose() 访问已释放的 Node。
+    // hook resources may register on external Scope, not subtree root's scope field.
+    // uniformly disconnect these back-pointers before node free, prevent later
+    // external Scope.dispose() access freed Node.
     hooks_mod.invalidateSubtreeHookState(node);
 
     if (node.meta.ownership.scope.scope) |scope| {
@@ -294,21 +303,28 @@ fn freeNodeNow(self: *Cx, node: *Node) void {
     for (node.children.items) |child| {
         freeNodeNow(self, child);
     }
+    // style host destroyed after node scope release: scope style layer free must unlink self from
+    // host
+    if (node.meta.per_frame.hooks.style_host) |h| {
+        node.meta.per_frame.hooks.style_host = null;
+        h.destroy(h.ptr);
+    }
     self.node_registry.noteNodeFreed(node.id);
-    // 触发 cleanup 回调 (释放用户分配的事件上下文等)。
-    // **先摘再调**：on_cleanup 有三个触发点（这里、node_lifecycle.destroy、
-    // fireCleanupCallbacks），谁都可能先到。不摘的话同一个 hook 会被调两次，
-    // 而回调普遍是"释放一次性资源"语义（ScrollArea 的 cell release 实测因此
-    // refcount 下溢）。取出即置空 ⇒ 天然只此一次。
+    // Trigger the cleanup callback (free user-allocated event context etc).
+    // **Unlink first, then call**: on_cleanup has three trigger points (here,
+    // node_lifecycle.destroy,
+    // fireCleanupCallbacks) and any may arrive first. Without unlinking, the same hook runs twice;
+    // callbacks are typically "free one-time resource" (ScrollArea cell release underflows its
+    // refcount). Extract then null => runs exactly once.
     if (node.meta.ownership.hooks.on_cleanup) |cleanup_handler| {
         node.meta.ownership.hooks.on_cleanup = null;
         cleanup_handler.invoke();
     }
-    // 必须在 elements.destroy 前 read owned text 释放
-    // 否则 element_id 被清后 getText 走 standalone path 拿不到原 entry，
-    // owned content 永远悬空泄漏。
-    // 释放 owned 的 text content 和 spans
-    if (node.getText()) |t| {
+    // must read owned text before elements.destroy
+    // else element_id cleared, getText walks standalone path can't get original entry,
+    // owned content hangs leaked forever.
+    // free owned text content + spans
+    if (node.getTextRaw()) |t| {
         if (t.spans_owned) {
             self.allocator.free(t.spans);
         }
@@ -316,42 +332,51 @@ fn freeNodeNow(self: *Cx, node: *Node) void {
             self.allocator.free(t.content);
         }
     }
-    // path 堆内存经 World.layout_output slot 释放，
-    // 必须在下方 elements.destroy 之前（element_id 还有效）。
+    // path heap freed via World.layout_output slot,
+    // must precede elements.destroy below (element_id still valid).
     node.releaseAllGeometry(self.allocator);
-    // 释放动态分配的 test_id
+    // free dynamically allocated test_id
     if (node.frame_state.state_bits.flags.test_id_owned) {
         if (node.meta.ownership.meta.test_id) |tid| {
             self.allocator.free(tid);
         }
     }
-    // 释放 Grid 配置指针
+    // free Grid config pointers
     if (node.style.ext) |ext| {
         if (ext.grid) |gc| {
             self.allocator.destroy(gc);
         }
         self.allocator.destroy(ext);
     }
-    // 释放 Transition 槽
+    // free Transition slot
     if (node.frame_state.frame_local.runtime.transitions) |ts| {
         self.allocator.destroy(ts);
     }
-    // 释放命令式节点动画
+    // free imperative node animation
     if (node.frame_state.frame_local.runtime.commands) |na| {
         na.deinit();
         self.allocator.destroy(na);
     }
-    // 同步销毁 World.elements 上的 entry。
-    // ElementTable.destroy 内部会自动 unlink 父子链；generation++ 防 ABA。
-    // 必须在 getText/owned content 释放之后做，因为 element_id 被
-    // 清后 getText 走 standalone path 拿不到原 World entry。
-    // **必须走 world.destroyElement 而非裸 elements.destroy**：后者只回收
-    // element slot（generation++ 进 free_list），但不清 content/paint/interaction
-    // 镜像表。ContentTable.getText 仅按 index 读、不校验 generation，于是 slot 被
-    // 下一个节点复用时会读到上一个 owner 的残留 text（典型：切走的 Menu 弹层项
-    // "Cut/Copy/Delete" 漏进新挂载的 DatePicker trigger -> content 串台/空白）。
+    // Synchronously destroy the World.elements entry.
+    // ElementTable.destroy auto-unlinks the parent/child chain; generation++ prevents ABA.
+    // Must come after getText/owned content free: once element_id is cleared, getText walks
+    // standalone and can't reach the original World entry.
+    // **Must use world.destroyElement, not bare elements.destroy**: the latter recycles the element
+    // slot (generation++ to free_list) but doesn't clear the content/paint/interaction mirrors.
+    // ContentTable.getText reads by index with no generation check, so a recycled slot exposes
+    // the prior owner's residual text (e.g. closed Menu items "Cut/Copy/Delete" leaking into a
+    // newly mounted DatePicker trigger).
     if (node.element_id_raw != 0xFFFFFFFF) {
         const eid = world.ElementId.fromRaw(node.element_id_raw);
+        // nodes with declared semantic sets: set provider points to component state (usually freed
+        // with subtree ancestor scope),
+        // must unregister here, subsequent AX callbacks can't call it.
+        if (node.behavior.interaction.a11y) |props| {
+            if (props.collection != null) {
+                self.accessibility_tree.retireCollection(a11y_tree.AXId.node(eid)) catch
+                    @panic("OOM: a11y collection retire");
+            }
+        }
         if (self.world.elements.isValid(eid)) {
             self.world.destroyElement(eid);
         }
@@ -362,8 +387,8 @@ fn freeNodeNow(self: *Cx, node: *Node) void {
     node.invalidatePromotedRenderCache();
     node.invalidateSubtreePayloadCache();
     node.children.deinit(self.allocator);
-    // 投毒（同 node_lifecycle.destroy）：Allocator.destroy 不覆写内存，不投毒的话
-    // 释放后的节点仍读出 ALIVE + freeing=true，二次 freeNode 会静默 no-op。
+    // poison (like node_lifecycle.destroy): Allocator.destroy doesn't overwrite, no poison
+    // freed node still reads ALIVE + freeing=true, double freeNode silent no-op.
     node.alive_sentinel = core_node.DEAD_SENTINEL;
     self.allocator.destroy(node);
 }

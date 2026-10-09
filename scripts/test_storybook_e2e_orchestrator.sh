@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Mutation test: a dead app must abort the runner promptly and emit evidence.
-set -uo pipefail
+set -euo pipefail
 
 cd "$(dirname "$0")/.."
 TEST_DIR="$(mktemp -d /tmp/zenit-e2e-orchestrator.XXXXXX)"
@@ -20,12 +20,14 @@ printf '#!/bin/sh\nexec sleep 30\n' >"$FAKE_BUN"
 chmod +x "$FAKE_BUN"
 
 START=$SECONDS
+set +e
 ZENIT_E2E_SKIP_BUILD=1 \
 ZENIT_E2E_APP=/usr/bin/false \
 ZENIT_E2E_BUN="$FAKE_BUN" \
 ZENIT_E2E_EVIDENCE_DIR="$TEST_DIR/evidence" \
 bash scripts/run_storybook_e2e.sh >/dev/null 2>"$TEST_DIR/stderr.log"
 RC=$?
+set -e
 ELAPSED=$((SECONDS - START))
 
 if (( RC != 86 )); then

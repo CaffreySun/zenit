@@ -94,8 +94,11 @@ while IFS= read -r -d '' source_path; do
 done < "$SOURCE_CANDIDATES"
 
 tar -C "$ROOT" -cf "$SOURCE_ARCHIVE" --null -T "$SOURCE_FILES"
-PACKAGE_HASH="$("$ZIG_BIN" fetch --global-cache-dir "$PACKAGE_CACHE" "$SOURCE_ARCHIVE")"
+PACKAGE_HASH="$(ZIG_GLOBAL_CACHE_DIR="$PACKAGE_CACHE" "$ZIG_BIN" fetch "$SOURCE_ARCHIVE")"
 PACKAGE_ROOT="$PACKAGE_CACHE/p/$PACKAGE_HASH"
+# Zig 0.17 stores fetched packages as filtered archives in the global cache.
+mkdir -p "$PACKAGE_ROOT"
+tar -xzf "$PACKAGE_ROOT.tar.gz" -C "$PACKAGE_ROOT" --strip-components=1
 if [[ ! -s "$PACKAGE_ROOT/build.zig.zon" ]]; then
   echo "zig fetch did not create the expected package cache entry: $PACKAGE_ROOT" >&2
   exit 1

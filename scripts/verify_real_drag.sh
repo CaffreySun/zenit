@@ -1,28 +1,27 @@
 #!/usr/bin/env bash
-# 拖放的真机验证 —— 从 Finder 拖真文件进 storybook 窗口。
+# verify real drag - drag real files from Finder into the storybook window.
 #
-# 这条路径 **e2e 覆盖不到**：e2e 的 dragAt 是程序化注入 SDK 事件队列，
-# 绕过了 macOS 的 NSDragging pasteboard 协议。本脚本走完整系统路径：
-#   Finder 拖拽会话 → NSDraggingDestination 回调 → pushDragEvent
-#   → view.dragEventQueue → macos_get_drag_event → SDK 事件队列
-#   → Cx.handleDrag → dispatcher → FileUpload.onDropFiles
+# This path is **not coverable by e2e**: e2e dragAt injects into the SDK event queue,
+# bypassing the macOS NSDragging pasteboard protocol. This script uses the full path:
+# Finder drag session -> NSDraggingDestination callback -> pushDragEvent ->
+# view.dragEventQueue -> macos_get_drag_event -> SDK event queue -> Cx.handleDrag ->
+# dispatcher -> FileUpload.onDropFiles
 #
-# 判据（唯一可信的）：ZENIT_DEBUG_DRAG=1 下 stderr 出现
-#   [DRAG] kind=3 x=.. y=.. paths=/private/tmp/...
-# kind 0/1/2/3 = entered/updated/exited/dropped，只有 kind=3 带 paths。
+# Criterion (sole truth): with ZENIT_DEBUG_DRAG=1 stderr shows
+# [DRAG] kind=3 x=.. y=.. paths=/private/tmp/...; kind 0/1/2/3 = entered/updated/
+# exited/dropped, only kind=3 has paths.
 #
-# 前置条件：
-#   1. 运行它的终端进程持有「辅助功能」权限（系统设置 → 隐私与安全性）。
-#   2. 需要 GUI 会话（不能在纯 ssh/headless 下跑）。
+# Prerequisites:
+# 1. the terminal has Accessibility permission (System Settings -> Privacy & Security).
+# 2. a GUI session (no headless/pure ssh).
 #
-# 本脚本做到「半自动」：它负责构建 + 起窗口 + 备好测试文件 + 开日志监视，
-# 剩下的窗口摆放 / 定位 drop zone / 发拖拽事件需要人给坐标 —— 因为
-# storybook 的 nav 与 drop zone 位置随窗口几何变化，没有稳定的
-# 可编程定位（zenit 的 a11y 树不导出 nav 行）。
+# Semi-automatic: the script builds, launches the window, stages a test file and
+# watches logs; window placement, drop zone location and drag coordinates come from
+# the user, since storybook nav and drop zone position vary with window geometry and
+# the a11y tree doesn't export nav rows.
 #
-# 用法：
-#   bash scripts/verify_real_drag.sh
-# 然后按提示用 scripts/cgevent.swift 发拖拽（见下方打印的示例）。
+# Usage: bash scripts/verify_real_drag.sh, then follow prompts using
+# scripts/cgevent.swift to send the drag (see printed example).
 
 set -euo pipefail
 

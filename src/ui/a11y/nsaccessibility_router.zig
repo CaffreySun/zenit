@@ -1,20 +1,18 @@
-//! NSAccessibility Router, Phase 6 a11y_tree -> 平台 bridge 路由
+//! NSAccessibility Router: a11y_tree -> platform bridge routing.
 //!
-//! 把 AccessibilityTree 的 dirty 队列转换为平台 bridge 调用：
-//! - role/state/value 变化 -> bridge.notifyPropertyChange
-//! - focus 变化 -> bridge.notifyFocusChange
+//! Converts the AccessibilityTree dirty queue to platform bridge calls:
+//! - role/state/value changes -> bridge.notifyPropertyChange
+//! - focus change -> bridge.notifyFocusChange
 //! - live region announce -> bridge.announceText
-//! - structure 变化 -> bridge.notifyChildrenChanged（重新拉 children）
+//! - structure change -> bridge.notifyChildrenChanged (re-pull children)
 //!
-//! ObjC 端已实装（不是 stub）：native/macos/window_bridge.m 的
-//! ZenitA11yElement 实现了完整 NSAccessibility 协议，roles/subroles、
-//! value/min/max、focus 读写、hit test、table 协议（rows/columns/cells/
-//! header）、AXTextArea 全套（selectedTextRange / frameForRange /
-//! rangeForLine / insertionPointLineNumber），含 UTF-8↔UTF-16 偏移换算。
-//! 本 router 与 a11y_macos_bridge 已接进生产（src/ui/core.zig / ui.zig）。
-//! 仍缺：attributed run（bold/link/拼写）播报、AXCustomRotor、
-//! press/increment/decrement 之外的自定义 action，以及真 VoiceOver 验收
-//! （尚未进行）。
+//! ObjC side: native/macos/window_bridge.m ZenitA11yElement implements the NSAccessibility
+//! protocol (roles/subroles, value/min/max, focus, hit-test, table protocol, AXTextArea suite
+//! incl. selectedTextRange / frameForRange / rangeForLine / insertionPointLineNumber,
+//! UTF-8<->UTF-16
+//! offsets). Router + a11y_macos_bridge are wired in src/ui/core.zig / ui.zig.
+//! Not done: attributed run (bold/link/spell) announce, AXCustomRotor, custom actions beyond
+//! press/increment/decrement, real VoiceOver acceptance.
 
 const std = @import("std");
 const testing = std.testing;
@@ -22,47 +20,59 @@ const tree_mod = @import("tree.zig");
 const element_id_mod = @import("../core/element_id.zig");
 
 pub const ElementId = element_id_mod.ElementId;
+pub const AXId = tree_mod.AXId;
 pub const A11yNode = tree_mod.A11yNode;
 pub const A11yDirtyFlag = tree_mod.A11yDirtyFlag;
 pub const AccessibilityTree = tree_mod.AccessibilityTree;
 
-/// Router 接收 dirty 通知，调适当的 platform bridge。
-/// platform bridge 是 trait 风格 vtable，便于不同平台实现 + 单测桩。
+/// Router receives dirty notifications, call appropriate platform bridge.
+/// Platform bridge is trait-style vtable, lets different platforms implement + unit-test stub.
 pub const PlatformBridge = struct {
     ctx: *anyopaque,
     vtable: *const VTable,
 
     pub const VTable = struct {
-        notify_property: *const fn (ctx: *anyopaque, id: ElementId, node: A11yNode, flag: A11yDirtyFlag) void,
+        notify_property: *const fn (ctx: *anyopaque, id: AXId, node: A11yNode, flag: A11yDirtyFlag) void,
         /// `node == null` means focus left the retained Zenit tree. Platforms
         /// should move accessibility focus back to the host/window, not retain
         /// a stale virtual element.
-        notify_focus: *const fn (ctx: *anyopaque, id: ElementId, node: ?A11yNode) void,
-        notify_children_changed: *const fn (ctx: *anyopaque, id: ElementId) void,
-        announce: *const fn (ctx: *anyopaque, id: ElementId, text_hash: u64, live: tree_mod.LiveRegion) void,
-        /// aria-activedescendant 变化 -> 平台投 AXSelectedChildren
-        /// (NSAccessibility) 或 IA2_STATE_ACTIVE (Windows IA2)。可选: null -> 跳过。
-        notify_active_descendant: ?*const fn (ctx: *anyopaque, container: ElementId, active: ElementId) void = null,
+        notify_focus: *const fn (ctx: *anyopaque, id: AXId, node: ?A11yNode) void,
+        notify_children_changed: *const fn (ctx: *anyopaque, id: AXId) void,
+        announce: *const fn (ctx: *anyopaque, id: AXId, text_hash: u64, live: tree_mod.LiveRegion) void,
+        /// aria-activedescendant change -> platform AXSelectedChildren (NSAccessibility)
+        /// or IA2_STATE_ACTIVE (Windows IA2). Optional: null -> skip.
+        notify_active_descendant: ?*const fn (ctx: *anyopaque, container: AXId, active: AXId) void = null,
+        /// Node leaves tree (deleted or replaced by new generation in slot). Platform should
+        /// post UIElementDestroyed and discard corresponding native proxy, else VoiceOver cursor
+        /// may stop on nonexistent element. Optional: null skip.
+        notify_destroyed: ?*const fn (ctx: *anyopaque, id: AXId) void = null,
+        /// Flush ends. Platform can coalesce accumulated layout notifications (one ancestor,
+        /// one send). Optional: null skip.
+        flush_end: ?*const fn (ctx: *anyopaque) void = null,
     };
 
-    pub fn notifyProperty(self: PlatformBridge, id: ElementId, node: A11yNode, flag: A11yDirtyFlag) void {
+    pub fn notifyProperty(self: PlatformBridge, id: AXId, node: A11yNode, flag: A11yDirtyFlag) void {
         self.vtable.notify_property(self.ctx, id, node, flag);
     }
-    pub fn notifyFocus(self: PlatformBridge, id: ElementId, node: ?A11yNode) void {
+    pub fn notifyFocus(self: PlatformBridge, id: AXId, node: ?A11yNode) void {
         self.vtable.notify_focus(self.ctx, id, node);
     }
-    pub fn notifyChildrenChanged(self: PlatformBridge, id: ElementId) void {
+    pub fn notifyChildrenChanged(self: PlatformBridge, id: AXId) void {
         self.vtable.notify_children_changed(self.ctx, id);
     }
-    pub fn announce(self: PlatformBridge, id: ElementId, text_hash: u64, live: tree_mod.LiveRegion) void {
+    pub fn announce(self: PlatformBridge, id: AXId, text_hash: u64, live: tree_mod.LiveRegion) void {
         self.vtable.announce(self.ctx, id, text_hash, live);
     }
-    pub fn notifyActiveDescendant(self: PlatformBridge, container: ElementId, active: ElementId) void {
+    pub fn notifyDestroyed(self: PlatformBridge, id: AXId) void {
+        if (self.vtable.notify_destroyed) |cb| cb(self.ctx, id);
+    }
+
+    pub fn notifyActiveDescendant(self: PlatformBridge, container: AXId, active: AXId) void {
         if (self.vtable.notify_active_descendant) |cb| cb(self.ctx, container, active);
     }
 };
 
-/// 从 a11y tree 把 dirty 队列推到平台。
+/// Flush a11y tree dirty queue to platform.
 pub fn flushToBridge(
     tree: *AccessibilityTree,
     bridge: PlatformBridge,
@@ -74,15 +84,18 @@ pub fn flushToBridge(
     };
     var ctx = Ctx{ .tree = tree, .bridge = bridge };
     tree.drainDirty(&ctx, &dispatch);
-    // Coalesce old-focus/new-focus records into one notification for the final
-    // retained state. Hash-map iteration order must never decide AX focus.
+    // Coalesce old-focus/new-focus records into one notification for final retained state.
+    // Hash-map iteration must never decide AX focus. Send layout notification first, focus last:
+    // VoiceOver only announces final focus event (AccessKit experience), layout after makes
+    // it recalculate cursor position.
+    if (bridge.vtable.flush_end) |cb| cb(bridge.ctx);
     if (ctx.focus_changed) {
         const focused = tree.focused;
         ctx.bridge.notifyFocus(focused, tree.get(focused));
     }
 }
 
-fn dispatch(ctx_ptr: *anyopaque, id: ElementId, flag: A11yDirtyFlag) void {
+fn dispatch(ctx_ptr: *anyopaque, id: AXId, flag: A11yDirtyFlag) void {
     const Ctx = struct {
         tree: *AccessibilityTree,
         bridge: PlatformBridge,
@@ -103,11 +116,12 @@ fn dispatch(ctx_ptr: *anyopaque, id: ElementId, flag: A11yDirtyFlag) void {
             // A same-parent reorder is already covered by the old-parent
             // notification above; do not post the identical layout change
             // twice.
+            if (change.had_old and !change.has_new) ctx.bridge.notifyDestroyed(id);
         }
     }
     const node = ctx.tree.get(id);
     if (node != null and (flag.role_changed or flag.state_changed or flag.label_changed or
-        flag.value_changed or flag.geometry_changed or flag.selection_changed))
+        flag.value_changed or flag.geometry_changed or flag.selection_changed or flag.row_count_changed))
     {
         ctx.bridge.notifyProperty(id, node.?, flag);
     }
@@ -127,11 +141,12 @@ fn dispatch(ctx_ptr: *anyopaque, id: ElementId, flag: A11yDirtyFlag) void {
 // ============================================================================
 
 const TestBridge = struct {
-    property_calls: std.ArrayListUnmanaged(ElementId) = .{},
-    focus_calls: std.ArrayListUnmanaged(ElementId) = .{},
-    children_calls: std.ArrayListUnmanaged(ElementId) = .{},
-    announce_calls: std.ArrayListUnmanaged(u64) = .{},
-    active_desc_calls: std.ArrayListUnmanaged(struct { container: ElementId, active: ElementId }) = .{},
+    property_calls: std.ArrayListUnmanaged(AXId) = .empty,
+    focus_calls: std.ArrayListUnmanaged(AXId) = .empty,
+    children_calls: std.ArrayListUnmanaged(AXId) = .empty,
+    announce_calls: std.ArrayListUnmanaged(u64) = .empty,
+    active_desc_calls: std.ArrayListUnmanaged(struct { container: AXId, active: AXId }) = .empty,
+    destroyed_calls: std.ArrayListUnmanaged(AXId) = .empty,
     allocator: std.mem.Allocator,
 
     fn vtable() *const PlatformBridge.VTable {
@@ -142,6 +157,7 @@ const TestBridge = struct {
                 .notify_children_changed = TestBridge.notifyChildrenChanged,
                 .announce = TestBridge.announce,
                 .notify_active_descendant = TestBridge.notifyActiveDescendant,
+                .notify_destroyed = TestBridge.notifyDestroyed,
             };
         };
         return &Static.v;
@@ -151,33 +167,39 @@ const TestBridge = struct {
         return .{ .ctx = self, .vtable = vtable() };
     }
 
-    fn notifyProperty(ctx: *anyopaque, id: ElementId, node: A11yNode, flag: A11yDirtyFlag) void {
+    fn notifyProperty(ctx: *anyopaque, id: AXId, node: A11yNode, flag: A11yDirtyFlag) void {
         const self: *TestBridge = @ptrCast(@alignCast(ctx));
         self.property_calls.append(self.allocator, id) catch {};
         _ = node;
         _ = flag;
     }
-    fn notifyFocus(ctx: *anyopaque, id: ElementId, node: ?A11yNode) void {
+    fn notifyFocus(ctx: *anyopaque, id: AXId, node: ?A11yNode) void {
         const self: *TestBridge = @ptrCast(@alignCast(ctx));
         self.focus_calls.append(self.allocator, id) catch {};
         _ = node;
     }
-    fn notifyChildrenChanged(ctx: *anyopaque, id: ElementId) void {
+    fn notifyChildrenChanged(ctx: *anyopaque, id: AXId) void {
         const self: *TestBridge = @ptrCast(@alignCast(ctx));
         self.children_calls.append(self.allocator, id) catch {};
     }
-    fn announce(ctx: *anyopaque, id: ElementId, text_hash: u64, live: tree_mod.LiveRegion) void {
+    fn announce(ctx: *anyopaque, id: AXId, text_hash: u64, live: tree_mod.LiveRegion) void {
         const self: *TestBridge = @ptrCast(@alignCast(ctx));
         self.announce_calls.append(self.allocator, text_hash) catch {};
         _ = id;
         _ = live;
     }
-    fn notifyActiveDescendant(ctx: *anyopaque, container: ElementId, active: ElementId) void {
+    fn notifyActiveDescendant(ctx: *anyopaque, container: AXId, active: AXId) void {
         const self: *TestBridge = @ptrCast(@alignCast(ctx));
         self.active_desc_calls.append(self.allocator, .{ .container = container, .active = active }) catch {};
     }
 
+    fn notifyDestroyed(ctx: *anyopaque, id: AXId) void {
+        const self: *TestBridge = @ptrCast(@alignCast(ctx));
+        self.destroyed_calls.append(self.allocator, id) catch {};
+    }
+
     fn deinit(self: *TestBridge) void {
+        self.destroyed_calls.deinit(self.allocator);
         self.property_calls.deinit(self.allocator);
         self.focus_calls.deinit(self.allocator);
         self.children_calls.deinit(self.allocator);
@@ -192,8 +214,8 @@ test "router: structure_changed triggers notifyChildrenChanged on parent" {
     var bridge = TestBridge{ .allocator = testing.allocator };
     defer bridge.deinit();
 
-    const parent: ElementId = .{ .index = 0, .generation = 0 };
-    const child: ElementId = .{ .index = 1, .generation = 0 };
+    const parent = AXId.node(.{ .index = 0, .generation = 0 });
+    const child = AXId.node(.{ .index = 1, .generation = 0 });
     try tree.upsert(.{ .element = parent, .role = .group });
     try tree.upsert(.{ .element = child, .parent = parent, .role = .button });
 
@@ -208,7 +230,7 @@ test "router: state_changed → notifyProperty" {
     var bridge = TestBridge{ .allocator = testing.allocator };
     defer bridge.deinit();
 
-    const id: ElementId = .{ .index = 0, .generation = 0 };
+    const id = AXId.node(.{ .index = 0, .generation = 0 });
     try tree.upsert(.{ .element = id, .role = .checkbox });
     flushToBridge(&tree, bridge.bridge());
     bridge.property_calls.clearRetainingCapacity();
@@ -225,7 +247,7 @@ test "router: focus_changed + focused=true → notifyFocus" {
     var bridge = TestBridge{ .allocator = testing.allocator };
     defer bridge.deinit();
 
-    const id: ElementId = .{ .index = 0, .generation = 0 };
+    const id = AXId.node(.{ .index = 0, .generation = 0 });
     try tree.upsert(.{ .element = id, .role = .button });
     flushToBridge(&tree, bridge.bridge());
     bridge.focus_calls.clearRetainingCapacity();
@@ -242,8 +264,8 @@ test "router: removed children and roots invalidate their former containers" {
     var bridge = TestBridge{ .allocator = testing.allocator };
     defer bridge.deinit();
 
-    const root: ElementId = .{ .index = 0, .generation = 0 };
-    const child: ElementId = .{ .index = 1, .generation = 0 };
+    const root = AXId.node(.{ .index = 0, .generation = 0 });
+    const child = AXId.node(.{ .index = 1, .generation = 0 });
     try tree.upsert(.{ .element = root, .role = .group });
     try tree.upsert(.{ .element = child, .parent = root, .role = .button });
     flushToBridge(&tree, bridge.bridge());
@@ -267,9 +289,9 @@ test "router: reparent and reorder invalidate every affected container" {
     var bridge = TestBridge{ .allocator = testing.allocator };
     defer bridge.deinit();
 
-    const a: ElementId = .{ .index = 0, .generation = 0 };
-    const b: ElementId = .{ .index = 1, .generation = 0 };
-    const child: ElementId = .{ .index = 2, .generation = 0 };
+    const a = AXId.node(.{ .index = 0, .generation = 0 });
+    const b = AXId.node(.{ .index = 1, .generation = 0 });
+    const child = AXId.node(.{ .index = 2, .generation = 0 });
     try tree.upsert(.{ .element = a, .role = .group });
     try tree.upsert(.{ .element = b, .role = .group });
     try tree.upsert(.{ .element = child, .parent = a, .role = .button });
@@ -300,8 +322,8 @@ test "router: focus changes coalesce to final element and clear on removal" {
     var bridge = TestBridge{ .allocator = testing.allocator };
     defer bridge.deinit();
 
-    const a: ElementId = .{ .index = 0, .generation = 0 };
-    const b: ElementId = .{ .index = 1, .generation = 0 };
+    const a = AXId.node(.{ .index = 0, .generation = 0 });
+    const b = AXId.node(.{ .index = 1, .generation = 0 });
     try tree.upsert(.{ .element = a, .role = .button, .state = .{ .focused = true, .focusable = true } });
     try tree.upsert(.{ .element = b, .role = .button });
     flushToBridge(&tree, bridge.bridge());
@@ -327,7 +349,7 @@ test "router: live_announce on text_hash change in live region" {
     var bridge = TestBridge{ .allocator = testing.allocator };
     defer bridge.deinit();
 
-    const id: ElementId = .{ .index = 0, .generation = 0 };
+    const id = AXId.node(.{ .index = 0, .generation = 0 });
     try tree.upsert(.{ .element = id, .role = .status, .live = .polite, .text_hash = 100 });
     flushToBridge(&tree, bridge.bridge());
     bridge.announce_calls.clearRetainingCapacity();
@@ -345,31 +367,67 @@ test "router: active_descendant change → notifyActiveDescendant" {
     var bridge = TestBridge{ .allocator = testing.allocator };
     defer bridge.deinit();
 
-    const container: ElementId = .{ .index = 0, .generation = 0 };
-    const opt_a: ElementId = .{ .index = 1, .generation = 0 };
-    const opt_b: ElementId = .{ .index = 2, .generation = 0 };
+    const container = AXId.node(.{ .index = 0, .generation = 0 });
+    const opt_a = AXId.node(.{ .index = 1, .generation = 0 });
+    const opt_b = AXId.node(.{ .index = 2, .generation = 0 });
 
     try tree.upsert(.{ .element = container, .role = .combobox });
     flushToBridge(&tree, bridge.bridge());
     bridge.active_desc_calls.clearRetainingCapacity();
 
-    // 容器声明 active_descendant=A
+    // Container declares active_descendant=A
     try tree.upsert(.{ .element = container, .role = .combobox, .active_descendant = opt_a });
     flushToBridge(&tree, bridge.bridge());
     try testing.expectEqual(@as(usize, 1), bridge.active_desc_calls.items.len);
     try testing.expect(bridge.active_desc_calls.items[0].container.eql(container));
     try testing.expect(bridge.active_desc_calls.items[0].active.eql(opt_a));
 
-    // 切到 B
+    // Switch to B
     bridge.active_desc_calls.clearRetainingCapacity();
     try tree.upsert(.{ .element = container, .role = .combobox, .active_descendant = opt_b });
     flushToBridge(&tree, bridge.bridge());
     try testing.expectEqual(@as(usize, 1), bridge.active_desc_calls.items.len);
     try testing.expect(bridge.active_desc_calls.items[0].active.eql(opt_b));
 
-    // 不变 -> 不投递
+    // Unchanged -> don't emit
     bridge.active_desc_calls.clearRetainingCapacity();
     try tree.upsert(.{ .element = container, .role = .combobox, .active_descendant = opt_b });
     flushToBridge(&tree, bridge.bridge());
     try testing.expectEqual(@as(usize, 0), bridge.active_desc_calls.items.len);
+}
+
+test "router: 节点删除发 destroyed；换父只是移动，不算销毁" {
+    var tree = AccessibilityTree.init(testing.allocator);
+    defer tree.deinit();
+    var tb = TestBridge{ .allocator = testing.allocator };
+    defer tb.deinit();
+
+    const a = AXId.node(.{ .index = 1, .generation = 0 });
+    const b = AXId.node(.{ .index = 2, .generation = 0 });
+    const child = AXId.node(.{ .index = 3, .generation = 0 });
+    try tree.upsert(.{ .element = a, .role = .group });
+    try tree.upsert(.{ .element = b, .role = .group });
+    try tree.upsert(.{ .element = child, .parent = a, .role = .button });
+    flushToBridge(&tree, tb.bridge());
+    tb.destroyed_calls.clearRetainingCapacity();
+
+    // Parent change: not destruction.
+    try tree.upsert(.{ .element = child, .parent = b, .role = .button });
+    flushToBridge(&tree, tb.bridge());
+    try testing.expectEqual(@as(usize, 0), tb.destroyed_calls.items.len);
+
+    // Deletion: destruction.
+    try tree.remove(child);
+    flushToBridge(&tree, tb.bridge());
+    try testing.expectEqual(@as(usize, 1), tb.destroyed_calls.items.len);
+    try testing.expect(tb.destroyed_calls.items[0].eql(child));
+
+    // New generation replaces in slot: old one destroyed.
+    const stale = AXId.node(.{ .index = 2, .generation = 0 });
+    const replacement = AXId.node(.{ .index = 2, .generation = 1 });
+    tb.destroyed_calls.clearRetainingCapacity();
+    try tree.upsert(.{ .element = replacement, .role = .button });
+    flushToBridge(&tree, tb.bridge());
+    try testing.expectEqual(@as(usize, 1), tb.destroyed_calls.items.len);
+    try testing.expect(tb.destroyed_calls.items[0].eql(stale));
 }

@@ -15,7 +15,7 @@ pub fn retainFallbackFontRef(font_ref: *anyopaque) void {
 }
 
 pub fn fallbackFontRefIdentityHash(font_ref: *anyopaque) u64 {
-    // FreeType 后端的 fallback ref 是稳定指针，直接用指针值作身份。
+    // FreeType backend fallback ref is stable pointer, use pointer value as identity.
     return @intFromPtr(font_ref);
 }
 
@@ -33,9 +33,10 @@ pub fn fallbackFontRefDebugName(allocator: std.mem.Allocator, font_ref: *anyopaq
 /// Font manager, responsible for initializing FreeType library
 pub const FontSystem = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     ft_library: c.FT_Library,
 
-    pub fn init(allocator: std.mem.Allocator) !FontSystem {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io) !FontSystem {
         var ft_lib: c.FT_Library = undefined;
         if (c.FT_Init_FreeType(&ft_lib) != 0) {
             return error.FreeTypeInitFailed;
@@ -45,6 +46,7 @@ pub const FontSystem = struct {
 
         return FontSystem{
             .allocator = allocator,
+            .io = io,
             .ft_library = ft_lib,
         };
     }
@@ -54,8 +56,8 @@ pub const FontSystem = struct {
         std.log.info("[FontSystem/FreeType] Destroyed", .{});
     }
 
-    /// 与 CoreText 后端 API 对齐（"system" family 映射）。FreeType 后端
-    /// 按路径加载字体、无 "system" 语义，no-op 即正确。
+    /// Align with CoreText backend API ("system" family mapping). FreeType backend
+    /// loads by path, no "system" semantics, no-op is correct.
     pub fn setDefaultFamily(self: *FontSystem, family: ?[]const u8) void {
         _ = self;
         _ = family;
@@ -149,8 +151,8 @@ pub const Font = struct {
         return height - (ascent + descent);
     }
 
-    /// FreeType 后端只走 FT_PIXEL_MODE_GRAY（见 rasterizeGlyph 的 pixel_mode 断言），
-    /// 没有彩色字形路径，恒为 false，与 CoreText 后端 API 对齐。
+    /// FreeType backend only uses FT_PIXEL_MODE_GRAY (see rasterizeGlyph pixel_mode assert),
+    /// no color glyph path, always false, align with CoreText backend API.
     pub fn hasColorGlyphs(self: *const Font) bool {
         _ = self;
         return false;

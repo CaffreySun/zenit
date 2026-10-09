@@ -1,18 +1,18 @@
-/// Event Dispatcher - Node 树事件调度
+/// Event Dispatcher - Node tree event dispatching.
 ///
-/// 事件传播顺序: capture -> target -> bubble
+/// Event propagation: capture -> target -> bubble
 ///
-/// 事件处理流程:
-/// 1. 命中测试: 确定目标节点
-/// 2. 构建路径: root -> ... -> target
-/// 3. Capture 阶段: 从 root 到 target (**不含 target**) 逐一调用
-///    node.behavior.events.on_event_capture (v0.6 §2.2)。null handler 节点
-///    零开销跳过；用于祖先抢先拦截 (focus trap / scroll lock / 手势仲裁)
-/// 4. Target 阶段: 在目标节点上调用 on_event + click/key 等专用 handler
-/// 5. Bubble 阶段: 从 target 父节点到 root 逐一调用
+/// Event flow:
+/// 1. Hit test: determine target node
+/// 2. Build path: root -> ... -> target
+/// 3. Capture phase: root to target (**excludes target**) call
+///    node.behavior.events.on_event_capture. null-handler nodes cost nothing;
+///    used for ancestor preemption (focus trap / scroll lock / gesture arbitration).
+/// 4. Target phase: on_event + specialized handlers (click/key) on target
+/// 5. Bubble phase: target parent to root call
 ///
-/// 任意阶段返回 .stop 都停止传播（capture stop 不再进 target/bubble，
-/// 这是 W3C DOM Events 标准语义）。
+/// Returning .stop from any phase stops propagation (W3C DOM semantics; capture stop skips
+/// target/bubble).
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const events = @import("events.zig");
@@ -22,7 +22,7 @@ const EventPhase = events.EventPhase;
 const KeyEvent = events.KeyEvent;
 const Modifiers = events.Modifiers;
 
-// 前向引用 core 模块的 Node 类型
+// Forward reference to core Node type
 const core = @import("core.zig");
 const Node = core.Node;
 const NodeHandle = core.NodeHandle;
@@ -97,9 +97,10 @@ fn logSidebarHit(comptime phase: []const u8, x: f32, y: f32, target: ?*Node) voi
     }
 }
 
-/// 事件调度器 - 基于 Node 树
+/// Event dispatcher - Node tree based
 pub const EventDispatcher = struct {
     allocator: Allocator,
+    io: std.Io,
 
     hovered_handle: ?NodeHandle = null,
 
@@ -108,11 +109,11 @@ pub const EventDispatcher = struct {
     last_mouse_pos: [2]f32 = .{ 0, 0 },
     has_last_mouse: bool = false,
 
-    /// 最近一次 mouseDown 的修饰键（合成 click 时使用）
+    /// Most recent mouse_down modifier flags (synthesize click)
     last_modifiers: events.Modifiers = .{},
 
-    /// 多击检测
-    last_click_instant: ?std.time.Instant = null,
+    /// Multi-click detection
+    last_click_instant: ?@import("zenit_time").Instant = null,
     last_click_pos: [2]f32 = .{ 0, 0 },
     consecutive_clicks: u8 = 0,
 
@@ -121,25 +122,29 @@ pub const EventDispatcher = struct {
     pointer_capture_epoch: u64 = 0,
     hover_epoch: u64 = 0,
 
-    /// pointer-sequence 级 click 抑制（drag 前置合同，见 docs/DRAG_INTERACTION_DESIGN.md §8.3）。
-    /// 左键 down 重置为 false；置 true 后本次序列的左键 up 不合成 click/double_click、
-    /// 不更新 multi-click 计数（普通路径与 capture 路径都被 gate）。up 消费并清零。
+    /// Pointer-sequence click suppression (drag precondition, see docs/DRAG_INTERACTION_DESIGN.md
+    /// §8.3).
+    /// LMB down resets to false; when true, this sequence's LMB up does not synthesize
+    /// click/double_click,
+    /// does not update multi-click count (both normal and capture paths gated). up consumes and
+    /// clears.
     suppress_click: bool = false,
 
-    /// Scroll 会话 owner（按节点 ID 锁定，避免跨帧重建后的悬垂指针）
+    /// Scroll session owner (locked by node ID, avoid dangling ptrs across rebuilds)
     scroll_session_owner: ?NodeHandle = null,
     scroll_session_owner_ptr: ?*Node = null,
-    /// 惯性阶段 owner（is_momentum=true 时固定派发）
+    /// Momentum phase owner (is_momentum=true dispatch fixed)
     scroll_momentum_owner: ?NodeHandle = null,
     scroll_momentum_owner_ptr: ?*Node = null,
-    /// 当前会话由 may_begin 打开（随后的 began 属于同一手势）
+    /// Session opened by may_begin (following began belongs same gesture)
     scroll_session_from_may_begin: bool = false,
 
     registry: ?*const NodeRegistry = null,
 
-    pub fn init(allocator: Allocator) EventDispatcher {
+    pub fn init(allocator: Allocator, io: std.Io) EventDispatcher {
         return .{
             .allocator = allocator,
+            .io = io,
         };
     }
 
@@ -159,7 +164,7 @@ pub const EventDispatcher = struct {
         self.scroll_session_from_may_begin = false;
     }
 
-    /// 设置 Pointer Capture，后续鼠标事件直接发给该节点
+    /// Set pointer capture; subsequent mouse events go directly to this node.
     pub fn setPointerCapture(self: *EventDispatcher, node: *Node) void {
         const next = if (self.registry) |registry| registry.handleFor(node) else null;
         if (std.meta.eql(next, self.pointer_capture_handle)) return;
@@ -170,7 +175,7 @@ pub const EventDispatcher = struct {
         self.pointer_capture_handle = if (self.resolveHandle(next) != null) next else null;
     }
 
-    /// 释放 Pointer Capture
+    /// Release pointer capture.
     pub fn releasePointerCapture(self: *EventDispatcher) void {
         const previous = self.pointer_capture_handle;
         self.pointer_capture_handle = null;
@@ -179,8 +184,9 @@ pub const EventDispatcher = struct {
         }
     }
 
-    /// 只释放"仍属于 handle 对应节点"的 capture：capture 是单槽，中途可能已被
-    /// 其他系统接管，盲清会误伤后来者。返回是否真的释放了。
+    /// Release capture only if still owned by handle's node: capture is single slot,
+    /// may have been taken over, blind clear would injure successor. Return whether actually
+    /// released.
     pub fn releasePointerCaptureFor(self: *EventDispatcher, handle: NodeHandle) bool {
         const current = self.pointer_capture_handle orelse return false;
         if (current.id != handle.id or current.generation != handle.generation) return false;
@@ -188,8 +194,8 @@ pub const EventDispatcher = struct {
         return true;
     }
 
-    /// 抑制当前 pointer sequence 的 click/double_click 合成（内部 API，供 drag
-    /// 越阈值 / can_start 拒绝 / 强制取消时调用）。仅影响本次序列。
+    /// Suppress click/double_click synthesis for current pointer sequence (internal API,
+    /// called when drag exceeds threshold / can_start refuses / forced cancel). This sequence only.
     pub fn cancelClickSynthesisForActivePointer(self: *EventDispatcher) void {
         self.suppress_click = true;
     }
@@ -198,13 +204,12 @@ pub const EventDispatcher = struct {
         return self.resolveHandle(self.pointer_capture_handle) != null;
     }
 
-    /// 当前按下序列的 mouse_down 目标节点（无按下或节点已失效时 null）。
+    /// Current LMB sequence's mouse_down target (null if no press or node invalid).
     ///
-    /// 供"按下即拖拽"的宿主使用：on_event 回调不携带节点指针，宿主在
-    /// mouse_down handler 里需要拿到被按下的节点才能 setPointerCapture,
-    /// 不捕获的话，指针在别的节点上抬起时 mouse_up 不会回到拖拽发起方，
-    /// 拖拽状态就地泄漏。dispatchMouseDownButton 在分发事件**之前**记录
-    /// mouse_down_handle，因此 mouse_down handler 里调用总能拿到自己。
+    /// For 'press-then-drag' hosts: the on_event callback has no node pointer, but the host needs
+    /// the pressed node in its mouse_down handler to setPointerCapture. Without capture, mouse_up
+    /// on another node does not route back to the drag initiator and drag state leaks.
+    /// dispatchMouseDownButton records mouse_down_handle **before** dispatch.
     pub fn mouseDownNode(self: *EventDispatcher) ?*Node {
         return self.resolveHandle(self.mouse_down_handle);
     }
@@ -253,27 +258,30 @@ pub const EventDispatcher = struct {
     /// Without a registry, the caller must keep every path node and its handler
     /// contexts alive until dispatch returns (including nested dispatches).
     pub fn dispatch(self: *EventDispatcher, event: Event, target: *Node) EventResult {
-        // 构建从 root 到 target 的路径
+        // Build path from root to target
         var path_buf: [128]*Node = undefined;
-        const path = buildPathInto(target, &path_buf);
+        const storage = pathStorage(*Node, self.allocator, &path_buf, pathDepth(target)) catch return .stop;
+        defer releasePathStorage(*Node, self.allocator, storage);
+        const path = buildPathInto(target, storage);
         if (path.len == 0) return .ignored;
         var handled = false;
 
-        // 提取事件指针坐标（用于 trace）
+        // Extract event pointer coordinate (for trace)
         const ptr_xy = eventPointerXY(event);
         const event_kind = eventToKindTag(event);
         const target_id = target.id;
 
-        // 优先走 handle 解析，避免 handler 中途销毁节点导致 path 指针悬垂。
+        // Prefer handle resolution, avoid handler mid-tree destruction invalidating path ptrs.
         if (self.registry) |registry| {
             var path_handle_buf: [128]NodeHandle = undefined;
+            const path_handles = pathStorage(NodeHandle, self.allocator, &path_handle_buf, path.len) catch return .stop;
+            defer releasePathStorage(NodeHandle, self.allocator, path_handles);
             for (path, 0..) |node, i| {
-                path_handle_buf[i] = registry.handleFor(node);
+                path_handles[i] = registry.handleFor(node);
             }
-            const path_handles = path_handle_buf[0..path.len];
             const target_handle = path_handles[path_handles.len - 1];
 
-            // Phase 1: Capture (root -> target, 不含 target)
+            // Phase 1: Capture (root -> target, excludes target)
             if (path_handles.len > 1) {
                 for (path_handles[0 .. path_handles.len - 1]) |node_handle| {
                     const node = registry.resolve(node_handle, null) orelse continue;
@@ -298,7 +306,7 @@ pub const EventDispatcher = struct {
                 return if (handled) .handled else .ignored;
             }
 
-            // Phase 3: Bubble (target 的父节点 -> root)
+            // Phase 3: Bubble (target's parent -> root)
             if (path_handles.len > 1) {
                 var i = path_handles.len - 1;
                 while (i > 0) {
@@ -317,7 +325,7 @@ pub const EventDispatcher = struct {
             return if (handled) .handled else .ignored;
         }
 
-        // Phase 1: Capture (root -> target, 不含 target)
+        // Phase 1: Capture (root -> target, excludes target)
         if (path.len > 1) {
             for (path[0 .. path.len - 1]) |node| {
                 const node_id = node.id;
@@ -338,7 +346,7 @@ pub const EventDispatcher = struct {
         if (target_result == .stop) return .stop;
         if (target_result == .handled) handled = true;
 
-        // Phase 3: Bubble (target 的父节点 -> root)
+        // Phase 3: Bubble (target's parent -> root)
         if (path.len > 1) {
             var i = path.len - 1;
             while (i > 0) {
@@ -357,19 +365,19 @@ pub const EventDispatcher = struct {
         return if (handled) .handled else .ignored;
     }
 
-    /// 分发鼠标移动事件, 处理 hover 状态变化（modifiers 退化为 `.{}` 的兼容入口）
+    /// Dispatch mouse move, handle hover change (modifiers degrade to `.{}` compat entry)
     pub fn dispatchMouseMove(self: *EventDispatcher, x: f32, y: f32, new_hovered: ?*Node) ?*Node {
         return self.dispatchMouseMoveEx(x, y, new_hovered, .{});
     }
 
-    /// 分发鼠标移动事件，携带移动时刻的修饰键
+    /// Dispatch mouse move with movement-time modifier flags
     pub fn dispatchMouseMoveEx(self: *EventDispatcher, x: f32, y: f32, new_hovered: ?*Node, modifiers: events.Modifiers) ?*Node {
         const dx: f32 = if (self.has_last_mouse) x - self.last_mouse_pos[0] else 0;
         const dy: f32 = if (self.has_last_mouse) y - self.last_mouse_pos[1] else 0;
         self.last_mouse_pos = .{ x, y };
         self.has_last_mouse = true;
 
-        // Pointer Capture: 直接发给捕获节点，跳过 hover 处理
+        // Pointer capture: direct to captured node, skip hover
         const capture_target = self.resolveHandle(self.pointer_capture_handle);
         if (capture_target) |capture| {
             const event = Event{ .mouse_move = .{ .x = x, .y = y, .dx = dx, .dy = dy, .modifiers = modifiers } };
@@ -388,10 +396,10 @@ pub const EventDispatcher = struct {
         return self.currentHovered();
     }
 
-    /// 分发鼠标按下事件（支持按钮类型）
+    /// Dispatch mouse down (button support)
     pub fn dispatchMouseDownButton(self: *EventDispatcher, x: f32, y: f32, target: ?*Node, button: events.MouseButton, modifiers: events.Modifiers) ?*Node {
         const identity = if (target) |node| HandlerTarget.init(self.registry, node) else null;
-        // 右键/中键不参与 click 合成与按压态跟踪，仅分发原始 down 事件。
+        // RMB/MMB skip click synthesis and press tracking; dispatch raw down only.
         if (button != .left) {
             if (target) |t| {
                 const event = Event{ .mouse_down = .{ .x = x, .y = y, .button = button, .modifiers = modifiers } };
@@ -416,27 +424,25 @@ pub const EventDispatcher = struct {
         return if (identity) |ref| ref.resolve() else null;
     }
 
-    /// 分发鼠标按下事件，默认左键的便利重载
+    /// Dispatch mouse down, LMB default convenience overload
     pub fn dispatchMouseDown(self: *EventDispatcher, x: f32, y: f32, target: ?*Node, modifiers: events.Modifiers) ?*Node {
         return self.dispatchMouseDownButton(x, y, target, .left, modifiers);
     }
 
-    /// 分发鼠标释放事件（支持按钮类型），左键才会合成 click
-    /// `modifiers` 是**抬手时刻**的修饰键，与 mouse_down 对称。
-    /// 刻意不复用 `self.last_modifiers`（那是按下时刻的值）：两者可以不同
-    /// （按下时没按 ⇧、抬手前按住，或反之），宿主在 mouse_up 判"加选还是
-    /// 独占选中"时需要的是抬手时刻的真值。合成的 click 仍用 last_modifiers
-    /// click 的语义锚点是按下。
+    /// Dispatch mouse up (button support); LMB synthesizes click.
+    /// `modifiers` is the **up-time** modifier state, mirroring mouse_down.
+    /// Deliberately not reusing `self.last_modifiers` (down-time value): they may differ (e.g.
+    /// Shift pressed after down), and hosts need up-time truth for 'add-select vs exclusive
+    /// select'. The synthesized click still uses last_modifiers; click's semantic anchor is down.
     pub fn dispatchMouseUpButton(self: *EventDispatcher, x: f32, y: f32, target: ?*Node, button: events.MouseButton, modifiers: events.Modifiers) void {
         const target_handle = if (target) |t|
             if (self.registry) |registry| registry.handleFor(t) else null
         else
             null;
 
-        // Pointer Capture: 发给捕获节点后自动释放。
-        // click/double_click 仍要合成（浏览器 setPointerCapture 语义：capture
-        // 元素收到合成 click），否则凡是 down 即 capture 的宿主（画布拖拽）
-        // 永远收不到双击。
+        // Pointer capture: send to captured, auto-release after. click/double_click still
+        // synthesized (browser setPointerCapture semantics: capture element receives synthetic
+        // click), else down-then-capture hosts (canvas drag) never see double-click.
         const capture_target = self.resolveHandle(self.pointer_capture_handle);
         if (capture_target) |capture| {
             const capture_handle = self.pointer_capture_handle;
@@ -464,13 +470,13 @@ pub const EventDispatcher = struct {
         }
         logSidebarHit("up", x, y, target);
 
-        // 分发 mouse_up
+        // Dispatch mouse_up
         if (resolveDispatchTarget(self, target_handle, target)) |t| {
             const event = Event{ .mouse_up = .{ .x = x, .y = y, .button = .left, .modifiers = modifiers } };
             _ = self.dispatch(event, t);
         }
 
-        // 合成 click (down 和 up 在同一元素)
+        // Synthesize click (down and up on same element)
         const down_target = self.resolveHandle(self.mouse_down_handle);
         const click_match = if (self.registry != null)
             nodeHandleEqual(self.mouse_down_handle, target_handle)
@@ -486,23 +492,23 @@ pub const EventDispatcher = struct {
         self.mouse_down_handle = null;
     }
 
-    /// click / double_click 合成（多击检测共享状态）。普通路径与 pointer
-    /// capture 路径共用，handle 优先，raw 指针只在 registry 缺席时兜底。
+    /// Synthesize click/double_click (multi-click detection shared). Normal and
+    /// pointer-capture paths reuse; handle priority, raw ptr fallback if registry absent.
     fn synthesizeClick(self: *EventDispatcher, x: f32, y: f32, target_handle: ?NodeHandle, target: ?*Node) void {
         {
-            // mouse_up handler 已经跑过，可能释放了 target 子树（例如 folder toggle）。
-            // 此时 raw 指针已悬垂，必须只信 handle。registry 缺席时只能赌 raw。
+            // mouse_up handler already ran, may have destroyed target subtree (e.g. folder toggle).
+            // Raw ptr now dangling; must trust handle. registry absent -> can only gamble on raw.
             const click_target: ?*Node = if (self.registry != null)
                 self.resolveHandle(target_handle)
             else
                 target;
             if (click_target) |t| {
-                // 多击检测：使用共享阈值，避免双击/三击判定过紧。
+                // Multi-click detect: shared threshold, avoid double/triple judgment too tight.
                 const dx = x - self.last_click_pos[0];
                 const dy = y - self.last_click_pos[1];
                 const dist_sq = dx * dx + dy * dy;
                 var is_multi_click = false;
-                const now_instant = std.time.Instant.now() catch null;
+                const now_instant = @import("zenit_time").Instant.now(self.io) catch null;
                 if (now_instant) |now| {
                     if (self.last_click_instant) |last| {
                         const time_delta_ns = now.since(last);
@@ -520,8 +526,10 @@ pub const EventDispatcher = struct {
                 const click_event = Event{ .click = .{ .x = x, .y = y, .click_count = self.consecutive_clicks, .modifiers = self.last_modifiers } };
                 _ = self.dispatch(click_event, t);
                 if (self.consecutive_clicks == 2) {
-                    // click handler 可能释放了 target 所在子树（例如 folder toggle 重建 file tree）。
-                    // 此时 raw 指针已悬垂，必须只信 handle：registry 存在且 resolve 失败则直接放弃 double_click。
+                    // click handler may have destroyed target's subtree (e.g. folder toggle
+                    // rebuilds tree).
+                    // Raw ptr dangling; must trust handle: if registry present but resolve fails,
+                    // abandon double_click.
                     const dc_target: ?*Node = if (self.registry != null)
                         self.resolveHandle(target_handle)
                     else
@@ -540,12 +548,12 @@ pub const EventDispatcher = struct {
         }
     }
 
-    /// 分发鼠标释放事件，默认左键、无修饰键的便利重载
+    /// Dispatch mouse up, LMB default, no modifiers convenience overload
     pub fn dispatchMouseUp(self: *EventDispatcher, x: f32, y: f32, target: ?*Node) void {
         self.dispatchMouseUpButton(x, y, target, .left, .{});
     }
 
-    /// 分发键盘事件到焦点节点
+    /// Dispatch keyboard event to focus node
     pub fn dispatchKeyDown(self: *EventDispatcher, target: *Node, key_event: KeyEvent) EventResult {
         const event = Event{ .key_down = key_event };
         return self.dispatch(event, target);
@@ -556,18 +564,18 @@ pub const EventDispatcher = struct {
         return self.dispatch(event, target);
     }
 
-    /// 分发文本输入到焦点节点
+    /// Dispatch text input to focus node
     pub fn dispatchTextInput(self: *EventDispatcher, target: *Node, text: []const u8) EventResult {
         const event = Event{ .text_input = .{ .text = text } };
         return self.dispatch(event, target);
     }
 
-    /// 分发 IME 预编辑到焦点节点
+    /// Dispatch IME preedit to focus node
     pub fn dispatchImePreedit(self: *EventDispatcher, target: *Node, text: []const u8, cursor_utf8_offset: u32) EventResult {
         return self.dispatchImePreeditReplace(target, text, cursor_utf8_offset, events.ime_no_replacement, events.ime_no_replacement);
     }
 
-    /// 分发带 replacementRange 的 IME 预编辑（再変換）；哨兵时与 dispatchImePreedit 等价
+    /// Dispatch IME preedit with replacementRange (reconversion); sentinel == dispatchImePreedit
     pub fn dispatchImePreeditReplace(self: *EventDispatcher, target: *Node, text: []const u8, cursor_utf8_offset: u32, replace_start_utf8: u32, replace_end_utf8: u32) EventResult {
         const event = Event{ .ime_preedit = .{
             .text = text,
@@ -578,12 +586,12 @@ pub const EventDispatcher = struct {
         return self.dispatch(event, target);
     }
 
-    /// 分发 IME 提交到焦点节点
+    /// Dispatch IME commit to focus node
     pub fn dispatchImeCommit(self: *EventDispatcher, target: *Node, text: []const u8) EventResult {
         return self.dispatchImeCommitReplace(target, text, events.ime_no_replacement, events.ime_no_replacement);
     }
 
-    /// 分发带 replacementRange 的 IME 提交；哨兵时与 dispatchImeCommit 等价
+    /// Dispatch IME commit with replacementRange; sentinel == dispatchImeCommit
     pub fn dispatchImeCommitReplace(self: *EventDispatcher, target: *Node, text: []const u8, replace_start_utf8: u32, replace_end_utf8: u32) EventResult {
         const event = Event{ .ime_commit = .{
             .text = text,
@@ -593,10 +601,10 @@ pub const EventDispatcher = struct {
         return self.dispatch(event, target);
     }
 
-    /// 每个滚动事件在命中测试**之前**调用：新手势开始意味着上一个手势已经结束，
-    /// 它的 ended 若丢失，先补发 cancelled（否则旧 owner 及其祖先链会一直以为手指
-    /// 还在板上）。放在命中测试之前，合成事件的处理器对节点树的任何改动都能被
-    /// 随后的命中看到。may_begin 之后的 began 属于同一手势。
+    /// Called **before** hit test per scroll event: gesture started means prior ended,
+    /// if its ended lost, synthesize cancelled first (old owner + ancestors not misled node
+    /// still touched). Before hit test so handler's tree edits visible to following hit. may_begin
+    /// then began belong same gesture.
     pub fn beginScrollEvent(self: *EventDispatcher, scroll: events.ScrollEvent) void {
         if (scroll.isMomentum() or scroll.phase == .none) return;
         switch (scroll.phase) {
@@ -607,12 +615,11 @@ pub const EventDispatcher = struct {
         self.scroll_session_from_may_begin = scroll.phase == .may_begin;
     }
 
-    /// 分发滚轮事件（调用前先 beginScrollEvent，再做命中测试）。
+    /// Dispatch wheel event (call beginScrollEvent first, then hit test).
     ///
-    /// 触控板手势在 may_begin/began 时按命中锁定 owner，changed 期间不换手
-    /// （内容在静止指针下移动，命中会变，不代表用户开始了新手势），ended/cancelled
-    /// 后释放；ended 把 owner 交给随后的惯性事件。鼠标滚轮（.none）没有手势，
-    /// 直接按命中派发，不读写会话状态。
+    /// Trackpad gestures lock owner on hit at may_begin/began and hold it through changed (content
+    /// moves under a steady pointer, so hit changes but it is not a new gesture); released on
+    /// ended/cancelled; ended transfers owner to momentum. Mouse wheel (.none) is stateless.
     pub fn dispatchScroll(self: *EventDispatcher, scroll: events.ScrollEvent, hit_target: ?*Node) EventResult {
         const hit = nearestCompatibleScrollOwner(hit_target, scroll.dx, scroll.dy) orelse hit_target;
         if (scrollDebugEnabled() and !scroll.isMomentum() and !scroll.phaseEnded() and (scroll.dy != 0 or scroll.dx != 0)) {
@@ -620,7 +627,7 @@ pub const EventDispatcher = struct {
         }
         if (scroll.isMomentum()) return self.dispatchMomentumScroll(scroll, hit);
         if (scroll.phase == .none) {
-            // 滚轮打断正在进行的惯性
+            // Wheel interrupts in-flight momentum.
             self.scroll_momentum_owner = null;
             self.scroll_momentum_owner_ptr = null;
             const target = hit orelse return .ignored;
@@ -641,7 +648,8 @@ pub const EventDispatcher = struct {
             .ended, .cancelled => if (self.scrollSessionOwner(hit) == null) self.setScrollSessionOwner(hit),
         }
 
-        // 任何新的手指/滚轮输入都打断上一轮惯性；ended 把 owner 交给本手势的惯性。
+        // Any new pointer/wheel input breaks prior momentum; ended transfers owner to this
+        // gesture's momentum.
         switch (scroll.phase) {
             .ended => {
                 self.scroll_momentum_owner = self.scroll_session_owner;
@@ -666,7 +674,7 @@ pub const EventDispatcher = struct {
         return self.dispatch(.{ .scroll = scroll }, target);
     }
 
-    /// registry 模式只存 handle（指针会悬垂）；无 registry 的单测模式只存指针。
+    /// registry mode stores handle (ptr dangling); no-registry test mode stores ptr only.
     fn setScrollSessionOwner(self: *EventDispatcher, node: ?*Node) void {
         if (self.registry) |registry| {
             self.scroll_session_owner = if (node) |n| registry.handleFor(n) else null;
@@ -677,7 +685,7 @@ pub const EventDispatcher = struct {
         }
     }
 
-    /// 当前会话 owner；已销毁（或指针模式下与命中不在同一棵树）时返回 null。
+    /// Current session owner; returns null if destroyed (or ptr mode + not same tree).
     fn scrollSessionOwner(self: *EventDispatcher, hit: ?*Node) ?*Node {
         if (self.registry != null) return self.resolveHandle(self.scroll_session_owner);
         const ptr = self.scroll_session_owner_ptr orelse return null;
@@ -685,8 +693,8 @@ pub const EventDispatcher = struct {
         return ptr;
     }
 
-    /// 惯性事件固定发给发起它的手势的 owner。owner 已被新手势清除（或节点已销毁）
-    /// 说明这段惯性已被打断，直接丢弃，不回退到命中目标。
+    /// Momentum dispatch fixed to gesture owner. Owner cleared by new gesture (or node
+    /// destroyed) means momentum broken, discard, do not fallback to hit.
     fn dispatchMomentumScroll(self: *EventDispatcher, scroll: events.ScrollEvent, hit: ?*Node) EventResult {
         const owner = if (self.registry != null)
             self.resolveHandle(self.scroll_momentum_owner)
@@ -706,24 +714,28 @@ pub const EventDispatcher = struct {
         return self.dispatch(.{ .scroll = scroll }, target);
     }
 
-    /// 系统中断（窗口失焦等）时结束进行中的滚动：给手势 owner 补发 cancelled，
-    /// 给惯性 owner 补发惯性 ended，与真实设备的结束信号走同一条路径。
+    /// System interrupt (window blur etc) ends active scroll: synthesize cancelled to
+    /// gesture owner, momentum ended to momentum owner, same code path as real device end.
     pub fn cancelScrollGesture(self: *EventDispatcher) void {
-        // 先把两个 owner 一次性取出并清空，再派发：处理器若重入滚动派发，
-        // 看到的是干净状态，且它建立的新会话不会被这里随后覆盖。
-        const session_owner = self.scrollSessionOwner(null);
-        const momentum_owner = if (self.registry != null)
-            self.resolveHandle(self.scroll_momentum_owner)
-        else
-            self.scroll_momentum_owner_ptr;
+        // Extract both owners once, clear, then dispatch: handler re-entering scroll sees
+        // clean state, new session it builds not overwritten. Extracted is **identity** (registry
+        // handle, not raw ptr): first dispatch handler may sync-destroy second owner, second
+        // dispatch must re-resolve before use. No-registry test mode by dispatch contract keeps
+        // raw ptrs alive.
+        const session_handle = self.scroll_session_owner;
+        const momentum_handle = self.scroll_momentum_owner;
+        const session_ptr = if (self.registry == null) self.scrollSessionOwner(null) else null;
+        const momentum_ptr = if (self.registry == null) self.scroll_momentum_owner_ptr else null;
         self.scroll_session_owner = null;
         self.scroll_session_owner_ptr = null;
         self.scroll_momentum_owner = null;
         self.scroll_momentum_owner_ptr = null;
         self.scroll_session_from_may_begin = false;
+        const session_owner = if (self.registry != null) self.resolveHandle(session_handle) else session_ptr;
         if (session_owner) |owner| {
             _ = self.dispatch(.{ .scroll = .{ .x = 0, .y = 0, .dx = 0, .dy = 0, .phase = .cancelled } }, owner);
         }
+        const momentum_owner = if (self.registry != null) self.resolveHandle(momentum_handle) else momentum_ptr;
         if (momentum_owner) |owner| {
             _ = self.dispatch(.{ .scroll = .{ .x = 0, .y = 0, .dx = 0, .dy = 0, .momentum = .ended } }, owner);
         }
@@ -745,17 +757,16 @@ pub const EventDispatcher = struct {
         var old_path_buf: [128]*Node = undefined;
         var new_path_buf: [128]*Node = undefined;
 
-        const old_path = if (old_hovered) |old|
-            buildPathInto(old, old_path_buf[0..])
-        else
-            old_path_buf[0..0];
+        // Prepare both complete paths before publishing a hover transition.
+        // OOM leaves the prior hover transaction unchanged, with no callbacks.
+        const old_storage = pathStorage(*Node, self.allocator, &old_path_buf, if (old_hovered) |old| pathDepth(old) else 0) catch return;
+        defer releasePathStorage(*Node, self.allocator, old_storage);
+        const new_storage = pathStorage(*Node, self.allocator, &new_path_buf, if (new_hovered) |new| pathDepth(new) else 0) catch return;
+        defer releasePathStorage(*Node, self.allocator, new_storage);
+        const old_path = if (old_hovered) |old| buildPathInto(old, old_storage) else old_storage;
+        const new_path = if (new_hovered) |new| buildPathInto(new, new_storage) else new_storage;
 
-        const new_path = if (new_hovered) |new|
-            buildPathInto(new, new_path_buf[0..])
-        else
-            new_path_buf[0..0];
-
-        // 找公共前缀
+        // Find common prefix
         var common: usize = 0;
         while (common < old_path.len and common < new_path.len and old_path[common] == new_path[common]) {
             common += 1;
@@ -765,8 +776,12 @@ pub const EventDispatcher = struct {
             // Callbacks can detach/free either path or reenter hover dispatch.
             // Snapshot identities before calling any user code, and resolve
             // again even between on_event and the convenience hover handler.
-            var old_handles: [128]NodeHandle = undefined;
-            var new_handles: [128]NodeHandle = undefined;
+            var old_handle_buf: [128]NodeHandle = undefined;
+            var new_handle_buf: [128]NodeHandle = undefined;
+            const old_handles = pathStorage(NodeHandle, self.allocator, &old_handle_buf, old_path.len) catch return;
+            defer releasePathStorage(NodeHandle, self.allocator, old_handles);
+            const new_handles = pathStorage(NodeHandle, self.allocator, &new_handle_buf, new_path.len) catch return;
+            defer releasePathStorage(NodeHandle, self.allocator, new_handles);
             for (old_path, 0..) |node, index| old_handles[index] = registry.handleFor(node);
             for (new_path, 0..) |node, index| new_handles[index] = registry.handleFor(node);
             self.hover_epoch +%= 1;
@@ -781,6 +796,7 @@ pub const EventDispatcher = struct {
                 }
                 if (self.hover_epoch != epoch) return;
                 if (self.resolveHandle(handle)) |node| {
+                    @import("hooks.zig").assertHoverHandlers(node);
                     if (node.behavior.events.on_leave) |handler| handler.invoke();
                 }
                 if (self.hover_epoch != epoch) return;
@@ -791,6 +807,7 @@ pub const EventDispatcher = struct {
                 }
                 if (self.hover_epoch != epoch) return;
                 if (self.resolveHandle(handle)) |node| {
+                    @import("hooks.zig").assertHoverHandlers(node);
                     if (node.behavior.events.on_hover) |handler| handler.invoke();
                 }
                 if (self.hover_epoch != epoch) return;
@@ -799,7 +816,7 @@ pub const EventDispatcher = struct {
             return;
         }
 
-        // 触发离开（从叶到根）
+        // Trigger leave (leaf to root)
         var i = old_path.len;
         while (i > common) {
             i -= 1;
@@ -807,16 +824,18 @@ pub const EventDispatcher = struct {
             if (leaving.behavior.events.on_event) |handler| {
                 _ = handler(.mouse_leave, leaving.behavior.events.event_context);
             }
+            @import("hooks.zig").assertHoverHandlers(leaving);
             if (leaving.behavior.events.on_leave) |h| {
                 h.invoke();
             }
         }
 
-        // 触发进入（从根到叶）
+        // Trigger enter (root to leaf)
         for (new_path[common..]) |node| {
             if (node.behavior.events.on_event) |handler| {
                 _ = handler(.mouse_enter, node.behavior.events.event_context);
             }
+            @import("hooks.zig").assertHoverHandlers(node);
             if (node.behavior.events.on_hover) |h| {
                 h.invoke();
             }
@@ -828,32 +847,19 @@ pub const EventDispatcher = struct {
             null;
     }
 
-    /// 构建从 root 到 target 的路径，写入外部 buffer
+    /// Build path root to target, write to external buffer
     fn buildPathInto(target: *Node, buf: []*Node) []*Node {
         return buildPathInternal(target, buf);
     }
 
     fn buildPathInternal(target: *Node, buf: []*Node) []*Node {
-        var count: usize = 0;
-        var node: ?*Node = target;
-
-        // 先计算深度
-        while (node != null) : (node = node.?.parent) {
-            count += 1;
-            if (count >= buf.len) {
-                std.log.warn("[EventDispatcher] node tree depth ({d}) exceeds path buffer ({d}), event propagation truncated", .{ count, buf.len });
-                break;
-            }
-        }
-
-        if (count == 0) return buf[0..0];
-        if (count > buf.len) count = buf.len;
-
-        // 从 target 向上填充, 然后反转得到 root->target 顺序
         var i: usize = 0;
-        node = target;
-        while (node != null and i < count) : (node = node.?.parent) {
-            buf[i] = node.?;
+        var node: ?*Node = target;
+        while (node) |n| : (node = n.parent) {
+            // Callers provision the complete depth. Never dispatch a partial
+            // path: losing root capture changes the event's authority.
+            if (i == buf.len) return buf[0..0];
+            buf[i] = n;
             i += 1;
         }
 
@@ -862,16 +868,32 @@ pub const EventDispatcher = struct {
     }
 };
 
+fn pathDepth(target: *Node) usize {
+    var depth: usize = 0;
+    var node: ?*Node = target;
+    while (node) |n| : (node = n.parent) depth += 1;
+    return depth;
+}
+
+/// Ordinary paths stay allocation-free. Deep dispatch snapshots the complete
+/// ancestry, including handles, before any callback can mutate the tree.
+fn pathStorage(comptime T: type, allocator: Allocator, stack: *[128]T, count: usize) ![]T {
+    return if (count <= stack.len) stack[0..count] else try allocator.alloc(T, count);
+}
+
+fn releasePathStorage(comptime T: type, allocator: Allocator, storage: []T) void {
+    if (storage.len > 128) allocator.free(storage);
+}
+
 fn nodeHandleEqual(a: ?NodeHandle, b: ?NodeHandle) bool {
     if (a == null or b == null) return a == null and b == null;
     return a.?.id == b.?.id and a.?.generation == b.?.generation;
 }
 
 fn resolveDispatchTarget(self: *EventDispatcher, handle: ?NodeHandle, raw: ?*Node) ?*Node {
-    // 优先走 handle（防悬垂指针：node 可能已被 free）；
-    // registry 里不存在时 fallback 到 raw 指针，避免 hit-test 产生的原始节点指针
-    // 被丢弃导致 click/hover 无响应。
-    // v1 的思路是严格模式（handle 失效就丢），但会导致任何未 register 的节点事件丢失，代价过高
+    // Prefer handle (prevent dangling: node may be freed); fallback to raw ptr when
+    // registry absent, keep hit-test's original node ptr from getting dropped (click/hover
+    // unresponsive). v1 strict mode (invalid handle -> drop) loses unregistered events, high cost.
     return self.resolveHandle(handle) orelse raw;
 }
 
@@ -886,7 +908,7 @@ fn scrollOwnerDirection(node: *Node) ?core.ScrollDirectionHint {
     return node.behavior.events.scroll_direction_hint;
 }
 
-/// 诊断：命中节点的祖先里没有 ScrollArea / VirtualList（滚动会被丢掉）。
+/// Diagnostic: hit node's ancestors lack ScrollArea/VirtualList (scroll gets dropped).
 fn logScrollHitWithoutScrollArea(hit: ?*Node, x: f32, y: f32) void {
     const ht = hit orelse {
         std.debug.print("[scroll-dbg] hitTest=null at ({d:.0},{d:.0})\n", .{ x, y });
@@ -947,7 +969,7 @@ fn isNodeInSubtree(root: *Node, node_id: u32) bool {
     return false;
 }
 
-// === Debug Trace 辅助 ===
+// === Debug Trace helpers ===
 
 fn eventToKindTag(event: Event) debug_trace.EventKindTag {
     return switch (event) {
@@ -1007,32 +1029,43 @@ const HandlerTarget = struct {
     }
 };
 
-/// 在节点上调用事件处理器
+/// Call event handler on node
 fn invokeHandler(registry: ?*const NodeRegistry, initial_node: *Node, event: Event, phase: EventPhase) EventResult {
     const target = HandlerTarget.init(registry, initial_node);
     var node = initial_node;
-    // capture 阶段真派发，root -> target 路径下行调用 on_event_capture。
-    // 默认 null handler 节点零开销跳过；与 bubble 阶段独立，可单独 stop 链路。
-    // 用于 focus trap、scroll lock、手势仲裁等"祖先抢先拦截"场景。
+    // Capture phase true dispatch, root -> target call on_event_capture. Default null
+    // handler zero cost; independent of bubble, can solo stop. For focus trap, scroll lock,
+    // gesture arbitration ('ancestor preemption' scenarios).
     if (phase == .capture) {
         if (node.behavior.events.on_event_capture) |handler| {
-            return handler(event, node.behavior.events.event_context);
+            return handler(event, node.behavior.events.capture_context orelse node.behavior.events.event_context);
         }
         return .ignored;
+    }
+
+    // Target's own capture handler runs at target phase, before on_event (DOM at-target
+    // order): ancestor capture is root -> target (no target), target's capture here. Without it,
+    // component root as focus target (Input) never sees ancestor capture. Non-ignored stops.
+    if (phase == .target) {
+        if (node.behavior.events.on_event_capture) |handler| {
+            const result = handler(event, node.behavior.events.capture_context orelse node.behavior.events.event_context);
+            if (result != .ignored) return result;
+            node = target.resolve() orelse return .ignored;
+        }
     }
 
     if (event == .click) {
         return invokeClickHandler(target, event, phase);
     }
 
-    // 调用通用事件处理器 (如果有)
+    // Call generic event handler (if any)
     if (node.behavior.events.on_event) |handler| {
         const result = handler(event, node.behavior.events.event_context);
         if (result != .ignored) return result;
         node = target.resolve() orelse return .ignored;
     }
 
-    // on_event 返回 ignored 或不存在时，对特定事件 fallthrough 到专用处理器
+    // on_event ignored/absent -> fallthrough to event-specific handler.
     switch (event) {
         .key_down => |ke| {
             if (node.behavior.events.on_key_down) |kh| {
@@ -1050,8 +1083,8 @@ fn invokeHandler(registry: ?*const NodeRegistry, initial_node: *Node, event: Eve
             }
         },
         .drag => |de| {
-            // 拖放专用 HandlerRef 通道。updated 无专属 handler：它是高频
-            // 位置流，drop target 只关心进入/离开/放下三态。
+            // Drag-specific HandlerRef channel. updated has no handler: high-frequency position
+            // stream; drop target only cares enter/leave/drop.
             switch (de.kind) {
                 .entered => if (node.behavior.events.on_drag_enter) |h| {
                     h.invoke();
@@ -1066,7 +1099,7 @@ fn invokeHandler(registry: ?*const NodeRegistry, initial_node: *Node, event: Eve
                         .paths = de.paths,
                         .x = de.x,
                         .y = de.y,
-                        .payload_kind = @intFromEnum(de.payload_kind),
+                        .payload_kind = @backingInt(de.payload_kind),
                         .payload_truncated = de.payload_truncated,
                         .payload_is_untrusted = de.payload_is_untrusted,
                     });
@@ -1109,19 +1142,19 @@ fn invokeClickHandler(target: HandlerTarget, event: Event, phase: EventPhase) Ev
     return if (handled) .handled else .ignored;
 }
 
-/// 命中测试: 从后向前遍历子节点 (Z-order), 找最上层匹配节点
-/// overflow_hidden 节点会裁剪子节点的命中区域
-/// 考虑父节点的 translate_x/translate_y 偏移（如 ScrollArea 滚动）
+/// Hit test: traverse children back-to-front (Z-order), find topmost match.
+/// overflow_hidden nodes clip children hit area. Consider parent translate_x/translate_y
+/// offset (e.g. ScrollArea scroll).
 fn hitTestNode(node: *Node, x: f32, y: f32) ?*Node {
     return hitTestNodeRuntime(node, x, y, .pointer);
 }
 
-/// 命中测试（不要求节点有事件处理器），单元测试 helper。
+/// Hit test (no handler required), unit test helper.
 fn hitTestNodeAny(node: *Node, x: f32, y: f32) ?*Node {
     return hitTestNodeRuntime(node, x, y, .inspect);
 }
 
-/// 命中查询辅助：供 dispatcher 单元测试使用，统一走 runtime 索引逻辑。
+/// Hit query helper: unit test dispatcher, unified runtime index logic.
 fn hitTestNodeRuntime(node: *Node, x: f32, y: f32, kind: core.HitQueryKind) ?*Node {
     if (!interaction_semantics.nodeParticipatesInHitTest(node)) return null;
     var registry = NodeRegistry.init(std.heap.page_allocator);
@@ -1139,10 +1172,10 @@ fn hitTestNodeRuntime(node: *Node, x: f32, y: f32, kind: core.HitQueryKind) ?*No
     return registry.resolve(hit.handle, null);
 }
 
-// ========== 测试 ==========
+// ========== Tests ==========
 
 test "EventDispatcher: init/deinit" {
-    var dispatcher = EventDispatcher.init(std.testing.allocator);
+    var dispatcher = EventDispatcher.init(std.testing.allocator, std.testing.io);
     defer dispatcher.deinit();
 
     try std.testing.expectEqual(@as(?NodeHandle, null), dispatcher.hovered_handle);
@@ -1150,10 +1183,10 @@ test "EventDispatcher: init/deinit" {
 }
 
 test "EventDispatcher: dispatch to target" {
-    var dispatcher = EventDispatcher.init(std.testing.allocator);
+    var dispatcher = EventDispatcher.init(std.testing.allocator, std.testing.io);
     defer dispatcher.deinit();
 
-    var ctx = try core.Cx.init(std.testing.allocator);
+    var ctx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     dispatcher.setRegistry(&ctx.node_registry);
 
@@ -1182,10 +1215,10 @@ test "EventDispatcher: dispatch to target" {
 }
 
 test "EventDispatcher: direct click dispatch invokes target on_click" {
-    var dispatcher = EventDispatcher.init(std.testing.allocator);
+    var dispatcher = EventDispatcher.init(std.testing.allocator, std.testing.io);
     defer dispatcher.deinit();
 
-    var ctx = try core.Cx.init(std.testing.allocator);
+    var ctx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     dispatcher.setRegistry(&ctx.node_registry);
 
@@ -1211,10 +1244,10 @@ test "EventDispatcher: direct click dispatch invokes target on_click" {
 }
 
 test "EventDispatcher: bubble propagation" {
-    var dispatcher = EventDispatcher.init(std.testing.allocator);
+    var dispatcher = EventDispatcher.init(std.testing.allocator, std.testing.io);
     defer dispatcher.deinit();
 
-    var ctx = try core.Cx.init(std.testing.allocator);
+    var ctx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     dispatcher.setRegistry(&ctx.node_registry);
 
@@ -1249,10 +1282,10 @@ test "EventDispatcher: bubble propagation" {
 }
 
 test "EventDispatcher: stop propagation" {
-    var dispatcher = EventDispatcher.init(std.testing.allocator);
+    var dispatcher = EventDispatcher.init(std.testing.allocator, std.testing.io);
     defer dispatcher.deinit();
 
-    var ctx = try core.Cx.init(std.testing.allocator);
+    var ctx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     dispatcher.setRegistry(&ctx.node_registry);
 
@@ -1296,15 +1329,15 @@ test "EventDispatcher: stop propagation" {
 
     const result = dispatcher.dispatch(Event{ .click = .{ .x = 50, .y = 50 } }, child);
     try std.testing.expectEqual(EventResult.stop, result);
-    // click 不会在 capture 阶段触发；child 在 target 阶段 stop 后，middle 的 bubble 也不应触发。
+    // click never fires capture; child stop at target -> middle bubble should not fire.
     try std.testing.expectEqual(@as(u32, 0), bubble_count);
 }
 
 test "EventDispatcher: bubbling skips nodes torn down during target handler" {
-    var dispatcher = EventDispatcher.init(std.testing.allocator);
+    var dispatcher = EventDispatcher.init(std.testing.allocator, std.testing.io);
     defer dispatcher.deinit();
 
-    var ctx = try core.Cx.init(std.testing.allocator);
+    var ctx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     dispatcher.setRegistry(&ctx.node_registry);
 
@@ -1378,10 +1411,10 @@ test "EventDispatcher: bubbling skips nodes torn down during target handler" {
 }
 
 test "EventDispatcher: mouse hover" {
-    var dispatcher = EventDispatcher.init(std.testing.allocator);
+    var dispatcher = EventDispatcher.init(std.testing.allocator, std.testing.io);
     defer dispatcher.deinit();
 
-    var ctx = try core.Cx.init(std.testing.allocator);
+    var ctx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     dispatcher.setRegistry(&ctx.node_registry);
 
@@ -1417,20 +1450,20 @@ test "EventDispatcher: mouse hover" {
     ctx.root = root;
     ctx.layout();
 
-    // 移入按钮区域
+    // Move into button area
     _ = dispatcher.dispatchMouseMove(10, 10, hitTestNode(root, 10, 10));
     try std.testing.expectEqual(@as(u32, 1), hover_ctx.hover_count);
 
-    // 移出
+    // Move out
     _ = dispatcher.dispatchMouseMove(300, 300, hitTestNode(root, 300, 300));
     try std.testing.expectEqual(@as(u32, 1), hover_ctx.leave_count);
 }
 
 test "EventDispatcher: scroll momentum keeps session owner despite hover target change" {
-    var dispatcher = EventDispatcher.init(std.testing.allocator);
+    var dispatcher = EventDispatcher.init(std.testing.allocator, std.testing.io);
     defer dispatcher.deinit();
 
-    var ctx = try core.Cx.init(std.testing.allocator);
+    var ctx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     dispatcher.setRegistry(&ctx.node_registry);
 
@@ -1486,11 +1519,11 @@ test "EventDispatcher: scroll momentum keeps session owner despite hover target 
     try root.appendChild(std.testing.allocator, right);
     ctx.root = root;
     ctx.layout();
-    // 手指阶段命中 left，建立 scroll session owner
+    // Touch hits left, build scroll session owner
     _ = dispatcher.dispatchScroll(.{ .x = 20, .y = 20, .dx = 0, .dy = -8, .phase = .began }, hitTestNode(root, 20, 20));
-    // 手指抬起，将 session owner 转移到 momentum owner
+    // Touch ends, transfer session owner to momentum owner
     _ = dispatcher.dispatchScroll(.{ .x = 20, .y = 20, .dx = 0, .dy = 0, .phase = .ended }, hitTestNode(root, 20, 20));
-    // momentum 阶段指针移到 right，仍应派发给 left
+    // Momentum still dispatches to left despite pointer over right
     _ = dispatcher.dispatchScroll(.{ .x = 220, .y = 20, .dx = 0, .dy = -6, .momentum = .changed }, hitTestNode(root, 220, 20));
 
     try std.testing.expectEqual(@as(u32, 3), counter.left);
@@ -1535,30 +1568,30 @@ fn scrollAt(dispatcher: *EventDispatcher, root: *Node, x: f32, phase: events.Scr
 }
 
 test "EventDispatcher: began starts a new session even if the previous gesture never ended" {
-    var dispatcher = EventDispatcher.init(std.testing.allocator);
+    var dispatcher = EventDispatcher.init(std.testing.allocator, std.testing.io);
     defer dispatcher.deinit();
-    var ctx = try core.Cx.init(std.testing.allocator);
+    var ctx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     dispatcher.setRegistry(&ctx.node_registry);
     var counts = [2]u32{ 0, 0 };
     const root = try scrollSessionFixture(ctx, &counts);
 
-    // 旧手势落在 left，ended 丢失
+    // Old gesture on left, ended lost
     scrollAt(&dispatcher, root, 20, .began, false);
     scrollAt(&dispatcher, root, 20, .changed, false);
-    // 新手势在 right 开始：began 重新按命中锁定
+    // New gesture on right: began re-locks by hit
     scrollAt(&dispatcher, root, 220, .began, false);
     scrollAt(&dispatcher, root, 220, .changed, false);
 
-    // left：began + changed + 新手势开始时补发的 cancelled
+    // left: began + changed + synthesized cancelled on new gesture start
     try std.testing.expectEqual(@as(u32, 3), counts[0]);
     try std.testing.expectEqual(@as(u32, 2), counts[1]);
 }
 
 test "EventDispatcher: changed keeps the gesture owner when the hit target moves" {
-    var dispatcher = EventDispatcher.init(std.testing.allocator);
+    var dispatcher = EventDispatcher.init(std.testing.allocator, std.testing.io);
     defer dispatcher.deinit();
-    var ctx = try core.Cx.init(std.testing.allocator);
+    var ctx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     dispatcher.setRegistry(&ctx.node_registry);
     var counts = [2]u32{ 0, 0 };
@@ -1573,9 +1606,9 @@ test "EventDispatcher: changed keeps the gesture owner when the hit target moves
 }
 
 test "EventDispatcher: cancelled releases the owner without handing it to momentum" {
-    var dispatcher = EventDispatcher.init(std.testing.allocator);
+    var dispatcher = EventDispatcher.init(std.testing.allocator, std.testing.io);
     defer dispatcher.deinit();
-    var ctx = try core.Cx.init(std.testing.allocator);
+    var ctx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     dispatcher.setRegistry(&ctx.node_registry);
     var counts = [2]u32{ 0, 0 };
@@ -1583,18 +1616,18 @@ test "EventDispatcher: cancelled releases the owner without handing it to moment
 
     scrollAt(&dispatcher, root, 20, .began, false);
     scrollAt(&dispatcher, root, 20, .cancelled, false);
-    scrollAt(&dispatcher, root, 20, .none, true); // 没有手势交出惯性：丢弃
+    scrollAt(&dispatcher, root, 20, .none, true); // No gesture momentum -> discard
     try std.testing.expectEqual(@as(u32, 2), counts[0]);
 
-    // 取消后下一次滚动按命中派发，而不是旧 owner
+    // Next scroll dispatches by hit, not old owner
     scrollAt(&dispatcher, root, 220, .changed, false);
     try std.testing.expectEqual(@as(u32, 1), counts[1]);
 }
 
 test "EventDispatcher: a new gesture cancels the previous one whose ended was lost" {
-    var dispatcher = EventDispatcher.init(std.testing.allocator);
+    var dispatcher = EventDispatcher.init(std.testing.allocator, std.testing.io);
     defer dispatcher.deinit();
-    var ctx = try core.Cx.init(std.testing.allocator);
+    var ctx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     dispatcher.setRegistry(&ctx.node_registry);
 
@@ -1619,21 +1652,21 @@ test "EventDispatcher: a new gesture cancels the previous one whose ended was lo
     }.handler;
     left.behavior.events.event_context = &left_phases;
 
-    // may_begin -> began 是同一个手势：不取消
+    // may_begin -> began same gesture: no cancel
     scrollAt(&dispatcher, root, 20, .may_begin, false);
     scrollAt(&dispatcher, root, 20, .began, false);
     try std.testing.expectEqual(@as(u32, 0), left_phases.cancelled);
     scrollAt(&dispatcher, root, 20, .changed, false);
-    // ended 丢失，新手势从 right 开始：left 收到补发的 cancelled
+    // ended lost, new gesture from right: left gets synthesized cancelled
     scrollAt(&dispatcher, root, 220, .began, false);
     try std.testing.expectEqual(@as(u32, 1), left_phases.cancelled);
     try std.testing.expectEqual(@as(u32, 1), counts[1]);
 }
 
 test "EventDispatcher: cancelScrollGesture still ends momentum when the cancel handler re-enters" {
-    var dispatcher = EventDispatcher.init(std.testing.allocator);
+    var dispatcher = EventDispatcher.init(std.testing.allocator, std.testing.io);
     defer dispatcher.deinit();
-    var ctx = try core.Cx.init(std.testing.allocator);
+    var ctx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     dispatcher.setRegistry(&ctx.node_registry);
     var counts = [2]u32{ 0, 0 };
@@ -1658,7 +1691,7 @@ test "EventDispatcher: cancelScrollGesture still ends momentum when the cancel h
     right.behavior.events.on_event = struct {
         fn handler(event: Event, context: ?*anyopaque) EventResult {
             const p: *Probe = @ptrCast(@alignCast(context.?));
-            // 收到补发的 cancelled 时重入一次滚动派发
+            // Re-enter scroll dispatch during synthesized cancelled
             if (event == .scroll and event.scroll.phase == .cancelled) {
                 _ = p.dispatcher.dispatchScroll(.{ .x = 220, .y = 20, .dx = 0, .dy = -3, .phase = .changed }, hitTestNode(p.root, 220, 20));
             }
@@ -1667,12 +1700,12 @@ test "EventDispatcher: cancelScrollGesture still ends momentum when the cancel h
     }.handler;
     right.behavior.events.event_context = &probe;
 
-    // left 的手势正常结束，惯性归 left
+    // left's gesture ends normally, momentum -> left
     scrollAt(&dispatcher, root, 20, .began, false);
     scrollAt(&dispatcher, root, 20, .ended, false);
-    // right 上的新手势 ended 丢失
+    // right's gesture ended lost
     scrollAt(&dispatcher, root, 220, .began, false);
-    // began 已经结束了 left 的惯性；重新给 left 一段惯性所有权来构造两者并存
+    // Manually restore left's momentum to construct both coexisting
     dispatcher.scroll_momentum_owner = ctx.node_registry.handleFor(left);
     probe.momentum_ended_on_left = 0;
 
@@ -1680,10 +1713,78 @@ test "EventDispatcher: cancelScrollGesture still ends momentum when the cancel h
     try std.testing.expectEqual(@as(u32, 1), probe.momentum_ended_on_left);
 }
 
-test "EventDispatcher: mouse wheel follows the hit target on every event" {
-    var dispatcher = EventDispatcher.init(std.testing.allocator);
+// Precondition lock: via the real scroll entry (beginScrollEvent + dispatchScroll), gesture
+// owner and momentum owner are never both non-null during a callback or post-event.
+// cancelScrollGesture re-resolves the handle between dispatches and does not rely on this
+// for safety; this locks the behavior 'system interrupt synthesizes at most one end signal'.
+// Exhausts 2 positions * 9 event types * 4-step sequences. Check inside handlers
+// (cancelPointerInteractions can call cancelScrollGesture from a handler).
+test "EventDispatcher: scroll session owner and momentum owner are never both set" {
+    var dispatcher = EventDispatcher.init(std.testing.allocator, std.testing.io);
     defer dispatcher.deinit();
-    var ctx = try core.Cx.init(std.testing.allocator);
+    var ctx = try core.Cx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
+    dispatcher.setRegistry(&ctx.node_registry);
+    var counts = [2]u32{ 0, 0 };
+    const root = try scrollSessionFixture(ctx, &counts);
+
+    const Check = struct {
+        var d: *EventDispatcher = undefined;
+        var violations: u32 = 0;
+        fn check() void {
+            if (d.scroll_session_owner != null and d.scroll_momentum_owner != null) violations += 1;
+        }
+        fn handler(event: Event, _: ?*anyopaque) EventResult {
+            if (event == .scroll) check();
+            return .stop;
+        }
+    };
+    Check.d = &dispatcher;
+    Check.violations = 0;
+    for (root.children.items) |pane| {
+        pane.behavior.events.on_event = Check.handler;
+        pane.behavior.events.event_context = null;
+    }
+
+    const Kind = struct { phase: events.ScrollPhase, momentum: events.MomentumPhase };
+    const kinds = [_]Kind{
+        .{ .phase = .none, .momentum = .none },
+        .{ .phase = .may_begin, .momentum = .none },
+        .{ .phase = .began, .momentum = .none },
+        .{ .phase = .changed, .momentum = .none },
+        .{ .phase = .ended, .momentum = .none },
+        .{ .phase = .cancelled, .momentum = .none },
+        .{ .phase = .none, .momentum = .began },
+        .{ .phase = .none, .momentum = .changed },
+        .{ .phase = .none, .momentum = .ended },
+    };
+    const xs = [_]f32{ 20, 220 };
+    const steps = 4;
+    const alphabet = kinds.len * xs.len;
+    var total: usize = 1;
+    for (0..steps) |_| total *= alphabet;
+    var seq: usize = 0;
+    while (seq < total) : (seq += 1) {
+        dispatcher.cancelScrollGesture();
+        var code = seq;
+        for (0..steps) |_| {
+            const sym = code % alphabet;
+            code /= alphabet;
+            const k = kinds[sym % kinds.len];
+            const x = xs[sym / kinds.len];
+            const ev: events.ScrollEvent = .{ .x = x, .y = 20, .dx = 0, .dy = -8, .phase = k.phase, .momentum = k.momentum };
+            dispatcher.beginScrollEvent(ev);
+            _ = dispatcher.dispatchScroll(ev, hitTestNode(root, x, 20));
+            Check.check();
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 0), Check.violations);
+}
+
+test "EventDispatcher: mouse wheel follows the hit target on every event" {
+    var dispatcher = EventDispatcher.init(std.testing.allocator, std.testing.io);
+    defer dispatcher.deinit();
+    var ctx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     dispatcher.setRegistry(&ctx.node_registry);
     var counts = [2]u32{ 0, 0 };
@@ -1697,16 +1798,16 @@ test "EventDispatcher: mouse wheel follows the hit target on every event" {
 }
 
 test "EventDispatcher: mouse wheel leaves no session for a later trackpad stream" {
-    var dispatcher = EventDispatcher.init(std.testing.allocator);
+    var dispatcher = EventDispatcher.init(std.testing.allocator, std.testing.io);
     defer dispatcher.deinit();
-    var ctx = try core.Cx.init(std.testing.allocator);
+    var ctx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     dispatcher.setRegistry(&ctx.node_registry);
     var counts = [2]u32{ 0, 0 };
     const root = try scrollSessionFixture(ctx, &counts);
 
     scrollAt(&dispatcher, root, 20, .none, false);
-    // 没有 began 的触控板流（旧 harness 的形状）：按自己的命中锁定，不粘到滚轮目标
+    // Trackpad stream lacking began (old harness shape): lock by own hit, not sticky to wheel.
     scrollAt(&dispatcher, root, 220, .changed, false);
     scrollAt(&dispatcher, root, 220, .ended, false);
 
@@ -1715,10 +1816,10 @@ test "EventDispatcher: mouse wheel leaves no session for a later trackpad stream
 }
 
 test "EventDispatcher: momentum owner missing should not fall back to current hover target" {
-    var dispatcher = EventDispatcher.init(std.testing.allocator);
+    var dispatcher = EventDispatcher.init(std.testing.allocator, std.testing.io);
     defer dispatcher.deinit();
 
-    var ctx = try core.Cx.init(std.testing.allocator);
+    var ctx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     dispatcher.setRegistry(&ctx.node_registry);
 
@@ -1748,11 +1849,11 @@ test "EventDispatcher: momentum owner missing should not fall back to current ho
     ctx.root = root1;
     ctx.layout();
 
-    // 建立 momentum owner = left1
+    // Establish momentum owner = left1
     _ = dispatcher.dispatchScroll(.{ .x = 20, .y = 20, .dx = 0, .dy = -8, .phase = .changed }, hitTestNode(root1, 20, 20));
     _ = dispatcher.dispatchScroll(.{ .x = 20, .y = 20, .dx = 0, .dy = -6, .momentum = .changed }, hitTestNode(root1, 20, 20));
 
-    // 新树里没有 left1，只有 right2；momentum 不应回退命中 right2
+    // New tree lacks left1, only right2; momentum should not fallback-hit right2.
     const root2 = try core.box(ctx, .{
         .width = .{ .px = 300 },
         .height = .{ .px = 120 },
@@ -1780,16 +1881,16 @@ test "EventDispatcher: momentum owner missing should not fall back to current ho
     try std.testing.expectEqual(EventResult.ignored, r);
     try std.testing.expectEqual(@as(u32, 0), counter.right);
 
-    // 手动释放 root2 节点树（不在 ctx.root 中，不会被 ctx.deinit 自动释放）
+    // Manually release root2 tree (outside ctx.root, not auto-freed by ctx.deinit)
     ctx.freeNode(root2);
 }
 
 test "hitTest: overflow_hidden container passthrough" {
-    // 模拟 ScrollArea 结构: container(overflow_hidden) > content > button
-    var ctx = try core.Cx.init(std.testing.allocator);
+    // Simulate ScrollArea structure: container(overflow_hidden) > content > button
+    var ctx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
-    // 根节点
+    // Root node
     const root = try core.box(ctx, .{
         .width = .{ .px = 800 },
         .height = .{ .px = 600 },
@@ -1828,19 +1929,19 @@ test "hitTest: overflow_hidden container passthrough" {
     // Layout
     ctx.layout();
 
-    // 验证 layout 正确
+    // Verify layout correct
     std.debug.print("\n[TEST] container rect: ({d:.0},{d:.0},{d:.0},{d:.0})\n", .{ container.rectFromWorldOrFallback().x, container.rectFromWorldOrFallback().y, container.rectFromWorldOrFallback().w, container.rectFromWorldOrFallback().h });
     std.debug.print("[TEST] content rect: ({d:.0},{d:.0},{d:.0},{d:.0})\n", .{ content.rectFromWorldOrFallback().x, content.rectFromWorldOrFallback().y, content.rectFromWorldOrFallback().w, content.rectFromWorldOrFallback().h });
     std.debug.print("[TEST] btn rect: ({d:.0},{d:.0},{d:.0},{d:.0})\n", .{ btn.rectFromWorldOrFallback().x, btn.rectFromWorldOrFallback().y, btn.rectFromWorldOrFallback().w, btn.rectFromWorldOrFallback().h });
 
-    // hitTest 在 button 区域应该命中 button，而不是 container
+    // hitTest on button area should hit button, not container
     const hit = hitTestNode(root, 50, 16);
     try std.testing.expect(hit != null);
     try std.testing.expectEqual(btn, hit.?);
 }
 
 test "hitTest: ScrollArea with padding and nested sections" {
-    // 模拟 storybook 结构:
+    // Simulate storybook structure:
     // root(1400x900)
     //   main_area
     //     header(h=56)
@@ -1849,7 +1950,7 @@ test "hitTest: ScrollArea with padding and nested sections" {
     //         section(card)
     //           row(direction=row)
     //             radio_container(tag=button, on_event)
-    var ctx = try core.Cx.init(std.testing.allocator);
+    var ctx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try core.box(ctx, .{ .width = .{ .px = 1400 }, .height = .{ .px = 900 } }, .{});
@@ -1944,7 +2045,7 @@ test "hitTest: ScrollArea with padding and nested sections" {
     std.debug.print("[TEST2] radio rect: ({d:.0},{d:.0},{d:.0},{d:.0})\n", .{ radio.rectFromWorldOrFallback().x, radio.rectFromWorldOrFallback().y, radio.rectFromWorldOrFallback().w, radio.rectFromWorldOrFallback().h });
     std.debug.print("[TEST2] circle rect: ({d:.0},{d:.0},{d:.0},{d:.0})\n", .{ circle.rectFromWorldOrFallback().x, circle.rectFromWorldOrFallback().y, circle.rectFromWorldOrFallback().w, circle.rectFromWorldOrFallback().h });
 
-    // hitTest 在 radio 区域，应命中 radio (tag=button)
+    // hitTest on radio area should hit radio (tag=button)
     const radio_global = radio.globalRect();
     const radio_center_x = radio_global.x + radio_global.w / 2;
     const radio_center_y = radio_global.y + radio_global.h / 2;
@@ -1957,7 +2058,7 @@ test "hitTest: ScrollArea with padding and nested sections" {
 }
 
 test "hitTest: opacity zero nodes do not participate" {
-    var ctx = try core.Cx.init(std.testing.allocator);
+    var ctx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try core.box(ctx, .{
@@ -1989,9 +2090,10 @@ test "hitTest: opacity zero nodes do not participate" {
 }
 
 test "hitTestAny: positive z does not escape overflow_hidden ancestor clip" {
-    // 方案 §9.2 第 13 条（反转旧的 "overlay escapes overflow_hidden ancestor clip"）：
-    // z_index 只影响同级顺序，z>0 节点照样受祖先 overflow_hidden 裁剪（命中与像素一致）。
-    var ctx = try core.Cx.init(std.testing.allocator);
+    // Plan §9.2 item 13 (invert old 'overlay escapes overflow_hidden ancestor clip'):
+    // z_index only affects sibling order, z>0 nodes still clipped by overflow_hidden ancestor
+    // (hit and pixels match).
+    var ctx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try core.box(ctx, .{
@@ -2016,16 +2118,16 @@ test "hitTestAny: positive z does not escape overflow_hidden ancestor clip" {
 
     ctx.layout();
     {
-        // 横跨 clipper 右下边界：(20..60) 与 clipper (0..40) 只有左上 20×20 重叠。
+        // Spans clipper right-bottom: (20..60) and clipper (0..40) overlap 20x20 top-left only.
         const r = overlay.rectFromWorldOrFallback();
         overlay.setLayoutRect(.{ .x = 20, .y = 20, .w = r.w, .h = r.h });
     }
 
-    // clipper 之外、overlay 之内 -> 不命中 overlay（旧实现命中它）。
+    // Outside clipper, inside overlay -> no hit (old impl hit it).
     const outside = hitTestNodeAny(root, 50, 50);
     try std.testing.expect(outside != overlay);
     try std.testing.expect(outside == null or outside.? == root);
-    // clipper 之内的重叠区 -> 命中 overlay。
+    // Overlap within clipper -> hit overlay.
     const inside = hitTestNodeAny(root, 30, 30);
     try std.testing.expect(inside != null);
     try std.testing.expectEqual(overlay, inside.?);
@@ -2038,7 +2140,7 @@ test "hitTest: runtime helper matches interaction index for hidden and overlay c
     var index = core.InteractionIndex.init(allocator);
     defer index.deinit();
 
-    var ctx = try core.Cx.init(allocator);
+    var ctx = try core.Cx.init(allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try core.box(ctx, .{
@@ -2085,7 +2187,7 @@ test "hitTest: runtime helper matches interaction index for hidden and overlay c
         hidden.setLayoutRect(.{ .x = 0, .y = 0, .w = hr.w, .h = hr.h });
         const cr = clipper.rectFromWorldOrFallback();
         clipper.setLayoutRect(.{ .x = 0, .y = 0, .w = cr.w, .h = cr.h });
-        // overlay 横跨 clipper 右下边界：(20..60) 与 clipper (0..40) 只重叠 20×20。
+        // Overlay spans clipper right-bottom: (20..60) and clipper (0..40) overlap 20x20.
         const or_ = overlay.rectFromWorldOrFallback();
         overlay.setLayoutRect(.{ .x = 20, .y = 20, .w = or_.w, .h = or_.h });
     }
@@ -2093,7 +2195,7 @@ test "hitTest: runtime helper matches interaction index for hidden and overlay c
     try registry.rebuild(root);
     try index.rebuild(root, &registry);
 
-    // clipper 内：z=10 的 overlay 压过 regular；两条命中路径一致。
+    // Inside clipper: z=10 overlay over regular; both paths match.
     const tree_overlay = hitTestNode(root, 30, 30);
     const index_overlay = index.hitTestQuery(.{ .kind = .pointer, .world_x = 30, .world_y = 30 }, &registry, null);
     try std.testing.expect(tree_overlay != null);
@@ -2101,7 +2203,8 @@ test "hitTest: runtime helper matches interaction index for hidden and overlay c
     try std.testing.expectEqual(overlay.id, tree_overlay.?.id);
     try std.testing.expectEqual(tree_overlay.?.id, index_overlay.?.handle.id);
 
-    // clipper 外、overlay 矩形内：overlay 被裁掉，命中落到下面的 regular；两条路径一致。
+    // Outside clipper, inside overlay rect: overlay clipped, hit falls through to regular; paths
+    // match.
     const tree_clipped = hitTestNode(root, 50, 50);
     const index_clipped = index.hitTestQuery(.{ .kind = .pointer, .world_x = 50, .world_y = 50 }, &registry, null);
     try std.testing.expect(tree_clipped != null);
@@ -2117,10 +2220,10 @@ test "hitTest: runtime helper matches interaction index for hidden and overlay c
 }
 
 test "on_key_down: basic key event" {
-    var dispatcher = EventDispatcher.init(std.testing.allocator);
+    var dispatcher = EventDispatcher.init(std.testing.allocator, std.testing.io);
     defer dispatcher.deinit();
 
-    var ctx = try core.Cx.init(std.testing.allocator);
+    var ctx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     dispatcher.setRegistry(&ctx.node_registry);
 
@@ -2148,10 +2251,10 @@ test "on_key_down: basic key event" {
 }
 
 test "on_key_down: bubbles to parent" {
-    var dispatcher = EventDispatcher.init(std.testing.allocator);
+    var dispatcher = EventDispatcher.init(std.testing.allocator, std.testing.io);
     defer dispatcher.deinit();
 
-    var ctx = try core.Cx.init(std.testing.allocator);
+    var ctx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     dispatcher.setRegistry(&ctx.node_registry);
 
@@ -2183,10 +2286,10 @@ test "on_key_down: bubbles to parent" {
 }
 
 test "on_event takes priority over on_key_down" {
-    var dispatcher = EventDispatcher.init(std.testing.allocator);
+    var dispatcher = EventDispatcher.init(std.testing.allocator, std.testing.io);
     defer dispatcher.deinit();
 
-    var ctx = try core.Cx.init(std.testing.allocator);
+    var ctx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     dispatcher.setRegistry(&ctx.node_registry);
 
@@ -2224,10 +2327,10 @@ test "on_event takes priority over on_key_down" {
 }
 
 test "PointerCapture: mouse_move goes to capture node" {
-    var dispatcher = EventDispatcher.init(std.testing.allocator);
+    var dispatcher = EventDispatcher.init(std.testing.allocator, std.testing.io);
     defer dispatcher.deinit();
 
-    var ctx = try core.Cx.init(std.testing.allocator);
+    var ctx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     dispatcher.setRegistry(&ctx.node_registry);
 
@@ -2274,10 +2377,10 @@ test "PointerCapture: mouse_move goes to capture node" {
 }
 
 test "PointerCapture: auto release on mouse_up" {
-    var dispatcher = EventDispatcher.init(std.testing.allocator);
+    var dispatcher = EventDispatcher.init(std.testing.allocator, std.testing.io);
     defer dispatcher.deinit();
 
-    var ctx = try core.Cx.init(std.testing.allocator);
+    var ctx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     dispatcher.setRegistry(&ctx.node_registry);
 
@@ -2315,10 +2418,10 @@ test "PointerCapture: auto release on mouse_up" {
 }
 
 test "PointerCapture: double click is synthesized on the capture node" {
-    var dispatcher = EventDispatcher.init(std.testing.allocator);
+    var dispatcher = EventDispatcher.init(std.testing.allocator, std.testing.io);
     defer dispatcher.deinit();
 
-    var ctx = try core.Cx.init(std.testing.allocator);
+    var ctx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     dispatcher.setRegistry(&ctx.node_registry);
 
@@ -2344,8 +2447,8 @@ test "PointerCapture: double click is synthesized on the capture node" {
     ctx.setViewport(400, 300);
     ctx.layout();
 
-    // 画布宿主模式：每次 down 即 capture（拖拽需要），up 自动释放。
-    // 双击 = 两轮 down/up，第二轮 up 必须在 capture 路径里合成 double_click。
+    // Canvas host mode: each down -> capture (drag requires), up -> auto-release.
+    // Double-click = two down/up rounds; second up must synthesize double_click in capture path.
     var round: u32 = 0;
     while (round < 2) : (round += 1) {
         const t = hitTestNode(root, 100, 100);
@@ -2357,10 +2460,10 @@ test "PointerCapture: double click is synthesized on the capture node" {
 }
 
 test "PointerCapture: uses handle-based state" {
-    var dispatcher = EventDispatcher.init(std.testing.allocator);
+    var dispatcher = EventDispatcher.init(std.testing.allocator, std.testing.io);
     defer dispatcher.deinit();
 
-    var ctx = try core.Cx.init(std.testing.allocator);
+    var ctx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     dispatcher.setRegistry(&ctx.node_registry);
 
@@ -2404,10 +2507,10 @@ test "PointerCapture: uses handle-based state" {
 }
 
 test "EventDispatcher: mouse down stores handle" {
-    var dispatcher = EventDispatcher.init(std.testing.allocator);
+    var dispatcher = EventDispatcher.init(std.testing.allocator, std.testing.io);
     defer dispatcher.deinit();
 
-    var ctx = try core.Cx.init(std.testing.allocator);
+    var ctx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     dispatcher.setRegistry(&ctx.node_registry);
 
@@ -2422,10 +2525,10 @@ test "EventDispatcher: mouse down stores handle" {
 }
 
 test "EventDispatcher: mouse move stores hover handle" {
-    var dispatcher = EventDispatcher.init(std.testing.allocator);
+    var dispatcher = EventDispatcher.init(std.testing.allocator, std.testing.io);
     defer dispatcher.deinit();
 
-    var ctx = try core.Cx.init(std.testing.allocator);
+    var ctx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     dispatcher.setRegistry(&ctx.node_registry);
 
@@ -2440,10 +2543,10 @@ test "EventDispatcher: mouse move stores hover handle" {
 }
 
 test "EventDispatcher: double click skips freed target after click handler teardown" {
-    var dispatcher = EventDispatcher.init(std.testing.allocator);
+    var dispatcher = EventDispatcher.init(std.testing.allocator, std.testing.io);
     defer dispatcher.deinit();
 
-    var ctx = try core.Cx.init(std.testing.allocator);
+    var ctx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     dispatcher.setRegistry(&ctx.node_registry);
 
@@ -2488,7 +2591,7 @@ test "EventDispatcher: double click skips freed target after click handler teard
 
     _ = dispatcher.dispatchMouseDown(20, 20, node, .{});
     dispatcher.last_click_pos = .{ 20, 20 };
-    dispatcher.last_click_instant = std.time.Instant.now() catch null;
+    dispatcher.last_click_instant = @import("zenit_time").Instant.now(std.testing.io) catch null;
     dispatcher.consecutive_clicks = 1;
 
     dispatcher.dispatchMouseUp(20, 20, node);
@@ -2498,12 +2601,12 @@ test "EventDispatcher: double click skips freed target after click handler teard
 }
 
 test "EventDispatcher: registry mode with invalid handle falls back to raw target" {
-    // 当 handle 失效（generation mismatch / registry 没注册）时 fallback 到 raw 指针。
-    // 这避免了任何未 register 的节点都丢 event 的问题。
-    var dispatcher = EventDispatcher.init(std.testing.allocator);
+    // When handle invalid (generation mismatch / registry unregistered), fallback to raw ptr.
+    // Avoids dropping events from unregistered nodes.
+    var dispatcher = EventDispatcher.init(std.testing.allocator, std.testing.io);
     defer dispatcher.deinit();
 
-    var ctx = try core.Cx.init(std.testing.allocator);
+    var ctx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     dispatcher.setRegistry(&ctx.node_registry);
 
@@ -2517,15 +2620,15 @@ test "EventDispatcher: registry mode with invalid handle falls back to raw targe
 
     const invalid_handle = NodeHandle{ .id = node.id, .generation = 999999 };
     try std.testing.expect(dispatcher.resolveHandle(invalid_handle) == null);
-    // fallback 到 raw -> 返回 node 指针
+    // Fallback to raw -> return node ptr.
     try std.testing.expect(resolveDispatchTarget(&dispatcher, invalid_handle, node) == node);
 }
 
 test "PointerCapture: normal when no capture" {
-    var dispatcher = EventDispatcher.init(std.testing.allocator);
+    var dispatcher = EventDispatcher.init(std.testing.allocator, std.testing.io);
     defer dispatcher.deinit();
 
-    var ctx = try core.Cx.init(std.testing.allocator);
+    var ctx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     dispatcher.setRegistry(&ctx.node_registry);
 
@@ -2560,10 +2663,10 @@ test "PointerCapture: normal when no capture" {
 }
 
 test "EventDispatcher: dispatchKeyUp invokes on_key_up" {
-    var dispatcher = EventDispatcher.init(std.testing.allocator);
+    var dispatcher = EventDispatcher.init(std.testing.allocator, std.testing.io);
     defer dispatcher.deinit();
 
-    var ctx = try core.Cx.init(std.testing.allocator);
+    var ctx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     dispatcher.setRegistry(&ctx.node_registry);
 
@@ -2617,12 +2720,12 @@ fn mouseUpProbeCx(ctx: *core.Cx, probe: *MouseUpProbe) !void {
 }
 
 test "Cx: mouse_up carries release-time modifiers" {
-    var ctx = try core.Cx.init(std.testing.allocator);
+    var ctx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     var probe = MouseUpProbe{};
     try mouseUpProbeCx(ctx, &probe);
 
-    // 验收 1：按住 ⇧ 按下 -> 抬手时仍按住 ⇒ mouse_up.shift == true
+    // Pass 1: hold Shift down -> up still Shift -> mouse_up.shift == true
     ctx.handleMouseDownEx(50, 50, .left, .{ .shift = true });
     ctx.handleMouseUpEx(50, 50, .left, .{ .shift = true });
     try std.testing.expectEqual(@as(u32, 1), probe.up_count);
@@ -2630,28 +2733,28 @@ test "Cx: mouse_up carries release-time modifiers" {
 }
 
 test "Cx: mouse_up reflects modifier released before lift, not press-time latch" {
-    var ctx = try core.Cx.init(std.testing.allocator);
+    var ctx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     var probe = MouseUpProbe{};
     try mouseUpProbeCx(ctx, &probe);
 
-    // 验收 2：按住 ⇧ 按下 -> **抬手前松开 ⇧** ⇒ mouse_up.shift == false。
-    // 这条专门区分"复用 last_modifiers"的偷懒改法，那样会错误地是 true。
+    // Pass 2: hold Shift down -> **release Shift before up** -> mouse_up.shift == false.
+    // Proves not reusing last_modifiers (would wrongly be true).
     ctx.handleMouseDownEx(50, 50, .left, .{ .shift = true });
     ctx.handleMouseUpEx(50, 50, .left, .{});
     try std.testing.expect(!probe.up_modifiers.shift);
 
-    // 合成的 click 锚点仍是按下时刻，保持既有语义不回归。
+    // Synthesized click anchor still down-time, preserve existing semantics.
     try std.testing.expect(probe.click_modifiers.shift);
 }
 
 test "Cx: mouse_up without modifiers stays all-false" {
-    var ctx = try core.Cx.init(std.testing.allocator);
+    var ctx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     var probe = MouseUpProbe{};
     try mouseUpProbeCx(ctx, &probe);
 
-    // 验收 3：不按修饰键 ⇒ 全 false（不回归）
+    // Pass 3: no modifiers -> all false (no regression)
     ctx.handleMouseDownEx(50, 50, .left, .{});
     ctx.handleMouseUpEx(50, 50, .left, .{});
     try std.testing.expect(!probe.up_modifiers.shift);
@@ -2659,17 +2762,17 @@ test "Cx: mouse_up without modifiers stays all-false" {
     try std.testing.expect(!probe.up_modifiers.ctrl);
     try std.testing.expect(!probe.up_modifiers.alt);
 
-    // 验收 4：旧的 handleMouseUp(x, y) 仍可编译调用，行为等价于无修饰键。
+    // Pass 4: old handleMouseUp(x, y) still compiles, behavior matches no modifiers.
     ctx.handleMouseDownEx(50, 50, .left, .{ .shift = true });
     ctx.handleMouseUp(50, 50);
     try std.testing.expect(!probe.up_modifiers.shift);
 }
 
 test "EventDispatcher: second click emits double_click" {
-    var dispatcher = EventDispatcher.init(std.testing.allocator);
+    var dispatcher = EventDispatcher.init(std.testing.allocator, std.testing.io);
     defer dispatcher.deinit();
 
-    var ctx = try core.Cx.init(std.testing.allocator);
+    var ctx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     dispatcher.setRegistry(&ctx.node_registry);
 
@@ -2717,7 +2820,7 @@ test "EventDispatcher: second click emits double_click" {
 
 test "EventDispatcher: nested dispatch preserves outer bubble path with and without registry" {
     for ([_]bool{ true, false }) |with_registry| {
-        var cx = try core.Cx.init(std.testing.allocator);
+        var cx = try core.Cx.init(std.testing.allocator, std.testing.io);
         defer cx.deinit();
         const root = try core.box(cx, .{}, .{});
         cx.root = root;
@@ -2769,7 +2872,7 @@ test "EventDispatcher: nested dispatch preserves outer bubble path with and with
 }
 
 test "EventDispatcher: destroyed click target receives no followup handler" {
-    const cx = try core.Cx.init(std.testing.allocator);
+    const cx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     const root = try core.box(cx, .{}, .{});
     cx.root = root;
@@ -2804,7 +2907,7 @@ test "EventDispatcher: generic callback destruction suppresses specialized follo
         .{ .key_down = .{ .key = .a, .modifiers = .{} } },
         .{ .click = .{ .x = 0, .y = 0 } },
     }) |input_event| {
-        const cx = try core.Cx.init(std.testing.allocator);
+        const cx = try core.Cx.init(std.testing.allocator, std.testing.io);
         defer cx.deinit();
         const root = try core.box(cx, .{}, .{});
         cx.root = root;
@@ -2846,7 +2949,7 @@ test "EventDispatcher: generic callback destruction suppresses specialized follo
 
 test "EventDispatcher: mouse down returns only a surviving target" {
     for ([_]events.MouseButton{ .left, .right, .middle }) |button| {
-        const cx = try core.Cx.init(std.testing.allocator);
+        const cx = try core.Cx.init(std.testing.allocator, std.testing.io);
         defer cx.deinit();
         const root = try core.box(cx, .{}, .{});
         cx.root = root;
@@ -2871,10 +2974,10 @@ test "EventDispatcher: mouse down returns only a surviving target" {
 }
 
 test "dispatch: nested dispatch from handler must not clobber outer bubble path" {
-    // root->A->B, root->C->D。B 的 mouse_up handler 调 cx.setFocus(D)，触发嵌套的
-    // blur/focus dispatch（路径 root->C->D）。外层冒泡必须仍走 B->A->root，
-    // 不能因共享路径缓冲被覆写而冒泡到 C。
-    var ctx = try core.Cx.init(std.testing.allocator);
+    // root->A->B, root->C->D. B's mouse_up handler calls cx.setFocus(D), nested
+    // blur/focus dispatch (path root->C->D). Outer bubble must still walk B->A->root,
+    // not overwritten by shared path buffer.
+    var ctx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     const Counter = struct { n: u32 = 0 };
     var a_calls = Counter{};
@@ -2915,4 +3018,118 @@ test "dispatch: nested dispatch from handler must not clobber outer bubble path"
     _ = ctx.dispatcher.dispatch(Event{ .mouse_up = .{ .x = 10, .y = 10 } }, b);
     try std.testing.expectEqual(@as(u32, 1), a_calls.n);
     try std.testing.expectEqual(@as(u32, 0), c_calls.n);
+}
+
+const DeepPathProbe = struct {
+    captures: usize = 0,
+    clicks: usize = 0,
+    bubbles: usize = 0,
+    enters: usize = 0,
+    leaves: usize = 0,
+    fn capture(_: Event, context: ?*anyopaque) EventResult {
+        const self: *DeepPathProbe = @ptrCast(@alignCast(context.?));
+        self.captures += 1;
+        return .stop;
+    }
+    fn clicked(context: *anyopaque) void {
+        const self: *DeepPathProbe = @ptrCast(@alignCast(context));
+        self.clicks += 1;
+    }
+    fn observe(event: Event, context: ?*anyopaque) EventResult {
+        const self: *DeepPathProbe = @ptrCast(@alignCast(context.?));
+        switch (event) {
+            .click => self.bubbles += 1,
+            .mouse_enter => self.enters += 1,
+            .mouse_leave => self.leaves += 1,
+            else => {},
+        }
+        return .ignored;
+    }
+    fn tree(self: *DeepPathProbe, cx: *core.Cx, depth: usize) !*Node {
+        const root = try core.box(cx, .{}, .{});
+        cx.root = root;
+        root.behavior.events.on_event_capture = capture;
+        root.behavior.events.capture_context = self;
+        root.behavior.events.on_event = observe;
+        root.behavior.events.event_context = self;
+        var leaf = root;
+        for (1..depth) |_| {
+            const node = try core.box(cx, .{}, .{});
+            try leaf.appendChild(std.testing.allocator, node);
+            leaf = node;
+        }
+        leaf.behavior.events.on_click = core.Cx.simpleHandler(clicked, self);
+        try cx.node_registry.rebuild(root);
+        return leaf;
+    }
+};
+
+test "deep dispatch retains root capture and bubble with and without registry" {
+    for ([_]bool{ false, true }) |with_registry| {
+        var cx = try core.Cx.init(std.testing.allocator, std.testing.io);
+        defer cx.deinit();
+        var probe: DeepPathProbe = .{};
+        const leaf = try probe.tree(cx, 180);
+        var dispatcher = EventDispatcher.init(std.testing.allocator, std.testing.io);
+        defer dispatcher.deinit();
+        if (with_registry) dispatcher.setRegistry(&cx.node_registry);
+        const click: Event = .{ .click = .{ .x = 0, .y = 0 } };
+        try std.testing.expectEqual(EventResult.stop, dispatcher.dispatch(click, leaf));
+        try std.testing.expectEqual(@as(usize, 1), probe.captures);
+        try std.testing.expectEqual(@as(usize, 0), probe.clicks);
+        cx.root.?.behavior.events.on_event_capture = null;
+        _ = dispatcher.dispatch(click, leaf);
+        try std.testing.expectEqual(@as(usize, 1), probe.clicks);
+        try std.testing.expectEqual(@as(usize, 1), probe.bubbles);
+    }
+}
+
+test "deep dispatch allocation failures cannot bypass capture policy" {
+    for (0..2) |fail_index| {
+        var cx = try core.Cx.init(std.testing.allocator, std.testing.io);
+        defer cx.deinit();
+        var probe: DeepPathProbe = .{};
+        const leaf = try probe.tree(cx, 180);
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        var dispatcher = EventDispatcher.init(failing.allocator(), std.testing.io);
+        defer dispatcher.deinit();
+        dispatcher.setRegistry(&cx.node_registry);
+        try std.testing.expectEqual(EventResult.stop, dispatcher.dispatch(.{ .click = .{ .x = 0, .y = 0 } }, leaf));
+        try std.testing.expect(failing.has_induced_failure);
+        try std.testing.expectEqual(@as(usize, 0), probe.clicks);
+        try std.testing.expectEqual(@as(usize, 0), probe.captures);
+    }
+}
+
+test "128-node dispatch stays allocation-free" {
+    var cx = try core.Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    var probe: DeepPathProbe = .{};
+    const leaf = try probe.tree(cx, 128);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var dispatcher = EventDispatcher.init(failing.allocator(), std.testing.io);
+    defer dispatcher.deinit();
+    dispatcher.setRegistry(&cx.node_registry);
+    try std.testing.expectEqual(EventResult.stop, dispatcher.dispatch(.{ .click = .{ .x = 0, .y = 0 } }, leaf));
+    try std.testing.expectEqual(@as(usize, 1), probe.captures);
+    try std.testing.expect(!failing.has_induced_failure);
+}
+
+test "deep hover visits root and OOM preserves prior hover transaction" {
+    var cx = try core.Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    var probe: DeepPathProbe = .{};
+    const leaf = try probe.tree(cx, 180);
+    var dispatcher = EventDispatcher.init(std.testing.allocator, std.testing.io);
+    defer dispatcher.deinit();
+    dispatcher.setRegistry(&cx.node_registry);
+    _ = dispatcher.syncHover(leaf);
+    try std.testing.expectEqual(@as(usize, 1), probe.enters);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    dispatcher.allocator = failing.allocator();
+    try std.testing.expectEqual(leaf, dispatcher.syncHover(null).?);
+    try std.testing.expectEqual(@as(usize, 0), probe.leaves);
+    dispatcher.allocator = std.testing.allocator;
+    try std.testing.expect(dispatcher.syncHover(null) == null);
+    try std.testing.expectEqual(@as(usize, 1), probe.leaves);
 }

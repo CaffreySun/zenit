@@ -1,6 +1,6 @@
-/// json_writer，轻量 JSON writer（无第三方依赖）
+/// json_writer, lightweight JSON writer (no third-party dependency)
 ///
-/// 支持 object/array/string/number/bool/null 的流式写入。
+/// Support streaming write of object/array/string/number/bool/null.
 const std = @import("std");
 
 pub const JsonWriter = struct {
@@ -8,10 +8,10 @@ pub const JsonWriter = struct {
     pos: usize = 0,
     overflow: bool = false,
 
-    // 用于跟踪逗号：每层 nesting 记录是否已写过第一个元素
+    // Track commas: each nesting level record if first element written
     depth: usize = 0,
-    needs_comma: [64]bool = [_]bool{false} ** 64,
-    // key 写完 ":" 后设为 true，下一个 value 写入时跳过逗号并重置
+    needs_comma: [64]bool = @as([64]bool, @splat(false)),
+    // Set true after ":" follow key, next value entry skip comma and reset
     after_key: bool = false,
 
     pub fn init(buf: []u8) JsonWriter {
@@ -26,7 +26,7 @@ pub const JsonWriter = struct {
         return self.overflow;
     }
 
-    // --- 写入原语 ---
+    // --- Write primitives ---
 
     fn writeRaw(self: *JsonWriter, data: []const u8) void {
         if (self.overflow) return;
@@ -51,15 +51,15 @@ pub const JsonWriter = struct {
         self.pos += 1;
     }
 
-    /// 在值之前插入逗号（如果需要的话）
-    /// key 后面紧跟的值不需要逗号（after_key=true 时跳过）
+    /// Insert comma before value (if needed); value following key needs no comma (after_key=true
+    /// skip)
     fn commaBeforeValue(self: *JsonWriter) void {
         if (self.after_key) {
-            // key 的 value：不需要逗号，清除标记
+            // Key value: no comma, clear flag
             self.after_key = false;
             return;
         }
-        // 普通值（array 元素 或 这是不可能的情况，object 中 value 总是跟在 key 后面）
+        // Normal value (array element or impossible: object value always follow key)
         if (self.depth > 0 and self.depth < 64) {
             if (self.needs_comma[self.depth]) {
                 self.writeByte(',');
@@ -84,9 +84,9 @@ pub const JsonWriter = struct {
         if (self.depth > 0) self.depth -= 1;
     }
 
-    /// 写入 key（自动处理逗号 + 引号）
+    /// Write key (auto handle comma + quotes)
     pub fn key(self: *JsonWriter, k: []const u8) void {
-        // key 之间需要逗号（第一个 key 除外）
+        // Comma needed between keys (skip first)
         if (self.depth > 0 and self.depth < 64) {
             if (self.needs_comma[self.depth]) {
                 self.writeByte(',');
@@ -97,7 +97,7 @@ pub const JsonWriter = struct {
         self.writeEscapedString(k);
         self.writeByte('"');
         self.writeByte(':');
-        // 标记下一个值是 key 的 value，不需要逗号
+        // Mark next value is key's value, no comma
         self.after_key = true;
     }
 
@@ -119,7 +119,7 @@ pub const JsonWriter = struct {
 
     // --- Values ---
 
-    /// 带逗号前缀的字符串（array 元素）
+    /// String with comma prefix (array element)
     pub fn string(self: *JsonWriter, s: []const u8) void {
         self.commaBeforeValue();
         self.writeByte('"');
@@ -127,7 +127,7 @@ pub const JsonWriter = struct {
         self.writeByte('"');
     }
 
-    /// 不带逗号的字符串值（key 的 value）
+    /// String without comma (key's value)
     pub fn stringValue(self: *JsonWriter, s: []const u8) void {
         self.commaBeforeValue();
         self.writeByte('"');

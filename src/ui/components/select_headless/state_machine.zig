@@ -6,61 +6,35 @@
 
 const std = @import("std");
 const testing = std.testing;
-const controlled_mod = @import("../controlled.zig");
 
-pub const ControlledProp = controlled_mod.ControlledProp;
-
-/// 单个选项数据。组件不限制 N (v0.7 §2.2 起 virtualize=true 用 VirtualList 池化)。
+/// Single option data. No N limit (v0.7 S2.2 onward virtualize=true uses VirtualList pooling).
 pub fn Option(comptime ValueT: type) type {
     return struct {
         value: ValueT,
         label: []const u8,
-        /// 是否禁用（仍出现在列表但不可选）
+        /// Whether disabled (still appears in list but not selectable)
         disabled: bool = false,
     };
 }
 
-/// 状态机三态：closed / open（无选中）/ open_with_highlight（有 highlight）
+/// State machine three states: closed / open (no selection) / open_with_highlight (has highlight)
 pub const OpenState = enum(u8) { closed, open, open_with_highlight };
 
-/// Root 组件 props
-pub fn SelectProps(comptime ValueT: type) type {
-    return struct {
-        /// 是否打开（controlled 或 uncontrolled）
-        open: ControlledProp(bool) = .{ .uncontrolled = .{ .default = false } },
-        /// 当前选中 value
-        value: ControlledProp(?ValueT) = .{ .uncontrolled = .{ .default = null } },
-        /// 当前 highlight 索引（键盘导航用）
-        highlight_index: ControlledProp(?u32) = .{ .uncontrolled = .{ .default = null } },
-        /// 是否禁用整个 select
-        disabled: bool = false,
-        /// 选项列表
-        options: []const Option(ValueT) = &.{},
-    };
-}
-
-/// 内部 state（uncontrolled 模式 mount 时种入；controlled 模式不用）
+/// Navigation state: open / value mirrors component data source (mount layer handles
+/// sync and proposals), highlight / typeahead owned by state machine
 pub fn SelectState(comptime ValueT: type) type {
     return struct {
-        open: bool,
-        value: ?ValueT,
-        highlight_index: ?u32,
-        /// typeahead 缓冲（按字符输入选择匹配 label 起首的 option）
+        open: bool = false,
+        value: ?ValueT = null,
+        highlight_index: ?u32 = null,
+        /// typeahead buffer (character input selects option whose label starts with buffer)
         typeahead_buf: [32]u8 = undefined,
         typeahead_len: u8 = 0,
         typeahead_last_input_ms: i64 = 0,
-
-        pub fn init(props: SelectProps(ValueT)) @This() {
-            return .{
-                .open = props.open.initialValue(),
-                .value = props.value.initialValue(),
-                .highlight_index = props.highlight_index.initialValue(),
-            };
-        }
     };
 }
 
-/// 状态机操作
+/// State machine operations
 pub const Action = enum(u8) {
     open,
     close,
@@ -76,7 +50,8 @@ pub const Action = enum(u8) {
     type_char,
 };
 
-/// 单步状态机。返回操作后的 highlight 索引（caller 写回 state）。
+/// Single-step state machine. Return highlight index after operation (caller writes
+/// back to state).
 pub fn step(
     comptime ValueT: type,
     state: *SelectState(ValueT),
@@ -131,7 +106,7 @@ pub fn step(
             if (n > 0) state.highlight_index = n - 1;
         },
         .enter => {
-            // 选中当前 highlight；caller 之后调 commitSelection
+            // Select current highlight; caller then calls commitSelection
             state.open = false;
         },
         .escape => {
@@ -140,7 +115,7 @@ pub fn step(
             state.typeahead_len = 0;
         },
         .type_char => {
-            // typeahead：把字符加入 buf；找首个 label 以 buf 开头的 option
+            // typeahead: add character to buf; find first option whose label starts with buf
             if (state.typeahead_len < state.typeahead_buf.len) {
                 state.typeahead_buf[state.typeahead_len] = std.ascii.toLower(typed_char);
                 state.typeahead_len += 1;
@@ -157,7 +132,7 @@ pub fn step(
     }
 }
 
-/// 提交当前 highlight 为 value（Enter / Item click 后调）
+/// Commit current highlight as value (call after Enter / item click)
 pub fn commitSelection(
     comptime ValueT: type,
     state: *SelectState(ValueT),
@@ -185,17 +160,15 @@ fn matchPrefixCI(text: []const u8, prefix: []const u8) bool {
 
 const Opt = Option(i32);
 
-test "SelectState init from uncontrolled props" {
-    const Props = SelectProps(i32);
-    const props = Props{};
-    const state = SelectState(i32).init(props);
+test "SelectState defaults" {
+    const state = SelectState(i32){};
     try testing.expect(!state.open);
     try testing.expect(state.value == null);
     try testing.expect(state.highlight_index == null);
 }
 
 test "step: open / close / toggle" {
-    var state = SelectState(i32).init(SelectProps(i32){});
+    var state = SelectState(i32){};
     const opts: []const Opt = &.{
         .{ .value = 1, .label = "Apple" },
     };
@@ -210,7 +183,7 @@ test "step: open / close / toggle" {
 }
 
 test "step: arrow_down with empty highlight starts at 0" {
-    var state = SelectState(i32).init(SelectProps(i32){});
+    var state = SelectState(i32){};
     const opts: []const Opt = &.{
         .{ .value = 1, .label = "A" },
         .{ .value = 2, .label = "B" },
@@ -223,7 +196,7 @@ test "step: arrow_down with empty highlight starts at 0" {
 }
 
 test "step: arrow_down wraps at end" {
-    var state = SelectState(i32).init(SelectProps(i32){});
+    var state = SelectState(i32){};
     state.highlight_index = 2;
     const opts: []const Opt = &.{
         .{ .value = 1, .label = "A" },
@@ -235,7 +208,7 @@ test "step: arrow_down wraps at end" {
 }
 
 test "step: arrow_up with null highlight goes to last" {
-    var state = SelectState(i32).init(SelectProps(i32){});
+    var state = SelectState(i32){};
     const opts: []const Opt = &.{
         .{ .value = 1, .label = "A" },
         .{ .value = 2, .label = "B" },
@@ -246,7 +219,7 @@ test "step: arrow_up with null highlight goes to last" {
 }
 
 test "step: home / end" {
-    var state = SelectState(i32).init(SelectProps(i32){});
+    var state = SelectState(i32){};
     const opts: []const Opt = &.{
         .{ .value = 1, .label = "A" },
         .{ .value = 2, .label = "B" },
@@ -260,7 +233,7 @@ test "step: home / end" {
 }
 
 test "step: page_down and page_up" {
-    var state = SelectState(i32).init(SelectProps(i32){});
+    var state = SelectState(i32){};
     var opts_buf: [50]Opt = undefined;
     for (&opts_buf, 0..) |*o, i| {
         o.* = .{ .value = @intCast(i), .label = "x" };
@@ -273,7 +246,7 @@ test "step: page_down and page_up" {
 }
 
 test "step: typeahead matches prefix case-insensitive" {
-    var state = SelectState(i32).init(SelectProps(i32){});
+    var state = SelectState(i32){};
     const opts: []const Opt = &.{
         .{ .value = 1, .label = "Apple" },
         .{ .value = 2, .label = "Banana" },
@@ -286,7 +259,7 @@ test "step: typeahead matches prefix case-insensitive" {
 }
 
 test "step: escape clears state" {
-    var state = SelectState(i32).init(SelectProps(i32){});
+    var state = SelectState(i32){};
     state.open = true;
     state.highlight_index = 2;
     state.typeahead_len = 3;
@@ -300,7 +273,7 @@ test "step: escape clears state" {
 }
 
 test "commitSelection: returns value of highlighted option" {
-    var state = SelectState(i32).init(SelectProps(i32){});
+    var state = SelectState(i32){};
     state.highlight_index = 1;
     const opts: []const Opt = &.{
         .{ .value = 100, .label = "A" },
@@ -312,7 +285,7 @@ test "commitSelection: returns value of highlighted option" {
 }
 
 test "commitSelection: disabled option not committed" {
-    var state = SelectState(i32).init(SelectProps(i32){});
+    var state = SelectState(i32){};
     state.highlight_index = 0;
     const opts: []const Opt = &.{
         .{ .value = 100, .label = "A", .disabled = true },
@@ -323,7 +296,7 @@ test "commitSelection: disabled option not committed" {
 }
 
 test "step: empty options is safe" {
-    var state = SelectState(i32).init(SelectProps(i32){});
+    var state = SelectState(i32){};
     const opts: []const Opt = &.{};
     step(i32, &state, opts, .arrow_down, 0);
     try testing.expect(state.highlight_index == null);

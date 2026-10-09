@@ -9,9 +9,16 @@
 
 const std = @import("std");
 const core = @import("../../core.zig");
+const view = @import("../../view.zig");
 const Cx = core.Cx;
 const Node = core.Node;
-const Scope = @import("../../reactive.zig").Scope;
+const reactive = @import("../../reactive.zig");
+const Scope = reactive.Scope;
+const Signal = reactive.Signal;
+const Model = reactive.Model;
+const Handler = core.Handler;
+const binding_mod = @import("binding.zig");
+const Binding = binding_mod.TextBinding(TextInputState);
 
 const state_mod = @import("state.zig");
 const render_mod = @import("render.zig");
@@ -20,8 +27,11 @@ const editable_block = @import("../editable_block/mod.zig");
 const TextInputState = state_mod.TextInputState;
 
 pub const EditableTextProps = struct {
-    /// Initial text, copied during mount.
-    value: ?[]const u8 = null,
+    /// Text value. A literal is the component-owned initial text; a
+    /// `*Signal([]const u8)` from `scope.createText` is the value source edits
+    /// write to; `ui.split` lets the parent accept, transform or reject each
+    /// edit. Same rules as Input.
+    value: Model([]const u8) = .{ .local = "" },
     font_size: f32 = 14,
     /// Line-height multiplier.
     line_height: f32 = 1.25,
@@ -31,13 +41,16 @@ pub const EditableTextProps = struct {
     /// preserves the original single-line behavior. When set, this takes
     /// precedence over `width` and the node height grows with visual lines.
     wrap_width: ?f32 = null,
-    /// Receives the current internal text slice; retainers must copy it.
-    on_change: ?core.HandlerRef = null,
+    /// Called with the landed value after a user edit; retainers must copy it.
+    on_change: ?Handler([]const u8) = null,
 };
 
 pub const EditableTextResult = struct {
     node: *Node,
     state: *TextInputState,
+    /// Text value signal (null under `ui.split`).
+    value: ?*Signal([]const u8),
+    binding: *Binding,
 
     /// Enter or leave editing mode. Leaving editing mode also ends IME and
     /// removes selection state. Repeated calls with the same value are cheap.
@@ -70,9 +83,10 @@ pub const EditableTextResult = struct {
     pub fn setMetrics(self: EditableTextResult, font_size: f32, line_height_ratio: f32) void {
         const safe_font_size = @max(font_size, 1);
         const safe_ratio = @max(line_height_ratio, 0.1);
-        // 不取整：静态文本布局的行高是 font_size × ratio（text_layout.zig），
-        // 这里 ceil 会让编辑态行距偏大最多 1px/行，宿主的静态/编辑双态
-        // 切换（画布双击进编辑）在非整数行高的缩放档位下整段文字跳动。
+        // no rounding: static text layout line_height = font_size * ratio (text_layout.zig), ceil
+        // here makes edit-mode line spacing up to 1px/line larger, host's static/edit dual-mode
+        // switch (canvas double-click to edit) jumps entire text at non-integer line-height scale
+        // levels.
         const line_height_px = safe_font_size * safe_ratio;
         const state = self.state;
         if (@abs(state.font_size - safe_font_size) <= 0.001 and
@@ -135,19 +149,29 @@ pub const EditableTextResult = struct {
         self.node.markRenderDirty();
     }
 
-    /// Replace text programmatically. This follows TextInputState.setText:
-    /// input is copied, grapheme-safe truncation is applied, and on_change is
-    /// not invoked.
+    /// Switch the edited document (a canvas overlay reused for another object):
+    /// cancels any composition, writes the value signal and applies it now.
+    /// Grapheme-safe truncation applies, undo history is cleared (Cmd+Z must
+    /// not restore the previous object's text) and on_change is not invoked.
+    /// The buffer always ends up equal to the value source: under `ui.split`
+    /// the text goes to the parent's write callback (which decides what lands)
+    /// and the buffer follows the landed value.
     pub fn setText(self: EditableTextResult, text: []const u8) usize {
-        if (self.state.imeIsComposing()) self.state.cancelImeComposition();
-        const written = self.state.setText(text);
-        // EditableText is often reused as a canvas overlay for different
-        // objects. A programmatic document switch must not let Cmd+Z restore
-        // the previous object's text.
-        self.state.clearUndoHistory();
-        self.state.updateScrollX();
+        // composition replaced by this switch (not abandoned): don't emit cancel callback, deferred
+        // external value no longer overwrites first
+        if (self.state.imeIsComposing()) self.state.supersedeImeComposition();
+        // programmatic write (often called in effect, so doesn't hit commit's 'only from events'
+        // assert): local / bound directly write signal; split hand to parent's write callback.
+        if (self.value) |sig| {
+            sig.set(text);
+        } else if (self.binding.value.write) |w| {
+            w.call(text);
+        }
+        // Apply immediately (an effect may be deferred inside a batch); a
+        // later effect run sees equal content and does nothing.
+        self.binding.applyExternal(self.binding.value.peek());
         self.node.markRenderDirty();
-        return written;
+        return self.state.getText().len;
     }
 
     pub fn getText(self: EditableTextResult) []const u8 {
@@ -155,8 +179,8 @@ pub const EditableTextResult = struct {
     }
 };
 
-pub fn EditableText(props: EditableTextProps) EditableTextBuilder {
-    return .{ .props = props };
+pub fn EditableText(props: anytype) EditableTextBuilder {
+    return .{ .props = reactive.props.coerce(EditableTextProps, props) };
 }
 
 pub const EditableTextBuilder = struct {
@@ -174,7 +198,7 @@ pub const EditableTextBuilder = struct {
         const props = self.props;
         const font_size = @max(props.font_size, 1);
         const line_height_ratio = @max(props.line_height, 0.1);
-        // 与 setMetrics 同源：不 ceil，保持与静态文本布局逐像素一致。
+        // same source as setMetrics: no ceil, stays pixel-perfect with static text layout.
         const line_height_px = font_size * line_height_ratio;
         const multiline = props.wrap_width != null;
         const wrap_width = @max(props.wrap_width orelse 0, 1);
@@ -183,12 +207,13 @@ pub const EditableTextBuilder = struct {
 
         const state = try my_scope.allocator.create(TextInputState);
         var state_registered = false;
-        state.* = .{};
+        state.* = .{
+            .io = cx.io,
+        };
         errdefer if (!state_registered) {
             state.deinit();
             my_scope.allocator.destroy(state);
         };
-        state.on_change = props.on_change;
         state.allocator = allocator;
         state.cx_ref = cx;
 
@@ -198,9 +223,9 @@ pub const EditableTextBuilder = struct {
                 my_scope.allocator.destroy(doc);
                 return err;
             };
-            // adoptResource 登记失败时**自己**调 destroyFn 释放（起的契约）；
-            // 这里再 deinit + destroy 一次就是双重释放（test-core 的 node-tree sweep 段错误，
-            // `checkWorkspaceWidgetMountFailure(false, true, false)`）。直接 try。
+            // adoptResource registration fail: **self** call destroyFn (that is its contract): deinit +
+            // destroy here again is double-free (test-core's node-tree sweep segfault,
+            // `checkWorkspaceWidgetMountFailure(false, true, false)`). just try.
             try my_scope.adoptResource(@ptrCast(doc), struct {
                 fn destroy(ptr: *anyopaque, alloc: std.mem.Allocator) void {
                     const typed: *state_mod.TextareaDocument = @ptrCast(@alignCast(ptr));
@@ -210,7 +235,7 @@ pub const EditableTextBuilder = struct {
             }.destroy);
 
             const wrap = try my_scope.allocator.create(state_mod.TextareaWrapMap);
-            wrap.* = state_mod.TextareaWrapMap.init(my_scope.allocator);
+            wrap.* = state_mod.TextareaWrapMap.init(my_scope.allocator, cx.io);
             wrap.measure_ctx_fn = core.Cx.measureTextWidthCallback;
             wrap.measure_ctx = cx;
             wrap.char_width = measured_char_width;
@@ -233,9 +258,8 @@ pub const EditableTextBuilder = struct {
             wrap.setEnabled(true, doc);
         }
 
-        if (props.value) |value| {
-            _ = try state.setTextChecked(value);
-        }
+        const value = try reactive.resolveTextModel(my_scope, props.value);
+        if (value.peek().len > 0) _ = try state.setTextChecked(value.peek());
         // Initial props are not an undoable user edit.
         state.clearUndoHistory();
         try my_scope.registerResource(@ptrCast(state), struct {
@@ -247,25 +271,73 @@ pub const EditableTextBuilder = struct {
         }.destroy);
         state_registered = true;
 
-        const node = try core.box(cx, .{
-            .width = if (multiline)
-                .{ .px = wrap_width }
-            else if (props.width) |width|
-                .{ .px = width }
-            else
-                .{ .grow = .{} },
-            .height = .{ .px = if (multiline)
-                @as(f32, @floatFromInt(@max(@as(u32, 1), state.textarea_wrap.?.displayLineCount()))) * line_height_px
-            else
-                line_height_px },
-            .overflow_hidden = true,
-        }, .{});
+        // value binding: edit output / composition cancel both via it
+        const binding = try my_scope.allocator.create(Binding);
+        binding.* = .{ .state = state, .value = value, .on_change = props.on_change };
+        try my_scope.adoptResource(@ptrCast(binding), Binding.destroy);
+        binding.install();
+
+        const zero_box: core.BoxStyle = .{ .width = .{ .px = 0 }, .height = .{ .px = 0 } };
+        const Parts = struct {
+            underlay: ?*core.Node = null,
+            selection: ?*core.Node = null,
+            text: *core.Node = undefined,
+            preedit: ?*core.Node = null,
+            cursor: *core.Node = undefined,
+        };
+        var parts: Parts = .{};
+        const node = try view.render(my_scope, cx, view.box(.{
+            .style = core.BoxStyle{
+                .width = if (multiline)
+                    .{ .px = wrap_width }
+                else if (props.width) |width|
+                    .{ .px = width }
+                else
+                    .{ .grow = .{} },
+                .height = .{ .px = if (multiline)
+                    @as(f32, @floatFromInt(@max(@as(u32, 1), state.textarea_wrap.?.displayLineCount()))) * line_height_px
+                else
+                    line_height_px },
+                .overflow_hidden = true,
+                .min_width = 0,
+            },
+            .a11y = core.A11yProps{ .role = .textbox, .label = null, .disabled = false, .multiline = multiline },
+            .focusable = false,
+        }, .{
+            // Selection is an underlay so glyphs remain visible over the
+            // highlight. It is intentionally separate from the cursor/IME
+            // overlay, which must paint above text.
+            if (multiline) view.capture(&parts.underlay, view.box(.{ .style = core.BoxStyle{
+                .width = .{ .grow = .{} },
+                .height = .{ .grow = .{} },
+                .position = .absolute,
+                .inset = .{ .top = .{ .px = 0 }, .left = .{ .px = 0 }, .right = .{ .px = 0 }, .bottom = .{ .px = 0 } },
+                .hit_behavior = .pass_through,
+            } }, view.capture(&parts.selection, view.box(.{ .style = zero_box }, {})))) else null,
+            // display text node: box style + text properties with spans contract (borrow state's
+            // buffer, display sync takes over)
+            view.capture(&parts.text, view.setup(view.box(.{ .style = core.BoxStyle{
+                .width = if (multiline) .{ .grow = .{} } else .{ .fit = .{} },
+                .height = .{ .fit = .{} },
+                .align_self = .start,
+            } }, {}), core.TextProps{
+                .content = state.getText(),
+                .color = cx.tokens.tokens.color.fg_primary,
+                .font_size = font_size,
+                .line_height = line_height_ratio,
+                .wrap = if (multiline) .word else .none,
+                .spans = state.text_spans_buf[0..0],
+                .spans_owned = false,
+                .spans_affect_layout = false,
+            }, setDisplayText)),
+            if (multiline) view.capture(&parts.preedit, view.box(.{ .style = zero_box }, {})) else null,
+            view.capture(&parts.cursor, view.box(.{ .style = zero_box }, {})),
+        }));
         errdefer cx.freeNode(node);
+        // view doesn't declare node tag: edit area is input semantic node
         node.tag = .input;
         node.meta.ownership.meta.component_name = "EditableText";
         node.behavior.events.event_context = state;
-        node.behavior.interaction.a11y = .{ .role = .textbox, .label = null, .disabled = false, .multiline = multiline };
-        (try node.style.ensureExtFallible(allocator)).min_width = 0;
         try core.bindScopeToNode(my_scope, node);
         scope_bound = true;
         node.addDebugState(@ptrCast(state));
@@ -286,68 +358,11 @@ pub const EditableTextBuilder = struct {
         );
         state.multiline_auto_height = multiline;
         state.input_container_node = node;
-
-        if (multiline) {
-            // Selection is an underlay so glyphs remain visible over the
-            // highlight. It is intentionally separate from the cursor/IME
-            // overlay, which must paint above text.
-            const underlay = try core.box(cx, .{
-                .width = .{ .grow = .{} },
-                .height = .{ .grow = .{} },
-                .position = .absolute,
-            }, .{});
-            try appendNewChild(cx, node, underlay);
-            const underlay_ext = try underlay.style.ensureExtFallible(allocator);
-            underlay_ext.inset = .{
-                .top = .{ .px = 0 },
-                .left = .{ .px = 0 },
-                .right = .{ .px = 0 },
-                .bottom = .{ .px = 0 },
-            };
-            underlay_ext.hit_behavior = .pass_through;
-            state.textarea_overlay_node = underlay;
-
-            const selection = try core.box(cx, .{
-                .width = .{ .px = 0 },
-                .height = .{ .px = 0 },
-            }, .{});
-            state.selection_node = selection;
-            try appendNewChild(cx, underlay, selection);
-        }
-
-        const text_node = try core.box(cx, .{
-            .width = if (multiline) .{ .grow = .{} } else .{ .fit = .{} },
-            .height = .{ .fit = .{} },
-        }, .{});
-        try appendNewChild(cx, node, text_node);
-        (try text_node.style.ensureExtFallible(allocator)).align_self = .start;
-        text_node.setText(.{
-            .content = state.getText(),
-            .color = cx.tokens.color.fg_primary,
-            .font_size = font_size,
-            .line_height = line_height_ratio,
-            .wrap = if (multiline) .word else .none,
-            .spans = state.text_spans_buf[0..0],
-            .spans_owned = false,
-            .spans_affect_layout = false,
-        });
-        state.text_display_node = text_node;
-
-        if (multiline) {
-            const preedit_node = try core.box(cx, .{
-                .width = .{ .px = 0 },
-                .height = .{ .px = 0 },
-            }, .{});
-            state.preedit_underline_node = preedit_node;
-            try appendNewChild(cx, node, preedit_node);
-        }
-
-        const cursor_node = try core.box(cx, .{
-            .width = .{ .px = 0 },
-            .height = .{ .px = 0 },
-        }, .{});
-        state.cursor_node = cursor_node;
-        try appendNewChild(cx, node, cursor_node);
+        state.textarea_overlay_node = parts.underlay;
+        state.selection_node = parts.selection;
+        state.text_display_node = parts.text;
+        state.preedit_underline_node = parts.preedit;
+        state.cursor_node = parts.cursor;
 
         node.behavior.events.on_focus = Cx.simpleHandler(struct {
             fn handler(context: *anyopaque) void {
@@ -369,21 +384,20 @@ pub const EditableTextBuilder = struct {
         node.meta.per_frame.hooks.before_render.main = render_mod.inputBeforeRender;
 
         node.behavior.events.on_event = null;
-        node.setFocusable(false);
         state.updateScrollX();
-        return .{ .node = node, .state = state };
+        // value is Model: external write via effect into buffer (first run same as initial value,
+        // short-circuit)
+        try my_scope.createEffect(binding, Binding.valueEffect);
+        return .{ .node = node, .state = state, .value = value.asSignal(), .binding = binding };
     }
 };
 
-fn appendNewChild(cx: *Cx, parent: *core.Node, child: *core.Node) !void {
-    parent.appendChild(cx.allocator, child) catch |err| {
-        cx.freeNode(child);
-        return err;
-    };
+fn setDisplayText(props: core.TextProps, node: *core.Node) void {
+    node.setText(props);
 }
 
 test "EditableText starts passive and updates runtime metrics" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     const scope = try Scope.init(std.testing.allocator, null, cx.owner);
     defer scope.dispose();
@@ -405,7 +419,7 @@ test "EditableText starts passive and updates runtime metrics" {
 }
 
 test "EditableText editing mode owns focus and detaches the input handler" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     const scope = try Scope.init(std.testing.allocator, null, cx.owner);
     defer scope.dispose();
@@ -430,7 +444,7 @@ test "EditableText editing mode owns focus and detaches the input handler" {
 }
 
 test "EditableText programmatic text switch clears IME and prior undo history" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     const scope = try Scope.init(std.testing.allocator, null, cx.owner);
     defer scope.dispose();
@@ -452,7 +466,7 @@ test "EditableText programmatic text switch clears IME and prior undo history" {
 }
 
 test "EditableText initial value truncates only at a grapheme boundary" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     const scope = try Scope.init(std.testing.allocator, null, cx.owner);
     defer scope.dispose();
@@ -467,7 +481,7 @@ test "EditableText initial value truncates only at a grapheme boundary" {
 }
 
 test "EditableText wrap_width mounts shell-free multiline document with auto height" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     const scope = try Scope.init(std.testing.allocator, null, cx.owner);
     defer scope.dispose();
@@ -498,7 +512,7 @@ test "EditableText wrap_width mounts shell-free multiline document with auto hei
 }
 
 test "EditableText multiline hit testing and keyboard navigation use display lines" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     const scope = try Scope.init(std.testing.allocator, null, cx.owner);
     defer scope.dispose();
@@ -533,7 +547,7 @@ test "EditableText multiline hit testing and keyboard navigation use display lin
 }
 
 test "EditableText multiline IME commit and undo share the document engine" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     const scope = try Scope.init(std.testing.allocator, null, cx.owner);
     defer scope.dispose();
@@ -561,7 +575,7 @@ test "EditableText multiline IME commit and undo share the document engine" {
 }
 
 test "EditableText multiline runtime metrics rewrap and programmatic switch clears history" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     const scope = try Scope.init(std.testing.allocator, null, cx.owner);
     defer scope.dispose();
@@ -594,7 +608,7 @@ test "EditableText multiline runtime metrics rewrap and programmatic switch clea
 }
 
 test "EditableText setWrapWidth rewraps at runtime and resizes node" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     const scope = try Scope.init(std.testing.allocator, null, cx.owner);
     defer scope.dispose();
@@ -618,7 +632,7 @@ test "EditableText setWrapWidth rewraps at runtime and resizes node" {
         0.001,
     );
 
-    // 回宽：行数收敛回去，重复设置同宽是 no-op
+    // reflow: line count falls back, repeated same width is no-op
     result.setWrapWidth(200);
     try std.testing.expectEqual(wide_lines, result.state.textarea_wrap.?.displayLineCount());
     result.setWrapWidth(200);
@@ -626,7 +640,7 @@ test "EditableText setWrapWidth rewraps at runtime and resizes node" {
 }
 
 test "EditableText setWrapWidth is a no-op on single-line editors" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     const scope = try Scope.init(std.testing.allocator, null, cx.owner);
     defer scope.dispose();
@@ -639,7 +653,7 @@ test "EditableText setWrapWidth is a no-op on single-line editors" {
 }
 
 test "EditableText multiline Return inserts a hard line and grows height" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     const scope = try Scope.init(std.testing.allocator, null, cx.owner);
     defer scope.dispose();
@@ -657,7 +671,7 @@ test "EditableText multiline Return inserts a hard line and grows height" {
 }
 
 test "EditableText renders text typed after a hard newline" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(320, 160);
     const scope = try Scope.init(std.testing.allocator, null, cx.owner);
@@ -694,7 +708,7 @@ test "EditableText renders text typed after a hard newline" {
 }
 
 test "EditableText renders and positions the caret after consecutive hard newlines" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(500, 300);
     const scope = try Scope.init(std.testing.allocator, null, cx.owner);
@@ -744,7 +758,7 @@ test "EditableText renders and positions the caret after consecutive hard newlin
 }
 
 test "EditableText single-line selection span honors host color overrides" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     const scope = try Scope.init(std.testing.allocator, null, cx.owner);
     defer scope.dispose();
@@ -756,14 +770,14 @@ test "EditableText single-line selection span honors host color overrides" {
     result.state.cursor_pos = 5;
     result.state.focused = true;
 
-    // 默认：走 tokens 的 selection_bg，fg 继承（span.color == null）
+    // default: use tokens selection_bg, fg inherited (span.color == null)
     result.node.meta.per_frame.hooks.before_render.main.?(result.node);
     var spans = result.state.text_display_node.?.getText().?.spans;
     try std.testing.expectEqual(@as(usize, 1), spans.len);
-    try std.testing.expect(core.Color.eql(spans[0].bg_color.?, result.state.tokens.color.selection_bg));
+    try std.testing.expect(core.Color.eql(spans[0].bg_color.?, result.state.tokens.tokens.color.selection_bg));
     try std.testing.expect(spans[0].color == null);
 
-    // 覆写：满饱和底 + 反白文字
+    // override: saturated bottom + inverted text
     result.state.selection_bg_override = core.Color.hex(0x2F5BFF);
     result.state.selection_fg_override = core.Color.hex(0xFFFFFF);
     result.node.meta.per_frame.hooks.before_render.main.?(result.node);
@@ -774,7 +788,7 @@ test "EditableText single-line selection span honors host color overrides" {
 }
 
 test "EditableText multiline preedit wrapping moves caret and expands transient height" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     const scope = try Scope.init(std.testing.allocator, null, cx.owner);
     defer scope.dispose();
@@ -807,4 +821,232 @@ test "EditableText multiline preedit wrapping moves caret and expands transient 
         result.node.style.height.px,
         0.001,
     );
+}
+
+test "EditableText value: 打字写回 signal；外部写入进缓冲且清撤销" {
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    const scope = try Scope.init(std.testing.allocator, null, cx.owner);
+    defer scope.dispose();
+    const v = try scope.createText("ab", .{});
+    const result = try EditableText(.{ .value = v }).mountResult(scope, cx);
+    cx.root = result.node;
+    result.setEditing(cx, true);
+    _ = events_mod.inputEventHandler(.{ .text_input = .{ .text = "c" } }, @ptrCast(result.state));
+    try std.testing.expectEqualStrings("abc", v.peek());
+    v.set("other object");
+    try std.testing.expectEqualStrings("other object", result.getText());
+    try std.testing.expectEqual(@as(u8, 0), result.state.undo_count);
+}
+
+test "EditableText setText: 组字中切换文档也立即生效，并写回数据源" {
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    const scope = try Scope.init(std.testing.allocator, null, cx.owner);
+    defer scope.dispose();
+    const v = try scope.createText("first", .{});
+    const result = try EditableText(.{ .value = v }).mountResult(scope, cx);
+    cx.root = result.node;
+    result.state.setImePreedit("中", 3);
+    try std.testing.expect(result.state.imeIsComposing());
+    // in batch: value effect deferred, setText still must swap buffer immediately
+    cx.owner.beginBatch();
+    _ = result.setText("second");
+    try std.testing.expectEqualStrings("second", result.getText());
+    cx.owner.endBatch();
+    try std.testing.expectEqualStrings("second", v.peek());
+    try std.testing.expect(!result.state.imeIsComposing());
+}
+
+test "EditableText setText: split 下交给父组件裁决，缓冲跟随落地值" {
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    const scope = try Scope.init(std.testing.allocator, null, cx.owner);
+    defer scope.dispose();
+    const Parent = struct {
+        sig: *Signal([]const u8),
+        accept: bool = true,
+        buf: [64]u8 = undefined,
+        fn write(self: *@This(), x: []const u8) void {
+            if (!self.accept) return;
+            const n = @min(x.len, self.buf.len);
+            for (x[0..n], 0..) |c, i| self.buf[i] = std.ascii.toUpper(c);
+            self.sig.set(self.buf[0..n]);
+        }
+    };
+    var parent = Parent{ .sig = try scope.createText("first", .{}) };
+    const result = try EditableText(.{
+        .value = reactive.split(parent.sig, cx.on(Parent, &parent, Parent.write)),
+    }).mountResult(scope, cx);
+    cx.root = result.node;
+
+    // parent rewrites: buffer is settled value, not passed value
+    _ = result.setText("second");
+    try std.testing.expectEqualStrings("SECOND", parent.sig.peek());
+    try std.testing.expectEqualStrings("SECOND", result.getText());
+    // parent rejects: buffer stays at data source's current value
+    parent.accept = false;
+    _ = result.setText("third");
+    try std.testing.expectEqualStrings("SECOND", parent.sig.peek());
+    try std.testing.expectEqualStrings("SECOND", result.getText());
+}
+
+test "EditableText multiline value: split 改写 / 拒绝就地修正（文档引擎路径），撤销自洽" {
+    inline for (.{ false, true }) |batched| {
+        var cx = try Cx.init(std.testing.allocator, std.testing.io);
+        defer cx.deinit();
+        const scope = try Scope.init(std.testing.allocator, null, cx.owner);
+        defer scope.dispose();
+        const Parent = struct {
+            sig: *Signal([]const u8),
+            accept: bool = true,
+            buf: [128]u8 = undefined,
+            fn write(self: *@This(), x: []const u8) void {
+                if (!self.accept) return;
+                const n = @min(x.len, self.buf.len);
+                for (x[0..n], 0..) |c, i| self.buf[i] = std.ascii.toUpper(c);
+                self.sig.set(self.buf[0..n]);
+            }
+        };
+        var parent = Parent{ .sig = try scope.createText("AB\nCD", .{}) };
+        const result = try EditableText(.{
+            .value = reactive.split(parent.sig, cx.on(Parent, &parent, Parent.write)),
+            .wrap_width = 200,
+        }).mountResult(scope, cx);
+        cx.root = result.node;
+        const s = result.state;
+        try std.testing.expect(s.textarea_doc != null);
+        s.cursor_pos = 4;
+        s.syncDocFromCursor();
+
+        // new undo unit opened rejected by parent: pushed snapshot must pop
+        parent.accept = false;
+        _ = events_mod.inputEventHandler(.{ .text_input = .{ .text = "q" } }, @ptrCast(s));
+        try std.testing.expectEqualStrings("AB\nCD", result.getText());
+        try std.testing.expectEqual(@as(usize, 4), s.cursor_pos);
+        try std.testing.expectEqual(@as(u8, 0), s.ta_undo_count);
+        parent.accept = true;
+
+        if (batched) cx.owner.beginBatch();
+        _ = events_mod.inputEventHandler(.{ .text_input = .{ .text = "x" } }, @ptrCast(s));
+        try std.testing.expectEqualStrings("AB\nCXD", result.getText());
+        try std.testing.expectEqual(@as(usize, 5), s.cursor_pos);
+        try std.testing.expectEqual(@as(usize, 5), s.textarea_cursor.offset);
+        if (batched) cx.owner.endBatch();
+        try std.testing.expectEqualStrings("AB\nCXD", parent.sig.peek());
+        try std.testing.expectEqual(@as(u8, 1), s.ta_undo_count);
+
+        parent.accept = false;
+        _ = events_mod.inputEventHandler(.{ .text_input = .{ .text = "q" } }, @ptrCast(s));
+        try std.testing.expectEqualStrings("AB\nCXD", result.getText());
+        try std.testing.expectEqual(@as(usize, 5), s.cursor_pos);
+        try std.testing.expectEqual(@as(u8, 1), s.ta_undo_count);
+        parent.accept = true;
+
+        _ = events_mod.inputEventHandler(.{ .key_down = .{ .key = .z, .modifiers = .{ .super = true } } }, @ptrCast(s));
+        try std.testing.expectEqualStrings("AB\nCD", result.getText());
+        try std.testing.expectEqual(@as(usize, 4), s.cursor_pos);
+        try std.testing.expectEqualStrings("AB\nCD", parent.sig.peek());
+    }
+}
+
+test "EditableText multiline value: split 拒绝——文档引擎的重做栈与淘汰条目完整还原" {
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    const scope = try Scope.init(std.testing.allocator, null, cx.owner);
+    defer scope.dispose();
+    const Parent = struct {
+        sig: *Signal([]const u8),
+        fn write(self: *@This(), x: []const u8) void {
+            for (x) |c| if (std.ascii.isLower(c)) return;
+            self.sig.set(x);
+        }
+    };
+    var parent = Parent{ .sig = try scope.createText("A", .{}) };
+    const result = try EditableText(.{
+        .value = reactive.split(parent.sig, cx.on(Parent, &parent, Parent.write)),
+        .wrap_width = 400,
+    }).mountResult(scope, cx);
+    cx.root = result.node;
+    const s = result.state;
+    s.cursor_pos = 1;
+    s.syncDocFromCursor();
+    const send = struct {
+        fn f(st: *TextInputState, ev: core.Event) void {
+            _ = events_mod.inputEventHandler(ev, @ptrCast(st));
+        }
+    }.f;
+    const undo = core.Event{ .key_down = .{ .key = .z, .modifiers = .{ .super = true } } };
+    const redo = core.Event{ .key_down = .{ .key = .z, .modifiers = .{ .super = true, .shift = true } } };
+
+    send(s, .{ .text_input = .{ .text = "B" } });
+    send(s, undo);
+    try std.testing.expectEqual(@as(u8, 1), s.ta_redo_count);
+    const redo_ptr = s.ta_redo[0].text.?.ptr;
+    send(s, .{ .text_input = .{ .text = "c" } });
+    try std.testing.expectEqualStrings("A", result.getText());
+    try std.testing.expectEqual(@as(u8, 1), s.ta_redo_count);
+    try std.testing.expectEqual(redo_ptr, s.ta_redo[0].text.?.ptr);
+    send(s, redo);
+    try std.testing.expectEqualStrings("AB", result.getText());
+
+    const cap = TextInputState.UNDO_CAPACITY;
+    while (s.ta_undo_count < cap) send(s, .{ .text_input = .{ .text = " " } });
+    send(s, .{ .text_input = .{ .text = " " } });
+    const bottom_ptr = s.ta_undo[0].text.?.ptr;
+    const top_ptr = s.ta_undo[cap - 1].text.?.ptr;
+    const len_before = result.getText().len;
+    send(s, .{ .text_input = .{ .text = "z" } });
+    try std.testing.expectEqual(len_before, result.getText().len);
+    try std.testing.expectEqual(@as(u8, @intCast(cap)), s.ta_undo_count);
+    try std.testing.expectEqual(bottom_ptr, s.ta_undo[0].text.?.ptr);
+    try std.testing.expectEqual(top_ptr, s.ta_undo[cap - 1].text.?.ptr);
+    try std.testing.expect(s.ta_undo_stash.isEmpty());
+
+    send(s, undo);
+    try std.testing.expectEqual(@as(u8, 1), s.ta_redo_count);
+    send(s, .{ .text_input = .{ .text = "Q" } });
+    try std.testing.expectEqual(@as(u8, 0), s.ta_redo_count);
+    send(s, .{ .text_input = .{ .text = "q" } });
+    try std.testing.expectEqual(@as(u8, 0), s.ta_redo_count);
+}
+
+test "EditableText multiline value: 组字中有推迟的外部写入时，AX 写值以 AX 的值为准（文档引擎路径）" {
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    const scope = try Scope.init(std.testing.allocator, null, cx.owner);
+    defer scope.dispose();
+    const v = try scope.createText("old", .{});
+    const result = try EditableText(.{ .value = v, .wrap_width = 300 }).mountResult(scope, cx);
+    cx.root = result.node;
+    result.node.setLayoutRect(.{ .x = 0, .y = 0, .w = 300, .h = result.node.style.height.px });
+    result.state.focused = true;
+    result.node.meta.per_frame.hooks.before_render.main.?(result.node);
+    const editable = result.node.behavior.interaction.a11y.?.editable_text.?;
+    _ = events_mod.inputEventHandler(.{ .ime_preedit = .{ .text = "ni", .cursor_utf8_offset = 2 } }, @ptrCast(result.state));
+    v.set("external");
+    try std.testing.expectEqualStrings("old", result.getText());
+    try std.testing.expect(editable.set_value.?(editable.context, "typed"));
+    try std.testing.expectEqualStrings("typed", result.getText());
+    try std.testing.expectEqualStrings("typed", v.peek());
+    try std.testing.expect(!result.state.imeIsComposing());
+}
+
+test "EditableText multiline: AX 写入超过上限的值在改动前拒绝（不能改完缓冲再报失败）" {
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    const scope = try Scope.init(std.testing.allocator, null, cx.owner);
+    defer scope.dispose();
+    const v = try scope.createText("keep", .{});
+    const result = try EditableText(.{ .value = v, .wrap_width = 300 }).mountResult(scope, cx);
+    cx.root = result.node;
+    result.node.setLayoutRect(.{ .x = 0, .y = 0, .w = 300, .h = result.node.style.height.px });
+    result.state.focused = true;
+    result.node.meta.per_frame.hooks.before_render.main.?(result.node);
+    const editable = result.node.behavior.interaction.a11y.?.editable_text.?;
+    const too_long = (@as([("x").len * ((editable_block.MAX_INPUT_BYTES + 1))]u8, @bitCast(@as([(editable_block.MAX_INPUT_BYTES + 1)][("x").len]u8, @splat(("x").*)))) ++ "");
+    try std.testing.expect(!editable.set_value.?(editable.context, too_long));
+    try std.testing.expectEqualStrings("keep", result.getText());
+    try std.testing.expectEqualStrings("keep", v.peek());
+    try std.testing.expectEqual(@as(u8, 0), result.state.ta_undo_count);
 }

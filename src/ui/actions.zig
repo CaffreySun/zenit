@@ -1,9 +1,9 @@
-/// Action Dispatch 系统
+/// Action Dispatch system
 ///
-/// 提供 Key Context + Action 绑定:
-/// - 节点可设置 key_context 标签 (如 "editor", "modal")
-/// - 全局注册 KeyBinding (key + modifiers -> Action)
-/// - 键盘事件到达时，沿焦点链查找匹配 context 的 Action 并分发
+/// Provides Key Context + Action binding:
+/// - Nodes set a key_context label (e.g., "editor", "modal")
+/// - KeyBindings (key + modifiers -> Action) are registered globally
+/// - On a keyboard event, walk the focus chain, find the matching context Action and dispatch
 const std = @import("std");
 const events_mod = @import("events.zig");
 const KeyCode = events_mod.KeyCode;
@@ -12,15 +12,15 @@ const EventResult = events_mod.EventResult;
 const core = @import("core.zig");
 const Node = core.Node;
 
-/// Action 定义
+/// Action definition
 pub const Action = struct {
-    /// 上下文名 (需要匹配节点的 key_context)
+    /// Context name (must match node's key_context)
     context: []const u8,
-    /// 动作名
+    /// Action name
     name: []const u8,
 };
 
-/// 键绑定
+/// Key binding
 pub const KeyBinding = struct {
     key: KeyCode,
     modifiers: Modifiers,
@@ -32,23 +32,23 @@ pub const CommandBinding = struct {
     action: Action,
 };
 
-/// Action handler 回调
+/// Action handler callback
 pub const ActionHandler = *const fn (action: Action, context: ?*anyopaque) EventResult;
 
-/// Action 调度器
+/// Action dispatcher
 pub const ActionDispatcher = struct {
     registry: ?*const core.NodeRegistry = null,
 
-    bindings: [64]?KeyBinding = [_]?KeyBinding{null} ** 64,
+    bindings: [64]?KeyBinding = @as([64]?KeyBinding, @splat(null)),
     binding_count: u8 = 0,
-    command_bindings: [64]?CommandBinding = [_]?CommandBinding{null} ** 64,
+    command_bindings: [64]?CommandBinding = @as([64]?CommandBinding, @splat(null)),
     command_binding_count: u8 = 0,
 
     pub fn setRegistry(self: *ActionDispatcher, registry: *const core.NodeRegistry) void {
         self.registry = registry;
     }
 
-    /// 注册键绑定
+    /// Register key binding
     pub fn bind(self: *ActionDispatcher, key: KeyCode, modifiers: Modifiers, action: Action) void {
         if (self.binding_count >= self.bindings.len) return;
         self.bindings[self.binding_count] = .{
@@ -59,7 +59,7 @@ pub const ActionDispatcher = struct {
         self.binding_count += 1;
     }
 
-    /// 查找匹配的 Action
+    /// Find matching Action
     pub fn matchKey(self: *const ActionDispatcher, key: KeyCode, modifiers: Modifiers) ?Action {
         for (self.bindings[0..self.binding_count]) |binding_opt| {
             if (binding_opt) |binding| {
@@ -119,8 +119,9 @@ pub const ActionDispatcher = struct {
         // Small paths use the stack; deeper trees preserve the API's unlimited
         // depth without imposing a truncation boundary. Allocation failure occurs
         // before any callback, so it cannot partially execute an action.
-        var fallback = std.heap.stackFallback(128 * @sizeOf(Entry), if (registry) |r| r.allocator else std.heap.page_allocator);
-        const allocator = fallback.get();
+        var buffer: [128 * @sizeOf(Entry)]u8 align(@alignOf(Entry)) = undefined;
+        var fallback = std.heap.BufferFirstAllocator.init(&buffer, if (registry) |r| r.allocator else std.heap.page_allocator);
+        const allocator = fallback.allocator();
         var path: std.ArrayList(Entry) = .empty;
         defer path.deinit(allocator);
         var current: ?*Node = focus_node;
@@ -147,7 +148,7 @@ pub const ActionDispatcher = struct {
     }
 };
 
-// ========== 测试 ==========
+// ========== Tests ==========
 
 test "ActionDispatcher: matchKey" {
     var ad = ActionDispatcher{};
@@ -186,7 +187,7 @@ test "ActionDispatcher: native menu command uses the same Action" {
 }
 
 test "Action: bubbles along focus chain" {
-    var ctx = try core.Cx.init(std.testing.allocator);
+    var ctx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try core.box(ctx, .{ .width = .{ .px = 800 }, .height = .{ .px = 600 } }, .{});
@@ -228,7 +229,7 @@ test "Action: bubbles along focus chain" {
 }
 
 test "ActionDispatcher: destruction skips removed ancestors and preserves surviving path" {
-    const cx = try core.Cx.init(std.testing.allocator);
+    const cx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     const root = try core.box(cx, .{}, .{});
     cx.root = root;
@@ -269,7 +270,7 @@ test "ActionDispatcher: destruction skips removed ancestors and preserves surviv
 
 test "ActionDispatcher: nested dispatch and reparenting preserve outer path" {
     for ([_]bool{ true, false }) |registered| {
-        const cx = try core.Cx.init(std.testing.allocator);
+        const cx = try core.Cx.init(std.testing.allocator, std.testing.io);
         defer cx.deinit();
         const root = try core.box(cx, .{}, .{});
         cx.root = root;
@@ -326,7 +327,7 @@ test "ActionDispatcher: nested dispatch and reparenting preserve outer path" {
 }
 
 test "ActionDispatcher: deep paths allocate before callbacks and OOM consumes input" {
-    const cx = try core.Cx.init(std.testing.allocator);
+    const cx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     const root = try core.box(cx, .{}, .{});
     cx.root = root;
@@ -365,7 +366,7 @@ test "ActionDispatcher: deep paths allocate before callbacks and OOM consumes in
 
 test "ActionDispatcher: command fallback depends on delivery not consumption" {
     for ([_]bool{ true, false }) |in_focus_path| {
-        const cx = try core.Cx.init(std.testing.allocator);
+        const cx = try core.Cx.init(std.testing.allocator, std.testing.io);
         defer cx.deinit();
         const root = try core.box(cx, .{}, .{});
         cx.root = root;

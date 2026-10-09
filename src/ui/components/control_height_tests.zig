@@ -1,6 +1,7 @@
-//! 控件高度合同（跨组件）：同一 ControlSize 下 Button / Input / Select /
-//! DatePicker / DateRangePicker 的外框高度完全一致，且等于
-//! padding_y × 2 + font_size × line_height，由内容撑出，没有任何控件写死 height。
+//! Control height contract (cross-component): Button / Input / Select /
+//! DatePicker / DateRangePicker at same ControlSize have identical outer height =
+//! padding_y*2 + font_size*line_height, sized by content, no hardcoded height.
+const control_shell = @import("control_shell/mod.zig");
 const std = @import("std");
 const testing = std.testing;
 const core = @import("../core.zig");
@@ -16,8 +17,8 @@ const date_range_picker = @import("date_range_picker/mod.zig");
 
 const Heights = struct { button: f32, input: f32, select: f32, date: f32, range: f32 };
 
-fn measure(tokens: *const theme.ThemeTokens, size: theme.ControlSize) !Heights {
-    var ctx = try Cx.init(testing.allocator);
+fn measure(tokens: *const theme.ThemeTokens, size: control_shell.ControlSize) !Heights {
+    var ctx = try Cx.init(testing.allocator, std.testing.io);
     defer ctx.deinit();
     ctx.setTheme(tokens);
     ctx.setViewport(900, 600);
@@ -30,7 +31,7 @@ fn measure(tokens: *const theme.ThemeTokens, size: theme.ControlSize) !Heights {
     try root.appendChild(testing.allocator, b);
     const in = try input.Input(.{ .placeholder = "Input", .size = size, .width = 240 }).mountResult(scope, ctx);
     try root.appendChild(testing.allocator, in.node);
-    const sel = try select.mountSelect(.{ .placeholder = "Select", .size = size, .width = 240 }, scope, ctx);
+    const sel = try select.Select(.{ .placeholder = "Select", .size = size, .width = 240 }).mount(scope, ctx);
     try root.appendChild(testing.allocator, sel.wrapper);
     const dp = try date_picker.DatePicker(.{ .placeholder = "Pick a date", .size = size }).mount(scope, ctx);
     try root.appendChild(testing.allocator, dp.wrapper);
@@ -41,9 +42,9 @@ fn measure(tokens: *const theme.ThemeTokens, size: theme.ControlSize) !Heights {
     return .{
         .button = b.rectFromWorldOrFallback().h,
         .input = in.input_container.rectFromWorldOrFallback().h,
-        .select = sel.state.trigger.rectFromWorldOrFallback().h,
-        .date = dp.state.trigger_node.rectFromWorldOrFallback().h,
-        .range = dr.state.trigger_node.rectFromWorldOrFallback().h,
+        .select = select.stateOf(sel).trigger.rectFromWorldOrFallback().h,
+        .date = @as(*date_picker.DatePickerState, @ptrCast(@alignCast(dp.wrapper.meta.ownership.debug_slots.state_ptrs[0].?))).trigger_node.rectFromWorldOrFallback().h,
+        .range = @as(*date_range_picker.DateRangePickerState, @ptrCast(@alignCast(dr.wrapper.meta.ownership.debug_slots.state_ptrs[0].?))).trigger_node.rectFromWorldOrFallback().h,
     };
 }
 
@@ -57,21 +58,69 @@ fn expectAllEqual(h: Heights, want: f32) !void {
 }
 
 test "控件高度合同：各尺寸下 Button/Input/Select/DatePicker/DateRangePicker 外框等高 = padding_y×2 + 行高" {
-    inline for (.{ theme.ControlSize.xs, .sm, .md, .lg }) |size| {
+    inline for (.{ control_shell.ControlSize.xs, .sm, .md, .lg }) |size| {
         const h = try measure(&theme.light, size);
-        try expectAllEqual(h, theme.light.control.get(size).derivedHeight());
+        try expectAllEqual(h, control_shell.metrics(&theme.light, size).derivedHeight());
     }
-    // 默认主题数值（视觉不回退）
-    try testing.expectEqual(@as(f32, 32), theme.light.control.get(.md).derivedHeight());
-    try testing.expectEqual(@as(f32, 40), theme.light.control.get(.lg).derivedHeight());
+    // Default theme values (visual no fallback)
+    try testing.expectEqual(@as(f32, 32), control_shell.metrics(&theme.light, .md).derivedHeight());
+    try testing.expectEqual(@as(f32, 40), control_shell.metrics(&theme.light, .lg).derivedHeight());
 }
 
-test "控件高度合同：改 font_size / line_height / padding_y，所有控件高度一起跟着变（证明未写死）" {
+test "控件高度合同：改基础 font_size / line_height，所有控件高度一起跟着变（证明未写死）" {
     var custom = theme.light;
-    custom.control.md.font_size = 18;
-    custom.control.md.line_height = 1.5;
-    custom.control.md.padding_y = 9;
-    const want: f32 = 18 * 1.5 + 9 * 2; // 45
+    custom.tokens.font_size.lg = 18;
+    custom.tokens.line_height.tight = 1.5;
+    const want: f32 = 18 * 1.5 + 7.25 * 2; // 41.5; vertical adjustment belongs to the recipe
     const h = try measure(&custom, .md);
     try expectAllEqual(h, want);
+}
+
+test "shell recipe preserves all measurements for every size and mode" {
+    const expected = [_]control_shell.ControlMetrics{
+        .{ .font_size = 12, .line_height = 1.25, .radius = 4, .padding_y = 2.5, .padding_h = 6, .padding_leading_icon = 4, .icon_size = 12, .gap = 4 },
+        .{ .font_size = 12, .line_height = 1.25, .radius = 6, .padding_y = 4.5, .padding_h = 8, .padding_leading_icon = 6, .icon_size = 14, .gap = 4 },
+        .{ .font_size = 14, .line_height = 1.25, .radius = 8, .padding_y = 7.25, .padding_h = 12, .padding_leading_icon = 10, .icon_size = 16, .gap = 6 },
+        .{ .font_size = 16, .line_height = 1.25, .radius = 10, .padding_y = 10, .padding_h = 16, .padding_leading_icon = 14, .icon_size = 20, .gap = 8 },
+    };
+    inline for (.{ &theme.light, &theme.dark, &theme.high_contrast }) |tokens| {
+        inline for (.{ control_shell.ControlSize.xs, .sm, .md, .lg }, expected) |size, want| {
+            try testing.expectEqualDeep(want, control_shell.metrics(tokens, size));
+        }
+    }
+}
+
+test "shell geometry adapts to material scales and keeps icons inside the line box" {
+    var custom = theme.light;
+    custom.tokens.space.space300 = 17;
+    custom.tokens.space.space50 = 3;
+    custom.tokens.radius.xl = 11;
+    custom.tokens.size.md = 30;
+    const m = control_shell.metrics(&custom, .md);
+    try testing.expectEqual(@as(f32, 17), m.padding_h);
+    try testing.expectEqual(@as(f32, 14), m.padding_leading_icon);
+    try testing.expectEqual(@as(f32, 11), m.radius);
+    try testing.expectEqual(m.lineHeightPx(), m.icon_size);
+    try expectAllEqual(try measure(&custom, .md), 32);
+}
+
+test "Yix components: theme follow dies with the component scope after root scope rebinding" {
+    const badge = @import("badge/mod.zig");
+    const tag = @import("tag/mod.zig");
+    inline for (.{ badge.Badge(.{ .label = "Badge" }), badge.StatusBadge(.{ .label = "Status" }), tag.Tag(.{ .label = "Tag", .closable = true }) }) |element| {
+        var ctx = try Cx.init(testing.allocator, std.testing.io);
+        defer ctx.deinit();
+        const outer = try Scope.init(testing.allocator, null, ctx.owner);
+        defer outer.dispose();
+        const node = try element.mount(outer, ctx);
+        ctx.root = node;
+        const state_scope = node.meta.ownership.scope.scope.?;
+        try core.bindScopeToNode(outer, node);
+        // Runtime style theme-follow is component scope effect; any on_theme on node
+        // only from compile-time constant styles, no component state. After state scope
+        // destroyed, theme switch can't touch freed state.
+        state_scope.dispose();
+        ctx.setTheme(&theme.dark);
+        ctx.setTheme(&theme.light);
+    }
 }

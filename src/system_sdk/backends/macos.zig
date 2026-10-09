@@ -322,12 +322,13 @@ test "application input order is independent of window slot order" {
     try std.testing.expect(nativeSequenceRegressed(3, 2));
 }
 
-/// Per-window 状态追踪
+/// per-window state tracking
 const WindowEntry = struct {
     window: Window,
     window_id: events.WindowId,
     native_window_id: u64 = 0,
     last_focused: bool = false,
+    last_appears_active: bool = true,
 
     last_width: u32 = 0,
     last_height: u32 = 0,
@@ -371,7 +372,7 @@ const WindowEntry = struct {
         const wid = self.window_id;
         self.collected_text_count = 0;
 
-        // 尺寸变化
+        // size change
         const size = self.window.getSize();
         const scale = self.window.getScaleFactor();
         if (size[0] != self.last_width or size[1] != self.last_height or scale != self.last_scale) {
@@ -416,7 +417,7 @@ const WindowEntry = struct {
             }
         }
 
-        // 鼠标按键队列
+        // mouse button queue
         while (true) {
             try ordered_native_events.ensureUnusedCapacity(allocator, 1);
             const btn_evt = self.window.getMouseButtonEvent() orelse break;
@@ -435,8 +436,9 @@ const WindowEntry = struct {
                         .y = btn_evt.y,
                         .button = btn,
                         .pressed = btn_evt.pressed,
-                        // 修饰键必须随指针事件一起送：⇧ 加选 / ⌘ 深选 / ctrl 框选
-                        // 都发生在 mouse_down 那一刻，事后从键盘状态推断不可靠。
+                        // modifier keys must come with pointer event: shift add-select / cmd
+                        // deep-select / ctrl box-select all happen at mouse_down, inferring from
+                        // keyboard state afterward unreliable.
                         .modifiers = blk: {
                             const m = platform.Modifiers.fromRaw(btn_evt.modifiers);
                             break :blk .{ .shift = m.shift, .ctrl = m.ctrl, .alt = m.alt, .super = m.cmd };
@@ -448,7 +450,8 @@ const WindowEntry = struct {
                 .left => self.left_down = btn_evt.pressed,
                 .right => self.right_down = btn_evt.pressed,
                 .middle => self.middle_down = btn_evt.pressed,
-                // 侧键等其他按钮不参与按下态跟踪（事件本身照常派发）
+                // side buttons etc. other buttons don't track pressed state (events still
+                // dispatched normally)
                 .other => {},
             }
             if (debug_input) {
@@ -467,7 +470,7 @@ const WindowEntry = struct {
             }
         }
 
-        // 滚轮队列: 每帧 drain，避免触控板/滚轮事件在原生队列中积压
+        // scroll queue: drain each frame, avoid trackpad/scroll events stacking in native queue
         while (true) {
             try ordered_native_events.ensureUnusedCapacity(allocator, 1);
             const scroll = self.window.getScrollDelta() orelse break;
@@ -479,8 +482,8 @@ const WindowEntry = struct {
                     .y = scroll.y,
                     .dx = scroll.dx,
                     .dy = scroll.dy,
-                    .phase = @enumFromInt(scroll.phase),
-                    .momentum = @enumFromInt(scroll.momentum),
+                    .phase = @fromBackingInt(@intCast(scroll.phase)),
+                    .momentum = @fromBackingInt(@intCast(scroll.momentum)),
                     .modifiers = MacOSBackend.toModifiers(scroll.modifiers),
                 } },
             });
@@ -492,7 +495,7 @@ const WindowEntry = struct {
             }
         }
 
-        // 捏合手势队列: 每帧 drain
+        // pinch gesture queue: drain each frame
         while (true) {
             try ordered_native_events.ensureUnusedCapacity(allocator, 1);
             const mag = self.window.getMagnifyEvent() orelse break;
@@ -508,7 +511,7 @@ const WindowEntry = struct {
             });
         }
 
-        // 按键队列: 每帧 drain，避免按键按下/抬起落后一帧甚至多帧
+        // key queue: drain each frame, avoid key press/release lagging one frame or more
         while (true) {
             try ordered_native_events.ensureUnusedCapacity(allocator, 1);
             const ke = self.window.getKeyEvent() orelse break;
@@ -575,14 +578,15 @@ const WindowEntry = struct {
         }
     }
 
-    /// 同步鼠标状态（liveResize 后调用）
+    /// sync mouse state (called after liveResize)
     fn syncInputState(self: *WindowEntry) void {
         while (self.window.getMouseButtonEvent()) |btn_evt| {
             switch (btn_evt.button) {
                 .left => self.left_down = btn_evt.pressed,
                 .right => self.right_down = btn_evt.pressed,
                 .middle => self.middle_down = btn_evt.pressed,
-                // 侧键等其他按钮不参与按下态跟踪（事件本身照常派发）
+                // side buttons etc. other buttons don't track pressed state (events still
+                // dispatched normally)
                 .other => {},
             }
         }
@@ -597,10 +601,10 @@ pub const MAX_WINDOWS = 8;
 pub const MacOSBackend = struct {
     allocator: Allocator,
 
-    /// 多窗口数组
-    windows: [MAX_WINDOWS]?WindowEntry = [_]?WindowEntry{null} ** MAX_WINDOWS,
+    /// multi-window array
+    windows: [MAX_WINDOWS]?WindowEntry = @as([MAX_WINDOWS]?WindowEntry, @splat(null)),
     window_count: u8 = 0,
-    ordered_native_events: std.ArrayList(OrderedNativeEvent) = .{},
+    ordered_native_events: std.ArrayList(OrderedNativeEvent) = .empty,
     native_collection_pending: bool = false,
     post_collection_pending: bool = false,
     global_collection_pending: bool = false,
@@ -616,7 +620,7 @@ pub const MacOSBackend = struct {
     pump_seq: u64 = 0,
     next_drag_token: u64 = 1,
 
-    /// 上一帧的系统主题状态（用于检测变化）
+    /// previous frame's system theme state (for change detection)
     last_is_dark: ?bool = null,
 
     pub fn create(
@@ -630,7 +634,7 @@ pub const MacOSBackend = struct {
             .allocator = allocator,
             .debug_input = debug_input,
         };
-        // 注册第一个窗口
+        // register first window
         backend_ctx.windows[0] = WindowEntry.initFromWindow(window, window_id);
         backend_ctx.window_count = 1;
 
@@ -736,7 +740,7 @@ pub const MacOSBackend = struct {
 
         // A failed global phase must finish before interpreting later input.
         if (!self.global_collection_pending) {
-            // 1. 驱动 NSApp 事件泵（支持阻塞等待，空闲时不 busy-loop）
+            // 1. drive NSApp event pump (support blocking wait, no busy-loop when idle)
             Window.pumpAppEventsTimeout(timeout_ms);
             const input_metrics = Window.inputQueueMetrics();
             if (self.debug_input and
@@ -776,7 +780,7 @@ pub const MacOSBackend = struct {
         return self.collectGlobalEvents(queue, source) catch |err| {
             if (err != error.OutOfMemory) return err;
             // Preserve successful earlier deliveries and retry before AppKit.
-            std.Thread.sleep(16 * std.time.ns_per_ms);
+            retryPause();
             return null;
         };
     }
@@ -829,7 +833,7 @@ pub const MacOSBackend = struct {
             if (err != error.OutOfMemory) return err;
             // Already published events must reach the application. Retry
             // the unread head before pumping later input on the next call.
-            std.Thread.sleep(16 * std.time.ns_per_ms);
+            retryPause();
             return false;
         };
         self.post_collection_pending = false;
@@ -853,12 +857,12 @@ pub const MacOSBackend = struct {
             // Do not pump AppKit here: another key must not query a client
             // which has not yet received the pending native text. Bound retry
             // frequency without a spin loop when memory pressure persists.
-            std.Thread.sleep(16 * std.time.ns_per_ms);
+            retryPause();
             return false;
         };
         self.dispatchNativeBatch(queue) catch |err| {
             if (err != error.OutOfMemory) return err;
-            std.Thread.sleep(16 * std.time.ns_per_ms);
+            retryPause();
             return false;
         };
         return true;
@@ -869,21 +873,24 @@ pub const MacOSBackend = struct {
         for (&self.windows) |*maybe_entry| {
             const entry = &(maybe_entry.* orelse continue);
 
-            // 更新此窗口的鼠标位置
+            // update this window's mouse position
             entry.window.updateWindowMouse();
 
             const focused = entry.window.isFocused();
-            if (focused != entry.last_focused) {
+            const appears_active = entry.window.appearsActive();
+            if (focused != entry.last_focused or appears_active != entry.last_appears_active) {
                 try self.ordered_native_events.append(self.allocator, .{ .sequence = 0, .event = .{
                     .window_focused = .{
                         .window_id = entry.window_id,
                         .focused = focused,
+                        .appears_active = appears_active,
                     },
                 } });
                 entry.last_focused = focused;
+                entry.last_appears_active = appears_active;
             }
 
-            // 检查窗口关闭请求
+            // check window close request
             if (entry.window.checkShouldClose()) {
                 try self.ordered_native_events.append(self.allocator, .{ .sequence = 0, .event = .{
                     .window_close_requested = .{
@@ -944,7 +951,7 @@ pub const MacOSBackend = struct {
 
     fn requestRedrawImpl(ctx: *anyopaque) SdkError!void {
         const self: *MacOSBackend = @ptrCast(@alignCast(ctx));
-        // 请求所有窗口重绘
+        // request all windows redraw
         for (&self.windows) |*maybe_entry| {
             const entry = &(maybe_entry.* orelse continue);
             entry.window.requestRedraw();
@@ -965,7 +972,7 @@ pub const MacOSBackend = struct {
                     node.key_equivalent.ptr,
                     node.key_equivalent.len,
                     modifiersBits(node.modifiers),
-                    @intFromEnum(node.role),
+                    @backingInt(node.role),
                     node.command_id,
                     @intFromBool(node.enabled),
                     @intFromBool(node.checked),
@@ -986,7 +993,7 @@ pub const MacOSBackend = struct {
         const ok = macos_begin_drag(
             entry.window.window_ptr,
             token,
-            @intFromEnum(request.payload_kind),
+            @backingInt(request.payload_kind),
             request.payload.ptr,
             request.payload.len,
             @bitCast(request.allowed_operations),
@@ -1031,7 +1038,7 @@ pub const MacOSBackend = struct {
                 if (entry.window.window_ptr == window.window_ptr) return SdkError.InvalidState;
             }
         }
-        // 查找空槽
+        // find empty slot
         for (&self.windows) |*maybe_entry| {
             if (maybe_entry.* == null) {
                 maybe_entry.* = WindowEntry.initFromWindow(window, window_id);
@@ -1039,7 +1046,7 @@ pub const MacOSBackend = struct {
                 return;
             }
         }
-        return SdkError.BackendFailure; // 窗口数已满
+        return SdkError.BackendFailure; // window count full
     }
 
     fn unregisterWindowImpl(ctx: *anyopaque, window_id: events.WindowId) void {
@@ -1143,7 +1150,8 @@ pub const MacOSBackend = struct {
     fn clipboardSetTextImpl(ctx: *anyopaque, text: []const u8) SdkError!void {
         _ = ctx;
         if (text.len > std.math.maxInt(c_int)) return SdkError.BufferTooSmall;
-        // 写失败必须上抛：此前这里丢弃返回值，复制静默失效时调用方仍收到成功。
+        // write failure must propagate: previously discarded here, when copy failed caller still
+        // got success.
         return clipboardWriteResult(macos_clipboard_set_text(text.ptr, @intCast(text.len)));
     }
 
@@ -1156,8 +1164,8 @@ pub const MacOSBackend = struct {
         return clipboardReadSlice(buffer, len);
     }
 
-    /// 同步弹出原生对话框（runModal 嵌套 run loop，期间帧循环阻塞，与既有
-    /// pick_folder/save_panel 行为一致）。返回 null = 用户取消。
+    /// sync native dialog (runModal nests run loop, frame loop blocks during, consistent with
+    /// existing pick_folder/save_panel behavior). return null = user cancel.
     fn dialogRunImpl(ctx: *anyopaque, request: backend.DialogRequest, path_buffer: []u8) SdkError!?[]const u8 {
         _ = ctx;
         if (path_buffer.len == 0) return SdkError.BufferTooSmall;
@@ -1167,7 +1175,7 @@ pub const MacOSBackend = struct {
             .open_file => macos_open_file_panel(path_buffer.ptr, @intCast(path_buffer.len)),
             .pick_folder => macos_pick_folder(path_buffer.ptr, @intCast(path_buffer.len)),
             .save_file => blk: {
-                // C 侧要 NUL 结尾字符串；default_path 过长按无默认目录处理
+                // C side needs NUL-terminated string; default_path too long treated as no default
                 var dir_buf: [1024]u8 = undefined;
                 var dir_z: ?[*:0]const u8 = null;
                 if (request.default_path.len > 0 and request.default_path.len < dir_buf.len) {
@@ -1186,7 +1194,7 @@ pub const MacOSBackend = struct {
             },
         };
         if (len < 0) return SdkError.BackendFailure;
-        if (len == 0) return null; // 用户取消
+        if (len == 0) return null; // user cancel
         return path_buffer[0..@intCast(len)];
     }
 
@@ -1206,8 +1214,8 @@ pub const MacOSBackend = struct {
             html_ptr = h.ptr;
             html_len = @intCast(h.len);
         }
-        // 与 set_text 同一返回合同；此前返回 void，非法 UTF-8 时先清空剪贴板
-        // 再静默放弃，调用方却收到成功。
+        // same return contract as set_text; previously returned void, on invalid UTF-8 cleared
+        // clipboard then silently gave up, caller got success.
         return clipboardWriteResult(macos_clipboard_set_rich_text(rich.text.ptr, @intCast(rich.text.len), html_ptr, html_len));
     }
 
@@ -1255,7 +1263,8 @@ pub const MacOSBackend = struct {
         const rgba = alloc.dupe(u8, rgba_raw[0..rgba_len]) catch return SdkError.OutOfMemory;
         errdefer alloc.free(rgba);
 
-        // 原始编码字节（可选：TIFF 派生等场景可能拿不到时仍返回解码结果）
+        // raw encoded bytes (optional: TIFF derivative etc. scenarios may get no bytes still return
+        // decode result)
         var raw_bytes: ?[]const u8 = null;
         var uti: ?[]const u8 = null;
         var raw_len: usize = 0;
@@ -1290,7 +1299,7 @@ pub const MacOSBackend = struct {
     }
 
     fn readDebugFlag(allocator: Allocator) bool {
-        const value = std.process.getEnvVarOwned(allocator, "ZENIT_INPUT_DEBUG") catch return false;
+        const value = @import("zenit_environment").getOwned(allocator, "ZENIT_INPUT_DEBUG") catch return false;
         defer allocator.free(value);
         if (value.len == 0) return false;
         if (std.mem.eql(u8, value, "0")) return false;
@@ -1320,7 +1329,7 @@ pub const MacOSBackend = struct {
         const result = switch (kind) {
             .focus => macos_accessibility_notify_focus(
                 window_ptr,
-                @intCast(@intFromEnum(snapshot.role)),
+                @intCast(@backingInt(snapshot.role)),
                 snapshot.label.ptr,
                 @intCast(snapshot.label.len),
                 snapshot.description.ptr,
@@ -1333,7 +1342,7 @@ pub const MacOSBackend = struct {
             ),
             .property_change => macos_accessibility_notify_property_change(
                 window_ptr,
-                @intCast(@intFromEnum(snapshot.role)),
+                @intCast(@backingInt(snapshot.role)),
                 snapshot.label.ptr,
                 @intCast(snapshot.label.len),
                 snapshot.description.ptr,
@@ -1363,8 +1372,8 @@ fn clipboardReadSlice(buffer: []u8, len: c_int) SdkError![]const u8 {
     return buffer[0..@intCast(len)];
 }
 
-/// 剪贴板写入桥的返回合同：1 = 成功，-1 = 载荷不是合法 UTF-8，其余 =
-/// NSPasteboard 拒绝写入。
+/// clipboard write bridge return contract: 1 = success, -1 = payload not valid UTF-8, others =
+/// NSPasteboard refused write.
 fn clipboardWriteResult(rc: c_int) SdkError!void {
     return switch (rc) {
         1 => {},
@@ -1400,9 +1409,9 @@ test "complete native text collection retains dequeued payloads and retries the 
     const t = std.testing;
     const Reader = struct {
         read: [3]bool = .{ false, false, false },
-        const text = "漢" ** 2000 ++ "\x00tail";
+        const text = (@as([("漢").len * (2000)]u8, @bitCast(@as([2000][("漢").len]u8, @splat(("漢").*)))) ++ "") ++ "\x00tail";
         fn readTextEventAllocChecked(self: *@This(), allocator: Allocator, kind: Window.TextEventKind) !?Window.ImePreeditEvent {
-            const index = @intFromEnum(kind);
+            const index = @backingInt(kind);
             if (self.read[index]) return null;
             const owned = try allocator.dupe(u8, text);
             self.read[index] = true;
@@ -1417,7 +1426,7 @@ test "complete native text collection retains dequeued payloads and retries the 
     for (0..24) |failure| {
         var failing = t.FailingAllocator.init(t.allocator, .{ .fail_index = failure });
         var reader: Reader = .{};
-        var pending: std.ArrayList(OrderedNativeEvent) = .{};
+        var pending: std.ArrayList(OrderedNativeEvent) = .empty;
         defer {
             for (pending.items) |*item| item.deinit(failing.allocator());
             pending.deinit(failing.allocator());
@@ -1462,7 +1471,7 @@ test "native batch publication is atomic and retry transfers independent complet
             backend_state.ordered_native_events.deinit(t.allocator);
         }
         for (0..3) |i| {
-            const owned = try t.allocator.dupe(u8, "a" ** 6000 ++ "漢");
+            const owned = try t.allocator.dupe(u8, (@as([("a").len * (6000)]u8, @bitCast(@as([6000][("a").len]u8, @splat(("a").*)))) ++ "") ++ "漢");
             try backend_state.ordered_native_events.append(t.allocator, .{ .sequence = 2 + i, .event = .{ .text_input = .{ .window_id = 7, .text = owned } }, .owned_text = owned });
         }
         failing.fail_index = failing.alloc_index + failure;
@@ -1484,7 +1493,7 @@ test "native batch publication is atomic and retry transfers independent complet
         try t.expectEqual(@as(u64, 4), backend_state.last_dispatched_native_sequence);
         try t.expectEqual(@as(usize, 0), backend_state.ordered_native_events.items.len);
         try t.expect(!backend_state.native_batch_complete);
-        for (queue.items()[1..]) |item| try t.expectEqualStrings("a" ** 6000 ++ "漢", item.text_input.text);
+        for (queue.items()[1..]) |item| try t.expectEqualStrings((@as([("a").len * (6000)]u8, @bitCast(@as([6000][("a").len]u8, @splat(("a").*)))) ++ "") ++ "漢", item.text_input.text);
         try backend_state.dispatchNativeBatch(&queue);
         try t.expectEqual(@as(usize, 4), queue.items().len);
         if (completed) break;
@@ -1498,7 +1507,7 @@ test "native collection has no 128 packet cutoff and unregister releases pending
         count: usize = 0,
         fn readTextEventAllocChecked(self: *@This(), allocator: Allocator, kind: Window.TextEventKind) !?Window.ImePreeditEvent {
             if (kind != .input or self.count == 200) return null;
-            const text = try allocator.dupe(u8, "complete" ** 100);
+            const text = try allocator.dupe(u8, (@as([("complete").len * (100)]u8, @bitCast(@as([100][("complete").len]u8, @splat(("complete").*)))) ++ ""));
             self.count += 1;
             return .{ .sequence = self.count, .text = text, .cursor_utf8_offset = 0 };
         }
@@ -1530,7 +1539,7 @@ test "native pump memory pressure keeps a deliverable batch without failing the 
         for (state.ordered_native_events.items) |*item| item.deinit(t.allocator);
         state.ordered_native_events.deinit(t.allocator);
     }
-    const text = try t.allocator.dupe(u8, "preserved" ** 1000);
+    const text = try t.allocator.dupe(u8, (@as([("preserved").len * (1000)]u8, @bitCast(@as([1000][("preserved").len]u8, @splat(("preserved").*)))) ++ ""));
     try state.ordered_native_events.append(t.allocator, .{ .sequence = 1, .event = .{ .text_input = .{ .window_id = 1, .text = text } }, .owned_text = text });
     const never_collect = struct {
         fn collect(_: *MacOSBackend) SdkError!void {
@@ -1543,7 +1552,7 @@ test "native pump memory pressure keeps a deliverable batch without failing the 
     try t.expectEqual(@as(u64, 0), state.last_dispatched_native_sequence);
     failing.fail_index = std.math.maxInt(usize);
     try t.expect(try state.resumeNativeBatchWithCollector(&queue, never_collect));
-    try t.expectEqualStrings("preserved" ** 1000, queue.items()[0].text_input.text);
+    try t.expectEqualStrings((@as([("preserved").len * (1000)]u8, @bitCast(@as([1000][("preserved").len]u8, @splat(("preserved").*)))) ++ ""), queue.items()[0].text_input.text);
     try t.expectEqual(@as(u64, 1), state.last_dispatched_native_sequence);
 }
 
@@ -1558,7 +1567,7 @@ test "drag collection retries every failed allocation without losing full paths 
                 .x = 12,
                 .y = 34,
                 .kind = if (self.count < 2) 3 else 4,
-                .paths = if (self.count < 2) "/tmp/漢.png\n" ** 1000 else "",
+                .paths = if (self.count < 2) (@as([("/tmp/漢.png\n").len * (1000)]u8, @bitCast(@as([1000][("/tmp/漢.png\n").len]u8, @splat(("/tmp/漢.png\n").*)))) ++ "") else "",
                 .payload_kind = 1,
                 .source_token = 123456789,
                 .operation = 2,
@@ -1587,7 +1596,7 @@ test "drag collection retries every failed allocation without losing full paths 
             try collectDragEvents(&queue, &reader, 7);
         }
         try t.expectEqual(@as(usize, 3), queue.items().len);
-        try t.expectEqualStrings("/tmp/漢.png\n" ** 1000, queue.items()[0].drag.paths);
+        try t.expectEqualStrings((@as([("/tmp/漢.png\n").len * (1000)]u8, @bitCast(@as([1000][("/tmp/漢.png\n").len]u8, @splat(("/tmp/漢.png\n").*)))) ++ ""), queue.items()[0].drag.paths);
         try t.expect(queue.items()[0].drag.payload_is_untrusted);
         try t.expect(!queue.items()[2].drag.payload_is_untrusted);
         try t.expectEqual(@as(u64, 123456789), queue.items()[2].drag.source_token);
@@ -1664,7 +1673,7 @@ test "global phase retries partial menu delivery and preserves activation and th
         var state: MacOSBackend = .{ .allocator = t.allocator, .last_is_dark = false };
         state.windows[0] = .{ .window = undefined, .window_id = 70, .native_window_id = 7 };
         state.window_count = 1;
-        var delivered: std.ArrayList(u64) = .{};
+        var delivered: std.ArrayList(u64) = .empty;
         defer delivered.deinit(t.allocator);
         const first = try state.resumeGlobalCollection(&queue, &source);
         if (first == null) {
@@ -1752,4 +1761,11 @@ test "quit OOM retries without confirming application exit and unregister discar
     state.unregisterWindowWithMenuDiscard(7, Discard.discard);
     try t.expectEqual(@as(u64, 700), Discard.id);
     try t.expectEqual(@as(usize, 0), state.window_count);
+}
+
+fn retryPause() void {
+    var remaining: std.c.timespec = .{ .sec = 0, .nsec = 16 * std.time.ns_per_ms };
+    while (std.c.nanosleep(&remaining, &remaining) != 0) {
+        if (std.posix.errno(-1) != .INTR) return;
+    }
 }

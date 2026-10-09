@@ -6,7 +6,7 @@ pub const WorkPriority = enum(u8) {
     background,
 
     pub fn rank(self: WorkPriority) u8 {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 };
 

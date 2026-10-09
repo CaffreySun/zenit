@@ -3,7 +3,11 @@
 A Zig GUI framework for native desktop apps. GPU-rendered (Metal), retained node
 tree, reactive state, flexbox-style layout, and a component library.
 
-Manual and component gallery: [zenit.z.express](https://zenit.z.express)
+Manual and component gallery: [ui.surf/zenit](https://ui.surf/zenit/)
+
+This development branch targets Zig **0.17.0** and includes a compatible ZLS source
+dependency. See [the compatibility guide](docs/ZIG_0_17_COMPAT.md) for setup,
+validation commands and protocol limits.
 
 ## Status
 
@@ -12,7 +16,7 @@ Manual and component gallery: [zenit.z.express](https://zenit.z.express)
 | **Maturity** | Alpha (`0.1.0-alpha`). The API will break before v1, so pin a revision. |
 | **Platforms** | macOS only, tested on Apple Silicon. Linux/Windows backends are compile-only stubs. |
 | **Accessibility** | Not supported. See [Accessibility](#accessibility). |
-| **Zig** | `0.15.2` |
+| **Zig** | `0.17.0` |
 
 ## How zenit is built
 
@@ -41,7 +45,7 @@ useful thing you can send.
 ## Prerequisites
 
 - macOS, Apple Silicon recommended
-- Zig `0.15.2` on `PATH` (or `ZIG=/path/to/zig` for repo scripts)
+- Zig `0.17.0` on `PATH` (or `ZIG=/path/to/zig` for repo scripts)
 - Xcode Command Line Tools: `xcode-select --install`
 - `bun`, only if you run the E2E suite
 
@@ -52,49 +56,38 @@ const std = @import("std");
 const ui = @import("ui");
 const App = @import("zenit_app").App;
 
-const Counter = struct {
-    n: u32 = 0,
-    label: ?*ui.Node = null,
-    buf: [32]u8 = undefined,
+const v = ui.view;
 
-    pub fn increment(self: *Counter) void {
-        self.n += 1;
-        const node = self.label orelse return;
-        const content = std.fmt.bufPrint(&self.buf, "Clicked {d} times", .{self.n}) catch return;
-        if (node.getText()) |old| {
-            var t = old;
-            t.content = content;
-            node.setText(t);
-        }
-        node.markRenderDirty();
-    }
+// Typed style objects resolve application tokens and follow theme changes.
+const S = struct {
+    const root = ui.css(.{ .width = .fill, .height = .fill, .gap = .space400, .align_items = .center, .justify = .center });
+    const title = ui.css(.{ .font_size = .xxxl, .color = .fg_primary });
 };
 
-fn mountUI(cx: *ui.Cx, scope: *ui.Scope) anyerror!*ui.Node {
-    const counter = try cx.bindState(Counter, .{});
-    const click = cx.on(Counter, counter, Counter.increment);
-
-    const root = try ui.box(cx, .{
-        .width = .{ .grow = .{} }, .height = .{ .grow = .{} },
-        .direction = .column, .gap = 16,
-        .align_items = .center, .justify = .center,
-    }, .{});
-
-    try root.appendChild(cx.allocator, try ui.text(cx, "Hello, zenit!", .{ .font_size = 24 }));
-    try root.appendChild(cx.allocator, try ui.widgets.Button(.{ .label = "Click me", .on_click = click }).mount(scope, cx));
-
-    const label = try ui.text(cx, "Clicked 0 times", .{ .font_size = 14 });
-    try root.appendChild(cx.allocator, label);
-    counter.label = label;
-
-    return root;
+fn inc(n: u32) u32 {
+    return n + 1;
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+fn mountUI(cx: *ui.Cx, scope: *ui.Scope) anyerror!*ui.Node {
+    // State is a Signal owned by the mount scope; it is freed with the scope.
+    const count = try scope.createSignal(u32, 0);
+
+    // The UI is one declarative tree. Elements are values; `render` mounts them
+    // once, and only fine-grained effects run afterwards (no virtual DOM).
+    return v.render(scope, cx, v.col(.{ .style = S.root }, .{
+        v.text(.{ .style = S.title }, "Hello, zenit!"),
+        ui.widgets.Button(.{ .label = "Click me", .on_click = ui.on.update(count, inc) }),
+        // Bound to `count`: re-formats and repaints on every `set()`.
+        v.text(.{}, v.fmt("Clicked {d} times", .{count})),
+    }));
+}
+
+pub fn main(init: std.process.Init) !void {
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
 
     const app = try App.init(gpa.allocator(), .{
+        .io = init.io,
         .window = .{ .title = "Hello", .width = 640, .height = 480 },
     });
     defer app.deinit();
@@ -103,14 +96,55 @@ pub fn main() !void {
 }
 ```
 
-The full example is in [`examples/hello_button/`](examples/hello_button/):
+The full example, with a derived `Memo`, conditional styles and `show` /
+`fallback`, is in [`examples/counter_reactive/`](examples/counter_reactive/):
 
 ```bash
-zig build hello-button       # .app bundle, ad-hoc signed
-zig build run-hello-button   # run unbundled
+zig build counter-reactive       # .app bundle, ad-hoc signed
+zig build run-counter-reactive   # run unbundled
 ```
 
-The bundle is 1.7 MB with `-Doptimize=ReleaseSmall` (7.8 MB in Debug).
+### The view tree (`ui.view`)
+
+`ui.view` is the one way to build UI. A short tour (full reference in
+[`docs/VIEW_DSL.md`](docs/VIEW_DSL.md)):
+
+| Write | For |
+|---|---|
+| `v.box / v.row / v.col(props, .{ children })` | containers |
+| `v.text(props, "literal" / v.fmt(...) / text_signal)` | text |
+| `v.icon(.{ .style, .tint }, asset)` | icons |
+| `W.Button(.{ ... })` (any widget builder) | components are children as-is |
+| `v.with(W.ScrollArea(...), .{ children })` | put children into a component's slot |
+| `v.show(cond, .{...}).fallback(.{...})` / `v.match(enum, .{...})` / `v.each(items, .id, row)` | control flow, anchored where it is written |
+| `v.list(array, f)` | expand a static array |
+| `.style = S.Card.of(.{ .selected = selected })` | composed, conditional, theme-following styles |
+| `ui.on.set / toggle / update / assign / call / bind` | event handlers without boilerplate |
+| `v.attrs(.{ .test_id, .style }, W.Button(...))` | extra attributes on a component root |
+
+### Reactivity rules
+
+- **Create reactive state through a `Scope`**: `scope.createSignal`,
+  `scope.createMemo`, `scope.createEffect`. Everything is released when the
+  scope is disposed (the mount scope is disposed on unmount). There is no
+  second, unscoped path on `Cx`.
+- **Event handlers, timers and animation ticks are batched.** If a handler sets
+  several signals, every effect that depends on them runs once, after the
+  handler returns, and sees the final values. Outside those entry points (for
+  example, in tests) wrap multi-signal writes in `owner.batch(...)` yourself.
+- **Bind, don't push.** Show a value through the view tree (`v.fmt`, a text
+  signal, `v.show`, `v.each`, `v.when` styles) instead of writing to nodes and
+  calling `markRenderDirty()`. Node-level code belongs inside components (and
+  in `v.setup`, the explicit escape hatch).
+- **Component props.** Anything that can change is a signal-friendly prop: pass
+  a literal for a fixed value, or a `*Signal(T)`, `*Memo(T)` or derived value
+  (`ui.not(busy)`, `ui.map(count, f)`) to keep it in sync. Values the user can
+  change, such as `checked`, are a `Model` (a controlled value): a plain value
+  keeps the state inside the component, a `*Signal(T)` makes your signal the
+  source that interactions write to, and `ui.split(read, on_write)` lets the
+  parent accept, transform or reject each change. There is one source of truth:
+  the component only proposes, the view follows the source, and `on_change`
+  reports the value that actually landed (see `docs/SIGNAL_API_DESIGN.md`).
 
 ## Using zenit in your project
 
@@ -144,7 +178,7 @@ you plug in another provider.
 
 `ui.X` holds the ~50 names every app uses: `Cx`, `Node`, `Scope`, `Style`,
 builders (`box`, `text`, `image`, `icon`, `grid`, ...), reactive primitives
-(`Signal`, `Memo`, `createEffect`), and control flow (`Show`, `For`, `Match`).
+(`Signal`, `Memo`; created through `Scope`), and control flow (`Show`, `For`, `Match`).
 
 Everything else is grouped by namespace:
 
@@ -204,14 +238,19 @@ VoiceOver test notes for any single component are a very welcome contribution.
 `MultiWindowApp` gives each window its own `Cx`, Metal surface, renderer, event
 route and IME context:
 
+Pass `init.io` from `main(init: std.process.Init)` to each window configuration
+(`io` in the snippet below).
+
 ```zig
 var application = zenit_app.MultiWindowApp.init(allocator, .{});
 defer application.deinit();
 
 const editor = try application.createWindowWith(.{
+    .io = io,
     .window = .{ .width = 900, .height = 700, .title = "Editor" },
 }, mountEditor);
 _ = try application.createWindowWith(.{
+    .io = io,
     .window = .{ .width = 480, .height = 700, .title = "Preview" },
 }, mountPreview);
 

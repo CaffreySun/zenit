@@ -1,70 +1,29 @@
-/// hello_button, zenit 框架的最小可运行 demo
+/// hello_button: minimal runnable zenit demo
 ///
-/// 一个原生 macOS 窗口 + 一个 Button + 一个计数器文本。
-/// 点击 Button 计数 +1，文本响应式更新。
+/// One native macOS window + Button + counter text. Click increments, text updates
+/// reactively; after a click the counter panel switches to the highlight variant.
 ///
-/// 用 zenit 的推荐 API：
-///   - `App.runWith(mountUI)` 一行启动主循环
-///   - `cx.bindState` / `cx.on` 不需要分配 u64 state id
-///
-/// 应用作者只需要写 mountUI，真正的"业务" UI 树构建。
+/// UI in view.yix (Yix -> ui.view, compile-time):
+///   - `var count: u32 = signal(0)`: component state; template writes `{count}`, not
+///     `.get()`
+///   - `onClick={count += 1}`: events write the signal inline, no Bindings struct
+///   - styles from styles.zig `ui.css` + `ui.cva` (variants receive computed source)
+/// This file only starts: `App.runWith(mountUI)` starts the main loop.
 const std = @import("std");
 const ui = @import("ui");
 const App = @import("zenit_app").App;
-
-/// 样式表：具名纯函数 + 应用层自定义 recipe，与业务逻辑分离。
-const S = @import("styles.zig");
-
-const Counter = struct {
-    n: u32 = 0,
-    label: ?*ui.Node = null,
-    buf: [32]u8 = undefined,
-
-    pub fn increment(self: *Counter) void {
-        self.n += 1;
-        const node = self.label orelse return;
-        const content = std.fmt.bufPrint(&self.buf, "Clicked {d} times", .{self.n}) catch return;
-        if (node.getText()) |old| {
-            var t = old;
-            t.content = content;
-            node.setText(t);
-        }
-        node.markRenderDirty();
-    }
-};
+const HelloButton = @import("_view.yix.zig").HelloButton;
 
 fn mountUI(cx: *ui.Cx, scope: *ui.Scope) anyerror!*ui.Node {
-    const allocator = cx.allocator;
-
-    const counter = try cx.bindState(Counter, .{});
-    const click = cx.on(Counter, counter, Counter.increment);
-
-    const root = try ui.boxStyled(cx, S.root, .{});
-
-    try root.appendChild(allocator, try ui.textStyled(cx, S.title, "Hello, zenit!"));
-
-    try root.appendChild(allocator, try ui.widgets.Button(.{
-        .label = "Click me",
-        .variant = .primary,
-        .size = .md,
-        .on_click = click,
-    }).mount(scope, cx));
-
-    // 应用层自定义 recipe（styles.zig 的 PanelRecipe）包住计数文本
-    const panel = try ui.boxStyled(cx, S.panel(.highlight), .{});
-    const label = try ui.textStyled(cx, S.counterLabel, "Clicked 0 times");
-    try panel.appendChild(allocator, label);
-    try root.appendChild(allocator, panel);
-    counter.label = label;
-
-    return root;
+    return ui.view.render(scope, cx, HelloButton(.{}));
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+pub fn main(init: std.process.Init) !void {
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
 
     const app = try App.init(gpa.allocator(), .{
+        .io = init.io,
         .window = .{ .width = 640, .height = 480, .title = "Hello Button" },
     });
     defer app.deinit();

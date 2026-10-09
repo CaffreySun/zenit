@@ -1,18 +1,15 @@
-//! ShapingCache, Phase 6 (text_hash, font, width) -> cached GlyphRun
+//! ShapingCache: (text_hash, font, width) -> cached GlyphRun.
 //!
-//! TextShaper.shape() 在 CoreText 后端单次 ~10-100µs；同文本第二次 shape 是
-//! 浪费。ShapingCache 用 (content_hash, font_id, max_width) 三元组 key 缓存
-//! shaping 结果。命中率 > 95% 是 plan 矩阵指标。
+//! TextShaper.shape() on CoreText costs ~10-100us; reshaping identical text is waste. Key is
+//! (content_hash, font_id, max_width). Target hit rate >95%. Reference: HarfBuzz hb_shape_plan_t
+//! cache.
 //!
-//! 设计参照：HarfBuzz hb_shape_plan_t 缓存 + Skia 内部 SkTextBlob 缓存。
-//!
-//! 历史债避免：
-//! - **不**让 cache entry 持有 Allocator-owned []GlyphPosition；用 arena
-//!   per-frame 重用 buffer，cache 只存指针 slice 视图。entry deinit 释放。
-//! - **不**把 cache 容量设硬上限太小（v0.1 MAX_LINES=64 类硬上限教训）；
-//!   默认 4096 entries + LRU eviction
-//! - **不**让 cache key 用 `[]const u8`（slice ptr 不稳定）；用 hash + length
-//!   作 key，命中时 caller 传原文件内容验证（避免哈希碰撞误命中）
+//! Pitfalls:
+//! - **do not** hold Allocator-owned []GlyphPosition in entries; use a per-frame arena buffer +
+//!   slice view
+//! - **do not** set a small hard capacity; default 4096 entries + LRU eviction
+//! - **do not** key on `[]const u8` (ptr unstable); key on hash + length, caller passes original to
+//!   verify
 
 const std = @import("std");
 const testing = std.testing;
@@ -26,15 +23,15 @@ pub const FontMetrics = glyph_run.FontMetrics;
 
 /// Shaping cache key
 pub const ShapingKey = struct {
-    /// 原文 hash（caller 用 std.hash.Wyhash 或类似生成）
+    /// Source hash (caller generates using std.hash.Wyhash or similar)
     text_hash: u64,
-    /// 文本长度（防哈希碰撞 + 大小估算）
+    /// Text length (prevents hash collision + size estimation)
     text_len: u32,
-    /// 字体 id（zenit FontSystem 内部 id；0 = 默认）
+    /// Font id (zenit FontSystem internal id; 0 = default)
     font_id: u32,
-    /// max_width（用于 line break；0 = 单行不折）
+    /// max_width (used for line break; 0 = single line no wrap)
     max_width: f32,
-    /// 字号
+    /// Font size
     font_size: f32,
 
     pub fn hash(self: ShapingKey) u64 {
@@ -56,17 +53,17 @@ pub const ShapingKey = struct {
     }
 };
 
-/// Cache entry, owned glyph + cluster slices（arena allocated）
+/// Cache entry, owned glyph + cluster slices (arena allocated)
 pub const Entry = struct {
     key: ShapingKey,
-    /// arena-allocated glyph 序列
+    /// Arena-allocated glyph sequence
     glyphs: []GlyphPosition,
-    /// arena-allocated cluster 序列
+    /// Arena-allocated cluster sequence
     clusters: []Cluster,
     metrics: FontMetrics,
     direction: glyph_run.Direction,
     total_advance: f32,
-    /// LRU 时间戳：最近使用的 frame index
+    /// LRU timestamp: most recently used frame index
     last_used_frame: u64,
 
     pub fn toRun(self: Entry) GlyphRun {
@@ -125,7 +122,7 @@ const VisualEntry = struct {
 
 pub const ShapingCache = struct {
     allocator: std.mem.Allocator,
-    /// arena for glyph/cluster slices；每次 evict + cache.deinit 时整 arena 重置
+    /// Arena for glyph/cluster slices; entire arena reset on each evict + cache.deinit
     arena: std.heap.ArenaAllocator,
     /// HashMap key -> entry index
     map: std.HashMapUnmanaged(ShapingKey, Entry, KeyContext, 80),
@@ -155,7 +152,7 @@ pub const ShapingCache = struct {
         self.current_frame +%= 1;
     }
 
-    /// 查询 cache。命中 -> 返回 GlyphRun + bump last_used_frame；未命中 -> null。
+    /// Query cache. Hit -> return GlyphRun + bump last_used_frame; miss -> null.
     pub fn lookup(self: *ShapingCache, key: ShapingKey) ?GlyphRun {
         if (self.map.getPtr(key)) |entry| {
             entry.last_used_frame = self.current_frame;
@@ -197,9 +194,8 @@ pub const ShapingCache = struct {
         });
     }
 
-    /// 插入 cache 条目。caller 提供 shaping 结果（glyph/cluster slice 由 cache
-    /// 内部的 arena 复制存储，所以 caller 可以传 stack-allocated 的）。
-    /// 容量满时按 LRU 驱逐。
+    /// Insert cache entry. Caller provides shaping result (glyph/cluster slice stored by
+    /// cache-internal arena, so caller can pass stack-allocated). Evict by LRU when full.
     pub fn insert(
         self: *ShapingCache,
         key: ShapingKey,
@@ -230,19 +226,21 @@ pub const ShapingCache = struct {
         });
     }
 
-    /// 超过该帧数未使用的条目视为 stale，批量驱逐优先清它们。
+    /// Entries unused for more than this frame count are stale; batch eviction prioritizes clearing
+    /// them.
     const STALE_FRAMES: u64 = 120;
-    /// entry slices 挂在内部 arena 上、逐条驱逐不回收内存；arena 超过该阈值时
-    /// 整体 clear（map + arena 一起重置），下一帧热集重新 shape 一轮。
+    /// Entry slices hung on internal arena; evict individually without reclaiming memory.
+    /// When arena exceeds threshold, clear fully (map + arena reset); next frame reshapes hot set.
     const ARENA_CLEAR_BYTES: usize = 32 * 1024 * 1024;
 
-    /// 批量驱逐：老的逐条 LRU 满载后每 miss 都 O(capacity) 全表扫描，且 arena
-    /// 内存永不回收。这里一次腾出至少 capacity/4，把扫描成本均摊到 O(4)/miss。
+    /// Batch eviction: old per-entry LRU when full scans O(capacity) per miss with no arena
+    /// reclaim. Free >= capacity/4 per eviction, amortizing scan cost to O(4)/miss.
     fn evictBatch(self: *ShapingCache) void {
         if (self.map.count() == 0) return;
 
         if (self.arena.queryCapacity() >= ARENA_CLEAR_BYTES) {
-            // arena 无界增长兜底：整体重置。代价是下一帧 shape 峰值，频率极低。
+            // Unbounded arena growth fallback: reset fully. Cost is peak shaping next frame;
+            // happens rarely.
             self.stats.evictions += self.map.count();
             self.map.clearRetainingCapacity();
             self.visual_map.clearRetainingCapacity();
@@ -251,10 +249,11 @@ pub const ShapingCache = struct {
         }
 
         const target: u64 = @max(self.capacity / 4, 1);
-        // 逐步收紧的年龄阈值：每轮一次全扫、批量 removeByPtr（remove 不 rehash，
-        // 迭代期间删除是 std.HashMap 支持的模式）。先清 STALE_FRAMES 未用的，
-        // 不够则阈值减半再扫，最坏 O(log(STALE_FRAMES)) 轮后 cutoff=当前帧，
-        // 必然腾够 target。
+        // Progressively tighten age threshold: scan all, batch removeByPtr (remove no rehash;
+        // deletion during iteration is std.HashMap-supported). First clear STALE_FRAMES unused.
+        // If insufficient, halve threshold and rescan; worst O(log(STALE_FRAMES)) rounds until
+        // cutoff
+        // = current frame, guaranteed to free enough target.
         var age_threshold: u64 = STALE_FRAMES;
         var removed: u64 = 0;
         while (removed < target) {
@@ -346,14 +345,14 @@ test "ShapingCache: batch eviction keeps recently-used, drops stale" {
     try cache.insert(k4, empty_glyphs, empty_clusters, m, .ltr, 0);
     try testing.expectEqual(@as(u32, 4), cache.count());
 
-    // 推进 200 帧，只有 k1 持续被使用，其余变 stale
+    // Advance 200 frames; k1 continuously used, rest become stale.
     var i: u32 = 0;
     while (i < 200) : (i += 1) {
         cache.beginFrame();
         _ = cache.lookup(k1);
     }
 
-    // 容量已满；插入 k5 触发批量驱逐，stale 的 k2/k3/k4 被清，k1 幸存
+    // Capacity full; insert k5 triggers batch eviction, stale k2/k3/k4 cleared, k1 survives.
     try cache.insert(k5, empty_glyphs, empty_clusters, m, .ltr, 0);
     try testing.expect(cache.lookup(k1) != null);
     try testing.expect(cache.lookup(k2) == null);

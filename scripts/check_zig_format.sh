@@ -15,7 +15,9 @@ cleanup() {
 trap cleanup EXIT
 
 zig fmt --check build.zig src examples tools >"$RAW" 2>&1 || true
-sort -u "$RAW" >"$CURRENT"
+# .yix / .yss generated twins (_<name>.yix.zig) are compiler raw output, not formatted (editor maps
+# location per compiler segment table)
+grep -vE '(^|/)_[^/]+\.(yix|yss)\.zig$' "$RAW" | sort -u >"$CURRENT" || true
 comm -13 "$ALLOWLIST" "$CURRENT" >"$NEW"
 
 if [[ -s "$NEW" ]]; then

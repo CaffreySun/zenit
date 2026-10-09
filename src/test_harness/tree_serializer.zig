@@ -1,8 +1,7 @@
-/// tree_serializer, Node 树 -> JSON 序列化
-///
-/// 递归遍历 UI Node 树，输出 JSON 结构供 AI Agent 读取。
-/// (zenit v0.5 适配：用 meta.ownership.meta.test_id / behavior.interaction.focusable /
-/// visuals.content.text / frame_state.rect 路径)
+/// tree_serializer: Node tree -> JSON serialization.
+/// Recursively traverse UI node tree, output JSON for AI agent consumption.
+/// (zenit v0.5 compat: uses meta.ownership.meta.test_id / behavior.interaction.focusable /
+/// visuals.content.text / frame_state.rect paths).
 const std = @import("std");
 const ui = @import("ui");
 const Node = ui.Node;
@@ -12,7 +11,7 @@ const OverlayStack = @FieldType(ui.Cx, "overlay_stack");
 
 const MAX_DEPTH = 20;
 
-// ── zenit v0.5 字段访问 helper ──
+// -- zenit v0.5 field access helpers --
 
 inline fn nodeTestId(node: *const Node) ?[]const u8 {
     return node.meta.ownership.meta.test_id;
@@ -40,16 +39,25 @@ fn writeColorRgba(jw: *JsonWriter, color: ui.Color) void {
     jw.stringValue(text);
 }
 
-/// 序列化整棵 Node 树到 JSON buffer。
-/// `overlays`：所属 Cx 的浮层栈，用于把挂起层里的节点计作不可见（见 effectiveOpacity）。
+/// Serialize entire node tree to JSON buffer. `overlays`: overlay stack for this Cx; nodes in
+/// suspended layers are hidden (see effectiveOpacity).
 pub fn serializeTree(root: *Node, overlays: ?*const OverlayStack, buf: []u8) error{TreeTooLarge}![]const u8 {
     var jw = JsonWriter.init(buf);
-    serializeNode(&jw, root, overlays, 0);
+    serializeNode(&jw, root, overlays, 0, false);
     if (jw.hasOverflowed()) return error.TreeTooLarge;
     return jw.getWritten();
 }
 
-/// 按 test_id 查找节点，返回匹配列表的 JSON
+/// Frame archives need opacity on descendants too: portaled/suspended layer
+/// visibility cannot always be inferred from the physical parent chain.
+pub fn serializeFrameTree(root: *Node, overlays: ?*const OverlayStack, buf: []u8) error{TreeTooLarge}![]const u8 {
+    var jw = JsonWriter.init(buf);
+    serializeNode(&jw, root, overlays, 0, true);
+    if (jw.hasOverflowed()) return error.TreeTooLarge;
+    return jw.getWritten();
+}
+
+/// Find nodes by test_id; return JSON of matches.
 pub fn queryByTestId(root: *Node, overlays: ?*const OverlayStack, test_id: []const u8, buf: []u8) error{TreeTooLarge}![]const u8 {
     var jw = JsonWriter.init(buf);
     jw.beginArray();
@@ -59,7 +67,7 @@ pub fn queryByTestId(root: *Node, overlays: ?*const OverlayStack, test_id: []con
     return jw.getWritten();
 }
 
-/// 按 test_id 查找单个节点，返回其指针
+/// Find single node by test_id; return pointer.
 pub fn findByTestId(root: *Node, test_id: []const u8) ?*Node {
     return findByTestIdRecursive(root, test_id, 0);
 }
@@ -82,7 +90,7 @@ fn queryByTestIdRecursive(jw: *JsonWriter, node: *Node, overlays: ?*const Overla
     if (depth > MAX_DEPTH) return;
     if (nodeTestId(node)) |tid| {
         if (std.mem.eql(u8, tid, test_id)) {
-            serializeNode(jw, node, overlays, 0);
+            serializeNode(jw, node, overlays, 0, false);
         }
     }
     const children = node.children.items;
@@ -91,7 +99,7 @@ fn queryByTestIdRecursive(jw: *JsonWriter, node: *Node, overlays: ?*const Overla
     }
 }
 
-/// 精简版布局摘要：只输出有 test_id/component_name/text 或 focusable 的节点
+/// Condensed layout summary: output only nodes with test_id / component_name / text / or focusable.
 pub fn serializeLayout(root: *Node, buf: []u8) []const u8 {
     var jw = JsonWriter.init(buf);
     jw.beginArray();
@@ -193,14 +201,14 @@ fn serializeLayoutRecursive(jw: *JsonWriter, node: *Node, depth: usize, indent: 
     }
 }
 
-/// 有效不透明度：自身 × 所有祖先 opacity，以下情形直接计 0（节点不呈现）：
-/// - 自身或祖先 display:none；
-/// - 落在挂起（已关闭）浮层的 content / barrier 子树里，Modal 关闭时只把 barrier
-///   缩成 0×0 + overflow_hidden + 层挂起，dialog 及祖先 opacity 仍是 1；
-/// - 自身或祖先 overflow_hidden 且盒子退化到 0 宽/高，渲染侧同判据整棵跳过
-///   （render_engine/tick.zig 的 `overflow_hidden and w/h <= 0.1`），裁剪对
-///   absolute / z_index 子节点同样生效（只有 portal 能逃出）。
-fn effectiveOpacity(node: *Node, overlays: ?*const OverlayStack) f32 {
+/// Effective opacity: self × all ancestor opacities. Nodes render as invisible (opacity 0) when:
+/// - Self or ancestor has display:none;
+/// - Falls under content/barrier subtree of suspended (closed) overlay layer. Modal close shrinks
+///   barrier to 0x0 + overflow_hidden + suspend layer; dialog and ancestor opacity remain 1;
+/// - Self or ancestor overflow_hidden with box collapsed to 0 width/height. Render engine skips
+///   entire subtree by same criteria (render_engine/tick.zig `overflow_hidden and w/h <= 0.1`);
+///   clipping applies to absolute/z_index children too (only portal escapes).
+pub fn effectiveOpacity(node: *Node, overlays: ?*const OverlayStack) f32 {
     if (overlays) |stack| {
         if (stack.isNodeInSuspendedLayer(node)) return 0;
     }
@@ -217,7 +225,7 @@ fn effectiveOpacity(node: *Node, overlays: ?*const OverlayStack) f32 {
     return o;
 }
 
-fn serializeNode(jw: *JsonWriter, node: *Node, overlays: ?*const OverlayStack, depth: usize) void {
+fn serializeNode(jw: *JsonWriter, node: *Node, overlays: ?*const OverlayStack, depth: usize, all_effective: bool) void {
     if (depth > MAX_DEPTH) {
         jw.null_();
         return;
@@ -242,15 +250,16 @@ fn serializeNode(jw: *JsonWriter, node: *Node, overlays: ?*const OverlayStack, d
         jw.stringValue(cn);
     }
 
-    // display:none（节点仍在树上但不呈现）：查询方据此排除不可见内容。
+    // display:none: node remains in tree but doesn't render; queries exclude by this.
     if (node.style.display == .none) {
         jw.key("hidden");
         jw.booleanValue(true);
     }
 
-    // 查询命中的顶层节点附带"有效不透明度"（自身 × 所有祖先；display:none 计 0）：
-    // 浮层淡入等过渡挂在祖先上时，测试据此等"真正完全可见"，而不是 sleep 猜时长。
-    if (depth == 0) {
+    // Query results include "effective opacity" for top-level hits (self × ancestors; display:none
+    // = 0). When layer transitions fade in on ancestors, tests wait for "truly fully visible"
+    // rather than guessing sleep duration.
+    if (depth == 0 or all_effective) {
         jw.key("effective_opacity");
         jw.floatValue(effectiveOpacity(node, overlays));
     }
@@ -288,6 +297,12 @@ fn serializeNode(jw: *JsonWriter, node: *Node, overlays: ?*const OverlayStack, d
         jw.key("translate_y");
         jw.floatValue(node.style.translate_y);
     }
+    if (@abs(node.style.scale_x() - 1) > 0.0001 or @abs(node.style.scale_y() - 1) > 0.0001) {
+        jw.key("scale_x");
+        jw.floatValue(node.style.scale_x());
+        jw.key("scale_y");
+        jw.floatValue(node.style.scale_y());
+    }
     if (@abs(node.style.rotate()) > 0.0001) {
         jw.key("rotate");
         jw.floatValue(node.style.rotate());
@@ -309,10 +324,11 @@ fn serializeNode(jw: *JsonWriter, node: *Node, overlays: ?*const OverlayStack, d
     if (children.len > 0) {
         jw.key("children");
         jw.beginArray();
-        // 全量输出：曾经每层只输出前 50 个子节点（长列表后半段"查不到"，客户端从不
-        // 处理 truncated 标记，静默丢失）。体积由调用方缓冲兜底，溢出显式报错。
+        // Full output: previously capped at 50 children per layer (list tails "not found"; client
+        // never handled truncated flag, silently lost). Caller buffers size; overflow errors
+        // explicitly.
         for (children) |child| {
-            serializeNode(jw, child, overlays, depth + 1);
+            serializeNode(jw, child, overlays, depth + 1, all_effective);
         }
         jw.endArray();
     }
@@ -320,7 +336,7 @@ fn serializeNode(jw: *JsonWriter, node: *Node, overlays: ?*const OverlayStack, d
     jw.endObject();
 }
 
-// ── 测试 ──
+// -- Tests --
 
 const testing = std.testing;
 
@@ -349,19 +365,19 @@ fn pumpFrames(ctx: *ui.Cx, n: usize) void {
 
 test "effective_opacity: 关闭的 Modal 内容计 0，打开后计 1，关回去再计 0" {
     const allocator = testing.allocator;
-    var ctx = try ui.Cx.init(allocator);
+    var ctx = try ui.Cx.init(allocator, std.testing.io);
     defer ctx.deinit();
     ctx.setViewport(800, 600);
     const root = try ui.box(ctx, .{ .width = .{ .px = 800 }, .height = .{ .px = 600 } }, .{});
     ctx.root = root;
     const scope = try ui.Scope.init(allocator, null, ctx.owner);
     defer scope.dispose();
-    const vis = try ctx.createSignal(bool, false);
-    const result = try ui.widgets.Modal(.{ .title = "Probe" }).visible(vis).mount(scope, ctx);
+    const vis = try scope.createSignal(bool, false);
+    const result = try ui.widgets.Modal(.{ .title = "Probe", .open = vis }).mount(scope, ctx);
     if (!result.portaled) try root.appendChild(allocator, result.overlay);
     result.dialog.meta.ownership.meta.test_id = "probe.dialog";
 
-    // 初始关闭：barrier 0×0 + 层挂起，但 dialog 自身及祖先 opacity 全是 1。
+    // Initially closed: barrier 0x0 + layer suspended, but dialog and ancestor opacity all 1.
     pumpFrames(ctx, 3);
     try testing.expectEqual(@as(f64, 0), try queryEffectiveOpacity(root, &ctx.overlay_stack, "probe.dialog"));
 
@@ -385,17 +401,35 @@ test "effective_opacity: 挂起层里的节点计 0（与几何无关）" {
     stack.bindFloatingContent(allocator, handle, content);
 
     try testing.expectEqual(@as(f32, 1), effectiveOpacity(child, &stack));
-    // 只挂起、不动 opacity / 尺寸：仍须计 0。
+    // Suspend alone (no opacity/size change): still counts as 0.
     stack.findLayer(handle).?.suspended = true;
     try testing.expectEqual(@as(f32, 0), effectiveOpacity(child, &stack));
     try testing.expectEqual(@as(f32, 0), effectiveOpacity(content, &stack));
-    // 不传浮层栈时退化为纯节点判定。
+    // Without overlay stack, degrades to pure node check.
     try testing.expectEqual(@as(f32, 1), effectiveOpacity(child, null));
+
+    // A frame archive must carry the suspended-layer visibility on descendants,
+    // even though their physical parent opacity remains one.
+    var buffer: [8192]u8 = undefined;
+    const archived = try serializeFrameTree(content, &stack, &buffer);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, archived, .{});
+    defer parsed.deinit();
+    const descendants = parsed.value.object.get("children").?.array.items;
+    try testing.expectEqual(@as(usize, 1), descendants.len);
+    const opacity = descendants[0].object.get("effective_opacity") orelse return error.TestUnexpectedResult;
+    const value: f64 = switch (opacity) {
+        .float => |f| f,
+        .integer => |i| @floatFromInt(i),
+        else => return error.TestUnexpectedResult,
+    };
+    try testing.expectEqual(@as(f64, 0), value);
+    var too_small: [16]u8 = undefined;
+    try testing.expectError(error.TreeTooLarge, serializeFrameTree(content, &stack, &too_small));
 }
 
 test "effective_opacity: 0×0 的 overflow_hidden 祖先把子树计 0" {
     const allocator = testing.allocator;
-    var ctx = try ui.Cx.init(allocator);
+    var ctx = try ui.Cx.init(allocator, std.testing.io);
     defer ctx.deinit();
     ctx.setViewport(400, 300);
     const root = try ui.box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
@@ -408,7 +442,7 @@ test "effective_opacity: 0×0 的 overflow_hidden 祖先把子树计 0" {
     pumpFrames(ctx, 1);
     try testing.expectEqual(@as(f32, 0), effectiveOpacity(leaf, null));
 
-    // 对照：同样 0×0 但不裁剪，子节点照常溢出可见。
+    // Control: same 0x0 but no clip; children still overflow visible.
     clipper.style.overflow_hidden = false;
     clipper.markRenderDirty();
     pumpFrames(ctx, 1);

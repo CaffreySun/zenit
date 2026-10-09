@@ -29,13 +29,15 @@ require 'bash scripts/test_bench_regression_contract\.sh' 'benchmark comparison 
 require 'python3 tools/generate_grapheme_data\.py --check' 'generated Unicode data must be reproducible'
 require 'bash scripts/check_icon_architecture\.sh' 'icon provider architecture gate'
 require 'zig build gen-icons-lucide' 'Lucide generated module reproducibility gate'
+require 'zig build gen-component-index' 'component source index regeneration gate'
+require 'git diff --exit-code -- src/ui/component_index_generated\.zig' 'component source index drift must fail CI'
 require 'gen-icons-common' 'common Lucide icon reproducibility gate'
 require 'bash scripts/check_version_contract\.sh' 'version/tag/package identity contract'
 require 'zig build test-package-consumer' 'downstream package consumer gate'
 require 'bash scripts/check_v04_deletions\.sh all' 'architecture migration invariant gate'
 require 'bash scripts/check_template_builds\.sh' 'minimal-app template + README example gate'
-# 本契约自身也必须在 CI 里跑 —— 否则有人删掉上面任何一条 require 所保护的
-# CI 步骤，都不会有任何东西发现（护栏不在现场就不是护栏）。
+# This contract itself must run in CI too — else anyone deletes any require-protected
+# CI step above and nothing will catch it (guardrail not present isn't a guardrail).
 require 'bash scripts/check_ci_contract\.sh' 'the CI contract itself must run in CI'
 require 'bash scripts/test_oss_boundary_contract\.sh' 'boundary gate failure handling tests'
 require 'zig build test-native' 'native macOS ObjC bridge tests (native/macos/tests)'

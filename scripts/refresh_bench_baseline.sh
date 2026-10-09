@@ -1,17 +1,19 @@
 #!/usr/bin/env bash
-# 重采 src/bench/baselines/main.json —— bench 门禁的比较基准。
+# Resample src/bench/baselines/main.json -- the bench gate comparison baseline.
 #
-# ── 为什么需要这个脚本 ────────────────────────────────────────────────
-# baseline 是手工产物，没有自动更新机制。2026-09-22 实测：文件停在 8 月 12 日
-# 且**不记录 commit**，于是门禁红了一个多月没人处理 —— 因为红了之后根本判断
-# 不出是代码退化还是换了机器。没有溯源信息的 baseline 会训练所有人无视门禁。
+# -- Why this script --
+# The baseline is a manual artifact with no auto-update. An untraceable baseline makes a red gate
+# indistinguishable between code regression and machine change, which trains everyone to ignore the
+# gate.
 #
-# 现在 bench JSON 带 commit / host / unix_time 三个字段（见 runner.zig），
-# 这个脚本负责把它们填对。
+# Bench JSON carries commit/host/unix_time fields (see runner.zig); this script fills them
+# correctly.
 #
-# 用法：bash scripts/refresh_bench_baseline.sh
-#       刷新后**必须**在 commit message 里说明为什么重采（性能确有变化？
-#       换机器？新增 bench？），否则下次红了还是同样查不清。
+# Usage: bash scripts/refresh_bench_baseline.sh; afterwards the commit message **must** explain why
+# you resampled (real perf change? machine swap? new bench?), else the next red is again
+# unexplainable.
+#
+# Exit: 0 success.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."

@@ -1,7 +1,8 @@
-//! Tabs 样式层，TabsSlotRecipe + variant×size spec 表 + EditorTabs 具名样式函数
+//! Tabs style layer, TabsSlotRecipe + variant x size spec table.
 //!
-//! 业务逻辑（TabsState/Builder/mount/事件/before_render）在 mod.zig；
-//! 本文件只有样式声明。TabsVariant/TabsSize 是公共 API，留在 mod.zig，循环 import 取用。
+//! Business logic (TabsRuntime/Builder/mount/event/before_render) in mod.zig; this file has only
+//! style declarations. TabsVariant/TabsSize are public API, left in mod.zig, accessed via cycle
+//! import.
 const core = @import("../../core.zig");
 const theme = core.theme;
 const Color = core.Color;
@@ -13,26 +14,25 @@ const mod = @import("mod.zig");
 const TabsVariant = mod.TabsVariant;
 const TabsSize = mod.TabsSize;
 
-// ============================================================================
-// TabsSlotRecipe, 5 slots: root, tab, highlight, badge, close
+// Tabs slot recipe: 5 slots: root, tab, highlight, badge, close.
 //
-// 样式全部收敛在这里：variant resolver 管颜色/字重/highlight 外观，
-// derived 管 variant × size 组合出的全部几何（padding/radius/gap/font_size）。
-// active 态不是独立 slot 而是 tab slot 的 .selected 条件，消费端
-// `slots.tab.resolve(.{ .is_selected = is_active })`。
-// mount/buildTab 只消费 resolve 结果，不再各自持有样式决策。
-// ============================================================================
+// All styles converge here: variant resolver manages color/font-weight/highlight appearance,
+// derived manages geometry from variant x size combinations (padding/radius/gap/font_size). Active
+// state is not a separate slot but .selected condition on tab slot; consumers call
+// `slots.tab.resolve(.{ .is_selected = is_active })`. mount/buildTab only consume resolve results,
+// no longer each holding style decisions.
 
 pub const TabsSlotRecipe = recipe_mod.slotRecipe(struct {
     pub const Slots = struct {
         root: ConditionalStyle = .{},
-        /// tab item（active 态走 .selected 条件字段）
+        /// Tab item (active state uses .selected condition field).
         tab: ConditionalStyle = .{},
-        /// 跟随 active tab 的滑动指示（underline 下划线 / pill 白底滑块 / tab 浅色底）
+        /// Slide indicator following active tab (underline / pill white-background slider / tab
+        /// light background).
         highlight: ConditionalStyle = .{},
-        /// 数字 badge
+        /// Numeric badge.
         badge: ConditionalStyle = .{},
-        /// 关闭按钮
+        /// Close button.
         close: ConditionalStyle = .{},
     };
 
@@ -41,17 +41,17 @@ pub const TabsSlotRecipe = recipe_mod.slotRecipe(struct {
         size: TabsSize = .md,
     };
 
-    /// 尺寸/变体无关的静态部件样式
+    /// Size/variant-agnostic static component styles.
     pub fn base(t: *const theme.ThemeTokens) Slots {
         return .{
             .badge = .{ .base = .{
                 .height = .{ .px = 16 },
-                .background = t.color.accent,
+                .background = t.tokens.color.accent,
                 .padding = Padding.symmetric(0, 6),
                 .border = .{ .radius = 8 },
                 .justify = .center,
                 .align_items = .center,
-                .text_color = t.color.button_primary_fg,
+                .text_color = t.tokens.color.button_primary_fg,
                 .font_size = 10,
             } },
             .close = .{ .base = .{
@@ -60,7 +60,7 @@ pub const TabsSlotRecipe = recipe_mod.slotRecipe(struct {
                 .border = .{ .radius = 2 },
                 .justify = .center,
                 .align_items = .center,
-                .text_color = t.color.fg_secondary,
+                .text_color = t.tokens.color.fg_secondary,
                 .font_size = 12,
             } },
         };
@@ -73,46 +73,47 @@ pub const TabsSlotRecipe = recipe_mod.slotRecipe(struct {
                     .underline => .{
                         .root = .{},
                         .tab = .{ .base = .{
-                            .text_color = t.color.fg_secondary,
+                            .text_color = t.tokens.color.fg_secondary,
                             .font_weight = 500,
                         }, .selected = .{
-                            .text_color = t.color.fg_primary,
+                            .text_color = t.tokens.color.fg_primary,
                             .font_weight = 600,
-                        }, .hover = .{ .text_color = t.color.fg_primary } },
-                        // 2px accent bar（高度固定，宽度/水平位移每帧跟随 active tab）
+                        }, .hover = .{ .text_color = t.tokens.color.fg_primary } },
+                        // 2px accent bar (height fixed, width/horizontal offset track active tab
+                        // each frame).
                         .highlight = .{ .base = .{
                             .height = .{ .px = 2 },
-                            .background = t.color.accent,
+                            .background = t.tokens.color.accent,
                         } },
                     },
                     .pill => .{
                         .root = .{ .base = .{
-                            .background = t.color.bg_secondary,
+                            .background = t.tokens.color.bg_secondary,
                         } },
                         .tab = .{ .base = .{
-                            .text_color = t.color.fg_secondary,
+                            .text_color = t.tokens.color.fg_secondary,
                             .font_weight = 500,
                         }, .selected = .{
-                            .text_color = t.color.fg_primary,
+                            .text_color = t.tokens.color.fg_primary,
                             .font_weight = 600,
                         } },
-                        // 白色滑块 + 精确 shadow
+                        // White slider + precise shadow.
                         .highlight = .{ .base = .{
-                            .background = t.color.bg_primary,
+                            .background = t.tokens.color.bg_primary,
                             .shadow = .{ .color = Color.rgba(0, 0, 0, 15), .blur = 2, .offset_x = 0, .offset_y = 1 },
                         } },
                     },
                     .tab => .{
                         .root = .{},
                         .tab = .{ .base = .{
-                            .text_color = t.color.fg_secondary,
+                            .text_color = t.tokens.color.fg_secondary,
                             .font_weight = 500,
                         }, .selected = .{
-                            .text_color = t.color.accent,
+                            .text_color = t.tokens.color.accent,
                             .font_weight = 600,
                         } },
                         .highlight = .{ .base = .{
-                            .background = t.color.accent_subtle,
+                            .background = t.tokens.color.accent_subtle,
                         } },
                     },
                 };
@@ -120,8 +121,9 @@ pub const TabsSlotRecipe = recipe_mod.slotRecipe(struct {
         }.resolve,
     };
 
-    /// 跨维度几何，variant × size 组合出的 padding/radius/gap/font_size 全在这里。
-    /// 只产出几何字段，禁碰 background（见 recipe.zig derived 约定）。
+    /// Cross-dimension geometry: all padding/radius/gap/font_size from variant x size combinations
+    /// here. Produce only geometry fields, never touch background (see recipe.zig derived
+    /// contract).
     pub fn derived(v: Variants, _: *const theme.ThemeTokens) Slots {
         const item_geo = StyleOverride{
             .padding = itemPadding(v.variant, v.size),
@@ -134,7 +136,7 @@ pub const TabsSlotRecipe = recipe_mod.slotRecipe(struct {
                 .corner_radius = rootCornerRadius(v.variant, v.size),
                 .gap = rootGap(v.variant, v.size),
             } },
-            // selected 条件不改几何，一份 base 即够
+            // Selected condition doesn't change geometry, one base suffices.
             .tab = .{ .base = item_geo },
             .highlight = .{ .base = .{
                 .corner_radius = highlightRadius(v.variant, v.size),
@@ -143,14 +145,12 @@ pub const TabsSlotRecipe = recipe_mod.slotRecipe(struct {
     }
 });
 
-// ============================================================================
-// Tabs 独立 spec 表，4 档 (xs/sm/md/lg)
+// Tabs independent spec table, 4 sizes (xs/sm/md/lg).
 //
-// 只被 TabsSlotRecipe.derived 消费（tabIconSize 例外：icon 尺寸不是
-// StyleOverride 字段，由 buildTab 直接取）。组件逻辑不得直接调用。
-// ============================================================================
+// Consumed only by TabsSlotRecipe.derived (tabIconSize exception: icon size not a StyleOverride
+// field, consumed directly by buildTab). Component logic must not call directly.
 
-/// Tab 内文字字号 (比 ControlSize.fontSize 略小)
+/// Tab text font size (slightly smaller than ControlSize.fontSize).
 pub fn tabFontSize(size: TabsSize) f32 {
     return switch (size) {
         .xs => 11,
@@ -247,7 +247,7 @@ pub fn tabCornerRadius(size: TabsSize) f32 {
     };
 }
 
-// ── 容器级 spec ──
+// -- Container-level spec --
 
 pub fn rootPadding(variant: TabsVariant, size: TabsSize) Padding {
     return switch (variant) {
@@ -278,7 +278,7 @@ pub fn rootGap(variant: TabsVariant, size: TabsSize) f32 {
     };
 }
 
-/// 每个 variant 对应的 tab item padding
+/// Tab item padding per variant.
 pub fn itemPadding(variant: TabsVariant, size: TabsSize) Padding {
     return switch (variant) {
         .underline => underlineItemPadding(size),
@@ -287,7 +287,7 @@ pub fn itemPadding(variant: TabsVariant, size: TabsSize) Padding {
     };
 }
 
-/// 每个 variant 对应的 item gap
+/// Item gap per variant.
 pub fn itemGap(variant: TabsVariant, size: TabsSize) f32 {
     return switch (variant) {
         .underline, .pill => switch (size) {
@@ -300,67 +300,11 @@ pub fn itemGap(variant: TabsVariant, size: TabsSize) f32 {
     };
 }
 
-/// highlight_box 的 corner radius
+/// highlight_box corner radius.
 pub fn highlightRadius(variant: TabsVariant, size: TabsSize) f32 {
     return switch (variant) {
         .underline => 2,
         .pill => pillInnerRadius(size),
         .tab => tabCornerRadius(size),
-    };
-}
-
-// ── EditorTabs 具名样式函数（无 variant 维度的静态样式层） ──
-
-pub fn editorTabsContainerStyle(t: *const theme.ThemeTokens) core.BoxStyle {
-    return .{
-        .height = .{ .px = 35 },
-        .background = t.color.bg_primary,
-        .direction = .row,
-    };
-}
-
-pub fn editorTabStyle(is_active: bool, t: *const theme.ThemeTokens) core.BoxStyle {
-    return .{
-        .height = .{ .px = 35 },
-        .background = if (is_active) t.color.bg_secondary else t.color.bg_primary,
-        .padding = Padding.symmetric(0, 10),
-        .direction = .row,
-        .align_items = .center,
-        .gap = 6,
-    };
-}
-
-pub fn editorTabLabelStyle(is_active: bool, t: *const theme.ThemeTokens) core.TextProps {
-    return .{
-        .content = "",
-        .color = if (is_active) t.color.fg_primary else t.color.fg_secondary,
-        .font_size = 12,
-    };
-}
-
-pub fn editorModifiedDotStyle(t: *const theme.ThemeTokens) core.BoxStyle {
-    return .{
-        .width = .{ .px = 8 },
-        .height = .{ .px = 8 },
-        .background = t.color.fg_secondary,
-        .border = .{ .radius = 4 },
-    };
-}
-
-pub fn editorCloseStyle(_: *const theme.ThemeTokens) core.BoxStyle {
-    return .{
-        .width = .{ .px = 16 },
-        .height = .{ .px = 16 },
-        .border = .{ .radius = 2 },
-        .justify = .center,
-        .align_items = .center,
-    };
-}
-
-pub fn editorCloseLabelStyle(t: *const theme.ThemeTokens) core.TextProps {
-    return .{
-        .content = "×",
-        .color = t.color.fg_secondary,
-        .font_size = 11,
     };
 }

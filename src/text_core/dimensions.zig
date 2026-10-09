@@ -1,38 +1,37 @@
-//! Phase 0, Dim trait / 统一的 SumTree seek 维度入口
+//! Dim trait / unified SumTree seek dimension entry
 //!
-//! 对齐 Zed `crates/sum_tree/src/sum_tree.rs:95-110` 的
-//! `trait Dimension<'a, S: Summary>`。
+//! Aligns with Zed crates/sum_tree/src/sum_tree.rs:95-110 trait Dimension<'a, S: Summary>.
 //!
-//! SumTree 的 Cursor 需要按不同维度 seek：
-//!   - ByteDim / ByteOffset，按字节偏移
-//!   - LineDim / Row，按行号
-//!   - PointDim，按 (row, column)
-//!   - CharDim，按字符数
-//!   - OffsetUtf16，按 UTF-16 code unit
+//! SumTree Cursor must seek by different dimensions:
+//!   - ByteDim / ByteOffset: by byte offset
+//!   - LineDim / Row: by line number
+//!   - PointDim: by (row, column)
+//!   - CharDim: by character count
+//!   - OffsetUtf16: by UTF-16 code unit
 //!
-//! 每个维度都实现一个"从 Summary 提取值 + 累加两个值"的契约。Phase 0 只定义
-//! 契约 + 空壳，具体维度在 Phase 2 `src/core/rope/summary.zig` 里逐一实现。
+//! Each dimension implements "extract value from Summary + add two values" contract.
+//! This file defines the contract + stubs; concrete dimensions are in src/core/rope/summary.zig.
 //!
-//! Zig 没有 Rust 的 trait；这里用 **结构化鸭子类型**：每个 Dim 类型必须满足
+//! Zig lacks Rust traits; uses **structured duck typing**: each Dim type must satisfy
 //!
 //!   ```zig
 //!   pub const Self = @This();
-//!   pub const ZERO: Self;                      // 该维度的零值
-//!   pub fn fromSummary(s: Summary) Self;       // 从 Summary 投影出本维度的值
-//!   pub fn addAssign(self: *Self, other: Self) void;  // 累加（monoid add）
-//!   pub fn cmp(a: Self, b: Self) std.math.Order;      // 全序（用于 seek）
+//!   pub const ZERO: Self;                      // zero value for this dimension
+//!   pub fn fromSummary(s: Summary) Self;       // project Summary to dimension value
+//!   pub fn addAssign(self: *Self, other: Self) void;  // accumulate (monoid add)
+//!   pub fn cmp(a: Self, b: Self) std.math.Order;      // total order (for seek)
 //!   ```
 //!
-//! Phase 2 的 `SumTree.Cursor(Dim, OtherDim)` 会 `@hasDecl(Dim, ...)` 强制检查。
+//! SumTree.Cursor(Dim, OtherDim) enforces this via @hasDecl(Dim, ...).
 //!
-//! 本文件目前只提供：
-//!   - `isValidDim(comptime Dim, comptime Summary)` 编译期检查辅助
-//!   - 一个 `Unit` 空维度作为占位（Cursor 第二维度可选时使用）
+//! This file provides:
+//!   - isValidDim(comptime Dim, comptime Summary) compile-time validation helper
+//!   - Unit empty dimension as placeholder (Cursor second dimension optional)
 
 const std = @import("std");
 
-/// 空维度。用作 `Cursor(Dim, Unit)` 里的 "不跟踪第二维度" 占位。
-/// 所有方法都是 no-op。
+/// No-op dimension. Used as placeholder for "don't track second dimension" in `Cursor(Dim, Unit)`.
+/// All methods are no-op.
 pub const Unit = struct {
     pub const ZERO: Unit = .{};
 
@@ -53,18 +52,18 @@ pub const Unit = struct {
     }
 };
 
-/// 编译期契约检查：Dim 必须满足 Dimension<Summary> 的四条方法。
+/// Compile-time contract check: Dim must satisfy Dimension<Summary> four methods.
 ///
-/// 用法：
+/// Usage:
 /// ```zig
-/// comptime isValidDim(ByteOffset, TextSummary);  // 若缺方法则编译报错
+/// comptime isValidDim(ByteOffset, TextSummary);  // compile error if methods missing
 /// ```
 pub fn isValidDim(comptime Dim: type, comptime Summary: type) void {
     if (!@hasDecl(Dim, "ZERO")) @compileError(@typeName(Dim) ++ " missing ZERO constant");
     if (!@hasDecl(Dim, "fromSummary")) @compileError(@typeName(Dim) ++ " missing fromSummary(Summary) " ++ @typeName(Dim));
     if (!@hasDecl(Dim, "addAssign")) @compileError(@typeName(Dim) ++ " missing addAssign(*Self, Self) void");
     if (!@hasDecl(Dim, "cmp")) @compileError(@typeName(Dim) ++ " missing cmp(Self, Self) Order");
-    _ = Summary; // 占位；Phase 2 会加上签名细节校验
+    _ = Summary; // Placeholder; Phase 2 adds signature detail validation.
 }
 
 // ============================================================================
@@ -78,7 +77,7 @@ test "Unit is a valid Dim for any Summary" {
     try std.testing.expectEqual(std.math.Order.eq, Unit.cmp(.{}, .{}));
 }
 
-// 一个最小化 Dim 示例：u64 byte offset 维度，绑定到任意带 `len: u64` 字段的 Summary。
+// Minimal Dim example: u64 byte offset dimension, bound to any Summary with `len: u64` field.
 const DummySummary = struct {
     len: u64 = 0,
     pub const ZERO: DummySummary = .{};

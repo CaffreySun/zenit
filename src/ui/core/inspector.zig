@@ -23,16 +23,16 @@ const ItemHeader = display_list_mod.ItemHeader;
 const PaintItem = paint_table_mod.DisplayItem;
 const PaintItemKind = paint_table_mod.DisplayItemKind;
 
-/// Inspector overlay 写到 lowering.main (DisplayItem 流) 时的 header，占位 INVALID。
+/// Inspector overlay write to lowering.main (DisplayItem stream) header, INVALID placeholder.
 const INSPECTOR_HEADER: ItemHeader = .{ .transform_id = property_tree_mod.INVALID_ID, .node_id = std.math.maxInt(u32) };
 
-/// 把 fill_rect 写为 paint_table.DisplayItem 直接 append 到 main_paint
-/// (encoder 主路径)。inspector overlay 不再依赖 union DisplayItem 中转。
+/// Write fill_rect as paint_table.DisplayItem, appended directly to main_paint
+/// (encoder main path).
 ///
-/// 【OOM 策略】本文件下面三个 appendInspector* 的 `catch {}` 都是诊断路径：
-/// inspector overlay 是**叠在真实界面之上的调试可视化**，不参与布局、命中、
-/// 状态。append 失败只是少画一条调试框线，真实 UI 的正确性不受影响，故意吞掉
-/// 分配失败而不是让调试工具把 app 拖崩。
+/// [OOM strategy] the three appendInspector* below use `catch {}` on purpose, all diagnostic:
+/// the inspector overlay is **debug visualization layered over the real UI**, not part of
+/// layout/hit/state. A failed append only skips a debug frame line; real UI correctness is
+/// unaffected, and swallowing alloc failure beats crashing the app from a debug tool.
 fn appendInspectorFillRect(cx: anytype, x: f32, y: f32, w: f32, h: f32, color: Color, radius: [4]f32) void {
     const paint_color: paint_table_mod.RGBA = .{ .r = color.r, .g = color.g, .b = color.b, .a = color.a };
     _ = cx.lowering.main_paint.append(cx.allocator, .{
@@ -70,7 +70,7 @@ fn appendInspectorTextRun(cx: anytype, x: f32, y: f32, content: []const u8, colo
     }) catch {};
 }
 
-/// Debug Paint 模式位域
+/// Debug Paint mode bitfield
 pub const DebugPaintMode = struct {
     show_margins: bool = false,
     show_padding: bool = false,
@@ -86,26 +86,26 @@ pub const DebugPaintMode = struct {
 
 pub const Inspector = struct {
     enabled: bool = false,
-    /// pick 模式：点击 DevTools 的"选择元素"按钮后激活，
-    /// hover 时高亮节点，点击后选中并自动退出 pick 模式（一次性）。
+    /// pick mode: activate after clicking DevTools 'select element', hover highlight node,
+    /// click select and auto-exit pick mode (one-time).
     pick_mode: bool = false,
     show_selected: bool = true,
 
-    /// Debug Paint 布局调试可视化
+    /// Debug Paint layout debug visualization
     debug_paint: DebugPaintMode = .{},
 
     hover_node_id: ?u32 = null,
     selected_node_id: ?u32 = null,
 
-    // 视觉样式
+    // visual style
     hover_outline: Color = Color.rgba(90, 160, 255, 255),
     hover_fill: Color = Color.rgba(90, 160, 255, 40),
     selected_outline: Color = Color.rgba(255, 180, 0, 255),
     selected_fill: Color = Color.rgba(255, 180, 0, 40),
     label_bg: Color = Color.rgba(55, 55, 60, 240),
-    label_tag_fg: Color = Color.rgba(150, 200, 255, 255), // tag 名：浅蓝
-    label_id_fg: Color = Color.rgba(230, 175, 255, 255), // #id：浅紫
-    label_dim_fg: Color = Color.rgba(180, 180, 185, 255), // 尺寸：浅灰
+    label_tag_fg: Color = Color.rgba(150, 200, 255, 255), // tag name: light blue
+    label_id_fg: Color = Color.rgba(230, 175, 255, 255), // #id: light purple
+    label_dim_fg: Color = Color.rgba(180, 180, 185, 255), // size: light gray
     label_font_size: f32 = 11,
 
     label_buf: [160]u8 = undefined,
@@ -118,7 +118,7 @@ pub const Inspector = struct {
     dim_len: usize = 0,
     label_spans: [3]TextSpan = undefined,
 
-    /// Debug trace store（按需堆分配，DevTools 关闭时为 null）
+    /// Debug trace store (heap-alloc on demand, null when DevTools closed)
     trace_store: ?*debug_trace.DebugTraceStore = null,
 
     pub fn ensureTraceStore(self: *Inspector, allocator: Allocator) ?*debug_trace.DebugTraceStore {
@@ -138,7 +138,7 @@ pub const Inspector = struct {
     }
 
     pub fn handleMouseMove(self: *Inspector, cx: anytype, x: f32, y: f32) void {
-        // 只在 pick 模式下 hover 高亮
+        // hover highlight only in pick mode
         if (!self.enabled or !self.pick_mode) {
             self.hover_node_id = null;
             return;
@@ -151,27 +151,28 @@ pub const Inspector = struct {
         }
     }
 
-    /// 返回 true 表示拦截输入（不再派发到 UI）
+    /// return true intercept input (no dispatch to UI)
     pub fn handleMouseDown(self: *Inspector, cx: anytype, x: f32, y: f32) bool {
-        // 只在 pick 模式下拦截点击
+        // intercept click only in pick mode
         if (!self.enabled or !self.pick_mode) return false;
-        // 坐标在视口外（如用户在 DevTools 窗口点击）-> 忽略，不消费 pick 模式
+        // coords outside viewport (e.g. user clicks DevTools window) -> ignore, don't consume pick
+        // mode
         if (x < 0 or y < 0 or x > cx.viewport.width or y > cx.viewport.height) return false;
         if (cx.root != null) {
             const hit = cx.hitTestInspect(x, y);
             if (hit) |node| {
                 self.selected_node_id = node.id;
             } else {
-                // 点击空白区域也消费 pick 模式（与 Chrome 一致）
+                // click blank area also consumes pick mode (match Chrome)
                 self.selected_node_id = null;
             }
         } else {
             self.selected_node_id = null;
         }
-        // 选中后退出 pick 模式（一次性）
+        // after select exit pick mode (one-time)
         self.pick_mode = false;
         self.hover_node_id = null;
-        return true; // 拦截点击，不传递到应用
+        return true; // intercept click, don't pass to app
     }
 
     pub fn clearSelection(self: *Inspector) void {
@@ -182,7 +183,7 @@ pub const Inspector = struct {
         if (!self.enabled and !self.debug_paint.anyActive()) return;
         const root = cx.root orelse return;
 
-        // Debug Paint: 布局调试可视化
+        // Debug Paint: layout debug visualization
         if (self.debug_paint.anyActive()) {
             self.renderDebugPaint(cx, root, Transform2D.identity());
         }
@@ -191,7 +192,7 @@ pub const Inspector = struct {
         var hover_node: ?*Node = null;
         var selected_node: ?*Node = null;
 
-        // pick 模式下才显示 hover 高亮
+        // show hover highlight only in pick mode
         if (self.pick_mode) {
             if (self.hover_node_id) |hid| {
                 hover_node = findNodeById(root, hid);
@@ -214,7 +215,7 @@ pub const Inspector = struct {
             appendHighlight(cx, rect, self.hover_fill, self.hover_outline, 1);
         }
 
-        // 标签优先显示选中节点，否则 hover
+        // label prefer show selected node else hover
         const label_node = if (selected_node) |s| s else hover_node;
         if (label_node) |node| {
             self.drawLabel(cx, node);
@@ -225,7 +226,7 @@ pub const Inspector = struct {
         const rect = computeRenderRect(node);
         const tag_name = @tagName(node.tag);
 
-        // 分段格式化到持久化 buffer（lowering_buffer 在帧末消费，局部变量会悬空）
+        // piecewise format to persistent buffer (lowering_buffer consumed frame-end, locals dangle)
         const tag_str = std.fmt.bufPrint(&self.tag_buf, "{s}", .{tag_name}) catch return;
         self.tag_len = tag_str.len;
 
@@ -255,13 +256,13 @@ pub const Inspector = struct {
         const bg_w = text_w + padding_x * 2;
         const bg_h = text_h + padding_y * 2;
 
-        // 水平方向：确保标签不超出视口右边
+        // horizontal: ensure label not exceed viewport right
         if (label_x + bg_w > cx.viewport.width and cx.viewport.width > bg_w) {
             label_x = cx.viewport.width - bg_w;
         }
         if (label_x < 0) label_x = 0;
 
-        // 垂直方向：优先放节点上方，放不下则放下方
+        // vertical: prefer above node, below if no room
         var label_y = rect.y - bg_h - 4;
         if (label_y < 0) {
             label_y = rect.y + rect.h + 4;
@@ -270,17 +271,17 @@ pub const Inspector = struct {
             label_y = rect.y + 2;
         }
 
-        // 背景
+        // background
         appendInspectorFillRect(cx, label_x, label_y, bg_w, bg_h, self.label_bg, .{ 4, 4, 4, 4 });
 
         const text_y = label_y + padding_y;
         appendInspectorTextRun(cx, label_x + padding_x, text_y, label_str, self.label_tag_fg, font_size, 500, self.label_spans[0..]);
     }
 
-    /// Debug Paint: 递归遍历可见节点，渲染 margin/padding/border overlay
+    /// Debug Paint: recursively traverse visible nodes, render margin/padding/border overlay
     fn renderDebugPaint(self: *Inspector, cx: anytype, node: *Node, parent_transform: Transform2D) void {
         const world_transform = retained_scene.buildNodeWorldTransform(node, parent_transform, .{ .include_rotation = true });
-        // 全局 hook 读 rect。
+        // global hook read rect
         const r = node.rectFromWorldOrFallback();
         const world_rect = world_transform.transformRect(ComputedRect.init(0, 0, r.w, r.h));
         const x = world_rect.x;
@@ -288,8 +289,8 @@ pub const Inspector = struct {
         const w = world_rect.w;
         const h = world_rect.h;
 
-        // 零尺寸只跳过自画，不能整棵 return：0 尺寸容器完全可以有
-        // overflow-visible / absolute 定位的可见子节点。
+        // zero-size skip self-draw, can't whole return: zero-size container fully can have
+        // overflow-visible / absolute-position visible children.
         if (w <= 0 or h <= 0) {
             for (node.children.items) |child| {
                 if (child.getOpacity() == 0) continue;
@@ -301,13 +302,13 @@ pub const Inspector = struct {
         const sx = @abs(world_transform.a);
         const sy = @abs(world_transform.d);
 
-        const margin_color = Color.rgba(255, 155, 0, 50); // 橙色 20% alpha
-        const padding_color = Color.rgba(0, 200, 100, 40); // 绿色 15% alpha
-        const border_color = Color.rgba(60, 120, 255, 180); // 蓝色边框
-        const clip_color = Color.rgba(255, 40, 40, 120); // 红色 clip 边界
-        const island_color = Color.rgba(200, 0, 255, 60); // 紫色 layout island
+        const margin_color = Color.rgba(255, 155, 0, 50); // orange 20% alpha
+        const padding_color = Color.rgba(0, 200, 100, 40); // green 15% alpha
+        const border_color = Color.rgba(60, 120, 255, 180); // blue border
+        const clip_color = Color.rgba(255, 40, 40, 120); // red clip boundary
+        const island_color = Color.rgba(200, 0, 255, 60); // purple layout island
 
-        // Margin overlay（四边各一个矩形，尺寸乘以缩放）
+        // Margin overlay (four-edge rectangles, size scaled)
         if (self.debug_paint.show_margins) {
             const m = node.style.margin;
             const ml = m.left * sx;
@@ -366,14 +367,15 @@ fn appendHighlight(cx: anytype, rect: ComputedRect, fill_color: Color, outline: 
 }
 
 fn computeRenderRect(node: *Node) ComputedRect {
-    // 全变换 world rect：节点是被含完整变换的 hit-test 选中的，高亮必须用
-    // 同一坐标口径，globalRect 只累计 translate，节点在 scaled/rotated
-    // 子树里时（GlassBox interactive 微放大、transition 中途）高亮会脱位。
+    // Full-transform world rect: nodes are hit-tested with full transforms applied;
+    // highlight must use the same coordinate frame. globalRect only accumulates translate,
+    // so highlight misaligns in scaled/rotated subtrees (e.g., GlassBox interactive
+    // micro-magnification, mid-transition).
     return nodeWorldRect(node);
 }
 
-/// 含祖先 scale/rotate 的 world rect（renderDebugPaint 同款口径）。
-/// 供 inspector 高亮与 devtools_overlay 共用。
+/// World rect including ancestor scale/rotate (same frame as renderDebugPaint).
+/// Shared by inspector highlight and devtools_overlay.
 pub fn nodeWorldRect(node: *Node) ComputedRect {
     const world = nodeWorldTransform(node);
     const r = node.rectFromWorldOrFallback();
@@ -419,7 +421,7 @@ test "inspector label renders as one spanned text command" {
     try root.appendChild(allocator, child);
 
     const FakeLowering = struct {
-        main_paint: std.ArrayList(PaintItem) = .{},
+        main_paint: std.ArrayList(PaintItem) = .empty,
     };
     const FakeCx = struct {
         allocator: std.mem.Allocator,
@@ -442,8 +444,8 @@ test "inspector label renders as one spanned text command" {
     };
     inspector.renderOverlay(&cx);
 
-    // inspector 写 paint_table.DisplayItem 到 main_paint。
-    // selected_node 输出: fill + stroke (highlight) + bg_fill + text_run = 4 items
+    // Inspector writes paint_table.DisplayItem to main_paint.
+    // selected_node output: fill + stroke (highlight) + bg_fill + text_run = 4 items
     try std.testing.expectEqual(@as(usize, 4), cx.lowering.main_paint.items.len);
 
     const txt = cx.lowering.main_paint.items[3];

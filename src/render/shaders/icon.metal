@@ -1,6 +1,6 @@
 /// Icon Shader
 ///
-/// 专用于 UI icon 的单通道 mask 渲染。
+/// Single-channel mask rendering specialized for UI icons.
 
 #include <metal_stdlib>
 using namespace metal;
@@ -24,7 +24,7 @@ struct IconInstanceData {
     float4 rect_clip;
     float corner_radius;
     float opacity;
-    float rotate;         // 旋转角度（弧度），以中心为 transform origin
+    float rotate; // Rotation angle (radians), with center as transform origin
     float _padding2;
 };
 
@@ -191,7 +191,7 @@ vertex IconVertexOutput icon_vertex_main(
     const float2 size = inst.rect.zw * s;
     float2 pixel_pos = pos + corner * size;
 
-    // 旋转：以中心为 transform origin
+    // Rotate: with center as transform origin
     const float2 center = pos + size * 0.5;
     if (abs(inst.rotate) > 0.0001) {
         float cos_r = cos(inst.rotate);
@@ -208,7 +208,7 @@ vertex IconVertexOutput icon_vertex_main(
 
     out.position = float4(ndc, 0.0, 1.0);
     out.uv = corner;
-    // SDF 裁剪用的本地坐标（旋转前空间）
+    // Local coordinates for SDF clipping (pre-rotation space)
     out.local_pos = (pos + corner * size) - center;
     out.size = size * 0.5;
     out.screen_pos = pixel_pos;

@@ -1,10 +1,12 @@
+const control_shell = @import("../components/control_shell/mod.zig");
 const std = @import("std");
 test {
     _ = @import("cursor_tests.zig");
+    _ = @import("host_entry_lifetime_tests.zig");
 }
 const builtin = @import("builtin");
-// task #161: ui_core import 历史 build.zig 漏配；改用相对路径让此文件能被
-// src/ui/tests_root.zig 的 test {} 块拉入。同一个 src/ui/core.zig 文件。
+// task #161: historical build.zig misconfigured ui_core import; use relative path to allow
+// this file to be imported by src/ui/tests_root.zig test block for same src/ui/core.zig file.
 const ui = @import("../core.zig");
 const a11y_tree_mod = @import("../a11y/tree.zig");
 const display_list = @import("display_list.zig");
@@ -66,7 +68,7 @@ fn testRenderContext(cx: *Cx) ui.render_engine.RenderContext {
 }
 
 test "Cx: basic init/deinit" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
 
     cx.setViewport(800, 600);
@@ -75,7 +77,7 @@ test "Cx: basic init/deinit" {
 }
 
 test "automation cursor shape is isolated from native cursor updates" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
 
     cx.updateAutomationCursor(40, 50, false);
@@ -88,9 +90,9 @@ test "automation cursor shape is isolated from native cursor updates" {
     try std.testing.expectEqual(ui.CursorShape.text, cx.virtual_cursor.shape);
 }
 
-// ── 自定义位图光标 ─────────────────────────────────────────────────────
-// 光标链路：Cx.setCustomCursor（光栅化+缓存+激活）-> style.cursor/override
-// 解析到 .custom -> system_sdk.setCustomCursor 下发位图。mock 后端记录调用。
+// Custom cursor bitmap flow
+// Cursor: Cx.setCustomCursor (rasterize + cache + activate) -> style.cursor/override.
+// Parse to .custom -> system_sdk.setCustomCursor dispatches bitmap. Mock backend records calls.
 
 const system_sdk = @import("system_sdk");
 
@@ -150,7 +152,7 @@ const CursorMockBackend = struct {
             .hot_y = hot_y,
             .key = key,
         };
-        // 借用缓冲只在本回调内有效（真实后端会拷贝），这里不触碰内容
+        // Borrowed buffer valid only in callback (real backend copies). Content untouched.
         _ = rgba;
     }
 };
@@ -165,7 +167,7 @@ test "cursor presenter: same-shape replay and failed submissions are independent
     };
     var sdk = system_sdk.SystemSdk.init(std.testing.allocator, &backend, &vtable, .{ .cursor = true });
     defer sdk.deinit();
-    const cx = try Cx.init(std.testing.allocator);
+    const cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setSystemSdk(&sdk);
     cx.setCursorOverride(.text);
@@ -201,11 +203,11 @@ test "custom cursor: setCustomCursor pushes bitmap and stays idempotent per key"
     var sdk = system_sdk.SystemSdk.init(std.testing.allocator, &backend, &vtable, .{ .cursor = true });
     defer sdk.deinit();
 
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setSystemSdk(&sdk);
 
-    // 激活时 override 还没到 .custom：只注册，不下发
+    // On activate, override not yet at .custom: register only, no dispatch.
     cx.setCustomCursor(.{ .svg_data = cursor_svg_a, .size_pt = 24, .scale = 2, .hot_x = 2, .hot_y = 22 });
     try std.testing.expectEqual(@as(u32, 0), backend.set_custom_count);
     try std.testing.expect(cx.activeCustomCursorKey() != null);
@@ -213,26 +215,26 @@ test "custom cursor: setCustomCursor pushes bitmap and stays idempotent per key"
     cx.setCursorOverride(.custom);
     try std.testing.expectEqual(ui.CursorShape.custom, cx.current_cursor);
     try std.testing.expectEqual(@as(u32, 1), backend.set_custom_count);
-    // viewBox 24x24 -> 24pt 宽 @2x = 48px；热点逻辑坐标 ×scale
+    // viewBox 24x24 -> 24pt @2x = 48px; hotspot in logical coords x scale
     try std.testing.expectEqual(@as(u32, 48), backend.last_custom.width);
     try std.testing.expectEqual(@as(u32, 48), backend.last_custom.height);
     try std.testing.expectEqual(@as(usize, 48 * 48 * 4), backend.last_custom.len);
     try std.testing.expectEqual(@as(f32, 4.0), backend.last_custom.hot_x);
     try std.testing.expectEqual(@as(f32, 44.0), backend.last_custom.hot_y);
 
-    // 同 desc 重复调用：key 相同直接返回，不重下发
+    // Repeated with same desc: same key returns cached, no redispatch.
     const first_key = backend.last_custom.key;
     cx.setCustomCursor(.{ .svg_data = cursor_svg_a, .size_pt = 24, .scale = 2, .hot_x = 2, .hot_y = 22 });
     try std.testing.expectEqual(@as(u32, 1), backend.set_custom_count);
 
-    // 换内容：shape 停在 .custom，但 key 变化必须重下发（指针静止场景）
+    // Content change: shape stays at .custom, changed key must redispatch (pointer static).
     cx.setCustomCursor(.{ .svg_data = cursor_svg_b, .size_pt = 24, .scale = 2, .hot_x = 1, .hot_y = 11 });
     try std.testing.expectEqual(@as(u32, 2), backend.set_custom_count);
     try std.testing.expect(backend.last_custom.key != first_key);
     // viewBox 24x12 -> 48x24 px
     try std.testing.expectEqual(@as(u32, 24), backend.last_custom.height);
 
-    // 离开 .custom：恢复固定形状路径并清空已下发 key
+    // Leave .custom: restore fixed shape path, clear dispatched key.
     cx.setCursorOverride(null);
     try std.testing.expectEqual(ui.CursorShape.default, cx.current_cursor);
     try std.testing.expect(cx.custom_cursor.submitted == null);
@@ -241,7 +243,7 @@ test "custom cursor: setCustomCursor pushes bitmap and stays idempotent per key"
 }
 
 test "custom cursor: unregistered or unsupported degrades to fallback shape" {
-    // 未注册位图就解析到 .custom -> 降级 crosshair，走 set_shape
+    // Bitmap not registered but parsed to .custom -> degrade to crosshair, use set_shape.
     {
         var backend = CursorMockBackend{};
         const vtable = system_sdk.BackendVTable{
@@ -256,17 +258,17 @@ test "custom cursor: unregistered or unsupported degrades to fallback shape" {
         var sdk = system_sdk.SystemSdk.init(std.testing.allocator, &backend, &vtable, .{ .cursor = true });
         defer sdk.deinit();
 
-        var cx = try Cx.init(std.testing.allocator);
+        var cx = try Cx.init(std.testing.allocator, std.testing.io);
         defer cx.deinit();
         cx.setSystemSdk(&sdk);
 
         cx.setCursorOverride(.custom);
         try std.testing.expectEqual(ui.CursorShape.crosshair, cx.current_cursor);
         try std.testing.expectEqual(@as(u32, 1), backend.set_shape_count);
-        try std.testing.expectEqual(@intFromEnum(ui.CursorShape.crosshair), backend.last_shape);
+        try std.testing.expectEqual(@backingInt(ui.CursorShape.crosshair), backend.last_shape);
         try std.testing.expectEqual(@as(u32, 0), backend.set_custom_count);
     }
-    // 后端没有 set_custom（可选字段缺失）：注册了也降级
+    // Backend lacks set_custom (optional field missing): degrade even if registered.
     {
         var backend = CursorMockBackend{};
         const vtable = system_sdk.BackendVTable{
@@ -278,7 +280,7 @@ test "custom cursor: unregistered or unsupported degrades to fallback shape" {
         var sdk = system_sdk.SystemSdk.init(std.testing.allocator, &backend, &vtable, .{ .cursor = true });
         defer sdk.deinit();
 
-        var cx = try Cx.init(std.testing.allocator);
+        var cx = try Cx.init(std.testing.allocator, std.testing.io);
         defer cx.deinit();
         cx.setSystemSdk(&sdk);
 
@@ -291,31 +293,31 @@ test "custom cursor: unregistered or unsupported degrades to fallback shape" {
 }
 
 test "Cx: nextWakeDelayNs aggregates scheduled redraw deadline read-only" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
 
-    // 无任何定时唤醒需求
+    // No timer wake requests.
     try std.testing.expectEqual(@as(?u64, null), cx.nextWakeDelayNs());
 
-    // scheduleRedrawAfterNs deadline 进入聚合：剩余时间 ≤ 请求的 delay
+    // scheduleRedrawAfterNs deadline enters aggregation: remaining time <= requested delay.
     const delay_ns: u64 = 50 * std.time.ns_per_ms;
     cx.scheduleRedrawAfterNs(delay_ns);
     const remaining = cx.nextWakeDelayNs() orelse return error.TestExpectedDeadline;
     try std.testing.expect(remaining <= delay_ns);
 
-    // 只读：查询不消费 deadline，也不置 needs_redraw
+    // Read-only: query consumes no deadline, doesn't set needs_redraw.
     cx.needs_redraw = false;
     try std.testing.expect(cx.nextWakeDelayNs() != null);
     try std.testing.expect(!cx.needs_redraw);
 
-    // 更近的 deadline 覆盖聚合结果
+    // Closer deadline overrides aggregated result.
     cx.scheduleRedrawAfterNs(1 * std.time.ns_per_ms);
     const closer = cx.nextWakeDelayNs() orelse return error.TestExpectedDeadline;
     try std.testing.expect(closer <= 1 * std.time.ns_per_ms);
 }
 
 test "box: inline children" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(800, 600);
 
@@ -326,7 +328,7 @@ test "box: inline children" {
         .gap = 16,
     }, .{
         try text(cx, "Hello", .{}),
-        try text(cx, "World", .{ .color = theme.dark.color.fg_secondary }),
+        try text(cx, "World", .{ .color = theme.dark.tokens.color.fg_secondary }),
     });
 
     cx.root = root;
@@ -338,7 +340,7 @@ test "box: inline children" {
 }
 
 test "hstack/vstack: layout shortcuts" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
 
@@ -364,7 +366,7 @@ test "component protocol: struct with render" {
         }
     };
 
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
 
@@ -381,7 +383,7 @@ test "component protocol: struct with render" {
 }
 
 test "after-layout hook reads this frame's layout and can request another layout pass" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 200);
     const child = try box(cx, .{ .width = .{ .px = 100 }, .height = .{ .px = 20 } }, .{});
@@ -412,7 +414,7 @@ test "after-layout hook reads this frame's layout and can request another layout
     try cx.addAfterLayoutHook(&probe, Probe.run);
     _ = cx.render();
     try std.testing.expectEqual(@as(u8, 2), probe.rounds);
-    // 第 1 轮读到的是同一帧、回调改动之后重新布局的宽度
+    // First pass reads width from same frame after callback changes, layout reapplied.
     try std.testing.expectEqual(@as(f32, 250), probe.seen_w);
     try std.testing.expectEqual(@as(f32, 250), child.rectFromWorldOrFallback().w);
 
@@ -421,9 +423,9 @@ test "after-layout hook reads this frame's layout and can request another layout
 }
 
 test "after-layout hook removing itself during iteration does not skip the next hook" {
-    // runAfterLayoutHooks 按下标遍历，回调里 removeAfterLayoutHook（一次性
-    // hook 的自然写法）orderedRemove 后下标照常 +1，紧随其后的 hook 被跳过。
-    var cx = try Cx.init(std.testing.allocator);
+    // runAfterLayoutHooks iterates by index; removeAfterLayoutHook in callback does orderedRemove,
+    // index increments normally, skips next hook.
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(200, 100);
     const root = try box(cx, .{ .width = .{ .px = 200 }, .height = .{ .px = 100 } }, .{});
@@ -451,7 +453,8 @@ test "after-layout hook removing itself during iteration does not skip the next 
     var b = Probe{ .cx = cx, .remove_self = true };
     var c = Probe{ .cx = cx };
     var d = Probe{ .cx = cx };
-    // c 回调里连带移除排在它前面的 a（前移两格：b 已自删）。
+    // c's callback also removes a, which sits before it (the index moves back two slots because b
+    // already removed itself).
     c.also_remove = &a;
     try cx.addAfterLayoutHook(&a, Probe.run);
     try cx.addAfterLayoutHook(&b, Probe.run);
@@ -466,7 +469,7 @@ test "after-layout hook removing itself during iteration does not skip the next 
 }
 
 test "after-layout hook that never converges stops at the round cap with last_round set" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(200, 100);
     const root = try box(cx, .{ .width = .{ .px = 200 }, .height = .{ .px = 100 } }, .{});
@@ -496,7 +499,7 @@ test "after-layout hook that never converges stops at the round cap with last_ro
 }
 
 test "render: retained frame populates display list and text blobs" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(320, 120);
 
@@ -530,10 +533,12 @@ test "render: retained frame populates display list and text blobs" {
                 try std.testing.expect(run.blob_id < cx.text_blob_store.blobs.items.len);
                 try std.testing.expectEqual(@as(u32, 0), run.blob_byte_start);
                 try std.testing.expectEqual(@as(u32, 27), run.blob_byte_end);
-                // content 曾断言为空（纯靠 blob_id 间接取字节）。但 blob_id 是
-                // 帧内序号，跨帧存活的 item 会落到别人的 blob 上，终端因此
-                // 画出状态栏的 "plaintext" 切片。现在 item 自带兜底切片，
-                // resolveTextRunContent 用 content_hash 识破易主后回退到它。
+                // content once asserted empty (blob_id indirect byte fetch). blob_id is frame-local
+                // sequence;
+                // cross-frame items land on others' blobs, terminal renders stale "plaintext"
+                // slice. Now item
+                // carries fallback slice; resolveTextRunContent detects via content_hash, reverts
+                // to fallback.
                 try std.testing.expectEqualStrings("Hello retained display list", run.content);
                 try std.testing.expect(run.blob_content_hash != 0);
             },
@@ -610,15 +615,15 @@ test "render: retained frame populates display list and text blobs" {
     cx.lowering.main_paint.clearRetainingCapacity();
     render_ctx = testRenderContext(cx);
     try std.testing.expect(try ui.render_engine.appendNodeDisplayPayloadToRenderList(&render_ctx, root.id, .subtree));
-    // appendLoweredBoth 不再写 .main，只写 .main_paint
+    // appendLoweredBoth no longer writes .main, only .main_paint.
     try std.testing.expect(cx.lowering.main_paint.items.len >= 1);
 }
 
 // Stage B-1/B-2: shadow GpuDraw encode end-to-end probe.
-// 跑 render 后断言 display_list / drawable lowering_buffer / GpuDraw 三者数量
-// 协调 + pipeline 序列等价 + max_batch_run 合理。
+// After render, assert display_list / drawable lowering_buffer / GpuDraw counts align
+// + pipeline sequence equivalent + max_batch_run reasonable.
 test "render: stage B-1/B-2 shadow GpuDraw encode is sequence-equivalent" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(320, 120);
 
@@ -641,43 +646,43 @@ test "render: stage B-1/B-2 shadow GpuDraw encode is sequence-equivalent" {
     // Production render only runs the diagnostic shadow encoder in Debug.
     // This test is configuration-independent, so invoke it explicitly in
     // optimized modes before asserting its counters.
-    if (builtin.mode != .Debug) {
+    if (builtin.mode != .debug) {
         var render_ctx = testRenderContext(cx);
         ui.render_engine.runShadowEncode(&render_ctx);
     }
 
-    // debug build 中 renderNode 末尾自动调 runShadowEncode，perf 应已累计。
-    // B-1 等价性：display_list 条目数 == drawable lowering_buffer commands 数。
+    // Debug build: renderNode auto-calls runShadowEncode at end, perf cumulative.
+    // B-1 equivalence: display_list count == drawable lowering_buffer command count.
     try std.testing.expectEqual(@as(u32, 0), cx.perf.stage_b_shadow_count_mismatches);
     try std.testing.expect(cx.perf.stage_b_shadow_display_items > 0);
     try std.testing.expectEqual(
         cx.perf.stage_b_shadow_display_items,
         cx.perf.stage_b_shadow_drawable_commands,
     );
-    // batching 后 GpuDraw 数应 ≤ display items 数
+    // Post-batching GpuDraw count should be <= display item count.
     try std.testing.expect(cx.perf.stage_b_shadow_gpu_draws <= cx.perf.stage_b_shadow_display_items);
 
-    // B-2 强化：pipeline 序列也必须等价。lowering 漏 case / DisplayItem 路径
-    // 多/少产某种 kind 的 draw 都会让此 mismatch 计数 > 0。
+    // B-2 strengthens: pipeline sequence must match. Lowering missed cases / DisplayItem
+    // path over/under-producing draw kinds cause mismatch count > 0.
     try std.testing.expectEqual(@as(u32, 0), cx.perf.stage_b_shadow_pipeline_mismatches);
-    // 至少应该看到一些可合并 run（连续 fill_rect 或同 pipeline）
+    // Expect some mergeable runs (adjacent fill_rects or same pipeline).
     try std.testing.expect(cx.perf.stage_b_shadow_max_batch_run >= 1);
 
-    // B-2 coverage probe: lowered kind 计数 == 主路径 drawable 计数 (per kind)。
-    // 任一 kind 不等说明 lowering 与主路径分类不一致，B-2 cutover 候选筛选会用到。
+    // B-2 coverage: lowered kind counts == main-path drawable counts (per kind).
+    // Any kind mismatch = lowering vs main path classify differently; B-2 cutover uses this.
     try std.testing.expectEqual(cx.perf.stage_b_shadow_kind_rect, cx.perf.stage_b_shadow_drawable_kind_rect);
     try std.testing.expectEqual(cx.perf.stage_b_shadow_kind_text, cx.perf.stage_b_shadow_drawable_kind_text);
     try std.testing.expectEqual(cx.perf.stage_b_shadow_kind_image, cx.perf.stage_b_shadow_drawable_kind_image);
     try std.testing.expectEqual(cx.perf.stage_b_shadow_kind_path, cx.perf.stage_b_shadow_drawable_kind_path);
     try std.testing.expectEqual(cx.perf.stage_b_shadow_kind_shadow, cx.perf.stage_b_shadow_drawable_kind_shadow);
     try std.testing.expectEqual(cx.perf.stage_b_shadow_kind_gradient, cx.perf.stage_b_shadow_drawable_kind_gradient);
-    // 本场景至少有 box 背景 (rect) + text，两类都应 > 0。
+    // This scenario has box background (rect) + text, both kinds should be > 0.
     try std.testing.expect(cx.perf.stage_b_shadow_kind_rect > 0);
     try std.testing.expect(cx.perf.stage_b_shadow_kind_text > 0);
 }
 
 test "render: lowered path geometry is frame-owned instead of borrowing the node" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(160, 100);
 
@@ -814,7 +819,7 @@ test "retained display item copies own path geometry across source teardown" {
 }
 
 test "render: identical text nodes reuse text blob within frame" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(360, 140);
 
@@ -862,7 +867,7 @@ test "render: identical text nodes reuse text blob within frame" {
 }
 
 test "node: text hash cache tracks content_version changes" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
 
     const node = try text(cx, "abc", .{});
@@ -884,13 +889,13 @@ test "node: text hash cache tracks content_version changes" {
 }
 
 test "node: setText invalidates the text hash cache on a same-length swap" {
-    // 回归（下游编辑器状态栏 "3 × 4" -> "3 × 5" 只重画 × 之前的段）：
-    // text hash 缓存键是 (content_version, content_ptr, content_len, spans_*)，
-    // 而 setText **不撞** content_version。等长换文本时 len 不变、ptr 又常被
-    // allocator 复用（就地改写调用方 buffer 则必然同址），三项全中就吐旧
-    // hash，下游 blob/paint chunk/retained 一路判"没变"而跳过重录。
-    // 这里刻意**不调**任何 markDirty：作废责任在写路径本身。
-    var cx = try Cx.init(std.testing.allocator);
+    // Regression (downstream editor "3 x 4" -> "3 x 5" repaints only before x):
+    // text hash cache key = (content_version, content_ptr, content_len, spans_*);
+    // setText does not bump content_version. A same-length swap keeps len and often reuses ptr,
+    // so the key collides, the old hash sticks, and blob/paint chunk/retained skip the repaint.
+    // Intentionally does NOT call any markDirty: invalidating the cache is the write path's own
+    // responsibility.
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
 
     var buf: [8]u8 = undefined;
@@ -907,7 +912,7 @@ test "node: setText invalidates the text hash cache on a same-length swap" {
     }
     const before = node.getOrComputeTextHashes(&node.getText().?);
 
-    // 同 ptr、同 len，只有最后一个字节变了（× 之后的那一段）。
+    // Same ptr, same len, only last byte changed (post-x segment).
     @memcpy(buf[0..6], "3 \xc3\x97 5");
     {
         var t = node.getText().?;
@@ -920,13 +925,12 @@ test "node: setText invalidates the text hash cache on a same-length swap" {
 }
 
 test "node: same-length setTextContent swap updates text hash and display run" {
-    // 回归（下游编辑器状态栏 "3 × 4" -> "3 × 5" 只重画 × 之前的那一段）：
-    // 等长换文本时 content_ptr 极可能被 allocator 复用成同一地址，len 也没变。
-    // 若 text_hash 缓存只认 (content_version, ptr, len)，而 content_version
-    // 又没被 setText 撞新，缓存就会命中旧 hash，下游 blob / paint chunk 一路
-    // 判 "内容没变" 而跳过重录。含回退字体的串（× 把行切成三段）尤其显眼：
-    // 变化落在哪一段就只有那段更新，其余段保持旧字形。
-    var cx = try Cx.init(std.testing.allocator);
+    // Regression (downstream editor "3 x 4" -> "3 x 5" repaints before x only):
+    // A same-length swap likely reuses the address, len unchanged. setText does not bump
+    // content_version, so the text_hash cache hits the old hash and downstream skips the repaint.
+    // Especially visible with a fallback font string (x cuts it into 3 segments):
+    // the change lands in one segment, the others keep old glyphs.
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(320, 180);
 
@@ -948,7 +952,7 @@ test "node: same-length setTextContent swap updates text hash and display run" {
     const after = node.getOrComputeTextHashes(&node.getText().?);
     try std.testing.expect(after.content_hash != before.content_hash);
 
-    // 端到端：再渲染一帧，display list 里的 text_run 必须吐出新字节。
+    // End-to-end: re-render frame, text_run in display list must emit new bytes.
     cx.layout();
     _ = cx.render();
 
@@ -966,7 +970,7 @@ test "node: same-length setTextContent swap updates text hash and display run" {
 }
 
 test "render: nested simple subtree can replay from display payload prepass" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(320, 180);
 
@@ -1029,7 +1033,7 @@ test "render: nested simple subtree can replay from display payload prepass" {
 }
 
 test "render: scroll descendants do not use subtree display payload prepass" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(320, 220);
 
@@ -1122,7 +1126,7 @@ test "render: scroll descendants do not use subtree display payload prepass" {
 }
 
 test "render: scroll descendants do not reuse legacy overflow cache from offscreen frame" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(320, 220);
 
@@ -1192,7 +1196,7 @@ test "render: scroll descendants do not reuse legacy overflow cache from offscre
 }
 
 test "render: simple subtree can replay from display payload prepass under parent opacity" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(320, 180);
 
@@ -1267,7 +1271,7 @@ test "render: simple subtree can replay from display payload prepass under paren
 }
 
 test "render: simple subtree can replay from display payload prepass under parent scale" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(320, 200);
 
@@ -1341,7 +1345,7 @@ test "render: simple subtree can replay from display payload prepass under paren
 }
 
 test "render: clipped simple subtree can replay from display payload prepass under parent scale" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(360, 220);
 
@@ -1418,7 +1422,7 @@ test "render: clipped simple subtree can replay from display payload prepass und
 }
 
 test "render: clipped simple subtree can replay from display payload prepass under parent opacity and scale" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(360, 220);
 
@@ -1498,7 +1502,7 @@ test "render: clipped simple subtree can replay from display payload prepass und
 }
 
 test "render: self opacity simple subtree can replay from display payload prepass" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(320, 180);
 
@@ -1571,7 +1575,7 @@ test "render: self opacity simple subtree can replay from display payload prepas
 }
 
 test "render: self opacity and rounded clip subtree can replay from display payload prepass" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(320, 200);
 
@@ -1646,8 +1650,8 @@ test "render: self opacity and rounded clip subtree can replay from display payl
         }
     }
 
-    // Stage 3 fold：同节点 rounded_clip 合并进 opacity layer，token 消失、
-    // begin_opacity_layer 携带 corner_radius。
+    // Stage 3 fold: same-node rounded_clip merges into opacity layer, token vanishes,
+    // begin_opacity_layer carries corner_radius.
     try std.testing.expect(saw_begin_opacity);
     try std.testing.expect(saw_folded_radius);
     try std.testing.expect(!saw_begin_rounded_clip);
@@ -1655,7 +1659,7 @@ test "render: self opacity and rounded clip subtree can replay from display payl
 }
 
 test "render: self blur subtree can replay from display payload prepass" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(320, 200);
 
@@ -1707,8 +1711,9 @@ test "render: self blur subtree can replay from display payload prepass" {
 
     try std.testing.expectEqual(@as(u32, 1), cx.perf.display_list_subtree_prebuild_count);
     try std.testing.expectEqual(@as(u32, 1), cx.perf.display_list_subtree_replay_count);
-    // self_blur 不用 self-effect 坐标空间（applyBackdropBlur 不 push offscreen layer，
-    // 没有外部 translation 把 button-local 坐标转回 absolute），因此不计入 self_effect 计数器。
+    // self_blur doesn't use self-effect coordinate space (applyBackdropBlur doesn't push offscreen
+    // layer, no external translation converts button-local to absolute), not counted in
+    // self_effect.
     try std.testing.expectEqual(@as(u32, 0), cx.perf.display_list_self_effect_subtree_replay_count);
 
     const root_runtime = cx.scene_runtime.get(root.id).?;
@@ -1734,7 +1739,7 @@ test "render: self blur subtree can replay from display payload prepass" {
 }
 
 test "render: self scale subtree can replay from display payload prepass" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(320, 220);
 
@@ -1816,7 +1821,7 @@ test "render: self scale subtree can replay from display payload prepass" {
 }
 
 test "render: self scale display replay preserves shadow extents" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(340, 240);
 
@@ -1894,7 +1899,7 @@ test "render: self scale display replay preserves shadow extents" {
 }
 
 test "render: self scale and blur subtree can replay from display payload prepass" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(340, 220);
 
@@ -1978,7 +1983,7 @@ test "render: self scale and blur subtree can replay from display payload prepas
 }
 
 test "render: self scale blur and rounded clip subtree can replay from display payload prepass" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(340, 240);
 
@@ -2056,7 +2061,7 @@ test "render: self scale blur and rounded clip subtree can replay from display p
 }
 
 test "render: self scale blur subtree can replay from display payload prepass under parent opacity and scale" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(380, 260);
 
@@ -2147,7 +2152,7 @@ test "render: self scale blur subtree can replay from display payload prepass un
 }
 
 test "render: self scale blur subtree with nested child subtree can replay from display payload prepass" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(380, 260);
 
@@ -2239,7 +2244,7 @@ test "render: self scale blur subtree with nested child subtree can replay from 
 }
 
 test "render: self opacity subtree can replay from display payload prepass under parent scale" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(360, 220);
 
@@ -2310,7 +2315,7 @@ test "render: self opacity subtree can replay from display payload prepass under
 }
 
 test "render: self opacity and rounded clip subtree can replay from display payload prepass under parent opacity and scale" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(360, 240);
 
@@ -2386,7 +2391,7 @@ test "render: self opacity and rounded clip subtree can replay from display payl
         }
     }
 
-    // Stage 3 fold：rounded_clip 并入 opacity layer（见上方同名注释）。
+    // Stage 3 fold: rounded_clip merges into opacity layer (see earlier comment).
     try std.testing.expect(saw_begin_opacity);
     try std.testing.expect(saw_folded_radius);
     try std.testing.expect(!saw_begin_rounded_clip);
@@ -2394,7 +2399,7 @@ test "render: self opacity and rounded clip subtree can replay from display payl
 }
 
 test "render: self scale and opacity subtree can replay from display payload prepass" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(360, 220);
 
@@ -2459,7 +2464,7 @@ test "render: self scale and opacity subtree can replay from display payload pre
 }
 
 test "render: self scale opacity and rounded clip subtree can replay from display payload prepass under parent opacity" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(380, 240);
 
@@ -2527,7 +2532,7 @@ test "render: self scale opacity and rounded clip subtree can replay from displa
         }
     }
 
-    // Stage 3 fold：rounded_clip 并入 opacity layer（见上方同名注释）。
+    // Stage 3 fold: rounded_clip merges into opacity layer (see earlier comment).
     try std.testing.expect(saw_begin_opacity);
     try std.testing.expect(saw_folded_radius);
     try std.testing.expect(!saw_begin_rounded_clip);
@@ -2535,7 +2540,7 @@ test "render: self scale opacity and rounded clip subtree can replay from displa
 }
 
 test "render: blob-backed ellipsis text subtree can replay from display payload prepass under parent scale" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(360, 220);
 
@@ -2607,7 +2612,7 @@ test "render: blob-backed ellipsis text subtree can replay from display payload 
 }
 
 test "render: spans text subtree can replay from display payload prepass under parent opacity and scale" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(360, 240);
 
@@ -2690,8 +2695,9 @@ test "render: spans text subtree can replay from display payload prepass under p
             if (Color.eql(r.color.toColor(), Color.rgba(255, 220, 80, 120))) saw_bg_rect = true;
         } else if (cmd.isText()) {
             const txt = cmd;
-            // task #161 校准（v0.4 之后）：render pipeline 现在用单文本 blob + spans 装饰
-            // 不再 chunk 成多 text command。检查 text 包含原文 + 有 spans。
+            // task #161 calibration (post-v0.4): render pipeline uses single text blob + spans
+            // decoration, no chunking into multiple text commands. Check text contains source + has
+            // spans.
             if (std.mem.indexOf(u8, txt.text_content, "span") != null and txt.text_spans != null) {
                 saw_text_with_spans = true;
             }
@@ -2703,7 +2709,7 @@ test "render: spans text subtree can replay from display payload prepass under p
 }
 
 test "render: text blobs do not reuse across different spans" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(360, 160);
 
@@ -2744,7 +2750,7 @@ test "render: text blobs do not reuse across different spans" {
 }
 
 test "render: display list emits span decorations and chunked text runs" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(420, 120);
 
@@ -2788,16 +2794,17 @@ test "render: display list emits span decorations and chunked text runs" {
         }
     }
 
-    // task #161 校准：v0.4 后 pipeline 合并 adjacent 同 weight/italic/monospace text runs，
-    // span 装饰（bg/underline/strikethrough/color）通过 spans 字段编码到单 run，
-    // 不同 font_weight 才真分 run。3 spans 在 6 字符上只产生 ≥ 2 runs（[0..4] + [4..6]）。
+    // task #161 calibration: post-v0.4 pipeline merges adjacent same weight/italic/monospace
+    // text runs; span decoration (bg/underline/strikethrough/color) encoded via spans in single
+    // run,
+    // only different font_weight splits. 3 spans over 6 chars produce >= 2 runs ([0..4] + [4..6]).
     try std.testing.expect(bg_rects >= 1);
     try std.testing.expect(deco_rects >= 2);
     try std.testing.expect(text_runs >= 2);
 }
 
 test "render: own content can replay directly from prebuilt display payload" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(220, 120);
 
@@ -2819,7 +2826,7 @@ test "render: own content can replay directly from prebuilt display payload" {
 }
 
 test "render: own payload replay preserves border-radius fallback from border.radius" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(220, 120);
 
@@ -2901,7 +2908,7 @@ test "render: own payload replay preserves border-radius fallback from border.ra
 }
 
 test "render: simple leaf opacity updates visible commands across frames" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(220, 120);
 
@@ -2941,7 +2948,7 @@ test "render: simple leaf opacity updates visible commands across frames" {
 }
 
 test "render: leaf own payload can replay under parent opacity when subtree prepass is disabled" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(260, 160);
 
@@ -2982,7 +2989,7 @@ test "render: leaf own payload can replay under parent opacity when subtree prep
 }
 
 test "render: display list uses visible ellipsis segments for truncated single-line text" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(220, 80);
 
@@ -3030,7 +3037,7 @@ test "render: display list uses visible ellipsis segments for truncated single-l
 }
 
 test "render: display list emits overflow fade gradients" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(220, 80);
 
@@ -3072,7 +3079,7 @@ test "render: display list emits overflow fade gradients" {
 }
 
 test "render: display list bridge projects simple items back to render commands" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(320, 120);
 
@@ -3144,7 +3151,7 @@ test "render: display list bridge projects simple items back to render commands"
 }
 
 test "render: display list bridge preserves opacity layer and clip structure" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(320, 140);
 
@@ -3202,7 +3209,7 @@ test "render: display list bridge preserves opacity layer and clip structure" {
         } else if (cmd.isControl(.push_clip)) {
             const clip = cmd;
             bridged_push_clip = true;
-            try std.testing.expect(clip.clip_shape_kind == @intFromEnum(ui.display_list.ClipShapeKind.rect) or clip.clip_shape_kind == @intFromEnum(ui.display_list.ClipShapeKind.rounded_rect) or clip.clip_shape_kind == @intFromEnum(ui.display_list.ClipShapeKind.polygon));
+            try std.testing.expect(clip.clip_shape_kind == @backingInt(ui.display_list.ClipShapeKind.rect) or clip.clip_shape_kind == @backingInt(ui.display_list.ClipShapeKind.rounded_rect) or clip.clip_shape_kind == @backingInt(ui.display_list.ClipShapeKind.polygon));
         } else if (cmd.isControl(.end_opacity_layer)) {
             bridged_end_opacity = true;
         } else if (cmd.isText()) {
@@ -3225,7 +3232,7 @@ test "render: display list bridge preserves opacity layer and clip structure" {
 }
 
 test "clickable: handler on node" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
 
@@ -3235,7 +3242,7 @@ test "clickable: handler on node" {
         try box(cx, .{
             .width = .{ .px = 100 },
             .height = .{ .px = 40 },
-            .background = theme.dark.color.accent,
+            .background = theme.dark.tokens.color.accent,
         }, .{}),
         Cx.simpleHandler(struct {
             fn handle(ctx: *anyopaque) void {
@@ -3253,7 +3260,7 @@ test "clickable: handler on node" {
 }
 
 test "optional child: conditional rendering" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
 
@@ -3272,7 +3279,7 @@ test "optional child: conditional rendering" {
 }
 
 test "Sizing: px/grow/fit" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
 
@@ -3293,14 +3300,13 @@ test "Sizing: px/grow/fit" {
 }
 
 test "Sizing: grow 子节点的主轴 margin 必须计入 used_space" {
-    // 回归：pass1 里 .px / .fit / .percent / flex_basis 四个分支都累加
-    // margin_main，唯独 .grow 分支只累加 flex_total, grow 子节点的主轴
-    // margin 从不进 used_space，于是 remaining 被高估，带 margin 的 flex
-    // 子节点会溢出父容器。
+    // Regression: pass1 .px / .fit / .percent / flex_basis accumulate margin_main, but only
+    // .grow accumulates flex_total; a grow child's margin never enters used_space, so
+    // remaining is inflated and a margin'd flex child overflows the container.
     //
-    // 400 宽容器：px 子节点 100 + grow 子节点左右各 20 margin。
-    // grow 应拿 400 - 100 - 40 = 260，而不是 300。
-    var cx = try Cx.init(std.testing.allocator);
+    // 400w container: px child 100 + grow child with +/-20 margin.
+    // Grow gets 400 - 100 - 40 = 260, not 300.
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
 
@@ -3321,19 +3327,20 @@ test "Sizing: grow 子节点的主轴 margin 必须计入 used_space" {
 
     const grow_child = root.children.items[1];
     try std.testing.expectEqual(@as(f32, 260), grow_child.rectFromWorldOrFallback().w);
-    // 右边界不得越过父容器
+    // Right edge must not exceed container.
     const r = grow_child.rectFromWorldOrFallback();
     try std.testing.expect(r.x + r.w <= 400);
 }
 
 test "align: 最终对齐 pass 移动子节点后必须标脏" {
-    // layoutChildren 末尾有一个「最终交叉轴对齐」pass：wrap / fit 回填会在
-    // 递归中改变子节点的交叉轴尺寸，所以要用最终尺寸重新对齐一次。
+    // layoutChildren ends with a "final cross-axis align" pass: wrap / fit backfill changes
+    // cross-axis
+    // size during recursion, so children are re-aligned with the final size.
     //
-    // 但它直接 setLayoutY/setLayoutX 写几何，**没有**摆放循环里那段
-    // 「位置变了就标 dirty.core.layout」的检查。如果它把子节点挪了位置却
-    // 不标脏，子树就带着过期的世界坐标留到下一帧。
-    var cx = try Cx.init(std.testing.allocator);
+    // But direct setLayoutY/setLayoutX skips the placement loop's "position changed -> mark
+    // dirty.core.layout" check. An unmarked move leaves the subtree with stale world coords next
+    // frame.
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
 
@@ -3349,19 +3356,20 @@ test "align: 最终对齐 pass 移动子节点后必须标脏" {
     cx.layout();
 
     const settled_y = child.rectFromWorldOrFallback().y;
-    // center 对齐：(300 - 50) / 2 = 125
+    // Center align: (300 - 50) / 2 = 125.
     try std.testing.expectEqual(@as(f32, 125), settled_y);
 
-    // 稳定后再布一次，位置不该再变（两个 pass 必须收敛到同一个答案，
-    // 否则每帧都在互相覆盖）
+    // Stable after re-layout, position shouldn't change (both passes converge to same answer,
+    // else each frame overwrites).
     cx.layout();
     try std.testing.expectEqual(settled_y, child.rectFromWorldOrFallback().y);
 }
 
 test "align: reverse pass 挪动子节点后必须标脏" {
-    // batchReverseChildren 直接 setLayoutX/Y 写几何，不标 dirty.core.layout。
-    // row_reverse 下每个子节点的主轴位置都会变，子树带着过期世界坐标留到下一帧。
-    var cx = try Cx.init(std.testing.allocator);
+    // batchReverseChildren directly setLayoutX/Y, no mark dirty.core.layout.
+    // row_reverse: every child main-axis position changes, subtree left with stale world coords
+    // next frame.
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
 
@@ -3376,17 +3384,17 @@ test "align: reverse pass 挪动子节点后必须标脏" {
     cx.root = root;
     cx.layout();
 
-    // reverse 把子节点推到右侧：400 - 100 = 300
+    // Reverse pushes child right: 400 - 100 = 300.
     try std.testing.expectEqual(@as(f32, 300), child.rectFromWorldOrFallback().x);
-    // 位置被 reverse pass 改过 ⇒ 必须标脏，否则后代的世界坐标不会重算
+    // Position changed by reverse pass -> must mark dirty, descendants' world coords don't recalc.
     try std.testing.expect(child.frame_state.state_bits.dirty.core.layout or
         child.frame_state.state_bits.dirty.core.subtree_layout);
 }
 
 test "align: 稳定后重复布局不再标脏（不得永不停帧）" {
-    // reverse / 最终对齐两个 pass 新增了标脏。若判据写成无条件标脏，稳定态
-    // 每帧都会有脏节点 ⇒ idle 永不停帧（这个坑仓库里踩过一次）。
-    var cx = try Cx.init(std.testing.allocator);
+    // Reverse / final-align both add marks. Unconditional mark in stable state
+    // gets dirty nodes every frame -> idle never stops (repo hit once).
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
 
@@ -3401,7 +3409,7 @@ test "align: 稳定后重复布局不再标脏（不得永不停帧）" {
     cx.root = root;
     cx.layout();
 
-    // 清掉首次布局的脏位，再布一次：位置已收敛 ⇒ 不该再标脏
+    // Clear first-layout dirty, layout again: position converged -> shouldn't mark dirty.
     child.frame_state.state_bits.dirty.core.layout = false;
     child.frame_state.state_bits.dirty.core.subtree_layout = false;
     const settled_x = child.rectFromWorldOrFallback().x;
@@ -3415,14 +3423,14 @@ test "align: 稳定后重复布局不再标脏（不得永不停帧）" {
 }
 
 test "render: generates commands" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
 
     cx.root = try box(cx, .{
         .width = .{ .px = 400 },
         .height = .{ .px = 300 },
-        .background = theme.dark.color.bg_primary,
+        .background = theme.dark.tokens.color.bg_primary,
     }, .{});
 
     cx.layout();
@@ -3435,7 +3443,7 @@ test "render: generates commands" {
 }
 
 test "render: non-uniform border widths emit single per-side border" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(220, 140);
 
@@ -3461,7 +3469,7 @@ test "render: non-uniform border widths emit single per-side border" {
         } else if ((cmd.kind == .rect and (cmd.border_widths[0] + cmd.border_widths[1] + cmd.border_widths[2] + cmd.border_widths[3]) > 0)) {
             const b = cmd;
             per_side_count += 1;
-            // 单个 draw call 包含全部 4 边宽度
+            // Single draw call includes all 4 border widths.
             try std.testing.expect(std.math.approxEqAbs(f32, b.border_widths[0], 1, 0.0001)); // top
             try std.testing.expect(std.math.approxEqAbs(f32, b.border_widths[1], 2, 0.0001)); // right
             try std.testing.expect(std.math.approxEqAbs(f32, b.border_widths[2], 3, 0.0001)); // bottom
@@ -3470,12 +3478,12 @@ test "render: non-uniform border widths emit single per-side border" {
         }
     }
 
-    try std.testing.expectEqual(@as(usize, 0), push_count); // 无 clip
-    try std.testing.expectEqual(@as(usize, 1), per_side_count); // 单个 draw call
+    try std.testing.expectEqual(@as(usize, 0), push_count); // No clip.
+    try std.testing.expectEqual(@as(usize, 1), per_side_count); // Single draw call.
 }
 
 test "render: per-side border colors emit per-side borders without clipping" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(180, 120);
 
@@ -3520,14 +3528,14 @@ test "render: per-side border colors emit per-side borders without clipping" {
         }
     }
 
-    try std.testing.expectEqual(@as(usize, 0), push_count); // 无 clip
+    try std.testing.expectEqual(@as(usize, 0), push_count); // No clip.
     try std.testing.expectEqual(@as(usize, 4), per_side_count);
     try std.testing.expect(saw_red);
     try std.testing.expect(saw_green);
     try std.testing.expect(saw_blue);
     try std.testing.expect(saw_yellow);
 
-    // display list 验证
+    // Display list validation.
     var display_per_side_count: usize = 0;
     var display_red = false;
     var display_green = false;
@@ -3565,7 +3573,7 @@ test "render: per-side border colors emit per-side borders without clipping" {
 }
 
 test "render: per-side borders preserve rounded outer corners without clips" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(160, 80);
 
@@ -3601,19 +3609,19 @@ test "render: per-side borders preserve rounded outer corners without clips" {
         } else if ((cmd.kind == .rect and (cmd.border_widths[0] + cmd.border_widths[1] + cmd.border_widths[2] + cmd.border_widths[3]) > 0)) {
             const b = cmd;
             per_side_count += 1;
-            // 圆角应当被传递到 shader
+            // Corner radius must pass to shader.
             try std.testing.expect(b.radii.toArray()[1] > 0); // TR = 8
             try std.testing.expect(b.radii.toArray()[2] > 0); // BR = 8
 
         }
     }
 
-    try std.testing.expectEqual(@as(usize, 0), push_count); // 无 clip
-    try std.testing.expect(per_side_count >= 1); // 至少有 3 边（左边透明不渲染）
+    try std.testing.expectEqual(@as(usize, 0), push_count); // No clip.
+    try std.testing.expect(per_side_count >= 1); // At least 3 edges (left transparent, no render).
 }
 
 test "render spans draws highlight backgrounds before italic text" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 120);
 
@@ -3665,7 +3673,7 @@ test "render spans draws highlight backgrounds before italic text" {
 }
 
 test "render: parent scale uses layer draw rect for child geometry" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(240, 140);
 
@@ -3722,7 +3730,7 @@ test "render: parent scale uses layer draw rect for child geometry" {
 }
 
 test "render: parent scale keeps text content local and scales at layer composite" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(240, 140);
 
@@ -3755,9 +3763,10 @@ test "render: parent scale keeps text content local and scales at layer composit
             const t = cmd;
             if (std.mem.eql(u8, t.text_content, "Zoom")) {
                 saw_text = true;
-                // CA-pure（P6 后）：surface 内容以 **1×**（unscaled owner-local）烘焙，
-                // scale 统一由 composite 的 draw_transform 施加（plan R4）。故 font_size
-                // 保持原始 12，而非旧模型的反向缩放 24。
+                // CA-pure (P6+): surface content baked at **1x** (unscaled owner-local), scale
+                // applied
+                // uniformly by composite draw_transform (plan R4). font_size stays 12, not old
+                // model's 24.
                 try std.testing.expectApproxEqAbs(@as(f32, 12), t.text_font_size, 0.001);
             }
         } else if (cmd.isControl(.begin_opacity_layer)) {
@@ -3772,7 +3781,7 @@ test "render: parent scale keeps text content local and scales at layer composit
 }
 
 test "render: self scale opacity bridge preserves shadow extents" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(320, 200);
 
@@ -3826,7 +3835,7 @@ test "render: self scale opacity bridge preserves shadow extents" {
 }
 
 test "render: retained effect bridge preserves property-tree order" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(240, 140);
 
@@ -3895,7 +3904,7 @@ test "render: retained effect bridge preserves property-tree order" {
 }
 
 test "render: retained effect subtree skips legacy overflow cache" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(240, 140);
 
@@ -3925,7 +3934,7 @@ test "render: retained effect subtree skips legacy overflow cache" {
 }
 
 test "render: liquid glass background fill is attenuated when blur glaze is active" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(240, 140);
 
@@ -3959,7 +3968,7 @@ test "render: liquid glass background fill is attenuated when blur glaze is acti
 }
 
 test "render: liquid glass border is attenuated when blur glaze is active" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(240, 140);
 
@@ -3993,7 +4002,7 @@ test "render: liquid glass border is attenuated when blur glaze is active" {
 }
 
 test "render: clip_shape none disables overflow clip in render runtime" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(240, 140);
 
@@ -4033,7 +4042,7 @@ test "render: clip_shape none disables overflow clip in render runtime" {
 }
 
 test "render: clip_shape ellipse emits ellipse clip fallback" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(240, 140);
 
@@ -4059,7 +4068,7 @@ test "render: clip_shape ellipse emits ellipse clip fallback" {
     for (commands) |cmd| {
         if (cmd.isControl(.push_clip)) {
             const clip = cmd;
-            try std.testing.expectEqual(@intFromEnum(ui.ClipShapeKind.ellipse), clip.clip_shape_kind);
+            try std.testing.expectEqual(@backingInt(ui.ClipShapeKind.ellipse), clip.clip_shape_kind);
             saw_ellipse_clip = true;
         } else if (cmd.isControl(.begin_rounded_clip)) {
             return error.UnexpectedRoundedClipEffect;
@@ -4069,7 +4078,7 @@ test "render: clip_shape ellipse emits ellipse clip fallback" {
 }
 
 test "render: clip_shape path emits polygon clip for single closed polyline" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(240, 140);
 
@@ -4108,7 +4117,7 @@ test "render: clip_shape path emits polygon clip for single closed polyline" {
     for (commands) |cmd| {
         if (cmd.isControl(.push_clip)) {
             const clip = cmd;
-            try std.testing.expectEqual(@intFromEnum(ui.ClipShapeKind.polygon), clip.clip_shape_kind);
+            try std.testing.expectEqual(@backingInt(ui.ClipShapeKind.polygon), clip.clip_shape_kind);
             try std.testing.expectApproxEqAbs(@as(f32, 20), clip.geom.x, 0.001);
             try std.testing.expectApproxEqAbs(@as(f32, 15), clip.geom.y, 0.001);
             try std.testing.expectApproxEqAbs(@as(f32, 60), clip.geom.w, 0.001);
@@ -4128,7 +4137,7 @@ test "render: clip_shape path emits polygon clip for single closed polyline" {
 }
 
 test "render: simple curved clip_shape path emits polygon clip approximation" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(240, 160);
 
@@ -4158,7 +4167,7 @@ test "render: simple curved clip_shape path emits polygon clip approximation" {
     for (commands) |cmd| {
         if (cmd.isControl(.push_clip)) {
             const clip = cmd;
-            try std.testing.expectEqual(@intFromEnum(ui.ClipShapeKind.polygon), clip.clip_shape_kind);
+            try std.testing.expectEqual(@backingInt(ui.ClipShapeKind.polygon), clip.clip_shape_kind);
             try std.testing.expect(clip.clip_polygon_ptr.?.point_count >= 4);
             try std.testing.expectEqual(ui.PathFillRule.evenodd, clip.clip_polygon_ptr.?.fill_rule);
             saw_polygon_clip = true;
@@ -4168,7 +4177,7 @@ test "render: simple curved clip_shape path emits polygon clip approximation" {
 }
 
 test "render: single-subpath multi-curve clip_shape path stays polygon clip within expanded point budget" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(260, 220);
 
@@ -4197,7 +4206,7 @@ test "render: single-subpath multi-curve clip_shape path stays polygon clip with
     for (commands) |cmd| {
         if (cmd.isControl(.push_clip)) {
             const clip = cmd;
-            try std.testing.expectEqual(@intFromEnum(ui.ClipShapeKind.polygon), clip.clip_shape_kind);
+            try std.testing.expectEqual(@backingInt(ui.ClipShapeKind.polygon), clip.clip_shape_kind);
             try std.testing.expect(clip.clip_polygon_ptr.?.point_count > 16);
             try std.testing.expectEqual(ui.PathFillRule.nonzero, clip.clip_polygon_ptr.?.fill_rule);
             saw_polygon_clip = true;
@@ -4207,7 +4216,7 @@ test "render: single-subpath multi-curve clip_shape path stays polygon clip with
 }
 
 test "render: multi-subpath curved clip_shape path emits polygon clip with contours" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(240, 160);
 
@@ -4236,7 +4245,7 @@ test "render: multi-subpath curved clip_shape path emits polygon clip with conto
     for (commands) |cmd| {
         if (cmd.isControl(.push_clip)) {
             const clip = cmd;
-            try std.testing.expectEqual(@intFromEnum(ui.ClipShapeKind.polygon), clip.clip_shape_kind);
+            try std.testing.expectEqual(@backingInt(ui.ClipShapeKind.polygon), clip.clip_shape_kind);
             try std.testing.expectEqual(@as(u8, 2), clip.clip_polygon_ptr.?.contour_count);
             try std.testing.expect(clip.clip_polygon_ptr.?.point_count >= 8);
             try std.testing.expect(clip.clip_polygon_ptr.?.contour_end_points[0] < clip.clip_polygon_ptr.?.contour_end_points[1]);
@@ -4247,7 +4256,7 @@ test "render: multi-subpath curved clip_shape path emits polygon clip with conto
 }
 
 test "render: clip_shape custom degrades to rect clip in render runtime" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(240, 140);
 
@@ -4281,7 +4290,7 @@ test "render: clip_shape custom degrades to rect clip in render runtime" {
     for (commands) |cmd| {
         if (cmd.isControl(.push_clip)) {
             const clip = cmd;
-            try std.testing.expectEqual(@intFromEnum(ui.ClipShapeKind.rect), clip.clip_shape_kind);
+            try std.testing.expectEqual(@backingInt(ui.ClipShapeKind.rect), clip.clip_shape_kind);
             saw_rect_clip = true;
         } else if (cmd.isControl(.begin_rounded_clip)) {
             return error.UnexpectedRoundedClipEffect;
@@ -4291,7 +4300,7 @@ test "render: clip_shape custom degrades to rect clip in render runtime" {
 }
 
 test "render: clip_shape custom uses polygon clip when path geometry exists" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(240, 140);
 
@@ -4320,7 +4329,7 @@ test "render: clip_shape custom uses polygon clip when path geometry exists" {
     for (commands) |cmd| {
         if (cmd.isControl(.push_clip)) {
             const clip = cmd;
-            try std.testing.expectEqual(@intFromEnum(ui.ClipShapeKind.polygon), clip.clip_shape_kind);
+            try std.testing.expectEqual(@backingInt(ui.ClipShapeKind.polygon), clip.clip_shape_kind);
             try std.testing.expectEqual(@as(u8, 1), clip.clip_polygon_ptr.?.contour_count);
             try std.testing.expectEqual(@as(u8, 4), clip.clip_polygon_ptr.?.point_count);
             saw_polygon_clip = true;
@@ -4330,7 +4339,7 @@ test "render: clip_shape custom uses polygon clip when path geometry exists" {
 }
 
 test "render: clip_shape custom uses dedicated custom clip geometry" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(240, 140);
 
@@ -4359,7 +4368,7 @@ test "render: clip_shape custom uses dedicated custom clip geometry" {
     for (commands) |cmd| {
         if (cmd.isControl(.push_clip)) {
             const clip = cmd;
-            try std.testing.expectEqual(@intFromEnum(ui.ClipShapeKind.polygon), clip.clip_shape_kind);
+            try std.testing.expectEqual(@backingInt(ui.ClipShapeKind.polygon), clip.clip_shape_kind);
             try std.testing.expectEqual(@as(u8, 1), clip.clip_polygon_ptr.?.contour_count);
             try std.testing.expectEqual(@as(u8, 4), clip.clip_polygon_ptr.?.point_count);
             saw_polygon_clip = true;
@@ -4381,7 +4390,7 @@ test "render: clip_shape custom uses provider geometry when dedicated geometry i
         }
     };
 
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(240, 140);
 
@@ -4411,7 +4420,7 @@ test "render: clip_shape custom uses provider geometry when dedicated geometry i
     for (commands) |cmd| {
         if (cmd.isControl(.push_clip)) {
             const clip = cmd;
-            try std.testing.expectEqual(@intFromEnum(ui.ClipShapeKind.polygon), clip.clip_shape_kind);
+            try std.testing.expectEqual(@backingInt(ui.ClipShapeKind.polygon), clip.clip_shape_kind);
             try std.testing.expectEqual(@as(u8, 1), clip.clip_polygon_ptr.?.contour_count);
             try std.testing.expectEqual(@as(u8, 4), clip.clip_polygon_ptr.?.point_count);
             saw_polygon_clip = true;
@@ -4421,11 +4430,12 @@ test "render: clip_shape custom uses provider geometry when dedicated geometry i
 }
 
 test "render: overflow_hidden 子节点不把祖先的 opacity 层切成两段，clip 与内容同帧" {
-    // 修复前（43bb5f3 起对所有 overflow_hidden 普通 box 发 CONTROL scroll-clip token）：
-    //   begin_opacity, 父背景, 子背景, end_opacity, push_clip(world 60,40), begin_opacity,
-    //   宽子, end_opacity, pop_clip
-    // 祖先 opacity 层被切成两次独立合成（重叠区二次混合），blur 场景则背板采样两次。
-    var cx = try Cx.init(std.testing.allocator);
+    // Pre-fix (43bb5f3 emitted CONTROL scroll-clip for all overflow_hidden plain boxes):
+    //   begin_opacity, parent_bg, child_bg, end_opacity, push_clip(world 60,40), begin_opacity,
+    //   wide_child, end_opacity, pop_clip
+    // Ancestor opacity layer split into two composites (overlap 2x blend), blur resamples backdrop
+    // twice.
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
     const parent = try box(cx, .{
@@ -4475,10 +4485,10 @@ test "render: overflow_hidden 子节点不把祖先的 opacity 层切成两段�
             wide_index = i;
         }
     }
-    // 祖先层只开一次、关一次。
+    // Ancestor layer opens once, closes once.
     try std.testing.expectEqual(@as(usize, 1), begins);
     try std.testing.expectEqual(@as(usize, 1), ends);
-    // clip 包住宽子，且整个包围落在 begin..end 之内。
+    // Clip wraps wide child, whole enclosure within begin..end.
     try std.testing.expect(clip_index != null and pop_index != null and wide_index != null);
     try std.testing.expect(begin_index.? < clip_index.?);
     try std.testing.expect(clip_index.? < wide_index.?);
@@ -4495,9 +4505,10 @@ test "render: overflow_hidden 子节点不把祖先的 opacity 层切成两段�
 }
 
 test "render: 自带离屏效果的 overflow_hidden 节点不再额外发 scroll-clip token" {
-    // 43bb5f3 让所有 overflow_hidden 节点都发 token；节点自己带 opacity/blur/rounded_clip 时
-    // 裁剪已由 compositor plan 的 apply_clip / surface mask 承担，token 只会重复并切开 effect 组。
-    var cx = try Cx.init(std.testing.allocator);
+    // 43bb5f3 emits token for all overflow_hidden; node with own opacity/blur/rounded_clip,
+    // clipping already handled by compositor apply_clip / surface mask, token duplicates, splits
+    // effect.
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(260, 180);
     const root = try box(cx, .{
@@ -4524,7 +4535,7 @@ test "render: 自带离屏效果的 overflow_hidden 节点不再额外发 scroll
 }
 
 test "render: compositor plan drives rect clip for opacity layer" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(220, 140);
 
@@ -4535,10 +4546,9 @@ test "render: compositor plan drives rect clip for opacity layer" {
         .overflow_hidden = true,
         .opacity = 0.6,
     }, .{});
-    // 无阴影/描边：owner 自身内容全在 clip 内，overflow clip 仍走 compositor
-    // apply_clip 快路径。带阴影的 owner 改由 children 包围 token 承担（阴影不许
-    // 被自身 overflow clip 裁），见 "composited owner overflow clip spares owner
-    // shadow ..."。
+    // No shadow/stroke: owner content fully inside clip, overflow clip takes compositor
+    // apply_clip fast path. Shadowed owner uses children-wrapping token (shadow exempt from
+    // owner overflow clip), see "composited owner overflow clip spares owner shadow...".
 
     cx.root = root;
     cx.layout();
@@ -4604,7 +4614,7 @@ test "render: compositor plan drives rect clip for opacity layer" {
 }
 
 test "render: opacity plan clip bounds projected to owner-local content frame" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(260, 180);
 
@@ -4643,10 +4653,10 @@ test "render: opacity plan clip bounds projected to owner-local content frame" {
         }
     }
 
-    // CA-pure 模型：surface 内 content 在 owner-unscaled-local 帧（world 的
-    // translate(40,20) 已被 owner_world⁻¹ 剥掉），apply_clip 必须与 content 同帧
-    // 即 (0,0,160,80)，恰与 content rect 重合。world 坐标 clip 会把 local
-    // 内容的左上 40/20px 裁掉（rotate 场景下则整体裁空，见 effect_bridge fix）。
+    // CA-pure model: surface content in owner-unscaled-local frame (world translate(40,20)
+    // stripped by owner_world inverse), apply_clip matches content frame = (0,0,160,80),
+    // same as content_rect. World-coord clip cuts left/top 40/20px of local content (rotate
+    // case clips entirely, see effect_bridge fix).
     try std.testing.expect(begin_x != null and begin_y != null);
     try std.testing.expect(clip_x != null and clip_y != null and clip_w != null and clip_h != null);
     try std.testing.expectApproxEqAbs(@as(f32, 0), clip_x.?, 0.001);
@@ -4656,7 +4666,7 @@ test "render: opacity plan clip bounds projected to owner-local content frame" {
 }
 
 test "render: scroll opacity subtree disables own payload replay in effect scope" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(320, 220);
 
@@ -4740,7 +4750,7 @@ test "render: scroll opacity subtree disables own payload replay in effect scope
 }
 
 test "render: compositor plan preserves ellipse clip for opacity layer" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(220, 140);
 
@@ -4780,7 +4790,7 @@ test "render: compositor plan preserves ellipse clip for opacity layer" {
         } else if (cmd.isControl(.push_clip)) {
             const clip = cmd;
             push_count += 1;
-            if (clip.clip_shape_kind == @intFromEnum(ui.display_list.ClipShapeKind.ellipse)) saw_ellipse_clip = true;
+            if (clip.clip_shape_kind == @backingInt(ui.display_list.ClipShapeKind.ellipse)) saw_ellipse_clip = true;
         } else if (cmd.isControl(.end_opacity_layer)) {
             end_opacity_count += 1;
         }
@@ -4793,7 +4803,7 @@ test "render: compositor plan preserves ellipse clip for opacity layer" {
 }
 
 test "render: compositor plan applies clip before blur layer" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(220, 140);
 
@@ -4878,14 +4888,17 @@ test "glass params resolve clamps optic ranges on CPU" {
         .center_thickness = -3.0,
     }).resolve();
 
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), resolved.refraction_level, 0.0001);
+    // Refraction strength [-1, 1]: negative is knob lens minify (8460fb85,
+    // native_slider_toggle.swift), keep.
+    try std.testing.expectApproxEqAbs(@as(f32, -0.4), resolved.refraction_level, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, -1.0), (ui.GlassParams{ .refraction_level = -3.0 }).resolve().refraction_level, 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), resolved.blur_level, 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 3.0), resolved.warp_gain, 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), resolved.center_thickness, 0.0001);
 }
 
 test "render: compositor plan preserves polygon clip for opacity layer" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(260, 180);
 
@@ -4926,7 +4939,7 @@ test "render: compositor plan preserves polygon clip for opacity layer" {
         if (cmd.isControl(.push_clip)) {
             const clip = cmd;
             push_count += 1;
-            if (clip.clip_shape_kind == @intFromEnum(ui.display_list.ClipShapeKind.polygon)) {
+            if (clip.clip_shape_kind == @backingInt(ui.display_list.ClipShapeKind.polygon)) {
                 try std.testing.expectEqual(@as(u8, 5), clip.clip_polygon_ptr.?.point_count);
                 saw_polygon_clip = true;
             }
@@ -4938,7 +4951,7 @@ test "render: compositor plan preserves polygon clip for opacity layer" {
 }
 
 test "render: compositor plan preserves multi-contour polygon clip for opacity layer" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(260, 180);
 
@@ -4976,7 +4989,7 @@ test "render: compositor plan preserves multi-contour polygon clip for opacity l
     for (commands) |cmd| {
         if (cmd.isControl(.push_clip)) {
             const clip = cmd;
-            if (clip.clip_shape_kind == @intFromEnum(ui.display_list.ClipShapeKind.polygon)) {
+            if (clip.clip_shape_kind == @backingInt(ui.display_list.ClipShapeKind.polygon)) {
                 try std.testing.expectEqual(@as(u8, 2), clip.clip_polygon_ptr.?.contour_count);
                 try std.testing.expect(clip.clip_polygon_ptr.?.contour_end_points[0] < clip.clip_polygon_ptr.?.contour_end_points[1]);
                 saw_polygon_clip = true;
@@ -4987,7 +5000,7 @@ test "render: compositor plan preserves multi-contour polygon clip for opacity l
 }
 
 test "render: queryNode exposes clip fallback for non-effect overflow subtree" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(220, 140);
 
@@ -5023,7 +5036,7 @@ test "render: queryNode exposes clip fallback for non-effect overflow subtree" {
 }
 
 test "render: queryNode and queryEffect expose managed opacity clip bridge" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(220, 140);
 
@@ -5034,10 +5047,9 @@ test "render: queryNode and queryEffect expose managed opacity clip bridge" {
         .overflow_hidden = true,
         .opacity = 0.6,
     }, .{});
-    // 无阴影/描边：owner 自身内容全在 clip 内，overflow clip 仍走 compositor
-    // apply_clip 快路径。带阴影的 owner 改由 children 包围 token 承担（阴影不许
-    // 被自身 overflow clip 裁），见 "composited owner overflow clip spares owner
-    // shadow ..."。
+    // No shadow/stroke: owner content fully inside clip, overflow clip takes compositor
+    // apply_clip fast path. Shadowed owner uses children-wrapping token (shadow exempt from
+    // owner overflow clip), see "composited owner overflow clip spares owner shadow...".
 
     cx.root = root;
     cx.layout();
@@ -5071,7 +5083,7 @@ test "render: queryNode and queryEffect expose managed opacity clip bridge" {
 }
 
 test "render: sibling z_index controls stable paint order without mutating child order" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(160, 100);
 
@@ -5135,7 +5147,7 @@ test "render: sibling z_index controls stable paint order without mutating child
 }
 
 test "render: positive sticky siblings obey z_index and match hit testing" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(160, 140);
 
@@ -5186,22 +5198,23 @@ test "render: positive sticky siblings obey z_index and match hit testing" {
     try std.testing.expect(high_order != null);
     try std.testing.expect(low_order.? < high_order.?);
     try std.testing.expectEqual(high, cx.hitTest(high_rect.x + 10, high_rect.y + 10));
-    // 命中侧的 paint_order 本身与渲染同序（C2 删除全局 stacking_z 之后，命中结果
-    // 只能来自 paint_order；旧实现里 high 的 paint_order 反而更小，靠 stacking_z 20>10 掩盖）。
+    // Hit side paint_order same as render order (C2 deleted global stacking_z, hit result from
+    // paint_order only; old: high paint_order smaller, masked by stacking_z 20>10).
     try std.testing.expect(high.frame_state.frame_local.spatial.paint.order > low_sticky.frame_state.frame_local.spatial.paint.order);
     try std.testing.expectEqual(high, root.children.items[0]);
     try std.testing.expectEqual(low_sticky, root.children.items[1]);
 }
 
-/// 推进帧时钟再 render：同一帧时间内 ensureBeforeRenderTicked 会跳过 tick，sticky 不重算。
+/// Advance frame clock then render: ensureBeforeRenderTicked skips tick same frame, sticky
+/// unchanged.
 fn renderNextStickyFrame(cx: *Cx) void {
     cx.frame_time_ms += 16.0;
     _ = cx.render();
 }
 
-/// viewport(200×200, overflow_hidden) -> content(translate_y = -S)
+/// viewport(200x200, overflow_hidden) -> content(translate_y = -S)
 ///   -> [spacer 500, section 300 -> [header 40 (sticky top=0)]]
-/// 附录 A 探针 5 的结构：sticky 的父节点是文档流里 y=500 的块。
+/// Appendix A probe 5: sticky parent is doc-flow block at y=500.
 const StickySectionFixture = struct {
     content: *Node,
     section: *Node,
@@ -5241,19 +5254,19 @@ const StickySectionFixture = struct {
 };
 
 test "sticky: clamp uses parent origin once (section in flow)" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     const fx = try StickySectionFixture.build(cx);
     try std.testing.expectEqual(@as(f32, 500), fx.section.rectFromWorldOrFallback().y);
 
-    // 未触及吸附线：自然位置。
+    // Hasn't reached stick line: natural position.
     fx.scrollTo(cx, 100);
     try std.testing.expectEqual(@as(f32, 0), fx.header.frame_state.frame_local.runtime.sticky.y);
-    // 吸附：header 自然 y = 500-600 = -100，补偿 100；未触及 section 底边。
+    // Pinned: header natural y = 500-600 = -100, offset +100; section bottom not reached.
     fx.scrollTo(cx, 600);
     try std.testing.expectEqual(@as(f32, 100), fx.header.frame_state.frame_local.runtime.sticky.y);
-    // 钳制：section 屏幕底边 = 500+300-780 = 20，header 底边不得越过 -> 补偿 260（旧公式把
-    // section.rect.y 又加了一次，得 280，header 越过 section 继续吸顶）。
+    // Constrained: section screen bottom = 500+300-780 = 20, header bottom can't exceed -> offset
+    // 260 (old formula re-added section.rect.y, got 280, header escapes past section).
     fx.scrollTo(cx, 780);
     try std.testing.expectEqual(@as(f32, 260), fx.header.frame_state.frame_local.runtime.sticky.y);
     const g = fx.header.globalRect();
@@ -5262,11 +5275,13 @@ test "sticky: clamp uses parent origin once (section in flow)" {
 }
 
 test "sticky: clamp with scrolled parent (parent.translate_y != 0)" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(200, 200);
-    // viewport(clip) -> content(translate_y=-S, padding.bottom=10) -> [lead 100, header 40, tail 300]
-    // sticky 的父节点就是被滚动的 content：旧公式多加一次 parent.translate_y(=-S)，钳制上限偏小 -> 提前松开。
+    // viewport(clip) -> content(translate_y=-S, padding.bottom=10) -> [lead 100, header 40, tail
+    // 300]
+    // sticky parent is scrolled content: old formula double-added parent.translate_y(=-S), cap
+    // small -> early release.
     const viewport = try box(cx, .{
         .width = .{ .px = 200 },
         .height = .{ .px = 200 },
@@ -5290,11 +5305,13 @@ test "sticky: clamp with scrolled parent (parent.translate_y != 0)" {
     cx.layout();
     try std.testing.expectEqual(@as(f32, 450), content.rectFromWorldOrFallback().h);
 
-    // S=380：header 自然 y=-280 -> 补偿 280；content 内容底 = 450-10-380 = 60，上限 60+280-40 = 300，不钳制。
+    // S=380: header natural y=-280 -> offset 280; content bottom = 450-10-380 = 60, cap 60+280-40 =
+    // 300, no constrain.
     content.setStyle(null, .translate_y, -380);
     renderNextStickyFrame(cx);
     try std.testing.expectEqual(@as(f32, 280), header.frame_state.frame_local.runtime.sticky.y);
-    // S=430：自然 y=-330 -> 想要 330；内容底 = 10，上限 10+330-40 = 300 -> 钳制到 300。
+    // S=430: natural y=-330 -> want 330; content bottom = 10, cap 10+330-40 = 300 -> constrain to
+    // 300.
     content.setStyle(null, .translate_y, -430);
     renderNextStickyFrame(cx);
     try std.testing.expectEqual(@as(f32, 300), header.frame_state.frame_local.runtime.sticky.y);
@@ -5303,7 +5320,7 @@ test "sticky: clamp with scrolled parent (parent.translate_y != 0)" {
 }
 
 test "sticky: offset resets when ancestor clip intersection is empty" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(200, 200);
     // root(200×200) -> clipper(100×100, clip) -> content(translate_y=-100) -> [lead 50, header 20, tail 200]
@@ -5331,8 +5348,8 @@ test "sticky: offset resets when ancestor clip intersection is empty" {
     renderNextStickyFrame(cx);
     try std.testing.expectEqual(@as(f32, 50), header.frame_state.frame_local.runtime.sticky.y);
 
-    // clipper 整体移出窗口：祖先裁剪交集为空，sticky 不再有吸附区域，偏移必须归零，
-    // 不能残留上一帧的 50（globalRect / 命中 / 锚定 popover 会读到它）。
+    // Clipper whole moved offscreen: ancestor clip empty, sticky no stick zone,
+    // offset must zero, can't stale prev frame's 50 (globalRect / hit / popover reads it).
     clipper.setStyle(null, .translate_y, 1000);
     renderNextStickyFrame(cx);
     try std.testing.expectEqual(@as(f32, 0), header.frame_state.frame_local.runtime.sticky.y);
@@ -5341,16 +5358,17 @@ test "sticky: offset resets when ancestor clip intersection is empty" {
 }
 
 test "sticky: own translate participates in natural position" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     const fx = try StickySectionFixture.build(cx);
     fx.header.setStyle(null, .translate_y, 10);
 
-    // 吸附：自然 y = 500-600+10 = -90 -> 补偿 90，视觉顶边正好贴在吸附线 0。
+    // Pinned: natural y = 500-600+10 = -90 -> offset 90, visual top at stick line 0.
     fx.scrollTo(cx, 600);
     try std.testing.expectEqual(@as(f32, 90), fx.header.frame_state.frame_local.runtime.sticky.y);
     try std.testing.expectEqual(@as(f32, 0), fx.header.globalRect().y);
-    // 钳制：视觉底边（含 translate）贴 section 底边 20 -> 补偿 20-(-270)-40 = 250。
+    // Constrained: visual bottom (with translate) at section bottom 20 -> offset 20-(-270)-40 =
+    // 250.
     fx.scrollTo(cx, 780);
     try std.testing.expectEqual(@as(f32, 250), fx.header.frame_state.frame_local.runtime.sticky.y);
     const g = fx.header.globalRect();
@@ -5358,24 +5376,24 @@ test "sticky: own translate participates in natural position" {
 }
 
 test "sticky: state flags follow natural -> pinned -> constrained -> scrolled out" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     const fx = try StickySectionFixture.build(cx);
     const sticky = &fx.header.frame_state.frame_local.runtime.sticky;
 
     const Expect = struct { scroll: f32, offset: f32, engaged_top: bool, pinned: bool, constrained: bool };
     const steps = [_]Expect{
-        // 自然位置：未越过吸附线。
+        // Natural position: hasn't crossed stick line.
         .{ .scroll = 100, .offset = 0, .engaged_top = false, .pinned = false, .constrained = false },
-        // 贴在吸附线上。
+        // Aligned to stick line.
         .{ .scroll = 600, .offset = 100, .engaged_top = true, .pinned = true, .constrained = false },
-        // 被 section 底边推着走（交接中）。
+        // Pushed by section bottom (transition).
         .{ .scroll = 780, .offset = 260, .engaged_top = true, .pinned = false, .constrained = true },
-        // header 整体滚出视口（视觉 -70..-30），仍被 section 钳制。
+        // Header wholly scrolled offscreen (visual -70..-30), still constrained by section.
         .{ .scroll = 830, .offset = 260, .engaged_top = true, .pinned = false, .constrained = true },
-        // 滚回 section 顶边进入视口：状态全部清除。
-        // 注：滚到 section 离开 clip+48px 余量（如 scroll=0）时，tick 按 out-of-clip 跳过整棵 section
-        // 子树，深层 sticky 不重算、保留上一次的值（§3.4 S3 的后半，C1 未处理）。
+        // Scroll back to section top, enter viewport: clear all state.
+        // Note: scroll to section leaves clip+48px margin (e.g. scroll=0), tick skips whole section
+        // subtree out-of-clip, deep sticky unchanged (see S3.4 S3, C1 unhandled).
         .{ .scroll = 300, .offset = 0, .engaged_top = false, .pinned = false, .constrained = false },
     };
     for (steps) |step| {
@@ -5402,13 +5420,15 @@ test "sticky: solveSticky exhaustive clamp matrix" {
     const parent_size: f32 = 300;
     const clip = Rect.init(0, 0, 200, 200);
 
-    // 一维模型（沿 sticky 方向）：父 content box 两端各扣 pad；sticky 贴在靠吸附线一侧的
-    // content 边（leading = pad，trailing = parent_size - pad - size），自身 translate = t。
-    // 自然位置 natural 按阶段选定，parent_origin 由它反推：
-    //   leading  吸附线 0：   idle natural=50,  pinned natural=-100, constrained natural=-280
-    //   trailing 吸附线 160： idle natural=60,  pinned natural=260,  constrained natural=440
-    // 期望补偿量：idle 0，pinned 100，constrained = content 余量 = 260-2pad∓t（leading 减 t，trailing 加 t）。
-    // parent_rect 的 x/y 故意给 500：它是相对祖父的布局坐标，求解时必须被忽略（双计 bug 的形状）。
+    // 1D model (along sticky direction): the parent content box has pad deducted at both ends;
+    // sticky sits on the content edge nearest the stick line (leading = pad,
+    // trailing = parent_size - pad - size), own translate = t. Natural by phase, parent_origin reverse-solved:
+    //   leading  line 0: idle natural=50, pinned natural=-100, constrained natural=-280
+    //   trailing line 160: idle natural=60, pinned natural=260, constrained natural=440
+    // Expect offset: idle 0, pinned 100, constrained = spare = 260-2pad+/-t (leading -t, trailing
+    // +t).
+    // parent_rect x/y deliberately 500: layout coord vs ancestor, must ignore in solve
+    // (double-count shape).
     for ([_]Side{ .top, .bottom, .left, .right }) |side| {
         for ([_]f32{ 0, 10 }) |pad| {
             for ([_]f32{ 0, 5 }) |t| {
@@ -5429,12 +5449,13 @@ test "sticky: solveSticky exhaustive clamp matrix" {
                     const magnitude: f32 = switch (phase) {
                         .idle => 0,
                         .pinned => 100,
-                        // 自身 translate 让 leading 侧余量变小、trailing 侧余量变大。
+                        // Own translate shrinks leading-side spare, grows trailing-side spare.
                         .constrained => 260 - 2 * pad - (if (leading) t else -t),
                     };
                     const expected: f32 = if (leading) magnitude else -magnitude;
 
-                    // 另一轴：自然位置 50（在 clip 内），且该轴没有 inset，不应产生任何补偿。
+                    // Other axis: natural 50 (inside clip), no inset on this axis, no offset
+                    // produces.
                     const insets: @import("types.zig").StickyInsets = switch (side) {
                         .top => .{ .top = 0 },
                         .bottom => .{ .bottom = 0 },
@@ -5474,7 +5495,7 @@ test "sticky: solveSticky exhaustive clamp matrix" {
                     try std.testing.expectEqual(phase == .pinned, r.state.pinned);
                     try std.testing.expectEqual(phase == .constrained, r.state.constrained);
 
-                    // 钳制后视觉位置（含自身 translate）正好贴 content box 边。
+                    // After constraint, visual (with own translate) aligns at content box edge.
                     if (phase == .constrained) {
                         const content_lo = origin_axis + pad;
                         const content_hi = origin_axis + parent_size - pad;
@@ -5489,7 +5510,7 @@ test "sticky: solveSticky exhaustive clamp matrix" {
         }
     }
 
-    // 无父节点：不钳制，纯吸附。
+    // No parent: no constraint, pure pin.
     {
         const r = geometry.solveSticky(.{
             .self_rect = Rect.init(0, 0, size, size),
@@ -5501,7 +5522,7 @@ test "sticky: solveSticky exhaustive clamp matrix" {
         try std.testing.expectEqual(@as(f32, 280), r.offset.y);
         try std.testing.expect(r.state.pinned and !r.state.constrained);
     }
-    // 显式 constraint 取代父 content box。
+    // Explicit constraint replaces parent content box.
     {
         const r = geometry.solveSticky(.{
             .self_rect = Rect.init(0, 0, size, size),
@@ -5511,7 +5532,7 @@ test "sticky: solveSticky exhaustive clamp matrix" {
             .clip = clip,
             .constraint = Rect.init(0, -280, 200, 400),
         });
-        // constraint 底边 120 -> 补偿上限 120-(-280)-40 = 360，不截短想要的 280。
+        // Constraint bottom 120 -> cap 120-(-280)-40 = 360, doesn't truncate wanted 280.
         try std.testing.expectEqual(@as(f32, 280), r.offset.y);
         try std.testing.expect(r.state.pinned);
         const r2 = geometry.solveSticky(.{
@@ -5522,14 +5543,14 @@ test "sticky: solveSticky exhaustive clamp matrix" {
             .clip = clip,
             .constraint = Rect.init(0, -280, 200, 100),
         });
-        // constraint 底边 -180 -> 上限 -180-(-280)-40 = 60。
+        // Constraint bottom -180 -> cap -180-(-280)-40 = 60.
         try std.testing.expectEqual(@as(f32, 60), r2.offset.y);
         try std.testing.expect(r2.state.constrained and !r2.state.pinned);
     }
 }
 
 test "render: legacy overflow cache replays escaped overlay exactly once" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(180, 120);
 
@@ -5581,12 +5602,61 @@ test "render: legacy overflow cache replays escaped overlay exactly once" {
     try std.testing.expectEqual(@as(usize, 1), replay_overlay_fill_count);
 }
 
-// ─── z>0 带外渲染单元：已知缺陷护栏（方案 sticky-zindex-clip-decoupling-plan.md §10 V1/V2）───
+test "render: legacy overflow cache hit emits the owner's own content once, before its children" {
+    // Progress bar shape: overflow_hidden + background track with fill inside; sibling repaints
+    // parent, track subtree uses cache replay. Replay once emitted own post-descendants
+    // (Stage B dual-list merge mirror remnant): track bg covers fill, static frame flashes.
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    cx.setViewport(240, 120);
+
+    const root = try box(cx, .{ .width = .{ .px = 220 }, .height = .{ .px = 100 }, .direction = .column }, .{});
+    const sibling = try box(cx, .{ .width = .{ .px = 60 }, .height = .{ .px = 20 }, .background = Color.rgba(90, 90, 90, 255) }, .{});
+    const track = try box(cx, .{
+        .width = .{ .px = 200 },
+        .height = .{ .px = 6 },
+        .overflow_hidden = true,
+        .background = Color.rgba(30, 34, 48, 255),
+    }, .{});
+    const fill = try box(cx, .{ .width = .{ .px = 50 }, .height = .{ .px = 6 }, .background = Color.rgba(199, 187, 179, 255) }, .{});
+    try track.appendChild(cx.allocator, fill);
+    try root.appendChild(cx.allocator, sibling);
+    try root.appendChild(cx.allocator, track);
+    cx.root = root;
+    cx.layout();
+    _ = cx.render();
+    try std.testing.expect(track.meta.per_frame.caches.commands.own != null);
+
+    // Sibling change only: parent repaints, track subtree clean -> legacy overflow cache replay.
+    sibling.setBackgroundRaw(Color.rgba(120, 120, 120, 255));
+    cx.frame_time_ms = 16.0;
+    cx.perf.render_cache_hit = 0;
+    _ = cx.render();
+    try std.testing.expect(cx.perf.render_cache_hit > 0);
+
+    var track_fills: usize = 0;
+    var track_at: ?usize = null;
+    var fill_at: ?usize = null;
+    for (cx.display_list.items.items, 0..) |item, i| switch (item) {
+        .fill_rect => |f| {
+            if (f.header.node_id == track.id) {
+                track_fills += 1;
+                if (track_at == null) track_at = i;
+            }
+            if (f.header.node_id == fill.id and fill_at == null) fill_at = i;
+        },
+        else => {},
+    };
+    try std.testing.expectEqual(@as(usize, 1), track_fills);
+    try std.testing.expect(track_at.? < fill_at.?);
+}
+
+// --- z>0 out-of-band render units: guardrails (plan sticky-zindex-clip-decoupling-plan.md S10
+// V1/V2) ---
 //
-// 以下三条在 2026-09-24 的工作树（C1 已修、C2/C3 未做）上**确认是红的**，红即缺陷存在。
-// C2（删除逃逸，legacy 补渲染改传父 clip）已落地：V1 那条已转绿并去掉跳过闸。
-// C3（带外 dirty 逐跳冒泡，node_dirty.zig isOutOfBandRenderUnit）已落地：V2 两条转绿、
-// 去掉跳过闸，转成常规回归测试。
+// C2 (remove escapes, legacy re-render via parent clip): V1 is a regular regression test.
+// C3 (out-of-band dirty bubble per-hop, node_dirty.zig isOutOfBandRenderUnit): both V2 tests
+// are regular regression tests.
 
 fn knownBugFillColorOfSize(cx: *Cx, w: f32, h: f32) ?Color {
     for (cx.lowerForEncoderPaintTable()) |it| {
@@ -5598,23 +5668,23 @@ fn knownBugFillColorOfSize(cx: *Cx, w: f32, h: f32) ?Color {
 }
 
 test "render: positive z child stays clipped on legacy overflow cache hit" {
-    // V1（方案 §9.1 第 2 条）。场景仿照「legacy overflow cache replays escaped overlay
-    // exactly once」：z>0 overlay 带自己的 opacity layer（opacity 0.8 + scale 动画），
-    // 其 render dirty 不冒泡（escapesAncestorRenderPass，C3 后为 isOutOfBandRenderUnit），clipper 第 2 帧起命中 legacy
-    // overflow cache。命中帧上 renderOverlayChildrenAfterCacheHit 以 clip=null 在缓存
-    // 命令（含 clipper 的 push/pop_clip token 对）**之后**补渲染 overlay -> scissor 栈空，
-    // 溢出 clipper 底边的 30px 真的画出来了；而新鲜帧（第 1 帧）它在 token 对内、被裁。
-    // 探针实测（2026-09-24）：第 1 帧 scissor=(0,0,160,100)，第 2..4 帧 scissor 深度 0。
-    // 只有「z>0 子节点在 paint pass 里渲染」时才出现；plain / 仅 opacity 的 z>0 子节点
-    // 内容由同帧 prebuild 写在 token 对内，命中帧仍被裁（同一探针的对照组）。
-    // C2（2026-09-24）已修：补渲染改传父节点 clip/clip_id，命中帧上 overlay 虽仍排在缓存
-    // token 对之后，但自带 clip-bridge（在它自己 opacity surface 的局部坐标里），换算到
-    // 世界坐标 = clipper 框。跳过闸已去掉，转为常规回归测试。scissor 用 surface 感知的
-    // c2ScissorStackForFill 计算：C2 之后 clip-bridge 出现在 overlay 的 surface 内部，
-    // 按世界坐标直接求交会得出错误的 (0,0,160,30)。
-    // 另：命中帧末尾 clipper 背景被再画一遍（F1，mod.zig tryReplayLegacyOverflowCacheHit
-    // 无条件 appendNodeOwnContent），不属于本方案，这里不断言。
-    var cx = try Cx.init(std.testing.allocator);
+    // V1 (plan S9.1 item 2). Mirrors "legacy overflow cache replays escaped overlay exactly once":
+    // z>0 overlay carries its own opacity layer (0.8 opacity + scale animation); render dirty does
+    // not
+    // bubble (escapesAncestorRenderPass, now isOutOfBandRenderUnit), so clipper frame 2+ hits the
+    // legacy overflow cache. On a hit, renderOverlayChildrenAfterCacheHit re-renders the overlay
+    // with
+    // clip=null **after** the cache commands (clipper push/pop_clip token pair) -> scissor stack is
+    // empty and 30px past the clipper bottom renders; fresh frame 1 is inside the tokens, clipped.
+    // Only "z>0 child renders in paint pass" is affected; plain / opacity-only z>0 child content is
+    // written by same-frame prebuild inside the tokens, so hit frames stay clipped (probe control).
+    // Fix: re-render passes parent clip/clip_id; overlay ranks after the cache tokens but carries a
+    // clip-bridge (in its own opacity surface local) converted to world = clipper frame. Scissor
+    // via
+    // surface-aware c2ScissorStackForFill: direct world intersection of the clip-bridge is wrong.
+    // Also: clipper bg is re-drawn at end of hit frame (mod.zig tryReplayLegacyOverflowCacheHit,
+    // unconditional appendNodeOwnContent); out of plan scope, unasserted.
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(180, 160);
 
@@ -5630,7 +5700,7 @@ test "render: positive z child stays clipped on legacy overflow cache hit" {
         .height = .{ .px = 60 },
         .background = overlay_color,
     }, .{});
-    overlay.style.translate_y = 70; // y ∈ [70,130)：溢出 clipper 底边 30px
+    overlay.style.translate_y = 70; // y in [70,130): overflows clipper bottom 30px.
     overlay.setOpacityRaw(0.8);
     (try overlay.style.ensureExtFallible(cx.allocator)).z_index = 10;
     try clipper.appendChild(cx.allocator, overlay);
@@ -5653,7 +5723,7 @@ test "render: positive z child stays clipped on legacy overflow cache hit" {
     cx.frame_time_ms = 16.0;
     cx.perf.render_cache_hit = 0;
     _ = cx.render();
-    // 前提：本帧确实走了 legacy overflow cache 命中路径。
+    // Precondition: frame truly took legacy overflow cache hit path.
     try std.testing.expect(cx.perf.render_cache_hit > 0);
     try std.testing.expect(clipper.meta.per_frame.caches.commands.own != null);
     const replayed = (try c2ScissorStackForFill(cx, 80, 60, overlay_color)).rect orelse return error.CacheHitFrameUnclipped;
@@ -5661,12 +5731,13 @@ test "render: positive z child stays clipped on legacy overflow cache hit" {
 }
 
 fn knownBugPositiveZChildRepaint(promoted_is_grandparent: bool) !void {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(320, 240);
 
     const root = try box(cx, .{ .width = .{ .px = 320 }, .height = .{ .px = 240 } }, .{});
-    // opacity 恒为 1：dirty 侧判据 parent.opacity >= 0.999 成立 -> 子节点 render dirty 不冒泡。
+    // opacity always 1: dirty criterion parent.opacity >= 0.999 holds -> child render dirty doesn't
+    // bubble.
     const promoted = try box(cx, .{
         .width = .{ .px = 200 },
         .height = .{ .px = 200 },
@@ -5703,43 +5774,56 @@ fn knownBugPositiveZChildRepaint(promoted_is_grandparent: bool) !void {
     cx.frame_time_ms = 16.0;
     _ = cx.render();
     try std.testing.expectEqual(blue, knownBugFillColorOfSize(cx, 60, 70).?);
-    // 再来一帧（无新改动）：不能靠"下一帧自愈"蒙混过关。
+    // Re-render frame (no new changes): can't rely on "next frame self-heals".
     cx.frame_time_ms = 32.0;
     _ = cx.render();
     try std.testing.expectEqual(blue, knownBugFillColorOfSize(cx, 60, 70).?);
 }
 
 test "render: positive z child content change repaints under composited_group parent" {
-    // V2（方案 §3.3 / §10）。父节点 composited_group=true、opacity=1：dirty 侧判据
-    // (parent.opacity >= 0.999) 认为 z>0 子节点是带外单元 -> render dirty 不冒泡；渲染侧
-    // use_opacity_layer=true -> childEscapesAncestorClipInPass=false，promoted cache 命中时
-    // renderOverlayChildrenAfterCacheHit 不补渲染它。结果：改色后画面永久停在旧色。
-    // 探针实测（2026-09-24）：composited_group 与「z>0 + will_change」父节点都复现；
-    // rotate / scale / blend_mode 父节点不复现（它们不走 promoted replay，cache_hit=0）。
-    // C3 已修：父节点持有 promoted 缓存 -> 子节点不是带外单元 -> render dirty 照常冒泡到父。
+    // V2 (plan S3.3 / S10). Parent composited_group=true, opacity=1: the dirty criterion
+    // (parent.opacity >= 0.999) deems the z>0 child out-of-band so render dirty does not bubble,
+    // while
+    // the render side has use_opacity_layer=true -> childEscapesAncestorClipInPass=false and the
+    // promoted
+    // cache hit (renderOverlayChildrenAfterCacheHit) skips re-render: recolor sticks at the old
+    // color.
+    // Reproduces with composited_group and "z>0 + will_change" parents, not rotate / scale /
+    // blend_mode
+    // parents (no promoted replay, cache_hit=0). Fix: a parent holding a promoted cache makes the
+    // child not out-of-band.
     try knownBugPositiveZChildRepaint(false);
 }
 
 test "render: positive z grandchild content change repaints under composited_group ancestor" {
-    // V2 延伸：composited_group 祖父 -> 普通父（opacity 1，不走 opacity layer）-> z>0 子。
-    // 这里 dirty 侧与渲染侧判据**一致**（都认为子节点在父处带外），照样陈旧：
-    // 子节点 dirty 在父处就停止冒泡，promoted 祖父整段替放旧缓存，而补渲染只看祖父的
-    // 直接子节点。所以"统一判据"本身修不好它，C3 必须让带外 dirty 让包住它的
-    // promoted/缓存祖先失效，而不只是对齐两个谓词。OverlayStack 的 content 节点
-    // （Modal/Popover/Tooltip，overlay_stack.zig bindContentNode）都是 composited_group，
-    // 里面任何 z>0 节点（focus ring、checkbox 指示器等）原地改色都落在这个形状里。
-    // C3 已修：子->父这一跳是带外（父不失效），但冒泡越过它继续到 promoted 祖父。
+    // V2 extension: composited_group grandparent -> plain parent (opacity 1, no opacity layer) ->
+    // z>0 child.
+    // Here the dirty/render criteria **align** (both deem the child out-of-band), yet it is still
+    // stale:
+    // child dirty stops at parent, the promoted grandparent replays its whole old cache, and
+    // re-render
+    // only sees the grandparent's direct children. So aligning criteria alone doesn't fix it;
+    // out-of-band
+    // dirty must invalidate the promoted/cached ancestor. OverlayStack content nodes
+    // (Modal/Popover/
+    // Tooltip, overlay_stack.zig bindContentNode) are all composited_group, so in-place recolor of
+    // any
+    // z>0 node inside (focus ring, checkbox indicator, etc) lands here.
+    // Fix: child->parent hop is out-of-band (parent unchanged); bubble continues to promoted
+    // ancestor.
     try knownBugPositiveZChildRepaint(true);
 }
 
-// ─── C3：带外单元（z>0）的 render dirty 必须让包住它的缓存祖先失效 ───
+// --- C3: render dirty of an out-of-band unit (z>0) must invalidate the cache ancestor wrapping it
+// ---
 //
-// 方案 §5.4 / §10 C3。规则（node_dirty.zig bubbleOutOfBandSubtreeRender）：逐跳判定
-// "child 对 parent 是不是带外单元"（z>0 ∧ parent.opacity ≥ 0.999 ∧ parent 没有 promoted
-// 缓存）。是 -> parent 的 legacy 缓存替放会剔除 child 整棵子树再 fresh 补渲染，parent
-// 不必失效，但**继续往上走**；否则 parent 的缓存（promoted 整段替放 / legacy 快照）
-// 里含 child 的旧命令，必须置 subtree_render。旧实现在第一个带外跳处就整体停止冒泡，
-// 于是 promoted 父/祖父整段替放旧缓存（V2）。下面四条是正确性与性能两个方向的护栏。
+// Plan S5.4 / S10 C3. Rule (node_dirty.zig bubbleOutOfBandSubtreeRender): judge per hop whether the
+// child is out-of-band to its parent (z>0 AND parent.opacity >= 0.999 AND parent has no promoted
+// cache). Yes -> parent's legacy cache replay omits the child subtree and re-renders fresh, parent
+// unchanged, but **continue upward**. Else the parent cache (promoted whole replay / legacy
+// snapshot)
+// holds the child's old commands: set subtree_render. Stopping at the first out-of-band hop leaves
+// a promoted ancestor replaying the old cache (V2). Guardrails below cover correctness/perf.
 
 fn c3FillColorOfNode(cx: *Cx, node_id: u32) ?Color {
     var found: ?Color = null;
@@ -5752,9 +5836,10 @@ fn c3FillColorOfNode(cx: *Cx, node_id: u32) ?Color {
     return found;
 }
 
-/// 让 z>0 节点在 paint pass 里渲染（自带 opacity layer + 长时 scale 动画）：plain z>0 节点的
-/// 内容每帧由 prebuild fresh 重录，legacy 快照里根本没有它的条目，测不出陈旧（V1 探针的
-/// 同一结论）。带 layer 的才会被 legacy 快照整段捕获。
+/// z>0 node renders in paint pass (own opacity layer + long scale animation): plain z>0 content
+/// each frame fresh-built by prebuild, legacy snapshot has no entry, can't measure stale (V1 probe
+/// same
+/// conclusion). Layered only caught by legacy snapshot whole capture.
 fn c3MakePaintPassUnit(cx: *Cx, node: *Node) void {
     node.setOpacityRaw(0.8);
     ui.animateNode(node, cx.allocator, .{ .prop = .scale_x, .from = 0.99, .to = 1.0, .duration = 30.0 });
@@ -5772,11 +5857,14 @@ fn c3CountFillsOfNode(cx: *Cx, node_id: u32) usize {
 }
 
 test "render: C3 positive z grandchild change invalidates legacy overflow grandparent" {
-    // legacy overflow 祖父 -> 普通父 -> z>0 孙（paint pass 单元）：祖父的 legacy 快照只剔除
-    // 它**直接**的 z>0 子节点，孙子的旧命令就在快照里。孙->父这一跳是带外（可跳过），
-    // 父->祖父这一跳不是，必须让祖父失效。旧实现在第一跳就停止冒泡 -> 祖父命中快照、
-    // 画面停在旧色（方案 §10 V2 探针的"legacy 祖父不陈旧"只对 plain 孙子成立）。
-    var cx = try Cx.init(std.testing.allocator);
+    // legacy overflow ancestor -> plain parent -> z>0 grandchild (paint pass unit): ancestor legacy
+    // snapshot omits its **direct** z>0 children, grandchild old commands in snapshot.
+    // Grandchild->parent
+    // out-of-band (skip), parent->ancestor not, must invalidate ancestor. Old: stops at first hop
+    // ->
+    // ancestor hits cache, picture stale (plan S10 V2 probe "legacy ancestor not stale" only holds
+    // for plain).
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(200, 160);
 
@@ -5804,7 +5892,7 @@ test "render: C3 positive z grandchild change invalidates legacy overflow grandp
     cx.frame_time_ms = 16.0;
     cx.perf.render_cache_hit = 0;
     _ = cx.render();
-    // 前提：空闲帧确实命中 legacy 快照。
+    // Precondition: idle frame truly hits legacy snapshot.
     try std.testing.expect(cx.perf.render_cache_hit > 0);
 
     const blue = Color.rgba(0, 0, 255, 255);
@@ -5817,15 +5905,15 @@ test "render: C3 positive z grandchild change invalidates legacy overflow grandp
     cx.perf.render_cache_hit = 0;
     _ = cx.render();
     try std.testing.expectEqual(blue, knownBugFillColorOfSize(cx, 60, 70).?);
-    // 失效只发生一次：之后的空闲帧重新命中（重写后的）快照。
+    // Invalidate once only: later idle frames re-hit (rewritten) snapshot.
     try std.testing.expect(cx.perf.render_cache_hit > 0);
 }
 
 test "render: C3 positive z child change keeps legacy overflow parent cache hit" {
-    // 性能护栏：legacy overflow 父节点的**直接** z>0 子节点（paint pass 单元）改色时，父节点
-    // 的快照替放会剔除它再 fresh 补渲染，父节点不能因此失效（这正是带外优化要保的）。
-    // 同时断言补渲染出来的是新颜色，且只画一遍。
-    var cx = try Cx.init(std.testing.allocator);
+    // Perf guardrail: legacy overflow parent's **direct** z>0 child (paint pass unit) recolor,
+    // parent snapshot replay omits it, fresh re-render, parent unchanged (that's the out-of-band
+    // optimization to keep). Assert re-render produces new color, one render only.
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(200, 160);
 
@@ -5858,8 +5946,8 @@ test "render: C3 positive z child change keeps legacy overflow parent cache hit"
     cx.perf.render_cache_hit = 0;
     _ = cx.render();
     const idle_hits = cx.perf.render_cache_hit;
-    // 空闲帧命中 = clipper 的 legacy 快照 + overlay 自己的 promoted surface。改色帧 overlay
-    // 自己必然 miss（它就是脏的那个），其余命中数必须不变，即 clipper 仍命中。
+    // Idle hit = clipper legacy snapshot + overlay own promoted surface. Recolor frame overlay
+    // itself miss (it's dirty), rest hit unchanged = clipper still hits.
     try std.testing.expect(overlay.meta.per_frame.caches.commands.promoted != null);
     try std.testing.expectEqual(@as(u32, 2), idle_hits);
 
@@ -5876,10 +5964,11 @@ test "render: C3 positive z child change keeps legacy overflow parent cache hit"
 }
 
 test "render: C3 nested out-of-band hops keep legacy overflow ancestor cache hit" {
-    // portal 形态：legacy 根 -> portal(z>0，普通) -> content(z>0，paint pass 单元)。两跳都是
-    // 带外：content 的变化既不让 portal 失效，也不让根失效（根的快照剔除整棵 portal 子树
-    // 再补渲染）。"只跳第一跳、其余照常冒泡"的修法会在这里让根每次都 miss。
-    var cx = try Cx.init(std.testing.allocator);
+    // Portal form: legacy root -> portal(z>0, plain) -> content(z>0, paint pass unit). Both
+    // out-of-band:
+    // content change neither invalidates portal nor root (root snapshot omits whole portal subtree,
+    // fresh re-render). "Skip first hop, rest bubble" fix fails here (root misses every time).
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(200, 160);
 
@@ -5909,7 +5998,7 @@ test "render: C3 nested out-of-band hops keep legacy overflow ancestor cache hit
     cx.perf.render_cache_hit = 0;
     _ = cx.render();
     const idle_hits = cx.perf.render_cache_hit;
-    // 同上：空闲帧命中 = clipper 快照 + content 自己的 promoted surface。
+    // Same: idle hit = clipper snapshot + content own promoted surface.
     try std.testing.expect(content.meta.per_frame.caches.commands.promoted != null);
     try std.testing.expectEqual(@as(u32, 2), idle_hits);
 
@@ -5924,10 +6013,12 @@ test "render: C3 nested out-of-band hops keep legacy overflow ancestor cache hit
 }
 
 test "render: C3 idle frames keep promoted cache hits with positive z children" {
-    // 性能护栏：composited_group 容器里若干 z>0 子节点，空闲多帧，每帧命中数与
-    // 第 2 帧相同、零 miss；改其中一个子节点后，**兄弟** promoted 容器照样命中，
-    // 且改色后的下一帧起恢复到与改色前相同的命中数（不会退化成每帧重建）。
-    var cx = try Cx.init(std.testing.allocator);
+    // Perf guardrail: composited_group container with z>0 children, idle multi-frame, each hit
+    // count
+    // = frame 2, zero miss; recolor one child, **sibling** promoted container still hits,
+    // post-recolor next frame onward restore to pre-recolor hit count (no degradation to per-frame
+    // rebuild).
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(420, 240);
 
@@ -5987,7 +6078,7 @@ test "render: C3 idle frames keep promoted cache hits with positive z children" 
     cx.frame_time_ms = t;
     cx.perf.render_cache_hit = 0;
     _ = cx.render();
-    // 改色帧：只有改动的那个 group 重建，兄弟 group 仍命中。
+    // Recolor frame: only changed group rebuilds, sibling group still hits.
     try std.testing.expectEqual(idle_hits - 1, cx.perf.render_cache_hit);
     try std.testing.expectEqual(blue, c3FillColorOfNode(cx, kids[0][1].id).?);
     for (0..3) |_| {
@@ -6002,12 +6093,11 @@ test "render: C3 idle frames keep promoted cache hits with positive z children" 
     }
 }
 
-// ─── C2：z_index 与裁剪解耦（方案 sticky-zindex-clip-decoupling-plan.md §9.1 第 1、3、4、5 条）───
+// --- C2: z_index decoupled from clipping (plan sticky-zindex-clip-decoupling-plan.md S9.1 items
+// 1,3,4,5) ---
 //
-// 旧实现里 z>0 子节点在渲染侧丢掉 clip-bridge 那层 clip_id（像素只靠祖先的
-// scissor token 兜住），在命中侧清空 clip 链并拿到全局 stacking_z。下面几条断言的是
-// 解耦后的真实保证：z>0 与 z=0 兄弟的裁剪完全相同（同一 retained clip_id、同一
-// scissor 栈深度与矩形），z 只决定同级顺序。
+// Invariant: a z>0 child is clipped identically to a z=0 sibling (same retained clip_id, same
+// scissor depth/rect); z only orders peers.
 
 const C2ScissorStack = struct {
     depth: usize,
@@ -6020,9 +6110,9 @@ const C2SurfaceFrame = struct {
     src_y: f32,
 };
 
-/// 把当前 surface 嵌套下的局部矩形换算到世界坐标。begin_opacity_layer 内的
-/// 绘制与 push_clip（clip-bridge 的 owner-local 投影）都在 surface 局部空间：
-/// 父空间点 = M·(p − src)，M = draw_transform、src = begin 的 geom 原点。
+/// Convert local rect within current surface to world coords. begin_opacity_layer and push_clip
+/// (clip-bridge owner-local projection) both in surface local space:
+/// parent_space_point = M*(p - src), M = draw_transform, src = begin geom origin.
 fn c2RectToWorld(frames: []const C2SurfaceFrame, rect: ui.ComputedRect) ui.ComputedRect {
     var x0 = rect.x;
     var y0 = rect.y;
@@ -6044,11 +6134,11 @@ fn c2RectToWorld(frames: []const C2SurfaceFrame, rect: ui.ComputedRect) ui.Compu
     return ui.ComputedRect.init(x0, y0, x1 - x0, y1 - y0);
 }
 
-/// 降级后 paint 表里第一个匹配 (w,h,color) 的 fill 所处的 scissor 栈：深度 + 各层
-/// 换算到世界坐标后的交集（整数像素容差 0.5 内取整）。栈空时 rect = null。
-/// 必须考虑 opacity surface 的局部坐标系，否则 surface 内的 clip-bridge 会被误当成
-/// 世界坐标（C2 让自带 surface 的 z>0 子节点也拿到父 clip_id 之后必然出现这种形状；
-/// C1 阶段的 knownBugEffectiveScissorForFill 按世界坐标直接求交，已被本函数取代）。
+/// Degrade: take the first paint entry matching (w,h,color); scissor stack = depth + each layer
+/// converted to world, intersected (integer pixel tolerance, 0.5 rounding). Empty stack -> rect =
+/// null.
+/// Must account for opacity-surface local coords, else a surface clip-bridge is wrongly treated as
+/// world (z>0 children of a self-surface carry the parent clip_id).
 fn c2ScissorStackForFill(cx: *Cx, w: f32, h: f32, color: Color) !C2ScissorStack {
     var stack: [32]ui.ComputedRect = undefined;
     var depth: usize = 0;
@@ -6101,7 +6191,7 @@ fn c2ScissorStackForFill(cx: *Cx, w: f32, h: f32, color: Color) !C2ScissorStack 
     return error.TargetFillNotFound;
 }
 
-/// display_list 里某节点第一个 fill_rect 的下标。
+/// Display list first fill_rect index of some node.
 fn c2FirstFillIndex(cx: *Cx, node: *Node) ?usize {
     for (cx.display_list.items.items, 0..) |item, index| switch (item) {
         .fill_rect => |fill| if (fill.header.node_id == node.id) return index,
@@ -6110,8 +6200,8 @@ fn c2FirstFillIndex(cx: *Cx, node: *Node) ?usize {
     return null;
 }
 
-/// z>0 节点与作对照的 z=0 兄弟必须拿到完全相同的裁剪：同一 retained clip_id（且非空）、
-/// 同一 scissor 栈深度、同一有效裁剪矩形 == expected。
+/// z>0 node and z=0 sibling contrast must get identical clipping: same retained clip_id (non-null),
+/// same scissor depth, same effective rect == expected.
 fn c2ExpectSameClipAsPeer(
     cx: *Cx,
     raised: *Node,
@@ -6136,9 +6226,9 @@ fn c2ExpectSameClipAsPeer(
 }
 
 test "render: positive z child is clipped by overflow_hidden parent (fresh frame)" {
-    // §9.1 第 1 条。附录 A 探针 1：旧实现 z=0 的 scissor 深度 2（token + clip-bridge），
-    // z=5 深度 1、retained clip_id = INVALID（像素只靠 token 兜住）。
-    var cx = try Cx.init(std.testing.allocator);
+    // S9.1 item 1. Appendix A probe 1: old z=0 scissor depth 2 (token + clip-bridge),
+    // z=5 depth 1, retained clip_id = INVALID (pixels via token only).
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(300, 300);
 
@@ -6163,7 +6253,7 @@ test "render: positive z child is clipped by overflow_hidden parent (fresh frame
         .position = .absolute,
         .background = peer_color,
     }, .{});
-    // z>0 先 append：同级顺序由 z 决定，而不是树序。
+    // z>0 appended first: peer order by z, not tree.
     try clipper.appendChild(cx.allocator, raised);
     try clipper.appendChild(cx.allocator, peer);
     cx.root = clipper;
@@ -6171,13 +6261,13 @@ test "render: positive z child is clipped by overflow_hidden parent (fresh frame
     _ = cx.render();
 
     try c2ExpectSameClipAsPeer(cx, raised, .{ 200, 200 }, raised_color, peer, .{ 190, 190 }, peer_color, ui.ComputedRect.init(0, 0, 100, 100));
-    // 顺序：z=5 画在 z=0 之上。
+    // Order: z=5 drawn above z=0.
     try std.testing.expect(c2FirstFillIndex(cx, peer).? < c2FirstFillIndex(cx, raised).?);
 }
 
 test "render: positive z grandchild clipped by grand-ancestor clip" {
-    // §9.1 第 3 条。附录 A 探针 2：outer(clip) -> mid -> child(z=5)。
-    var cx = try Cx.init(std.testing.allocator);
+    // S9.1 item 3. Appendix A probe 2: outer(clip) -> mid -> child(z=5).
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(300, 300);
 
@@ -6214,16 +6304,18 @@ test "render: positive z grandchild clipped by grand-ancestor clip" {
     _ = cx.render();
 
     try c2ExpectSameClipAsPeer(cx, raised, .{ 200, 200 }, raised_color, peer, .{ 190, 190 }, peer_color, ui.ComputedRect.init(0, 0, 120, 90));
-    // 隔代：z>0 孙节点继承 outer 的裁剪（mid 本身不裁剪，clip_id 与 mid 相同）。
+    // Cross-generation: z>0 grandchild inherits outer clip (mid itself no clip, clip_id same as
+    // mid).
     try std.testing.expectEqual(cx.scene_runtime.get(mid.id).?.clip_id, cx.scene_runtime.get(raised.id).?.clip_id);
 }
 
 test "render: sticky with positive z is clipped by scroll viewport and orders above z=0 siblings" {
-    // §9.1 第 4 条。root(column) -> [topbar 40, viewport(200×200 clip) -> content(translate_y=-S)
-    //   -> [lead 500, section 300 -> [header 40 (sticky top=0, z=3), body 260]]]。
-    // S=780：header 被 section 底边钳制（C1 修正后补偿 260），屏幕 y = 40+500+260-780 = 20，
-    // 顶部 20px 滚出 viewport（落在 topbar 区）。
-    var cx = try Cx.init(std.testing.allocator);
+    // S9.1 item 4. root(column) -> [topbar 40, viewport(200x200 clip) -> content(translate_y=-S)
+    //   -> [lead 500, section 300 -> [header 40 (sticky top=0, z=3), body 260]]].
+    // S=780: header constrained by section bottom (post-C1 offset 260), screen y = 40+500+260-780 =
+    // 20,
+    // top 20px scrolled past viewport (in topbar area).
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(200, 240);
 
@@ -6272,20 +6364,20 @@ test "render: sticky with positive z is clipped by scroll viewport and orders ab
 
     const viewport_box = ui.ComputedRect.init(0, 40, 200, 200);
     try c2ExpectSameClipAsPeer(cx, header, .{ 200, 40 }, header_color, body, .{ 200, 260 }, body_color, viewport_box);
-    // 顺序：header（positive_z 带）画在同级 z=0 的 body 之上（两者在 section 内重叠）。
+    // Order: header (positive_z band) drawn above z=0 sibling body (both overlap in section).
     try std.testing.expect(c2FirstFillIndex(cx, body).? < c2FirstFillIndex(cx, header).?);
 
-    // 命中与像素一致：viewport 内的重叠区命中 header；滚出 viewport 的那 20px 落在 topbar 上，
-    // 必须命中 topbar 而不是（看不见的）header。
+    // Hit vs render same: viewport overlap hits header; scrolled past 20px in topbar,
+    // must hit topbar, not (invisible) header.
     try std.testing.expectEqual(header, cx.hitTest(100, 50).?);
     try std.testing.expectEqual(topbar, cx.hitTest(100, 30).?);
 }
 
 test "render: z>0 child of opacity-layer parent is included in surface bounds" {
-    // §9.1 第 5 条。非裁剪的 opacity 0.8 父节点，z>0 子节点溢出父框：解耦后它和 z=0 一样
-    // 画在父节点的 surface 里，children_bbox / surface begin_bounds 必须覆盖它，否则
-    // 溢出部分被纹理边界截掉（旧 computeChildrenBBox 排除 z>0）。
-    var cx = try Cx.init(std.testing.allocator);
+    // S9.1 item 5. Non-clip opacity 0.8 parent, z>0 child overflow parent frame: post-decouple
+    // renders in parent surface like z=0, children_bbox / surface begin_bounds must cover it,
+    // else overflow clipped by texture edge (old computeChildrenBBox excluded z>0).
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 400);
 
@@ -6302,8 +6394,8 @@ test "render: z>0 child of opacity-layer parent is included in surface bounds" {
         .position = .absolute,
         .background = Color.rgba(220, 40, 60, 255),
     }, .{});
-    raised.style.translate_x = 150; // 局部 x ∈ [150,210)：溢出父框右侧 110px
-    raised.style.translate_y = 170; // 局部 y ∈ [170,230)
+    raised.style.translate_x = 150; // Local x in [150,210): overflows parent right 110px.
+    raised.style.translate_y = 170; // Local y in [170,230).
     (try raised.style.ensureExtFallible(cx.allocator)).z_index = 5;
     try parent.appendChild(cx.allocator, raised);
     try root.appendChild(cx.allocator, parent);
@@ -6326,14 +6418,15 @@ test "render: z>0 child of opacity-layer parent is included in surface bounds" {
 }
 
 test "overlay: modal barrier is always portaled when root exists" {
-    // §9.2 第 15 条 / 方案 §6 步骤 1：overlay() 与 Popover 一致，总是经
-    // ensurePopoverPortalRoot 取 portal；standalone Cx 没预设 portal 时就地补建，
-    // 不再退回 caller inline append（inline 挂载会被祖先裁剪，z_index 不会让它逃逸）。
+    // S9.2 item 15 / plan S6 step 1: overlay() like Popover, always via
+    // ensurePopoverPortalRoot; standalone Cx no preset portal builds in-place,
+    // no longer fallback to caller inline append (inline mounted clipped by ancestor, z_index
+    // doesn't escape).
     const overlay_mod = @import("../overlay_stack.zig");
     const Scope = @import("../reactive.zig").Scope;
 
     {
-        var cx = try Cx.init(std.testing.allocator);
+        var cx = try Cx.init(std.testing.allocator, std.testing.io);
         defer cx.deinit();
         cx.setViewport(400, 300);
         const root = try box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
@@ -6352,7 +6445,7 @@ test "overlay: modal barrier is always portaled when root exists" {
         const portal = cx.popover_portal_root orelse return error.PortalNotCreated;
         try std.testing.expect(portal.parent == root);
         try std.testing.expect(res.barrier.?.parent == portal);
-        // 与 Popover 共用同一个 portal（第二个 modal 不再新建）。
+        // Share same portal as Popover (second modal doesn't create new).
         const res2 = try overlay_mod.overlay(scope, cx, .{
             .kind = .modal,
             .barrier = .{ .color = Color.rgba(0, 0, 0, 120) },
@@ -6365,8 +6458,8 @@ test "overlay: modal barrier is always portaled when root exists" {
     }
 
     {
-        // 纯单元测试场景（cx.root == null）：保留 inline 回退，由 caller append。
-        var cx = try Cx.init(std.testing.allocator);
+        // Pure unit test (cx.root == null): keep inline fallback, caller appends.
+        var cx = try Cx.init(std.testing.allocator, std.testing.io);
         defer cx.deinit();
         const scope = try Scope.init(std.testing.allocator, null, cx.owner);
         defer scope.dispose();
@@ -6379,7 +6472,7 @@ test "overlay: modal barrier is always portaled when root exists" {
         try std.testing.expect(!res.portaled);
         try std.testing.expect(res.barrier.?.parent == null);
         try std.testing.expect(cx.popover_portal_root == null);
-        // caller 负责挂载；这里把它挂进一棵临时树，避免 scope cleanup 前泄漏语义不清。
+        // Caller mounts; here temporary tree attach avoids scope cleanup leak.
         const host = try box(cx, .{ .width = .{ .px = 10 }, .height = .{ .px = 10 } }, .{});
         cx.root = host;
         try host.appendChild(std.testing.allocator, res.barrier.?);
@@ -6387,7 +6480,7 @@ test "overlay: modal barrier is always portaled when root exists" {
 }
 
 test "render: overlay composite animation marks promoted layer" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(320, 200);
 
@@ -6427,7 +6520,7 @@ test "render: overlay composite animation marks promoted layer" {
     try std.testing.expect(runtime.has_active_opacity_animation);
 
     var promoted_layer = false;
-    // P1.6'：从 LayerTree iterate（plan.layers 即将下台）。
+    // P1.6': iterate from LayerTree (plan.layers retiring).
     for (cx.layer_tree.layers.items) |tree_layer| {
         if (!tree_layer.alive) continue;
         const layer = tree_layer.composited orelse continue;
@@ -6445,7 +6538,7 @@ test "render: overlay composite animation marks promoted layer" {
 }
 
 test "render: promoted root layer prefers blur over opacity and rounded clip" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(320, 200);
 
@@ -6488,7 +6581,7 @@ test "render: promoted root layer prefers blur over opacity and rounded clip" {
 }
 
 test "render: rotate animation promotes overlay layer with affine support" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(320, 200);
 
@@ -6549,8 +6642,9 @@ test "render: rotate animation promotes overlay layer with affine support" {
 
     cx.perf.render_cache_hit = 0;
     cx.perf.render_cache_miss = 0;
-    // task #161 校准：v0.5-P4 加了 frame-time skip path，同 frame_time 时直接返回 cached commands
-    // 不进 promoted_surface_reused 路径。第二次 render 必须推进 frame time 才进入正常 render。
+    // task #161 calibration: v0.5-P4 adds frame-time skip path, same frame_time returns
+    // cached commands, skips promoted_surface_reused path. Second render needs frame time bump to
+    // normal.
     cx.frame_time_ms = 16.0;
     _ = cx.render();
 
@@ -6561,7 +6655,7 @@ test "render: rotate animation promotes overlay layer with affine support" {
 }
 
 test "render: icon quarter-turn rotation keeps affine surface transform" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(320, 200);
 
@@ -6604,22 +6698,16 @@ test "render: icon quarter-turn rotation keeps affine surface transform" {
 }
 
 test "render: promoted cache reuses only matching versions" {
-    // 曾长期 SkipZigTest，注释称"layer.flags.reused_this_frame=true 但
-    // cx.perf.render_cache_hit=0，与 v0.5-P4 skip path / promoted_cached_commands
-    // 持久状态交互需深入诊断"。
-    // **排查结论：不是 cache 系统不一致，是测试自己把帧跳过了。**
-    // v0.5-P4 零脏帧快速路径（core.zig:2991）的成立条件之一是
-    // `frame_time_ms == last_render_frame_time_ms`，而本测试原先在多处**重复**
-    // 写 `cx.frame_time_ms = 16.0`（注释还写着"推进 frame time 跳过 skip path"）,
-    // 第二次写等于没推进，于是 render 直接返回缓存、perf.resetFrame() 把计数清零。
-    // 实测证据：hit=0 **且 miss=0**（两者同时为 0 只可能是整帧被跳过），
-    // 而 reused_this_frame=true 是上一帧留下的状态。
-    // 修法：让帧时钟单调递增（16 -> 32 -> 48）。
+    // Zero-dirty fast path (core.zig:2991) requires `frame_time_ms == last_render_frame_time_ms`.
+    // The test must advance a monotonic frame clock (16 -> 32 -> 48); writing `cx.frame_time_ms =
+    // 16.0`
+    // repeatedly doesn't advance, render returns cached and perf.resetFrame() clears the count
+    // (symptom: hit=0 **and miss=0**; reused_this_frame=true is prev-frame state, not a cache
+    // inconsistency).
     //
-    // 另修两处 pre-surface 时代的过期断言：promoted surface 下 overlay 的
-    // translate/scale 由包裹层 draw_transform 承载，surface 内的 text 保持
-    // surface-local 坐标（实测恒 x=0），故断言改读包裹层的 draw_transform。
-    var cx = try Cx.init(std.testing.allocator);
+    // Promoted surface overlay translate/scale live in the wrapper draw_transform; surface-internal
+    // text stays surface-local (always x=0), so asserts read the wrapper draw_transform.
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(320, 200);
 
@@ -6667,7 +6755,7 @@ test "render: promoted cache reuses only matching versions" {
     try std.testing.expect(!first_runtime.promoted_surface_flags.invalidated_by_descendant_this_frame);
 
     cx.perf.render_cache_hit = 0;
-    cx.frame_time_ms = 16.0; // task #161: 推进 frame time 跳过 v0.5-P4 skip path
+    cx.frame_time_ms = 16.0; // task #161: advance frame time past v0.5-P4 skip path.
     _ = cx.render();
     try std.testing.expect(cx.perf.render_cache_hit > 0);
     const reused_runtime = cx.scene_runtime.get(overlay.id).?;
@@ -6696,11 +6784,11 @@ test "render: promoted cache reuses only matching versions" {
     const opacity_commands = cx.lowerForEncoderPaintTable();
     try std.testing.expect(cx.perf.render_cache_hit > 0);
 
-    // promoted surface 下，overlay 的 translate/scale 由包裹层的 draw_transform
-    // 承载，surface 内的 text 保持 **surface-local** 坐标（恒 x=0）。
-    // 原测试断言 "text.geom.x 增加 24"，那是 pre-surface 时代的期望，
-    // 在当前架构下永远不成立（实测 text x 恒为 0，位移在 dt[4] 上）。
-    // 改为读包裹层的 draw transform。
+    // Promoted surface: overlay translate/scale in wrapper draw_transform, surface-internal
+    // text stays **surface-local** (always x=0).
+    // Old assert "text.geom.x += 24" (pre-surface era), now never true (text x always 0, offset on
+    // dt[4]).
+    // Read wrapper draw_transform instead.
     var baseline_layer_x: ?f32 = null;
     for (opacity_commands) |cmd| {
         if (cmd.isControl(.begin_opacity_layer) and cmd.use_draw_transform) {
@@ -6780,7 +6868,7 @@ test "render: promoted cache reuses only matching versions" {
     try std.testing.expect(saw_scaled_draw_transform);
 
     cx.perf.render_cache_hit = 0;
-    cx.frame_time_ms = 32.0; // task #161: 跳过 v0.5-P4 skip path
+    cx.frame_time_ms = 32.0; // task #161: skip v0.5-P4 skip path.
     _ = cx.render();
     try std.testing.expect(cx.perf.render_cache_hit > 0);
     try std.testing.expect(cx.layer_tree.planFrameFlagsOf(0).reused_this_frame);
@@ -6793,13 +6881,13 @@ test "render: promoted cache reuses only matching versions" {
 
     overlay.markRenderDirty();
     cx.perf.render_cache_hit = 0;
-    cx.frame_time_ms = 48.0; // 帧时钟必须单调递增，见上方 skip-path 注释
+    cx.frame_time_ms = 48.0; // Frame clock must monotonic increase (see above skip-path comment).
     _ = cx.render();
     try std.testing.expectEqual(@as(u32, 0), cx.perf.render_cache_hit);
 }
 
 test "render: explicit composited group requests retained promoted surface" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(320, 200);
 
@@ -6836,7 +6924,7 @@ test "render: explicit composited group requests retained promoted surface" {
     try std.testing.expect(!first_runtime.promoted_surface_flags.reused_this_frame);
 
     cx.perf.render_cache_hit = 0;
-    cx.frame_time_ms = 16.0; // task #161: 跳过 v0.5-P4 skip path
+    cx.frame_time_ms = 16.0; // task #161: skip v0.5-P4 skip path.
     _ = cx.render();
 
     const reused_runtime = cx.scene_runtime.get(panel.id).?;
@@ -6856,7 +6944,7 @@ test "render: explicit composited group requests retained promoted surface" {
 }
 
 test "render: composited group descendants stay in content space during self scale" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(320, 200);
 
@@ -6908,7 +6996,7 @@ test "render: composited group descendants stay in content space during self sca
 }
 
 test "render: compositor-only dirty keeps content version stable" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(320, 200);
 
@@ -6954,8 +7042,36 @@ test "render: compositor-only dirty keeps content version stable" {
     try std.testing.expect(!runtime.promoted_surface_flags.rebuilt_this_frame);
 }
 
+test "render: font_smoothing = false reaches the encoder as TextFontFlag.no_smoothing" {
+    // Regression: the lowering pass rebuilt text_run field by field and dropped font_smoothing,
+    // so the iOS bars drew macOS-smoothed (heavier) glyphs.
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    cx.setViewport(320, 200);
+    const root = try box(cx, .{ .width = .{ .px = 320 }, .height = .{ .px = 200 } }, .{});
+    try root.appendChild(cx.allocator, try text(cx, "Crisp", .{ .font_size = 14, .font_smoothing = false }));
+    try root.appendChild(cx.allocator, try text(cx, "Smooth", .{ .font_size = 14 }));
+    cx.root = root;
+    cx.layout();
+    _ = cx.render();
+    const commands = cx.lowerForEncoderPaintTable();
+    var seen: u8 = 0;
+    for (commands) |cmd| {
+        if (!cmd.isText()) continue;
+        const no_smooth = (cmd.text_font_flags & @import("paint_table.zig").TextFontFlag.no_smoothing) != 0;
+        if (std.mem.eql(u8, cmd.text_content, "Crisp")) {
+            try std.testing.expect(no_smooth);
+            seen |= 1;
+        } else if (std.mem.eql(u8, cmd.text_content, "Smooth")) {
+            try std.testing.expect(!no_smooth);
+            seen |= 2;
+        }
+    }
+    try std.testing.expectEqual(@as(u8, 3), seen);
+}
+
 test "render: transform-animated text subtree auto stabilizes raster policy" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(320, 200);
 
@@ -6998,9 +7114,10 @@ test "render: transform-animated text subtree auto stabilizes raster policy" {
         if (cmd.isText()) {
             const t = cmd;
             if (std.mem.eql(u8, t.text_content, "Overlay text")) {
-                // paint_table.DisplayItem.text_raster_policy 三态过线：
-                // 0 = static_crisp; 1 = animated_stable/direct_animated; 2 = surface_cached。
-                // 动画中的 overlay 文本必须离开静态路径（1 或 2 都合法，取决于提升时机）。
+                // paint_table.DisplayItem.text_raster_policy three-state threshold:
+                // 0 = static_crisp; 1 = animated_stable/direct_animated; 2 = surface_cached.
+                // Animating overlay text must leave static path (1 or 2 both valid, depends promote
+                // timing).
                 try std.testing.expect(t.text_raster_policy != 0);
                 saw_stabilized_text = true;
                 break;
@@ -7011,7 +7128,7 @@ test "render: transform-animated text subtree auto stabilizes raster policy" {
 }
 
 test "render: will-change pre-promotes overlay layer before animation starts" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(320, 200);
 
@@ -7049,7 +7166,7 @@ test "render: will-change pre-promotes overlay layer before animation starts" {
 }
 
 test "render: promoted cache skips subtrees with before-render hooks" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(320, 200);
 
@@ -7100,7 +7217,7 @@ test "render: promoted cache skips subtrees with before-render hooks" {
 }
 
 test "render: legacy overflow cache skips subtrees with before-render hooks" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(320, 220);
 
@@ -7136,7 +7253,7 @@ test "render: legacy overflow cache skips subtrees with before-render hooks" {
 }
 
 test "render: overlay composite dirty preserves ancestor legacy overflow cache hits" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(320, 200);
 
@@ -7186,7 +7303,7 @@ test "render: overlay composite dirty preserves ancestor legacy overflow cache h
 }
 
 test "render: descendant composite dirty rebuilds promoted ancestor but preserves outer overflow cache" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(360, 240);
 
@@ -7270,7 +7387,7 @@ test "render: descendant composite dirty rebuilds promoted ancestor but preserve
     try std.testing.expectApproxEqAbs(baseline_inner_x.? + 24, translated_inner_x.?, 0.001);
 
     cx.perf.render_cache_hit = 0;
-    cx.frame_time_ms = 16.0; // task #161: 跳过 v0.5-P4 skip path
+    cx.frame_time_ms = 16.0; // task #161: skip v0.5-P4 skip path.
     _ = cx.render();
     try std.testing.expect(cx.perf.render_cache_hit >= 2);
     const reused_overlay_runtime = cx.scene_runtime.get(overlay_root.id).?;
@@ -7279,7 +7396,7 @@ test "render: descendant composite dirty rebuilds promoted ancestor but preserve
 }
 
 test "render: promoted descendant composite dirty still rebuilds promoted ancestor" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(360, 240);
 
@@ -7379,7 +7496,7 @@ test "render: promoted descendant composite dirty still rebuilds promoted ancest
     try std.testing.expect(child_runtime.promoted_surface_flags.reused_this_frame or child_runtime.promoted_surface_flags.rebuilt_this_frame);
 
     cx.perf.render_cache_hit = 0;
-    cx.frame_time_ms = 16.0; // task #161: 跳过 v0.5-P4 skip path
+    cx.frame_time_ms = 16.0; // task #161: skip v0.5-P4 skip path.
     _ = cx.render();
     const reused_overlay_runtime = cx.scene_runtime.get(overlay_root.id).?;
     try std.testing.expect(reused_overlay_runtime.promoted_surface_flags.reused_this_frame);
@@ -7390,7 +7507,7 @@ test "render: promoted descendant composite dirty still rebuilds promoted ancest
 }
 
 test "Cx: overlay composite dirty still counts as pending scene work" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(320, 200);
 
@@ -7424,7 +7541,7 @@ test "Cx: overlay composite dirty still counts as pending scene work" {
 }
 
 test "render: fully transparent skipped child clears stale render/composite dirty" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(320, 200);
 
@@ -7464,7 +7581,7 @@ test "render: fully transparent skipped child clears stale render/composite dirt
 }
 
 test "Cx: parent scale propagates to hit testing" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(240, 140);
 
@@ -7498,7 +7615,7 @@ test "Cx: parent scale propagates to hit testing" {
 }
 
 test "Cx: rotate propagates to hit testing" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(240, 180);
 
@@ -7528,7 +7645,7 @@ test "Cx: rotate propagates to hit testing" {
 }
 
 test "Cx: custom transform origin propagates to hit testing" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(240, 180);
 
@@ -7559,7 +7676,7 @@ test "Cx: custom transform origin propagates to hit testing" {
 }
 
 test "Cx: setTransformOrigin updates hit testing without touching StyleExt directly" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(240, 180);
 
@@ -7589,7 +7706,7 @@ test "Cx: setTransformOrigin updates hit testing without touching StyleExt direc
 }
 
 test "Cx: custom clip with path geometry constrains hit testing" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(200, 140);
 
@@ -7622,7 +7739,7 @@ test "Cx: custom clip with path geometry constrains hit testing" {
 }
 
 test "Cx: custom clip with path geometry preserves nonzero fill rule in hit testing" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(220, 160);
 
@@ -7655,7 +7772,7 @@ test "Cx: custom clip with path geometry preserves nonzero fill rule in hit test
 }
 
 test "Cx: custom clip with dedicated custom clip geometry constrains hit testing" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(200, 140);
 
@@ -7700,7 +7817,7 @@ test "Cx: custom clip provider geometry constrains hit testing" {
         }
     };
 
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(200, 140);
 
@@ -7758,7 +7875,7 @@ test "render: custom clip provider geometry regenerates after layout change" {
         }
     };
 
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(240, 140);
 
@@ -7815,7 +7932,7 @@ test "render: custom clip provider geometry regenerates after render-only change
         }
     };
 
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(240, 140);
 
@@ -7846,7 +7963,7 @@ test "render: custom clip provider geometry regenerates after render-only change
 }
 
 test "box: basic node construction" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(200, 100);
 
@@ -7859,7 +7976,7 @@ test "box: basic node construction" {
 }
 
 test "box: click handler" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(200, 100);
 
@@ -7890,7 +8007,7 @@ test "box: click handler" {
 }
 
 test "Cx: handleKeyDown with Tab cycles focus" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
 
@@ -7929,7 +8046,7 @@ test "Cx: handleKeyDown with Tab cycles focus" {
 }
 
 test "Cx: bubbled Tab handler suppresses default focus traversal" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
 
@@ -7982,7 +8099,7 @@ test "Cx: bubbled Tab handler suppresses default focus traversal" {
 }
 
 test "Cx: pointer capture release refreshes hover target" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(300, 120);
 
@@ -8042,7 +8159,7 @@ test "Cx: pointer capture release refreshes hover target" {
 }
 
 test "Cx: mouseUp can replace root during pointer capture without stale root dereference" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(300, 120);
 
@@ -8126,7 +8243,7 @@ test "Cx: mouseUp can replace root during pointer capture without stale root der
 }
 
 test "Cx: same-position hover keeps pending scene work for idle loop" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(220, 120);
 
@@ -8177,7 +8294,7 @@ test "Cx: same-position hover keeps pending scene work for idle loop" {
 }
 
 test "Cx: mouseDown syncs runtime and interaction for newly appended node" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
 
@@ -8193,12 +8310,12 @@ test "Cx: mouseDown syncs runtime and interaction for newly appended node" {
         .width = .{ .px = 100 },
         .height = .{ .px = 40 },
     }, .{});
-    // 需要 pointer 角色才能被 hitTest 找到
+    // Needs pointer role to hitTest find.
     button.setFocusable(true);
     try root.appendChild(cx.allocator, button);
 
     try std.testing.expect(root.frame_state.state_bits.dirty.runtime.subtree_dirty);
-    // appendChild 不再设置 subtree_order_dirty，只设置 subtree_runtime_index_dirty
+    // appendChild no longer sets subtree_order_dirty, only subtree_runtime_index_dirty.
 
     cx.handleMouseDown(10, 10, .{});
 
@@ -8207,7 +8324,7 @@ test "Cx: mouseDown syncs runtime and interaction for newly appended node" {
 }
 
 test "Cx: render resolves last mouse-down target through its generation handle" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
 
@@ -8241,7 +8358,7 @@ test "Cx: render resolves last mouse-down target through its generation handle" 
 }
 
 test "Cx: mouseMove syncs translated dirty subtree before render" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
 
@@ -8257,7 +8374,7 @@ test "Cx: mouseMove syncs translated dirty subtree before render" {
         .width = .{ .px = 80 },
         .height = .{ .px = 32 },
     }, .{});
-    // 需要 pointer 角色才能被 hitTest 找到
+    // Needs pointer role to hitTest find.
     button.setFocusable(true);
 
     try container.appendChild(cx.allocator, button);
@@ -8267,7 +8384,7 @@ test "Cx: mouseMove syncs translated dirty subtree before render" {
     _ = cx.render();
 
     container.style.translate_y = 80;
-    container.markLayoutDirty(); // translate 变更需要重新布局才能更新 hitTest 位置
+    container.markLayoutDirty(); // translate change needs layout to update hitTest position.
 
     cx.handleMouseMove(10, 90);
 
@@ -8275,7 +8392,7 @@ test "Cx: mouseMove syncs translated dirty subtree before render" {
 }
 
 test "Cx: deferred text commits preserve explicit invalidation and conservative defaults" {
-    const cx = try Cx.init(std.testing.allocator);
+    const cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     const Capture = struct {
         cx: *Cx,
@@ -8335,7 +8452,7 @@ test "Cx: deferred text commits preserve explicit invalidation and conservative 
 }
 
 test "Cx: handleTextInput dispatches to focused text editor" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
 
@@ -8376,7 +8493,7 @@ test "Cx: handleTextInput dispatches to focused text editor" {
 }
 
 test "Cx: handleImePreedit/Commit dispatches to focused text editor" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
 
@@ -8490,7 +8607,7 @@ test "Cx: text input session is the sole idempotent native IME owner" {
     var sdk = system_sdk.SystemSdk.init(std.testing.allocator, &backend, &vtable, .{ .ime = true });
     defer sdk.deinit();
 
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setSystemSdk(&sdk);
     // SDK attachment reconciles the initially unfocused window exactly once.
@@ -8569,7 +8686,7 @@ test "Cx: text input session is the sole idempotent native IME owner" {
     // window 1's live client. No render/focus retry may be needed to recover.
     const before_new_window = backend.enabled_calls;
     {
-        const other = try Cx.init(std.testing.allocator);
+        const other = try Cx.init(std.testing.allocator, std.testing.io);
         defer other.deinit();
         other.setWindowId(2);
         try std.testing.expectEqual(before_new_window, backend.enabled_calls);
@@ -8580,7 +8697,7 @@ test "Cx: text input session is the sole idempotent native IME owner" {
     }
     try std.testing.expectEqual(@as(c_int, 1), Native.zenit_text_input_selection(1, &start, &end, &caret));
     // Even an unused Cx destroyed with its default id must not clear window 1.
-    const unused = try Cx.init(std.testing.allocator);
+    const unused = try Cx.init(std.testing.allocator, std.testing.io);
     unused.deinit();
     try std.testing.expectEqual(@as(c_int, 1), Native.zenit_text_input_selection(1, &start, &end, &caret));
 
@@ -8592,7 +8709,7 @@ test "Cx: text input session is the sole idempotent native IME owner" {
     cx.setWindowId(1); // idempotent logical assignment preserves native identity
     try std.testing.expectEqual(@as(c_int, 1), Native.zenit_text_input_selection(101, &start, &end, &caret));
     {
-        const other = try Cx.init(std.testing.allocator);
+        const other = try Cx.init(std.testing.allocator, std.testing.io);
         defer other.deinit();
         // Logical id deliberately equals the first window's native id. Never
         // publish an intermediate resolver under that logical key.
@@ -8624,7 +8741,7 @@ test "Cx: text input session is the sole idempotent native IME owner" {
 }
 
 test "Cx: text and IME events ignore non-text focused nodes" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
 
@@ -8678,7 +8795,7 @@ test "Cx: text and IME events ignore non-text focused nodes" {
 }
 
 test "Cx: mouse interaction path does not fall back to tree hit test" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
 
@@ -8709,7 +8826,7 @@ test "Cx: mouse interaction path does not fall back to tree hit test" {
 }
 
 test "Cx: scroll interaction path does not fall back to tree hit test" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
 
@@ -8723,7 +8840,7 @@ test "Cx: scroll interaction path does not fall back to tree hit test" {
         .width = .{ .px = 240 },
         .height = .{ .px = 120 },
     }, .{});
-    // scroll hitTest 需要节点有 scroll 角色，设置 tag = .scroll
+    // scroll hitTest requires node to have scroll role; set tag = .scroll
     node.tag = .scroll;
     node.behavior.events.on_event = struct {
         fn handler(event: Event, context: ?*anyopaque) EventResult {
@@ -8749,7 +8866,7 @@ test "Cx: scroll interaction path does not fall back to tree hit test" {
 }
 
 test "Cx: registered texture svg hit shape auto-attaches to image nodes" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
 
     try cx.svg_textures.registerHit(
@@ -8798,7 +8915,7 @@ test "Cx: svg API caches embedded svg textures by data and size" {
         }
     };
 
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
 
     var state = LoaderState{};
@@ -8820,9 +8937,9 @@ test "Cx: svg API caches embedded svg textures by data and size" {
     });
     defer third.destroy(std.testing.allocator);
 
-    // svgOversampleFactor 对 ≤64px 图标做 2x oversample：
-    // first/second (viewBox 32×16) -> raster (64,32)，共享缓存
-    // third (style 64×32) -> raster (128,64)，独立 load
+    // svgOversampleFactor 2x-oversample <=64px icons:
+    // first/second (viewBox 32x16) -> raster (64,32), shared cache
+    // third (style 64x32) -> raster (128,64), separate load.
     try std.testing.expectEqual(@as(u32, 2), state.load_count);
     try std.testing.expectEqual(@as(u32, 128), state.last_width);
     try std.testing.expectEqual(@as(u32, 64), state.last_height);
@@ -8840,7 +8957,7 @@ test "Cx: svg API caches embedded svg textures by data and size" {
 }
 
 test "Cx: pure layout dirty does not rebuild runtime indexes" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
 
@@ -8866,7 +8983,7 @@ test "Cx: pure layout dirty does not rebuild runtime indexes" {
 }
 
 test "Cx: append child updates focus order without full runtime rebuild" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
 
@@ -8910,7 +9027,7 @@ test "Cx: append child updates focus order without full runtime rebuild" {
 }
 
 test "Cx: detach child updates focus order without full runtime rebuild" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
 
@@ -8951,7 +9068,7 @@ test "Cx: detach child updates focus order without full runtime rebuild" {
 }
 
 test "Cx: order dirty reorders focus order without runtime rebuild" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
 
@@ -9003,7 +9120,7 @@ test "Cx: order dirty reorders focus order without runtime rebuild" {
 }
 
 test "Cx: non-focus order dirty skips focus order rebuild" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
 
@@ -9063,7 +9180,7 @@ test "Cx: non-focus order dirty skips focus order rebuild" {
 }
 
 test "Cx: positive tabindex order dirty falls back to full focus rebuild" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(240, 120);
 
@@ -9100,7 +9217,7 @@ test "Cx: positive tabindex order dirty falls back to full focus rebuild" {
 }
 
 test "Cx: focusable toggle updates focus order incrementally" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(240, 120);
 
@@ -9134,7 +9251,7 @@ test "Cx: focusable toggle updates focus order incrementally" {
 }
 
 test "Cx: absolute layout dirty uses partial interaction rebuild" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(240, 120);
 
@@ -9163,7 +9280,7 @@ test "Cx: absolute layout dirty uses partial interaction rebuild" {
 }
 
 test "Cx: relative layout dirty uses partial interaction rebuild" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(240, 120);
 
@@ -9192,7 +9309,7 @@ test "Cx: relative layout dirty uses partial interaction rebuild" {
 }
 
 test "Cx: clipped layout dirty uses partial interaction rebuild" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(240, 120);
 
@@ -9227,7 +9344,7 @@ test "Cx: clipped layout dirty uses partial interaction rebuild" {
 }
 
 test "Cx: before-render layout dirty uses partial interaction rebuild" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(240, 120);
 
@@ -9262,7 +9379,7 @@ test "Cx: before-render layout dirty uses partial interaction rebuild" {
 }
 
 test "Cx: before-render deferred free invalidates collected partial roots" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(240, 120);
 
@@ -9312,7 +9429,7 @@ test "Cx: before-render deferred free invalidates collected partial roots" {
 }
 
 test "Cx: offscreen node animations still advance and finish" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(120, 80);
 
@@ -9353,15 +9470,15 @@ test "Cx: offscreen node animations still advance and finish" {
     _ = cx.render();
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), offscreen.getOpacity(), 0.01);
 
-    // 动画完成帧的 tick 仍会请求补一帧（linger + O(1) 活跃动画标志的
-    // 保守方向）；再渲染一帧后系统进入真正 idle。
+    // Animation complete frame tick still requests re-render (linger + O(1) active anim flag
+    // conservative); system truly idle after one more render.
     cx.frame_time_ms = 1016;
     _ = cx.render();
     try std.testing.expect(!cx.hasPendingSceneWork());
 }
 
 test "Cx: geometry-only interaction dirty uses partial interaction rebuild" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(240, 120);
 
@@ -9391,7 +9508,7 @@ test "Cx: geometry-only interaction dirty uses partial interaction rebuild" {
 }
 
 test "Cx: hitTest refreshes geometry-only dirty state without render" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(240, 120);
 
@@ -9418,7 +9535,7 @@ test "Cx: hitTest refreshes geometry-only dirty state without render" {
 }
 
 test "Cx: hitTest refreshes animated geometry without render" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(240, 120);
 
@@ -9451,7 +9568,7 @@ test "Cx: hitTest refreshes animated geometry without render" {
 }
 
 test "Cx: runtime dirty subtree can use partial interaction rebuild" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(240, 120);
 
@@ -9483,7 +9600,7 @@ test "Cx: runtime dirty subtree can use partial interaction rebuild" {
 }
 
 test "Cx: hitTest miss does not tree-fallback once index is built" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(240, 120);
 
@@ -9505,7 +9622,7 @@ test "Cx: hitTest miss does not tree-fallback once index is built" {
 }
 
 test "Node: replaceChildOrder preserves handles and parents" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(240, 120);
 
@@ -9545,7 +9662,7 @@ test "Node: replaceChildOrder preserves handles and parents" {
 }
 
 test "Node: focus setters mark order dirty" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(200, 100);
 
@@ -9573,7 +9690,7 @@ test "Node: focus setters mark order dirty" {
 }
 
 test "justify: space_between distributes remaining space" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(300, 100);
 
@@ -9598,7 +9715,7 @@ test "justify: space_between distributes remaining space" {
 }
 
 test "justify: space_around wraps children with equal space" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(300, 100);
 
@@ -9624,7 +9741,7 @@ test "justify: space_around wraps children with equal space" {
 }
 
 test "justify: space_evenly distributes with equal gaps including edges" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 100);
 
@@ -9650,13 +9767,13 @@ test "justify: space_evenly distributes with equal gaps including edges" {
 }
 
 test "fit container: intrinsic size from px children" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(800, 600);
 
-    // fit 容器包含 2 个 px 子节点 (row 方向, gap=10)
+    // fit container 2 px children (row, gap=10)
     // intrinsic width = 50 + 80 + 10(gap) = 140
-    // intrinsic height = max(30, 40) = 40
+    // intrinsic height = max(30, 40) = 40.
     const fit_container = try box(cx, .{
         .width = .{ .fit = .{} },
         .height = .{ .fit = .{} },
@@ -9675,7 +9792,7 @@ test "fit container: intrinsic size from px children" {
 }
 
 test "fit container relayouts on deep wrapped text height change" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(300, 200);
 
@@ -9735,12 +9852,83 @@ test "fit container relayouts on deep wrapped text height change" {
     try std.testing.expect(table_container.rectFromWorldOrFallback().y + table_container.rectFromWorldOrFallback().h >= text_node.rectFromWorldOrFallback().y + text_node.rectFromWorldOrFallback().h);
 }
 
+test "fit > grow > fit chain grows with wrapped text (grow under a fit grandparent backfills)" {
+    // GlassBox structure: root fit -> glass surface grow -> content fit -> wrapped text.
+    // Wrap happens in child layout, grow layer never backfilled, stays single-line height, fit
+    // ancestor sums
+    // -> text overflows glass bottom (storybook GlassBox Materials card).
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    cx.setViewport(800, 400);
+    const root = try box(cx, .{ .width = .{ .px = 800 }, .height = .{ .px = 400 }, .direction = .row, .align_items = .center }, .{});
+    const outer = try box(cx, .{ .width = .{ .px = 160 }, .height = .{ .fit = .{} }, .direction = .column }, .{});
+    const middle = try box(cx, .{ .width = .{ .grow = .{} }, .height = .{ .grow = .{} }, .direction = .column }, .{});
+    const inner = try box(cx, .{ .width = .{ .grow = .{} }, .height = .{ .fit = .{} }, .direction = .column, .padding = Padding.all(16) }, .{});
+    const t = try box(cx, .{ .width = .{ .grow = .{} }, .height = .{ .fit = .{} } }, .{});
+    t.setText(.{ .content = "Functional layer content. Functional layer content.", .font_size = 13, .wrap = .word });
+    try inner.appendChild(cx.allocator, t);
+    try middle.appendChild(cx.allocator, inner);
+    try outer.appendChild(cx.allocator, middle);
+    try root.appendChild(cx.allocator, outer);
+    cx.root = root;
+    cx.layout();
+    const th = t.rectFromWorldOrFallback().h;
+    try std.testing.expect(th > 20); // Really wrapped into multiline.
+    try std.testing.expectApproxEqAbs(th + 32, inner.rectFromWorldOrFallback().h, 0.5);
+    try std.testing.expectApproxEqAbs(inner.rectFromWorldOrFallback().h, middle.rectFromWorldOrFallback().h, 0.5);
+    try std.testing.expectApproxEqAbs(inner.rectFromWorldOrFallback().h, outer.rectFromWorldOrFallback().h, 0.5);
+}
+
+test "grow backfill under a fit parent only expands: a stretched grow panel keeps its children centred" {
+    // fit column grow-wide backplate stretched to widest sibling (240), narrow child (10) centered.
+    // If content backfill first shrinks the backplate to 10, the final align places the child by
+    // 10 (offset 0); the fit column then re-stretches the backplate to 240 without re-laying out
+    // the child -> child sticks left (storybook GlassBox Materials row shifted 24 pt left).
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    cx.setViewport(800, 400);
+    const root = try box(cx, .{ .width = .{ .px = 800 }, .height = .{ .px = 400 }, .direction = .row, .align_items = .start }, .{});
+    const col = try box(cx, .{ .width = .{ .fit = .{} }, .height = .{ .fit = .{} }, .direction = .column }, .{});
+    const wide = try box(cx, .{ .width = .{ .px = 240 }, .height = .{ .px = 20 } }, .{});
+    const panel = try box(cx, .{ .width = .{ .grow = .{} }, .height = .{ .px = 20 }, .direction = .column, .align_items = .center }, .{});
+    const dot = try box(cx, .{ .width = .{ .px = 10 }, .height = .{ .px = 10 } }, .{});
+    try panel.appendChild(cx.allocator, dot);
+    try col.appendChild(cx.allocator, wide);
+    try col.appendChild(cx.allocator, panel);
+    try root.appendChild(cx.allocator, col);
+    cx.root = root;
+    cx.layout();
+    try std.testing.expectApproxEqAbs(@as(f32, 240), panel.rectFromWorldOrFallback().w, 0.5);
+    try std.testing.expectApproxEqAbs(@as(f32, 115), dot.rectFromWorldOrFallback().x, 0.5);
+}
+
+test "absolute bottom-anchored fit child re-anchors after its wrapped text grows" {
+    // y was calculated before wrap: 20px-bottom panel wraps, bottom overshoots enclosure (storybook
+    // GlassAdapt).
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    cx.setViewport(640, 420);
+    const stage = try box(cx, .{ .width = .{ .px = 640 }, .height = .{ .px = 420 }, .position = .relative }, .{});
+    const panel = try box(cx, .{ .width = .{ .px = 220 }, .height = .{ .fit = .{} }, .direction = .column, .padding = Padding.all(16), .position = .absolute }, .{});
+    (try panel.style.ensureExtFallible(cx.allocator)).inset = .{ .right = .{ .px = 20 }, .bottom = .{ .px = 20 } };
+    const t = try box(cx, .{ .width = .{ .grow = .{} }, .height = .{ .fit = .{} } }, .{});
+    t.setText(.{ .content = "Material still adapts: the backdrop shows through, the shadow and rim follow.", .font_size = 13, .wrap = .word });
+    try panel.appendChild(cx.allocator, t);
+    try stage.appendChild(cx.allocator, panel);
+    cx.root = stage;
+    cx.layout();
+    const r = panel.rectFromWorldOrFallback();
+    try std.testing.expect(t.rectFromWorldOrFallback().h > 20); // Really wrapped.
+    try std.testing.expectApproxEqAbs(@as(f32, 400), r.y + r.h, 0.5);
+    try std.testing.expectApproxEqAbs(@as(f32, 620), r.x + r.w, 0.5);
+}
+
 test "stretch: fit children stretch on cross-axis" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 200);
 
-    // row 容器 align_items=stretch，fit 子节点应在交叉轴 (height) 上拉伸
+    // row align_items=stretch, fit child should stretch on cross-axis (height).
     const root = try box(cx, .{
         .width = .{ .px = 400 },
         .height = .{ .px = 200 },
@@ -9753,16 +9941,16 @@ test "stretch: fit children stretch on cross-axis" {
     cx.root = root;
     cx.layout();
 
-    // fit 子节点的 height 应被 stretch 到 200
+    // fit child height stretched to 200.
     try std.testing.expectEqual(@as(f32, 200), root.children.items[0].rectFromWorldOrFallback().h);
 }
 
 test "row_reverse: children laid out right-to-left" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(300, 100);
 
-    // 3 个子节点，正常 row 是 [A:0, B:50, C:150]，reverse 应为 [A:200, B:100, C:0]
+    // 3 children, normal row [A:0, B:50, C:150], reverse should [A:200, B:100, C:0].
     const root = try box(cx, .{
         .width = .{ .px = 300 },
         .height = .{ .px = 100 },
@@ -9780,14 +9968,14 @@ test "row_reverse: children laid out right-to-left" {
     const b = root.children.items[1];
     const c = root.children.items[2];
 
-    // reverse: C 在最左，B 在中间，A 在最右
+    // reverse: C leftmost, B center, A rightmost.
     try std.testing.expectEqual(@as(f32, 200), a.rectFromWorldOrFallback().x);
     try std.testing.expectEqual(@as(f32, 150), b.rectFromWorldOrFallback().x);
     try std.testing.expectEqual(@as(f32, 0), c.rectFromWorldOrFallback().x);
 }
 
 test "column_reverse: children laid out bottom-to-top" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(200, 300);
 
@@ -9808,18 +9996,18 @@ test "column_reverse: children laid out bottom-to-top" {
     const b = root.children.items[1];
     const c = root.children.items[2];
 
-    // reverse: C 在顶部，B 在中间，A 在底部
+    // reverse: C top, B center, A bottom.
     try std.testing.expectEqual(@as(f32, 220), a.rectFromWorldOrFallback().y); // 300 - 80 = 220
     try std.testing.expectEqual(@as(f32, 100), b.rectFromWorldOrFallback().y); // 300 - 80 - 120 = 100
     try std.testing.expectEqual(@as(f32, 0), c.rectFromWorldOrFallback().y); // 300 - 80 - 120 - 100 = 0
 }
 
 test "row_reverse: nested children positions offset correctly" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 200);
 
-    // 验证嵌套子节点的绝对位置也正确偏移
+    // Nested child absolute position offset correctly.
     const inner = try box(cx, .{ .width = .{ .px = 50 }, .height = .{ .px = 30 } }, .{});
     const container = try box(cx, .{
         .width = .{ .px = 100 },
@@ -9839,18 +10027,18 @@ test "row_reverse: nested children positions offset correctly" {
     cx.root = root;
     cx.layout();
 
-    // container 应在右侧 (400-100=300)
+    // Container rightmost (400-100=300).
     try std.testing.expectEqual(@as(f32, 300), container.rectFromWorldOrFallback().x);
-    // inner 在 container 内偏移 padding，相对坐标（不再是绝对坐标 310）
+    // inner offset padding inside container, relative (not absolute 310).
     try std.testing.expectEqual(@as(f32, 10), inner.rectFromWorldOrFallback().x);
 }
 
 test "flex_wrap: row wrap breaks into multiple lines" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(300, 300);
 
-    // 容器 300x300, 4 个 100px 宽子节点 -> 第一行放 3 个，第二行放 1 个
+    // Container 300x300, 4x100px children -> first row 3, second row 1.
     const root = try box(cx, .{
         .width = .{ .px = 300 },
         .height = .{ .px = 300 },
@@ -9871,7 +10059,7 @@ test "flex_wrap: row wrap breaks into multiple lines" {
     const c = root.children.items[2];
     const d = root.children.items[3];
 
-    // 第一行: A(0,0), B(100,0), C(200,0)
+    // First row: A(0,0), B(100,0), C(200,0).
     try std.testing.expectEqual(@as(f32, 0), a.rectFromWorldOrFallback().x);
     try std.testing.expectEqual(@as(f32, 0), a.rectFromWorldOrFallback().y);
     try std.testing.expectEqual(@as(f32, 100), b.rectFromWorldOrFallback().x);
@@ -9879,17 +10067,17 @@ test "flex_wrap: row wrap breaks into multiple lines" {
     try std.testing.expectEqual(@as(f32, 200), c.rectFromWorldOrFallback().x);
     try std.testing.expectEqual(@as(f32, 0), c.rectFromWorldOrFallback().y);
 
-    // 第二行: D(0, 50)
+    // Second row: D(0,50).
     try std.testing.expectEqual(@as(f32, 0), d.rectFromWorldOrFallback().x);
     try std.testing.expectEqual(@as(f32, 50), d.rectFromWorldOrFallback().y);
 }
 
 test "flex_wrap: column wrap breaks into multiple columns" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 200);
 
-    // 容器 400x200, column wrap, 3 个 100px 高子节点 -> 第一列 2 个，第二列 1 个
+    // Container 400x200, column wrap, 3x100px children -> col 1 has 2, col 2 has 1.
     const root = try box(cx, .{
         .width = .{ .px = 400 },
         .height = .{ .px = 200 },
@@ -9908,25 +10096,25 @@ test "flex_wrap: column wrap breaks into multiple columns" {
     const b = root.children.items[1];
     const c = root.children.items[2];
 
-    // 第一列: A(0,0), B(0,100)
+    // First column: A(0,0), B(0,100).
     try std.testing.expectEqual(@as(f32, 0), a.rectFromWorldOrFallback().x);
     try std.testing.expectEqual(@as(f32, 0), a.rectFromWorldOrFallback().y);
     try std.testing.expectEqual(@as(f32, 0), b.rectFromWorldOrFallback().x);
     try std.testing.expectEqual(@as(f32, 100), b.rectFromWorldOrFallback().y);
 
-    // 第二列: C(80,0)
+    // Second column: C(80,0).
     try std.testing.expectEqual(@as(f32, 80), c.rectFromWorldOrFallback().x);
     try std.testing.expectEqual(@as(f32, 0), c.rectFromWorldOrFallback().y);
 }
 
 test "flex_wrap: wrap_reverse reverses cross axis" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(200, 300);
 
-    // 容器 200x300, row wrap_reverse, 4 个 100px 子节点 -> 2 行
-    // 正常 wrap: 第1行 y=0, 第2行 y=50
-    // wrap_reverse: 第1行在底部, 第2行在顶部
+    // Container 200x300, row wrap_reverse, 4x100px children -> 2 rows.
+    // Normal wrap: row 1 y=0, row 2 y=50.
+    // wrap_reverse: row 1 bottom, row 2 top.
     const root = try box(cx, .{
         .width = .{ .px = 200 },
         .height = .{ .px = 300 },
@@ -9947,7 +10135,7 @@ test "flex_wrap: wrap_reverse reverses cross axis" {
     const c = root.children.items[2];
     const d = root.children.items[3];
 
-    // wrap_reverse: 第1行(A,B)在底部, 第2行(C,D)在顶部
+    // wrap_reverse: row 1 (A,B) bottom, row 2 (C,D) top.
     try std.testing.expectEqual(@as(f32, 250), a.rectFromWorldOrFallback().y); // 300 - 50 = 250
     try std.testing.expectEqual(@as(f32, 250), b.rectFromWorldOrFallback().y);
     try std.testing.expectEqual(@as(f32, 200), c.rectFromWorldOrFallback().y); // 300 - 50 - 50 = 200
@@ -9955,7 +10143,7 @@ test "flex_wrap: wrap_reverse reverses cross axis" {
 }
 
 test "Context API: provide and consume" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
 
     const AppTheme = struct {
@@ -9963,22 +10151,22 @@ test "Context API: provide and consume" {
         font_size: f32,
     };
 
-    var app_theme = AppTheme{ .accent = theme.dark.color.accent, .font_size = 16 };
+    var app_theme = AppTheme{ .accent = theme.dark.tokens.color.accent, .font_size = 16 };
     try cx.provide(AppTheme, &app_theme);
 
-    // 消费上下文
+    // Consume context.
     const retrieved = cx.consume(AppTheme);
     try std.testing.expect(retrieved != null);
     try std.testing.expectEqual(@as(f32, 16), retrieved.?.font_size);
 
-    // 修改后再消费
+    // Modify then consume.
     app_theme.font_size = 20;
     const retrieved2 = cx.consume(AppTheme);
     try std.testing.expectEqual(@as(f32, 20), retrieved2.?.font_size);
 }
 
 test "Context API: consume returns null if not provided" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
 
     const MyConfig = struct { value: i32 };
@@ -9987,7 +10175,7 @@ test "Context API: consume returns null if not provided" {
 }
 
 test "Context API: provide overwrites existing" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
 
     const Config = struct { value: i32 };
@@ -10000,18 +10188,18 @@ test "Context API: provide overwrites existing" {
     try cx.provide(Config, &cfg2);
     try std.testing.expectEqual(@as(i32, 2), cx.consume(Config).?.value);
 
-    // 只有一个条目 (不是两个)
+    // Only one entry (not two).
     try std.testing.expectEqual(@as(usize, 1), cx.contextCount());
 }
 
 test "Context API: multiple types" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
 
     const ThemeCtx = struct { accent: Color };
     const UserCtx = struct { name: []const u8 };
 
-    var theme_ctx = ThemeCtx{ .accent = theme.dark.color.accent };
+    var theme_ctx = ThemeCtx{ .accent = theme.dark.tokens.color.accent };
     var user = UserCtx{ .name = "Alice" };
 
     try cx.provide(ThemeCtx, &theme_ctx);
@@ -10019,14 +10207,14 @@ test "Context API: multiple types" {
 
     try std.testing.expectEqual(@as(usize, 2), cx.contextCount());
     try std.testing.expectEqualStrings("Alice", cx.consume(UserCtx).?.name);
-    try std.testing.expect(Color.eql(theme.dark.color.accent, cx.consume(ThemeCtx).?.accent));
+    try std.testing.expect(Color.eql(theme.dark.tokens.color.accent, cx.consume(ThemeCtx).?.accent));
 }
 
 test "Context API: overflow returns error" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
 
-    // 填满 16 个 context 槽 (每个用不同类型)
+    // Fill 16 context slots (each different type).
     var vals: [16]u8 = undefined;
     inline for (0..16) |i| {
         const T = GenContextType(i);
@@ -10034,7 +10222,7 @@ test "Context API: overflow returns error" {
     }
     try std.testing.expectEqual(@as(usize, 16), cx.contextCount());
 
-    // 第 17 个应返回 error.ContextsFull
+    // 17th should return error.ContextsFull.
     var extra: u8 = 0;
     const result = cx.provide(struct { x: u8 }, @ptrCast(&extra));
     try std.testing.expectError(error.ContextsFull, result);
@@ -10047,7 +10235,7 @@ fn GenContextType(comptime i: usize) type {
 }
 
 test "Cx: handleKeyUp dispatches to focused node" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
 
     const root = try box(cx, .{
@@ -10080,7 +10268,7 @@ test "Cx: handleKeyUp dispatches to focused node" {
 }
 
 test "Grid: multi-span child expands auto columns" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(300, 200);
 
@@ -10119,7 +10307,7 @@ test "Grid: multi-span child expands auto columns" {
 }
 
 test "Grid: multi-span child expands auto rows" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(200, 240);
 
@@ -10152,7 +10340,7 @@ test "Grid: multi-span child expands auto rows" {
 }
 
 test "Grid: raw counts and explicit placement are bounded by backing tables" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(320, 160);
 
@@ -10196,7 +10384,7 @@ test "Grid: raw counts and explicit placement are bounded by backing tables" {
 }
 
 test "Layout: fit container includes child margins in size" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(120, 80);
 
@@ -10222,7 +10410,7 @@ test "Layout: fit container includes child margins in size" {
 }
 
 test "Layout: wrap layout accounts for child margins" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(100, 80);
 
@@ -10258,7 +10446,7 @@ test "Layout: wrap layout accounts for child margins" {
 }
 
 test "Layout: absolute grow subtracts margins from size" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(200, 100);
 
@@ -10284,7 +10472,7 @@ test "Layout: absolute grow subtracts margins from size" {
 }
 
 test "Layout: absolute children use the parent padding box as containing block" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(120, 80);
 
@@ -10363,7 +10551,7 @@ test "Layout: absolute children use the parent padding box as containing block" 
 }
 
 test "Grid: absolute children use the parent padding box as containing block" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(140, 90);
 
@@ -10391,7 +10579,7 @@ test "Grid: absolute children use the parent padding box as containing block" {
 }
 
 test "Grid: auto tracks and alignment include margins" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(160, 120);
 
@@ -10442,20 +10630,20 @@ test "Grid: auto tracks and alignment include margins" {
 }
 
 test "Layout: no_cross_stretch only suppresses inherited stretch" {
-    // column 的交叉轴是 width：fit 宽 + justify=center 的 row 子节点（intrinsic 宽 = 30px
-    // 的内嵌 px 盒）。inner_x 断言内容没有按「被拉伸后的宽度」居中而漂出子节点自身框。
+    // column cross-axis = width: fit-wide + justify=center row child (intrinsic 30px px box).
+    // inner_x assert content not center-aligned to stretched width, not escape child frame.
     const Case = struct { align_items: ui.AlignItems, explicit: ?ui.AlignItems, want_x: f32 };
     const cases = [_]Case{
         .{ .align_items = .stretch, .explicit = null, .want_x = 0 },
         .{ .align_items = .center, .explicit = null, .want_x = 85 },
         .{ .align_items = .end, .explicit = null, .want_x = 170 },
         .{ .align_items = .start, .explicit = null, .want_x = 0 },
-        // 显式 align_self 优先于 flag
+        // Explicit align_self prioritizes flag.
         .{ .align_items = .stretch, .explicit = .end, .want_x = 170 },
         .{ .align_items = .center, .explicit = .start, .want_x = 0 },
     };
     for (cases) |c| {
-        var cx = try Cx.init(std.testing.allocator);
+        var cx = try Cx.init(std.testing.allocator, std.testing.io);
         defer cx.deinit();
         cx.setViewport(200, 100);
 
@@ -10487,9 +10675,9 @@ test "Layout: no_cross_stretch only suppresses inherited stretch" {
 }
 
 test "Layout: fit back-fill repositions main-axis content against final size" {
-    // fit 宽的 row 容器被父 column 的 stretch 先拉到 200 宽、按 200 算 justify 偏移，
-    // 随后自身 fit 回填缩回 intrinsic 宽。回填后主轴位置必须按最终尺寸重排，
-    // 否则内容停在按 200 算出的位置、漂出容器框。不带 no_cross_stretch。
+    // fit-wide row stretched by parent column to 200, justify offset by 200,
+    // then fit backfill shrink. Post-backfill main reposition must use final size,
+    // else content stops at 200-offset, escape box. Without the no_cross_stretch flag.
     const Case = struct {
         justify: ui.Justify,
         parent_align: ui.AlignItems,
@@ -10502,12 +10690,12 @@ test "Layout: fit back-fill repositions main-axis content against final size" {
         .{ .justify = .center, .parent_align = .stretch, .explicit = null, .min_w = 0, .want_w = 30, .want_inner_x = 0 },
         .{ .justify = .end, .parent_align = .stretch, .explicit = null, .min_w = 0, .want_w = 30, .want_inner_x = 0 },
         .{ .justify = .center, .parent_align = .start, .explicit = .stretch, .min_w = 0, .want_w = 30, .want_inner_x = 0 },
-        // min_width 让最终尺寸 > 内容：居中按最终 100 宽算，而不是按拉伸的 200 宽
+        // min_width inflates final size > content: center by final 100w, not stretched 200w.
         .{ .justify = .center, .parent_align = .stretch, .explicit = null, .min_w = 100, .want_w = 100, .want_inner_x = 35 },
         .{ .justify = .end, .parent_align = .stretch, .explicit = null, .min_w = 100, .want_w = 100, .want_inner_x = 70 },
     };
     for (cases) |c| {
-        var cx = try Cx.init(std.testing.allocator);
+        var cx = try Cx.init(std.testing.allocator, std.testing.io);
         defer cx.deinit();
         cx.setViewport(200, 100);
 
@@ -10543,7 +10731,7 @@ test "Layout: fit back-fill repositions main-axis content against final size" {
 }
 
 test "Layout: fit back-fill keeps centered content inside after incremental resize" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(200, 100);
 
@@ -10564,7 +10752,7 @@ test "Layout: fit back-fill keeps centered content inside after incremental resi
     cx.layout();
     try std.testing.expectApproxEqAbs(@as(f32, 0), inner.rectFromWorldOrFallback().x, 0.001);
 
-    // 增量：只改内层尺寸并标脏，第二帧同样不能漂
+    // Increment: only change inner size, mark dirty, second frame same no escape.
     inner.style.width = .{ .px = 50 };
     inner.markLayoutDirty();
     cx.layout();
@@ -10573,10 +10761,10 @@ test "Layout: fit back-fill keeps centered content inside after incremental resi
 }
 
 test "Layout: fit back-fill relayout does not flip-flop child positions" {
-    // 首轮 justify 按预测的回填尺寸算：fit 容器全量重排时子节点位置不应
-    // 「先按拉伸宽摆到 85 -> 回填后挪回 0」来回翻转（翻转会把子节点标 layout 脏、
-    // overflow_hidden 子节点连带失效渲染缓存）。
-    var cx = try Cx.init(std.testing.allocator);
+    // First-pass justify by predicted backfill size: fit container full-relayout child
+    // positions not "append at stretch-width 85 -> backfill move to 0" flip
+    // (flip marks child layout-dirty, overflow_hidden child loses render cache).
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(200, 100);
 
@@ -10605,15 +10793,15 @@ test "Layout: fit back-fill relayout does not flip-flop child positions" {
 }
 
 test "Layout: fit back-fill repositions auto-margin content against final size" {
-    // 主轴 auto margin 在首轮按拉伸宽分配剩余空间（不走回填尺寸预测），
-    // 只能靠回填后的主轴终轮定位纠正。
+    // Main-axis auto margin first-pass by stretch-width spare (no backfill predict),
+    // only post-backfill main final-place correct. .
     const Case = struct { min_w: f32, want_w: f32, want_inner_x: f32 };
     const cases = [_]Case{
         .{ .min_w = 0, .want_w = 30, .want_inner_x = 0 },
         .{ .min_w = 100, .want_w = 100, .want_inner_x = 35 },
     };
     for (cases) |c| {
-        var cx = try Cx.init(std.testing.allocator);
+        var cx = try Cx.init(std.testing.allocator, std.testing.io);
         defer cx.deinit();
         cx.setViewport(200, 100);
 
@@ -10643,7 +10831,7 @@ test "Layout: fit back-fill repositions auto-margin content against final size" 
 }
 
 test "Layout: fit-width column with align_items=center stays inside stretched-then-backfilled box" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(200, 100);
 
@@ -10670,7 +10858,7 @@ test "Layout: fit-width column with align_items=center stays inside stretched-th
 }
 
 test "Layout: auto margins absorb remaining flow space" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(200, 80);
 
@@ -10693,7 +10881,7 @@ test "Layout: auto margins absorb remaining flow space" {
 }
 
 test "Layout: absolute auto margins center inside inset box" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(240, 120);
 
@@ -10722,7 +10910,7 @@ test "Layout: absolute auto margins center inside inset box" {
 }
 
 test "Node margin helpers clear stale auto flags" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
 
     const node = try box(cx, .{}, .{});
@@ -10745,7 +10933,7 @@ test "Node margin helpers clear stale auto flags" {
 }
 
 test "box style margin_spec supports auto margins declaratively" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(200, 80);
 
@@ -10771,7 +10959,7 @@ test "box style margin_spec supports auto margins declaratively" {
 }
 
 test "Cx.freeNode releases transition slots" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(100, 100);
 
@@ -10790,7 +10978,7 @@ test "Cx.freeNode releases transition slots" {
     cx.root = root;
 }
 
-// ==================== StyleOverride 测试 ====================
+// ==================== StyleOverride tests ====================
 
 const StyleOverride = ui.StyleOverride;
 const Style = ui.Style;
@@ -10824,15 +11012,15 @@ test "StyleOverride: merge — other 覆盖 self" {
     };
     const result = base.merge(over);
 
-    // background 被覆盖
+    // background override
     try std.testing.expect(Color.eql(result.background.?, Color.hex(0x00FF00)));
-    // opacity 保留 base
+    // opacity retains base
     try std.testing.expectEqual(@as(f32, 0.5), result.opacity.?);
-    // font_weight 保留 base
+    // font_weight retains base
     try std.testing.expectEqual(@as(u16, 400), result.font_weight.?);
-    // gap 来自 other
+    // gap from other
     try std.testing.expectEqual(@as(f32, 16), result.gap.?);
-    // 未设置的仍为 null
+    // unset fields remain null
     try std.testing.expect(result.border == null);
 }
 
@@ -10864,24 +11052,24 @@ test "StyleOverride: applyTo — 覆盖 Style 字段" {
     };
     ov.applyTo(&style, null);
 
-    // background/opacity 已不在 Style -> World.paint_state。
-    // applyTo 不再写 Style.background/opacity；它们经 paintOverride() 携带，
-    // 由 builder 在 Node.create 后用 setBackgroundRaw/setOpacityRaw 落 SoA。
+    // background/opacity no longer in Style -> World.paint_state.
+    // applyTo no longer writes Style.background/opacity; carried via paintOverride(),
+    // builder sets SoA fields via setBackgroundRaw/setOpacityRaw after Node.create.
     const po = ov.paintOverride();
     try std.testing.expect(Color.eql(po.background.?, Color.hex(0xFF0000)));
     try std.testing.expectEqual(@as(f32, 0.8), po.opacity.?);
     try std.testing.expectEqual(@as(f32, 12), style.gap);
-    // width 被覆盖
+    // width override
     switch (style.width) {
         .px => |v| try std.testing.expectEqual(@as(f32, 200), v),
         else => return error.TestUnexpectedResult,
     }
-    // 未覆盖的保持默认
+    // unoverridden fields stay default
     try std.testing.expectEqual(style.direction, .column);
 }
 
 test "StyleOverride: applyTo — margin_spec writes auto flags" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     var style = ui.Style{};
     defer if (style.ext) |e| cx.allocator.destroy(e);
@@ -10910,8 +11098,8 @@ test "StyleOverride: applyTo — null 字段不影响 Style" {
     const ov = StyleOverride{ .gap = 8 };
     ov.applyTo(&style, null);
 
-    // 无 paint 字段的 override，paintOverride() 全 null
-    // （builder 据此跳过 setBackgroundRaw/setOpacityRaw，保留节点已有 SoA 值）。
+    // no paint fields in override -> paintOverride() returns all null
+    // (builder skips setBackgroundRaw/setOpacityRaw, preserves existing node SoA values)
     const po = ov.paintOverride();
     try std.testing.expect(po.background == null);
     try std.testing.expect(po.opacity == null);
@@ -10964,43 +11152,43 @@ test "StyleOverride: applyTo — corner_radius 写入 ext" {
     const ov = StyleOverride{ .corner_radius = 12 };
     ov.applyTo(&style, std.testing.allocator);
 
-    // ext 应已分配且 corner_radius 设置
+    // ext should be allocated and corner_radius set
     try std.testing.expect(style.ext != null);
     const cr = style.corner_radius().?;
     try std.testing.expectEqual(@as(f32, 12), cr.resolve());
 
-    // 清理 ext
+    // free ext
     std.testing.allocator.destroy(style.ext.?);
 }
 
-// ==================== Style Inherit 测试 ====================
+// ==================== Style Inherit tests ====================
 
 test "Node.resolveTextColor: 从 parent 链继承 text_color" {
-    var cx = try ui.Cx.init(std.testing.allocator);
+    var cx = try ui.Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
 
     const root = try box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 400 } }, .{});
     cx.root = root;
 
-    // root 设置 text_color
+    // root sets text_color
     root.style.ensureExtPanic(cx.allocator).text_color = Color.hex(0xFF0000);
 
-    // 中间容器（无 text_color）
+    // intermediate container (no text_color)
     const container = try box(cx, .{ .width = .{ .px = 200 }, .height = .{ .px = 200 } }, .{});
     try root.appendChild(cx.allocator, container);
 
-    // 叶子节点
+    // leaf node
     const leaf = try box(cx, .{ .width = .{ .px = 100 }, .height = .{ .px = 50 } }, .{});
     try container.appendChild(cx.allocator, leaf);
 
-    // leaf 应继承 root 的 text_color（跳过 container）
+    // leaf inherits root text_color (skips container)
     const resolved = leaf.resolveTextColor();
     try std.testing.expect(resolved != null);
     try std.testing.expect(Color.eql(resolved.?, Color.hex(0xFF0000)));
 }
 
 test "Node.resolveTextColor: 就近覆盖" {
-    var cx = try ui.Cx.init(std.testing.allocator);
+    var cx = try ui.Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
 
     const root = try box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 400 } }, .{});
@@ -11015,14 +11203,14 @@ test "Node.resolveTextColor: 就近覆盖" {
     const leaf = try box(cx, .{ .width = .{ .px = 100 }, .height = .{ .px = 50 } }, .{});
     try container.appendChild(cx.allocator, leaf);
 
-    // leaf 应取最近的 container 的 text_color（绿色），不是 root 的红色
+    // leaf inherits nearest container text_color (green), not root (red)
     const resolved = leaf.resolveTextColor();
     try std.testing.expect(resolved != null);
     try std.testing.expect(Color.eql(resolved.?, Color.hex(0x00FF00)));
 }
 
 test "Node.resolveTextColor: 无继承返回 null" {
-    var cx = try ui.Cx.init(std.testing.allocator);
+    var cx = try ui.Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
 
     const root = try box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 400 } }, .{});
@@ -11031,12 +11219,12 @@ test "Node.resolveTextColor: 无继承返回 null" {
     const leaf = try box(cx, .{ .width = .{ .px = 100 }, .height = .{ .px = 50 } }, .{});
     try root.appendChild(cx.allocator, leaf);
 
-    // 无任何 parent 设置 text_color
+    // no parent sets text_color
     try std.testing.expect(leaf.resolveTextColor() == null);
 }
 
 test "Node.resolveTextFontSize/Weight: 继承生效" {
-    var cx = try ui.Cx.init(std.testing.allocator);
+    var cx = try ui.Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
 
     const root = try box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 400 } }, .{});
@@ -11089,7 +11277,7 @@ fn testDrawContextForList(cx: *Cx, render_list: *std.ArrayList(ui.DisplayItem)) 
 }
 
 test "Snapshot.capture localizes node commands" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(320, 240);
 
@@ -11124,7 +11312,7 @@ test "Snapshot.capture localizes node commands" {
 }
 
 test "Snapshot.capture returns null for zero-sized node" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(320, 240);
 
@@ -11144,7 +11332,7 @@ test "Snapshot.capture returns null for zero-sized node" {
 }
 
 test "Snapshot.capture uses global origin for absolute translated node" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(320, 240);
 
@@ -11179,7 +11367,7 @@ test "Snapshot.capture uses global origin for absolute translated node" {
 }
 
 test "Snapshot survives source node destroy" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(320, 240);
 
@@ -11202,11 +11390,11 @@ test "Snapshot survives source node destroy" {
     root.destroy(cx.allocator);
 
     cx.lowering.main_paint.clearRetainingCapacity();
-    var render_list: std.ArrayList(ui.DisplayItem) = .{};
+    var render_list: std.ArrayList(ui.DisplayItem) = .empty;
     defer render_list.deinit(cx.allocator);
     try snapshot.appendTo(testDrawContextForList(cx, &render_list), .{ .x = 24, .y = 16 }, 1.0, 1.0);
 
-    // snapshot.appendTo 写到 cx.lowering.main_paint (paint_table)
+    // snapshot.appendTo writes to cx.lowering.main_paint (paint_table)
     try std.testing.expect(cx.lowering.main_paint.items.len > 0);
     var saw_rect = false;
     for (cx.lowering.main_paint.items) |cmd| {
@@ -11221,7 +11409,7 @@ test "Snapshot survives source node destroy" {
 }
 
 test "Snapshot.appendTo preserves captured transform origin during scale" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(320, 240);
 
@@ -11248,11 +11436,11 @@ test "Snapshot.appendTo preserves captured transform origin during scale" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), snapshot.local_transform_origin.y, 0.001);
 
     cx.lowering.main_paint.clearRetainingCapacity();
-    var render_list: std.ArrayList(ui.DisplayItem) = .{};
+    var render_list: std.ArrayList(ui.DisplayItem) = .empty;
     defer render_list.deinit(cx.allocator);
     try snapshot.appendTo(testDrawContextForList(cx, &render_list), .{ .x = 24, .y = 16 }, 1.0, 0.5);
 
-    // appendTo 写 paint_table 流，第一个是 begin_opacity_layer control item
+    // appendTo writes paint_table stream; first is begin_opacity_layer control item
     try std.testing.expect(cx.lowering.main_paint.items.len > 0);
     const first = cx.lowering.main_paint.items[0];
     try std.testing.expectEqual(@import("paint_table.zig").DisplayItemKind.control, first.kind);
@@ -11264,7 +11452,7 @@ test "Snapshot.appendTo preserves captured transform origin during scale" {
 }
 
 test "Snapshot.captureWithOptions node_rect locks geometry to live node rect" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(320, 240);
 
@@ -11278,7 +11466,7 @@ test "Snapshot.captureWithOptions node_rect locks geometry to live node rect" {
         },
     }, .{});
     const child_ext = child.style.ensureExtPanic(std.testing.allocator);
-    child_ext.setShadows(theme.dark.shadow.md, .{
+    child_ext.setShadows(theme.dark.tokens.shadow.md, .{
         .color = Color.rgba(0, 0, 0, 18),
         .blur = 40,
         .offset_x = 0,
@@ -11320,7 +11508,7 @@ test "Snapshot.captureWithOptions node_rect locks geometry to live node rect" {
 }
 
 test "Snapshot deep-copies text commands" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(320, 240);
 
@@ -11353,10 +11541,8 @@ test "Snapshot deep-copies text commands" {
     return error.TestUnexpectedResult;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Phase 1: Wavy underline geometry（diagnostic squiggle 的纯几何测试）
-// 对应 memory/lsp_ui_framework_upgrade.md D3
-// ─────────────────────────────────────────────────────────────────────────────
+// Phase 1: Wavy underline geometry (diagnostic squiggle pure geometry test)
+// Corresponds to memory/lsp_ui_framework_upgrade.md D3
 
 test "wavy: WavyParams scales with font_size" {
     const small = ui.render_engine.WavyParams.forFontSize(10);
@@ -11374,9 +11560,9 @@ test "wavy: centerline oscillates within the underline band" {
     try std.testing.expect(b[1] >= 100 and b[1] <= 100 + params.totalHeight(params.thickness));
 }
 
-// 矩阵 #3, ScrollArea 60fps < 3ms（will_change_transform 自动 promote）
+// Matrix #3, ScrollArea 60fps < 3ms (will_change_transform auto-promotes)
 test "ScrollArea content carries will_change_transform hint" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
 
     const root = try box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
@@ -11387,15 +11573,15 @@ test "ScrollArea content carries will_change_transform hint" {
     const scope = try Scope.init(std.testing.allocator, null, cx.owner);
     defer if (!scope.disposed) scope.dispose();
 
-    const result = try ScrollAreaMod.mountScrollArea(.{}, scope, cx);
+    const result = try ScrollAreaMod.ScrollArea(.{}).mount(scope, cx);
     try root.appendChild(std.testing.allocator, result.container);
-    // mount 后 content 应有 will_change_transform = true，触发 promotion
+    // after mount, content should have will_change_transform = true to trigger promotion
     try std.testing.expect(result.content.style.will_change_transform());
 }
 
-// 矩阵 #4, Transform 动画 paint = 0
+// Matrix #4, Transform animation paint = 0
 test "transform-only animation promotes node and preserves paint cache" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(320, 240);
 
@@ -11410,9 +11596,10 @@ test "transform-only animation promotes node and preserves paint cache" {
         .background = Color.rgba(100, 150, 200, 255),
     }, .{});
     try root.appendChild(cx.allocator, animated);
-    // v0.5-P5 promotion 约定：transform 动画节点需显式 composited_group + will_change_transform
-    // 才 promote。promotion 需 effect entry，effect entry 需 composited_group / opacity<1 / blur 等。
-    // ScrollArea 走 is_scroll_container 路径自动 promote；手动 animateNode 节点需自己声明。
+    // v0.5-P5 promotion contract: transform animated nodes need explicit composited_group +
+    // will_change_transform to promote. promotion requires effect entry; effect entry requires
+    // composited_group / opacity<1 / blur etc. ScrollArea auto-promotes via is_scroll_container;
+    // manual animateNode nodes must self-declare.
     const ext = animated.style.ensureExtPanic(cx.allocator);
     ext.will_change_transform = true;
     ext.composited_group = true;
@@ -11428,28 +11615,29 @@ test "transform-only animation promotes node and preserves paint cache" {
     cx.layout();
     _ = cx.render();
 
-    // 第一次 render 后，translate 动画应促使节点被 promote
+    // after first render, translate animation should promote the node
     const runtime = cx.scene_runtime.get(animated.id).?;
     try std.testing.expect(runtime.has_active_transform_animation);
-    // 矩阵 #4 关键：promoted layer 在 transform 动画期间不重录 paint chunks。
+    // Matrix #4 critical: promoted layer skips re-recording paint chunks during transform
+    // animation.
     try std.testing.expect(runtime.promoted_layer_id != ui.SceneRuntimeInvalidId);
 
-    // 推进 translate 动画，只动 transform，不改 paint content
+    // advance translate animation; only transform changes, paint content unchanged
     const content_version_before = animated.meta.per_frame.caches.versions.content;
     animated.style.translate_x = 50;
     animated.markCompositeDirty();
     cx.layout();
     _ = cx.render();
 
-    // content_version 不应变（paint chunks 没重录）；composite_version 增加
+    // content_version unchanged (paint chunks not re-recorded); composite_version increments
     try std.testing.expectEqual(content_version_before, animated.meta.per_frame.caches.versions.content);
-    // promoted_cached_commands 应已被首次 render 填充
+    // promoted_cached_commands should be populated by first render
     try std.testing.expect(animated.meta.per_frame.caches.commands.promoted != null);
 }
 
-// 矩阵 #1, 10k 节点零脏帧 < 0.5ms 的快速路径
+// Matrix #1, 10k nodes zero-dirty-frame fast path < 0.5ms
 test "render() skip path returns cached commands when tree fully clean" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(320, 120);
 
@@ -11461,22 +11649,22 @@ test "render() skip path returns cached commands when tree fully clean" {
     cx.root = root;
     cx.layout();
 
-    // 第一次 render 跑完整路径，填充 last_render_list
+    // first render runs full path, populates last_render_list
     const first = cx.render();
     try std.testing.expect(cx.last_render_valid);
     try std.testing.expect(first.len > 0);
     const first_len = first.len;
 
-    // 第二次 render 应走 skip 路径，commands 内容、长度都不变
+    // second render should skip-path; commands content and length unchanged
     const second = cx.render();
     try std.testing.expectEqual(first_len, second.len);
-    // skip 路径返回的是 last_render_list.items；render_list 应已被 cleared (capacity 保留)
-    // 但因 render_list 在 first 后已 populated，second 跳过时未 clear，所以 render_list 仍有内容。
-    // 关键保证：commands 切片有效且长度等于上一帧。
+    // skip-path returns last_render_list.items; render_list should be cleared (capacity kept)
+    // but render_list stays populated after first render; second skips without clearing.
+    // Key invariant: commands slice valid and same length as prior frame.
 }
 
 test "markRenderDirty 后 skip 路径失效" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(320, 120);
 
@@ -11487,25 +11675,27 @@ test "markRenderDirty 后 skip 路径失效" {
     }, .{});
     cx.root = root;
     cx.layout();
-    _ = cx.render(); // 填充 cache
+    _ = cx.render(); // populate cache
 
-    // markRenderDirty 应清除整树 clean 状态，subtree_render_dirty 冒泡到 root
+    // markRenderDirty clears tree clean state, bubbles subtree_render_dirty to root
     root.markRenderDirty();
     cx.layout();
-    _ = cx.render(); // 应走完整路径
-    // 验证：dirty 标记被消费，render 完后 root 应该 clean
+    _ = cx.render(); // should run full path
+    // verify: dirty flags consumed; root should be clean after render
     try std.testing.expect(!root.frame_state.state_bits.dirty.core.render);
 }
 
-// 矩阵 #1 真 perf bench, 10k 节点零脏帧 < 0.5ms
-// 建 10k Node 树（100 行 × 100 列），warm 一帧填 cache，然后 measure 100 次 zero-dirty
-// render 的中位数应远低于 0.5ms（500µs）。这是 plan 矩阵 #1 的真验证。
+// Matrix #1 true perf bench: 10k nodes zero-dirty-frame < 0.5ms
+// build 10k Node tree (100 rows x 100 cols), warm one frame to populate cache, measure 100x
+// zero-dirty render; median should be well below 0.5ms (500µs). Real validation for plan
+// matrix #1.
 test "10k node zero-dirty render < 0.5ms (matrix #1)" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(1200, 1000);
 
-    // 建 100 列 grid，每列 100 个 small box，共 100*100 = 10000 leaf nodes + 100 cols = 10100 nodes
+    // build 100-column grid, 100 small boxes per column = 10000 leaf nodes + 100 cols =
+    // 10100 nodes
     const root = try box(cx, .{
         .width = .{ .px = 1200 },
         .height = .{ .px = 1000 },
@@ -11535,43 +11725,45 @@ test "10k node zero-dirty render < 0.5ms (matrix #1)" {
 
     cx.layout();
 
-    // Warm-up: 第一次走完整 render 路径填充 last_render_list
+    // Warm-up: first render runs full path, populates last_render_list
     _ = cx.render();
     try std.testing.expect(cx.last_render_valid);
 
-    // Measure 100 次 zero-dirty render，树未变，frame_time 未变，应全走 skip path
+    // Measure 100x zero-dirty render; tree unchanged, frame_time unchanged, should skip-path
+    // all
     const iterations: u32 = 100;
     var total_ns: u64 = 0;
     var max_ns: u64 = 0;
     var i: u32 = 0;
     while (i < iterations) : (i += 1) {
-        var timer = std.time.Timer.start() catch unreachable;
+        var timer = @import("zenit_time").Timer.start(std.testing.io) catch unreachable;
         const list = cx.render();
         const elapsed = timer.read();
         total_ns += elapsed;
         if (elapsed > max_ns) max_ns = elapsed;
-        // 防优化：sanity check commands 仍非空
+        // prevent optimization: sanity check that commands still non-empty
         try std.testing.expect(list.len > 0);
     }
     const avg_ns = total_ns / iterations;
 
-    // 矩阵 #1 目标：< 500µs (500_000ns)。skip path 是 O(1) flag 检查 + 返回 slice，应在 10µs 内。
-    // 给 50µs (50_000ns) 阈值留 debug build 余量；ReleaseFast 实测远低于此值。
-    // 失败时打印 actual, zig test 默认吞 stdout，断言失败时才显示。
+    // Matrix #1 target: < 500µs (500_000ns). skip-path is O(1) flag check + slice return,
+    // should be under 10µs. 50µs (50_000ns) threshold leaves room for debug build; ReleaseFast
+    // measured well below. Failure prints actual; zig test mutes stdout by default, shows on
+    // assertion failure.
     if (avg_ns >= 50_000 or max_ns >= 200_000) {
         std.debug.print("[v0.5-P4 matrix #1] 10k nodes zero-dirty render REGRESSED: avg={d}ns max={d}ns (target avg<50_000 max<200_000)\n", .{ avg_ns, max_ns });
         return error.PerfRegression;
     }
 }
 
-// select_headless 主挂渲染，mountSelectHeadless 把 346 行 state machine
-// 挂到 *Node 树 + Popover trigger/content + default item rendering。
-// 是替代 legacy select.zig 的 stage-1 实装。
+// select_headless drives rendering; mountSelectHeadless mounts 346-line state machine
+// onto Node tree + Popover trigger/content + default item rendering. Stage-1 replacement
+// for legacy select.zig.
 test "mountSelectHeadless creates trigger + content + items" {
     const select_headless = @import("../components/select_headless/mod.zig");
     const Scope = @import("../reactive.zig").Scope;
 
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
 
@@ -11588,35 +11780,35 @@ test "mountSelectHeadless creates trigger + content + items" {
         .{ .value = 3, .label = "Cherry" },
     };
 
-    const result = try select_headless.mountSelectHeadless(i32, .{
+    const result = try select_headless.SelectHeadless(i32, .{
         .options = &opts,
         .placeholder = "Pick one...",
         .width = 200,
-    }, scope, cx);
+    }).mount(scope, cx);
 
     try root.appendChild(std.testing.allocator, result.wrapper);
 
-    // 验证：创建了 3 个 item nodes
-    try std.testing.expectEqual(@as(usize, 3), result.item_nodes.len);
+    // verify: created 3 item nodes
+    try std.testing.expectEqual(@as(usize, 3), select_headless.stateOf(i32, result).item_nodes.len);
 
-    // 验证：state.value 初始 null（uncontrolled 默认）
-    try std.testing.expect(result.state.value == null);
+    // verify: state.value initially null (uncontrolled default)
+    try std.testing.expect(result.value.?.peek() == null);
 
-    // 验证：trigger 显示 placeholder
+    // verify: trigger shows placeholder
     try std.testing.expect(result.trigger_label.getText() != null);
     if (result.trigger_label.getText()) |txt| {
         try std.testing.expectEqualStrings("Pick one...", txt.content);
     }
 
-    // 验证：is_open signal 初始 false
-    try std.testing.expect(!result.is_open.peek());
+    // verify: is_open signal initially false
+    try std.testing.expect(!result.open.?.peek());
 }
 
 test "mountSelectHeadless with initial_value displays selected label" {
     const select_headless = @import("../components/select_headless/mod.zig");
     const Scope = @import("../reactive.zig").Scope;
 
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
 
@@ -11632,22 +11824,20 @@ test "mountSelectHeadless with initial_value displays selected label" {
         .{ .value = 20, .label = "Twenty" },
     };
 
-    const result = try select_headless.mountSelectHeadless(i32, .{
+    const result = try select_headless.SelectHeadless(i32, .{
         .options = &opts,
-        .initial_value = 20,
-    }, scope, cx);
+        .value = @as(?i32, 20),
+    }).mount(scope, cx);
     try root.appendChild(std.testing.allocator, result.wrapper);
 
-    // 验证：trigger label 为 "Twenty"
+    // verify: trigger label is "Twenty"
     if (result.trigger_label.getText()) |txt| {
         try std.testing.expectEqualStrings("Twenty", txt.content);
     }
-    try std.testing.expectEqual(@as(?i32, 20), result.state.value);
+    try std.testing.expectEqual(@as(?i32, 20), result.value.?.peek());
 }
 
-// ============================================================================
-// v0.7 §2.1, select_headless slot 化 + recipe 接入 tests
-// ============================================================================
+// v0.7 §2.1, select_headless slot recipe + recipe integration tests
 
 test "SelectSlotRecipe.resolve 给三 slot 返合理 ConditionalStyle" {
     const mount_mod = @import("../components/select_headless/mount.zig");
@@ -11656,13 +11846,13 @@ test "SelectSlotRecipe.resolve 给三 slot 返合理 ConditionalStyle" {
         .{ .variant = .default, .size = .md },
         &dark,
     );
-    // trigger / content / item base 必须有可解析的非空字段
+    // trigger / content / item base must have parseable non-empty fields
     const tr = slots.trigger.resolve(.{});
     try std.testing.expect(tr.background != null);
     try std.testing.expect(tr.text_color != null);
     const ct = slots.content.resolve(.{});
     try std.testing.expect(ct.background != null);
-    // item hover 态走 bg_hover
+    // item hover state uses bg_hover
     const it_hover = slots.item.resolve(.{ .is_hovered = true });
     try std.testing.expect(it_hover.background != null);
 }
@@ -11671,7 +11861,7 @@ test "mountSelectHeadless render_trigger slot — caller 自定义 trigger 节�
     const select_headless = @import("../components/select_headless/mod.zig");
     const Scope = @import("../reactive.zig").Scope;
 
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
 
@@ -11686,8 +11876,8 @@ test "mountSelectHeadless render_trigger slot — caller 自定义 trigger 节�
 
     const TriggerCtx = select_headless.mount.TriggerSlotCtx(i32);
     const CustomTrigger = struct {
-        // caller 自定义 trigger 用 "Button" tag 而不是默认的 input box
-        // 标志位标识本节点被自定义渲染 fn 调过
+        // caller custom trigger uses "Button" tag instead of default input box
+        // flag marks node was rendered by custom fn
         var was_called: bool = false;
         var captured_label: []const u8 = "";
 
@@ -11698,7 +11888,7 @@ test "mountSelectHeadless render_trigger slot — caller 自定义 trigger 节�
                 .width = .{ .px = 100 },
                 .height = .{ .px = 24 },
             }, .{});
-            // 用一个特殊 component_name 让 fixture 能验
+            // use special component_name for fixture verification
             n.meta.ownership.meta.component_name = "MyCustomTrigger";
             return n;
         }
@@ -11709,16 +11899,16 @@ test "mountSelectHeadless render_trigger slot — caller 自定义 trigger 节�
     CustomTrigger.was_called = false;
     CustomTrigger.captured_label = "";
 
-    const result = try select_headless.mountSelectHeadless(i32, .{
+    const result = try select_headless.SelectHeadless(i32, .{
         .options = &opts,
         .placeholder = "Pick A or B",
         .render_trigger = CustomTrigger.render,
-    }, scope, cx);
+    }).mount(scope, cx);
     try root.appendChild(std.testing.allocator, result.wrapper);
 
     try std.testing.expect(CustomTrigger.was_called);
     try std.testing.expectEqualStrings("Pick A or B", CustomTrigger.captured_label);
-    // result.trigger_label 应指向 caller 的自定义节点
+    // result.trigger_label should point to caller's custom node
     try std.testing.expect(result.trigger_label.meta.ownership.meta.component_name != null);
     try std.testing.expectEqualStrings(
         "MyCustomTrigger",
@@ -11730,7 +11920,7 @@ test "mountSelectHeadless render_item slot — caller 自定义每个 option 行
     const select_headless = @import("../components/select_headless/mod.zig");
     const Scope = @import("../reactive.zig").Scope;
 
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
 
@@ -11757,9 +11947,9 @@ test "mountSelectHeadless render_item slot — caller 自定义每个 option 行
                 .width = .{ .grow = .{} },
                 .height = .{ .px = 30 },
             }, .{});
-            // 自定义 item: 把 option.value 编码到 component_name 里好验
+            // custom item: encode option.value in component_name for verification
             var buf: [16]u8 = undefined;
-            const label_str = std.fmt.bufPrintZ(&buf, "item-{d}", .{ctx.option.value}) catch "item";
+            const label_str = std.fmt.bufPrintSentinel(&buf, "item-{d}", .{ctx.option.value}, 0) catch "item";
             const owned = c.allocator.dupe(u8, label_str) catch return n;
             n.meta.ownership.meta.component_name = owned;
             return n;
@@ -11769,26 +11959,26 @@ test "mountSelectHeadless render_item slot — caller 自定义每个 option 行
     };
     CustomItem.call_count = 0;
 
-    const result = try select_headless.mountSelectHeadless(i32, .{
+    const result = try select_headless.SelectHeadless(i32, .{
         .options = &opts,
         .render_item = CustomItem.render,
-    }, scope, cx);
+    }).mount(scope, cx);
     try root.appendChild(std.testing.allocator, result.wrapper);
 
     try std.testing.expectEqual(@as(u32, 3), CustomItem.call_count);
-    // 每个 item 都该走 caller 的渲染
-    try std.testing.expectEqual(@as(usize, 3), result.item_nodes.len);
+    // each item should use caller's render fn
+    try std.testing.expectEqual(@as(usize, 3), select_headless.stateOf(i32, result).item_nodes.len);
     try std.testing.expectEqualStrings(
         "item-1",
-        result.item_nodes[0].meta.ownership.meta.component_name.?,
+        select_headless.stateOf(i32, result).item_nodes[0].meta.ownership.meta.component_name.?,
     );
     try std.testing.expectEqualStrings(
         "item-3",
-        result.item_nodes[2].meta.ownership.meta.component_name.?,
+        select_headless.stateOf(i32, result).item_nodes[2].meta.ownership.meta.component_name.?,
     );
 
-    // free 之前 dupe 的字符串
-    for (result.item_nodes) |n| {
+    // free duplicated strings
+    for (select_headless.stateOf(i32, result).item_nodes) |n| {
         if (n.meta.ownership.meta.component_name) |name| {
             std.testing.allocator.free(name);
             n.meta.ownership.meta.component_name = null;
@@ -11803,22 +11993,22 @@ test "SelectSize：默认 trigger 建在 ControlShell 上，外框高 = padding_
     const Opt = select_headless.Option(i32);
     const opts = [_]Opt{ .{ .value = 1, .label = "Apple" }, .{ .value = 2, .label = "Banana" } };
 
-    inline for (.{ ui.theme.ControlSize.xs, .sm, .md, .lg }) |size| {
-        var cx = try Cx.init(std.testing.allocator);
+    inline for (.{ control_shell.ControlSize.xs, .sm, .md, .lg }) |size| {
+        var cx = try Cx.init(std.testing.allocator, std.testing.io);
         defer cx.deinit();
         cx.setViewport(400, 300);
         const root = try box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
         cx.root = root;
         const scope = try Scope.init(std.testing.allocator, null, cx.owner);
         defer scope.dispose();
-        const result = try select_headless.mountSelectHeadless(i32, .{ .options = &opts, .width = 200, .size = size }, scope, cx);
+        const result = try select_headless.SelectHeadless(i32, .{ .options = &opts, .width = 200, .size = size }).mount(scope, cx);
         try root.appendChild(std.testing.allocator, result.wrapper);
         cx.layout();
-        // trigger_label = ControlShell 的 content_slot；其父即外框
+        // trigger_label = ControlShell's content_slot; its parent is the shell
         const frame = result.trigger_label.parent.?;
-        try std.testing.expectApproxEqAbs(cx.tokens.control.get(size).derivedHeight(), frame.rectFromWorldOrFallback().h, 0.01);
+        try std.testing.expectApproxEqAbs(control_shell.metrics(cx.tokens, size).derivedHeight(), frame.rectFromWorldOrFallback().h, 0.01);
     }
-    // 下拉列表行高是列表行度量（点击区），不随控件外框走
+    // dropdown row height is list measurement (click target), independent of shell
     try std.testing.expectEqual(@as(f32, 32), mount_mod.itemHeight(.xs));
     try std.testing.expectEqual(@as(f32, 32), mount_mod.itemHeight(.sm));
     try std.testing.expectEqual(@as(f32, 36), mount_mod.itemHeight(.md));
@@ -11833,7 +12023,7 @@ test "virtualize=true 时 item_nodes 为空 (pool 复用)" {
     const select_headless = @import("../components/select_headless/mod.zig");
     const Scope = @import("../reactive.zig").Scope;
 
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 400);
 
@@ -11850,24 +12040,24 @@ test "virtualize=true 时 item_nodes 为空 (pool 复用)" {
         o.* = .{ .value = @intCast(i), .label = "x" };
     }
 
-    const result = try select_headless.mountSelectHeadless(i32, .{
+    const result = try select_headless.SelectHeadless(i32, .{
         .options = &opts_buf,
         .virtualize = true,
         .max_dropdown_height = 200,
-    }, scope, cx);
+    }).mount(scope, cx);
     try root.appendChild(std.testing.allocator, result.wrapper);
 
-    // virtualize 模式下 item_nodes 是空 slice (pool 节点不暴露到外面)
-    try std.testing.expectEqual(@as(usize, 0), result.item_nodes.len);
-    // state 还在
-    try std.testing.expect(result.state.value == null);
+    // virtualize mode: item_nodes is empty slice (pool nodes not exposed)
+    try std.testing.expectEqual(@as(usize, 0), select_headless.stateOf(i32, result).item_nodes.len);
+    // state still present
+    try std.testing.expect(result.value.?.peek() == null);
 }
 
 test "virtualize=false (默认) 仍每 option 一个 Node" {
     const select_headless = @import("../components/select_headless/mod.zig");
     const Scope = @import("../reactive.zig").Scope;
 
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 400);
 
@@ -11884,20 +12074,20 @@ test "virtualize=false (默认) 仍每 option 一个 Node" {
         .{ .value = 3, .label = "C" },
     };
 
-    const result = try select_headless.mountSelectHeadless(i32, .{
+    const result = try select_headless.SelectHeadless(i32, .{
         .options = &opts,
-        // virtualize 默认 false
-    }, scope, cx);
+        // virtualize defaults to false
+    }).mount(scope, cx);
     try root.appendChild(std.testing.allocator, result.wrapper);
 
-    try std.testing.expectEqual(@as(usize, 3), result.item_nodes.len);
+    try std.testing.expectEqual(@as(usize, 3), select_headless.stateOf(i32, result).item_nodes.len);
 }
 
 test "virtualize + 1000 options compile + mount 不爆 Node" {
     const select_headless = @import("../components/select_headless/mod.zig");
     const Scope = @import("../reactive.zig").Scope;
 
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 400);
 
@@ -11913,27 +12103,25 @@ test "virtualize + 1000 options compile + mount 不爆 Node" {
         o.* = .{ .value = @intCast(i), .label = "x" };
     }
 
-    const result = try select_headless.mountSelectHeadless(i32, .{
+    const result = try select_headless.SelectHeadless(i32, .{
         .options = &opts_buf,
         .virtualize = true,
-        .max_dropdown_height = 200, // 视口 ~6-7 行
-    }, scope, cx);
+        .max_dropdown_height = 200, // viewport ~6-7 rows
+    }).mount(scope, cx);
     try root.appendChild(std.testing.allocator, result.wrapper);
 
-    // mount 成功；这条 fixture 主要验编译 + mount 不爆 (1k options 创建 1k Node
-    // 会很慢且分配 100KB+, virtualize 应只 ~10 行 pool node).
+    // mount succeeds; fixture mainly verifies compilation + no crash (1k options create 1k
+    // Nodes, slow and allocs 100KB+; virtualize should only ~10-row pool).
     try std.testing.expect(result.wrapper != root);
 }
 
-// ============================================================================
-// v0.8 §2.1, select_headless aria-activedescendant 接入 tests
-// ============================================================================
+// v0.8 §2.1, select_headless aria-activedescendant integration tests
 
 test "select trigger 初始化 role=combobox + has_popup=listbox + 无 active_descendant" {
     const select_headless = @import("../components/select_headless/mod.zig");
     const Scope = @import("../reactive.zig").Scope;
 
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
 
@@ -11948,9 +12136,9 @@ test "select trigger 初始化 role=combobox + has_popup=listbox + 无 active_de
         .{ .value = 1, .label = "A" },
         .{ .value = 2, .label = "B" },
     };
-    const result = try select_headless.mountSelectHeadless(i32, .{
+    const result = try select_headless.SelectHeadless(i32, .{
         .options = &opts,
-    }, scope, cx);
+    }).mount(scope, cx);
     try root.appendChild(std.testing.allocator, result.wrapper);
 
     const a11y = result.trigger.behavior.interaction.a11y orelse return error.MissingA11y;
@@ -11964,7 +12152,7 @@ test "mouse_enter item → trigger.active_descendant_element_id 跟随 item.elem
     const Scope = @import("../reactive.zig").Scope;
     const events_mod = @import("../events.zig");
 
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
 
@@ -11980,27 +12168,27 @@ test "mouse_enter item → trigger.active_descendant_element_id 跟随 item.elem
         .{ .value = 2, .label = "B" },
         .{ .value = 3, .label = "C" },
     };
-    const result = try select_headless.mountSelectHeadless(i32, .{
+    const result = try select_headless.SelectHeadless(i32, .{
         .options = &opts,
-    }, scope, cx);
+    }).mount(scope, cx);
     try root.appendChild(std.testing.allocator, result.wrapper);
 
-    try std.testing.expectEqual(@as(usize, 3), result.item_nodes.len);
+    try std.testing.expectEqual(@as(usize, 3), select_headless.stateOf(i32, result).item_nodes.len);
 
-    // 直接驱动 item[1] 的 mouse_enter handler
-    const item1 = result.item_nodes[1];
+    // directly drive item[1]'s mouse_enter handler
+    const item1 = select_headless.stateOf(i32, result).item_nodes[1];
     const handler = item1.behavior.events.on_event orelse return error.MissingHandler;
     const ctx = item1.behavior.events.event_context orelse return error.MissingContext;
     _ = handler(events_mod.Event{ .mouse_enter = {} }, ctx);
 
-    // trigger.a11y.active_descendant_element_id 应该等于 item[1] 的 element_id_raw
+    // trigger.a11y.active_descendant_element_id should equal item[1]'s element_id_raw
     {
         const a11y = result.trigger.behavior.interaction.a11y orelse return error.MissingA11y;
         try std.testing.expectEqual(item1.element_id_raw, a11y.active_descendant_element_id);
     }
 
-    // 切到 item[2]
-    const item2 = result.item_nodes[2];
+    // switch to item[2]
+    const item2 = select_headless.stateOf(i32, result).item_nodes[2];
     const handler2 = item2.behavior.events.on_event orelse return error.MissingHandler;
     const ctx2 = item2.behavior.events.event_context orelse return error.MissingContext;
     _ = handler2(events_mod.Event{ .mouse_enter = {} }, ctx2);
@@ -12011,9 +12199,9 @@ test "mouse_enter item → trigger.active_descendant_element_id 跟随 item.elem
 }
 
 // shadow-sync Node.rect -> LayoutTable.final_rect
-// 验证 Cx.layout() 后 cx.rectOf(eid) 返回与 node.rect 相同的几何。
+// verify cx.rectOf(eid) after Cx.layout() matches node.rect geometry
 test "LayoutTable shadow-syncs Node.rect after layout" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
 
@@ -12036,7 +12224,7 @@ test "LayoutTable shadow-syncs Node.rect after layout" {
     try std.testing.expect(child.rectFromWorldOrFallback().w > 0);
     try std.testing.expect(child.rectFromWorldOrFallback().h > 0);
 
-    // Stage 3-1 invariant：LayoutTable should be in sync with Node.rect
+    // Stage 3-1 invariant: LayoutTable should be in sync with Node.rect
     if (child.element_id_raw != 0xFFFFFFFF) {
         const eid = ui.world.ElementId.fromRaw(child.element_id_raw);
         const lr = cx.rectOf(eid).?;
@@ -12047,11 +12235,11 @@ test "LayoutTable shadow-syncs Node.rect after layout" {
     }
 }
 
-// shadow-sync Node 父子链 -> World.elements 父子链
-// 验证 Node.appendChild 后 World.elements 上的 first_child / parent / sibling 链
-// 与 Node 树等价。
+// shadow-sync Node parent-child chain -> World.elements parent-child chain
+// verify after Node.appendChild, World.elements' first_child/parent/sibling chains match
+// Node tree
 test "ElementTable shadow-syncs Node parent/child chain" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
 
@@ -12065,7 +12253,7 @@ test "ElementTable shadow-syncs Node parent/child chain" {
     try root.appendChild(std.testing.allocator, c2);
     try root.appendChild(std.testing.allocator, c3);
 
-    // 三个 child 都已注册到 World
+    // all three children registered to World
     try std.testing.expect(root.element_id_raw != 0xFFFFFFFF);
     try std.testing.expect(c1.element_id_raw != 0xFFFFFFFF);
     try std.testing.expect(c2.element_id_raw != 0xFFFFFFFF);
@@ -12076,7 +12264,7 @@ test "ElementTable shadow-syncs Node parent/child chain" {
     const c2_eid = ui.world.ElementId.fromRaw(c2.element_id_raw);
     const c3_eid = ui.world.ElementId.fromRaw(c3.element_id_raw);
 
-    // World 上的链应是 root -> c1 -> c2 -> c3
+    // World chain should be root -> c1 -> c2 -> c3
     const root_links = cx.world.elements.links(root_eid).?;
     try std.testing.expect(root_links.first_child.eql(c1_eid));
     try std.testing.expect(root_links.last_child.eql(c3_eid));
@@ -12096,13 +12284,14 @@ test "ElementTable shadow-syncs Node parent/child chain" {
     try std.testing.expect(c3_links.prev_sibling.eql(c2_eid));
     try std.testing.expect(c3_links.next_sibling.isNull());
 
-    // child count 与 Node.children.items.len 一致
+    // child count matches Node.children.items.len
     try std.testing.expectEqual(root.children.items.len, cx.world.elements.childCount(root_eid));
 }
 
-// v0.5-P3 Stage 3-2 (收尾): removeChild 应同步 unlink World 父子链
+// v0.5-P3 Stage 3-2 (final): removeChild should sync and unlink World parent-child
+// chain
 test "removeChild unlinks ElementTable chain" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
 
@@ -12119,16 +12308,16 @@ test "removeChild unlinks ElementTable chain" {
     const root_eid = ui.world.ElementId.fromRaw(root.element_id_raw);
     const c2_eid = ui.world.ElementId.fromRaw(c2.element_id_raw);
 
-    // 摘除中间节点 c2
+    // remove middle node c2
     root.removeChild(c2);
 
-    // World 上 c2 已游离
+    // c2 detached in World
     const c2_links = cx.world.elements.links(c2_eid).?;
     try std.testing.expect(c2_links.parent.isNull());
     try std.testing.expect(c2_links.prev_sibling.isNull());
     try std.testing.expect(c2_links.next_sibling.isNull());
 
-    // root 子链应缩到 c1 -> c3
+    // root's child chain should shrink to c1 -> c3
     try std.testing.expectEqual(@as(u32, 2), cx.world.elements.childCount(root_eid));
     const root_links = cx.world.elements.links(root_eid).?;
     const c1_eid = ui.world.ElementId.fromRaw(c1.element_id_raw);
@@ -12136,12 +12325,12 @@ test "removeChild unlinks ElementTable chain" {
     try std.testing.expect(root_links.first_child.eql(c1_eid));
     try std.testing.expect(root_links.last_child.eql(c3_eid));
 
-    // 释放 c2 节点（c2 已脱离树，需要单独释放）
+    // free c2 node (detached from tree, needs explicit free)
     cx.freeNode(c2);
 }
 
 test "removeAllChildren unlinks the full ElementTable chain" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
 
     const root = try box(cx, .{}, .{});
@@ -12170,10 +12359,11 @@ test "removeAllChildren unlinks the full ElementTable chain" {
     cx.freeNode(c2);
 }
 
-// PaintTable shadow-sync 路径走通
-// render 之后 PaintTable 应填充对应 element 的 chunk；改 background 应让 hash mismatch 触发重录。
+// PaintTable shadow-sync path working
+// after render, PaintTable populates chunks for elements; changing background should
+// trigger hash mismatch and re-recording
 test "PaintTable shadow-syncs after render and invalidates on style change" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
 
@@ -12197,13 +12387,13 @@ test "PaintTable shadow-syncs after render and invalidates on style change" {
     const hash1 = chunk1.content_hash;
     try std.testing.expect(epoch1 > 0);
 
-    // 同一帧再 render -> hash 命中，paint_epoch 不变
+    // render again same frame -> hash hit, paint_epoch unchanged
     _ = cx.render();
     const chunk2 = cx.world.paint.get(eid).?;
     try std.testing.expectEqual(epoch1, chunk2.paint_epoch);
     try std.testing.expectEqual(hash1, chunk2.content_hash);
 
-    // 改 background -> hash mismatch -> 重录 -> epoch 增大
+    // change background -> hash mismatch -> re-record -> epoch increments
     child.setBackgroundRaw(.{ .r = 0, .g = 0, .b = 255, .a = 255 });
     child.markRenderDirty();
     _ = cx.render();
@@ -12211,8 +12401,8 @@ test "PaintTable shadow-syncs after render and invalidates on style change" {
     try std.testing.expect(chunk3.paint_epoch > epoch1);
     try std.testing.expect(chunk3.content_hash != hash1);
 
-    // Phase 2: PaintTable 现在真填了 DisplayItem（不再 placeholder）。
-    // 有 background 的节点应至少产生一个 .rect kind 的 PaintTable.DisplayItem。
+    // Phase 2: PaintTable now populates DisplayItem (not placeholder)
+    // nodes with background should produce at least one .rect kind PaintTable.DisplayItem
     var has_rect_item = false;
     for (chunk3.display_items.items) |item| {
         if (item.kind == .rect) {
@@ -12223,10 +12413,10 @@ test "PaintTable shadow-syncs after render and invalidates on style change" {
     try std.testing.expect(has_rect_item);
 }
 
-// cx.lowerForEncoderPaintTable() 入口
-// 与 lowerForEncoder() 输出一一对应 (kind + 字段无损)。
+// cx.lowerForEncoderPaintTable() entry point
+// one-to-one mapping with lowerForEncoder() output (kind + fields lossless)
 test "lowerForEncoderPaintTable 与 lowerForEncoder kind 序列一致" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
 
@@ -12254,9 +12444,9 @@ test "lowerForEncoderPaintTable 与 lowerForEncoder kind 序列一致" {
 
     const display_list_lowered = cx.lowerForEncoderPaintTable();
     const paint_table_lowered = cx.lowerForEncoderPaintTable();
-    // 长度一致：B-5 lowerForEncoderPaintTable 是 1:1 翻译
+    // length matches: B-5 lowerForEncoderPaintTable is 1:1 translation
     try std.testing.expectEqual(display_list_lowered.len, paint_table_lowered.len);
-    // 至少要看到两个 .rect kind 的 paint_table item
+    // should see at least two .rect kind paint_table items
     var rect_count: usize = 0;
     for (paint_table_lowered) |it| {
         if (it.kind == .rect) rect_count += 1;
@@ -12264,16 +12454,15 @@ test "lowerForEncoderPaintTable 与 lowerForEncoder kind 序列一致" {
     try std.testing.expect(rect_count >= 2);
 }
 
-// paint_table.DisplayItem 字段无损验证。
-// fill_rect 走 cx.syncPaintToTable 写入的 PaintTable chunk 应该字段完全保留
-// (geom + color + radii)，让后续 encoder 切到 paint_table.DisplayItem 真接管
-// 时数据无损。
+// paint_table.DisplayItem field preservation check.
+// fill_rect via cx.syncPaintToTable written PaintTable chunks should preserve all fields
+// (geom + color + radii) so encoder switching to paint_table.DisplayItem has lossless data
 test "PaintTable.DisplayItem 字段无损 (fill_rect geom + color + radii)" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
 
-    // 用确定的几何 + 颜色 + radii，方便后面字段对照
+    // use deterministic geom + color + radii for field comparison
     const root = try box(cx, .{
         .width = .{ .px = 400 },
         .height = .{ .px = 300 },
@@ -12293,7 +12482,7 @@ test "PaintTable.DisplayItem 字段无损 (fill_rect geom + color + radii)" {
 
     const eid = ui.world.ElementId.fromRaw(child.element_id_raw);
     const chunk = cx.world.paint.get(eid).?;
-    // 找 .rect kind 的 DisplayItem (background fill_rect)
+    // find .rect kind DisplayItem (background fill_rect)
     var found_idx: ?usize = null;
     for (chunk.display_items.items, 0..) |item, idx| {
         if (item.kind == .rect and item.color.a == 255 and item.color.r == 200) {
@@ -12303,15 +12492,16 @@ test "PaintTable.DisplayItem 字段无损 (fill_rect geom + color + radii)" {
     }
     try std.testing.expect(found_idx != null);
     const item = chunk.display_items.items[found_idx.?];
-    // 几何字段无损，encoder 切到 paint_table 后用这些字段直接产 SDF rect
+    // geometry fields lossless; encoder uses these to produce SDF rect after switching to
+    // paint_table
     try std.testing.expectEqual(@as(f32, 100), item.geom.w);
     try std.testing.expectEqual(@as(f32, 50), item.geom.h);
-    // 颜色无损
+    // color lossless
     try std.testing.expectEqual(@as(u8, 200), item.color.r);
     try std.testing.expectEqual(@as(u8, 150), item.color.g);
     try std.testing.expectEqual(@as(u8, 100), item.color.b);
     try std.testing.expectEqual(@as(u8, 255), item.color.a);
-    // radii 无损 (uniform corner_radius=8 -> 4 角全 8)
+    // radii lossless (uniform corner_radius=8 -> all 4 corners 8)
     try std.testing.expectEqual(@as(f32, 8), item.radii.tl);
     try std.testing.expectEqual(@as(f32, 8), item.radii.tr);
     try std.testing.expectEqual(@as(f32, 8), item.radii.br);
@@ -12319,16 +12509,16 @@ test "PaintTable.DisplayItem 字段无损 (fill_rect geom + color + radii)" {
 }
 
 // InteractionTable shadow-sync
-// focusable 节点 / 监听 click 节点 / 有 a11y role 的节点应在 InteractionTable 中。
+// focusable nodes / click listeners / a11y role nodes should be in InteractionTable
 test "InteractionTable shadow-syncs focusable/event/a11y nodes" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
 
     const root = try box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
     cx.root = root;
 
-    // 三个子节点：focusable / a11y role / 啥也没有（不应进 InteractionTable）
+    // three children: focusable / a11y role / plain (plain should not be in InteractionTable)
     const fcb = try box(cx, .{ .width = .{ .px = 100 }, .height = .{ .px = 50 } }, .{});
     fcb.behavior.interaction.focusable = true;
     fcb.behavior.interaction.tab_index = 0;
@@ -12356,15 +12546,15 @@ test "InteractionTable shadow-syncs focusable/event/a11y nodes" {
     const a11y_data = cx.world.interaction.get(a11y_eid).?;
     try std.testing.expect(a11y_data.a11y_role != 0);
 
-    // plain 没有 focusable / a11y / event -> 不应在 InteractionTable
+    // plain: no focusable / a11y / event -> should not be in InteractionTable
     try std.testing.expect(cx.world.interaction.get(plain_eid) == null);
 }
 
-// LayoutTable 全树等价校验
-// 整树遍历，所有 element_id 节点的 cx.rectOf(eid) 与 node.rect 必须严格一致。
-// 这是 SoT inversion 前的 gate：两个 store 必须每帧同步，差异即 bug。
+// LayoutTable tree equivalence check
+// full tree traversal: all element_id nodes' cx.rectOf(eid) must exactly match node.rect.
+// Gate before SoT inversion: two stores must sync every frame; mismatch is a bug
 test "LayoutTable matches Node.rect for whole tree" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(800, 600);
 
@@ -12381,49 +12571,49 @@ test "LayoutTable matches Node.rect for whole tree" {
 
     cx.layout();
 
-    // 用 Cx 提供的 helper（debug build 也能在 prod 路径调用）
+    // use Cx-provided helper (callable in prod path even in debug build)
     try std.testing.expect(cx.assertLayoutSyncIntegrity(root));
 
-    // v0.5-P3 N-2 (2026-05-03 字段已删): 原 perturb test 验证 frame_state.rect 与
-    // LayoutTable 的 divergence 能被 catch。字段已删 (World 是唯一 source-of-truth)，
-    // divergence 不可能发生，此 perturb path 自然失效。integrity check 退化为
-    // PaintTable.bounds vs LayoutTable.rect invariant，由 syncPaintToTable 保证。
+    // v0.5-P3 N-2 (2026-05-03 field removed): original perturb test verified frame_state.rect
+    // vs LayoutTable divergence could be caught. Field is removed (World is sole source-of-truth);
+    // divergence cannot occur, so this perturb path naturally fails. Integrity check reduces to
+    // PaintTable.bounds vs LayoutTable.rect invariant, guaranteed by syncPaintToTable.
 }
 
-// layerizeFrame 现在真消费 PaintTable.bounds（之前是 placeholder {}）
-// 验证：scroll container 节点 layerize 后 layer.world_bounds 非空。
+// layerizeFrame now truly consumes PaintTable.bounds (was placeholder {})
+// verify: scroll container node after layerize has non-empty layer.world_bounds
 test "layerizeFrame reads PaintTable bounds" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
 
     const root = try box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
     cx.root = root;
 
-    // scroll container 子节点
+    // scroll container child node
     const scrollable = try box(cx, .{ .width = .{ .px = 200 }, .height = .{ .px = 200 } }, .{});
     try root.appendChild(std.testing.allocator, scrollable);
 
     cx.layout();
     _ = cx.render();
 
-    // 注入 scroll_id 到 InteractionTable（绕过真 ScrollArea 复杂性）
+    // inject scroll_id into InteractionTable (bypass real ScrollArea complexity)
     const eid = ui.world.ElementId.fromRaw(scrollable.element_id_raw);
     cx.world.interaction.put(eid, .{
-        .scroll_id = 1, // 假 scroll id
+        .scroll_id = 1, // dummy scroll id
     }) catch unreachable;
 
     _ = cx.layerizeFrame(&[_]ui.layerize_mod.LayerizeInput{});
 
-    // PaintTable.chunk(eid).bounds 应已通过 syncPaintToTable 写入
+    // PaintTable.chunk(eid).bounds should be written via syncPaintToTable
     const chunk = cx.world.paint.get(eid).?;
     try std.testing.expect(!chunk.bounds.isEmpty());
 
-    // LayerTree 应有非 root layer，且其 world_bounds 复用 PaintTable.bounds
+    // LayerTree should have non-root layer with world_bounds reusing PaintTable.bounds
     var found_promoted: bool = false;
     for (cx.layer_tree.layers.items) |*l| {
         if (!l.alive) continue;
-        if (l.root_element.isNull()) continue; // root layer 没有 root_element
+        if (l.root_element.isNull()) continue; // root layer has no root_element
         if (!l.world_bounds.isEmpty()) {
             found_promoted = true;
             break;
@@ -12432,10 +12622,10 @@ test "layerizeFrame reads PaintTable bounds" {
     try std.testing.expect(found_promoted);
 }
 
-// v0.5-P3 Stage 3-3 Phase 1++ (session 43): paintContentHash 现在覆盖更多视觉属性
-// 验证 opacity / border / text 颜色变化都触发 cache invalidation。
+// v0.5-P3 Stage 3-3 Phase 1++ (session 43): paintContentHash now covers more visual
+// properties. Verify opacity / border / text color changes all trigger cache invalidation
 test "paintContentHash invalidates on more visual attrs" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
 
@@ -12452,7 +12642,7 @@ test "paintContentHash invalidates on more visual attrs" {
     const eid = ui.world.ElementId.fromRaw(root.element_id_raw);
     const epoch1 = cx.world.paint.get(eid).?.paint_epoch;
 
-    // 改 opacity 应触发 hash mismatch
+    // changing opacity should trigger hash mismatch
     root.setOpacityRaw(0.5);
     root.markRenderDirty();
     _ = cx.render();
@@ -12460,10 +12650,11 @@ test "paintContentHash invalidates on more visual attrs" {
     try std.testing.expect(epoch2 > epoch1);
 }
 
-// v0.5-P3 Stage 3-3 Phase 4 (session 38): layerizeFrame 真消费 PaintTable.property_state
-// 至少证明：扫 chunks 的代码路径不会破坏现有 layerize 行为（test = no-regression gate）。
+// v0.5-P3 Stage 3-3 Phase 4 (session 38): layerizeFrame truly consumes
+// PaintTable.property_state. At minimum: chunk-scanning path doesn't break existing
+// layerize behavior (no-regression gate)
 test "layerizeFrame still works after PaintTable property_state scan" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
 
@@ -12480,16 +12671,17 @@ test "layerizeFrame still works after PaintTable property_state scan" {
     cx.layout();
     _ = cx.render();
 
-    // 扫 chunks promotion 路径不报错
+    // chunk-scanning promotion path succeeds without error
     const layer_count = cx.layerizeFrame(&[_]ui.layerize_mod.LayerizeInput{});
-    // 至少有 root layer
+    // at least one root layer exists
     try std.testing.expect(layer_count >= 1);
 }
 
-// v0.5-P3 Stage 3-3 Phase 3 (session 37): PaintChunk.property_state 真填
-// transform_id / clip_id / effect_id 来自 SceneRuntime；scroll_id 来自 InteractionTable。
+// v0.5-P3 Stage 3-3 Phase 3 (session 37): PaintChunk.property_state truly
+// populated. transform_id / clip_id / effect_id from SceneRuntime; scroll_id from
+// InteractionTable
 test "PaintChunk.property_state populated from SceneRuntime" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
 
@@ -12505,23 +12697,22 @@ test "PaintChunk.property_state populated from SceneRuntime" {
 
     const eid = ui.world.ElementId.fromRaw(root.element_id_raw);
     const chunk = cx.world.paint.get(eid).?;
-    // transform_id 应有效（root 有 transform）
+    // transform_id should be valid (root has transform)
     try std.testing.expect(chunk.property_state.transform_id != std.math.maxInt(u32));
 }
 
-// ============================================================================
-// 帧尾 shadow-sync 按脏区跳子树（Step 1）+ 子树标志 O(1) 化（Step 0）
-// ============================================================================
+// Frame-end shadow-sync skips subtree per damage rect (Step 1) + O(1) subtree flags (Step 0)
 
-// Step 0: collectContentFlags.has_text 改读 NodeFlags.has_text_subtree
-// （setText 置位 + appendChild 并入父链，保守不清位）。验证加文本 / 删文本 /
-// reparent 三条路径下 scene_runtime.get(id).content_flags.has_text 正确。
+// Step 0: collectContentFlags.has_text now reads NodeFlags.has_text_subtree
+// (setText sets flag + appendChild merges into parent; conservative, never clear). Verify
+// add-text / remove-text / reparent paths all correctly set
+// scene_runtime.get(id).content_flags.has_text
 test "content flags: has_text_subtree flag tracks add/remove/reparent text" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
 
-    // 场景：root > container > leaf；leaf 初始无文本。
+    // scenario: root > container > leaf; leaf initially has no text
     const root = try box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
     cx.root = root;
     const container = try box(cx, .{ .width = .{ .px = 200 }, .height = .{ .px = 100 } }, .{});
@@ -12532,10 +12723,11 @@ test "content flags: has_text_subtree flag tracks add/remove/reparent text" {
     cx.layout();
     _ = cx.render();
 
-    // canary：无文本时 has_text 应为 false（若本断言红，说明标志/收集根本没接上）。
+    // canary: has_text should be false when text-less (red = flag/collection not wired)
     try std.testing.expect(cx.scene_runtime.get(container.id).?.content_flags.has_text == false);
 
-    // 1. 加文本：叶子 setText 非空 -> 沿祖先冒泡，container/root 的 has_text 都为 true。
+    // 1. add text: leaf setText non-empty -> bubbles up ancestors; container/root both
+    // have has_text=true
     try leaf.setTextContent(std.testing.allocator, "hello");
     leaf.markRenderDirty();
     cx.layout();
@@ -12544,14 +12736,16 @@ test "content flags: has_text_subtree flag tracks add/remove/reparent text" {
     try std.testing.expect(cx.scene_runtime.get(container.id).?.content_flags.has_text == true);
     try std.testing.expect(cx.scene_runtime.get(root.id).?.content_flags.has_text == true);
 
-    // 2. 删文本：保守不清位 -> has_text 保持 true（旧 subtreeHasText 语义的超集）。
+    // 2. remove text: conservative, never clear -> has_text stays true (superset of old
+    // subtreeHasText)
     leaf.setText(null);
     leaf.markRenderDirty();
     cx.layout();
     _ = cx.render();
     try std.testing.expect(cx.scene_runtime.get(container.id).?.content_flags.has_text == true);
 
-    // 3. reparent：另一棵无文本子树 append 到 root -> 标志从挂载点并入父链。
+    // 3. reparent: text-less subtree appended to root -> flag merged up from attach
+    // point
     const other = try box(cx, .{ .width = .{ .px = 80 }, .height = .{ .px = 40 } }, .{});
     try root.appendChild(std.testing.allocator, other);
     const other_text = try text(cx, "world", .{});
@@ -12559,12 +12753,13 @@ test "content flags: has_text_subtree flag tracks add/remove/reparent text" {
     cx.layout();
     _ = cx.render();
     try std.testing.expect(cx.scene_runtime.get(other.id).?.content_flags.has_text == true);
-    // other 挂进 root 时 root 已因 leaf 的历史文本为 true；把整棵树换掉验证
-    // 并入路径本身：fresh parent（无文本历史）+ 带 text 的子树。
+    // when other attaches to root, root already true from leaf's text history; full tree
+    // swap verifies merge path itself: fresh parent (no text history) + text-bearing subtree
     const fresh_root = try box(cx, .{ .width = .{ .px = 100 }, .height = .{ .px = 100 } }, .{});
     const fresh_leaf = try text(cx, "deep", .{});
     try fresh_root.appendChild(std.testing.allocator, fresh_leaf);
-    // 挂进现有树 -> appendChild 的并入路径必须把 fresh_root 以上的父链也点亮。
+    // attach to existing tree -> appendChild merge path must light up parent chain above
+    // fresh_root
     try root.appendChild(std.testing.allocator, fresh_root);
     cx.layout();
     _ = cx.render();
@@ -12574,9 +12769,9 @@ test "content flags: has_text_subtree flag tracks add/remove/reparent text" {
 
 // ============================================================================
 
-// 让 ScrollArea.mount 注入的 scroll_id 被清回 sentinel。
+// let ScrollArea.mount's injected scroll_id be cleared back to sentinel
 test "syncInteractionToTable preserves scroll_id across renders" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
 
@@ -12588,33 +12783,31 @@ test "syncInteractionToTable preserves scroll_id across renders" {
 
     cx.layout();
 
-    // 模拟 ScrollArea.mount: 注入 scroll_id
+    // simulate ScrollArea.mount: inject scroll_id
     const eid = ui.world.ElementId.fromRaw(target.element_id_raw);
     cx.world.interaction.put(eid, .{
         .scroll_id = 42,
     }) catch unreachable;
 
-    // 触发一次 render -> syncInteractionToTable 跑
+    // trigger one render -> syncInteractionToTable runs
     _ = cx.render();
 
-    // scroll_id 应仍然是 42，不被擦回 sentinel
+    // scroll_id should still be 42, not erased to sentinel
     const data = cx.world.interaction.get(eid).?;
     try std.testing.expectEqual(@as(u32, 42), data.scroll_id);
 }
 
-// ============================================================================
-// v0.6 §2.1, Accessibility Tree 投影 tests
-// ============================================================================
+// v0.6 §2.1, Accessibility Tree projection tests
 
 test "syncA11yTreeFromInteractions projects nodes with a11y or focusable" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
 
     const root = try box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
     cx.root = root;
 
-    // 三个子节点：focusable / a11y role / 纯视觉
+    // three children: focusable / a11y role / visual-only
     const btn = try box(cx, .{ .width = .{ .px = 100 }, .height = .{ .px = 50 } }, .{});
     btn.behavior.interaction.a11y = .{ .role = .button, .label = "Click Me" };
 
@@ -12630,36 +12823,36 @@ test "syncA11yTreeFromInteractions projects nodes with a11y or focusable" {
     cx.layout();
     _ = cx.render();
 
-    // root 无 a11y、无 focusable -> 不投影
-    // btn -> 投影为 .button
-    // focusable_n -> 投影为 .generic (focusable 容器)
-    // plain -> 不投影
+    // root: no a11y, no focusable -> not projected
+    // btn -> projected as .button
+    // focusable_n -> projected as .generic (focusable container)
+    // plain -> not projected
     try std.testing.expectEqual(@as(usize, 2), cx.accessibility_tree.count());
 
     const btn_eid = ui.ElementId.fromRaw(btn.element_id_raw);
-    const btn_node = cx.accessibility_tree.get(btn_eid).?;
+    const btn_node = cx.accessibility_tree.getNode(btn_eid).?;
     try std.testing.expectEqual(ui.a11y_tree.Role.button, btn_node.role);
     try std.testing.expect(btn_node.label_hash != 0);
 
-    // label_buf 应能查回 "Click Me"
+    // label_buf should retrieve "Click Me"
     const got_label = cx.a11y_label_buf.get(btn_node.label_hash).?;
     try std.testing.expectEqualStrings("Click Me", got_label);
 
     const f_eid = ui.ElementId.fromRaw(focusable_n.element_id_raw);
-    const f_node = cx.accessibility_tree.get(f_eid).?;
+    const f_node = cx.accessibility_tree.getNode(f_eid).?;
     try std.testing.expectEqual(ui.a11y_tree.Role.generic, f_node.role);
     try std.testing.expect(f_node.state.focusable);
 }
 
 test "label falls back to subtree text when a11y.label is null" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
 
     const root = try box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
     cx.root = root;
 
-    // button 无 explicit label，但子文本 "Submit" 应作为 label fallback
+    // button has no explicit label, but child text "Submit" should serve as label fallback
     const btn = try box(cx, .{ .width = .{ .px = 100 }, .height = .{ .px = 50 } }, .{});
     btn.behavior.interaction.a11y = .{ .role = .button };
     const label_text = try ui.text(cx, "Submit", .{});
@@ -12670,24 +12863,24 @@ test "label falls back to subtree text when a11y.label is null" {
     _ = cx.render();
 
     const btn_eid = ui.ElementId.fromRaw(btn.element_id_raw);
-    const btn_node = cx.accessibility_tree.get(btn_eid).?;
+    const btn_node = cx.accessibility_tree.getNode(btn_eid).?;
     const got_label = cx.a11y_label_buf.get(btn_node.label_hash).?;
     try std.testing.expectEqualStrings("Submit", got_label);
 }
 
 test "a11y_tree parent skips non-projected ancestors" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
 
     const root = try box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
     cx.root = root;
 
-    // 中间纯视觉 wrapper（不投影）
+    // intermediate visual-only wrapper (not projected)
     const wrapper = try box(cx, .{ .width = .{ .px = 200 }, .height = .{ .px = 100 } }, .{});
     try root.appendChild(std.testing.allocator, wrapper);
 
-    // 内层 button
+    // nested button
     const btn = try box(cx, .{ .width = .{ .px = 100 }, .height = .{ .px = 50 } }, .{});
     btn.behavior.interaction.a11y = .{ .role = .button, .label = "Inner" };
     try wrapper.appendChild(std.testing.allocator, btn);
@@ -12695,14 +12888,14 @@ test "a11y_tree parent skips non-projected ancestors" {
     cx.layout();
     _ = cx.render();
 
-    // root + wrapper 都不投影；btn parent 应是 NULL（最近已投影祖先）
+    // root + wrapper not projected; btn parent should be NULL (nearest projected ancestor)
     const btn_eid = ui.ElementId.fromRaw(btn.element_id_raw);
-    const btn_node = cx.accessibility_tree.get(btn_eid).?;
+    const btn_node = cx.accessibility_tree.getNode(btn_eid).?;
     try std.testing.expect(btn_node.parent.isNull());
 }
 
 test "state.checked / disabled propagated from A11yProps" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
 
@@ -12722,35 +12915,34 @@ test "state.checked / disabled propagated from A11yProps" {
     _ = cx.render();
 
     const cb_eid = ui.ElementId.fromRaw(cb.element_id_raw);
-    const cb_node = cx.accessibility_tree.get(cb_eid).?;
+    const cb_node = cx.accessibility_tree.getNode(cb_eid).?;
     try std.testing.expect(cb_node.state.checked);
     try std.testing.expect(cb_node.state.disabled);
 }
 
-// ============================================================================
-// v0.6 §2.1, macos_bridge C ABI 集成 tests (ObjC accessibilityChildren 协议
-// 等价回调路径)。这些 fixture 模拟 ObjC 调 zenit_a11y_* extern 序列，验证
-// cx.render() 之后 a11y_tree 可以被 C-style API 完整遍历 + 取 label。
-// ============================================================================
+// v0.6 §2.1, macos_bridge C ABI integration tests (ObjC accessibilityChildren protocol
+// equivalent callback paths). Fixtures simulate ObjC calling zenit_a11y_* extern sequence,
+// verify cx.render() leaves a11y_tree fully traversable via C-style API with label retrieval.
 
-// 每个 export 的首参是 window_id（ObjC 代理从自己的 NSWindow 取）。这些 fixture
-// 用 ANY_WINDOW(0) 通配，等价于"当前唯一注册的窗口"，本文件的 cx 都是单窗口。
-// 按具体 window_id 路由的多窗口验收在 a11y/macos_bridge.zig 的单测里。
+// each export's first param is window_id (ObjC proxy gets from its NSWindow). Fixtures
+// use ANY_WINDOW(0) as wildcard, equivalent to "currently sole registered window"; all cx
+// in this file are single-window. Multi-window routing by specific window_id verified in
+// a11y/macos_bridge.zig unit tests.
 const a11y_bridge_extern = struct {
     const ANY: u32 = 0;
     extern fn zenit_a11y_root_count(window_id: u32) c_int;
-    extern fn zenit_a11y_root_at(window_id: u32, idx: c_int) u32;
-    extern fn zenit_a11y_children_count(window_id: u32, parent_raw: u32) c_int;
-    extern fn zenit_a11y_children_at(window_id: u32, parent_raw: u32, idx: c_int) u32;
-    extern fn zenit_a11y_role(window_id: u32, handle: u32) c_int;
-    extern fn zenit_a11y_label(window_id: u32, handle: u32, buf: ?[*]u8, buf_len: c_int) c_int;
-    extern fn zenit_a11y_frame(window_id: u32, handle: u32, x: ?*f32, y: ?*f32, width: ?*f32, height: ?*f32) c_int;
-    extern fn zenit_a11y_actions(window_id: u32, handle: u32) u8;
-    extern fn zenit_a11y_perform_action(window_id: u32, handle: u32, action: u8) c_int;
+    extern fn zenit_a11y_root_at(window_id: u32, idx: c_int) u64;
+    extern fn zenit_a11y_children_count(window_id: u32, parent_raw: u64) c_int;
+    extern fn zenit_a11y_children_at(window_id: u32, parent_raw: u64, idx: c_int) u64;
+    extern fn zenit_a11y_role(window_id: u32, handle: u64) c_int;
+    extern fn zenit_a11y_label(window_id: u32, handle: u64, buf: ?[*]u8, buf_len: c_int) c_int;
+    extern fn zenit_a11y_frame(window_id: u32, handle: u64, x: ?*f32, y: ?*f32, width: ?*f32, height: ?*f32) c_int;
+    extern fn zenit_a11y_actions(window_id: u32, handle: u64) u8;
+    extern fn zenit_a11y_perform_action(window_id: u32, handle: u64, action: u8) c_int;
 };
 
 test "VoiceOver-style navigation reaches button labels" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
 
@@ -12769,7 +12961,7 @@ test "VoiceOver-style navigation reaches button labels" {
     cx.layout();
     _ = cx.render();
 
-    // 模拟 VoiceOver pull path: MetalView.accessibilityChildren -> root_count/_at
+    // simulate VoiceOver pull path: MetalView.accessibilityChildren -> root_count/_at
     try std.testing.expectEqual(@as(c_int, 2), a11y_bridge_extern.zenit_a11y_root_count(a11y_bridge_extern.ANY));
 
     var seen_save = false;
@@ -12779,7 +12971,7 @@ test "VoiceOver-style navigation reaches button labels" {
         const h = a11y_bridge_extern.zenit_a11y_root_at(a11y_bridge_extern.ANY, i);
         try std.testing.expect(h != 0);
         try std.testing.expectEqual(
-            @as(c_int, @intFromEnum(ui.a11y_tree.Role.button)),
+            @as(c_int, @backingInt(ui.a11y_tree.Role.button)),
             a11y_bridge_extern.zenit_a11y_role(a11y_bridge_extern.ANY, h),
         );
         var buf: [32]u8 = undefined;
@@ -12794,7 +12986,7 @@ test "VoiceOver-style navigation reaches button labels" {
 }
 
 test "a11y bridge: projected global frame and native press use focus/event routing" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
     cx.setWindowId(303);
@@ -12806,9 +12998,19 @@ test "a11y bridge: projected global frame and native press use focus/event routi
     }, .{});
     cx.root = root;
     var pressed = false;
+    var selected = false;
     const btn = try box(cx, .{ .width = .{ .px = 91 }, .height = .{ .px = 37 } }, .{});
     btn.setFocusable(true);
-    btn.behavior.interaction.a11y = .{ .role = .button, .label = "Native action" };
+    btn.behavior.interaction.a11y = .{ .role = .button, .label = "Native action", .item_selection = .{
+        .context = &selected,
+        .set = struct {
+            fn call(context: *anyopaque, _: ui.A11yProps.ItemSelectionOperation) bool {
+                const value: *bool = @ptrCast(@alignCast(context));
+                value.* = true;
+                return true;
+            }
+        }.call,
+    } };
     btn.behavior.events.on_click = Cx.simpleHandler(struct {
         fn call(context: *anyopaque) void {
             const value: *bool = @ptrCast(@alignCast(context));
@@ -12834,17 +13036,232 @@ test "a11y bridge: projected global frame and native press use focus/event routi
     try std.testing.expectEqual(@as(c_int, 1), a11y_bridge_extern.zenit_a11y_perform_action(303, handle, 0));
     try std.testing.expect(pressed);
     try std.testing.expect(cx.isFocused(btn));
+
+    try std.testing.expect(cx.setA11yItemSelection(handle, .replace));
+    try std.testing.expect(selected);
+
+    // The native client may retain an enabled snapshot while a modal opens.
+    // Revalidate the live boundary before dispatching, even before projection.
+    const panel = try box(cx, .{}, .{});
+    try root.appendChild(std.testing.allocator, panel);
+    const modal = try cx.overlay_stack.push(.{ .kind = .modal, .enter_transition = .none });
+    cx.overlay_stack.bindFloatingContent(std.testing.allocator, modal, panel);
+    pressed = false;
+    selected = false;
+    try std.testing.expect(!cx.setA11yItemSelection(handle, .replace));
+    try std.testing.expect(!selected);
+    try std.testing.expectEqual(@as(c_int, 0), a11y_bridge_extern.zenit_a11y_perform_action(303, handle, 0));
+    try std.testing.expect(!pressed);
+    cx.syncA11yTreeFromInteractions(root);
+    try std.testing.expect(cx.accessibility_tree.get(a11y_tree_mod.AXId.fromRaw(handle)).?.state.disabled);
+    try std.testing.expect(!btn.behavior.interaction.a11y.?.disabled);
+    cx.overlay_stack.commitExit(modal);
+    try std.testing.expect(cx.setA11yItemSelection(handle, .replace));
+    try std.testing.expect(selected);
+    cx.syncA11yTreeFromInteractions(root);
+    try std.testing.expect(!cx.accessibility_tree.get(a11y_tree_mod.AXId.fromRaw(handle)).?.state.disabled);
+    try std.testing.expectEqual(@as(c_int, 1), a11y_bridge_extern.zenit_a11y_perform_action(303, handle, 0));
+    try std.testing.expect(pressed);
+}
+
+// ── 2026-10-01 semantic merging / static text / inferred button (real Cx-driven) ──
+// corresponds to AXUIElement probe (tools/axprobe) issues seen on hello_button /
+// storybook; see a11y_projection.zig same-date section
+
+test "a11y: 未标注文字投影为 static_text，按钮吸收自身文字与 spinner" {
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    cx.setViewport(400, 300);
+
+    const root = try box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
+    cx.root = root;
+    const title = try ui.text(cx, "Hello, zenit!", .{});
+    const btn = try box(cx, .{ .width = .{ .px = 100 }, .height = .{ .px = 40 } }, .{});
+    btn.behavior.interaction.a11y = .{ .role = .button };
+    const spinner = try box(cx, .{ .width = .{ .px = 10 }, .height = .{ .px = 10 } }, .{});
+    spinner.behavior.interaction.a11y = .{ .role = .progressbar };
+    const btn_text = try ui.text(cx, "Saving", .{});
+    try btn.appendChild(std.testing.allocator, spinner);
+    try btn.appendChild(std.testing.allocator, btn_text);
+    const counter_text = try ui.text(cx, "Clicked 0 times", .{});
+    try root.appendChild(std.testing.allocator, title);
+    try root.appendChild(std.testing.allocator, btn);
+    try root.appendChild(std.testing.allocator, counter_text);
+
+    cx.layout();
+    _ = cx.render();
+
+    const t = cx.accessibility_tree.getNode(ui.ElementId.fromRaw(title.element_id_raw)).?;
+    try std.testing.expectEqual(ui.a11y_tree.Role.static_text, t.role);
+    try std.testing.expectEqualStrings("Hello, zenit!", cx.a11y_label_buf.get(t.text_hash).?);
+
+    const b = cx.accessibility_tree.getNode(ui.ElementId.fromRaw(btn.element_id_raw)).?;
+    try std.testing.expectEqualStrings("Saving", cx.a11y_label_buf.get(b.label_hash).?);
+    try std.testing.expect(cx.accessibility_tree.getNode(ui.ElementId.fromRaw(spinner.element_id_raw)) == null);
+    try std.testing.expect(cx.accessibility_tree.getNode(ui.ElementId.fromRaw(btn_text.element_id_raw)) == null);
+
+    // top-level read order = document order: title, button, count result
+    const tops = cx.accessibility_tree.exposedChildren(a11y_tree_mod.AXId.NULL);
+    try std.testing.expectEqual(@as(usize, 3), tops.len);
+    try std.testing.expect(tops[0].eql(a11y_tree_mod.AXId.node(ui.ElementId.fromRaw(title.element_id_raw))));
+    try std.testing.expect(tops[1].eql(a11y_tree_mod.AXId.node(ui.ElementId.fromRaw(btn.element_id_raw))));
+    try std.testing.expect(tops[2].eql(a11y_tree_mod.AXId.node(ui.ElementId.fromRaw(counter_text.element_id_raw))));
+
+    // after text changes, value follows (hello_button: after press, AT reads new count)
+    var props = counter_text.getText().?;
+    props.content = "Clicked 1 times";
+    counter_text.setText(props);
+    counter_text.markRenderDirty();
+    cx.layout();
+    _ = cx.render();
+    const c = cx.accessibility_tree.getNode(ui.ElementId.fromRaw(counter_text.element_id_raw)).?;
+    try std.testing.expectEqualStrings("Clicked 1 times", cx.a11y_label_buf.get(c.text_hash).?);
+}
+
+test "a11y: 容器角色不借第一行文字作名（VirtualList 曾被叫作 \"#0\"）" {
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    cx.setViewport(400, 300);
+
+    const root = try box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
+    cx.root = root;
+    const list = try box(cx, .{ .width = .{ .px = 200 }, .height = .{ .px = 100 } }, .{});
+    list.behavior.interaction.a11y = .{ .role = .list };
+    const item = try box(cx, .{ .width = .{ .px = 200 }, .height = .{ .px = 30 } }, .{});
+    item.behavior.interaction.a11y = .{ .role = .listitem };
+    const item_text = try ui.text(cx, "#0", .{});
+    try item.appendChild(std.testing.allocator, item_text);
+    try list.appendChild(std.testing.allocator, item);
+    try root.appendChild(std.testing.allocator, list);
+
+    cx.layout();
+    _ = cx.render();
+
+    try std.testing.expectEqual(@as(u64, 0), cx.accessibility_tree.getNode(ui.ElementId.fromRaw(list.element_id_raw)).?.label_hash);
+    // list items absorb own text, use content as name (real VoiceOver: when row is
+    // container wrapping static text, VO skips row layer, reads text directly; user unaware
+    // of list)
+    const item_node = cx.accessibility_tree.getNode(ui.ElementId.fromRaw(item.element_id_raw)).?;
+    try std.testing.expectEqualStrings("#0", cx.a11y_label_buf.get(item_node.label_hash).?);
+    try std.testing.expect(cx.accessibility_tree.getNode(ui.ElementId.fromRaw(item_text.element_id_raw)) == null);
+}
+
+test "a11y: 只有点击路由的叶子推断为按钮且原生 press 可达；点击遮罩不推断" {
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    cx.setViewport(400, 300);
+    cx.setWindowId(304);
+
+    const root = try box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
+    cx.root = root;
+    var pressed = false;
+    const nav = try box(cx, .{ .width = .{ .px = 120 }, .height = .{ .px = 30 } }, .{});
+    nav.behavior.events.on_click = Cx.simpleHandler(struct {
+        fn call(context: *anyopaque) void {
+            const value: *bool = @ptrCast(@alignCast(context));
+            value.* = true;
+        }
+    }.call, &pressed);
+    try nav.appendChild(std.testing.allocator, try ui.text(cx, "Checkbox", .{}));
+
+    const backdrop = try box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 200 } }, .{});
+    backdrop.behavior.events.on_click = Cx.simpleHandler(struct {
+        fn call(_: *anyopaque) void {}
+    }.call, &pressed);
+    const dialog = try box(cx, .{ .width = .{ .px = 200 }, .height = .{ .px = 100 } }, .{});
+    dialog.behavior.interaction.a11y = .{ .role = .dialog, .label = "Confirm" };
+    try dialog.appendChild(std.testing.allocator, try ui.text(cx, "Are you sure?", .{}));
+    try backdrop.appendChild(std.testing.allocator, dialog);
+
+    try root.appendChild(std.testing.allocator, nav);
+    try root.appendChild(std.testing.allocator, backdrop);
+    cx.layout();
+    _ = cx.render();
+
+    const n = cx.accessibility_tree.getNode(ui.ElementId.fromRaw(nav.element_id_raw)).?;
+    try std.testing.expectEqual(ui.a11y_tree.Role.button, n.role);
+    try std.testing.expectEqualStrings("Checkbox", cx.a11y_label_buf.get(n.label_hash).?);
+    // inferred button lacks a11y props, native press must still work (old impl returned
+    // false)
+    try std.testing.expectEqual(@as(c_int, 1), a11y_bridge_extern.zenit_a11y_perform_action(304, nav.element_id_raw, 0));
+    try std.testing.expect(pressed);
+
+    try std.testing.expect(cx.accessibility_tree.getNode(ui.ElementId.fromRaw(backdrop.element_id_raw)) == null);
+    try std.testing.expectEqual(ui.a11y_tree.Role.dialog, cx.accessibility_tree.getNode(ui.ElementId.fromRaw(dialog.element_id_raw)).?.role);
+}
+
+test "a11y: 模态对话框打开时背景 inert，关闭后恢复" {
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    cx.setViewport(400, 300);
+
+    const root = try box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
+    cx.root = root;
+    const page = try box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 100 } }, .{});
+    const background_btn = try box(cx, .{ .width = .{ .px = 80 }, .height = .{ .px = 30 } }, .{});
+    background_btn.behavior.interaction.a11y = .{ .role = .button, .label = "Behind" };
+    try page.appendChild(std.testing.allocator, background_btn);
+    try page.appendChild(std.testing.allocator, try ui.text(cx, "Background text", .{}));
+
+    const portal = try box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 200 } }, .{});
+    const dialog = try box(cx, .{ .width = .{ .px = 200 }, .height = .{ .px = 100 } }, .{});
+    dialog.behavior.interaction.a11y = .{ .role = .dialog, .label = "Confirm", .modal = true };
+    const ok_btn = try box(cx, .{ .width = .{ .px = 60 }, .height = .{ .px = 30 } }, .{});
+    ok_btn.behavior.interaction.a11y = .{ .role = .button, .label = "OK" };
+    try dialog.appendChild(std.testing.allocator, ok_btn);
+    try portal.appendChild(std.testing.allocator, dialog);
+    try root.appendChild(std.testing.allocator, page);
+    try root.appendChild(std.testing.allocator, portal);
+
+    cx.layout();
+    _ = cx.render();
+
+    const behind = cx.accessibility_tree.getNode(ui.ElementId.fromRaw(background_btn.element_id_raw)).?;
+    try std.testing.expect(behind.state.hidden);
+    try std.testing.expect(!cx.accessibility_tree.getNode(ui.ElementId.fromRaw(dialog.element_id_raw)).?.state.hidden);
+    try std.testing.expect(!cx.accessibility_tree.getNode(ui.ElementId.fromRaw(ok_btn.element_id_raw)).?.state.hidden);
+    // only dialog visible at top level to outside
+    const tops = cx.accessibility_tree.exposedChildren(a11y_tree_mod.AXId.NULL);
+    try std.testing.expectEqual(@as(usize, 1), tops.len);
+    try std.testing.expect(tops[0].eql(a11y_tree_mod.AXId.node(ui.ElementId.fromRaw(dialog.element_id_raw))));
+
+    // after close (display:none), background restores
+    dialog.style.display = .none;
+    dialog.markLayoutDirty();
+    cx.layout();
+    _ = cx.render();
+    try std.testing.expect(!cx.accessibility_tree.getNode(ui.ElementId.fromRaw(background_btn.element_id_raw)).?.state.hidden);
+}
+
+test "a11y: 未声明语义的滚动容器投影为 scroll_area 分组（不再和兄弟区域交错）" {
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    cx.setViewport(400, 300);
+    const root = try box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
+    cx.root = root;
+    const scroll = try box(cx, .{ .width = .{ .px = 200 }, .height = .{ .px = 200 } }, .{});
+    scroll.tag = .scroll;
+    const inside = try ui.text(cx, "Inside", .{});
+    try scroll.appendChild(std.testing.allocator, inside);
+    try root.appendChild(std.testing.allocator, scroll);
+    cx.layout();
+    _ = cx.render();
+    const area = cx.accessibility_tree.getNode(ui.ElementId.fromRaw(scroll.element_id_raw)).?;
+    try std.testing.expectEqual(ui.a11y_tree.Role.scroll_area, area.role);
+    // container: doesn't borrow child text as name, text remains its child element
+    try std.testing.expectEqual(@as(u64, 0), area.label_hash);
+    try std.testing.expect(cx.accessibility_tree.getNode(ui.ElementId.fromRaw(inside.element_id_raw)).?.parent.eql(a11y_tree_mod.AXId.node(ui.ElementId.fromRaw(scroll.element_id_raw))));
 }
 
 test "nested a11y tree exposes children via C ABI" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
 
     const root = try box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
     cx.root = root;
 
-    // dialog 容器 + 2 个子 button
+    // dialog container + 2 child buttons
     const dialog = try box(cx, .{ .width = .{ .px = 300 }, .height = .{ .px = 200 } }, .{});
     dialog.behavior.interaction.a11y = .{ .role = .dialog, .label = "Confirm" };
 
@@ -12861,18 +13278,18 @@ test "nested a11y tree exposes children via C ABI" {
     cx.layout();
     _ = cx.render();
 
-    // VoiceOver flow: 顶级是 dialog
+    // VoiceOver flow: top-level is dialog
     try std.testing.expectEqual(@as(c_int, 1), a11y_bridge_extern.zenit_a11y_root_count(a11y_bridge_extern.ANY));
     const dialog_h = a11y_bridge_extern.zenit_a11y_root_at(a11y_bridge_extern.ANY, 0);
     try std.testing.expectEqual(
-        @as(c_int, @intFromEnum(ui.a11y_tree.Role.dialog)),
+        @as(c_int, @backingInt(ui.a11y_tree.Role.dialog)),
         a11y_bridge_extern.zenit_a11y_role(a11y_bridge_extern.ANY, dialog_h),
     );
 
-    // dialog 有 2 个 children
+    // dialog has 2 children
     try std.testing.expectEqual(@as(c_int, 2), a11y_bridge_extern.zenit_a11y_children_count(a11y_bridge_extern.ANY, dialog_h));
 
-    // 验 children label 包含 "OK" / "Cancel"
+    // verify children labels contain "OK" / "Cancel"
     var seen_ok = false;
     var seen_cancel = false;
     var ci: c_int = 0;
@@ -12890,7 +13307,7 @@ test "nested a11y tree exposes children via C ABI" {
 }
 
 test "probe mode returns length when buf=null" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
 
@@ -12904,24 +13321,22 @@ test "probe mode returns length when buf=null" {
     _ = cx.render();
 
     const h = a11y_bridge_extern.zenit_a11y_root_at(a11y_bridge_extern.ANY, 0);
-    // probe: buf=null 返实际长度
+    // probe: buf=null returns actual length
     const probe = a11y_bridge_extern.zenit_a11y_label(a11y_bridge_extern.ANY, h, null, 0);
     try std.testing.expectEqual(@as(c_int, "Hello World".len), probe);
 }
 
-// ============================================================================
-// v0.6 §2.2, event_dispatcher capture phase 真派发 tests
-// ============================================================================
+// v0.6 §2.2, event_dispatcher capture phase dispatch tests
 
-// 共享 trace buffer：每个 capture handler push 节点 tag (root/mid/target)
+// shared trace buffer: each capture handler pushes node tag (root/mid/target)
 const CaptureTrace = struct {
     seq: std.ArrayList(u8),
-    stop_after: ?u8 = null, // 收到此 tag 后返 .stop
+    stop_after: ?u8 = null, // after receiving this tag, return .stop
 
     fn append(self: *CaptureTrace, tag: u8) EventResult {
-        // 测试脚手架：这里签名被事件回调固定成返回 EventResult，没法传播 error。
-        // 用的是 testing.allocator，真 OOM 会让测试自己失败，而且序列断言
-        // 会立刻发现少了一项，不存在"静默通过"的风险。
+        // test scaffold: callback signature fixed to return EventResult, can't propagate
+        // error. uses testing.allocator; real OOM fails test itself; sequence assertion catches
+        // missing item immediately; no silent-pass risk.
         self.seq.append(std.testing.allocator, tag) catch {};
         if (self.stop_after) |s| if (tag == s) return .stop;
         return .ignored;
@@ -12938,12 +13353,12 @@ fn captureHandlerFor(comptime tag: u8) ui.GenericEventCallback {
     }.handle;
 }
 
-test "capture phase walks root → target (not including target)" {
-    var cx = try Cx.init(std.testing.allocator);
+test "capture phase walks root → target; the target's own capture handler runs at the target phase, before its on_event" {
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
 
-    var trace = CaptureTrace{ .seq = .{} };
+    var trace = CaptureTrace{ .seq = .empty };
     defer trace.seq.deinit(std.testing.allocator);
 
     const root = try box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
@@ -12963,23 +13378,25 @@ test "capture phase walks root → target (not including target)" {
     cx.root = root;
     cx.layout();
 
-    // 直接走 dispatcher 测试 capture/bubble 逻辑，绕开 hit-test (hit-test 已被
-    // 大量 fixture 覆盖；这里只测事件分发协议本身)。
+    // test dispatcher directly for capture/bubble logic, bypass hit-test (well-covered
+    // by other fixtures; here only protocol itself).
     _ = cx.dispatcher.dispatch(ui.Event{ .click = .{ .x = 50, .y = 50 } }, target);
 
-    // root (R) + mid (M) 在 capture phase 触发；target (T) 不触发 capture（capture
-    // 协议只走 root -> target 路径，**不含 target 自身**）。
-    try std.testing.expectEqual(@as(usize, 2), trace.seq.items.len);
+    // root (R) + mid (M) fire in capture phase; target (T)'s capture fires in target
+    // phase (DOM at-target order), once only (capture phase root->target path excludes target
+    // itself).
+    try std.testing.expectEqual(@as(usize, 3), trace.seq.items.len);
     try std.testing.expectEqual(@as(u8, 'R'), trace.seq.items[0]);
     try std.testing.expectEqual(@as(u8, 'M'), trace.seq.items[1]);
+    try std.testing.expectEqual(@as(u8, 'T'), trace.seq.items[2]);
 }
 
 test "capture stop halts propagation (no bubble)" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
 
-    var trace = CaptureTrace{ .seq = .{}, .stop_after = 'M' };
+    var trace = CaptureTrace{ .seq = .empty, .stop_after = 'M' };
     defer trace.seq.deinit(std.testing.allocator);
 
     const root = try box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
@@ -12990,7 +13407,7 @@ test "capture stop halts propagation (no bubble)" {
     mid.behavior.events.on_event_capture = captureHandlerFor('M');
     mid.behavior.events.event_context = &trace;
 
-    // target 还挂个 on_event 验证 target/bubble 阶段是否被 stop 阻断
+    // target also has on_event to verify target/bubble phase stopped or not
     var target_hit = false;
     const HandlerCtx = struct { hit: *bool };
     var hctx = HandlerCtx{ .hit = &target_hit };
@@ -13011,21 +13428,21 @@ test "capture stop halts propagation (no bubble)" {
 
     _ = cx.dispatcher.dispatch(ui.Event{ .click = .{ .x = 50, .y = 50 } }, target);
 
-    // R + M 触发；M 返 stop 后 target 不应被触发
+    // R + M fire; after M returns stop, target should not fire
     try std.testing.expectEqual(@as(usize, 2), trace.seq.items.len);
     try std.testing.expect(!target_hit);
 }
 
 test "null on_event_capture handler skipped (zero overhead)" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
 
-    var trace = CaptureTrace{ .seq = .{} };
+    var trace = CaptureTrace{ .seq = .empty };
     defer trace.seq.deinit(std.testing.allocator);
 
     const root = try box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
-    // root 不设 on_event_capture
+    // root doesn't set on_event_capture
 
     const mid = try box(cx, .{ .width = .{ .px = 200 }, .height = .{ .px = 200 } }, .{});
     mid.behavior.events.on_event_capture = captureHandlerFor('M');
@@ -13040,14 +13457,12 @@ test "null on_event_capture handler skipped (zero overhead)" {
 
     _ = cx.dispatcher.dispatch(ui.Event{ .click = .{ .x = 50, .y = 50 } }, target);
 
-    // 只有 mid (M) 触发；root null handler 跳过
+    // only mid (M) fires; root's null handler skipped
     try std.testing.expectEqual(@as(usize, 1), trace.seq.items.len);
     try std.testing.expectEqual(@as(u8, 'M'), trace.seq.items[0]);
 }
 
-// ============================================================================
-// v0.6 §2.4, a11y_router.flushToBridge 端到端 tests
-// ============================================================================
+// v0.6 §2.4, a11y_router.flushToBridge end-to-end tests
 
 const PushHookCalls = struct {
     children_changed: u32 = 0,
@@ -13058,7 +13473,7 @@ const PushHookCalls = struct {
 
 var g_push_test_state: PushHookCalls = .{};
 
-fn testChildrenChangedHook(_: u32, _: u32) callconv(.c) c_int {
+fn testChildrenChangedHook(_: u32, _: u64) callconv(.c) c_int {
     g_push_test_state.children_changed += 1;
     return 1;
 }
@@ -13079,7 +13494,7 @@ test "cx.render flushes structure_changed dirty to children_changed hook" {
     });
     defer ui.a11y_macos_bridge.setPushHooks(.{}); // reset
 
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
 
@@ -13094,9 +13509,9 @@ test "cx.render flushes structure_changed dirty to children_changed hook" {
     cx.layout();
     _ = cx.render();
 
-    // root + btn 都是新增（structure_changed），router 给 parent 推 children_changed.
-    // btn.parent == root (有效)；root.parent == NULL (router 跳过 NULL parent)。
-    // 所以 children_changed 至少调 1 次（btn 的 parent=root 触发）。
+    // root + btn both new (structure_changed), router pushes children_changed to parent.
+    // btn.parent == root (valid); root.parent == NULL (router skips NULL parent).
+    // so children_changed called at least 1x (btn's parent=root triggers).
     try std.testing.expect(g_push_test_state.children_changed >= 1);
 }
 
@@ -13108,7 +13523,7 @@ test "live region text_hash change triggers announce hook" {
     });
     defer ui.a11y_macos_bridge.setPushHooks(.{});
 
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
 
@@ -13118,8 +13533,8 @@ test "live region text_hash change triggers announce hook" {
     _ = cx.render();
     g_push_test_state.announce_count = 0;
 
-    // 手动 upsert 一个 live region 节点 + 修改 text_hash -> live_announce dirty
-    const id: ui.ElementId = .{ .index = 999, .generation = 0 };
+    // manually upsert live region node + modify text_hash -> live_announce dirty
+    const id = a11y_tree_mod.AXId.node(.{ .index = 999, .generation = 0 });
     const initial_text = "Loading";
     const initial_hash = std.hash.Wyhash.hash(0, initial_text);
     try cx.a11y_label_buf.put(cx.allocator, initial_hash, initial_text);
@@ -13129,7 +13544,7 @@ test "live region text_hash change triggers announce hook" {
         .live = .polite,
         .text_hash = initial_hash,
     });
-    // drain 第一次 upsert (structure_changed)
+    // drain first upsert (structure_changed)
     var dummy_cx_ref = ui.a11y_macos_bridge.PushCxRef{
         .window_id = 1,
         .label_ctx = cx,
@@ -13146,7 +13561,7 @@ test "live region text_hash change triggers announce hook" {
     );
     g_push_test_state.announce_count = 0;
 
-    // 改 text -> live_announce
+    // change text -> live_announce
     const new_text = "Done";
     const new_hash = std.hash.Wyhash.hash(0, new_text);
     try cx.a11y_label_buf.put(cx.allocator, new_hash, new_text);
@@ -13167,10 +13582,10 @@ test "live region text_hash change triggers announce hook" {
 
 test "null hooks → no callbacks (zero-overhead test build)" {
     g_push_test_state = .{};
-    ui.a11y_macos_bridge.setPushHooks(.{}); // 全 null
+    ui.a11y_macos_bridge.setPushHooks(.{}); // all null
     defer ui.a11y_macos_bridge.setPushHooks(.{});
 
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
 
@@ -13180,7 +13595,7 @@ test "null hooks → no callbacks (zero-overhead test build)" {
     cx.layout();
     _ = cx.render();
 
-    // 没注册 hook -> 计数器都是 0
+    // hooks not registered -> all counters 0
     try std.testing.expectEqual(@as(u32, 0), g_push_test_state.children_changed);
     try std.testing.expectEqual(@as(u32, 0), g_push_test_state.announce_count);
 }
@@ -13190,7 +13605,7 @@ test "null hooks → no callbacks (zero-overhead test build)" {
 // ============================================================================
 
 test "focus survives same-node identity (no rerender)" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
 
@@ -13205,13 +13620,13 @@ test "focus survives same-node identity (no rerender)" {
 
     try std.testing.expect(cx.focus_manager.getFocused() == btn);
 
-    // 再渲一帧后焦点应保持
+    // after another render, focus should persist
     _ = cx.render();
     try std.testing.expect(cx.focus_manager.getFocused() == btn);
 }
 
 test "focus cleared when focused node destroyed" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
 
@@ -13226,18 +13641,18 @@ test "focus cleared when focused node destroyed" {
 
     try std.testing.expect(cx.focus_manager.getFocused() == btn);
 
-    // 摧毁焦点节点
+    // destroy focused node
     cx.detachChild(root, btn);
     cx.freeNode(btn);
 
-    // getFocused 应自动清空 (generational handle resolve null)
+    // getFocused should auto-clear (generational handle resolves to null)
     try std.testing.expect(cx.focus_manager.getFocused() == null);
 }
 
-// setFocusWithReason 在旧焦点 blur/新焦点 focus 回调里同步 freeNode 的 UAF 防御。
-// 实测崩溃栈：NodeRegistry.trackGeneration <- FocusManager.setFocusWithReason,
-// blur 处理器释放了新焦点候选节点，之后直接把悬垂指针写进 current_focus 并读 node.id。
-// 回调在 tick/reactive 深度之外，freeNode 走 freeNodeNow 当场释放（不排队）。
+// setFocusWithReason syncs freeNode UAF defense in blur/focus callbacks.
+// Crash stack: NodeRegistry.trackGeneration <- FocusManager.setFocusWithReason: a blur handler
+// frees the new focus candidate, then a dangling ptr is written to current_focus and node.id read.
+// Callbacks run outside tick/reactive depth; freeNode calls freeNodeNow (no queue).
 const FocusFreeProbe = struct {
     cx: *Cx,
     parent: *Node,
@@ -13273,7 +13688,7 @@ fn focusFreeFixture(cx: *Cx) !struct { root: *Node, a: *Node, b: *Node } {
 }
 
 test "focus: blur handler freeing the incoming focus target degrades to cleared focus (no UAF)" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
     const f = try focusFreeFixture(cx);
@@ -13284,16 +13699,16 @@ test "focus: blur handler freeing the incoming focus target degrades to cleared 
     var probe = FocusFreeProbe{ .cx = cx, .parent = f.root, .victim = f.b };
     f.a.behavior.events.on_blur = probe.handler();
 
-    // b 在 a 的 blur 里被释放；修复前这里把悬垂的 b 写进 current_focus。
+    // b freed in a's blur; before fix, dangling b was written to current_focus here
     cx.focus_manager.setFocusWithReason(f.b, .click);
 
     try std.testing.expectEqual(@as(u32, 1), probe.fired);
     try std.testing.expect(cx.focus_manager.current_focus == null);
     try std.testing.expect(cx.focus_manager.current_focus_handle == null);
     try std.testing.expect(cx.focus_manager.getFocused() == null);
-    // 旧焦点已收到 blur，不得"还原"成焦点
+    // old focus received blur, must not 'restore' to focused
     try std.testing.expect(!cx.focus_manager.isFocused(f.a));
-    // 帧照常可跑、焦点链照常可用
+    // frames run normally, focus chain works normally
     _ = cx.render();
     f.a.behavior.events.on_blur = null;
     cx.focus_manager.setFocus(f.a);
@@ -13301,7 +13716,7 @@ test "focus: blur handler freeing the incoming focus target degrades to cleared 
 }
 
 test "focus: Tab traversal whose blur handler frees the next target does not UAF" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
     const f = try focusFreeFixture(cx);
@@ -13320,7 +13735,7 @@ test "focus: Tab traversal whose blur handler frees the next target does not UAF
 }
 
 test "focus: blur handler freeing the old focused node still hands focus to the new node" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
     const f = try focusFreeFixture(cx);
@@ -13329,17 +13744,19 @@ test "focus: blur handler freeing the old focused node still hands focus to the 
     var probe = FocusFreeProbe{ .cx = cx, .parent = f.root, .victim = f.a };
     f.a.behavior.events.on_blur = probe.handler();
 
-    // a 在自己的 blur 里被释放；之后的 dispatcher blur 冒泡与 markRenderDirty 不得再碰 a。
+    // a freed in own blur; subsequent dispatcher blur propagation and markRenderDirty
+    // must not touch a
     cx.focus_manager.setFocusWithReason(f.b, .click);
 
-    // detachChild -> invalidateReferencesTo 会对仍持焦点的 a 再发一次 blur（重入，victim 已空）。
+    // detachChild -> invalidateReferencesTo re-sends blur to still-focused a (reentrant,
+    // victim null)
     try std.testing.expect(probe.fired >= 1);
     try std.testing.expect(cx.focus_manager.getFocused() == f.b);
     _ = cx.render();
 }
 
 test "focus: focus handler freeing its own node leaves focus cleared (no UAF)" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
     const f = try focusFreeFixture(cx);
@@ -13354,21 +13771,18 @@ test "focus: focus handler freeing its own node leaves focus cleared (no UAF)" {
     _ = cx.render();
 }
 
-// Documenting current limitation:
-// v0.6 §2.5 audit 发现 reactive rerender 后 focus restoration 不基于 stable_id
-// (e.g. For 控制流 key=item.id 重建节点)，新节点 ptr/generation 都不同；
-// 现有 getFocused 走 cached ptr+id match，新节点不能恢复。这是 Phase 7
-// (主 plan §Phase 7 "For 控制流 key-only + eq_props") 范围，v0.6 保留 limitation。
+// Documents a current limitation: focus restoration after reactive rerender is not stable-id-based
+// (e.g. For loop key=item.id rebuilds nodes); new node ptr/generation differ.
+// getFocused uses cached ptr+id match and can't recover new nodes. Out of scope until
+// main plan Phase 7 "For loop key-only + eq_props".
 
-// ============================================================================
-// v0.6 §2.3, gesture_recognizer 接入 dispatcher tests
-// ============================================================================
+// gesture_recognizer integration with dispatcher tests
 //
-// 验证 cx.handleMouseDown/Move/Up + cx.render() (tick) feed 到 gesture_arena，
-// recognizer callback 在 state 转换时被触发。
+// Verify cx.handleMouseDown/Move/Up + cx.render() (tick) feed gesture_arena and the
+// recognizer callback fires on state transition.
 //
-// 不验证：input/state.zig 双击/三击/drag anchor 迁移到 GestureArena,
-// plan §2.3 显式 defer 该迁移，本组只测 infrastructure。
+// Not verified: input/state.zig double/triple-click/drag anchor migration to GestureArena
+// (deferred); this suite tests infrastructure only.
 
 const GestureCount = struct {
     began: u32 = 0,
@@ -13391,7 +13805,7 @@ const GestureCount = struct {
 };
 
 test "cx.registerGesture wires tap recognizer through arena" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
 
@@ -13402,7 +13816,7 @@ test "cx.registerGesture wires tap recognizer through arena" {
     var counter = GestureCount{};
     _ = try cx.registerGesture(root, .tap, .{}, GestureCount.cb, &counter);
 
-    // mouse down + up 在同一位置 -> tap.ended emit
+    // mouse down + up at same position -> tap.ended emit
     cx.handleMouseDown(50, 50, .{});
     cx.handleMouseUp(50, 50);
 
@@ -13411,7 +13825,7 @@ test "cx.registerGesture wires tap recognizer through arena" {
 }
 
 test "pan recognizer fires began on movement > threshold" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
 
@@ -13423,15 +13837,15 @@ test "pan recognizer fires began on movement > threshold" {
     _ = try cx.registerGesture(root, .pan, .{ .pan_min_movement_px = 10 }, GestureCount.cb, &counter);
 
     cx.handleMouseDown(50, 50, .{});
-    // 移动 5px（< 10px 阈值） -> 不 began
+    // move 5px (< 10px threshold) -> no began
     cx.handleMouseMove(55, 50);
     try std.testing.expectEqual(@as(u32, 0), counter.began);
 
-    // 移动到 70 (距 origin 20px > 10px) -> began
+    // move to 70 (20px from origin > 10px) -> began
     cx.handleMouseMove(70, 50);
     try std.testing.expectEqual(@as(u32, 1), counter.began);
 
-    // 继续移动 -> changed
+    // continue move -> changed
     cx.handleMouseMove(80, 50);
     try std.testing.expectEqual(@as(u32, 1), counter.changed);
 
@@ -13440,7 +13854,7 @@ test "pan recognizer fires began on movement > threshold" {
 }
 
 test "tap recognizer fails when movement > threshold (no ended)" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
 
@@ -13460,7 +13874,7 @@ test "tap recognizer fails when movement > threshold (no ended)" {
 }
 
 test "long_press began emit on cx.render() tick after threshold" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
 
@@ -13469,14 +13883,14 @@ test "long_press began emit on cx.render() tick after threshold" {
     cx.layout();
 
     var counter = GestureCount{};
-    // 阈值设极小 (1ms)，因为单元测试不好等 500ms 真实时钟
+    // threshold set tiny (1ms) because unit test can't wait 500ms real clock
     _ = try cx.registerGesture(root, .long_press, .{ .long_press_min_duration_ms = 1 }, GestureCount.cb, &counter);
 
     cx.handleMouseDown(50, 50, .{});
     try std.testing.expectEqual(@as(u32, 0), counter.began);
 
-    // 真等 5ms 让 nanoTimestamp 推进过阈值
-    std.Thread.sleep(5 * std.time.ns_per_ms);
+    // actually wait 5ms to advance nanoTimestamp past threshold
+    try std.Io.sleep(cx.io, .fromNanoseconds(5 * std.time.ns_per_ms), .awake);
     _ = cx.render();
     try std.testing.expectEqual(@as(u32, 1), counter.began);
 
@@ -13484,17 +13898,17 @@ test "long_press began emit on cx.render() tick after threshold" {
     try std.testing.expectEqual(@as(u32, 1), counter.ended);
 }
 
-// ── CA-pure surface revamp regression gate (P0) ──
-// 居中的 composited_group surface owner（= modal dialog 场景）在动画态（scale≠1）
-// 必须合成在它的居中世界位置，**绝不**漂到 (0,0)。这是之前几次修复缺失的逐帧位置
-// 断言：旧的 surface_inverse 双重 localize 会让 begin_opacity_layer 的合成位置落在
-// 屏幕左上角。修好（CA-pure 单矩阵 M_composite）后必须居中。
+// -- CA-pure surface regression gate --
+// A centered composited_group surface owner (modal dialog scenario) in animated state
+// (scale != 1) must composite at its centered world position, **never** drift to (0,0).
+// Needs a per-frame position assertion: surface_inverse double-localizing put the
+// begin_opacity_layer composite at screen top-left; single-matrix M_composite must be centered.
 test "render(CA): centered composited_group surface composites at center, not (0,0)" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(1100, 1000);
 
-    // 全窗口 root，flex 居中（= barrier 居中 dialog）
+    // full-window root, flex-centered (= barrier-centered dialog)
     const root = try box(cx, .{
         .width = .{ .px = 1100 },
         .height = .{ .px = 1000 },
@@ -13502,7 +13916,7 @@ test "render(CA): centered composited_group surface composites at center, not (0
         .align_items = .center,
     }, .{});
 
-    // 居中的 surface owner（dialog）：400x100，composited_group + 动画态 scale=0.9
+    // centered surface owner (dialog): 400x100, composited_group + animated scale=0.9
     const dialog = try box(cx, .{
         .width = .{ .px = 400 },
         .height = .{ .px = 100 },
@@ -13519,20 +13933,20 @@ test "render(CA): centered composited_group surface composites at center, not (0
     _ = cx.render();
     const commands = cx.lowerForEncoderPaintTable();
 
-    // 居中世界位置：x=(1100-400)/2=350, y=(1000-100)/2=450
-    const expect_cx: f32 = 350 + 200; // dialog 中心 x
-    const expect_cy: f32 = 450 + 50; // dialog 中心 y
+    // centered world position: x=(1100-400)/2=350, y=(1000-100)/2=450
+    const expect_cx: f32 = 350 + 200; // dialog center x
+    const expect_cy: f32 = 450 + 50; // dialog center y
 
     var saw_layer = false;
     for (commands) |cmd| {
         if (!cmd.isControl(.begin_opacity_layer)) continue;
         saw_layer = true;
-        // 合成位置：use_draw_transform 时取 draw_transform 的平移分量映射 src 中心；
-        // 否则取 draw_x/y + draw_w/h 中心（settled fallback 路径）。
+        // composite position: if use_draw_transform, map src center via draw_transform
+        // translation; else use draw_x/y + draw_w/h center (settled fallback path).
         var composed_cx: f32 = undefined;
         var composed_cy: f32 = undefined;
         if (cmd.use_draw_transform) {
-            // draw_transform 作用于 src 矩形 (geom)。算 src 中心经 transform 后的位置。
+            // draw_transform acts on src rect (geom). compute src center after transform
             const t = cmd.draw_transform; // [a,b,c,d,tx,ty]
             const sx = cmd.geom.x + cmd.geom.w / 2;
             const sy = cmd.geom.y + cmd.geom.h / 2;
@@ -13542,11 +13956,11 @@ test "render(CA): centered composited_group surface composites at center, not (0
             composed_cx = cmd.draw_x + cmd.draw_w / 2;
             composed_cy = cmd.draw_y + cmd.draw_h / 2;
         }
-        // 合成中心必须靠近 dialog 居中世界中心（容差 60，覆盖 shadow margin/scale）。
-        // 旧 bug 下 composed_cx≈0 -> 远离 550 -> 失败。
+        // composite center must be near dialog centered-world center (tolerance 60, covers
+        // shadow margin/scale). Old bug: composed_cx≈0 -> far from 550 -> fail.
         try std.testing.expect(@abs(composed_cx - expect_cx) < 60);
         try std.testing.expect(@abs(composed_cy - expect_cy) < 60);
-        // 且绝不在左上角
+        // and never at top-left corner
         try std.testing.expect(composed_cx > 100);
         try std.testing.expect(composed_cy > 100);
     }
@@ -13554,11 +13968,11 @@ test "render(CA): centered composited_group surface composites at center, not (0
 }
 
 test "render: rotated leaf inside ancestor clip emits surface-local apply_clip" {
-    // 回归：settle 后静态 rotate=π/2 的叶子（accordion 展开态 chevron）走
-    // has_surface_transform surface，effect bridge 把祖先 clip 的 world AABB
-    // 原样发进 surface 内 -> 世界坐标 scissor 在 surface-local 内容上裁空一切。
-    // 修复后 apply_clip 须经 surface_draw_transform 逆变换进 surface-local 空间。
-    var cx = try Cx.init(std.testing.allocator);
+    // regression: settled static rotate=π/2 leaf (accordion expanded chevron) has
+    // has_surface_transform surface; effect bridge sends ancestor clip's world AABB unchanged
+    // into surface -> world-coordinate scissor clips away all surface-local content. After fix
+    // apply_clip must inverse-transform via surface_draw_transform into surface-local space.
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(800, 600);
 
@@ -13599,8 +14013,8 @@ test "render: rotated leaf inside ancestor clip emits surface-local apply_clip" 
         } else if (cmd.isControl(.end_opacity_layer)) {
             depth -= 1;
         } else if (depth > 0 and cmd.isControl(.push_clip)) {
-            // surface 内容为 surface-local（16x16 于原点附近）；clipper 的世界
-            // x=200 若原样出现，说明 clip 未逆变换 -> 内容会被整体裁掉
+            // surface content is surface-local (16x16 near origin); if clipper's world x=200
+            // appears unchanged, clip wasn't inverse-transformed -> content fully clipped
             if (cmd.geom.x > 100) saw_world_space_clip_in_surface = true;
         }
     }
@@ -13609,10 +14023,10 @@ test "render: rotated leaf inside ancestor clip emits surface-local apply_clip" 
 }
 
 test "render: blur layer ancestor clip stays in parent frame before begin_blur_layer" {
-    // blur 的 apply_clip 发在 begin_blur_layer **之前**（父上下文），必须保持
-    // world 坐标，effect_bridge 的 surface-local 投影只适用于 layer 内部的 clip
-    //（inside_surface=true 分支），此处不得误投影。
-    var cx = try Cx.init(std.testing.allocator);
+    // blur's apply_clip happens **before** begin_blur_layer (parent context), must stay
+    // world coordinates. effect_bridge's surface-local projection only for in-layer clip
+    // (inside_surface=true branch); must not mistakenly project here.
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(800, 600);
 
@@ -13656,33 +14070,33 @@ test "render: blur layer ancestor clip stays in parent frame before begin_blur_l
     }
     try std.testing.expect(saw_blur);
     if (clip_before_blur_x) |x| {
-        // 父上下文的 clip 应为 world 坐标（clipper 在 x=200）
+        // parent context's clip should be world coordinates (clipper at x=200)
         try std.testing.expectApproxEqAbs(@as(f32, 200), x, 0.001);
     }
 }
 
 test "world ownership: node carries its owning Cx id" {
-    // P0-3 阶段 1 验收：Node 现在带 owner 标识。
-    // 这是拆掉全局回调间接层的地基，ElementId 本身
-    // ({index:u24, generation:u8}) 不含 World 标识，两个 World 都从 index 0
-    // 分配，故仅凭 element_id 无法区分归属（isValid 会假匹配）。
-    var cx = try Cx.init(std.testing.allocator);
+    // P0-3 Phase 1 acceptance: Node now carries owner identifier.
+    // foundation for dismantling global callback indirection. ElementId itself
+    // ({index:u24, generation:u8}) lacks World identifier; both Worlds allocate from index
+    // 0, so element_id alone can't disambiguate (isValid false-matches).
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
 
     const n = try box(cx, .{ .width = .{ .px = 10 }, .height = .{ .px = 10 } }, .{});
     cx.root = n;
 
-    // 经 Cx 创建的节点都被盖上了 owner 章。
+    // nodes created via Cx all stamped with owner
     try std.testing.expect(n.world_id != ui.INVALID_WORLD_ID);
     try std.testing.expectEqual(cx.world_id, n.world_id);
 }
 
 test "world ownership: guard detects a foreign node (negative test)" {
-    // 证明守卫不是死代码：把 world_id 篡改成非 active 值后，
-    // nodeBelongsToActiveWorld 必须判否。
-    // （不直接调 rectFromWorldOrFallback，那会 panic 中断测试进程；
-    //   这里验的是判定逻辑本身。）
-    var cx = try Cx.init(std.testing.allocator);
+    // prove guard is not dead code: after tampering world_id to non-active value,
+    // nodeBelongsToActiveWorld must return false.
+    // (don't call rectFromWorldOrFallback directly, it would panic and kill test;
+    // here verifying the guard logic itself.)
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
 
     const n = try box(cx, .{ .width = .{ .px = 10 }, .height = .{ .px = 10 } }, .{});
@@ -13690,46 +14104,47 @@ test "world ownership: guard detects a foreign node (negative test)" {
 
     try std.testing.expect(Cx.nodeBelongsToActiveWorldForTest(n));
     const saved = n.world_id;
-    n.world_id = saved +% 7; // 伪造成别的 World 的节点
+    n.world_id = saved +% 7; // spoof as node from different World
     try std.testing.expect(!Cx.nodeBelongsToActiveWorldForTest(n));
     n.world_id = saved;
 
-    // INVALID（cx-less mock）必须放行，否则大量测试路径会误报。
+    // INVALID (cx-less mock) must pass, else many test paths false-alarm
     n.world_id = ui.INVALID_WORLD_ID;
     try std.testing.expect(Cx.nodeBelongsToActiveWorldForTest(n));
     n.world_id = saved;
 }
 
 test "world ownership: sequential Cx get distinct world ids" {
-    // world id 不复用，复用会让已释放 Cx 的陈旧 Node 与新 Cx 假匹配，
-    // 正是 owner 标识要防的问题。
+    // world_id not reused; reuse would let stale Nodes from freed Cx false-match new
+    // Cx, exactly the problem owner identifier prevents.
     var first_id: u16 = undefined;
     {
-        var cx = try Cx.init(std.testing.allocator);
+        var cx = try Cx.init(std.testing.allocator, std.testing.io);
         defer cx.deinit();
         first_id = cx.world_id;
     }
     {
-        var cx = try Cx.init(std.testing.allocator);
+        var cx = try Cx.init(std.testing.allocator, std.testing.io);
         defer cx.deinit();
         try std.testing.expect(cx.world_id != first_id);
     }
 }
 
 test "standalone fallback storage is reclaimed on last Cx deinit" {
-    // 这几张 fallback 表是进程级 + page_allocator，**GPA leak check 看不见**
-    // （审查报告列的盲区：`zig build test` 全绿不代表这条路径没泄漏）。
-    // 现在 Cx.deinit 会在最后一个 Cx 退出时显式回收，这里断言"确实清零"。
+    // these fallback tables are process-level + page_allocator, **GPA leak check can't
+    // see** (blind spot in audit report: `zig build test` green doesn't mean no leak on this
+    // path). now Cx.deinit explicitly reclaims when last Cx exits; here assert 'truly
+    // zeroed'.
     const accessor = @import("paint_content_accessor.zig");
     const lifecycle = @import("node_lifecycle.zig");
 
     {
-        var cx = try Cx.init(std.testing.allocator);
+        var cx = try Cx.init(std.testing.allocator, std.testing.io);
         defer cx.deinit();
         const n = try box(cx, .{ .width = .{ .px = 8 }, .height = .{ .px = 8 } }, .{});
         cx.root = n;
-        // 制造 standalone 条目：Node.create 会跑 create hook 拿到真 element_id，
-        // 故手动清回 INVALID 来强制走 fallback 写入路径（模拟 cx-less mock）。
+        // make standalone entry: Node.create runs create hook, gets real element_id;
+        // manually clear to INVALID to force fallback write path (simulate cx-less mock).
         const orphan = try Node.create(std.testing.allocator, 99999, .box, .{});
         defer orphan.destroy(std.testing.allocator);
         orphan.element_id_raw = 0xFFFFFFFF;
@@ -13738,28 +14153,28 @@ test "standalone fallback storage is reclaimed on last Cx deinit" {
         try std.testing.expect(lifecycle.standaloneRectCount() > 0);
     }
 
-    // 最后一个 Cx 退出后，表应被回收干净。
+    // after last Cx exits, table should be reclaimed clean
     try std.testing.expectEqual(@as(usize, 0), lifecycle.standaloneRectCount());
     try std.testing.expectEqual(@as(usize, 0), accessor.standaloneEntryCount());
 }
 
 test "P0-3 stage 3: node property access bypasses global callbacks" {
-    // 阶段 3 验收：paint / content / layout_output 的读写现在直连
-    // node.world_ref.*，不再经过进程级全局回调。
-    // legacy_callback_hits 只在 world_ref == null（cx-less mock）时自增，
-    // 所以经 Cx 创建的节点做完整读写后，它必须**纹丝不动**。
+    // Phase 3 acceptance: paint / content / layout_output read-write now direct to
+    // node.world_ref.*, no longer via process-level global callback.
+    // legacy_callback_hits increments only when world_ref == null (cx-less mock);
+    // so after Cx-created nodes do full read-write, it must **stay zero**.
     const pca = @import("paint_content_accessor.zig");
 
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
 
     const n = try box(cx, .{ .width = .{ .px = 20 }, .height = .{ .px = 10 } }, .{});
     cx.root = n;
-    try std.testing.expect(n.world_ref != null); // onNodeCreate 已注入 owner
+    try std.testing.expect(n.world_ref != null); // onNodeCreate has injected owner
 
     const before = pca.legacy_callback_hits;
 
-    // 覆盖三组访问器的读写各一次。
+    // cover three accessor groups, read and write each once
     n.setBackgroundRaw(Color.rgb(1, 2, 3));
     _ = n.getBackground();
     n.setOpacityRaw(0.5);
@@ -13771,16 +14186,18 @@ test "P0-3 stage 3: node property access bypasses global callbacks" {
 
     try std.testing.expectEqual(before, pca.legacy_callback_hits);
 
-    // 且值确实通过 World 往返正确（不是"绕过了但读不到"）。
+    // and values actually round-trip correctly via World (not "bypassed but
+    // unreadable")
     try std.testing.expectApproxEqAbs(@as(f32, 0.5), n.getOpacity(), 0.001);
     try std.testing.expectEqual(@as(f32, 3), n.rectFromWorldOrFallback().w);
 }
 
 test "P0-3 stage 3: dirty + structure sync reach World directly" {
-    // dirty_notify / structure_notify 也已直连（不再走进程级回调）。
-    // 这里断言"父子链确实同步进了 World.elements"，若还在走旧回调而
-    // 回调恰好没注册，链表就会是空的，测试会失败。
-    var cx = try Cx.init(std.testing.allocator);
+    // dirty_notify / structure_notify also direct-connected (no process-level
+    // callback). here assert 'parent-child chain truly synced to World.elements'; if still
+    // using old callback that happens not to be registered, chain would be empty, test
+    // fails.
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
 
     const parent = try box(cx, .{ .width = .{ .px = 40 }, .height = .{ .px = 40 } }, .{});
@@ -13792,16 +14209,16 @@ test "P0-3 stage 3: dirty + structure sync reach World directly" {
     const p_eid = ui.ElementId.fromRaw(parent.element_id_raw);
     const c_eid = ui.ElementId.fromRaw(child.element_id_raw);
 
-    // append 已同步到 World.elements 父子链。
+    // append synced to World.elements parent-child chain
     const links = w.elements.links(c_eid).?;
     try std.testing.expect(!links.parent.isNull());
     try std.testing.expectEqual(p_eid.raw(), links.parent.raw());
 
-    // markRenderDirty 走 markWorldDirty -> World.dirty_set（不 panic 即通过；
-    // 这里主要验证直连路径没有因为 world_ref 为空而静默丢弃）。
+    // markRenderDirty goes through markWorldDirty -> World.dirty_set (no panic = pass;
+    // mainly verify direct path doesn't silently drop due to null world_ref).
     child.markRenderDirty();
 
-    // unlink 同样同步。
+    // unlink also syncs
     cx.detachChild(parent, child);
     const links_after = w.elements.links(c_eid).?;
     try std.testing.expect(links_after.parent.isNull());
@@ -13809,27 +14226,30 @@ test "P0-3 stage 3: dirty + structure sync reach World directly" {
 }
 
 test "P0-3 stage 5: two coexisting Cx route node mutations independently" {
-    // **多窗口的核心验收**：两个 Cx 同时存活，各自的节点 mutation 必须落进
-    // 各自的 World，互不串台。
+    // **core multi-window acceptance**: two concurrent Cx, each node mutation goes to its own
+    // World.
     //
-    // 这是 P0-3 的终点判据。历史上不可能通过：Node↔World 路由走进程级全局
-    // 回调，第二个 Cx.init 会把回调重指向新 World，于是**窗口 A 的节点写进
-    // 窗口 B 的表**；而 ElementId 不含 World 标识（两个 World 都从 index 0
-    // 分配），isValid 只校验 index+generation，跨查会**假匹配返回错误数据**。
+    // Node<->World routing used to go via a process-level global callback: a second Cx.init
+    // redirected
+    // it, so **window A node writes landed in window B table**; ElementId lacks a World identifier
+    // (both Worlds allocate from index 0) and isValid checks only index+generation, so
+    // cross-queries
+    // **false-match wrong data**.
     //
-    // 现在属性访问全部走 node.world_ref 直连，故只要节点用 Cx.createNode
-    // 显式创建（不依赖 g_active_world），两个 Cx 就能各自独立。
-    var cx_a = try Cx.init(std.testing.allocator);
+    // Now all property access goes through node.world_ref, so nodes created explicitly via
+    // Cx.createNode (not relying on g_active_world) keep both Cx independent.
+    var cx_a = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx_a.deinit();
 
-    // 无需任何放行开关，并发守卫已拆除（2026-07-30，最后一处进程级依赖
-    // a11y active context 已按 window_id 路由）。第二个 Cx 直接 init 即可。
-    var cx_b = try Cx.init(std.testing.allocator);
+    // no allowlist needed, concurrency guards removed (2026-07-30, last
+    // process-level dependency a11y active context now routed by window_id). Second Cx can
+    // init directly.
+    var cx_b = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx_b.deinit();
 
     try std.testing.expect(cx_a.world_id != cx_b.world_id);
 
-    // 两个节点分别显式归属各自的 Cx。
+    // two nodes explicitly belong to respective Cx
     const a = try cx_a.createNode(.box, .{ .width = .{ .px = 10 }, .height = .{ .px = 10 } });
     defer cx_a.freeNode(a);
     const b = try cx_b.createNode(.box, .{ .width = .{ .px = 20 }, .height = .{ .px = 20 } });
@@ -13837,8 +14257,8 @@ test "P0-3 stage 5: two coexisting Cx route node mutations independently" {
 
     try std.testing.expect(a.world_ref.? != b.world_ref.?);
 
-    // 关键：即使两者的 ElementId **可能完全相同**（各自 World 都从 index 0 起
-    // 分配），写入也必须各回各家。
+    // key: even if both ElementIds are **potentially identical** (each World allocates
+    // from index 0), writes must return to respective homes.
     a.setLayoutRect(.{ .x = 1, .y = 1, .w = 11, .h = 11 });
     b.setLayoutRect(.{ .x = 2, .y = 2, .w = 22, .h = 22 });
     a.setOpacityRaw(0.25);
@@ -13849,24 +14269,24 @@ test "P0-3 stage 5: two coexisting Cx route node mutations independently" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.25), a.getOpacity(), 0.001);
     try std.testing.expectApproxEqAbs(@as(f32, 0.75), b.getOpacity(), 0.001);
 
-    // 反向确认串台确实不存在：改 A 不影响 B。
+    // reverse confirmation: no crosstalk exists; changing A doesn't affect B
     a.setLayoutRect(.{ .x = 9, .y = 9, .w = 99, .h = 99 });
     try std.testing.expectEqual(@as(f32, 22), b.rectFromWorldOrFallback().w);
 }
 
 test "silent-swallow counters stay zero in normal operation" {
-    // 审查报告 §3：全仓约 250 处 `catch return;` / `catch {}` 把 OOM 与构建
-    // 失败完全吞掉。逐个改成可传播的 error 需要动 effect/回调签名，成本极高；
-    // 折中方案是给**风险最高的几处**加计数器，让"静默"变成"可观测"。
-    // 这个测试锁住：正常渲染路径下它们必须恒为 0，一旦非 0，说明有 OOM
-    // 或容量问题正在悄悄劣化画面/响应式，而不是等用户报"少了一块"。
+    // ~250 `catch return;` / `catch {}` sites swallow OOM and build failures. Propagating all of
+    // them
+    // needs effect/callback signature changes; cost prohibitive. Compromise: counters on the
+    // **highest-risk few** make 'silent' failures observable. This test locks: normal render paths
+    // must stay 0; non-zero signals OOM or capacity silently degrading rendering/reactivity.
     const graph_mod = @import("../reactive/graph.zig");
 
     const base_paint = ui.paint_push_failures;
     const base_track = graph_mod.reactive_tracking_failures;
     const base_hit = ui.interaction_put_failures;
 
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(200, 120);
 
@@ -13874,7 +14294,8 @@ test "silent-swallow counters stay zero in normal operation" {
     cx.root = root;
     try root.appendChild(std.testing.allocator, try text(cx, "hello", .{}));
 
-    // 跑两帧完整 layout+render（含文本 paint chunk 录制，即 pushItem 的路径）。
+    // run two full frames of layout+render (includes text paint chunk recording,
+    // pushItem path).
     cx.layout();
     _ = cx.render();
     root.markRenderDirty();
@@ -13888,21 +14309,22 @@ test "silent-swallow counters stay zero in normal operation" {
 }
 
 test "allocation campaign: rebuildRuntimeIndexes reports OOM instead of publishing partial indexes" {
-    // 锁住 core.zig 那批 `catch @panic("OOM: rebuildRuntimeIndexes ...")` 的前提：
-    // 该函数**确实会**在 OOM 时返回 error（即 panic 不是死代码）。
+    // Locks the premise of core.zig `catch @panic("OOM: rebuildRuntimeIndexes")`: the function
+    // **truly does** return an error on OOM (panic is not dead code).
     //
-    // 为什么必须 panic 而不是吞掉：rebuildRuntimeStateRecursive 先把节点的
-    // dirty 位全清成 false，之后才做可失败的 node_registry.put /
-    // focus_order.append。中途 OOM 会留下「节点已标记干净、却不在索引里」的
-    // 状态，该节点从此 hit-test 打不中、Tab 走不到，而且没有 dirty 位能触发
-    // 重试。旧代码的 `catch {}` 正好把这个状态变成永久静默错乱。
-    var cx = try Cx.init(std.testing.allocator);
+    // Why panic, not swallow: rebuildRuntimeStateRecursive clears node dirty bits first, then does
+    // fallible node_registry.put / focus_order.append. Mid-OOM leaves a node marked clean but not
+    // in
+    // the index: it never hit-tests, Tab skips it, and no dirty bit remains to retry. Swallowing
+    // would be permanent silent corruption.
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(200, 120);
 
     const root = try box(cx, .{ .width = .{ .px = 200 }, .height = .{ .px = 120 } }, .{});
     cx.root = root;
-    // 多挂几个 focusable 子节点，保证重建过程里有足够多次分配可以失败。
+    // attach several focusable children, ensure enough allocations can fail during
+    // rebuild
     var i: usize = 0;
     while (i < 8) : (i += 1) {
         const child = try box(cx, .{ .width = .{ .px = 20 }, .height = .{ .px = 20 } }, .{});
@@ -13910,14 +14332,14 @@ test "allocation campaign: rebuildRuntimeIndexes reports OOM instead of publishi
         try root.appendChild(std.testing.allocator, child);
     }
 
-    // 先跑一帧，让索引进入已建好的稳定态。
+    // run one frame first to put index into stable built state
     cx.layout();
     _ = cx.render();
 
-    // 再挂一批新节点，让重建**必须**申请新容量。
-    // （只 clear() 是不够的：node_registry / focus_order 都走
-    // clearRetainingCapacity，重填同一批节点不会触发任何分配，
-    // FailingAllocator 也就永远不会被调用，实测第一版就栽在这里。）
+    // attach more new nodes, force rebuild to **must** request new capacity.
+    // (clear() alone insufficient: node_registry / focus_order use clearRetainingCapacity,
+    // refilling same nodes triggers no allocations, FailingAllocator never called; real
+    // first-draft failure here.)
     i = 0;
     while (i < 512) : (i += 1) {
         const child = try box(cx, .{ .width = .{ .px = 20 }, .height = .{ .px = 20 } }, .{});
@@ -13925,9 +14347,9 @@ test "allocation campaign: rebuildRuntimeIndexes reports OOM instead of publishi
         try root.appendChild(std.testing.allocator, child);
     }
 
-    // 换成注定失败的 allocator。注意必须换 node_registry / focus_manager
-    // **自己持有的** allocator 字段：它们在 init 时就捕获了 allocator，
-    // 事后改 cx.allocator 对重建路径毫无影响（实测第二版栽在这里）。
+    // switch to allocator that will fail. Note: must swap node_registry /
+    // focus_manager's **own** allocator fields: they capture at init time, changing
+    // cx.allocator later doesn't affect rebuild path (real second-draft failure here).
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
     const saved_reg = cx.node_registry.allocator;
     const saved_focus = cx.focus_manager.allocator;
@@ -13939,31 +14361,34 @@ test "allocation campaign: rebuildRuntimeIndexes reports OOM instead of publishi
 
     const result = cx.rebuildRuntimeIndexesForTest();
 
-    // 关键断言：错误被**返回**了，没有被内部吞掉。
+    // key assertion: error **returned**, not silently swallowed
     try std.testing.expectError(error.OutOfMemory, result);
 
-    // 还原，让 deinit 用真 allocator 收尾（否则 GPA 会报 free 到错 allocator）。
+    // restore, let deinit finish with real allocator (else GPA reports free to wrong
+    // allocator)
     cx.node_registry.allocator = saved_reg;
     cx.focus_manager.allocator = saved_focus;
 }
 
 test "P0-3: two coexisting Cx each render their own tree correctly" {
-    // 比阶段 5 那个测试更进一步：不只验证属性路由，而是让**两个 Cx 各自跑
-    // 完整 layout + render**，断言各自的 display list 只包含自己的内容。
-    // 这是"多窗口真的能用"的判据，builder 已全部改走 cx.createNode，
-    // 不再依赖 g_active_world 决定节点归属。
-    var cx_a = try Cx.init(std.testing.allocator);
+    // step beyond Phase 5: not just verify property routing, but **both Cx run full
+    // layout + render**, assert each display list contains only its own content.
+    // multiwindow truly works criterion; builders all switched to cx.createNode,
+    // no longer rely on g_active_world for node ownership.
+    var cx_a = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx_a.deinit();
 
-    // 无需任何放行开关，并发守卫已拆除（2026-07-30，最后一处进程级依赖
-    // a11y active context 已按 window_id 路由）。第二个 Cx 直接 init 即可。
-    var cx_b = try Cx.init(std.testing.allocator);
+    // no allowlist needed, concurrency guards removed (2026-07-30, last
+    // process-level dependency a11y active context now routed by window_id). Second Cx can
+    // init directly.
+    var cx_b = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx_b.deinit();
 
     cx_a.setViewport(100, 60);
     cx_b.setViewport(200, 120);
 
-    // 两棵完全独立的树，各自用自己的 cx 建（走 builders -> createNode）。
+    // two fully independent trees, each built with its own cx (via builders ->
+    // createNode)
     const root_a = try box(cx_a, .{ .width = .{ .px = 100 }, .height = .{ .px = 60 } }, .{});
     cx_a.root = root_a;
     try root_a.appendChild(std.testing.allocator, try text(cx_a, "AAA", .{}));
@@ -13972,11 +14397,11 @@ test "P0-3: two coexisting Cx each render their own tree correctly" {
     cx_b.root = root_b;
     try root_b.appendChild(std.testing.allocator, try text(cx_b, "BBB", .{}));
 
-    // 节点确实各归各的 World。
+    // nodes truly belong to respective Worlds
     try std.testing.expect(root_a.world_ref.? == &cx_a.world);
     try std.testing.expect(root_b.world_ref.? == &cx_b.world);
 
-    // 交错渲染，最坏情况：g_active_world 在两者间反复切换。
+    // interleaved renders, worst case: g_active_world switches back and forth
     cx_a.layout();
     _ = cx_a.render();
     cx_b.layout();
@@ -13984,23 +14409,22 @@ test "P0-3: two coexisting Cx each render their own tree correctly" {
     cx_a.layout();
     _ = cx_a.render();
 
-    // 各自的布局结果互不污染（viewport 不同，根尺寸必须各按各的）。
+    // each layout result independent (different viewports, root sizes per each)
     try std.testing.expectEqual(@as(f32, 100), root_a.rectFromWorldOrFallback().w);
     try std.testing.expectEqual(@as(f32, 200), root_b.rectFromWorldOrFallback().w);
 
-    // 各自的 paint 列表非空且互相独立。
+    // each paint list non-empty and independent
     try std.testing.expect(cx_a.lowerForEncoderPaintTable().len > 0);
     try std.testing.expect(cx_b.lowerForEncoderPaintTable().len > 0);
 
-    // ── a11y 端到端：ObjC 用各自的 window_id 调 C ABI，必须拿到各自的树 ──
-    // 这是拆掉 Cx.init 并发守卫的最后一块拼图。守卫存在期间这段不可能跑到：
-    // 旧实现的 setActiveContext 是单槽，cx_b.render() 会直接覆盖 cx_a 的注册，
-    // 于是两个 window_id 查出来是同一棵树。
+    // -- a11y end-to-end: ObjC calls C ABI with each window_id and must get its own tree --
+    // Needs concurrent Cx; a single-slot setActiveContext would let cx_b.render() overwrite
+    // cx_a's registration so both window_ids resolve to the same tree.
     cx_a.setWindowId(101);
     cx_b.setWindowId(202);
 
-    // a11y 树只投影**显式带 role/label** 的节点，光有 box+text 投不出东西,
-    // 各给一棵树挂一个 button。
+    // a11y tree only projects **nodes with explicit role/label**, bare box+text
+    // projects nothing; each tree gets one button
     const a11y_btn_a = try box(cx_a, .{ .width = .{ .px = 10 }, .height = .{ .px = 10 } }, .{});
     a11y_btn_a.behavior.interaction.a11y = .{ .role = .button, .label = "AAA" };
     try root_a.appendChild(std.testing.allocator, a11y_btn_a);
@@ -14009,7 +14433,8 @@ test "P0-3: two coexisting Cx each render their own tree correctly" {
     a11y_btn_b.behavior.interaction.a11y = .{ .role = .button, .label = "BBB" };
     try root_b.appendChild(std.testing.allocator, a11y_btn_b);
 
-    // window_id 变了要重新注册（注册发生在 render 末尾的 syncA11yTree）。
+    // window_id changes require re-registration (happens at render end in
+    // syncA11yTree)
     cx_a.layout();
     _ = cx_a.render();
     cx_b.layout();
@@ -14020,39 +14445,39 @@ test "P0-3: two coexisting Cx each render their own tree correctly" {
     try std.testing.expect(a_roots > 0);
     try std.testing.expect(b_roots > 0);
 
-    // 各自的 root handle 指向各自 World 的 element，拿 A 的 handle 去 B 里
-    // 查 role，不该命中 A 的节点（两个 World 的 ElementId 都从 index 0 起，
-    // 正是历史上"假匹配"的形状）。
+    // each root handle points to its World's element; using A's handle to query
+    // B's role should not match A's node (both Worlds' ElementIds start from index 0,
+    // classic false-match shape).
     const a_root_h = a11y_bridge_extern.zenit_a11y_root_at(101, 0);
     const b_root_h = a11y_bridge_extern.zenit_a11y_root_at(202, 0);
     try std.testing.expect(a_root_h != 0);
     try std.testing.expect(b_root_h != 0);
 
-    // 从 A 的树里能读到 "AAA"，从 B 的树里能读到 "BBB"，且不互串。
+    // can read "AAA" from A's tree, "BBB" from B's tree, no crosstalk
     try std.testing.expect(try a11yTreeContainsLabel(101, "AAA"));
     try std.testing.expect(!try a11yTreeContainsLabel(101, "BBB"));
     try std.testing.expect(try a11yTreeContainsLabel(202, "BBB"));
     try std.testing.expect(!try a11yTreeContainsLabel(202, "AAA"));
 
-    // 注销其中一个窗口，另一个不受影响。
+    // deregister one window, other unaffected
     ui.a11y_macos_bridge.clearActiveContext(101);
     try std.testing.expectEqual(@as(c_int, 0), a11y_bridge_extern.zenit_a11y_root_count(101));
     try std.testing.expectEqual(b_roots, a11y_bridge_extern.zenit_a11y_root_count(202));
 }
 
-/// 在某个 window_id 的 a11y 树里递归找有没有节点的 label 等于 `needle`。
+/// recursively find node in a11y tree for window_id whose label equals `needle`
 fn a11yTreeContainsLabel(window_id: u32, needle: []const u8) !bool {
     const n = a11y_bridge_extern.zenit_a11y_root_count(window_id);
     var i: c_int = 0;
     while (i < n) : (i += 1) {
         const h = a11y_bridge_extern.zenit_a11y_root_at(window_id, i);
-        if (h == 0) continue;
+        if (h == ui.a11y_macos_bridge.INVALID_HANDLE) continue;
         if (try a11ySubtreeContainsLabel(window_id, h, needle)) return true;
     }
     return false;
 }
 
-fn a11ySubtreeContainsLabel(window_id: u32, handle: u32, needle: []const u8) !bool {
+fn a11ySubtreeContainsLabel(window_id: u32, handle: u64, needle: []const u8) !bool {
     var buf: [256]u8 = undefined;
     const written = a11y_bridge_extern.zenit_a11y_label(window_id, handle, &buf, buf.len);
     if (written > 0 and std.mem.eql(u8, buf[0..@intCast(written)], needle)) return true;
@@ -14061,17 +14486,19 @@ fn a11ySubtreeContainsLabel(window_id: u32, handle: u32, needle: []const u8) !bo
     var i: c_int = 0;
     while (i < kids) : (i += 1) {
         const ch = a11y_bridge_extern.zenit_a11y_children_at(window_id, handle, i);
-        if (ch == 0) continue;
+        if (ch == ui.a11y_macos_bridge.INVALID_HANDLE) continue;
         if (try a11ySubtreeContainsLabel(window_id, ch, needle)) return true;
     }
     return false;
 }
 
 test "measure ctx: per-Cx measure function wins over the process-wide one" {
-    // 多窗口的两处非 World 全局依赖之一：measure_fn 签名不带 context，
-    // 调用方（zenit_app.runtime）只能用进程级 g_font_selector_for_measure
-    // 偷渡字体选择器，两个 App 并存时后者覆盖前者，前一个窗口的文本会
-    // 用错字体测量。现在 Cx 支持 measure_ctx_fn(+ctx)，各测各的。
+    // One of two non-World global dependencies for multi-window: measure_fn signature lacks
+    // context,
+    // so the caller (zenit_app.runtime) would smuggle the font selector via process-level
+    // g_font_selector_for_measure; with two concurrent Apps the latter overwrites the former and
+    // the
+    // prior window mismeasures text. Cx supports measure_ctx_fn(+ctx) so each measures its own.
     const tl = @import("text_layout.zig");
 
     const S = struct {
@@ -14098,20 +14525,69 @@ test "measure ctx: per-Cx measure function wins over the process-wide one" {
     S.ctx_calls = 0;
     const w = tl.measureTextWidthByFontKind("abcd", 10, 400, false, false);
 
-    // 带 context 的版本必须优先（否则多窗口下仍会串台）。
+    // context version must take priority (else still crosstalk in multi-window)
     try std.testing.expect(S.ctx_calls > 0);
     try std.testing.expectEqual(@as(u32, 0), S.global_calls);
     try std.testing.expectApproxEqAbs(@as(f32, 4 * 10 * 2.0), w, 0.001);
 }
 
+test "render: legacy overflow replay keeps own background once and before blended children" {
+    // Cover both a prebuilt own prefix and a prefix blocked by an earlier
+    // rotated sibling. The old cache-hit path appended the owner's background
+    // after cached children, hiding the blend on every settled frame.
+    for ([_]bool{ false, true }) |blocked_prefix| {
+        var cx = try Cx.init(std.testing.allocator, std.testing.io);
+        defer cx.deinit();
+        cx.setViewport(400, 200);
+        const root = try box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 200 }, .direction = .row }, .{});
+        if (blocked_prefix) {
+            const first = try box(cx, .{ .width = .{ .px = 20 }, .height = .{ .px = 20 }, .rotate = 0.2, .background = Color.WHITE }, .{});
+            try root.appendChild(cx.allocator, first);
+        }
+        const parent_color = Color.rgba(128, 192, 64, 128);
+        const parent = try box(cx, .{ .width = .{ .px = 100 }, .height = .{ .px = 100 }, .background = parent_color, .overflow_hidden = true, .corner_radius = 30 }, .{});
+        const child = try box(cx, .{ .width = .{ .px = 100 }, .height = .{ .px = 100 }, .background = Color.rgba(192, 64, 128, 255) }, .{});
+        (try child.style.ensureExtFallible(cx.allocator)).blend_mode = .multiply;
+        try parent.appendChild(cx.allocator, child);
+        try root.appendChild(cx.allocator, parent);
+        cx.root = root;
+        cx.layout();
+        for (0..3) |frame| {
+            cx.frame_time_ms = @as(f64, @floatFromInt(frame)) * 16;
+            cx.perf.render_cache_hit = 0;
+            _ = cx.render();
+            if (frame > 0) try std.testing.expect(cx.perf.render_cache_hit > 0);
+            var parent_count: usize = 0;
+            var child_count: usize = 0;
+            var parent_index: usize = 0;
+            var child_index: usize = 0;
+            for (cx.display_list.items.items, 0..) |item, index| switch (item) {
+                .fill_rect => |fill| {
+                    if (fill.header.node_id == parent.id) {
+                        parent_count += 1;
+                        parent_index = index;
+                    }
+                    if (fill.header.node_id == child.id) {
+                        child_count += 1;
+                        child_index = index;
+                    }
+                },
+                else => {},
+            };
+            try std.testing.expectEqual(@as(usize, 1), parent_count);
+            try std.testing.expectEqual(@as(usize, 1), child_count);
+            try std.testing.expect(parent_index < child_index);
+        }
+    }
+}
+
 test "blend_mode: non-normal forces offscreen and reaches the paint table" {
-    // blend_mode 端到端链路验收（2026-07-30 接线）。此前这条链"两头都断"：
-    // 没有 API 能设出非 normal，encoder 侧也从未消费。本测试守生产端三件事：
-    // 1. blend_mode != normal 强制 use_opacity_layer（混合需要独立光栅化 src）；
-    // 2. EffectNode -> CompositedLayer -> begin_opacity_layer 逐层携带不丢；
-    // 3. lowered paint item 的 blend_mode 字段非 0（encoder 据此走 blend
-    //    composite 而非 trivial 短路 / 普通 SrcOver）。
-    var cx = try Cx.init(std.testing.allocator);
+    // blend_mode end-to-end path acceptance. Guards three production invariants:
+    // 1. blend_mode != normal forces use_opacity_layer (blending needs independent rasterize);
+    // 2. EffectNode -> CompositedLayer -> begin_opacity_layer carries it losslessly;
+    // 3. lowered paint item blend_mode field != 0 (encoder uses it for blend composite, not a
+    //    trivial short-circuit / plain SrcOver).
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(300, 200);
 
@@ -14128,8 +14604,8 @@ test "blend_mode: non-normal forces offscreen and reaches the paint table" {
     cx.layout();
     _ = cx.render();
 
-    // 走 offscreen effect（blend 不要求 promotion，只要求独立光栅化），
-    // blend_mode 带到 EffectNode。
+    // use offscreen effect (blend doesn't require promotion, only independent
+    // rasterize), carry blend_mode to EffectNode
     var effect_found = false;
     for (cx.property_tree.effects.items) |eff| {
         if (eff.node_id == panel.id and eff.blend_mode == .multiply) {
@@ -14139,11 +14615,11 @@ test "blend_mode: non-normal forces offscreen and reaches the paint table" {
     }
     try std.testing.expect(effect_found);
 
-    // lowered paint 列表里能找到 blend_mode == multiply 的 begin_opacity_layer。
+    // lowered paint list contains begin_opacity_layer with blend_mode == multiply
     var found = false;
     for (cx.lowerForEncoderPaintTable()) |it| {
         if (it.kind == .control and it.control_kind == .begin_opacity_layer and
-            it.blend_mode == @intFromEnum(ui.BlendMode.multiply))
+            it.blend_mode == @backingInt(ui.BlendMode.multiply))
         {
             found = true;
             break;
@@ -14153,9 +14629,10 @@ test "blend_mode: non-normal forces offscreen and reaches the paint table" {
 }
 
 test "Cx: deinit with lingering focus does not UAF (downstream regression)" {
-    // 复现：树里有 focusable 节点且退出时仍持有焦点 -> 递归 freeNode 的
-    // unregisterFocusableSilent 曾经过 getFocused() 解引用已释放节点 -> segfault。
-    var cx = try Cx.init(std.testing.allocator);
+    // reproduce: tree has focusable node still holding focus at exit -> recursive
+    // freeNode's unregisterFocusableSilent dereferences freed node via getFocused() ->
+    // segfault.
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     cx.setViewport(200, 100);
 
     const root = try box(cx, .{ .width = .{ .px = 200 }, .height = .{ .px = 100 } }, .{});
@@ -14169,23 +14646,23 @@ test "Cx: deinit with lingering focus does not UAF (downstream regression)" {
     cx.layout();
     _ = cx.render();
 
-    // 测试脚手架：用 testing.allocator，OOM 会让测试自身失败；且后续断言直接
-    // 检查 focus 行为，注册没成功会立刻暴露，不会静默通过。
+    // test scaffold: testing.allocator fails test itself on OOM; subsequent
+    // assertions directly check focus behavior; failed registration exposes immediately,
+    // no silent pass.
     cx.focus_manager.registerFocusable(a_node) catch {};
     cx.focus_manager.registerFocusable(b_node) catch {};
     cx.focus_manager.setFocus(b_node);
 
-    // 不 clearFocus 直接 deinit，修复前此处必崩
+    // deinit without clearFocus; must crash before fix
     cx.deinit();
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 下游应用上游 #12：单点 render-dirty 帧不得全树 paint 重录（O(全树) 放大器）
-// 验收口径：2000 绝对定位兄弟场景，单点 markRenderDirty 后重录节点数下降 ≥90%。
-// ─────────────────────────────────────────────────────────────────────────────
+// Downstream app upstream #12: single render-dirty frame must not full-tree paint replay
+// (O(full tree) amplifier). Acceptance criterion: 2000 absolutely-positioned siblings,
+// single markRenderDirty followed by replayed-node count drop >= 90%.
 
 test "perf: single render-dirty node must not re-record 2000 clean siblings" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(1280, 800);
 
@@ -14204,7 +14681,8 @@ test "perf: single render-dirty node must not re-record 2000 clean siblings" {
             .position = .absolute,
             .background = Color.rgba(@intCast(i % 200), 80, 120, 255),
         }, .{});
-        // translate 落位（下游应用模式：绝对定位 + per-box 平移）
+        // translate landing (downstream pattern: absolute positioning + per-box
+        // translate)
         child.style.translate_x = @floatFromInt((i % 40) * 30);
         child.style.translate_y = @floatFromInt((i / 40) * 15);
         try root.appendChild(cx.allocator, child);
@@ -14213,23 +14691,24 @@ test "perf: single render-dirty node must not re-record 2000 clean siblings" {
 
     cx.root = root;
 
-    // 帧 1：全量渲染（全树 fresh 重录）
+    // Frame 1: full render (full tree fresh re-record)
     _ = cx.render();
     const full_emit = cx.perf.own_content_emit_count;
-    try std.testing.expect(full_emit >= n_boxes); // 全树都真的录了一遍
+    try std.testing.expect(full_emit >= n_boxes); // full tree truly re-recorded once
     const full_display_len = cx.display_list.items.items.len;
     const full_paint_len = cx.lowering.main_paint.items.len;
-    try std.testing.expect(full_display_len >= n_boxes); // 每个 box 至少 1 条 fill_rect
+    try std.testing.expect(full_display_len >= n_boxes); // each box at least 1 fill_rect
 
-    // 快照帧 1 lowered 几何（等价性验收：修复不许改变最终画面命令流）
+    // snapshot Frame 1 lowered geometry (equivalence check: fix must not change final
+    // command stream)
     const Geom = struct { kind_tag: u16, x: f32, y: f32, w: f32, h: f32 };
     var snap = try std.testing.allocator.alloc(Geom, full_paint_len);
     defer std.testing.allocator.free(snap);
     for (cx.lowering.main_paint.items, 0..) |it, gi| {
-        snap[gi] = .{ .kind_tag = @intFromEnum(it.kind), .x = it.geom.x, .y = it.geom.y, .w = it.geom.w, .h = it.geom.h };
+        snap[gi] = .{ .kind_tag = @backingInt(it.kind), .x = it.geom.x, .y = it.geom.y, .w = it.geom.w, .h = it.geom.h };
     }
 
-    // 帧 2：单点 render dirty
+    // Frame 2: single-point render dirty
     mid_child.?.markRenderDirty();
     _ = cx.render();
 
@@ -14237,18 +14716,20 @@ test "perf: single render-dirty node must not re-record 2000 clean siblings" {
     const dirty_display_len = cx.display_list.items.items.len;
     const dirty_paint_len = cx.lowering.main_paint.items.len;
 
-    // 等价性：display list / lowered 命令数一致，lowered 几何完全一致
+    // equivalence: display list / lowered command counts match, lowered geometry
+    // identical
     try std.testing.expectEqual(full_display_len, dirty_display_len);
     try std.testing.expectEqual(full_paint_len, dirty_paint_len);
     for (cx.lowering.main_paint.items, 0..) |it, gi| {
-        try std.testing.expectEqual(snap[gi].kind_tag, @intFromEnum(it.kind));
+        try std.testing.expectEqual(snap[gi].kind_tag, @backingInt(it.kind));
         try std.testing.expectApproxEqAbs(snap[gi].x, it.geom.x, 0.01);
         try std.testing.expectApproxEqAbs(snap[gi].y, it.geom.y, 0.01);
         try std.testing.expectApproxEqAbs(snap[gi].w, it.geom.w, 0.01);
         try std.testing.expectApproxEqAbs(snap[gi].h, it.geom.h, 0.01);
     }
 
-    // 验收：单点脏帧重录节点数 ≤ 全量的 10%（目标是个位数：脏节点 + 根 + 路径）
+    // acceptance: single-dirty-frame re-recorded nodes <= 10% of full (target single
+    // digits: dirty node + root + path)
     std.debug.print(
         "\n[dirty-splice-bench] full_emit={d} dirty_emit={d} splice_hits={d} cache_writes={d}\n",
         .{ full_emit, dirty_emit, cx.perf.subtree_payload_splice_count, cx.perf.subtree_payload_cache_write_count },
@@ -14256,33 +14737,33 @@ test "perf: single render-dirty node must not re-record 2000 clean siblings" {
     try std.testing.expect(dirty_emit * 10 <= full_emit);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// hook 影响范围声明（before_render_hook_affects_self_only）
+// Hook scope declaration (before_render_hook_affects_self_only)
 //
-// 背景（下游编辑器稳态帧调查 2026-09-17）：markdown 编辑器在最外层挂了
-// before_render hook（滚动同步/几何回填），而 prebuildDisplayPayloadSubtrees
-// 遇到任何带 hook 的节点就置 display_payload_prefix_broken，让 paint 顺序在其
-// 之后的**一切**退回 fresh emit。实测后果：正文整棵子树的
-// subtree_payload_splice_count 恒为 0，每帧重录 186 个节点，
-// ZENIT_DISABLE_SUBTREE_SPLICE 的 A/B 差异 -1%（因为它本就没生效）。
+// Background: a markdown editor hooks before_render at top level (scroll sync/geometry backfill),
+// and prebuildDisplayPayloadSubtrees sets display_payload_prefix_broken on any hooked node, so all
+// paint order after it falls back to fresh emit. Result: whole-document
+// subtree_payload_splice_count
+// stuck at 0, 186 nodes/frame replayed; ZENIT_DISABLE_SUBTREE_SPLICE A/B delta -1% (never applied).
 //
-// 下面两个测试是一对：
-//   1. 不声明（默认保守）-> 前缀被打断，兄弟子树零复用。这条锚定我们**没有**
-//      放松默认语义（GlassLab 双份合成的防线还在）。
-//   2. 声明 self-only -> 兄弟子树恢复复用，且 lowered 命令流逐条等价。
-// 第 2 条摘掉 hookScopeIsSelfOnly 的放行必然变红，它就是负向注入锚点。
-// ─────────────────────────────────────────────────────────────────────────────
+// The two tests below are a pair:
+//   1. Undeclared (conservative default) -> prefix breaks, sibling subtrees zero-reused.
+//      Anchors that defaults are NOT relaxed (GlassLab double-composite defense line intact).
+//   2. Declared self-only -> sibling subtree reuse resumes, lowered command stream
+//      matches per-instruction.
+// Removing hookScopeIsSelfOnly's allowance makes test 2 red: it is the negative-injection anchor.
 
-/// 只改自身样式的 hook：模拟编辑器的"每帧回填自己的几何"，不触碰任何后代。
+/// hook modifying only own style: simulate editor 'backfill own geometry each
+/// frame', don't touch descendants
 fn selfOnlyHookForTest(node: *Node) void {
-    // 写自身背景（own 内容变化），不碰 children
+    // modify own background (own content changes), don't touch children
     node.setBackground(Color.rgba(10, 20, 30, 255));
 }
 
 fn buildHookedPrefixScene(cx: *Cx, n_siblings: usize, self_only: bool) !*Node {
     const root = try box(cx, .{ .width = .{ .px = 1280 }, .height = .{ .px = 800 } }, .{});
 
-    // 带 hook 的节点排在**前面**，它一旦打断前缀，后面的兄弟全部失去缓存资格。
+    // hooked node comes **first**; once it breaks prefix, all following siblings lose
+    // cache eligibility
     const hooked = try box(cx, .{ .width = .{ .px = 50 }, .height = .{ .px = 20 } }, .{});
     hooked.meta.per_frame.hooks.before_render.main = selfOnlyHookForTest;
     hooked.frame_state.state_bits.flags.before_render_hook_affects_self_only = self_only;
@@ -14298,7 +14779,8 @@ fn buildHookedPrefixScene(cx: *Cx, n_siblings: usize, self_only: bool) !*Node {
         }, .{});
         sib.style.translate_x = @floatFromInt((i % 40) * 30);
         sib.style.translate_y = @floatFromInt((i / 40) * 15);
-        // 每个兄弟带一个子节点，构成"子树"而不是叶子，splice 的粒度在子树。
+        // each sibling carries one child, forms 'subtree' not leaf; splice granularity at
+        // subtree level
         const inner = try box(cx, .{
             .width = .{ .px = 4 },
             .height = .{ .px = 4 },
@@ -14312,61 +14794,63 @@ fn buildHookedPrefixScene(cx: *Cx, n_siblings: usize, self_only: bool) !*Node {
 }
 
 test "hook scope: 默认（未声明）保持保守语义——前缀打断，兄弟子树零复用" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(1280, 800);
 
     const root = try buildHookedPrefixScene(cx, 200, false);
 
-    _ = cx.render(); // 帧 1：建立缓存的机会
+    _ = cx.render(); // Frame 1: opportunity to build cache
     cx.perf.subtree_payload_splice_count = 0;
-    // ⚠ 必须制造一个脏点：全干净的树会被 Cx.render 的零脏帧 fast-path 整帧
-    // early-return（core.zig:5766），prebuild 根本不执行，splice 计数恒为 0
-    // 那样断言"等于 0"是假绿（测的是 fast-path，不是本闸门）。
-    // 脏最后一个兄弟，模拟"只有一行变了"。
+    // ⚠ must create a dirty point: fully clean tree hits Cx.render zero-dirty
+    // fast-path, early-return entire frame (core.zig:5766), prebuild never runs, splice
+    // count stays 0; then asserting 'equals 0' is false-green (testing fast-path, not
+    // this gate). dirty last sibling, simulate 'only one row changed'.
     root.children.items[root.children.items.len - 1].markRenderDirty();
-    _ = cx.render(); // 帧 2：单点脏帧
+    _ = cx.render(); // Frame 2: single-point dirty frame
 
-    // 默认语义下，带 hook 的节点把前缀打断 -> 后面的兄弟一个都 splice 不到。
+    // default semantics: hooked node breaks prefix -> no following siblings can
+    // splice
     try std.testing.expectEqual(@as(u32, 0), cx.perf.subtree_payload_splice_count);
 }
 
 test "hook scope: 声明 self-only 后兄弟子树恢复跨帧复用且命令流等价" {
     const n: usize = 200;
 
-    // ── A：声明 self-only ────────────────────────────────────────────
-    var cx = try Cx.init(std.testing.allocator);
+    // ── A: declare self-only ────────────────────────────────────────────
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(1280, 800);
     const root = try buildHookedPrefixScene(cx, n, true);
 
     _ = cx.render();
-    // 等价性基准：取**关掉复用**时的命令流。同一棵树、同一个脏点，
-    // 走 fresh 全量重录的结果就是真值；下面开着复用再跑一遍必须逐条相同。
-    // （若拿帧 1 当基准，帧 1 本身也可能已经复用，等于拿被测物当尺子。）
+    // equivalence baseline: use **cache-disabled** command stream. same tree, same
+    // dirty point, fresh full re-record result is ground truth; below, with cache on,
+    // must match element-by-element. (if using Frame 1 as baseline, Frame 1 itself might
+    // already cache, = measuring with the subject.)
     const Geom = struct { kind_tag: u16, x: f32, y: f32, w: f32, h: f32 };
-    var baseline = std.ArrayListUnmanaged(Geom){};
+    var baseline = @as(std.ArrayListUnmanaged(Geom), .empty);
     defer baseline.deinit(std.testing.allocator);
     {
-        var cx_ref = try Cx.init(std.testing.allocator);
+        var cx_ref = try Cx.init(std.testing.allocator, std.testing.io);
         defer cx_ref.deinit();
         cx_ref.setViewport(1280, 800);
-        const ref_root = try buildHookedPrefixScene(cx_ref, n, false); // false = 保守全量
+        const ref_root = try buildHookedPrefixScene(cx_ref, n, false); // false = conservative full
         _ = cx_ref.render();
         ref_root.children.items[ref_root.children.items.len - 1].markRenderDirty();
         _ = cx_ref.render();
         try baseline.ensureTotalCapacity(std.testing.allocator, cx_ref.lowering.main_paint.items.len);
         for (cx_ref.lowering.main_paint.items) |it| {
-            baseline.appendAssumeCapacity(.{ .kind_tag = @intFromEnum(it.kind), .x = it.geom.x, .y = it.geom.y, .w = it.geom.w, .h = it.geom.h });
+            baseline.appendAssumeCapacity(.{ .kind_tag = @backingInt(it.kind), .x = it.geom.x, .y = it.geom.y, .w = it.geom.w, .h = it.geom.h });
         }
     }
 
     cx.perf.subtree_payload_splice_count = 0;
     cx.perf.own_content_emit_count = 0;
-    // 单点脏（同上：避开零脏帧 fast-path）。这也正是要优化的真实场景,
-    // "只有一行变了，其余全部复用"。
+    // single-point dirty (same: avoid zero-dirty fast-path). this is the true
+    // scenario to optimize: 'only one row changed, rest all reuse'.
     root.children.items[root.children.items.len - 1].markRenderDirty();
-    _ = cx.render(); // 帧 2：单点脏帧，干净兄弟应大量命中 splice
+    _ = cx.render(); // Frame 2: single-point dirty frame, clean siblings should heavily hit splice
 
     const splice_hits = cx.perf.subtree_payload_splice_count;
     const emit = cx.perf.own_content_emit_count;
@@ -14375,14 +14859,16 @@ test "hook scope: 声明 self-only 后兄弟子树恢复跨帧复用且命令流
         .{ splice_hits, emit, n },
     );
 
-    // 核心断言：干净兄弟子树被整支复用（摘掉 hookScopeIsSelfOnly 放行即变红）
+    // core assertion: clean sibling subtrees fully reused (removing
+    // hookScopeIsSelfOnly allowance turns red)
     try std.testing.expect(splice_hits > 0);
 
-    // 等价性：复用路径产出的 lowered 命令流必须与**保守全量**路径逐条一致。
-    // 这是防"缓存生效但画错"的护栏，命中率高而画面错是更坏的结果。
+    // equivalence: reuse-path lowered commands must match **conservative full** path
+    // element-by-element. safeguard against 'cache works but draws wrong'; high hit rate
+    // but wrong picture is worse.
     try std.testing.expectEqual(baseline.items.len, cx.lowering.main_paint.items.len);
     for (cx.lowering.main_paint.items, 0..) |it, gi| {
-        try std.testing.expectEqual(baseline.items[gi].kind_tag, @intFromEnum(it.kind));
+        try std.testing.expectEqual(baseline.items[gi].kind_tag, @backingInt(it.kind));
         try std.testing.expectApproxEqAbs(baseline.items[gi].x, it.geom.x, 0.01);
         try std.testing.expectApproxEqAbs(baseline.items[gi].y, it.geom.y, 0.01);
         try std.testing.expectApproxEqAbs(baseline.items[gi].w, it.geom.w, 0.01);
@@ -14390,17 +14876,17 @@ test "hook scope: 声明 self-only 后兄弟子树恢复跨帧复用且命令流
     }
 }
 
-// 交叉审查（GLM，问题一之 1）提出的最严重疑点：一个自称 self-only 的 hook
-// 若**直接写后代的 style.translate_x**（绕过 setTranslateX 的 markCompositePropDirty），
-// 后代六个 dirty 位与 content_version 都不变 -> 祖先 stamp 全过 -> splice 出
-// hook 运行前的陈旧位置。production 里 textarea/virtual_list/scrollbar 都是
-// 这种直接写法，而 manual_transform_animation_active 只在测试文件里被置位。
-// 本探针判定：这条路径是否真的画错。
-// 稽核修正后的三向验证：真违约必须仍然被抓到，合法写法必须放行。
+// Risk: a self-only hook that **directly writes a descendant's style.translate_x**
+// (bypassing setTranslateX's markCompositePropDirty) leaves the descendant's six dirty bits and
+// content_version unchanged -> ancestor stamp passes -> old position spliced before the hook ran.
+// Production textarea/virtual_list/scrollbar all use direct writes;
+// manual_transform_animation_active
+// is only set in test files. The probe checks whether this path truly draws wrong; with the runtime
+// audit, real violations must still be caught and lawful writes allowed.
 var g_audit_victim: ?*Node = null;
 var g_audit_tick: u8 = 0;
 
-// (A) 真违约：raw 写入口改别人，不标脏
+// (A) real violation: raw write modifies other, no mark-dirty
 fn auditRawWriteHook(node: *Node) void {
     _ = node;
     if (g_audit_victim) |t| {
@@ -14409,7 +14895,8 @@ fn auditRawWriteHook(node: *Node) void {
     }
 }
 
-// (B) 合法：改别人但走标脏入口（panic 文案推荐的修法之一，必须放行）
+// (B) legal: modify other but via mark-dirty entry (one of panic message's
+// recommended fixes, must allow)
 fn auditMarkedWriteHook(node: *Node) void {
     _ = node;
     if (g_audit_victim) |t| {
@@ -14438,14 +14925,17 @@ fn buildAuditScene(cx: *Cx, hook: *const fn (*Node) void) !*Node {
     return root;
 }
 
-// 负向确认：真违约（raw 写入口改别人、不标脏）必须仍被抓到。
-// 这个 test 期望 panic，所以不能当常规用例跑，用 PROBE2 前缀手动跑：
-//   zig build test-ui-core -Dtest-filter="PROBE2 真违约"
-// 预期：panic 并点名 hook 所在 node 与被改的 node。
+// Negative confirmation: real violations (raw write modifies another node, no mark-dirty)
+// must still be caught. This test expects a panic so can't run as a normal case; run manually
+// with the PROBE2 prefix:
+//   zig build test-ui-core -Dtest-filter="PROBE2"
+// (the test name itself is still Chinese; the filter must match the actual test name)
+// expect: panic naming hooked node and modified node.
 test "PROBE2 真违约必须仍被稽核抓到（预期 panic）" {
-    // SKIP-REASON: 稽核违约探针，需显式设 ZENIT_RUN_AUDIT_VIOLATION_PROBE 才跑（它故意触发 panic 路径）
-    if (std.posix.getenv("ZENIT_RUN_AUDIT_VIOLATION_PROBE") == null) return error.SkipZigTest;
-    var cx = try Cx.init(std.testing.allocator);
+    // SKIP-REASON: audit violation probe, needs explicit
+    // ZENIT_RUN_AUDIT_VIOLATION_PROBE to run (intentionally triggers panic path)
+    if (!@import("zenit_environment").has("ZENIT_RUN_AUDIT_VIOLATION_PROBE")) return error.SkipZigTest;
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(1280, 800);
     _ = try buildAuditScene(cx, auditRawWriteHook);
@@ -14460,34 +14950,37 @@ test "PROBE2 真违约必须仍被稽核抓到（预期 panic）" {
 }
 
 test "hook scope 稽核: 合法的标脏写入必须放行（不得误报）" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(1280, 800);
     _ = try buildAuditScene(cx, auditMarkedWriteHook);
     defer g_audit_victim = null;
 
-    // 走 setBackground（标脏）改别人：缓存会正常失效，不是威胁模型内的违约。
-    // 稽核若把它也判违约，panic 文案推荐的修法(b)就自相矛盾了。
+    // use setBackground (mark-dirty) to modify other: cache invalidates normally,
+    // not violation in threat model. if audit also flags as violation, panic message's
+    // recommended fix (b) becomes self-contradictory.
     var f: usize = 0;
     while (f < 4) : (f += 1) {
         cx.frame_count += 1;
         cx.frame_time_ms += 16.0;
         _ = cx.render();
     }
-    // 跑到这里没 panic 即通过
+    // reaching here without panic passes
     try std.testing.expect(g_audit_tick > 0);
 }
 
-// 第二轮交叉审查（GLM）结论 1 的回归护栏：稽核不得因 hook 自己 mount 新节点误报。
-// 修正前实测必崩，而首个真实采纳者（编辑器 hook 每帧驱动 VL 挂载/回收）
-// 恰恰就是这个形态，等于该声明位对目标用户完全不可用。
+// second cross-review (GLM) conclusion-1 regression guard: audit must not
+// false-positive when hook mounts own new nodes. real pre-fix crash, and first actual
+// adopter (editor hook drives VL mount/reclaim per-frame) is exactly this shape; =
+// declaration unusable for target user.
 var g_mounting_hook_cx: ?*Cx = null;
 var g_mounting_hook_ran: u32 = 0;
 
 fn mountingHookForTest(node: *Node) void {
     const cx = g_mounting_hook_cx orelse return;
     g_mounting_hook_ran += 1;
-    // 模拟 VL 每帧挂一行：只加自己的后代，不碰任何现存节点的绘制态
+    // simulate VL mounting one row per-frame: only add own descendants, don't touch
+    // any existing node's draw state
     const child = box(cx, .{
         .width = .{ .px = 5 },
         .height = .{ .px = 5 },
@@ -14497,7 +14990,7 @@ fn mountingHookForTest(node: *Node) void {
 }
 
 test "hook scope 稽核: hook 自身 mount 新节点不得误报" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(1280, 800);
     g_mounting_hook_cx = cx;
@@ -14511,54 +15004,49 @@ test "hook scope 稽核: hook 自身 mount 新节点不得误报" {
     try root.appendChild(cx.allocator, hooked);
     cx.root = root;
 
-    // 若稽核把"树形状变化"误判成违约，这里会 panic
+    // if audit false-positives 'tree shape change' as violation, panics here
     _ = cx.render();
     cx.frame_count += 1;
     cx.frame_time_ms += 16.0;
     _ = cx.render();
 
-    // 跑到这里没 panic 即通过；顺带确认 hook 真的执行并挂上了节点，
-    // 否则这个测试会在"hook 根本没跑"的情况下假绿。
+    // reaching here without panic passes; confirm hook truly ran and mounted nodes,
+    // else test false-greens if 'hook never ran'.
     try std.testing.expect(g_mounting_hook_ran >= 2);
     try std.testing.expect(hooked.children.items.len >= 2);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 交叉审查（GLM-5.3，2026-09-17）验证记录：self-only 担保说谎会怎样
+// Verification: what if the self-only promise lies. Two lie patterns, different outcomes:
 //
-// 用探针实测过两种谎报形态，结论不同，都记在这里免得后人重走：
+// 1. Hook directly writes another's style.translate_x (bypassing setTranslateX's dirty mark)
+//    -> does NOT draw wrong. DisplayItem in cache is local coords + transform_id; lowering reads
+//    the frame's property_tree matrix (display_list_lowering.zig:309; property_tree is rebuilt
+//    every frame), so translate writes have a fallback. Measured: 8 frames translate 7->56,
+//    drawn_x tracks every frame, mismatch=0.
 //
-// 1. hook 直接写别人的 style.translate_x（绕过 setTranslateX 的标脏）
-//    -> **不会画错**。缓存里的 DisplayItem 是 local 坐标 + transform_id，
-//    lower 时读当帧 property_tree 矩阵（display_list_lowering.zig:309，
-//    property_tree 每帧 clear 重建），所以平移类写入天然有兜底。
-//    实测：8 帧 translate 7->56，drawn_x 逐帧跟上，mismatch=0。
+// 2. Hook directly writes another's background color (setBackgroundRaw, the "side-effect-free
+//    write port", 151 production call sites) -> DOES draw wrong, silently. Color is baked into
+//    DisplayItem value with no recompute fallback; the raw write does not bump content_version, so
+//    the stamp doesn't catch it. Measured: 8 frames all reuse stale color (drawn_r frozen at 30,
+//    style at 240); without the self-only flag stale_frames=0.
 //
-// 2. hook 直接写别人的背景色（setBackgroundRaw，框架自带的"无副作用
-//    写入口"，生产代码 151 处在用）
-//    -> **会画错，且静默**。颜色是烘焙进 DisplayItem 的值，没有重算兜底；
-//    content_version 也不被 raw 写入口 bump，stamp 拦不住。
-//    实测：8 帧全部复用陈旧颜色（drawn_r 冻在 30，style 已走到 240）；
-//    去掉 self-only 声明则 stale_frames=0，即这是本特性引入的新风险。
+// Therefore runBeforeRenderHook (tick.zig) runs a runtime audit: if a hook declared self-only and
+// ANY node except itself changes draw state after the hook runs, panic with names. Lies become
+// "immediate crash + fix path" rather than "occasional ghost".
 //
-// 因此 runBeforeRenderHook 加了运行期稽核（tick.zig）：声明了 self-only 的
-// hook，跑完后若整棵树里**除自己以外**任何节点的绘制态变了，直接 panic 指名
-// 道姓。谎报从"偶发残影"变成"当场炸、带修法"。
-//
-// 稽核只在 Debug/ReleaseSafe 生效，且只对声明了该位的节点付遍历成本。
-// ─────────────────────────────────────────────────────────────────────────────
+// Audit runs only in Debug/ReleaseSafe, cost only on nodes declaring the flag.
 
-// 交叉审查（GLM，P4）提出的疑点：hook 的增删不 bump versions.content，
-// 而 nodeEligibleForSubtreePayloadCache 用 hasBeforeRenderHooks() 把关缓存的
-// 读端与写端，那么"挂 hook 期间不写缓存、摘掉 hook 后第一帧"读到的会不会是
-// 挂 hook **之前**的陈旧条目？本测试用来判定该路径是否真的可达。
+// Question: hook add/remove doesn't bump versions.content; nodeEligibleForSubtreePayloadCache uses
+// hasBeforeRenderHooks() to guard both cache read and write. After a hook is removed, the first
+// frame might read a **pre-hook** stale entry written while hooked. Probe judges whether the
+// path is truly reachable.
 test "hook scope: hook 摘除后不得 splice 到陈旧缓存条目" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(1280, 800);
 
     const root = try box(cx, .{ .width = .{ .px = 1280 }, .height = .{ .px = 800 } }, .{});
-    // target：先无 hook（可缓存）-> 内容 A
+    // target: initially no hook (cacheable) -> content A
     const target = try box(cx, .{ .width = .{ .px = 100 }, .height = .{ .px = 50 } }, .{});
     const inner = try box(cx, .{
         .width = .{ .px = 20 },
@@ -14566,7 +15054,8 @@ test "hook scope: hook 摘除后不得 splice 到陈旧缓存条目" {
         .background = Color.rgba(11, 22, 33, 255),
     }, .{});
     try target.appendChild(cx.allocator, inner);
-    // 多放几个带背景的孙节点，让"画错"有地方显形（只有 1 条命令时比对形同虚设）
+    // add several background-bearing grandchildren so 'draw wrong' has visible place
+    // (1-command comparison is vacuous)
     var k: usize = 0;
     while (k < 6) : (k += 1) {
         const leaf = try box(cx, .{
@@ -14577,30 +15066,31 @@ test "hook scope: hook 摘除后不得 splice 到陈旧缓存条目" {
         try inner.appendChild(cx.allocator, leaf);
     }
     try root.appendChild(cx.allocator, target);
-    // 一个兄弟，保证 root 有别的脏点可制造非零脏帧
+    // one sibling, ensure root has other dirty point to make non-zero dirty frame
     const sib = try box(cx, .{ .width = .{ .px = 10 }, .height = .{ .px = 10 } }, .{});
     try root.appendChild(cx.allocator, sib);
     cx.root = root;
 
-    _ = cx.render(); // 帧 1：target 无 hook → 写入缓存（内容 A）
+    _ = cx.render(); // Frame 1: target no hook -> write cache (content A)
     _ = cx.render();
 
-    // 挂 hook：此后 target 不参与缓存（读写两端都被 hasBeforeRenderHooks 拦）
+    // mount hook: thereafter target ineligible for cache (both read/write ends blocked
+    // by hasBeforeRenderHooks)
     target.meta.per_frame.hooks.before_render.main = selfOnlyHookForTest;
-    // 挂 hook 期间改变 inner 的内容（缓存条目里的 A 因此过时）
+    // while hooked, change inner's content (cache entry A becomes stale)
     inner.setBackground(Color.rgba(200, 100, 50, 255));
     sib.markRenderDirty();
     _ = cx.render();
 
-    // 摘掉 hook：target 重新具备缓存资格
+    // remove hook: target regains cache eligibility
     target.meta.per_frame.hooks.before_render.main = null;
-    sib.markRenderDirty(); // 制造单点脏帧（避开零脏帧 fast-path）
+    sib.markRenderDirty(); // create single-point dirty frame (avoid zero-dirty fast-path)
     cx.perf.subtree_payload_splice_count = 0;
     _ = cx.render();
 
-    // splice 命中本身不等于画错，关键是内容对不对。
-    // 与"从未挂过 hook、其余完全相同"的参照 Cx 逐条比对 lowered 命令流。
-    var ref = try Cx.init(std.testing.allocator);
+    // splice hit doesn't equal drawing wrong; content correctness is key.
+    // Compare lowered commands element-by-element with reference Cx that 'never hooked'
+    var ref = try Cx.init(std.testing.allocator, std.testing.io);
     defer ref.deinit();
     ref.setViewport(1280, 800);
     const r_root = try box(ref, .{ .width = .{ .px = 1280 }, .height = .{ .px = 800 } }, .{});
@@ -14626,7 +15116,7 @@ test "hook scope: hook 摘除后不得 splice 到陈旧缓存条目" {
     ref.root = r_root;
     _ = ref.render();
     _ = ref.render();
-    r_inner.setBackground(Color.rgba(200, 100, 50, 255)); // 同样的内容变更，但全程无 hook
+    r_inner.setBackground(Color.rgba(200, 100, 50, 255)); // same content change, but never hooked
     r_sib.markRenderDirty();
     _ = ref.render();
     r_sib.markRenderDirty();
@@ -14637,11 +15127,12 @@ test "hook scope: hook 摘除后不得 splice 到陈旧缓存条目" {
         .{ cx.perf.subtree_payload_splice_count, cx.lowering.main_paint.items.len, ref.lowering.main_paint.items.len },
     );
 
-    // 逐条比对：若 hook 摘除路径复用了陈旧条目，这里会出现颜色/几何差异
+    // element-by-element comparison: if hook-remove reuses stale entry, color/geometry
+    // diff appears
     try std.testing.expectEqual(ref.lowering.main_paint.items.len, cx.lowering.main_paint.items.len);
     for (cx.lowering.main_paint.items, 0..) |it, gi| {
         const r = ref.lowering.main_paint.items[gi];
-        try std.testing.expectEqual(@intFromEnum(r.kind), @intFromEnum(it.kind));
+        try std.testing.expectEqual(@backingInt(r.kind), @backingInt(it.kind));
         try std.testing.expectApproxEqAbs(r.geom.x, it.geom.x, 0.01);
         try std.testing.expectApproxEqAbs(r.geom.y, it.geom.y, 0.01);
         try std.testing.expectApproxEqAbs(r.geom.w, it.geom.w, 0.01);
@@ -14650,7 +15141,7 @@ test "hook scope: hook 摘除后不得 splice 到陈旧缓存条目" {
 }
 
 test "subtree payload cache isolates a disable_render_cache boundary in both directions" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(320, 200);
 
@@ -14701,15 +15192,16 @@ test "subtree payload cache isolates a disable_render_cache boundary in both dir
 }
 
 test "hook scope: 逃生阀 ZENIT_DISABLE_HOOK_SELF_SCOPE 能关掉降级" {
-    // 逃生阀读的是进程级 env + 一次性 cache，测试内不便改 env；
-    // 这里退而验证判定函数对两个**不可放行例外**的处理：
-    // overlay candidate 与手动动画进行中，即使声明了 self-only 也不放行。
-    var cx = try Cx.init(std.testing.allocator);
+    // escape valve reads process-level env + one-time cache, env change inconvenient
+    // in test; instead verify guard function handles two **non-allowable exceptions**:
+    // overlay candidate and manual animation in progress, no allowance even if declaring
+    // self-only.
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(1280, 800);
 
     const root = try buildHookedPrefixScene(cx, 40, true);
-    // 找到那个 hooked 节点（第一个 child），给它开手动 transform 动画标志
+    // find hooked node (first child), set manual transform animation flag
     const hooked = root.children.items[0];
     hooked.frame_state.state_bits.flags.manual_transform_animation_active = true;
 
@@ -14718,24 +15210,21 @@ test "hook scope: 逃生阀 ZENIT_DISABLE_HOOK_SELF_SCOPE 能关掉降级" {
     root.children.items[root.children.items.len - 1].markRenderDirty();
     _ = cx.render();
 
-    // 手动动画进行中 ⇒ 担保不成立 ⇒ 回到保守语义（前缀打断，零复用）
+    // manual animation in progress ⇒ guarantee void ⇒ revert to conservative (prefix
+    // broken, zero reuse)
     try std.testing.expectEqual(@as(u32, 0), cx.perf.subtree_payload_splice_count);
 }
 
-// ============================================================================
-// 2026-07-31 审查修复：a11y 投影此前把十个 state 位硬编码成 false，
-// value_now/min/max 硬编码成 0，组件声明了也传不到 a11y 树。
+// a11y projection must not hard-code ten state bits to false or value_now/min/max to 0;
+// component-declared values must reach the a11y tree.
 //
-// ⚠ 注意与既有测试 "v0.8 §2.1: select trigger 初始化 role=combobox +
-// has_popup=listbox" 的区别：那个测试断言的是
-// `trigger.behavior.interaction.a11y`（**props 结构体**），props 一直是
-// 对的，坏的是 props -> a11y tree 这一段。所以它全程是绿的，功能却端到端
-// 坏着。下面的测试断言 `cx.accessibility_tree.get(...)`，即真正送给 AT 的
-// 那份数据。
-// ============================================================================
+// WARNING: distinct from the existing select-trigger test (init role=combobox + has_popup=listbox):
+// it asserts `trigger.behavior.interaction.a11y` (props struct), which was always correct; the
+// broken part was props -> a11y tree, so it stayed green while the feature broke end-to-end.
+// Below asserts `cx.accessibility_tree.getNode(...)`, the actual data sent to AT.
 
 test "a11y 投影：props 的 state 位真的到达 a11y tree（此前被硬编码丢弃）" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
 
@@ -14764,9 +15253,9 @@ test "a11y 投影：props 的 state 位真的到达 a11y tree（此前被硬编�
     _ = cx.render();
 
     const eid = ui.ElementId.fromRaw(n.element_id_raw);
-    const a11y_node = cx.accessibility_tree.get(eid).?;
+    const a11y_node = cx.accessibility_tree.getNode(eid).?;
 
-    // 修复前这 10 个断言**全部**失败（硬编码 false）
+    // before fix, these 10 assertions **all** failed (hardcoded false)
     try std.testing.expect(a11y_node.state.haspopup);
     try std.testing.expect(a11y_node.state.selected);
     try std.testing.expect(a11y_node.state.pressed);
@@ -14779,19 +15268,19 @@ test "a11y 投影：props 的 state 位真的到达 a11y tree（此前被硬编�
     try std.testing.expect(a11y_node.state.multiselectable);
     try std.testing.expect(a11y_node.state.indeterminate);
 
-    // has_popup = .none 时 haspopup 必须是 false（别一律 true）
+    // when has_popup = .none, haspopup must be false (not always true)
     const n2 = try box(cx, .{ .width = .{ .px = 10 }, .height = .{ .px = 10 } }, .{});
     n2.behavior.interaction.a11y = .{ .role = .button, .label = "Plain" };
     try root.appendChild(std.testing.allocator, n2);
     cx.layout();
     _ = cx.render();
-    const a2 = cx.accessibility_tree.get(ui.ElementId.fromRaw(n2.element_id_raw)).?;
+    const a2 = cx.accessibility_tree.getNode(ui.ElementId.fromRaw(n2.element_id_raw)).?;
     try std.testing.expect(!a2.state.haspopup);
     try std.testing.expect(!a2.state.selected);
 }
 
 test "a11y 投影：slider/progressbar 的 value_now/min/max 真的到达 a11y tree" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
 
@@ -14811,8 +15300,8 @@ test "a11y 投影：slider/progressbar 的 value_now/min/max 真的到达 a11y t
     cx.layout();
     _ = cx.render();
 
-    const a = cx.accessibility_tree.get(ui.ElementId.fromRaw(slider.element_id_raw)).?;
-    // 修复前三者恒为 0, VoiceOver 读不出"42，范围 0 到 100"
+    const a = cx.accessibility_tree.getNode(ui.ElementId.fromRaw(slider.element_id_raw)).?;
+    // before fix, all three always 0, VoiceOver can't read "42, range 0 to 100"
     try std.testing.expectEqual(@as(f32, 42), a.value_now);
     try std.testing.expectEqual(@as(f32, 0), a.value_min);
     try std.testing.expectEqual(@as(f32, 100), a.value_max);
@@ -14822,7 +15311,7 @@ test "a11y: Slider 拖动后 value_now 跟随（不是冻结在 mount 初值）"
     const slider_mod = @import("../components/slider/mod.zig");
     const Scope = @import("../reactive.zig").Scope;
 
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
 
@@ -14832,36 +15321,34 @@ test "a11y: Slider 拖动后 value_now 跟随（不是冻结在 mount 初值）"
     const scope = try Scope.init(std.testing.allocator, null, cx.owner);
     defer scope.dispose();
 
-    const res = try slider_mod.Slider(.{ .min = 0, .max = 100, .initial_value = 10 }).mount(scope, cx);
+    const level = try scope.createSignal(f32, 10);
+    const res = try slider_mod.Slider(.{ .min = 0, .max = 100, .value = level }).mount(scope, cx);
     try root.appendChild(std.testing.allocator, res.wrapper);
     cx.layout();
     _ = cx.render();
 
     const eid = ui.ElementId.fromRaw(res.wrapper.element_id_raw);
-    try std.testing.expectEqual(@as(f32, 10), cx.accessibility_tree.get(eid).?.value_now);
+    try std.testing.expectEqual(@as(f32, 10), cx.accessibility_tree.getNode(eid).?.value_now);
 
-    // 拖到 73：a11y 必须跟上
-    res.state.setValue(73);
+    // change to 73: a11y must follow
+    level.set(73);
     cx.layout();
     _ = cx.render();
-    try std.testing.expectEqual(@as(f32, 73), cx.accessibility_tree.get(eid).?.value_now);
-    try std.testing.expectEqual(@as(f32, 100), cx.accessibility_tree.get(eid).?.value_max);
+    try std.testing.expectEqual(@as(f32, 73), cx.accessibility_tree.getNode(eid).?.value_now);
+    try std.testing.expectEqual(@as(f32, 100), cx.accessibility_tree.getNode(eid).?.value_max);
 }
 
-// ============================================================================
-// 2026-07-31 组件 a11y 声明补齐。
+// Component a11y declaration completion.
 //
-// 这组测试一律断言 `cx.accessibility_tree`（真正送给 AT 的数据），
-// **不是** `node.behavior.interaction.a11y`（props）。原因见仓库里那条
-// "select trigger 初始化 role=combobox" 的旧测试：它断言 props，于是
-// props->a11y tree 投影整段坏掉时它照样全绿。
-// ============================================================================
+// All tests assert `cx.accessibility_tree` (data actually sent to AT), NOT
+// `node.behavior.interaction.a11y` (props): a props-only assertion (like the select trigger
+// init role=combobox test) stays green when the props->a11y projection breaks.
 
-test "a11y: Tabs 每个 tab 有 role=tab，selected 跟随 active_index 切换" {
+test "a11y: Tabs 每个 tab 有 role=tab，selected 跟随 active 切换" {
     const tabs_mod = @import("../components/tabs/mod.zig");
     const Scope = @import("../reactive.zig").Scope;
 
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(600, 300);
 
@@ -14872,49 +15359,45 @@ test "a11y: Tabs 每个 tab 有 role=tab，selected 跟随 active_index 切换" 
     defer scope.dispose();
 
     const items = [_]tabs_mod.TabItem{
-        .{ .id = "a", .label_text = "Alpha" },
-        .{ .id = "b", .label_text = "Beta" },
-        .{ .id = "c", .label_text = "Gamma" },
+        .{ .id = "a", .label = "Alpha" },
+        .{ .id = "b", .label = "Beta" },
+        .{ .id = "c", .label = "Gamma" },
     };
-    // 用 .pill：underline 变体会把 tab_row 再套一层 outer container，
-    // pill 下 container 就是 tab_row，断言路径最短。
-    const container = try tabs_mod.Tabs(.{ .items = &items, .variant = .pill }).mount(scope, cx);
+    // use .pill: underline variant wraps tab_row in outer container again;
+    // under pill container is tab_row, assertion path shortest.
+    const current = try scope.createSignal(?[]const u8, null);
+    const container = try tabs_mod.Tabs(.{ .items = &items, .variant = .pill, .active = current }).mount(scope, cx);
     try root.appendChild(std.testing.allocator, container);
     cx.layout();
     _ = cx.render();
 
-    // children[0] 是 highlight_box，之后才是 3 个 tab。
+    // children[0] is highlight_box, then 3 tabs
     const tab_row = container;
     try std.testing.expect(tab_row.children.items.len >= 4);
 
     const a11yOf = struct {
         fn get(c: *Cx, n: *Node) a11y_tree_mod.A11yNode {
-            return c.accessibility_tree.get(ui.ElementId.fromRaw(n.element_id_raw)).?;
+            return c.accessibility_tree.getNode(ui.ElementId.fromRaw(n.element_id_raw)).?;
         }
     }.get;
 
     const tab_a = tab_row.children.items[1];
     const tab_b = tab_row.children.items[2];
 
-    // tablist 自身
-    // A11yRole.tablist 映射到 tree Role.tabs
+    // tablist itself
+    // A11yRole.tablist maps to tree Role.tabs
     try std.testing.expectEqual(a11y_tree_mod.Role.tabs, a11yOf(cx, container).role);
 
-    // 每个 tab 都必须是 role=tab（此前 tab 节点没有任何 a11y 声明）
+    // each tab must be role=tab (tabs previously had no a11y declaration)
     try std.testing.expectEqual(a11y_tree_mod.Role.tab, a11yOf(cx, tab_a).role);
     try std.testing.expectEqual(a11y_tree_mod.Role.tab, a11yOf(cx, tab_b).role);
 
-    // 初始：第 0 个选中
+    // initially: item 0 selected
     try std.testing.expect(a11yOf(cx, tab_a).state.selected);
     try std.testing.expect(!a11yOf(cx, tab_b).state.selected);
 
-    // 切到第 1 个，selected 必须跟着走（关键：不是 mount 冻结值）
-    // TabsState 通过 addDebugState 挂在 container 上（mount 里已登记）。
-    const state: *tabs_mod.TabsState = @ptrCast(@alignCast(
-        container.meta.ownership.debug_slots.state_ptrs[0].?,
-    ));
-    state.setActive(1);
-    tab_row.markRenderDirty();
+    // switch to item 1, selected must follow (key: not mount-frozen value)
+    current.set("b");
     cx.layout();
     _ = cx.render();
 
@@ -14922,11 +15405,38 @@ test "a11y: Tabs 每个 tab 有 role=tab，selected 跟随 active_index 切换" 
     try std.testing.expect(a11yOf(cx, tab_b).state.selected);
 }
 
+test "a11y: Modal / Sheet 在 a11y 树里是 role=dialog（此前挂在从不进树的 ol.content 上）" {
+    const modal_mod = @import("../components/modal/mod.zig");
+    const sheet_mod = @import("../components/sheet/mod.zig");
+    const Scope = @import("../reactive.zig").Scope;
+
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    cx.setViewport(800, 600);
+    const root = try box(cx, .{ .width = .{ .px = 800 }, .height = .{ .px = 600 } }, .{});
+    cx.root = root;
+    const scope = try Scope.init(std.testing.allocator, null, cx.owner);
+    defer scope.dispose();
+
+    const m = try modal_mod.Modal(.{ .title = "Delete file?", .open = true }).mount(scope, cx);
+    if (!m.portaled) try root.appendChild(std.testing.allocator, m.overlay);
+    const sh = try sheet_mod.Sheet(.{ .open = true }).mount(scope, cx);
+    if (!sh.portaled) try root.appendChild(std.testing.allocator, sh.overlay);
+    cx.layout();
+    _ = cx.render();
+
+    const dialog_node = cx.accessibility_tree.getNode(ui.ElementId.fromRaw(m.dialog.element_id_raw)).?;
+    try std.testing.expectEqual(a11y_tree_mod.Role.dialog, dialog_node.role);
+    try std.testing.expectEqualStrings("Delete file?", cx.a11y_label_buf.get(dialog_node.label_hash).?);
+    const panel = sh.overlay.children.items[0];
+    try std.testing.expectEqual(a11y_tree_mod.Role.dialog, cx.accessibility_tree.getNode(ui.ElementId.fromRaw(panel.element_id_raw)).?.role);
+}
+
 test "a11y: Accordion header 的 expanded 跟随展开/折叠（此前从不设置）" {
     const accordion_mod = @import("../components/accordion/mod.zig");
     const Scope = @import("../reactive.zig").Scope;
 
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(600, 400);
 
@@ -14936,7 +15446,8 @@ test "a11y: Accordion header 的 expanded 跟随展开/折叠（此前从不设�
     const scope = try Scope.init(std.testing.allocator, null, cx.owner);
     defer scope.dispose();
 
-    const res = try accordion_mod.AccordionItem(.{ .title = "Details" }).mount(scope, cx);
+    const open = try scope.createSignal(bool, false);
+    const res = try accordion_mod.AccordionItem(.{ .title = "Details", .expanded = open }).mount(scope, cx);
     try root.appendChild(std.testing.allocator, res.item);
     cx.layout();
     _ = cx.render();
@@ -14944,32 +15455,28 @@ test "a11y: Accordion header 的 expanded 跟随展开/折叠（此前从不设�
     const header = res.item.children.items[0];
     const eid = ui.ElementId.fromRaw(header.element_id_raw);
 
-    try std.testing.expectEqual(a11y_tree_mod.Role.button, cx.accessibility_tree.get(eid).?.role);
-    // 折叠态
-    try std.testing.expect(!cx.accessibility_tree.get(eid).?.state.expanded);
+    try std.testing.expectEqual(a11y_tree_mod.Role.button, cx.accessibility_tree.getNode(eid).?.role);
+    // collapsed state
+    try std.testing.expect(!cx.accessibility_tree.getNode(eid).?.state.expanded);
 
-    // 展开，a11y tree 必须跟上
-    // AccordionItemState 就是 header 的 event_context（mount 里已挂）。
-    const state: *accordion_mod.AccordionItemState = @ptrCast(@alignCast(
-        header.behavior.events.event_context.?,
-    ));
-    state.setExpanded(true);
+    // expand, a11y tree must follow
+    open.set(true);
     cx.layout();
     _ = cx.render();
-    try std.testing.expect(cx.accessibility_tree.get(eid).?.state.expanded);
+    try std.testing.expect(cx.accessibility_tree.getNode(eid).?.state.expanded);
 
-    // 再折叠回去
-    state.setExpanded(false);
+    // collapse again
+    open.set(false);
     cx.layout();
     _ = cx.render();
-    try std.testing.expect(!cx.accessibility_tree.get(eid).?.state.expanded);
+    try std.testing.expect(!cx.accessibility_tree.getNode(eid).?.state.expanded);
 }
 
 test "a11y: Alert 是 live region（否则 role=alert 永远不会被朗读）" {
     const alert_mod = @import("../components/alert/mod.zig");
     const Scope = @import("../reactive.zig").Scope;
 
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(600, 300);
 
@@ -14986,11 +15493,11 @@ test "a11y: Alert 是 live region（否则 role=alert 永远不会被朗读）" 
     cx.layout();
     _ = cx.render();
 
-    const err_node = cx.accessibility_tree.get(ui.ElementId.fromRaw(err.element_id_raw)).?;
-    const info_node = cx.accessibility_tree.get(ui.ElementId.fromRaw(info.element_id_raw)).?;
+    const err_node = cx.accessibility_tree.getNode(ui.ElementId.fromRaw(err.element_id_raw)).?;
+    const info_node = cx.accessibility_tree.getNode(ui.ElementId.fromRaw(info.element_id_raw)).?;
 
     try std.testing.expectEqual(a11y_tree_mod.Role.alert, err_node.role);
-    // 修复前这两条都是 .off，视觉上有提示，AT 侧完全静默。
+    // before fix, both .off; visual cues present, AT side completely silent
     try std.testing.expectEqual(a11y_tree_mod.LiveRegion.assertive, err_node.live);
     try std.testing.expectEqual(a11y_tree_mod.LiveRegion.polite, info_node.live);
 }
@@ -14999,7 +15506,7 @@ test "a11y: Progress 报出 role=progressbar + valuenow；不确定模式改报 
     const progress_mod = @import("../components/progress/mod.zig");
     const Scope = @import("../reactive.zig").Scope;
 
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(600, 300);
 
@@ -15016,13 +15523,13 @@ test "a11y: Progress 报出 role=progressbar + valuenow；不确定模式改报 
     cx.layout();
     _ = cx.render();
 
-    const d = cx.accessibility_tree.get(ui.ElementId.fromRaw(det.element_id_raw)).?;
+    const d = cx.accessibility_tree.getNode(ui.ElementId.fromRaw(det.element_id_raw)).?;
     try std.testing.expectEqual(a11y_tree_mod.Role.progressbar, d.role);
     try std.testing.expectEqual(@as(f32, 70), d.value_now);
     try std.testing.expectEqual(@as(f32, 100), d.value_max);
     try std.testing.expect(!d.state.busy);
 
-    const i = cx.accessibility_tree.get(ui.ElementId.fromRaw(indet.element_id_raw)).?;
+    const i = cx.accessibility_tree.getNode(ui.ElementId.fromRaw(indet.element_id_raw)).?;
     try std.testing.expectEqual(a11y_tree_mod.Role.progressbar, i.role);
     try std.testing.expect(i.state.busy);
 }
@@ -15031,7 +15538,7 @@ test "a11y: Tree 行是 treeitem，expanded/selected 跟随状态变化" {
     const tree_mod = @import("../components/tree/mod.zig");
     const Scope = @import("../reactive.zig").Scope;
 
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(600, 400);
 
@@ -15041,51 +15548,52 @@ test "a11y: Tree 行是 treeitem，expanded/selected 跟随状态变化" {
     const scope = try Scope.init(std.testing.allocator, null, cx.owner);
     defer scope.dispose();
 
-    const leaf = [_]tree_mod.TreeNodeData{.{ .id = "f", .label_text = "file.zig" }};
+    const leaf = [_]tree_mod.TreeNodeData{.{ .id = "f", .label = "file.zig" }};
     const nodes = [_]tree_mod.TreeNodeData{
-        .{ .id = "d", .label_text = "src", .children = &leaf },
+        .{ .id = "d", .label = "src", .children = &leaf },
     };
     const res = try tree_mod.Tree(.{ .nodes = &nodes }).mount(scope, cx);
+    const tree_state: *tree_mod.TreeState = @ptrCast(@alignCast(res.wrapper.meta.ownership.debug_slots.state_ptrs[0].?));
     try root.appendChild(std.testing.allocator, res.wrapper);
     cx.layout();
     _ = cx.render();
 
-    const dir_row = res.state.flat_node_rows[0].?;
+    const dir_row = tree_state.flat_node_rows[0].?;
     const dir_eid = ui.ElementId.fromRaw(dir_row.element_id_raw);
 
-    try std.testing.expectEqual(a11y_tree_mod.Role.tree, cx.accessibility_tree.get(
+    try std.testing.expectEqual(a11y_tree_mod.Role.tree, cx.accessibility_tree.getNode(
         ui.ElementId.fromRaw(res.wrapper.element_id_raw),
     ).?.role);
-    try std.testing.expectEqual(a11y_tree_mod.Role.treeitem, cx.accessibility_tree.get(dir_eid).?.role);
+    try std.testing.expectEqual(a11y_tree_mod.Role.treeitem, cx.accessibility_tree.getNode(dir_eid).?.role);
 
-    // 初始折叠 + 未选中
-    try std.testing.expect(!cx.accessibility_tree.get(dir_eid).?.state.expanded);
-    try std.testing.expect(!cx.accessibility_tree.get(dir_eid).?.state.selected);
+    // initially collapsed + unselected
+    try std.testing.expect(!cx.accessibility_tree.getNode(dir_eid).?.state.expanded);
+    try std.testing.expect(!cx.accessibility_tree.getNode(dir_eid).?.state.selected);
 
-    // 展开 -> a11y 必须跟上
-    res.state.toggleExpand(0);
+    // expand -> a11y must follow
+    tree_state.toggleExpand(0);
     cx.layout();
     _ = cx.render();
-    try std.testing.expect(cx.accessibility_tree.get(dir_eid).?.state.expanded);
+    try std.testing.expect(cx.accessibility_tree.getNode(dir_eid).?.state.expanded);
 
-    // 选中 -> selected 跟上（此前只有背景高亮这一个纯视觉信号）
-    res.state.selectNode(0);
+    // select -> selected follows (before only background highlight as pure visual signal)
+    tree_state.selectNode(0);
     cx.layout();
     _ = cx.render();
-    try std.testing.expect(cx.accessibility_tree.get(dir_eid).?.state.selected);
+    try std.testing.expect(cx.accessibility_tree.getNode(dir_eid).?.state.selected);
 
-    // 选到别的行时旧行必须被取消 selected
-    res.state.selectNode(1);
+    // when selecting different row, old row must lose selected
+    tree_state.selectNode(1);
     cx.layout();
     _ = cx.render();
-    try std.testing.expect(!cx.accessibility_tree.get(dir_eid).?.state.selected);
+    try std.testing.expect(!cx.accessibility_tree.getNode(dir_eid).?.state.selected);
 }
 
 test "a11y: Menu 有 role=menu，项是 menuitem 且 disabled 如实上报" {
     const menu_mod = @import("../components/menu/mod.zig");
     const Scope = @import("../reactive.zig").Scope;
 
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(600, 400);
 
@@ -15096,25 +15604,27 @@ test "a11y: Menu 有 role=menu，项是 menuitem 且 disabled 如实上报" {
     defer scope.dispose();
 
     const items = [_]menu_mod.MenuItem{
-        .{ .id = "cut", .label_text = "Cut" },
+        .{ .id = "cut", .label = "Cut" },
         .{ .id = "sep", .kind = .separator },
-        .{ .id = "paste", .label_text = "Paste", .disabled = true },
+        .{ .id = "paste", .label = "Paste", .disabled = true },
     };
     const res = try menu_mod.Menu(.{ .items = &items }).mount(scope, cx);
+    const menu_state: *menu_mod.MenuState = @ptrCast(@alignCast(res.wrapper.meta.ownership.debug_slots.state_ptrs[0].?));
     try root.appendChild(std.testing.allocator, res.wrapper);
-    res.state.is_open.set(true);
+    res.open.?.set(true);
     cx.layout();
     _ = cx.render();
 
-    const cut = cx.accessibility_tree.get(ui.ElementId.fromRaw(res.state.item_nodes[0].?.element_id_raw)).?;
+    const cut = cx.accessibility_tree.getNode(ui.ElementId.fromRaw(menu_state.item_nodes[0].?.element_id_raw)).?;
     try std.testing.expectEqual(a11y_tree_mod.Role.menuitem, cut.role);
     try std.testing.expect(!cut.state.disabled);
 
-    const sep = cx.accessibility_tree.get(ui.ElementId.fromRaw(res.state.item_nodes[1].?.element_id_raw)).?;
+    const sep = cx.accessibility_tree.getNode(ui.ElementId.fromRaw(menu_state.item_nodes[1].?.element_id_raw)).?;
     try std.testing.expectEqual(a11y_tree_mod.Role.separator, sep.role);
 
-    // 禁用项必须报 disabled，否则 AT 用户会反复尝试激活一个没反应的菜单项
-    const paste = cx.accessibility_tree.get(ui.ElementId.fromRaw(res.state.item_nodes[2].?.element_id_raw)).?;
+    // disabled items must report disabled, else AT users repeatedly try activating
+    // unresponsive menu item
+    const paste = cx.accessibility_tree.getNode(ui.ElementId.fromRaw(menu_state.item_nodes[2].?.element_id_raw)).?;
     try std.testing.expectEqual(a11y_tree_mod.Role.menuitem, paste.role);
     try std.testing.expect(paste.state.disabled);
 }
@@ -15123,7 +15633,7 @@ test "a11y: NumberStepper 是 spinbutton，value_now 跟随步进" {
     const ns_mod = @import("../components/number_stepper/mod.zig");
     const Scope = @import("../reactive.zig").Scope;
 
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 200);
 
@@ -15133,36 +15643,35 @@ test "a11y: NumberStepper 是 spinbutton，value_now 跟随步进" {
     const scope = try Scope.init(std.testing.allocator, null, cx.owner);
     defer scope.dispose();
 
-    const ns = try ns_mod.mountNumberStepper(.{ .value = 5, .min = 0, .max = 10, .step = 1 }, scope, cx);
+    const ns = try ns_mod.NumberStepper(.{ .value = 5, .min = 0, .max = 10, .step = 1 }).mount(scope, cx);
     try root.appendChild(std.testing.allocator, ns.wrapper);
     cx.layout();
     _ = cx.render();
 
     const eid = ui.ElementId.fromRaw(ns.wrapper.element_id_raw);
-    const n0 = cx.accessibility_tree.get(eid).?;
+    const n0 = cx.accessibility_tree.getNode(eid).?;
     try std.testing.expectEqual(a11y_tree_mod.Role.spinbutton, n0.role);
     try std.testing.expectEqual(@as(f32, 5), n0.value_now);
     try std.testing.expectEqual(@as(f32, 0), n0.value_min);
     try std.testing.expectEqual(@as(f32, 10), n0.value_max);
     try std.testing.expectEqual(@as(u8, 0b1100), a11y_bridge_extern.zenit_a11y_actions(a11y_bridge_extern.ANY, eid.raw()));
     try std.testing.expectEqual(@as(c_int, 1), a11y_bridge_extern.zenit_a11y_perform_action(a11y_bridge_extern.ANY, eid.raw(), 2));
-    try std.testing.expectEqual(@as(f64, 6), ns.state.value);
+    try std.testing.expectEqual(@as(f64, 6), ns.value.?.peek());
     try std.testing.expectEqual(@as(c_int, 1), a11y_bridge_extern.zenit_a11y_perform_action(a11y_bridge_extern.ANY, eid.raw(), 3));
-    try std.testing.expectEqual(@as(f64, 5), ns.state.value);
+    try std.testing.expectEqual(@as(f64, 5), ns.value.?.peek());
 
-    // 步进后 a11y 数值必须跟上（不是冻结在 mount 初值）
-    ns.state.increment();
-    ns.state.increment();
+    // after value change, a11y numbers must follow (not frozen to mount value)
+    ns.value.?.set(7);
     cx.layout();
     _ = cx.render();
-    try std.testing.expectEqual(@as(f32, 7), cx.accessibility_tree.get(eid).?.value_now);
+    try std.testing.expectEqual(@as(f32, 7), cx.accessibility_tree.getNode(eid).?.value_now);
 }
 
 test "a11y: Rate 是 slider，value_now 跟随点击但不被 hover 预览污染" {
     const rate_mod = @import("../components/rate/mod.zig");
     const Scope = @import("../reactive.zig").Scope;
 
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 200);
 
@@ -15178,31 +15687,30 @@ test "a11y: Rate 是 slider，value_now 跟随点击但不被 hover 预览污染
     _ = cx.render();
 
     const eid = ui.ElementId.fromRaw(res.wrapper.element_id_raw);
-    const n0 = cx.accessibility_tree.get(eid).?;
+    const n0 = cx.accessibility_tree.getNode(eid).?;
     try std.testing.expectEqual(a11y_tree_mod.Role.slider, n0.role);
     try std.testing.expectEqual(@as(f32, 2), n0.value_now);
     try std.testing.expectEqual(@as(f32, 5), n0.value_max);
 
-    res.state.setValue(4);
+    res.value.?.set(4);
     cx.layout();
     _ = cx.render();
-    try std.testing.expectEqual(@as(f32, 4), cx.accessibility_tree.get(eid).?.value_now);
+    try std.testing.expectEqual(@as(f32, 4), cx.accessibility_tree.getNode(eid).?.value_now);
 
-    // hover 预览是纯视觉的临时态，不能改 a11y 数值，否则 AT 用户会以为
-    // 鼠标扫过就已经改分了。
-    res.state.hover_value = 1;
-    res.state.is_hovering = true;
-    res.state.setValue(4); // 触发一次 updateDisplay（值没变）
+    // hover preview is pure visual temporary state, can't change a11y numbers, else AT
+    // users think hovering already changed score.
+    const first = res.wrapper.children.items[0];
+    _ = first.behavior.events.on_event.?(.{ .mouse_enter = {} }, first.behavior.events.event_context);
     cx.layout();
     _ = cx.render();
-    try std.testing.expectEqual(@as(f32, 4), cx.accessibility_tree.get(eid).?.value_now);
+    try std.testing.expectEqual(@as(f32, 4), cx.accessibility_tree.getNode(eid).?.value_now);
 }
 
 test "a11y: DataTable 是 grid，表头是 columnheader，空的复用行不进 a11y 树" {
     const dt_mod = @import("../components/data_table/mod.zig");
     const Scope = @import("../reactive.zig").Scope;
 
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(800, 500);
 
@@ -15216,49 +15724,50 @@ test "a11y: DataTable 是 grid，表头是 columnheader，空的复用行不进 
         .{ .id = "name", .header = "Name", .width = 160 },
         .{ .id = "size", .header = "Size", .width = 100 },
     };
-    // page_size=3 但只给 1 行数据 -> 另外 2 个复用行是空的
+    // page_size=3 but only 1 row data -> other 2 reused rows are empty
     const r0 = [_][]const u8{ "a.zig", "1K" };
     const rows = [_][]const []const u8{&r0};
-    const dt = try dt_mod.mountDataTable(.{
+    const dt = try dt_mod.DataTable(.{
         .columns = &cols,
         .rows = &rows,
         .page_size = 3,
-    }, scope, cx);
+    }).mount(scope, cx);
+    const dt_state: *dt_mod.DataTableState = @ptrCast(@alignCast(dt.wrapper.meta.ownership.debug_slots.state_ptrs[0].?));
     try root.appendChild(std.testing.allocator, dt.wrapper);
     cx.layout();
     _ = cx.render();
 
-    try std.testing.expectEqual(a11y_tree_mod.Role.grid, cx.accessibility_tree.get(
+    try std.testing.expectEqual(a11y_tree_mod.Role.grid, cx.accessibility_tree.getNode(
         ui.ElementId.fromRaw(dt.wrapper.element_id_raw),
     ).?.role);
 
-    // 表头必须是 columnheader，AT 才会在读数据格时带上列名
-    try std.testing.expectEqual(a11y_tree_mod.Role.columnheader, cx.accessibility_tree.get(
-        ui.ElementId.fromRaw(dt.state.header_cells[0].element_id_raw),
+    // headers must be columnheader so AT includes column names when reading cells
+    try std.testing.expectEqual(a11y_tree_mod.Role.columnheader, cx.accessibility_tree.getNode(
+        ui.ElementId.fromRaw(dt_state.header_cells[0].element_id_raw),
     ).?.role);
 
-    // 有数据的行 = row
-    try std.testing.expectEqual(a11y_tree_mod.Role.row, cx.accessibility_tree.get(
-        ui.ElementId.fromRaw(dt.state.row_nodes[0].element_id_raw),
+    // rows with data = row
+    try std.testing.expectEqual(a11y_tree_mod.Role.row, cx.accessibility_tree.getNode(
+        ui.ElementId.fromRaw(dt_state.row_nodes[0].element_id_raw),
     ).?.role);
 
     // Empty recycled rows retain parentage so their semantic cells cannot be
     // reparented to the grid, but the complete subtree is hidden from AT.
-    const empty_row = cx.accessibility_tree.get(
-        ui.ElementId.fromRaw(dt.state.row_nodes[1].element_id_raw),
+    const empty_row = cx.accessibility_tree.getNode(
+        ui.ElementId.fromRaw(dt_state.row_nodes[1].element_id_raw),
     ).?;
     try std.testing.expect(empty_row.state.hidden);
-    const empty_cell = dt.state.cell_text_nodes[2].parent.?;
-    try std.testing.expect(cx.accessibility_tree.get(
+    const empty_cell = dt_state.cell_text_nodes[2].parent.?;
+    try std.testing.expect(cx.accessibility_tree.getNode(
         ui.ElementId.fromRaw(empty_cell.element_id_raw),
     ).?.state.hidden);
 }
 
-test "a11y: DropdownMenu 键盘高亮更新 active_descendant（虚拟焦点）" {
-    const dd_mod = @import("../components/dropdown_menu/mod.zig");
+test "a11y: Menu 键盘高亮更新 active_descendant（虚拟焦点）" {
+    const menu_mod = @import("../components/menu/mod.zig");
     const Scope = @import("../reactive.zig").Scope;
 
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(600, 400);
 
@@ -15268,47 +15777,49 @@ test "a11y: DropdownMenu 键盘高亮更新 active_descendant（虚拟焦点）"
     const scope = try Scope.init(std.testing.allocator, null, cx.owner);
     defer scope.dispose();
 
-    const items = [_]dd_mod.DropdownItem{
-        .{ .id = "new", .label_text = "New File", .shortcut = "CmdN" },
+    const items = [_]menu_mod.MenuItem{
+        .{ .id = "new", .label = "New File", .shortcut = "CmdN" },
         .{ .kind = .separator },
-        .{ .id = "del", .label_text = "Delete", .disabled = true },
+        .{ .id = "del", .label = "Delete", .disabled = true },
     };
-    const res = try dd_mod.DropdownMenu(.{ .items = &items }).mount(scope, cx);
+    const res = try menu_mod.Menu(.{ .items = &items }).mount(scope, cx);
+    const menu_state: *menu_mod.MenuState = @ptrCast(@alignCast(res.wrapper.meta.ownership.debug_slots.state_ptrs[0].?));
     try root.appendChild(std.testing.allocator, res.wrapper);
-    res.state.is_open.set(true);
+    res.open.?.set(true);
     cx.layout();
     _ = cx.render();
 
-    const menu_eid = ui.ElementId.fromRaw(res.state.menu_node.?.element_id_raw);
-    try std.testing.expectEqual(a11y_tree_mod.Role.menu, cx.accessibility_tree.get(menu_eid).?.role);
+    const menu_eid = ui.ElementId.fromRaw(menu_state.menu_node.?.element_id_raw);
+    try std.testing.expectEqual(a11y_tree_mod.Role.menu, cx.accessibility_tree.getNode(menu_eid).?.role);
 
-    const item0 = res.state.item_nodes[0].?;
-    const del = res.state.item_nodes[2].?;
-    try std.testing.expectEqual(a11y_tree_mod.Role.menuitem, cx.accessibility_tree.get(
+    const item0 = menu_state.item_nodes[0].?;
+    const del = menu_state.item_nodes[2].?;
+    try std.testing.expectEqual(a11y_tree_mod.Role.menuitem, cx.accessibility_tree.getNode(
         ui.ElementId.fromRaw(item0.element_id_raw),
     ).?.role);
-    try std.testing.expect(cx.accessibility_tree.get(
+    try std.testing.expect(cx.accessibility_tree.getNode(
         ui.ElementId.fromRaw(del.element_id_raw),
     ).?.state.disabled);
-    try std.testing.expectEqual(a11y_tree_mod.Role.separator, cx.accessibility_tree.get(
-        ui.ElementId.fromRaw(res.state.item_nodes[1].?.element_id_raw),
+    try std.testing.expectEqual(a11y_tree_mod.Role.separator, cx.accessibility_tree.getNode(
+        ui.ElementId.fromRaw(menu_state.item_nodes[1].?.element_id_raw),
     ).?.role);
 
-    // 真实焦点停在容器上，只有 active_descendant 能说出"当前停在哪一项"
-    res.state.highlightIndex(0);
+    // real focus on container; only active_descendant conveys 'currently on which
+    // item'
+    menu_state.highlightIndex(0);
     cx.layout();
     _ = cx.render();
     try std.testing.expectEqual(
-        ui.ElementId.fromRaw(item0.element_id_raw),
-        cx.accessibility_tree.get(menu_eid).?.active_descendant,
+        a11y_tree_mod.AXId.node(ui.ElementId.fromRaw(item0.element_id_raw)),
+        cx.accessibility_tree.getNode(menu_eid).?.active_descendant,
     );
 
-    res.state.highlightIndex(2);
+    menu_state.highlightIndex(2);
     cx.layout();
     _ = cx.render();
     try std.testing.expectEqual(
-        ui.ElementId.fromRaw(del.element_id_raw),
-        cx.accessibility_tree.get(menu_eid).?.active_descendant,
+        a11y_tree_mod.AXId.node(ui.ElementId.fromRaw(del.element_id_raw)),
+        cx.accessibility_tree.getNode(menu_eid).?.active_descendant,
     );
 }
 
@@ -15316,7 +15827,7 @@ test "a11y: Breadcrumb 进得了 a11y 树（此前 role=.none 被整个丢弃）
     const bc_mod = @import("../components/breadcrumb/mod.zig");
     const Scope = @import("../reactive.zig").Scope;
 
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(600, 200);
 
@@ -15327,26 +15838,36 @@ test "a11y: Breadcrumb 进得了 a11y 树（此前 role=.none 被整个丢弃）
     defer scope.dispose();
 
     const items = [_]bc_mod.BreadcrumbItem{
-        .{ .id = "home", .label_text = "Home" },
-        .{ .id = "docs", .label_text = "Docs" },
-        .{ .id = "api", .label_text = "API" },
+        .{ .id = "home", .label = "Home" },
+        .{ .id = "docs", .label = "Docs" },
+        .{ .id = "api", .label = "API" },
     };
     const bc = try bc_mod.Breadcrumb(.{ .items = &items }).mount(scope, cx);
     try root.appendChild(std.testing.allocator, bc);
     cx.layout();
     _ = cx.render();
 
-    // 容器此前是 role=.none，投影层对 none + 不可 focus 直接丢弃，
-    // 整个 Breadcrumb 在 AT 侧根本不存在。
-    try std.testing.expectEqual(a11y_tree_mod.Role.navigation, cx.accessibility_tree.get(
+    // container was role=.none, projection discards none + non-focusable,
+    // whole Breadcrumb invisible to AT
+    try std.testing.expectEqual(a11y_tree_mod.Role.navigation, cx.accessibility_tree.getNode(
         ui.ElementId.fromRaw(bc.element_id_raw),
     ).?.role);
 
-    // children: item, sep, item, sep, item
-    const first = cx.accessibility_tree.get(ui.ElementId.fromRaw(bc.children.items[0].element_id_raw)).?;
-    const last = cx.accessibility_tree.get(ui.ElementId.fromRaw(bc.children.items[4].element_id_raw)).?;
+    // find levels by semantics (not internal nesting: each level is 'link +
+    // separator' row)
+    const Find = struct {
+        fn byText(n: *Node, content: []const u8) ?*Node {
+            if (n.getText()) |t| if (std.mem.eql(u8, t.content, content)) return n;
+            for (n.children.items) |c| if (byText(c, content)) |r| return r;
+            return null;
+        }
+    };
+    const first = cx.accessibility_tree.getNode(ui.ElementId.fromRaw(Find.byText(bc, "Home").?.element_id_raw)).?;
+    const last = cx.accessibility_tree.getNode(ui.ElementId.fromRaw(Find.byText(bc, "API").?.element_id_raw)).?;
+    // separators are decoration, don't enter a11y tree
+    try std.testing.expect(cx.accessibility_tree.getNode(ui.ElementId.fromRaw(Find.byText(bc, "/").?.element_id_raw)) == null);
 
-    // 前面几级是可点链接，最后一级是当前页（selected）
+    // earlier levels are clickable links, last level is current page (selected)
     try std.testing.expectEqual(a11y_tree_mod.Role.link, first.role);
     try std.testing.expect(!first.state.selected);
     try std.testing.expect(last.state.selected);
@@ -15356,7 +15877,7 @@ test "a11y: Steps 每步报出 selected/checked/disabled 三态" {
     const steps_mod = @import("../components/steps/mod.zig");
     const Scope = @import("../reactive.zig").Scope;
 
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(800, 300);
 
@@ -15371,24 +15892,25 @@ test "a11y: Steps 每步报出 selected/checked/disabled 三态" {
         .{ .title = "Build" },
         .{ .title = "Ship" },
     };
-    // current=1 -> 第 0 步已完成、第 1 步进行中、第 2 步未开始
-    const container = try steps_mod.Steps(.{ .items = &items, .initial_current = 1 })
+    // current=1 -> step 0 complete, step 1 in-progress, step 2 not started
+    const container = try steps_mod.Steps(.{ .items = &items, .current = 1 })
         .mount(scope, cx);
     try root.appendChild(std.testing.allocator, container);
     cx.layout();
     _ = cx.render();
 
-    try std.testing.expectEqual(a11y_tree_mod.Role.list, cx.accessibility_tree.get(
+    try std.testing.expectEqual(a11y_tree_mod.Role.list, cx.accessibility_tree.getNode(
         ui.ElementId.fromRaw(container.element_id_raw),
     ).?.role);
 
-    // 水平布局下 children 里除 step 列还有进度线，按 role 过滤出 step
+    // horizontal layout children include progress line besides steps; filter by role
+    // for steps
     var steps_found: usize = 0;
     var done = false;
     var active = false;
     var pending = false;
     for (container.children.items) |child| {
-        const n = cx.accessibility_tree.get(ui.ElementId.fromRaw(child.element_id_raw)) orelse continue;
+        const n = cx.accessibility_tree.getNode(ui.ElementId.fromRaw(child.element_id_raw)) orelse continue;
         if (n.role != .listitem) continue;
         switch (steps_found) {
             0 => done = n.state.checked and !n.state.selected,
@@ -15399,28 +15921,30 @@ test "a11y: Steps 每步报出 selected/checked/disabled 三态" {
         steps_found += 1;
     }
     try std.testing.expectEqual(@as(usize, 3), steps_found);
-    // 圆圈颜色是纯视觉信号，AT 只能靠这三个位区分"做完了/在这儿/还没到"
+    // circle color is pure visual, AT distinguishes 'done/current/not-reached' via
+    // these three flags
     try std.testing.expect(done);
     try std.testing.expect(active);
     try std.testing.expect(pending);
 }
 
-test "a11y: VirtualList 回收的 slot 退出 a11y 树" {
+test "a11y: VirtualList 作为语义集合暴露全部数据行，行身份不随池节点重绑定改变" {
     const vl_mod = @import("../components/virtual_list/mod.zig");
     const Scope = @import("../reactive.zig").Scope;
+    const AXId = a11y_tree_mod.AXId;
 
     const Render = struct {
         fn row(node: *Node, index: usize, c: *Cx) void {
             _ = index;
-            // 测试脚手架：VirtualList 的 render_row 回调签名返回 void，无法传播。
-            // testing.allocator 下真 OOM 会让测试失败，行数断言也会立刻发现。
+            // test scaffold: VirtualList render_row callback returns void, can't propagate.
+            // testing.allocator, real OOM fails test, row count assertion catches immediately.
             const label = box(c, .{}, .{}) catch return;
             label.setText(.{ .content = "row" });
             node.appendChild(c.allocator, label) catch {};
         }
     };
 
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 200);
 
@@ -15439,47 +15963,62 @@ test "a11y: VirtualList 回收的 slot 退出 a11y 树" {
     cx.layout();
     _ = cx.render();
 
-    try std.testing.expectEqual(a11y_tree_mod.Role.list, cx.accessibility_tree.get(
+    const tree = &cx.accessibility_tree;
+    const table = AXId.node(ui.ElementId.fromRaw(res.state.content_node.element_id_raw));
+    // outer container is scroll area, content node is table, exposes all data rows
+    // (not rendered dozen)
+    try std.testing.expectEqual(a11y_tree_mod.Role.scroll_area, tree.getNode(
         ui.ElementId.fromRaw(res.container.element_id_raw),
     ).?.role);
+    try std.testing.expectEqual(a11y_tree_mod.Role.grid, tree.get(table).?.role);
+    try std.testing.expectEqual(@as(usize, 1000), tree.childCount(table));
 
-    // 滚到很远处：原先绑定的 slot 全被回收再重绑到新的数据行。这一步是
-    // 关键，不滚动的话空闲 slot 从来没进过树，断言会变成空转。
-    // 先滚到中段让全部 slot 都被绑定过一轮，再滚到末尾（末尾可见行更少，
-    // 会有 slot 真正被释放）。只滚一次的话空闲 slot 是 growPool 出来的
-    // 全新节点，从来没带过 a11y，断言就成了空转。
+    const row3 = tree.childAt(table, 3).?;
+    const cell3 = tree.childAt(row3, 0).?;
+
+    // scroll to middle then end: all pool nodes rebind
     res.state.scroll_state.scroll_y = 4000;
     res.state.updateVisibleItems();
     cx.layout();
     _ = cx.render();
-
-    res.state.scroll_state.scroll_y = 1000 * 20 - 20;
+    res.state.scroll_state.scroll_y = 1000 * 20 - 100;
     res.state.updateVisibleItems();
     cx.layout();
     _ = cx.render();
 
-    // 绑定到真实数据行的 slot 在树里；未绑定的 slot 不在。
-    var bound_in_tree: usize = 0;
-    var unbound_in_tree: usize = 0;
+    // pool nodes never enter tree; bound row content under data item's cell
+    var bound: usize = 0;
     for (res.state.pool_nodes, res.state.pool_bindings) |node, binding| {
-        const present = cx.accessibility_tree.get(ui.ElementId.fromRaw(node.element_id_raw)) != null;
-        if (binding != null) {
-            if (present) bound_in_tree += 1;
-        } else {
-            // 空闲/被回收的 slot 必须不在树里，否则 AT 会读到一堆
-            // 已经滚出视口的旧行内容。
-            if (present) unbound_in_tree += 1;
-        }
+        try std.testing.expect(tree.getNode(ui.ElementId.fromRaw(node.element_id_raw)) == null);
+        const index = binding orelse continue;
+        bound += 1;
+        const row = tree.childAt(table, index).?;
+        const cell = tree.childAt(row, 0).?;
+        const label = node.children.items[0];
+        const label_node = tree.getNode(ui.ElementId.fromRaw(label.element_id_raw)).?;
+        try std.testing.expect(label_node.parent.eql(cell));
     }
-    try std.testing.expect(bound_in_tree > 0);
-    try std.testing.expectEqual(@as(usize, 0), unbound_in_tree);
+    try std.testing.expect(bound > 0);
+
+    // item 3's row and cell identity unchanged by scroll/rebind; unbound cell has
+    // synthesized text
+    try std.testing.expect(tree.childAt(table, 3).?.eql(row3));
+    try std.testing.expect(tree.childAt(row3, 0).?.eql(cell3));
+    try std.testing.expectEqual(AXId.Kind.cell_text, tree.childAt(cell3, 0).?.kind);
+
+    // data source changes: row identity rotates
+    vl_mod.updateItemCount(res.state, 10);
+    cx.layout();
+    _ = cx.render();
+    try std.testing.expect(tree.get(row3) == null);
+    try std.testing.expectEqual(@as(usize, 10), tree.childCount(table));
 }
 
 test "a11y: Timeline 项把 completed/active/pending 说出来（不只靠圆点颜色）" {
     const tl_mod = @import("../components/timeline/mod.zig");
     const Scope = @import("../reactive.zig").Scope;
 
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(600, 400);
 
@@ -15499,9 +16038,9 @@ test "a11y: Timeline 项把 completed/active/pending 说出来（不只靠圆点
     cx.layout();
     _ = cx.render();
 
-    const a0 = cx.accessibility_tree.get(ui.ElementId.fromRaw(tl.children.items[0].element_id_raw)).?;
-    const a1 = cx.accessibility_tree.get(ui.ElementId.fromRaw(tl.children.items[1].element_id_raw)).?;
-    const a2 = cx.accessibility_tree.get(ui.ElementId.fromRaw(tl.children.items[2].element_id_raw)).?;
+    const a0 = cx.accessibility_tree.getNode(ui.ElementId.fromRaw(tl.children.items[0].element_id_raw)).?;
+    const a1 = cx.accessibility_tree.getNode(ui.ElementId.fromRaw(tl.children.items[1].element_id_raw)).?;
+    const a2 = cx.accessibility_tree.getNode(ui.ElementId.fromRaw(tl.children.items[2].element_id_raw)).?;
 
     try std.testing.expectEqual(a11y_tree_mod.Role.listitem, a0.role);
     try std.testing.expect(a0.state.checked);
@@ -15513,7 +16052,7 @@ test "a11y: Skeleton 报 busy + live，AT 才知道内容在加载而不是页�
     const sk_mod = @import("../components/skeleton/mod.zig");
     const Scope = @import("../reactive.zig").Scope;
 
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 200);
 
@@ -15528,20 +16067,18 @@ test "a11y: Skeleton 报 busy + live，AT 才知道内容在加载而不是页�
     cx.layout();
     _ = cx.render();
 
-    const n = cx.accessibility_tree.get(ui.ElementId.fromRaw(sk.element_id_raw)).?;
+    const n = cx.accessibility_tree.getNode(ui.ElementId.fromRaw(sk.element_id_raw)).?;
     try std.testing.expectEqual(a11y_tree_mod.Role.status, n.role);
     try std.testing.expect(n.state.busy);
     try std.testing.expectEqual(a11y_tree_mod.LiveRegion.polite, n.live);
 }
 
-// ============================================================================
-// 2026-07-31 回调协议并轨：HandlerRef 带值通道
+// Callback protocol convergence: HandlerRef carries payload
 //
-// 背景：组件回调此前分两轨且不可互换，`?HandlerRef`（无参）与
-// `?*const fn (T, *anyopaque) void`（带值），实测 16 vs 17 对半分裂。
-// 直接把带值那组迁到无参 HandlerRef 会**静默丢 payload**：调用方照常
-// 编译、值没了。这组测试就是钉住"值不能丢"。
-// ============================================================================
+// Callbacks split into two incompatible tracks, `?HandlerRef` (no args) vs
+// `?*const fn (T, *anyopaque) void` (payload). Moving a payload callback to no-arg HandlerRef
+// silently DROPS THE PAYLOAD: the call site still compiles, the value disappears.
+// This suite nails down "values cannot be lost".
 
 test "HandlerRef: bool payload 能送达（不是静默丢值）" {
     const Sink = struct {
@@ -15581,7 +16118,8 @@ test "HandlerRef: string payload 能送达" {
 }
 
 test "HandlerRef: 无参 handler 收到带值触发时退化调用，不丢事件" {
-    // 组件可以无条件调 invokeWithBool/Str，不必关心调用方注册了哪种。
+    // components can unconditionally invoke withBool/Str, need not care which
+    // registered
     const Sink = struct {
         calls: u32 = 0,
         fn bump(self: *@This()) void {
@@ -15594,13 +16132,13 @@ test "HandlerRef: 无参 handler 收到带值触发时退化调用，不丢事�
     h.invokeWithBool(true);
     h.invokeWithStr("x");
     h.invoke();
-    // 三次都应到达，只是拿不到值，而不是被吞掉
+    // all three reach, just no value extraction, not swallowed
     try std.testing.expectEqual(@as(u32, 3), sink.calls);
 }
 
 test "HandlerRef: 类型不匹配的 payload 退化为无参而非误传" {
-    // bool handler 收到 string 触发（或反之）时，绝不能把另一种类型
-    // 的值强行塞进去，退化为无参兜底。
+    // bool handler receiving string trigger (or vice versa) must never force-fit
+    // other type, degrade to no-arg fallback
     const Sink = struct {
         bool_calls: u32 = 0,
         bare_calls: u32 = 0,
@@ -15612,10 +16150,10 @@ test "HandlerRef: 类型不匹配的 payload 退化为无参而非误传" {
     var sink = Sink{};
     const h = Cx.boolHandlerFrom(Sink, &sink, Sink.onBool);
 
-    h.invokeWithStr("not a bool"); // 走无参兜底（bare 会调 method(_, false)）
+    h.invokeWithStr("not a bool"); // uses no-arg fallback (bare calls method(_, false))
     try std.testing.expectEqual(@as(u32, 1), sink.bool_calls);
 
-    h.invokeWithBool(true); // 走正常带值通道
+    h.invokeWithBool(true); // uses normal payload channel
     try std.testing.expectEqual(@as(u32, 2), sink.bool_calls);
 }
 
@@ -15627,7 +16165,7 @@ test "HandlerRef: 既有无参用法零改动（54 处 invoke 调用点的合同
         }
     };
     var sink = Sink{};
-    // 老构造器 + 老调用方式，行为必须完全不变
+    // old constructor + old call style, behavior must be identical
     const h = Cx.handlerFrom(Sink, &sink, Sink.bump);
     try std.testing.expectEqual(@as(?ui.HandlerRef.PayloadCallback, null), h.payload_callback);
     h.invoke();
@@ -15639,7 +16177,7 @@ test "并轨端到端：Checkbox 点击后 on_change 收到真实新值" {
     const checkbox = @import("../components/checkbox/mod.zig");
     const Scope = @import("../reactive.zig").Scope;
 
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
 
@@ -15659,20 +16197,21 @@ test "并轨端到端：Checkbox 点击后 on_change 收到真实新值" {
     var sink = Sink{};
 
     const node = try checkbox.Checkbox(.{
-        .label_text = "Accept",
-        .on_change = Cx.boolHandlerFrom(Sink, &sink, Sink.onChange),
+        .label = "Accept",
+        .on_change = cx.on(Sink, &sink, Sink.onChange),
     }).mount(scope, cx);
     try root.appendChild(std.testing.allocator, node);
     cx.layout();
     _ = cx.render();
 
-    // 走真实事件派发（比直接调 state.toggle 更接近用户路径）
+    // use real event dispatch (closer to user path than direct state.toggle)
     const rect = node.rectFromWorldOrFallback();
     const px = rect.x + rect.w / 2;
     const py = rect.y + rect.h / 2;
     _ = cx.dispatcher.dispatch(ui.Event{ .click = .{ .x = px, .y = py } }, node);
 
-    // 关键：不只是"被调用了"，而是**新值真的送到了**（并轨最容易丢的东西）
+    // key: not just 'called', but **new value truly delivered** (merge's easiest
+    // loss point)
     try std.testing.expectEqual(@as(u32, 1), sink.calls);
     try std.testing.expect(sink.last);
 
@@ -15685,7 +16224,7 @@ test "overlay 关闭后焦点恢复到触发控件（previous_focus 此前写了
     const overlay_mod = @import("../overlay_stack.zig");
     const Scope = @import("../reactive.zig").Scope;
 
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
 
@@ -15694,7 +16233,7 @@ test "overlay 关闭后焦点恢复到触发控件（previous_focus 此前写了
     const scope = try Scope.init(std.testing.allocator, null, cx.owner);
     defer scope.dispose();
 
-    // 触发控件：打开 overlay 前它持有焦点
+    // trigger: holds focus before opening overlay
     const trigger = try box(cx, .{ .width = .{ .px = 80 }, .height = .{ .px = 24 } }, .{});
     trigger.behavior.interaction.focusable = true;
     try root.appendChild(std.testing.allocator, trigger);
@@ -15706,14 +16245,14 @@ test "overlay 关闭后焦点恢复到触发控件（previous_focus 此前写了
 
     std.debug.print("\n[DBG] trigger={*}\n", .{trigger});
     std.debug.print("[DBG] pending={any}\n", .{cx.overlay_stack.pending_focus_restore});
-    // 打开一个 overlay（focus.restore 默认 true）
+    // open overlay (focus.restore default true)
     const res = try overlay_mod.overlay(scope, cx, .{
         .kind = .modal,
         .enter_transition = .none,
         .exit_transition = .none,
         .focus = .{ .restore = true },
     });
-    // 模拟 overlay 内部控件取走焦点
+    // simulate overlay-internal control taking focus
     const inner = try box(cx, .{ .width = .{ .px = 40 }, .height = .{ .px = 20 } }, .{});
     inner.behavior.interaction.focusable = true;
     try res.content.appendChild(std.testing.allocator, inner);
@@ -15722,20 +16261,20 @@ test "overlay 关闭后焦点恢复到触发控件（previous_focus 此前写了
     cx.focus_manager.setFocus(inner);
     try std.testing.expect(cx.focus_manager.current_focus != trigger);
 
-    // 关闭 overlay -> 焦点必须回到 trigger
+    // close overlay -> focus must return to trigger
     cx.overlay_stack.commitExit(res.handle);
     _ = cx.render();
 
     try std.testing.expectEqual(@as(?*ui.Node, trigger), cx.focus_manager.current_focus);
 }
 
-// === 拖放 drop target ===
+// === drag-drop drop target ===
 
 const DropProbe = struct {
     enters: u32 = 0,
     leaves: u32 = 0,
     drops: u32 = 0,
-    last_paths: [256]u8 = [_]u8{0} ** 256,
+    last_paths: [256]u8 = @as([256]u8, @splat(0)),
     last_paths_len: usize = 0,
 
     fn onEnter(self: *DropProbe) void {
@@ -15755,10 +16294,10 @@ const DropProbe = struct {
     }
 };
 
-// 挂了 drop handler 的普通 box 必须能被 pointer 命中，
-// 否则 handleDrag 永远命不中它（同 on_scroll 的老坑）。
+// plain box with drop handler must hit pointer,
+// else handleDrag never reaches it (same old on_scroll trap).
 test "Cx: drop target 收到 entered + dropped(paths)" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(300, 200);
 
@@ -15782,10 +16321,10 @@ test "Cx: drop target 收到 entered + dropped(paths)" {
     try std.testing.expectEqualStrings("/tmp/a.png\n/tmp/b.png", probe.pathsSlice());
 }
 
-// 下游回归：drop 回调必须能拿到落点坐标（按落点摆放文件的画布场景）。
-// 同时锁住降级合同：string 版 handler 仍只拿 paths（上一个测试）。
+// downstream regression: drop callback must get drop coords (canvas drop-place
+// scenario). lock degradation: string handler still gets only paths (previous test).
 test "Cx: drop payload 版 handler 收到落点坐标" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(300, 200);
 
@@ -15829,9 +16368,10 @@ test "Cx: drop payload 版 handler 收到落点坐标" {
     try std.testing.expect(probe.untrusted);
 }
 
-// 平台只在窗口边界给 entered/exited；节点级进出必须由 updated 位置流合成。
+// platform only gives entered/exited at window boundary; node-level enter/exit
+// from position stream
 test "Cx: 拖过两个 drop target 时合成节点级 enter/leave" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(300, 200);
 
@@ -15852,35 +16392,36 @@ test "Cx: 拖过两个 drop target 时合成节点级 enter/leave" {
     cx.root = root;
     cx.layout();
 
-    // 进入左侧
+    // enter left
     cx.handleDrag(50, 50, 0, "");
     try std.testing.expectEqual(@as(u32, 1), left_probe.enters);
     try std.testing.expectEqual(@as(u32, 0), right_probe.enters);
 
-    // 同一目标内移动：不重复 enter
+    // move within same target: no duplicate enter
     cx.handleDrag(60, 50, 1, "");
     try std.testing.expectEqual(@as(u32, 1), left_probe.enters);
     try std.testing.expectEqual(@as(u32, 0), left_probe.leaves);
 
-    // 移到右侧：左 leave + 右 enter
+    // move to right: left leave + right enter
     cx.handleDrag(150, 50, 1, "");
     try std.testing.expectEqual(@as(u32, 1), left_probe.leaves);
     try std.testing.expectEqual(@as(u32, 1), right_probe.enters);
 
-    // 拖出窗口：右侧收到 leave
+    // drag out window: right receives leave
     cx.handleDrag(0, 0, 2, "");
     try std.testing.expectEqual(@as(u32, 1), right_probe.leaves);
     try std.testing.expect(cx.drag_hover_handle == null);
 }
 
-// ═════ 下游回归：同帧双 "backdrop_blur + rounded_clip 同节点" 内容进错作用域 ═════
+// ═════ downstream regression: same-frame dual 'backdrop_blur + rounded_clip same
+// node' content wrong scope ═════
 
-/// 校验 lowered paint 命令流里：每个岛的独特色内容命令必须
-///  1. 落在**自己**的 begin_blur_layer(glass_owner_id=岛) .. 配对 end_blur_layer 之间；
-///  2. 坐标落在紧随其后的 begin_rounded_clip 的 src 帧内（owner-local）。
-///     rounded_clip layer 的纹理覆盖 src 矩形，encoder offscreenOffset =
-///     -(src 原点)；内容若以 world 坐标 emit（下游回归），会整体
-///     画出纹理外 -> 合成回来是空的（第二个岛的 world x 远超 src.w，必失败）。
+/// Verify lowered paint stream: each island's unique-color content must
+///   1. fall within its **own** begin_blur_layer(glass_owner_id=island) .. paired end_blur_layer;
+///   2. have coords within the following begin_rounded_clip's src frame (owner-local).
+///     rounded_clip layer texture covers the src rect, encoder offscreenOffset = -(src origin);
+///     content emitted in world coords draws outside the texture -> composite empty
+///     (second island's world x exceeds src.w, must fail).
 fn expectIslandContentScoped(
     commands: []const ui.paint_table.DisplayItem,
     island_id: u32,
@@ -15923,7 +16464,7 @@ fn expectIslandContentScoped(
     try std.testing.expect(content_index != null);
     try std.testing.expect(content_index.? > blur_start.?);
     try std.testing.expect(content_index.? < blur_end.?);
-    // 内容坐标帧断言：必须整体落在 rclip surface 的 src 矩形内
+    // content frame assertion: must stay within rclip surface's src rect
     const src = rclip_src.?;
     const g = commands[content_index.?].geom;
     try std.testing.expect(g.x >= src.x - 0.5);
@@ -15933,7 +16474,7 @@ fn expectIslandContentScoped(
 }
 
 test "render: 同帧两个 blur+rounded_clip 岛，各自内容落在自己的 effect 作用域（下游回归）" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(800, 400);
 
@@ -15946,7 +16487,8 @@ test "render: 同帧两个 blur+rounded_clip 岛，各自内容落在自己的 e
         .padding = Padding.all(10),
     }, .{});
 
-    // 两个岛：blur + overflow_hidden + corner_radius 同节点（下游应用 islandCard 原始形态）
+    // two islands: blur + overflow_hidden + corner_radius same node (downstream
+    // islandCard original)
     var islands: [2]*Node = undefined;
     const content_reds = [2]u8{ 201, 202 };
     for (0..2) |k| {
@@ -15965,9 +16507,10 @@ test "render: 同帧两个 blur+rounded_clip 岛，各自内容落在自己的 e
             .background = Color.rgba(content_reds[k], 64, 64, 255),
         }, .{});
         try island.appendChild(cx.allocator, content);
-        // 自带 clip 的子行：把岛内容切成多个 (effect_id, clip_id) group，
-        // 复现下游应用 sidebar 的"每行一个 clip"形态，早先 lowering 每组
-        // 整链 close+reopen effect scope，blur 背板被重画 N 次糊掉前面组。
+        // child rows with clip: split island content into (effect_id, clip_id) groups,
+        // reproduce downstream sidebar 'one clip per row' shape; prior lowering
+        // closed+reopened effect scope per group, blur backplate redrawn N times, smudged
+        // prior groups.
         const clipped_row = try box(cx, .{
             .width = .{ .px = 200 },
             .height = .{ .px = 30 },
@@ -15982,15 +16525,16 @@ test "render: 同帧两个 blur+rounded_clip 岛，各自内容落在自己的 e
 
     cx.root = root;
 
-    // 帧 1：全 fresh
+    // Frame 1: full fresh
     cx.layout();
     _ = cx.render();
     {
         const commands = cx.lowerForEncoderPaintTable();
         try expectIslandContentScoped(commands, islands[0].id, content_reds[0]);
         try expectIslandContentScoped(commands, islands[1].id, content_reds[1]);
-        // 前缀保留断言：每个岛的 begin_blur_layer 恰好一次（encoder 端
-        // begin_blur = 立即合成玻璃背板，多于一次即背板糊内容）。
+        // prefix-retained assertion: each island's begin_blur_layer exactly once
+        // (encoder-side begin_blur = immediately composite glass backplate; more than
+        // once = smudges).
         var blur_begins: usize = 0;
         for (commands) |cmd| {
             if (cmd.isControl(.begin_blur_layer)) blur_begins += 1;
@@ -15998,7 +16542,8 @@ test "render: 同帧两个 blur+rounded_clip 岛，各自内容落在自己的 e
         try std.testing.expectEqual(@as(usize, 2), blur_begins);
     }
 
-    // 帧 2：只脏第一个岛（第二个岛走缓存/replay 路径，docs/12 嫌疑路径）
+    // Frame 2: only first island dirty (second island cache/replay path, docs/12
+    // suspect)
     islands[0].children.items[0].markRenderDirty();
     cx.layout();
     _ = cx.render();
@@ -16008,7 +16553,7 @@ test "render: 同帧两个 blur+rounded_clip 岛，各自内容落在自己的 e
         try expectIslandContentScoped(commands, islands[1].id, content_reds[1]);
     }
 
-    // 帧 3：全净帧
+    // Frame 3: fully clean
     cx.layout();
     _ = cx.render();
     {
@@ -16019,7 +16564,7 @@ test "render: 同帧两个 blur+rounded_clip 岛，各自内容落在自己的 e
 }
 
 test "render: blur 叶节点带（header 毛玻璃）跨帧保持在后画兄弟内容之前（下游应用 header 回归）" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(800, 200);
 
@@ -16029,7 +16574,7 @@ test "render: blur 叶节点带（header 毛玻璃）跨帧保持在后画兄弟
         .background = Color.rgba(240, 240, 235, 255),
     }, .{});
 
-    // 通铺毛玻璃带：blur 叶节点（无子节点），树序在前
+    // continuous blur band: blur leaf node (no children), tree order first
     const band = try box(cx, .{
         .position = .absolute,
         .width = .{ .grow = .{} },
@@ -16037,8 +16582,9 @@ test "render: blur 叶节点带（header 毛玻璃）跨帧保持在后画兄弟
         .background = Color.rgba(255, 255, 255, 144),
     }, .{});
     (try band.style.ensureExtFallible(cx.allocator)).glass = .{ .backdrop_blur = 24, .glass_intensity = 0 };
-    // 嵌套 progressive blur：内层纯玻璃子节点（无 bg/渐变 -> 零常规 item，
-    // 依赖占位 item 携带 effect；下游应用 header 双层毛玻璃形态）
+    // nested progressive blur: inner pure-glass child (no bg/gradient -> zero
+    // normal items, depends placeholder item carrying effect; downstream header
+    // dual-blur).
     const heavy = try box(cx, .{
         .width = .{ .grow = .{} },
         .height = .{ .px = 48 },
@@ -16047,7 +16593,7 @@ test "render: blur 叶节点带（header 毛玻璃）跨帧保持在后画兄弟
     try band.appendChild(cx.allocator, heavy);
     try root.appendChild(cx.allocator, band);
 
-    // header 内容：树序在后，必须画在带之上
+    // header content: tree order last, must draw atop band
     const header = try box(cx, .{
         .position = .absolute,
         .width = .{ .grow = .{} },
@@ -16081,54 +16627,55 @@ test "render: blur 叶节点带（header 毛玻璃）跨帧保持在后画兄弟
                 if (cmd.isFillRect() and cmd.color.r == 203 and cmd.color.a == 255) badge_index = i;
             }
             try std.testing.expect(band_begin != null);
-            // 无 content 的纯玻璃子节点必须靠占位 item 让 begin_blur 发射
+            // contentless pure-glass child must use placeholder item to emit begin_blur
             try std.testing.expect(heavy_begin != null);
             try std.testing.expect(badge_index != null);
-            // header 内容必须排在两层玻璃合成之后（即画在其上）
+            // header content must order after dual-glass composite (draw atop)
             try std.testing.expect(badge_index.? > band_begin.?);
             try std.testing.expect(badge_index.? > heavy_begin.?);
         }
     }.check;
 
-    // 帧 1：全 fresh
+    // Frame 1: full fresh
     cx.layout();
     _ = cx.render();
     try expectBandBeforeHeader(cx.lowerForEncoderPaintTable(), band.id, heavy.id);
 
-    // 帧 2：只脏 header（band 走跨帧 clean 路径，嫌疑路径）
+    // Frame 2: only header dirty (band cross-frame clean path, suspect)
     badge.markRenderDirty();
     cx.layout();
     _ = cx.render();
     try expectBandBeforeHeader(cx.lowerForEncoderPaintTable(), band.id, heavy.id);
 
-    // 帧 3：只脏 band
+    // Frame 3: only band dirty
     band.markRenderDirty();
     cx.layout();
     _ = cx.render();
     try expectBandBeforeHeader(cx.lowerForEncoderPaintTable(), band.id, heavy.id);
 
-    // 帧 4：全净
+    // Frame 4: fully clean
     cx.layout();
     _ = cx.render();
     try expectBandBeforeHeader(cx.lowerForEncoderPaintTable(), band.id, heavy.id);
 
-    // 帧 5：脏 root 背景（band/header 都 clean、祖先重录，另一条嫌疑路径）
+    // Frame 5: root background dirty (band/header both clean, ancestor rerecord,
+    // another suspect)
     root.markRenderDirty();
     cx.layout();
     _ = cx.render();
     try expectBandBeforeHeader(cx.lowerForEncoderPaintTable(), band.id, heavy.id);
 }
 
-// ── BulkQuad：Node 路径 vs 批量路径的一致性 ────────────────────────────
+// -- BulkQuad: Node path vs bulk path consistency --
 //
-// 这组测试是 `BulkQuad` 像素等价承诺的守卫。批量路径的全部意义是"省掉
-// per-node 开销、但画出**完全一样**的东西"，一旦 lower 出的 display item
-// 与 Node 路径产生任何参数差异，缩放临界点上就会出现肉眼可见的跳变
-// （颜色/圆角/描边宽度突变）。所以这里逐字段对照，而不是只看数量。
+// Guards `BulkQuad`'s pixel-equivalence promise: the bulk path exists to avoid per-node cost while
+// drawing **identical** results. If lowered display items differ from the Node path in any param,
+// zoom cutoff points show visible jumps (color/radius/stroke). So compare element by element,
+// not just counts.
 
-/// 取出 display list 里第一个 fill_rect 的几何+样式（忽略 header：
-/// Node 路径把位置放在 transform 里，批量路径放在 x/y 里，两者本就不同构，
-/// 真正要对齐的是**最终落到 SDF 管线的那组参数**）。
+/// extract first fill_rect's geom+style from display list (skip header: Node
+/// path puts position in transform, bulk in x/y, intrinsically different; align
+/// **final SDF-pipeline params**).
 fn firstFillRect(cx: *Cx) ?struct { w: f32, h: f32, color: Color, radius: [4]f32 } {
     for (cx.display_list.items.items) |it| {
         switch (it) {
@@ -16153,8 +16700,8 @@ test "BulkQuad: 填充参数与 Node 路径逐字段一致" {
     const fill = Color.hex(0x4A90D9);
     const radius: f32 = 6;
 
-    // A) Node 路径
-    var cx_node = try Cx.init(std.testing.allocator);
+    // A) Node path
+    var cx_node = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx_node.deinit();
     cx_node.setViewport(800, 600);
     const root = try ui.box(cx_node, .{
@@ -16177,8 +16724,8 @@ test "BulkQuad: 填充参数与 Node 路径逐字段一致" {
     _ = cx_node.render();
     const node_rect = firstFillRect(cx_node) orelse return error.TestExpectedFillRect;
 
-    // B) 批量路径：同样的矩形
-    var cx_bulk = try Cx.init(std.testing.allocator);
+    // B) bulk path: same rect
+    var cx_bulk = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx_bulk.deinit();
     cx_bulk.setViewport(800, 600);
     const empty_root = try ui.box(cx_bulk, .{
@@ -16212,7 +16759,7 @@ test "BulkQuad: 描边参数与 Node 路径逐字段一致" {
     const border = Color.rgba(23, 23, 27, 36);
     const bw: f32 = 1.0;
 
-    var cx_node = try Cx.init(std.testing.allocator);
+    var cx_node = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx_node.deinit();
     cx_node.setViewport(800, 600);
     const root = try ui.box(cx_node, .{
@@ -16234,7 +16781,7 @@ test "BulkQuad: 描边参数与 Node 路径逐字段一致" {
     _ = cx_node.render();
     const node_stroke = firstStrokeRect(cx_node) orelse return error.TestExpectedStrokeRect;
 
-    var cx_bulk = try Cx.init(std.testing.allocator);
+    var cx_bulk = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx_bulk.deinit();
     cx_bulk.setViewport(800, 600);
     const empty_root = try ui.box(cx_bulk, .{
@@ -16264,7 +16811,7 @@ test "BulkQuad: 描边参数与 Node 路径逐字段一致" {
 }
 
 test "BulkQuad: alpha=0 不产生 fill_rect（只描边）" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
     const root = try ui.box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
@@ -16288,15 +16835,16 @@ test "BulkQuad: alpha=0 不产生 fill_rect（只描边）" {
         .stroke_rect => strokes += 1,
         else => {},
     };
-    // root 自身背景是 TRANSPARENT ⇒ 不发 fill_rect；批量项 alpha=0 同样不发。
+    // root background TRANSPARENT ⇒ no fill_rect; bulk item alpha=0 same.
     try std.testing.expectEqual(@as(usize, 0), fills);
     try std.testing.expectEqual(@as(usize, 1), strokes);
 }
 
-// 宿主（下游应用）用逐字段哈希给批量层算内容版本号，版本不变 ⇒ 不重画。
-// 新字段若没进哈希，改了效果画面**静默不刷新**。下游应用侧有 comptime 字段数
-// 断言守着"别忘了加"，但那只保证有人来改，不保证改对，这里守语义：
-// 新字段的任何变化都必须改变 lower 出来的 DisplayItem。
+// Host (downstream) uses a per-field hash for the bulk layer content version; unchanged -> no
+// redraw.
+// A new field that skips the hash **silently never refreshes**. Downstream has a comptime
+// field-count assert, but it only guarantees someone changes the hash, not correctly. Guard
+// semantics here: any new field change must alter the lowered DisplayItem.
 test "BulkQuad: 新增外观字段全部影响 lower 结果（防版本号静默失效）" {
     const Case = struct { name: []const u8, q: ui.BulkQuad };
     const base = ui.BulkQuad{
@@ -16326,7 +16874,7 @@ test "BulkQuad: 新增外观字段全部影响 lower 结果（防版本号静默
 
     var counts: [cases.len]usize = undefined;
     for (cases, 0..) |c, i| {
-        var cx = try Cx.init(std.testing.allocator);
+        var cx = try Cx.init(std.testing.allocator, std.testing.io);
         defer cx.deinit();
         cx.setViewport(400, 300);
         const root = try ui.box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
@@ -16336,19 +16884,21 @@ test "BulkQuad: 新增外观字段全部影响 lower 结果（防版本号静默
         _ = cx.render();
         counts[i] = cx.display_list.items.items.len;
     }
-    // base 之外的每种都必须多产出至少一个 item（阴影/分边/内阴影各占一个）
+    // each type beyond base must produce at least one extra item
+    // (shadow/edge/inner-shadow each)
     for (counts[1..], cases[1..]) |n, c| {
         if (n <= counts[0] and !std.mem.eql(u8, c.name, "shadow blur 变化")) {
             std.debug.print("字段 {s} 没有影响 lower 结果\n", .{c.name});
             return error.FieldNotLowered;
         }
     }
-    // blur 值变化不改 item 数，但必须改字段值，单独验
+    // blur value change doesn't change item count, but must change field value,
+    // verify separately
     try std.testing.expectEqual(counts[1], counts[2]);
 }
 
 test "BulkQuad: 渐变降为 multi_gradient_rect，且不再发纯色 fill" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
     const root = try ui.box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
@@ -16362,7 +16912,7 @@ test "BulkQuad: 渐变降为 multi_gradient_rect，且不再发纯色 fill" {
         .y = 10,
         .w = 50,
         .h = 50,
-        .color = Color.hex(0x00FF00), // 给了渐变 ⇒ 这个纯色应被忽略
+        .color = Color.hex(0x00FF00), // gradient given ⇒ this solid ignored
         .gradient = g,
         .gradient_center = .{ 0.25, 0.75 },
     }});
@@ -16385,12 +16935,12 @@ test "BulkQuad: 渐变降为 multi_gradient_rect，且不再发纯色 fill" {
         else => {},
     };
     try std.testing.expectEqual(@as(usize, 1), grads);
-    // 给了渐变就**不得**再发纯色，否则纯色画在渐变之后会盖住它
+    // gradient given ⇒ **don't** emit solid, else solid after gradient covers it
     try std.testing.expectEqual(@as(usize, 0), fills);
 }
 
 test "BulkQuad: 少于两个 stop 的渐变不画（一个 stop 就是纯色）" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
     const root = try ui.box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
@@ -16414,7 +16964,7 @@ test "BulkQuad: 少于两个 stop 的渐变不画（一个 stop 就是纯色）"
 }
 
 test "BulkQuad: shadow 降为 shadow_rect 且排在 fill 之前" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
     const root = try ui.box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
@@ -16440,7 +16990,7 @@ test "BulkQuad: shadow 降为 shadow_rect 且排在 fill 之前" {
                 try std.testing.expectEqual(@as(f32, 8), s.blur);
                 try std.testing.expectEqual(@as(f32, 1), s.offset_x);
                 try std.testing.expectEqual(@as(f32, 2), s.offset_y);
-                // 圆角必须透传，否则阴影是直角矩形、四角露出方块
+                // radius must pass through, else shadow is rect, corners show blocks
                 try std.testing.expectEqual(@as(f32, 4), s.radius[0]);
             }
         },
@@ -16451,12 +17001,12 @@ test "BulkQuad: shadow 降为 shadow_rect 且排在 fill 之前" {
     };
     try std.testing.expect(shadow_at != null);
     try std.testing.expect(fill_at != null);
-    // 投影必须先画，否则会盖住对象本体
+    // shadow must draw first, else covers object
     try std.testing.expect(shadow_at.? < fill_at.?);
 }
 
 test "BulkQuad: border_widths 非零走 border_per_side，忽略 border_width" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
     const root = try ui.box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
@@ -16467,7 +17017,7 @@ test "BulkQuad: border_widths 非零走 border_per_side，忽略 border_width" {
         .w = 50,
         .h = 50,
         .color = Color.hex(0x00FF00),
-        .border_width = 99, // 应被忽略
+        .border_width = 99, // should be ignored
         .border_color = Color.hex(0xFF0000),
         .border_widths = .{ 1, 2, 3, 4 },
     }});
@@ -16486,12 +17036,12 @@ test "BulkQuad: border_widths 非零走 border_per_side，忽略 border_width" {
         else => {},
     };
     try std.testing.expectEqual(@as(usize, 1), per_side);
-    // 分边生效时不得再发统一描边（否则描两遍）
+    // with edge active, don't emit unified stroke (else double-stroke)
     try std.testing.expectEqual(@as(usize, 0), strokes);
 }
 
 test "BulkQuad: inset_shadow 排在 fill 之后且不重复画底色" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
     const root = try ui.box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
@@ -16516,7 +17066,8 @@ test "BulkQuad: inset_shadow 排在 fill 之后且不重复画底色" {
         .inset_shadow_rect => |s| {
             if (inset_at == null) {
                 inset_at = i;
-                // 底色已由 fill_rect 画过；这里再画一次会让半透明填充叠深
+                // base color already drawn by fill_rect; re-drawing here makes semi-transparent
+                // fill darker
                 try std.testing.expectEqual(@as(u8, 0), s.fill.a);
                 try std.testing.expectEqual(@as(u8, 80), s.shadow_color.a);
             }
@@ -16529,7 +17080,7 @@ test "BulkQuad: inset_shadow 排在 fill 之后且不重复画底色" {
 }
 
 test "BulkQuad: setBulkQuads 传空切片关闭该层" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
     const root = try ui.box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
@@ -16554,7 +17105,7 @@ test "BulkQuad: setBulkQuads 传空切片关闭该层" {
 }
 
 test "BulkQuad: 提交顺序即绘制顺序（后者盖前者）" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
     const root = try ui.box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
@@ -16576,36 +17127,38 @@ test "BulkQuad: 提交顺序即绘制顺序（后者盖前者）" {
         else => {},
     };
     try std.testing.expectEqual(@as(usize, 2), i);
-    // 数组顺序 = display list 顺序 = 绘制顺序
+    // array order = display list order = draw order
     try std.testing.expectEqual(@as(u8, 0xFF), seen[0].r);
     try std.testing.expectEqual(@as(u8, 0xFF), seen[1].g);
 }
 
-// ── BulkQuad 层级/裁剪回归 ──────────────────────────────────────────────
+// -- BulkQuad layering/clipping regression --
 //
-// 复现的 bug：批量层曾无条件 append 在整棵 Node 树之后、且不进 clip 栈，
-// 于是两万个画布矩形盖住了侧栏 / inspector / 工具栏，并溢出画布视口。
-// 这组测试搭一个和真实宿主同构的 shell（画布容器 + 其后的 chrome 兄弟），
-// 断言 display list 里**每个 chrome item 都排在所有 bulk quad 之后**，
-// 且 bulk quad 带着画布的 clip_id。
+// Bug: the bulk layer was unconditionally appended after the entire Node tree, outside the clip
+// stack; twenty thousand canvas rects covered sidebar / inspector / toolbar and spilled beyond the
+// canvas viewport. This group builds a shell isomorphic to the real host (canvas container +
+// following chrome siblings) and asserts **every chrome display item orders after all bulk quads**
+// and bulk quads carry the canvas clip_id.
 
 const BulkShell = struct {
     cx: *Cx,
     canvas: *ui.Node,
-    /// chrome 节点 id（侧栏 / inspector / 工具栏）
+    /// chrome node ids (sidebar / inspector / toolbar)
     chrome_ids: [3]u32,
 };
 
-/// 画布全窗打底 + 三个 chrome 兄弟压在其上（下游应用的 compose 结构）。
+/// canvas full-window base + three chrome siblings atop (downstream compose
+/// structure).
 fn buildBulkShell(allocator: std.mem.Allocator) !BulkShell {
-    var cx = try Cx.init(allocator);
+    var cx = try Cx.init(allocator, std.testing.io);
     cx.setViewport(1200, 800);
     const root = try ui.box(cx, .{
         .width = .{ .px = 1200 },
         .height = .{ .px = 800 },
     }, .{});
 
-    // 画布容器：overflow_hidden ⇒ 建立 clip，批量层必须受它约束
+    // canvas container: overflow_hidden ⇒ establishes clip, bulk layer must be
+    // constrained
     const canvas = try ui.box(cx, .{
         .position = .absolute,
         .width = .{ .px = 900 },
@@ -16615,7 +17168,7 @@ fn buildBulkShell(allocator: std.mem.Allocator) !BulkShell {
     }, .{});
     try root.appendChild(cx.allocator, canvas);
 
-    // chrome：在画布之后 append ⇒ 必须盖在画布内容（含批量层）之上
+    // chrome: appended after canvas ⇒ must cover canvas content (including bulk)
     var chrome_ids: [3]u32 = undefined;
     const chrome_colors = [_]u24{ 0x111111, 0x222222, 0x333333 };
     for (chrome_colors, 0..) |c, idx| {
@@ -16632,15 +17185,16 @@ fn buildBulkShell(allocator: std.mem.Allocator) !BulkShell {
     return .{ .cx = cx, .canvas = canvas, .chrome_ids = chrome_ids };
 }
 
-/// 铺一批画布对象。scale 模拟缩放档：6% 时对象又多又小，正是复现档。
+/// lay canvas objects; scale simulates zoom level: 6% makes many small, exactly
+/// reproduction
 fn bulkQuadsForScale(buf: *std.ArrayListUnmanaged(ui.BulkQuad), allocator: std.mem.Allocator, scale: f32) !void {
     buf.clearRetainingCapacity();
     var i: usize = 0;
     while (i < 400) : (i += 1) {
         const fi: f32 = @floatFromInt(i);
         try buf.append(allocator, .{
-            // 刻意让一部分落到画布矩形之外（chrome 区域 / 视口外），
-            // 未裁剪的旧实现会把它们画到 UI 上。
+            // intentionally place some outside canvas rect (chrome area / out of viewport),
+            // unclamped old impl draws them onto UI.
             .x = (fi * 37.0) * scale - 100.0,
             .y = (fi * 19.0) * scale - 60.0,
             .w = @max(1.0, 80.0 * scale),
@@ -16653,7 +17207,7 @@ fn bulkQuadsForScale(buf: *std.ArrayListUnmanaged(ui.BulkQuad), allocator: std.m
     }
 }
 
-/// 返回 (最后一个 bulk quad 的下标, 第一个 chrome item 的下标)。
+/// return (last bulk quad index, first chrome item index)
 fn bulkVsChromeOrder(cx: *Cx, canvas_id: u32, chrome_ids: []const u32) struct {
     last_bulk: ?usize,
     first_chrome: ?usize,
@@ -16693,7 +17247,7 @@ fn expectBulkUnderChrome(scale: f32) !void {
     var shell = try buildBulkShell(allocator);
     defer shell.cx.deinit();
 
-    var quads: std.ArrayListUnmanaged(ui.BulkQuad) = .{};
+    var quads: std.ArrayListUnmanaged(ui.BulkQuad) = .empty;
     defer quads.deinit(allocator);
     try bulkQuadsForScale(&quads, allocator, scale);
 
@@ -16703,16 +17257,16 @@ fn expectBulkUnderChrome(scale: f32) !void {
 
     const ord = bulkVsChromeOrder(shell.cx, shell.canvas.id, &shell.chrome_ids);
 
-    // 批量层确实产出了 item（否则下面的断言会真空通过）
+    // bulk layer truly produces items (else below assertions pass vacuously)
     try std.testing.expect(ord.bulk_count > 0);
     const last_bulk = ord.last_bulk orelse return error.TestExpectedBulkQuads;
     const first_chrome = ord.first_chrome orelse return error.TestExpectedChromeItems;
 
-    // ① 层级：所有 chrome 都排在批量层之后 ⇒ chrome 盖住画布内容。
-    //    旧实现里批量层 append 在最后，这一条必然失败。
+    // ① layering: all chrome order after bulk ⇒ chrome covers canvas.
+    //    old impl: bulk appends last, this must fail.
     try std.testing.expect(last_bulk < first_chrome);
 
-    // ② 裁剪：每个 bulk quad 都带画布的 clip，不会溢出到 UI 区域。
+    // ② clipping: each bulk quad carries canvas clip, won't spill to UI area.
     try std.testing.expectEqual(@as(usize, 0), ord.unclipped_bulk);
 }
 
@@ -16721,17 +17275,17 @@ test "BulkQuad: 挂靠画布后 UI chrome 盖在批量层之上（scale≈1）" 
 }
 
 test "BulkQuad: 挂靠画布后 UI chrome 盖在批量层之上（6% 缩放档）" {
-    // MIN_SCALE=0.05 附近：用户报告的复现缩放档
+    // MIN_SCALE≈0.05: user-reported reproduction zoom
     try expectBulkUnderChrome(0.06);
 }
 
 test "BulkQuad: 挂靠时带上画布 clip_id，不挂靠时保持旧的无裁剪行为" {
     const allocator = std.testing.allocator;
 
-    // A) 挂靠 ⇒ 有 clip
+    // A) anchored ⇒ has clip
     var shell = try buildBulkShell(allocator);
     defer shell.cx.deinit();
-    var quads: std.ArrayListUnmanaged(ui.BulkQuad) = .{};
+    var quads: std.ArrayListUnmanaged(ui.BulkQuad) = .empty;
     defer quads.deinit(allocator);
     try bulkQuadsForScale(&quads, allocator, 0.06);
     try shell.cx.setBulkQuads(shell.canvas, quads.items);
@@ -16741,7 +17295,7 @@ test "BulkQuad: 挂靠时带上画布 clip_id，不挂靠时保持旧的无裁�
     try std.testing.expect(anchored.bulk_count > 0);
     try std.testing.expectEqual(@as(usize, 0), anchored.unclipped_bulk);
 
-    // B) 不挂靠 ⇒ 退化为旧行为：node_id=0、无 clip、排在所有 chrome 之后
+    // B) not anchored ⇒ degrades to old: node_id=0, no clip, after all chrome
     var shell2 = try buildBulkShell(allocator);
     defer shell2.cx.deinit();
     try shell2.cx.setBulkQuads(null, quads.items);
@@ -16771,25 +17325,26 @@ test "BulkQuad: 挂靠时带上画布 clip_id，不挂靠时保持旧的无裁�
     }
 }
 
-// ── BulkQuad：锚点子树无 display item 时的插入点回归 ────────────────────
+// BulkQuad: anchor subtree insert point when it has no display items
 //
-// 复现的 bug（"缩小视图下批量层时而闪烁消失"）：
-// bulkAnchorInsertPoint 只按"锚点子树**已产出的** display item"定位插入点。
-// 画布容器自身无背景、且该帧所有对象都降级成批量层/block LOD（缩小到全部
-// 对象可见时正是这一档）⇒ 锚点子树在 display list 里一个 item 都没有 ⇒
-// 函数返回 null ⇒ 调用方把 null 当作"追加到末尾 + 不裁剪"，批量层重新跑到
-// 所有 chrome 之后。于是缩小档下画面时而正常（画布里还剩个别 Node 对象）、
-// 时而整片盖住 UI（全降级帧），表现就是间歇性闪烁。
+// Bug ("shrunk view batch layer flickers invisible intermittently"): bulkAnchorInsertPoint locates
+// the insert point only from display items ALREADY PRODUCED by the anchor subtree. A canvas
+// container
+// with no background of its own, with all objects downgraded to batch layer/block LOD (a shrunk
+// viewport), produces zero anchor-subtree display items => returns null => caller treats null as
+// "append to end + no clip", so the batch layer re-runs after all chrome. The shrunk view is
+// sometimes correct (canvas has a stray Node), sometimes fully covered (all downgraded):
+// an intermittent flicker.
 fn buildEmptyCanvasBulkShell(allocator: std.mem.Allocator) !BulkShell {
-    var cx = try Cx.init(allocator);
+    var cx = try Cx.init(allocator, std.testing.io);
     cx.setViewport(1200, 800);
     const root = try ui.box(cx, .{
         .width = .{ .px = 1200 },
         .height = .{ .px = 800 },
     }, .{});
 
-    // 画布容器：与 buildBulkShell 唯一的差别是**不设 background**，因此自身
-    // 不产出 fill_rect。全对象降级帧里它的子树就是空的。
+    // canvas container: only difference from buildBulkShell is **no background**, so
+    // no fill_rect. all-degraded frame: its subtree empty.
     const canvas = try ui.box(cx, .{
         .position = .absolute,
         .width = .{ .px = 900 },
@@ -16819,7 +17374,7 @@ test "BulkQuad: 锚点子树无 display item 时仍排在 chrome 之下且带 cl
     var shell = try buildEmptyCanvasBulkShell(allocator);
     defer shell.cx.deinit();
 
-    var quads: std.ArrayListUnmanaged(ui.BulkQuad) = .{};
+    var quads: std.ArrayListUnmanaged(ui.BulkQuad) = .empty;
     defer quads.deinit(allocator);
     try bulkQuadsForScale(&quads, allocator, 0.06);
 
@@ -16832,24 +17387,25 @@ test "BulkQuad: 锚点子树无 display item 时仍排在 chrome 之下且带 cl
     const last_bulk = ord.last_bulk orelse return error.TestExpectedBulkQuads;
     const first_chrome = ord.first_chrome orelse return error.TestExpectedChromeItems;
 
-    // 层级：即使锚点子树空，批量层也必须落在 chrome 之前。
+    // layering: even with empty anchor subtree, bulk must order before chrome.
     try std.testing.expect(last_bulk < first_chrome);
-    // 裁剪：仍然带画布 clip。
+    // clipping: still carries canvas clip.
     try std.testing.expectEqual(@as(usize, 0), ord.unclipped_bulk);
 }
 
-// ── BulkQuad：画布内交互叠加必须盖在批量层之上 ──────────────────────────
+// BulkQuad: canvas interaction overlay must layer above batch quad
 //
-// 复现的 bug（有截图）：选中对象后，白色 resize handles 和蓝底 "320 × 200"
-// 尺寸标签被批量 quad 压住，只透出局部。原因是这些叠加节点是**画布 Node 的
-// 子节点**（下游应用 compose.zig：sel_outline z=31500 / size_pill z=31600 /
-// handles z=32000），而批量层按"锚点子树最后一个 item 之后"定位 ⇒ 排到了
-// 叠加之后。修复：setBulkQuadsEx 传 overlay_z_threshold 声明叠加层起点。
+// Bug: after selection, white resize handles and the blue "320 x 200" size label were buried under
+// the batch quad. These overlay nodes are children of the canvas Node (downstream compose.zig:
+// sel_outline z=31500 / size_pill z=31600 / handles z=32000), while the batch layer positions after
+// "last item of anchor subtree", i.e. above the overlay. setBulkQuadsEx passes overlay_z_threshold
+// to declare where the overlay layer starts.
 const bulk_overlay_z: i16 = 31000;
 
-/// 画布容器 + 画布内交互叠加（高 z_index 的 handles/尺寸标签）+ 其后的 chrome。
+/// canvas container + canvas-internal interaction overlay (high-z_index
+/// handles/labels) + following chrome.
 fn buildOverlayBulkShell(allocator: std.mem.Allocator, out_overlay: *[2]u32) !BulkShell {
-    var cx = try Cx.init(allocator);
+    var cx = try Cx.init(allocator, std.testing.io);
     cx.setViewport(1200, 800);
     const root = try ui.box(cx, .{
         .width = .{ .px = 1200 },
@@ -16865,7 +17421,7 @@ fn buildOverlayBulkShell(allocator: std.mem.Allocator, out_overlay: *[2]u32) !Bu
     }, .{});
     try root.appendChild(cx.allocator, canvas);
 
-    // 画布内的交互叠加：一个 resize handle + 一个尺寸标签胶囊。
+    // canvas-internal overlay: one resize handle + one size label capsule.
     const handle = try ui.box(cx, .{
         .position = .absolute,
         .width = .{ .px = 8 },
@@ -16908,7 +17464,7 @@ test "BulkQuad: 画布内交互叠加(handles/尺寸标签)盖在批量层之上
     var shell = try buildOverlayBulkShell(allocator, &overlay_ids);
     defer shell.cx.deinit();
 
-    var quads: std.ArrayListUnmanaged(ui.BulkQuad) = .{};
+    var quads: std.ArrayListUnmanaged(ui.BulkQuad) = .empty;
     defer quads.deinit(allocator);
     try bulkQuadsForScale(&quads, allocator, 0.06);
 
@@ -16946,48 +17502,33 @@ test "BulkQuad: 画布内交互叠加(handles/尺寸标签)盖在批量层之上
     const fo = first_overlay orelse return error.TestExpectedOverlayItems;
     const fc = first_chrome orelse return error.TestExpectedChromeItems;
 
-    // ① 交互叠加盖在批量层之上（截图里的 bug：这条会失败）。
+    // ① Interaction layer overlays bulk layer (screenshot bug: this fails).
     try std.testing.expect(lb < fo);
-    // ② chrome 仍在最上。
+    // ② chrome stays on top.
     try std.testing.expect(lb < fc);
-    // ③ 批量层仍受画布裁剪。
+    // ③ Bulk layer still clipped by canvas.
     try std.testing.expectEqual(@as(usize, 0), unclipped);
 }
 
-// ── BulkQuad：间歇性丢层的真正根因 ─────────────────────────────────────
-//
-// 用户症状：缩到 7% 以下画布整片消失，几个对象糊在 UI chrome 之上；点一下
-// 恢复，再点几下又没。此前两轮修复（空锚点子树回退、交互叠加阈值）都没根治。
-//
-// 根因：`bulkAnchorInsertPoint` 的三级定位**全部**依赖扫描 display list 找
-// 参照物，而扫描只认 `fill_rect` / `stroke_rect` / `text_run` 三种 item,
-// DisplayItem 一共 25 种。下游应用画布之后的 chrome 恰恰大量由被忽略的种类
-// 绘制：毛玻璃带走 `begin_blur_layer`、点阵/图标走 `image_quad` /
-// `icon_rep`、岛卡片走 `shadow_rect` / `gradient_rect`，而 `edge_wrap` /
-// `panels_wrap` / `side_slot` 这些 wrapper 本身无背景、不产任何 item。
-//
-// 于是全 LOD 降级帧（缩到 <7%，锚点子树无 item ⇒ ① 落空）+ 无选择态
-// （交互叠加消失 ⇒ ② 落空）时，③ 也扫不到任何"锚点之后"的参照物 ⇒ 返回
-// null ⇒ 调用方 `at_tail` 语义把整批 quad 追加到 display list 末尾且
-// `clip_id = INVALID_ID` ⇒ 既越过全部 chrome 又不裁剪。这就是截图里
-// "对象糊在 UI 之上"，也解释了点击的开关效应：选中对象让叠加重新产出
-// item，② 命中，画面恢复；点空白清空选择，② 再次落空，画面又坏。
-//
-// 下面这组测试构造 "锚点子树无 item × 有/无交互叠加 × chrome 只用
-// 非扫描种类绘制" 的矩阵，是前两轮测试漏掉的洞：它们的 chrome 一律用
-// 带 background 的 box（产 fill_rect），③ 总能得救，所以全绿却没发现问题。
+// -- BulkQuad: intermittent layer loss root cause --
+// Symptom: canvas vanishes when scaled below 7%; objects blur over UI chrome.
+// Root cause: bulkAnchorInsertPoint scans the display list for references but only recognizes
+// fill_rect/stroke_rect/text_run (3 of 25 DisplayItem types); chrome after the canvas may use
+// begin_blur_layer, image_quad/icon_rep, shadow_rect/gradient_rect, or wrappers with no items.
+// No items in anchor subtree + no interaction layer -> no reference -> null -> at_tail appends
+// with clip_id=INVALID_ID, bypassing chrome unclipped. Tests cover that matrix.
 
-/// 画布之后的 chrome **只用被插入点扫描忽略的 item 种类**绘制（image_quad），
-/// 复刻下游应用真实结构：wrapper 无背景、内容是毛玻璃/图标/阴影。
+/// Chrome post-canvas uses only unscanned item types (image_quad), mimicking real structure:
+/// wrappers have no background, content is glass/icons/shadows.
 fn buildGlassChromeBulkShell(allocator: std.mem.Allocator, out_chrome: *[2]u32) !BulkShell {
-    var cx = try Cx.init(allocator);
+    var cx = try Cx.init(allocator, std.testing.io);
     cx.setViewport(1200, 800);
     const root = try ui.box(cx, .{
         .width = .{ .px = 1200 },
         .height = .{ .px = 800 },
     }, .{});
 
-    // 画布容器：无 background ⇒ 自身不产 item；全对象降级时子树为空。
+    // Canvas container: no background => produces no item; subtree empty when all objects degrade.
     const canvas = try ui.box(cx, .{
         .position = .absolute,
         .width = .{ .px = 900 },
@@ -16996,7 +17537,7 @@ fn buildGlassChromeBulkShell(allocator: std.mem.Allocator, out_chrome: *[2]u32) 
     }, .{});
     try root.appendChild(cx.allocator, canvas);
 
-    // chrome：无背景的 wrapper + 图片内容（image_quad，不被扫描认出）。
+    // chrome: no-background wrapper + image content (image_quad, unrecognized by scan).
     var chrome_ids: [2]u32 = undefined;
     for (0..2) |idx| {
         const wrap = try ui.box(cx, .{
@@ -17017,7 +17558,7 @@ fn buildGlassChromeBulkShell(allocator: std.mem.Allocator, out_chrome: *[2]u32) 
     return .{ .cx = cx, .canvas = canvas, .chrome_ids = .{ chrome_ids[0], chrome_ids[1], chrome_ids[1] } };
 }
 
-/// 统计批量 quad 与 chrome（image_quad）的相对次序 + 逃逸裁剪数。
+/// Count relative order of bulk quad and chrome (image_quad) + unclipped count.
 fn bulkVsGlassChrome(cx: *Cx, canvas_id: u32, chrome_ids: []const u32) struct {
     bulk_count: usize,
     last_bulk: ?usize,
@@ -17036,7 +17577,7 @@ fn bulkVsGlassChrome(cx: *Cx, canvas_id: u32, chrome_ids: []const u32) struct {
                     .stroke_rect => |v| v.header,
                     else => unreachable,
                 };
-                // 批量 quad：修好后 node_id=画布；回归形态是 node_id=0 无 clip。
+                // Bulk quad: after fix node_id=canvas; regression form is node_id=0 no clip.
                 if (h.node_id == canvas_id or
                     (h.node_id == 0 and h.clip_id == display_list.INVALID_ID))
                 {
@@ -17067,11 +17608,11 @@ test "BulkQuad: 锚点子树无 item + 无选择 + chrome 只产 image_quad ⇒ 
     var shell = try buildGlassChromeBulkShell(allocator, &chrome_ids);
     defer shell.cx.deinit();
 
-    var quads: std.ArrayListUnmanaged(ui.BulkQuad) = .{};
+    var quads: std.ArrayListUnmanaged(ui.BulkQuad) = .empty;
     defer quads.deinit(allocator);
     try bulkQuadsForScale(&quads, allocator, 0.06);
 
-    // 无选择态：不传叠加阈值也没有叠加节点 ⇒ ①②③ 全落空的那一帧。
+    // No selection: no overlay threshold, no overlay node => frame where ①②③ all fail.
     try shell.cx.setBulkQuadsEx(shell.canvas, quads.items, bulk_overlay_z);
     shell.cx.layout();
     _ = shell.cx.render();
@@ -17079,9 +17620,8 @@ test "BulkQuad: 锚点子树无 item + 无选择 + chrome 只产 image_quad ⇒ 
     const ord = bulkVsGlassChrome(shell.cx, shell.canvas.id, &chrome_ids);
     const fc = ord.first_chrome orelse return error.TestExpectedChromeItems;
 
-    // 修复前：insert_at=null ⇒ 追加末尾 + 不裁剪，这两条都失败。
-    // 修复后：要么正确插在 chrome 之前且带 clip，要么这一帧干脆不画
-    //（安全降级），但**绝不允许**画在 chrome 之上。
+    // Before fix: insert_at=null => append to end unclipped; both fail. After fix: either correctly
+    // insert pre-chrome with clip, or skip this frame (safe degrade), but never draw over chrome.
     if (ord.last_bulk) |lb| {
         try std.testing.expect(lb < fc);
         try std.testing.expectEqual(@as(usize, 0), ord.unclipped_bulk);
@@ -17091,12 +17631,12 @@ test "BulkQuad: 锚点子树无 item + 无选择 + chrome 只产 image_quad ⇒ 
 test "BulkQuad: 选择态开关不改变层级（点击恢复/再点又坏 的确定性复现）" {
     const allocator = std.testing.allocator;
 
-    // A) 无选择：画布子树空、无叠加。
+    // A) No selection: canvas subtree empty, no overlay.
     {
         var chrome_ids: [2]u32 = undefined;
         var shell = try buildGlassChromeBulkShell(allocator, &chrome_ids);
         defer shell.cx.deinit();
-        var quads: std.ArrayListUnmanaged(ui.BulkQuad) = .{};
+        var quads: std.ArrayListUnmanaged(ui.BulkQuad) = .empty;
         defer quads.deinit(allocator);
         try bulkQuadsForScale(&quads, allocator, 0.06);
         try shell.cx.setBulkQuadsEx(shell.canvas, quads.items, bulk_overlay_z);
@@ -17110,7 +17650,7 @@ test "BulkQuad: 选择态开关不改变层级（点击恢复/再点又坏 的�
         }
     }
 
-    // B) 有选择：同一棵树 + 一个交互叠加节点（选中后出现的 handle）。
+    // B) With selection: same tree + one interaction overlay node (handle appearing on select).
     {
         var chrome_ids: [2]u32 = undefined;
         var shell = try buildGlassChromeBulkShell(allocator, &chrome_ids);
@@ -17124,7 +17664,7 @@ test "BulkQuad: 选择态开关不改变层级（点击恢复/再点又坏 的�
         handle.setStyle(shell.cx.allocator, .z_index, @as(i16, 32000));
         try shell.canvas.appendChild(shell.cx.allocator, handle);
 
-        var quads: std.ArrayListUnmanaged(ui.BulkQuad) = .{};
+        var quads: std.ArrayListUnmanaged(ui.BulkQuad) = .empty;
         defer quads.deinit(allocator);
         try bulkQuadsForScale(&quads, allocator, 0.06);
         try shell.cx.setBulkQuadsEx(shell.canvas, quads.items, bulk_overlay_z);
@@ -17142,16 +17682,16 @@ test "BulkQuad: 选择态开关不改变层级（点击恢复/再点又坏 的�
 test "BulkQuad: 找不到插入点时宁可不画,也不得追加到末尾且不裁剪" {
     const allocator = std.testing.allocator;
 
-    // 画布是 root 的**最后**一个孩子：锚点之后没有任何兄弟，子树也没 item。
-    // 三级定位必然全落空，这是 null 语义的纯净样本。
-    var cx = try Cx.init(allocator);
+    // Canvas is root's last child: no siblings post-anchor, subtree has no items. Three-level
+    // positioning inevitably all fail; pure null-semantic example.
+    var cx = try Cx.init(allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(1200, 800);
     const root = try ui.box(cx, .{
         .width = .{ .px = 1200 },
         .height = .{ .px = 800 },
     }, .{});
-    // chrome 在前（画布之后无兄弟）
+    // chrome first (no siblings post-canvas)
     const panel = try ui.box(cx, .{
         .position = .absolute,
         .width = .{ .px = 240 },
@@ -17168,15 +17708,15 @@ test "BulkQuad: 找不到插入点时宁可不画,也不得追加到末尾且不
     try root.appendChild(cx.allocator, canvas);
     cx.root = root;
 
-    var quads: std.ArrayListUnmanaged(ui.BulkQuad) = .{};
+    var quads: std.ArrayListUnmanaged(ui.BulkQuad) = .empty;
     defer quads.deinit(allocator);
     try bulkQuadsForScale(&quads, allocator, 0.06);
     try cx.setBulkQuadsEx(canvas, quads.items, bulk_overlay_z);
     cx.layout();
     _ = cx.render();
 
-    // 关键断言：批量 quad 若被画出来，必须带画布 clip；绝不允许出现
-    // "node_id=0 / clip=INVALID_ID" 的裸追加形态（那就是糊住 UI 的元凶）。
+    // Critical assertion: bulk quad if drawn must have canvas clip; never allow bare-append form
+    // (node_id=0 / clip=INVALID_ID) that blurs UI.
     var naked: usize = 0;
     for (cx.display_list.items.items) |it| {
         const h: display_list.ItemHeader = switch (it) {
@@ -17189,22 +17729,14 @@ test "BulkQuad: 找不到插入点时宁可不画,也不得追加到末尾且不
     try std.testing.expectEqual(@as(usize, 0), naked);
 }
 
-// ── BulkQuad：锚点子树销毁后必须自动关层（use-after-free 回归）─────────
-//
-// 复现的真实 crash（下游应用，EXC_BAD_ACCESS / SIGSEGV，栈顶 core.Cx.render）：
-// 下游应用的 goHome -> teardownChromeScreen 把整棵 board chrome 子树（含
-// canvas_host）detach + free，但**没有**重新提交批量层；而 applySnapshot 在
-// homepage 屏第一行就 `if (g_chrome_root == null) return` 早退，于是再也没有
-// 提交点。cx.bulk_quads_anchor 继续指向已释放的 canvas_host，并且 bulk_quads
-// 按 retained 语义跨帧保留 ⇒ 下一帧 appendBulkQuads 解引用 `anchor.id`
-// （core.zig 的 `self.scene_runtime.get(anchor.id)`）⇒ 读未映射地址。
-//
-// 修复：invalidateReferencesToEx 把锚点纳入失效清理，连同 quads 一起清掉。
-// 修复前本测试在 anchor.id 处读已释放内存（Debug 下 testing.allocator 的
-// 0xaa 毒化 + GPA use-after-free 检测会直接报错）。
+// -- BulkQuad: must close layer after anchor subtree destruction --
+// Crash (EXC_BAD_ACCESS in core.Cx.render): host frees the chrome subtree without resubmitting;
+// cx.bulk_quads_anchor still points at the freed node and bulk_quads persist across frames, so
+// appendBulkQuads would deref freed anchor.id; invalidateReferencesToEx clears anchor and quads
+// together.
 test "BulkQuad: 锚点子树被销毁后自动关层，render 不得解引用悬垂锚点" {
     const allocator = std.testing.allocator;
-    var cx = try Cx.init(allocator);
+    var cx = try Cx.init(allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(1200, 800);
 
@@ -17214,7 +17746,7 @@ test "BulkQuad: 锚点子树被销毁后自动关层，render 不得解引用悬
     }, .{});
     cx.root = root;
 
-    // 画布子树，相当于下游应用的 canvas_host，稍后整棵销毁。
+    // Canvas subtree (equivalent to downstream canvas_host), destroyed later.
     const canvas = try ui.box(cx, .{
         .position = .absolute,
         .width = .{ .px = 900 },
@@ -17223,7 +17755,7 @@ test "BulkQuad: 锚点子树被销毁后自动关层，render 不得解引用悬
     }, .{});
     try root.appendChild(cx.allocator, canvas);
 
-    var quads: std.ArrayListUnmanaged(ui.BulkQuad) = .{};
+    var quads: std.ArrayListUnmanaged(ui.BulkQuad) = .empty;
     defer quads.deinit(allocator);
     try bulkQuadsForScale(&quads, allocator, 0.06);
     try cx.setBulkQuadsEx(canvas, quads.items, bulk_overlay_z);
@@ -17231,16 +17763,16 @@ test "BulkQuad: 锚点子树被销毁后自动关层，render 不得解引用悬
     _ = cx.render();
     try std.testing.expect(cx.bulk_quads.items.len > 0);
 
-    // 下游应用 teardownChromeScreen 的等价动作：摘树 + 释放，**不**重新提交批量层。
+    // Equivalent to downstream teardownChromeScreen: detach + free, do NOT resubmit bulk layer.
     cx.detachChild(root, canvas);
     cx.freeNode(canvas);
 
-    // 锚点必须已被清空，否则下面这帧就是 use-after-free。
+    // Anchor must be cleared, else this frame is UAF.
     try std.testing.expect(cx.bulk_quads_anchor == null);
-    // 关层而不是退化成 null-anchor 的"追加末尾 + 不裁剪"。
+    // Close layer, not degrade to null-anchor's 'append + unclipped'.
     try std.testing.expectEqual(@as(usize, 0), cx.bulk_quads.items.len);
 
-    // homepage 屏继续出帧：不得崩，也不得画出裸批量 quad。
+    // homepage screen continues rendering: no crash, no bare bulk quad.
     cx.layout();
     _ = cx.render();
     var naked: usize = 0;
@@ -17256,12 +17788,11 @@ test "BulkQuad: 锚点子树被销毁后自动关层，render 不得解引用悬
 }
 
 test "BulkQuad: 版本号未变时零脏帧快速路径仍然成立" {
-    // 背景：批量层由宿主每帧重新提交，zenit 不做跨帧 diff，所以**只要存在
-    // 批量层就保守重画整份 display list**。在两万+ quad 的画布上实测
-    // render_gen 21.6ms/帧、占整帧 70%（GPU 只用 6.3ms），画面完全静止时
-    // 也照付。宿主用 setBulkQuadsVersioned 自证"这批和上一帧一样"后，
-    // 静止画面必须回到零脏帧。
-    var cx = try Cx.init(std.testing.allocator);
+    // Background: bulk layer resubmitted each frame, zenit doesn't cross-frame diff; conservatively
+    // redraws entire display list if present. On 20k+ quad canvas: render_gen 21.6ms/frame (70%
+    // total, GPU 6.3ms), still pays even when static. After setBulkQuadsVersioned declares
+    // unchanged, static screen must reach zero dirty frames.
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
     const root = try ui.box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
@@ -17275,23 +17806,23 @@ test "BulkQuad: 版本号未变时零脏帧快速路径仍然成立" {
         .color = Color.hex(0x00FF00),
     }};
 
-    // 第一帧：建立基线（版本首次出现，不算"未变"）。
+    // Frame 1: baseline (version first appears, not 'unchanged').
     try cx.setBulkQuadsVersioned(null, &quads, null, 7);
     cx.layout();
     _ = cx.render();
     try std.testing.expect(firstFillRect(cx) != null);
 
-    // 第二帧：同一个版本号 ⇒ 宿主声明内容未变 ⇒ 允许走零脏帧。
+    // Frame 2: same version => host declares unchanged => zero dirty frame allowed.
     try cx.setBulkQuadsVersioned(null, &quads, null, 7);
     try std.testing.expect(cx.bulk_quads_unchanged);
     cx.layout();
     _ = cx.render();
-    // 画面不能因为"跳过重画"而消失，display list 跨帧保留。
+    // Screen must not disappear because skip redraw; display list retained cross-frame.
     try std.testing.expect(firstFillRect(cx) != null);
 }
 
 test "BulkQuad: 版本号变化必须重画（否则改了内容画面不动）" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
     const root = try ui.box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
@@ -17302,7 +17833,7 @@ test "BulkQuad: 版本号变化必须重画（否则改了内容画面不动）"
     cx.layout();
     _ = cx.render();
 
-    // 换内容 + 换版本 ⇒ 必须重画，不得被"未变"短路吞掉。
+    // Change content + version => must redraw, not short-circuited by 'unchanged'.
     const red = [_]ui.BulkQuad{.{ .x = 0, .y = 0, .w = 10, .h = 10, .color = Color.hex(0xFF0000) }};
     try cx.setBulkQuadsVersioned(null, &red, null, 2);
     try std.testing.expect(!cx.bulk_quads_unchanged);
@@ -17313,28 +17844,26 @@ test "BulkQuad: 版本号变化必须重画（否则改了内容画面不动）"
 }
 
 test "BulkQuad: 不传版本号时保持原来的保守重画语义" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
     const root = try ui.box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
     cx.root = root;
 
     const quads = [_]ui.BulkQuad{.{ .x = 0, .y = 0, .w = 10, .h = 10, .color = Color.hex(0x00FF00) }};
-    // 老接口（无版本）：宿主无法自证 ⇒ 永远算"变了"，行为与修改前一致。
+    // Old API (no version): host can't self-certify => always treated as 'changed',
+    // backward-compatible.
     try cx.setBulkQuads(null, &quads);
     try std.testing.expect(!cx.bulk_quads_unchanged);
     try cx.setBulkQuads(null, &quads);
     try std.testing.expect(!cx.bulk_quads_unchanged);
 }
 
-// ── BulkQuad 分段（z 交错）────────────────────────────────────────────
-//
-// 背景：批量层原本是**一个平面**，插在锚点子树静态内容之后 ⇒ 画在所有对象
-// Node 之上。于是"部分对象在某些 Node 之下、另一些在其之上"这件事根本表达
-// 不了，宿主侧试过按 z 切一刀的四种方案，每种都在真实板上留下上万个错误
-// 像素（低 z 侧或高 z 侧总有一边被画错）。
-//
-// 分段后每条 quad 可以带 z_index，插到"第一个 z 更大的 Node item"之前。
+// -- BulkQuad stratification (z interleaving) --
+// The bulk layer is a single plane inserted after anchor-subtree static content, so it draws over
+// all Node objects and can't express 'some objects under Nodes, others over'.
+// Stratification: each quad can carry z_index and is inserted before the first Node item with a
+// larger z.
 
 fn fillRectColorsInOrder(cx: *Cx, out: *std.ArrayListUnmanaged(Color), a: std.mem.Allocator) !void {
     for (cx.display_list.items.items) |it| {
@@ -17347,14 +17876,13 @@ fn fillRectColorsInOrder(cx: *Cx, out: *std.ArrayListUnmanaged(Color), a: std.me
 
 test "BulkQuad 分段：带 z 的 quad 与 Node 逐个交错" {
     const a = std.testing.allocator;
-    var cx = try Cx.init(a);
+    var cx = try Cx.init(a, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
 
     const root = try ui.box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
     cx.root = root;
-    // 一个 z=50 的 Node（红），批量层里有 z=10（绿）和 z=90（蓝）两段。
-    // 正确顺序应当是 绿 -> 红 -> 蓝。
+    // Node z=50 (red), bulk has z=10 (green) and z=90 (blue). Correct order: green -> red -> blue.
     const mid = try ui.box(cx, .{
         .position = .absolute,
         .width = .{ .px = 10 },
@@ -17371,11 +17899,11 @@ test "BulkQuad 分段：带 z 的 quad 与 Node 逐个交错" {
     cx.layout();
     _ = cx.render();
 
-    var colors: std.ArrayListUnmanaged(Color) = .{};
+    var colors: std.ArrayListUnmanaged(Color) = .empty;
     defer colors.deinit(a);
     try fillRectColorsInOrder(cx, &colors, a);
 
-    // 找到三者的下标，断言 绿 < 红 < 蓝。
+    // Find indices, assert green < red < blue.
     var gi: ?usize = null;
     var ri: ?usize = null;
     var bi: ?usize = null;
@@ -17385,19 +17913,19 @@ test "BulkQuad 分段：带 z 的 quad 与 Node 逐个交错" {
         if (std.meta.eql(c, Color.hex(0x0000FF))) bi = idx;
     }
     try std.testing.expect(gi != null and ri != null and bi != null);
-    try std.testing.expect(gi.? < ri.?); // z=10 的批量项在 z=50 的 Node 之下
-    try std.testing.expect(ri.? < bi.?); // z=90 的批量项在 z=50 的 Node 之上
+    try std.testing.expect(gi.? < ri.?); // z=10 bulk item under z=50 Node
+    try std.testing.expect(ri.? < bi.?); // z=90 bulk item over z=50 Node
 }
 
 test "BulkQuad 分段：同一段内保持提交顺序（后者盖前者）" {
     const a = std.testing.allocator;
-    var cx = try Cx.init(a);
+    var cx = try Cx.init(a, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
     const root = try ui.box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
     cx.root = root;
 
-    // 同 z 的两条：数组顺序即绘制顺序，分段不得重排。
+    // Same-z items: array order is draw order, segments not reordered.
     try cx.setBulkQuads(root, &[_]ui.BulkQuad{
         .{ .x = 0, .y = 0, .w = 10, .h = 10, .color = Color.hex(0x111111), .z_index = 5 },
         .{ .x = 0, .y = 0, .w = 10, .h = 10, .color = Color.hex(0x222222), .z_index = 5 },
@@ -17405,7 +17933,7 @@ test "BulkQuad 分段：同一段内保持提交顺序（后者盖前者）" {
     cx.layout();
     _ = cx.render();
 
-    var colors: std.ArrayListUnmanaged(Color) = .{};
+    var colors: std.ArrayListUnmanaged(Color) = .empty;
     defer colors.deinit(a);
     try fillRectColorsInOrder(cx, &colors, a);
     var first_idx: ?usize = null;
@@ -17420,7 +17948,7 @@ test "BulkQuad 分段：同一段内保持提交顺序（后者盖前者）" {
 
 test "BulkQuad 分段：不带 z 时行为与原来完全一致（整层在 Node 之上）" {
     const a = std.testing.allocator;
-    var cx = try Cx.init(a);
+    var cx = try Cx.init(a, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
     const root = try ui.box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
@@ -17434,14 +17962,14 @@ test "BulkQuad 分段：不带 z 时行为与原来完全一致（整层在 Node
     node.setStyle(a, .z_index, @as(i16, 50));
     try root.appendChild(a, node);
 
-    // 不给 z_index ⇒ 老语义：整层画在所有 Node 之上。
+    // No z_index => legacy: entire layer over all Nodes.
     try cx.setBulkQuads(root, &[_]ui.BulkQuad{
         .{ .x = 0, .y = 0, .w = 10, .h = 10, .color = Color.hex(0x00FF00) },
     });
     cx.layout();
     _ = cx.render();
 
-    var colors: std.ArrayListUnmanaged(Color) = .{};
+    var colors: std.ArrayListUnmanaged(Color) = .empty;
     defer colors.deinit(a);
     try fillRectColorsInOrder(cx, &colors, a);
     var gi: ?usize = null;
@@ -17451,12 +17979,10 @@ test "BulkQuad 分段：不带 z 时行为与原来完全一致（整层在 Node
         if (std.meta.eql(c, Color.hex(0xFF0000))) ri = idx;
     }
     try std.testing.expect(gi != null and ri != null);
-    try std.testing.expect(ri.? < gi.?); // Node 在前 ⇒ 批量层盖在它上面
+    try std.testing.expect(ri.? < gi.?); // Node first => bulk layer over it
 }
 
-// ============================================================================
-// interaction.drag 集成测试（docs/DRAG_INTERACTION_DESIGN.md §18.2）
-// ============================================================================
+// interaction.drag integration test (docs/DRAG_INTERACTION_DESIGN.md §18.2)
 
 const drag_mod = @import("../interaction/drag.zig");
 const ReactiveScope = @import("../reactive.zig").Scope;
@@ -17468,7 +17994,7 @@ const DragRec = struct {
     pending_downs: u32 = 0,
     can_start_calls: u32 = 0,
     allow_start: bool = true,
-    // 重入动作（callback 内执行一次后清除）
+    // Re-entrant action (executes once in callback, then clears)
     cx: ?*Cx = null,
     detach_parent_on_move: ?*Node = null,
     detach_child_on_move: ?*Node = null,
@@ -17512,7 +18038,7 @@ const DragFixture = struct {
     rec: DragRec = .{},
 
     fn init() !DragFixture {
-        var cx = try Cx.init(std.testing.allocator);
+        var cx = try Cx.init(std.testing.allocator, std.testing.io);
         errdefer cx.deinit();
         cx.setViewport(300, 200);
         const root = try box(cx, .{ .width = .{ .px = 300 }, .height = .{ .px = 200 } }, .{});
@@ -17531,8 +18057,8 @@ const DragFixture = struct {
     fn attach(self: *DragFixture, config: drag_mod.Config) !*drag_mod.Binding {
         self.rec.cx = self.cx;
         const b = try drag_mod.Binding.attach(self.scope, self.cx, self.source, config, DragRec.cb, &self.rec);
-        // handler 挂上之后再 layout，hit-test 场景才会把 source 当交互目标
-        //（与真实组件"构建期挂 handler -> layout"的顺序一致）。
+        // Mount handler, then layout; hit-test treats source as target (matches real component
+        // order: mount handler -> layout).
         self.cx.layout();
         return b;
     }
@@ -17549,7 +18075,7 @@ test "drag: pending 短点击仍派发 click，无 drag callback" {
     f.attachClickCounter();
 
     f.cx.handleMouseDown(10, 10, .{});
-    f.cx.handleMouseMove(12, 11); // 未越阈值
+    f.cx.handleMouseMove(12, 11); // below threshold
     f.cx.handleMouseUp(12, 11);
 
     try std.testing.expectEqual(@as(usize, 0), f.rec.len);
@@ -17578,7 +18104,7 @@ test "drag: 越阈值后 start/move/end，无 click，capture/cursor 清理" {
     try std.testing.expectEqual(drag_mod.Phase.start, f.rec.events[0].phase);
     try std.testing.expectEqual(drag_mod.Phase.move, f.rec.events[1].phase);
     try std.testing.expectEqual(drag_mod.Phase.end, f.rec.events[2].phase);
-    // end 用 up 最终坐标的累计 delta
+    // end uses cumulative delta from up's final coordinate
     try std.testing.expectEqual(@as(f32, 50), f.rec.events[2].delta.x);
     try std.testing.expectEqual(@as(f32, 15), f.rec.events[2].delta.y);
     try std.testing.expectEqual(@as(u32, 0), f.rec.clicks);
@@ -17586,7 +18112,7 @@ test "drag: 越阈值后 start/move/end，无 click，capture/cursor 清理" {
     try std.testing.expect(f.cx.cursor_override == null);
     try std.testing.expect(f.cx.drag_manager.session == null);
 
-    // 随后普通点击恢复
+    // normal click resumes after
     f.cx.handleMouseDown(10, 10, .{});
     f.cx.handleMouseUp(10, 10);
     try std.testing.expectEqual(@as(u32, 1), f.rec.clicks);
@@ -17619,7 +18145,7 @@ test "drag: capture 后移出 source 仍收 move；axis horizontal 投影" {
     _ = try f.attach(.{ .activation_distance = 4, .axis = .horizontal });
 
     f.cx.handleMouseDown(10, 10, .{});
-    f.cx.handleMouseMove(250, 180); // 远超 source 区域
+    f.cx.handleMouseMove(250, 180); // far beyond source region
     f.cx.handleMouseUp(280, 190);
 
     try std.testing.expectEqual(@as(usize, 2), f.rec.len);
@@ -17661,11 +18187,11 @@ test "drag: Escape 取消 active，恰好一次 cancel，up 幂等无 click" {
     try std.testing.expect(f.cx.cursor_override == null);
     try std.testing.expect(f.cx.drag_manager.session == null);
 
-    // 再次 Escape 不再产生任何 callback（幂等）
+    // second Escape produces no callback (idempotent)
     f.cx.handleKeyDown(.escape, .{});
     try std.testing.expectEqual(@as(usize, 2), f.rec.len);
 
-    // 后到的 up 只做幂等清理，不 click
+    // late up does idempotent cleanup only, no click
     f.cx.handleMouseUp(40, 10);
     try std.testing.expectEqual(@as(usize, 2), f.rec.len);
     try std.testing.expectEqual(@as(u32, 0), f.rec.clicks);
@@ -17734,7 +18260,7 @@ test "drag: source detach 取消 active（source_detached）" {
     try std.testing.expectEqual(@as(?drag_mod.CancelReason, .source_detached), f.rec.events[f.rec.len - 1].cancel_reason);
     try std.testing.expect(!f.cx.dispatcher.hasPointerCapture());
     try std.testing.expect(f.cx.drag_manager.session == null);
-    // 节点已摘链，交还给测试释放
+    // node detached, returned to test for cleanup
     f.cx.freeNode(f.source);
 }
 
@@ -17747,14 +18273,14 @@ test "drag: move callback 中销毁 source 子树不 UAF，终止恰好一次" {
 
     f.cx.handleMouseDown(10, 10, .{});
     f.cx.handleMouseMove(40, 10); // start
-    f.cx.handleMouseMove(50, 10); // move → callback 内 detach → 同步 cancel
+    f.cx.handleMouseMove(50, 10); // move -> detach in callback -> sync cancel
 
     // start, move, cancel(source_detached)
     try std.testing.expectEqual(@as(usize, 3), f.rec.len);
     try std.testing.expectEqual(drag_mod.Phase.cancel, f.rec.events[2].phase);
     try std.testing.expectEqual(@as(?drag_mod.CancelReason, .source_detached), f.rec.events[2].cancel_reason);
 
-    // 后续输入幂等
+    // subsequent input idempotent
     f.cx.handleMouseMove(60, 10);
     f.cx.handleMouseUp(60, 10);
     try std.testing.expectEqual(@as(usize, 3), f.rec.len);
@@ -17778,7 +18304,7 @@ test "drag: can_start 拒绝 → 只询问一次、无 callback、up 无 click" 
     try std.testing.expectEqual(@as(u32, 0), f.rec.clicks);
     try std.testing.expect(f.cx.drag_manager.session == null);
 
-    // 下一次序列重新询问
+    // next sequence re-asks
     f.rec.allow_start = true;
     f.cx.handleMouseDown(10, 10, .{});
     f.cx.handleMouseMove(40, 10);
@@ -17814,7 +18340,7 @@ test "drag: scope dispose 中途取消（scope_disposed），无 UAF" {
     try std.testing.expectEqual(@as(?drag_mod.CancelReason, .scope_disposed), f.rec.events[f.rec.len - 1].cancel_reason);
     try std.testing.expect(f.cx.drag_manager.session == null);
     try std.testing.expect(!f.cx.dispatcher.hasPointerCapture());
-    // source 的 event slot 已摘除
+    // source's event slot removed
     try std.testing.expect(f.source.behavior.events.on_event == null);
     try std.testing.expect(f.source.behavior.events.event_context == null);
 }
@@ -17837,7 +18363,7 @@ test "drag: scope dispose before first mouse down detaches event slots" {
 }
 
 test "drag: 嵌套 draggable 最深命中者获胜" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(300, 200);
     const root = try box(cx, .{ .width = .{ .px = 300 }, .height = .{ .px = 200 } }, .{});
@@ -17865,7 +18391,7 @@ test "drag: 嵌套 draggable 最深命中者获胜" {
 }
 
 test "drag: 第二个 binding 在 session 期间不 claim" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(300, 200);
     const root = try box(cx, .{ .width = .{ .px = 300 }, .height = .{ .px = 200 }, .direction = Direction.row }, .{});
@@ -17884,7 +18410,7 @@ test "drag: 第二个 binding 在 session 期间不 claim" {
     cx.layout();
 
     cx.handleMouseDown(10, 10, .{});
-    cx.handleMouseMove(40, 10); // a active，capture 生效
+    cx.handleMouseMove(40, 10); // a active, capture takes effect
     try std.testing.expect(ba.isDragging());
     try std.testing.expect(!bc.isPending());
     cx.handleMouseUp(40, 10);
@@ -17898,20 +18424,18 @@ test "drag: attach 错误（阈值/按钮/槽占用）事务性" {
     try std.testing.expectError(error.InvalidActivationDistance, f.attach(.{ .activation_distance = -1 }));
     try std.testing.expectError(error.InvalidActivationDistance, f.attach(.{ .activation_distance = std.math.nan(f32) }));
     try std.testing.expectError(error.UnsupportedButton, f.attach(.{ .button = .right }));
-    // 失败不留半注册状态
+    // failure leaves no half-registered state
     try std.testing.expect(f.source.behavior.events.on_event == null);
 
     _ = try f.attach(.{});
     try std.testing.expectError(error.EventSlotOccupied, f.attach(.{}));
 }
 
-// 下游应用 layers hover"字母微抖"复现：同一段文字，跨帧缓存 splice 重放与
-// dirty 后 fresh 重录，产出的 text_run x 必须**逐位相等**。祖先带分数坐标
-// （真实场景：玻璃岛/行内偏移不保证整数）时，两条路径若量化不一致，
-// hover 翻转底色（强制该行 fresh）就会让整行文字平移亚像素，用户看到
-// "letters 之间微小抖动"。
+// Regression: 'letters micro-jitter on hover'. Same text, cached replay vs fresh redraw after dirty
+// must produce bit-identical text_run x. When ancestors have fractional coordinates (glass islands,
+// inline offsets), quantization mismatch causes hover bg flip (force fresh) to subpixel-shift text.
 test "render: fresh re-record and cached splice agree on text x at fractional origin" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(320, 200);
 
@@ -17931,7 +18455,7 @@ test "render: fresh re-record and cached splice agree on text x at fractional or
         .height = .{ .px = 120 },
         .direction = .column,
         .overflow_hidden = true,
-        // 分数内边距 -> 行/文字落在半像素坐标上（真实侧栏的等效条件）
+        // fractional padding -> line/text at subpixel coordinates (equivalent to real sidebar)
         .padding = .{ .left = 6.5, .top = 3.5, .right = 6, .bottom = 0 },
     }, .{row});
     const root = try box(cx, .{
@@ -17952,25 +18476,25 @@ test "render: fresh re-record and cached splice agree on text x at fractional or
         }
     }.f;
 
-    // 帧 1：全 fresh。
+    // Frame 1: all fresh.
     _ = cx.render();
     const t1 = findText(cx.lowerForEncoderPaintTable()) orelse return error.TestExpectedText;
 
-    // 帧 2：无脏 -> 缓存/重放路径。
+    // Frame 2: clean -> cached replay path.
     _ = cx.render();
     const t2 = findText(cx.lowerForEncoderPaintTable()) orelse return error.TestExpectedText;
 
-    // 帧 3：行底色直写（= hover），行子树 fresh 重录。
+    // Frame 3: row bg direct write (= hover), row subtree fresh redraw.
     row.setStyle(null, .background, Color.rgba(0, 0, 0, 20));
     _ = cx.render();
     const t3 = findText(cx.lowerForEncoderPaintTable()) orelse return error.TestExpectedText;
 
-    // 帧 4：底色回透明（= 离开 hover）。
+    // Frame 4: bg back to transparent (= leave hover).
     row.setStyle(null, .background, Color.rgba(0, 0, 0, 0));
     _ = cx.render();
     const t4 = findText(cx.lowerForEncoderPaintTable()) orelse return error.TestExpectedText;
 
-    // 全部逐位相等，亚像素都不许移。
+    // All bit-identical, no subpixel drift.
     try std.testing.expectEqual(t1.geom.x, t2.geom.x);
     try std.testing.expectEqual(t1.geom.y, t2.geom.y);
     try std.testing.expectEqual(t1.geom.x, t3.geom.x);
@@ -17979,8 +18503,8 @@ test "render: fresh re-record and cached splice agree on text x at fractional or
     try std.testing.expectEqual(t1.geom.y, t4.geom.y);
 }
 
-// TextProps.text_align：居中/右对齐只挪绘制起点。折行（有 TextLayout）与单行
-// （wrap=.none）两条发射路径都要生效，偏移公式与 text_layout.alignLineOffset 一致。
+// TextProps.text_align: center/right only shifts draw start. Both wrapped (TextLayout) and
+// single-line (wrap=.none) paths must work, offset formula matches text_layout.alignLineOffset.
 test "render: text_align centers and end-aligns each visual line" {
     const cases = [_]struct { wrap: ui.TextWrap, text_align: ui.TextAlign }{
         .{ .wrap = .word, .text_align = .start },
@@ -17990,7 +18514,7 @@ test "render: text_align centers and end-aligns each visual line" {
         .{ .wrap = .none, .text_align = .end },
     };
     for (cases) |c| {
-        var cx = try Cx.init(std.testing.allocator);
+        var cx = try Cx.init(std.testing.allocator, std.testing.io);
         defer cx.deinit();
         cx.setViewport(320, 100);
 
@@ -18025,11 +18549,10 @@ test "render: text_align centers and end-aligns each visual line" {
 }
 
 test "render: rotated node inside z=0 subtree stays below sibling z>0 overlay" {
-    // 回归：下游应用的颜色浮层（z=30500 的兄弟子树）盖住 Inspector 岛时，
-    // 岛内**旋转**的小方块（◇ 菱形）浮到浮层之上，带 transform 的节点
-    // 走了独立的合成/发射路径，逃逸了兄弟 z_index 叠序。
-    // 期望：旋转节点的绘制项在 overlay 的绘制项**之前**（被盖住）。
-    var cx = try Cx.init(std.testing.allocator);
+    // Regression: color overlay (z=30500 sibling) over Inspector island; rotated square inside
+    // floats above it. Transform nodes use separate path, escape z_index layering. Expected:
+    // rotated node draws before overlay (behind).
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(200, 200);
 
@@ -18037,7 +18560,7 @@ test "render: rotated node inside z=0 subtree stays below sibling z>0 overlay" {
         .width = .{ .px = 200 },
         .height = .{ .px = 200 },
     }, .{});
-    // 岛（z 默认 0），内含一个旋转 45° 的小方块
+    // Island (z default 0), contains 45-degree rotated square
     const island = try box(cx, .{
         .width = .{ .px = 200 },
         .height = .{ .px = 200 },
@@ -18051,7 +18574,7 @@ test "render: rotated node inside z=0 subtree stays below sibling z>0 overlay" {
     (try rotated.style.ensureExtFallible(cx.allocator)).rotate = std.math.pi / 4.0;
     try island.appendChild(cx.allocator, rotated);
     try root.appendChild(cx.allocator, island);
-    // 浮层：z>0 的兄弟，整块盖住岛
+    // Overlay: z>0 sibling, covers island
     const overlay = try box(cx, .{
         .position = .absolute,
         .width = .{ .px = 200 },
@@ -18077,7 +18600,7 @@ test "render: rotated node inside z=0 subtree stays below sibling z>0 overlay" {
     try std.testing.expect(overlay_order != null);
     try std.testing.expect(rotated_order.? < overlay_order.?);
 
-    // 第二帧走缓存/retained 路径，叠序必须依旧成立
+    // frame 2 uses cached/retained path, layering must hold
     cx.frame_time_ms = 16.0;
     _ = cx.render();
     rotated_order = null;
@@ -18095,12 +18618,10 @@ test "render: rotated node inside z=0 subtree stays below sibling z>0 overlay" {
 }
 
 test "layout: absolute child appended after initial layout gets sized incrementally" {
-    // 回归（下游应用 sticky 文本消失的根因）：增量布局的 must_full_layout 判定
-    // 有意跳过 absolute 子节点，而 fallback 曾只 layoutNode(child, 旧rect)
-    // 首帧布局**之后**才 append 的 absolute 子节点 rect 恒为 (0,0,0,0)，
-    // 画布对象后挂的文字 label 因此永远不渲染。修复后 absolute 且自身
-    // layout-dirty 的子节点走 layoutAbsoluteChild 重新 resolve。
-    var cx = try Cx.init(std.testing.allocator);
+    // Regression: sticky text disappears. Incremental layout skips absolute children; fallback
+    // layoutNode leaves post-append absolute at (0,0,0,0), labels never render. After fix: absolute
+    // + layout-dirty use layoutAbsoluteChild.
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
 
@@ -18116,7 +18637,7 @@ test "layout: absolute child appended after initial layout gets sized incrementa
     cx.layout();
     _ = cx.render();
 
-    // 首帧布局完成后再挂 absolute 子节点（对象先落笔、后写字的时序）
+    // Mount absolute child after frame 1 layout (object drawn first, label after)
     const label = try box(cx, .{
         .position = .absolute,
         .width = .{ .px = 120 },
@@ -18133,17 +18654,15 @@ test "layout: absolute child appended after initial layout gets sized incrementa
 }
 
 test "bulk layer: quad below a container's z does not cover that container's children" {
-    // 回归（下游应用便签正文"不渲染"的根因）：批量层归并按 item 的 z 决定 quad
-    // 插在它前还是后，而 z 是**兄弟间**的层级语义，容器设了 z，其内部的
-    // 文字/图标子节点并不会各自再设一遍。collectSubtreeZ 曾直接读子节点自身
-    // 的 z_index（默认 0），于是"z=3 容器里的文字"被当成 z=0，z=2 的 quad
-    // 插到了文字之后，把它整块盖掉。
-    var cx = try Cx.init(std.testing.allocator);
+    // Regression: bulk merges by item z (sibling-only semantics). Container z=3 doesn't cascade;
+    // collectSubtreeZ read child z_index (default 0), so text in z=3 container treated as z=0, z=2
+    // quad inserted after and covers it.
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(300, 300);
 
     const host = try box(cx, .{ .width = .{ .px = 300 }, .height = .{ .px = 300 } }, .{});
-    // 低 z 的对象（会被批量层表达）
+    // low-z object (expressed by bulk)
     const low = try box(cx, .{
         .position = .absolute,
         .width = .{ .px = 100 },
@@ -18152,7 +18671,7 @@ test "bulk layer: quad below a container's z does not cover that container's chi
     }, .{});
     (try low.style.ensureExtFallible(cx.allocator)).z_index = 1;
     try host.appendChild(cx.allocator, low);
-    // 高 z 的容器 + 它的子内容（子节点**不设** z_index）
+    // high-z container + its child content (children have no z_index)
     const container = try box(cx, .{
         .position = .absolute,
         .width = .{ .px = 100 },
@@ -18170,7 +18689,7 @@ test "bulk layer: quad below a container's z does not cover that container's chi
     try host.appendChild(cx.allocator, container);
     cx.root = host;
 
-    // 一条 z=2 的 quad：应当画在 low(z=1) 之上、container(z=3) 及其子内容之下
+    // z=2 quad: should draw over low (z=1), under container (z=3) and its content
     try cx.setBulkQuads(host, &.{.{
         .x = 0,
         .y = 0,
@@ -18193,13 +18712,13 @@ test "bulk layer: quad below a container's z does not cover that container's chi
     };
     try std.testing.expect(quad_order != null);
     try std.testing.expect(child_order != null);
-    // 容器的子内容必须画在 quad **之后**（= 覆盖在它之上）
+    // container's child content must draw after quad (= over it)
     try std.testing.expect(quad_order.? < child_order.?);
 }
 
 test "render: node-local overflow clip follows text across surfaces and retained frames" {
     for ([_]u8{ 0, 1, 2 }) |layers| {
-        var cx = try Cx.init(std.testing.allocator);
+        var cx = try Cx.init(std.testing.allocator, std.testing.io);
         defer cx.deinit();
         cx.setViewport(800, 600);
         const root = try box(cx, .{ .width = .{ .px = 700 }, .height = .{ .px = 500 }, .padding = Padding.all(30), .opacity = if (layers == 2) 0.8 else 1 }, .{});
@@ -18241,7 +18760,7 @@ test "render: node-local overflow clip follows text across surfaces and retained
 }
 
 test "Snapshot.capture preserves descendant clip and paint placement" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(500, 300);
     const painted = try box(cx, .{ .width = .{ .px = 160 }, .height = .{ .px = 30 }, .background = Color.rgb(210, 20, 20) }, .{});
@@ -18273,7 +18792,7 @@ test "Snapshot.capture preserves descendant clip and paint placement" {
 
 test "render: nested opacity layer composites in its parent content frame" {
     for ([_]f32{ 0.8, 1, 1.25 }) |scale| {
-        var cx = try Cx.init(std.testing.allocator);
+        var cx = try Cx.init(std.testing.allocator, std.testing.io);
         defer cx.deinit();
         cx.setViewport(600, 400);
         const inner = try box(cx, .{ .width = .{ .px = 100 }, .height = .{ .px = 40 }, .opacity = 0.7, .background = Color.rgb(200, 0, 0) }, .{});
@@ -18302,7 +18821,7 @@ test "render: nested opacity layer composites in its parent content frame" {
 }
 
 test "Snapshot frozen clip and paint survive source teardown and property tree replacement" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(500, 300);
     const painted = try box(cx, .{ .width = .{ .px = 160 }, .height = .{ .px = 30 }, .background = Color.rgb(210, 20, 20) }, .{});
@@ -18360,8 +18879,61 @@ test "Snapshot frozen clip and paint survive source teardown and property tree r
     try std.testing.expect(saw_clip and saw_paint and saw_wrapper);
 }
 
+test "text ownership: getText 的副本不带所有权，读-改-写换成借用内容后销毁不误释放" {
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    const node = try text(cx, "framework owned content", .{});
+    var t = node.getText().?;
+    try std.testing.expect(!t.owned);
+    try std.testing.expect(node.getTextRaw().?.owned);
+    // write back as-is: ownership retained (freed on destroy, allocator detects leak)
+    node.setText(t);
+    try std.testing.expect(node.getTextRaw().?.owned);
+    // swap to caller's borrowed content: node must not free
+    t.content = "borrowed literal";
+    node.setText(t);
+    try std.testing.expect(!node.getTextRaw().?.owned);
+    cx.freeNode(node);
+}
+
+test "text ownership: 同指针原地截断写回不恢复所有权（避免按错误长度释放）" {
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    const node = try text(cx, "framework owned content", .{});
+    var t = node.getText().?;
+    const full = node.getTextRaw().?.content;
+    t.content = t.content[0..5];
+    node.setText(t);
+    try std.testing.expect(!node.getTextRaw().?.owned);
+    cx.freeNode(node);
+    // node no longer owns pre-truncate block: test returns it, allocator happy
+    std.testing.allocator.free(full);
+}
+
+test "Snapshot.captureDisplayed 换长文本后仍取到上一帧显示的内容（旧内容退役到下一帧）" {
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    cx.setViewport(300, 200);
+    const label = try text(cx, "displayed content longer than sixteen", .{ .font_size = 14 });
+    const root = try box(cx, .{ .width = .{ .px = 300 }, .height = .{ .px = 200 }, .padding = Padding.all(20) }, .{label});
+    cx.root = root;
+    cx.layout();
+    _ = cx.render();
+    try label.setTextContent(cx.allocator, "pending replacement that is also long");
+    const snap = (try Snapshot.captureDisplayed(cx, label)).?;
+    defer snap.deinit();
+    var found = false;
+    for (snap.commands.commands) |item| {
+        if (item == .text_run) {
+            try std.testing.expectEqualStrings("displayed content longer than sixteen", item.text_run.content);
+            found = true;
+        }
+    }
+    try std.testing.expect(found);
+}
+
 test "Snapshot.captureDisplayed preserves last displayed content when node is dirty" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(300, 200);
     const label = try text(cx, "displayed", .{ .font_size = 14 });
@@ -18384,7 +18956,7 @@ test "Snapshot.captureDisplayed preserves last displayed content when node is di
 }
 
 test "render: blur clip and composite use the enclosing surface frame" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(600, 400);
     const blurred = try box(cx, .{ .width = .{ .px = 80 }, .height = .{ .px = 40 }, .background = Color.rgb(100, 120, 140) }, .{});
@@ -18411,7 +18983,7 @@ test "render: blur clip and composite use the enclosing surface frame" {
 }
 
 test "Snapshot text-only capture has a nonzero surface width" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(300, 100);
     const label = try text(cx, "Visible snapshot text", .{ .font_size = 14 });
@@ -18460,7 +19032,7 @@ test "Cx: runtime index rebuild reconciles the native IME gate" {
     var sdk = system_sdk.SystemSdk.init(std.testing.allocator, &backend, &vtable, .{ .ime = true });
     defer sdk.deinit();
 
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setSystemSdk(&sdk);
 
@@ -18578,7 +19150,7 @@ test "Cx: preedit acknowledgement rejects freed switched and replaced clients" {
     ui.a11y_macos_bridge.setTextInputAppliedHook(Capture.apply);
     defer ui.a11y_macos_bridge.setTextInputAppliedHook(null);
     for ([_]@FieldType(Probe, "mode"){ .keep, .free, .focus, .swap }) |mode| {
-        var cx = try Cx.init(std.testing.allocator);
+        var cx = try Cx.init(std.testing.allocator, std.testing.io);
         defer cx.deinit();
         cx.setWindowIdentity(88, 903);
         const f = try focusFreeFixture(cx);
@@ -18600,11 +19172,10 @@ test "Cx: preedit acknowledgement rejects freed switched and replaced clients" {
     }
 }
 
-// ─── 点击回调里 replaceChildOrder 换入同形新子树后，新子树永久点不中 ───
-// 现场：下游编辑器 Global Find 点结果行 -> 回调里重建文件列表（新 VirtualList 换入旧位置）+
-// 预览池只改样式切换可见 editor；之后整张列表的点击都落到父容器上，直到下次搜索。
-// 根因：mouseUp 分发后的 rebuildRuntimeIndexesIfCurrentRootDirty 在布局前按 0 尺寸重建命中
-// 索引并清掉 hit 脏位（见该函数注释）。两个变体：预览复用槽（纯样式）/ 新挂槽（结构追加）。
+// ─── Click callback replaceChildOrder with same-shape new subtree, new subtree never hits ───
+// Scene: downstream Global Find clicks result -> callback rebuilds list (new VirtualList replaces)
+// + preview toggles; after, all list clicks miss, hit parent. Root: post-mouseUp
+// rebuildRuntimeIndexes rebuilds hit index at 0-size, clears dirty flag.
 const SwapRepro = struct {
     const ROWS: usize = 5;
     const ROW_H: f32 = 20;
@@ -18687,7 +19258,7 @@ const SwapRepro = struct {
     }
 
     fn run(new_slot: bool) !void {
-        var cx = try Cx.init(std.testing.allocator);
+        var cx = try Cx.init(std.testing.allocator, std.testing.io);
         defer cx.deinit();
         cx.setViewport(800, 600);
         g_cx = cx;
@@ -18745,11 +19316,11 @@ test "hit-test: click handler swaps in same-shape subtree via replaceChildOrder 
     try SwapRepro.run(true);
 }
 
-// ─── freeNode 立即路径必须清掉指进被释放子树的交互裸引用（与延迟路径同一契约）───
-// 现场：点击回调里释放了被按下的行（Global Find 重建文件列表），mouseUp 收尾清 pressed_node 之前
-// 若有 before_render hook 运行（命中索引先布局再重建），animBg 读 cx.pressed_node -> 段错误。
+// ─── freeNode immediate path must clear interaction raw refs to freed subtree ───
+// Scene: click callback frees pressed row; if before_render hook runs before cleanup clears
+// pressed_node, animBg reads freed pointer -> segfault.
 test "freeNode outside tick/reactive depth clears pressed/hovered/last-mouse-down refs into the freed subtree" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
     const root = try box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 }, .direction = .column }, .{});
@@ -18782,12 +19353,13 @@ test "freeNode outside tick/reactive depth clears pressed/hovered/last-mouse-dow
     _ = cx.render();
 }
 
-// ─── portal 祖先检查不把窗口根的裁剪当问题 ───
-// borderless 窗口根带 overflow_hidden（圆角），其裁剪区就是视口；在其中挂 tooltip 等浮层
-// 曾每次 log.err "clipping/effect-surface ancestor"（下游编辑器 Global Find 标题栏 tooltip 实测，
-// 测试运行器把 logged errors 判失败）。链顶（无父）节点必须跳过；更内层的裁剪祖先照报。
+// ─── portal ancestor check doesn't treat window-root clip as problem ───
+// A borderless window root carries overflow_hidden (rounded corners) and its clip is the viewport.
+// Mounting an overlay such as a tooltip inside it used to log.err "clipping/effect-surface
+// ancestor" every time, and the test runner fails tests that log errors. The chain-top node (no
+// parent) must be skipped; inner clipping ancestors are still reported.
 test "popover portal under an overflow-hidden window root logs no clipping error" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
     const root = try box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 }, .direction = .column }, .{});
@@ -18799,14 +19371,14 @@ test "popover portal under an overflow-hidden window root logs no clipping error
 }
 
 test "multi box-shadow with spread lowers one shadow_rect per layer, last layer first" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
     const root = try ui.box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
     cx.root = root;
     const card = try ui.box(cx, .{ .width = .{ .px = 200 }, .height = .{ .px = 80 }, .background = Color.rgba(255, 255, 255, 200) }, .{});
     try root.appendChild(std.testing.allocator, card);
-    // 设计稿 16.3 的三段投影：0 1 2 .10 / 0 16 34 -12 .24 / 0 40 80 -32 .36
+    // Design 16.3 three-layer shadow: 0 1 2 .10 / 0 16 34 -12 .24 / 0 40 80 -32 .36
     (try card.style.ensureExtFallible(std.testing.allocator)).setShadowList(&.{
         .{ .color = Color.rgba(50, 38, 26, 26), .blur = 2, .offset_y = 1 },
         .{ .color = Color.rgba(50, 38, 26, 61), .blur = 34, .offset_y = 16, .spread = -12 },
@@ -18825,14 +19397,14 @@ test "multi box-shadow with spread lowers one shadow_rect per layer, last layer 
         else => {},
     };
     try std.testing.expectEqual(@as(usize, 3), n);
-    // 列表第一项在最上层 -> 最后画：发射顺序为 3、2、1。
+    // first item topmost -> last drawn: emit order 3, 2, 1
     try std.testing.expectApproxEqAbs(@as(f32, -32), got[0], 1e-4);
     try std.testing.expectApproxEqAbs(@as(f32, -12), got[1], 1e-4);
     try std.testing.expectApproxEqAbs(@as(f32, 0), got[2], 1e-4);
 }
 
 test "multi inset shadows lower with a transparent fill (no double-painted translucent background)" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
     const root = try ui.box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
@@ -18858,7 +19430,7 @@ test "multi inset shadows lower with a transparent fill (no double-painted trans
 }
 
 test "radial multi-gradient carries CSS center and ellipse radius to the display list" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 300);
     const root = try ui.box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
@@ -18893,12 +19465,13 @@ test "glass backdrop saturation / brightness resolve with clamping" {
     try std.testing.expectApproxEqAbs(@as(f32, 2.1), g.backdrop_saturation, 1e-5);
     try std.testing.expectApproxEqAbs(@as(f32, 1.06), g.backdrop_brightness, 1e-5);
     const clamped = (ui.GlassParams{ .backdrop_saturation = 99, .backdrop_brightness = -1 }).resolve();
-    try std.testing.expectApproxEqAbs(@as(f32, 4), clamped.backdrop_saturation, 1e-5);
+    // ceiling 8: native model chroma gain after veil alpha compensation can exceed 4
+    try std.testing.expectApproxEqAbs(@as(f32, 8), clamped.backdrop_saturation, 1e-5);
     try std.testing.expectApproxEqAbs(@as(f32, 0), clamped.backdrop_brightness, 1e-5);
 }
 
 test "Cx timers: wake an idle loop, fire before the zero-dirty fast path, and can be cleared" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(200, 100);
     const root = try box(cx, .{ .width = .{ .px = 200 }, .height = .{ .px = 100 } }, .{});
@@ -18924,7 +19497,7 @@ test "Cx timers: wake an idle loop, fire before the zero-dirty fast path, and ca
     try std.testing.expect(!cx.wantsFrame());
     const wake = cx.nextWakeDelayNs() orelse return error.NoWake;
     try std.testing.expect(wake <= 2 * std.time.ns_per_ms);
-    std.Thread.sleep(4 * std.time.ns_per_ms);
+    try std.Io.sleep(cx.io, .fromNanoseconds(4 * std.time.ns_per_ms), .awake);
     try std.testing.expect(cx.wantsFrame());
     _ = cx.render();
     try std.testing.expectEqual(@as(usize, 1), rec.fired);
@@ -18942,7 +19515,7 @@ fn countTextRuns(items: anytype) usize {
 }
 
 fn textFillCase(wrap: ui.TextWrap, start_hidden: bool) !usize {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(300, 200);
     const root = try box(cx, .{ .width = .{ .px = 300 }, .height = .{ .px = 200 }, .direction = .column }, .{});
@@ -18973,9 +19546,9 @@ fn textFillCase(wrap: ui.TextWrap, start_hidden: bool) !usize {
     }
     cx.layout();
     const painted_bytes = countTextRuns(cx.render());
-    // 换行文本必须按新内容重新折行：高度应长到多行。
+    // wrapping text must reflow to new content: height extends to multiline
     if (wrap != .none) try std.testing.expect(t.rectFromWorldOrFallback().h > one_line_h * 2);
-    // 画出来的是新内容的全部（每行尾的断行空格可省）。
+    // drawn is entire new content (line-end break spaces optional)
     const expected = "0 silenced · nothing pops up; summarized once when it ends, and this sentence keeps going so it needs several lines".len;
     try std.testing.expect(painted_bytes + 8 >= expected);
     return painted_bytes;
@@ -18989,7 +19562,7 @@ test "text: an empty wrapped text node paints after setTextContent" {
 }
 
 test "text: setTextContent re-measures so a longer label never overflows its row" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(300, 100);
     const root = try box(cx, .{ .width = .{ .px = 300 }, .height = .{ .px = 100 }, .direction = .column }, .{});
@@ -19005,36 +19578,36 @@ test "text: setTextContent re-measures so a longer label never overflows its row
     cx.layout();
     _ = cx.render();
     const short_w = ts.rectFromWorldOrFallback().w;
-    // 不手动标脏：setTextContent 自己负责。
+    // don't manually mark dirty: setTextContent handles it
     try ts.setTextContent(cx.allocator, "12 minutes ago");
     _ = cx.render();
     const r = ts.rectFromWorldOrFallback();
     try std.testing.expect(r.w > short_w * 2);
-    // 右边缘仍在行内（右对齐，不冲出去）。
+    // right edge stays inline (right-aligned, doesn't overflow)
     const row_r = row.rectFromWorldOrFallback();
     try std.testing.expect(ts.globalRect().x + r.w <= row.globalRect().x + row_r.w + 0.5);
 }
 
 test "layout: a fit-height absolute child grows when only its descendants change" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(400, 600);
     const root = try box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 600 } }, .{});
     cx.root = root;
-    // 类似 Popover 面板：绝对定位、高度 fit 内容。
+    // like Popover panel: absolute, height fits content
     const panel = try box(cx, .{ .position = .absolute, .width = .{ .px = 200 }, .direction = .column }, .{});
     panel.style.height = .{ .fit = .{} };
     try root.appendChild(cx.allocator, panel);
     const list = try box(cx, .{ .width = .fill(), .direction = .column }, .{});
     list.style.height = .{ .fit = .{} };
-    // 可收缩的列表（Popover 里「只有列表让位」的写法）：旧高度当可用空间时会被挤回去。
+    // shrinkable list (Popover 'only list yields' pattern): old height compressed when out of space
     list.style.flex_shrink = 1;
     try panel.appendChild(cx.allocator, list);
     try list.appendChild(cx.allocator, try box(cx, .{ .width = .fill(), .height = .{ .px = 40 } }, .{}));
     cx.layout();
     _ = cx.render();
     try std.testing.expectApproxEqAbs(@as(f32, 40), panel.rectFromWorldOrFallback().h, 0.5);
-    // 只在深层加行：panel 自身不是 layout-dirty，只有 subtree_layout。
+    // only add row in subtree: panel not layout-dirty, only subtree_layout
     try list.appendChild(cx.allocator, try box(cx, .{ .width = .fill(), .height = .{ .px = 60 } }, .{}));
     try list.appendChild(cx.allocator, try box(cx, .{ .width = .fill(), .height = .{ .px = 60 } }, .{}));
     cx.layout();
@@ -19043,20 +19616,17 @@ test "layout: a fit-height absolute child grows when only its descendants change
     try std.testing.expectApproxEqAbs(@as(f32, 160), panel.rectFromWorldOrFallback().h, 0.5);
 }
 
-// ─── overflow clip 只裁后代、收在描边内沿（CSS overflow 语义）───
+// ─── overflow clip clips descendants only, at the padding box (inner edge of the border) ───
 //
-// 回归锚（storybook Popover「Tall content」+ 下游编辑器 block 菜单实拍）：
-//   1. 阴影被自身 overflow clip 裁成 border-box 矩形，圆角外露出矩形灰块，
-//      面板四周的柔和阴影整圈消失；
-//   2. 贴边/溢出的子内容盖住描边，描边在内容处断开。
-// 两条路径都要覆盖：普通节点（lowering 的 clip 链）与 composited_group surface
-// owner（Popover chrome；以前 compositor apply_clip 在 begin_layer 后立即 push，
-// 连 owner 自己的阴影一起裁），后者还要覆盖 promoted cache 命中帧（缓存替放）。
+// Regression: shadow clipped to border-box, rounded corners expose gray, panel shadow disappears;
+// edge child covers stroke.
+// Two paths: normal node (lowering) + composited_group owner (Popover, apply_clip post begin_layer
+// clipped owner shadow too); also covers promoted cache hits.
 
 const OwnClipProbe = struct {
-    /// 第一条 shadow 命令所处的 scissor 深度（0 = 未被任何 clip 包住）。
+    /// first shadow command scissor depth (0 = unclipped)
     shadow_depth: ?usize = null,
-    /// 目标子节点 fill 的世界坐标 scissor（null = 未被裁）。
+    /// target child fill world scissor (null = unclipped)
     child_scissor: ?ui.ComputedRect = null,
     child_found: bool = false,
 };
@@ -19129,7 +19699,7 @@ fn buildShadowedClipPanel(cx: *Cx, composited: bool, child_color: Color) !*Node 
     const ext = try panel.style.ensureExtFallible(cx.allocator);
     ext.setShadow(.{ .color = Color.rgba(0, 0, 0, 40), .blur = 12, .offset_y = 6 });
     if (composited) ext.composited_group = true;
-    // 子内容比面板高很多（1400 之于 tall popover）：必须被面板裁掉。
+    // child content much taller than panel (1400 vs tall popover): must be clipped
     const child = try box(cx, .{
         .width = .{ .px = 104 },
         .height = .{ .px = 300 },
@@ -19143,15 +19713,15 @@ fn buildShadowedClipPanel(cx: *Cx, composited: bool, child_color: Color) !*Node 
 
 fn expectOwnClipContract(cx: *Cx, child_color: Color) !void {
     const probe = try ownClipProbe(cx, 104, 300, child_color);
-    // 阴影不被自身 overflow clip 裁
+    // shadow not clipped by own overflow
     try std.testing.expectEqual(@as(?usize, 0), probe.shadow_depth);
-    // 子内容被裁到 padding box（描边内沿）：面板 (40,40,120x80)，描边 1px
+    // child clipped to padding box (border inner edge): panel (40,40,120x80), stroke 1px
     try std.testing.expect(probe.child_found);
     try std.testing.expectEqual(@as(?ui.ComputedRect, ui.ComputedRect.init(41, 41, 118, 78)), probe.child_scissor);
 }
 
 test "render: overflow clip spares owner shadow and stops at border inner edge (plain node)" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(320, 240);
     const child_color = Color.rgba(79, 70, 229, 255);
@@ -19162,7 +19732,7 @@ test "render: overflow clip spares owner shadow and stops at border inner edge (
 }
 
 test "render: composited owner overflow clip spares owner shadow and stops at border inner edge, fresh and cached" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.setViewport(320, 240);
     const child_color = Color.rgba(79, 70, 229, 255);
@@ -19173,13 +19743,13 @@ test "render: composited owner overflow clip spares owner shadow and stops at bo
     _ = cx.render();
     try std.testing.expect(panel.meta.per_frame.caches.commands.promoted != null);
     try expectOwnClipContract(cx, child_color);
-    // compositor apply_clip 不得取 owner 自己的 clip（它会连阴影一起裁）
+    // compositor apply_clip must not use owner's own clip (would clip owner shadow too)
     for (cx.layer_tree.frame_ops.items) |op| switch (op) {
         .apply_clip => |clip| try std.testing.expect(clip.bounds.w != 120 or clip.bounds.h != 80),
         else => {},
     };
 
-    // promoted cache 命中帧：整段替放必须带上 children 包围 token
+    // promoted cache hit frame: entire segment replacement must include children wrap token
     cx.perf.render_cache_hit = 0;
     cx.frame_time_ms = 16.0;
     panel.style.translate_x = 42;
@@ -19192,7 +19762,7 @@ test "render: composited owner overflow clip spares owner shadow and stops at bo
     try std.testing.expectEqual(@as(?ui.ComputedRect, ui.ComputedRect.init(43, 41, 118, 78)), probe.child_scissor);
 }
 
-// ── display: none（框架原生隐藏：布局 / 绘制 / 命中 / 焦点 / 无障碍 一致退出）──
+// ── display: none (framework-native hiding: layout/render/hit/focus/a11y all excluded) ──
 
 const DisplayNoneFixture = struct {
     root: *Node,
@@ -19210,8 +19780,8 @@ fn displayNoneFixture(cx: *Cx) !DisplayNoneFixture {
     const a = try ui.box(cx, .{ .width = .{ .px = 50 }, .height = .{ .px = 40 }, .background = Color.hex(0xFF0000) }, .{});
     const b = try ui.box(cx, .{ .width = .{ .px = 50 }, .height = .{ .px = 40 }, .background = Color.hex(0x00FF00) }, .{});
     const b_child = try ui.box(cx, .{ .width = .{ .px = 20 }, .height = .{ .px = 20 }, .background = Color.hex(0x0000FF) }, .{});
-    // c 只有 10 高：隐藏 b 后 c 左移，b_child 的陈旧几何（y 10..20）不被 c 覆盖，
-    // 命中测试才能区分"隐藏子树被剪掉"与"恰好被 c 盖住"。
+    // c height 10 only: after hiding b, c shifts left; b_child stale geometry (y 10..20) not
+    // covered by c, so hit-test distinguishes 'hidden subtree culled' from 'exactly covered'.
     const c = try ui.box(cx, .{ .width = .{ .px = 50 }, .height = .{ .px = 10 }, .background = Color.hex(0xFFFF00) }, .{});
     inline for (.{ a, b_child, c }) |n| n.behavior.interaction.focusable = true;
     b_child.behavior.interaction.a11y = .{ .role = .button, .label = "hidden" };
@@ -19232,7 +19802,7 @@ fn itemsForNode(items: []const display_list.DisplayItem, node: *const Node) usiz
 }
 
 test "display none: 不占空间不计 gap、父容器随之收缩；切回恢复" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     const f = try displayNoneFixture(cx);
     cx.layout();
@@ -19241,10 +19811,10 @@ test "display none: 不占空间不计 gap、父容器随之收缩；切回恢�
 
     f.b.setDisplay(.none);
     cx.layout();
-    try std.testing.expectApproxEqAbs(@as(f32, 60), f.c.rectFromWorldOrFallback().x, 0.01); // a + 一个 gap
+    try std.testing.expectApproxEqAbs(@as(f32, 60), f.c.rectFromWorldOrFallback().x, 0.01); // a + one gap
     try std.testing.expectApproxEqAbs(@as(f32, 110), f.root.rectFromWorldOrFallback().w, 0.01);
     _ = cx.render();
-    try std.testing.expect(!cx.hasPendingSceneWork()); // 隐藏子树不残留脏位（idle 能停帧）
+    try std.testing.expect(!cx.hasPendingSceneWork()); // hidden subtree leaves no dirty bits (idle can gate frames)
 
     f.b.setDisplay(.flex);
     cx.layout();
@@ -19253,7 +19823,7 @@ test "display none: 不占空间不计 gap、父容器随之收缩；切回恢�
 }
 
 test "display none: 子树不绘制、不命中、不进无障碍树" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     const f = try displayNoneFixture(cx);
     cx.layout();
@@ -19263,23 +19833,23 @@ test "display none: 子树不绘制、不命中、不进无障碍树" {
     const child_rect = f.b_child.rectFromWorldOrFallback();
     const bx = f.b.rectFromWorldOrFallback().x + child_rect.x + 5;
     try std.testing.expect(cx.hitTest(bx, 5) == f.b_child);
-    try std.testing.expect(!cx.accessibility_tree.get(ui.ElementId.fromRaw(f.b_child.element_id_raw)).?.state.hidden);
+    try std.testing.expect(!cx.accessibility_tree.getNode(ui.ElementId.fromRaw(f.b_child.element_id_raw)).?.state.hidden);
 
     f.b.setDisplay(.none);
     cx.layout();
     items = cx.render();
     try std.testing.expectEqual(@as(usize, 0), itemsForNode(items, f.b));
     try std.testing.expectEqual(@as(usize, 0), itemsForNode(items, f.b_child));
-    // 原位置现在是 c（c 左移补位），隐藏子树绝不命中
-    // y = 15：只有 b_child 的陈旧几何在此（c 高 10），隐藏子树必须不命中
+    // original position now c (c shifts to fill), hidden subtree never hits / y=15: only b_child
+    // stale geometry here (c height 10), hidden subtree must not hit
     const hit = cx.hitTest(f.c.rectFromWorldOrFallback().x + 5, 15);
     try std.testing.expect(hit != f.b_child and hit != f.b);
-    // 与 aria-hidden 同一语义：节点留在树上但标 hidden，bridge 不朗读。
-    try std.testing.expect(cx.accessibility_tree.get(ui.ElementId.fromRaw(f.b_child.element_id_raw)).?.state.hidden);
+    // same semantics as aria-hidden: node stays in tree but marked hidden, bridge doesn't read.
+    try std.testing.expect(cx.accessibility_tree.getNode(ui.ElementId.fromRaw(f.b_child.element_id_raw)).?.state.hidden);
 }
 
 test "display none: Tab / Shift+Tab 跳过隐藏子树里的可聚焦节点" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     const f = try displayNoneFixture(cx);
     cx.layout();
@@ -19301,33 +19871,34 @@ test "display none: Tab / Shift+Tab 跳过隐藏子树里的可聚焦节点" {
 }
 
 test "focus order: 子树增量重建后可聚焦节点保持树序（不被挪到 Tab 末尾）" {
-    // 回归：rebuildDirtyRuntimeSubtrees 注销子树可聚焦节点后 appendFocusableUnsorted
-    // 追加到末尾且不重排，Tab 从 a 直接跳到 c，子树里的 b_child 被挪到最后。
-    var cx = try Cx.init(std.testing.allocator);
+    // Regression: rebuildDirtyRuntimeSubtrees unregisters subtree focusable nodes, then
+    // appendFocusableUnsorted appends to end without reordering; Tab jumps a->c, b_child moved to
+    // end.
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     const f = try displayNoneFixture(cx);
     cx.layout();
     try std.testing.expectEqualSlices(*Node, &.{ f.a, f.b_child, f.c }, cx.focus_manager.focus_order.items);
-    f.b.markRuntimeIndexDirty(); // 触发 b 子树的运行时增量重建（rebuildDirtyRuntimeSubtrees）
-    _ = cx.render(); // 走完整一帧：纯 layout() 在无布局脏时是快路径，不重建运行时索引
+    f.b.markRuntimeIndexDirty(); // trigger b subtree runtime incremental rebuild (rebuildDirtyRuntimeSubtrees)
+    _ = cx.render(); // full frame: pure layout() on clean is fast path, no runtime index rebuild
     try std.testing.expectEqualSlices(*Node, &.{ f.a, f.b_child, f.c }, cx.focus_manager.focus_order.items);
 }
 
 test "Node.setTint：icon 表与 image 两种存储都改到，无图形内容返回 false" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     const red = Color.hex(0xFF0000);
     const blue = Color.hex(0x0000FF);
 
-    // 带 icon_id 的资源 -> icon 表
+    // resource with icon_id -> icon table
     const icon_node = try ui.iconTint(cx, ui.svg_assets.common.star, red, .{ .width = .{ .px = 16 }, .height = .{ .px = 16 } });
     defer cx.freeNode(icon_node);
     try std.testing.expect(icon_node.getIcon() != null);
     try std.testing.expect(icon_node.setTint(blue));
     try std.testing.expectEqual(blue, icon_node.getIcon().?.tint);
 
-    // image 存储（svgTint 对无预烘焙 rep 的 SVG 走的就是 image；headless 无 GPU
-    // 纹理加载器，直接用 imageTint 构造同一存储形态）
+    // image storage (svgTint for non-prebaked SVG uses image; headless has no GPU texture loader,
+    // uses imageTint to construct same storage form)
     const img_node = try ui.imageTint(cx, 7, red, .{ .width = .{ .px = 16 }, .height = .{ .px = 16 } });
     defer cx.freeNode(img_node);
     try std.testing.expect(img_node.getIcon() == null);
@@ -19337,4 +19908,30 @@ test "Node.setTint：icon 表与 image 两种存储都改到，无图形内容�
     const plain = try ui.box(cx, .{}, .{});
     defer cx.freeNode(plain);
     try std.testing.expect(!plain.setTint(blue));
+}
+
+test "降低透明度：玻璃变成不透明磨砂（a11y 主体 242、保留 16% 色度；折射 / 扭曲 / 放大归零，模糊与高光保留），关闭后原样" {
+    const prefs = @import("../a11y/preferences.zig");
+    const saved = prefs.current();
+    defer prefs.set(saved);
+    const gp = ui.GlassParams{ .backdrop_blur = 12, .refraction_level = 0.8, .warp_gain = 2, .magnification = 0.5, .specular_opacity = 0.4 };
+
+    prefs.set(.{});
+    const normal = gp.resolve();
+    try std.testing.expectEqual(@as(f32, 12), normal.backdrop_blur);
+    try std.testing.expectEqual(@as(f32, 0.8), normal.refraction_level);
+
+    // native measurement (native_tint_backdrop.swift): subject becomes opaque frosted at brightness
+    // 242, retains 16% background saturation; subject color from glass-blurred background; material
+    // highlight and shadow retained
+    prefs.set(.{ .reduce_transparency = true });
+    const frosted = gp.resolve();
+    try std.testing.expectEqual(@as(f32, 12), frosted.backdrop_blur);
+    try std.testing.expectEqual(@as(f32, 1), frosted.a11y[0]);
+    try std.testing.expectApproxEqAbs(@as(f32, 242.0 / 255.0), frosted.a11y[1], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.16), frosted.a11y[3], 1e-6);
+    try std.testing.expectEqual(@as(f32, 0), frosted.refraction_level);
+    try std.testing.expectEqual(@as(f32, 0), frosted.warp_gain);
+    try std.testing.expectEqual(@as(f32, 0), frosted.magnification);
+    try std.testing.expectEqual(normal.specular_opacity, frosted.specular_opacity);
 }

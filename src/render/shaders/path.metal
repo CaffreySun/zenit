@@ -1,42 +1,82 @@
-/// Path Fill Shader (D5: 含边缘抗锯齿)
+/// Path Fill Shader (with edge anti-aliasing)
 ///
-/// 顶点格式：(position.xy, alpha_scale)
-///   - 填充三角形：alpha_scale = 1.0
-///   - AA fringe 三角形：内侧顶点 alpha_scale = 1.0，外侧顶点 alpha_scale = 0.0
+/// Vertex format: (position.xy, alpha_scale)
+///   - fill triangles: alpha_scale = 1.0
+///   - AA fringe triangles: inner verts alpha_scale = 1.0, outer verts alpha_scale = 0.0
 ///
-/// 通过 fringe strip 沿多边形轮廓软化边缘（约 0.5-1.0 像素宽）。
-/// 使用 buffer(0) 直接访问顶点（与 SDF/Image renderer 保持一致，无需 VertexDescriptor）。
+/// Edges are softened (~0.5-1.0 px wide) by a fringe strip along the polygon boundary. Vertices are
+/// read directly via buffer(0) (consistent with SDF/Image renderer, no VertexDescriptor needed).
 
 #include <metal_stdlib>
 using namespace metal;
 
 struct PathUniforms {
-    float2 viewport_size;   // 逻辑像素视口尺寸
-    float  scale_factor;    // Retina 比例（1.0 或 2.0）
+    float2 viewport_size; // logical pixel viewport size
+    float  scale_factor; // Retina scale (1.0 or 2.0)
     uint   draw_mode;       // 0 = triangles, 1 = polygon fill
-    float4 color;           // draw color（通过 uniforms 传入）
-    float4 rect;            // bbox x,y,w,h（逻辑像素）
+    float4 color; // draw color (passed via uniforms)
+    float4 rect; // bbox x,y,w,h (logical pixels)
     uint   fill_rule;       // 0 = evenodd, 1 = nonzero
     uint   point_count;
     uint   contour_count;
     uint   _pad0;
     uint   contour_end_points[8];
     float2 polygon_points[32];
-    // shape clip mask（与 sdf/text/image/icon pipeline 对齐；path 只支持
-    // kind 0=none / 1=rounded_rect / 2=ellipse，polygon clip 对 path 不生效）
-    float4 clip_rect;       // 逻辑像素 x,y,w,h
+    // shape clip mask (align with sdf/text/image/icon pipeline; path only supports kind 0=none /
+    // 1=rounded_rect / 2=ellipse, polygon clip not effective for path)
+    float4 clip_rect; // logical pixels x,y,w,h
     float  clip_radius;
     uint   clip_shape_kind;
     uint   _pad1;
     uint   _pad2;
+    // draw_mode 2: radial/conic gradient per fragment over `rect`.
+    uint   grad_dir;
+    uint   grad_stop_count;
+    float2 grad_center;
+    float  grad_angle;
+    uint   _pad3;
+    uint   _pad4;
+    uint   _pad5;
+    float4 grad_colors[16];
+    float  grad_positions[16];
 };
+
+/// Same t as FillGradient.tAt (4 = radial, 5 = conic) on bounds-normalized uv.
+float path_gradient_t(float2 uv, constant PathUniforms& u) {
+    const float2 d = uv - u.grad_center;
+    if (u.grad_dir == 4u) return clamp(length(d) * 2.0, 0.0, 1.0);
+    const float tau = 6.28318530718;
+    float ang = atan2(d.y, d.x) - u.grad_angle;
+    ang = ang - tau * floor(ang / tau);
+    return ang / tau;
+}
+
+/// Same stop interpolation as FillGradient.colorAt (pad).
+float4 path_gradient_color(float t_in, constant PathUniforms& u) {
+    const uint n = min(u.grad_stop_count, 16u);
+    if (n == 0u) return float4(0.0);
+    if (n == 1u) return u.grad_colors[0];
+    const float t = clamp(t_in, 0.0, 1.0);
+    if (t <= u.grad_positions[0]) return u.grad_colors[0];
+    float4 result = u.grad_colors[n - 1u];
+    bool found = false;
+    for (uint i = 1u; i < n; i++) {
+        if (!found && t <= u.grad_positions[i]) {
+            const float span = u.grad_positions[i] - u.grad_positions[i - 1u];
+            const float k = span > 1e-6 ? (t - u.grad_positions[i - 1u]) / span : 0.0;
+            result = mix(u.grad_colors[i - 1u], u.grad_colors[i], k);
+            found = true;
+        }
+    }
+    return result;
+}
 
 struct PathVertexIn {
     float x;
     float y;
     float alpha_scale;
-    // linear RGB + alpha（非预乘）。packed_float4 保持 4 字节对齐，
-    // 与 CPU 端 28 字节 extern struct 布局一致（float4 会被对齐到 16）。
+    // linear RGB + alpha (unpremultiplied). packed_float4 maintains 4-byte alignment, consistent
+    // with CPU side 28-byte extern struct layout (float4 aligned to 16).
     packed_float4 color;
 };
 
@@ -46,7 +86,7 @@ struct PathVertexOut {
     float2 local_pos;
 };
 
-/// 将逻辑像素坐标转换为 NDC（clip space）
+/// convert logical pixel coords to NDC (clip space)
 float4 to_clip(float2 pos, float2 vp_size) {
     float x = (pos.x / vp_size.x) * 2.0 - 1.0;
     float y = 1.0 - (pos.y / vp_size.y) * 2.0;
@@ -62,8 +102,8 @@ vertex PathVertexOut path_vertex_main(
     PathVertexOut out;
     out.position = to_clip(float2(v.x, v.y), u.viewport_size);
     out.local_pos = float2(v.x - u.rect.x, v.y - u.rect.y);
-    // 颜色 per-vertex（CPU 端已做 sRGB→linear），使 triangles draw call 可合批；
-    // polygon_fill 分支的 fragment 仍读 u.color。alpha_scale 用于 AA fringe。
+    // color per-vertex (CPU side already sRGB->linear), enables draw call batching; polygon_fill
+    // branch fragment still reads u.color. alpha_scale for AA fringe.
     float4 vcolor = float4(v.color);
     float a = vcolor.a * v.alpha_scale;
     out.fill_color = float4(vcolor.rgb * a, a);
@@ -141,7 +181,7 @@ float sdf_ellipse_path(float2 p, float2 half_size) {
     return d * min(safe.x, safe.y);
 }
 
-/// screen_pos 为 device px（fragment [[position]]）；clip_rect 为逻辑像素。
+/// screen_pos is device px (fragment [[position]]); clip_rect logical pixels.
 float shape_clip_alpha_path(float2 screen_pos, constant PathUniforms& u) {
     if (u.clip_shape_kind == 0u) {
         return 1.0;
@@ -191,6 +231,11 @@ fragment float4 path_fragment_main(PathVertexOut in [[stage_in]], constant PathU
         const float signed_dist = inside ? -min_dist : min_dist;
         const float alpha = smoothstep(aa, -aa, signed_dist) * u.color.a * clip_alpha;
         return float4(u.color.rgb * alpha, alpha);
+    }
+    if (u.draw_mode == 2u) {
+        const float4 g = path_gradient_color(path_gradient_t(in.local_pos / max(u.rect.zw, float2(1e-6)), u), u);
+        const float a = g.a * in.fill_color.a * clip_alpha;
+        return float4(g.rgb * a, a);
     }
     return in.fill_color * clip_alpha;
 }

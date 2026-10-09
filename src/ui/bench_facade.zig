@@ -1,12 +1,12 @@
-//! v0.2 bench facade，把 bench 需要的所有 zenit 内部类型从一个 module 导出。
+//! Bench facade: exports all zenit internal types the bench needs from one module.
 //!
-//! 必须放在 src/ui/ 内部（zig 0.15 module strict path：facade module 不能
-//! 跨上级目录 import）。bench main 通过此 facade module 访问 element_table /
-//! paint_table 等，避免 element_id.zig 被多个 module 重复 import 冲突。
+//! Must live inside src/ui/ (zig 0.15 module strict paths: a facade can't import parent dirs).
+//! Bench main reaches element_table / paint_table etc. through this facade, avoiding element_id.zig
+//! multi-import conflicts.
 //!
-//! 加 frame-level scenario bench 支持，re-export Cx + ui builders。
-//! 要求 build.zig 给 zenit_facade_bench_module 注入 system_sdk/icon_ir/
-//! text_core/trace/platform 等 sub-import（与 ui_module 同构）。
+//! Also re-exports Cx + ui builders for frame-level scenario benches. Requires build.zig to inject
+//! system_sdk/icon_ir/text_core/trace/platform etc. sub-imports into zenit_facade_bench_module
+//! (same as ui_module).
 
 pub const element_id = @import("core/element_id.zig");
 pub const ElementId = element_id.ElementId;
@@ -36,9 +36,9 @@ pub const LayoutTable = layout_table_mod.LayoutTable;
 pub const LayoutData = layout_table_mod.LayoutData;
 pub const Size2D = layout_constraint.Size2D;
 
-// PropertyTree（Scroll 部分），注意 property_tree.zig 链 types.zig 链
-// animation/easing 跨目录 import，bench facade 无法访问完整版；只暴露 ScrollNode
-// 类型本身（无依赖的 enum/struct）。bench 测 nodes 是逻辑表达式不需要真 PropertyTree。
+// PropertyTree (Scroll part), note property_tree.zig links types.zig links animation/easing
+// cross-dir import, bench facade can't access full version; only expose ScrollNode type itself
+// (enum/struct with no deps). bench tests nodes logic expr doesn't need real PropertyTree.
 pub const PropertyScrollNode = struct {
     parent: u32 = 0xFFFFFFFF,
     transform_id: u32 = 0xFFFFFFFF,
@@ -52,9 +52,9 @@ pub const PropertyScrollNode = struct {
     is_scrolling: bool = false,
 };
 
-// v0.2-P4 注：layer_tree.zig 链 property_tree -> types -> animation/easing 等
-// 跨目录 import，bench module strict path 不可达。layer_tree 真 bench 等 v0.3
-// 主路径切换时通过 ui module 测。当前 bench 只能测**纯 enum/packed struct** 部分。
+// v0.2-P4 note: layer_tree.zig links property_tree -> types -> animation/easing etc. cross-dir
+// import, bench module strict path unreachable. layer_tree true bench waits v0.3 main path switch
+// via ui module. Current bench can only test **pure enum/packed struct** parts.
 
 pub const gpu_draw_mod = @import("core/gpu_draw.zig");
 pub const GpuDraw = gpu_draw_mod.GpuDraw;
@@ -75,6 +75,7 @@ pub const a11y_tree_mod_facade = @import("a11y/tree.zig");
 pub const AccessibilityTree = a11y_tree_mod_facade.AccessibilityTree;
 pub const A11yNode = a11y_tree_mod_facade.A11yNode;
 pub const A11yDirtyFlag = a11y_tree_mod_facade.A11yDirtyFlag;
+pub const AXId = a11y_tree_mod_facade.AXId;
 pub const A11yRole = a11y_tree_mod_facade.Role;
 
 pub const gesture_mod = @import("input/gesture_recognizer.zig");
@@ -83,20 +84,16 @@ pub const GestureKind = gesture_mod.GestureKind;
 pub const GestureState = gesture_mod.GestureState;
 pub const Recognizer = gesture_mod.Recognizer;
 
-pub const controlled_mod = @import("components/controlled.zig");
-pub const ControlledProp = controlled_mod.ControlledProp;
-
 pub const select_headless_mod = @import("components/select_headless/state_machine.zig");
 
-// v0.8 §2.2 frame_select_1k_keyboard_pagedown 需要完整 mount 路径 (Popover +
-// VirtualList + Scope) 来跑真 frame-level bench
+// v0.8 §2.2 frame_select_1k_keyboard_pagedown needs full mount path (Popover + VirtualList + Scope)
+// to run true frame-level bench
 pub const select_headless_mount = @import("components/select_headless/mod.zig");
 pub const Scope = @import("reactive.zig").Scope;
 
-// re-export Cx + ui builders so bench
-// main 可以构 real frame (build -> layout -> render -> encode)。
-// 需要 build.zig 给 zenit_facade_bench_module 注入 system_sdk/icon_ir/
-// text_core/trace/platform sub-imports（参见 ui_module 的依赖列表）。
+// re-export Cx + ui builders so bench main can build real frame (build -> layout -> render ->
+// encode). Requires build.zig inject system_sdk/icon_ir/text_core/trace/platform sub-imports into
+// zenit_facade_bench_module (see ui_module dependency list).
 pub const ui_core = @import("core.zig");
 pub const Cx = ui_core.Cx;
 pub const Node = ui_core.Node;
@@ -116,8 +113,8 @@ pub const encodeStream = display_item_encode.encodeStream;
 pub const maxBatchableRun = display_item_encode.maxBatchableRun;
 pub const pipelineForKind = display_item_encode.pipelineForKind;
 
-// 把 PromotionHint 复制一份到 facade（不依赖 layer_tree.zig）
-// 注意：与 layer_tree.zig::PromotionHint 字段结构必须保持同步
+// copy PromotionHint to facade (independent of layer_tree.zig) Note: must keep field structure in
+// sync with layer_tree.zig::PromotionHint
 pub const PromotionReasonForBench = enum(u8) {
     root,
     transform_animating,

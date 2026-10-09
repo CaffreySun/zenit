@@ -1,27 +1,27 @@
-/// AnimationManager，全局动画管理器
+/// AnimationManager: global animation controller
 ///
-/// 管理全局活跃的 Timeline，提供全局 pause/timeScale 控制。
+/// Manages active Timelines globally; provides global pause/timeScale control.
 ///
-/// 现状：**尚未接入 Cx**，不存在 `cx.animation_manager` 字段，框架渲染
-/// 循环不会自动 tick，仓内也没有生产代码注册 Timeline。使用者需要自行
-/// 持有 manager 实例并每帧调用 tick(dt)。
+/// Current status: **not yet integrated into Cx**; no `cx.animation_manager` field exists, and the
+/// frame loop does not automatically tick. No production code registers Timelines yet.
+/// Users must hold the manager instance and call tick(dt) each frame.
 ///
-/// 注册关系是借用：不拥有 Timeline，但 Timeline.deinit 会自动解除所有
-/// manager 连接。manager.deinit 同样先解除连接。两者注册期间须地址稳定，
-/// 释放 Timeline 前必须调用 deinit，不能直接释放裸指针。
+/// Registration is borrowed: does not own Timelines, but Timeline.deinit() automatically
+/// removes all manager links. manager.deinit() also disconnects first. Addresses must remain stable
+/// during registration. Call deinit before freeing a Timeline; do not free raw pointers directly.
 ///
-/// 用法:
+/// Usage:
 /// ```zig
 /// var mgr = AnimationManager.init(allocator);
 /// defer mgr.deinit();
 ///
 /// try mgr.register(&my_timeline);
-/// // 每帧: 使用者自行驱动
+/// // Per-frame: user drives
 /// _ = mgr.tick(dt);
 ///
-/// // 全局控制
+/// // Global control
 /// mgr.pauseAll();
-/// mgr.setGlobalTimeScale(0.5); // 慢动作
+/// mgr.setGlobalTimeScale(0.5); // slow motion
 /// mgr.resumeAll();
 /// ```
 const std = @import("std");
@@ -178,9 +178,9 @@ pub const AnimationManager = struct {
     }
 };
 
-// ========== 测试 ==========
+// ========== Tests ==========
 
-/// 测试辅助：设置全局模拟时间
+/// Test helper: set global simulated time
 fn setTestTime(ms: f64) void {
     render_engine.current_frame_time_ms = ms;
     render_engine.current_frame_dt_ms = 1000.0 / 60.0;
@@ -209,7 +209,7 @@ test "AnimationManager: basic lifecycle" {
 
     tl.play();
 
-    // tick 到完成
+    // Tick to completion
     const dt: f32 = 1.0 / 60.0;
     var now: f64 = 1000.0;
     var i: usize = 0;
@@ -219,7 +219,7 @@ test "AnimationManager: basic lifecycle" {
         if (!mgr.tick(dt)) break;
     }
 
-    // 完成后自动移除
+    // Auto-remove after completion
     try std.testing.expectEqual(@as(usize, 0), mgr.activeCount());
 }
 
@@ -252,11 +252,11 @@ test "AnimationManager: global pause" {
     setTestTime(1750.0);
     render_engine.current_frame_dt_ms = 500.0;
     _ = mgr.tick(0.5);
-    try std.testing.expectEqual(value_before, ctrl1.value); // 暂停期间不变
+    try std.testing.expectEqual(value_before, ctrl1.value); // Unchanged during pause
 
     mgr.resumeAll();
     setTestTime(2000.0);
     render_engine.current_frame_dt_ms = 250.0;
     _ = mgr.tick(0.25);
-    try std.testing.expect(ctrl1.value > value_before); // 恢复后继续
+    try std.testing.expect(ctrl1.value > value_before); // Resumes after unpause
 }

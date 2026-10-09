@@ -23,9 +23,9 @@ pub const SystemSdk = struct {
     capabilities: capabilities_mod.Capabilities,
     event_queue: events_mod.EventQueue,
     owner_thread_id: std.Thread.Id,
-    /// runtime 正在遍历 events() 借出的切片。此期间重入 pump() 会先
-    /// clear() 释放正被遍历的 payload（UAF），用断言把契约钉死
-    /// （对齐 MultiWindowApp 的 iterating 先例）。
+    /// Runtime is iterating slice from events(). Reentrant pump() in meantime
+    /// would clear() release iterated payload (UAF); assert pins contract
+    /// (align with MultiWindowApp's iterating precedent).
     dispatching: bool = false,
 
     pub fn init(
@@ -64,7 +64,7 @@ pub const SystemSdk = struct {
 
     pub fn pump(self: *SystemSdk, timeout_ms: u32) SdkError!backend_mod.PumpResult {
         try self.ensureOwnerThread();
-        // events() 切片遍历期间禁止重入：clear() 会释放正被遍历的 payload
+        // No reentrancy during events() slice iteration: clear() releases payload being iterated.
         std.debug.assert(!self.dispatching);
         self.event_queue.clear();
         return self.vtable.pump_events(self.backend_ctx, &self.event_queue, timeout_ms);
@@ -86,9 +86,9 @@ pub const SystemSdk = struct {
         try func(self.backend_ctx);
     }
 
-    /// 静默同步输入状态（不产生事件）。
-    /// 在 liveResize 等系统代理鼠标的场景结束后调用，
-    /// 防止恢复轮询时 emitMouseButtonDelta 产生虚假事件。
+    /// Silently sync input state (no events).
+    /// Call after system-proxied mouse scenarios like liveResize end;
+    /// prevent false events from emitMouseButtonDelta on polling resume.
     pub fn syncInputState(self: *SystemSdk) void {
         std.debug.assert(self.owner_thread_id == std.Thread.getCurrentId());
         if (self.vtable.sync_input_state) |func| {
@@ -110,7 +110,7 @@ pub const SystemSdk = struct {
         return api.get_text(self.backend_ctx, buffer);
     }
 
-    /// 动态分配版：查询剪贴板文本长度后按需分配缓冲区
+    /// Dynamic allocation version: query clipboard text length, alloc buffer on demand.
     pub fn clipboardGetTextAlloc(self: *SystemSdk, alloc: Allocator) SdkError!?[]const u8 {
         try self.ensureOwnerThread();
         if (!self.capabilities.has(.clipboard)) return SdkError.NotSupported;
@@ -119,8 +119,9 @@ pub const SystemSdk = struct {
         return self.readClipboardAlloc(alloc, get_len, api.get_text);
     }
 
-    /// 富文本写入：plain text + 可选 HTML 写入同一 pasteboard item 的多 representation。
-    /// RTF 暂不支持（macOS HTML->RTF 依赖 WebKit 主线程转换，见 backend 注释）。
+    /// Rich text write: plain text + optional HTML as multiple representations
+    /// in one pasteboard item. RTF not supported (macOS HTML->RTF needs WebKit
+    /// main-thread conversion; see backend comment).
     pub fn clipboardSetRichText(self: *SystemSdk, rich: backend_mod.ClipboardRichText) SdkError!void {
         try self.ensureOwnerThread();
         if (!self.capabilities.has(.clipboard)) return SdkError.NotSupported;
@@ -130,8 +131,8 @@ pub const SystemSdk = struct {
         try set_rich(self.backend_ctx, rich);
     }
 
-    /// 读取剪贴板 HTML representation（动态分配）。null = 剪贴板无 HTML；
-    /// 是否回退 plain text（clipboardGetTextAlloc）由调用方决定。
+    /// Read clipboard HTML representation (dynamic alloc). null = no HTML;
+    /// caller decides whether to fall back to plain text (clipboardGetTextAlloc).
     pub fn clipboardGetHtmlAlloc(self: *SystemSdk, alloc: Allocator) SdkError!?[]const u8 {
         try self.ensureOwnerThread();
         if (!self.capabilities.has(.clipboard)) return SdkError.NotSupported;
@@ -181,7 +182,7 @@ pub const SystemSdk = struct {
         unreachable;
     }
 
-    /// 探测剪贴板可提供的类型。不解码，成本极低，可在每次 Cmd+V 时调用。
+    /// Probe clipboard for available types. No decoding; low cost; can call every Cmd+V.
     pub fn clipboardProbe(self: *SystemSdk) SdkError!ClipboardKinds {
         try self.ensureOwnerThread();
         if (!self.capabilities.has(.clipboard_image)) return SdkError.NotSupported;
@@ -195,7 +196,7 @@ pub const SystemSdk = struct {
         };
     }
 
-    /// 剪贴板中的图片项数（支持 Finder 多选复制）
+    /// Count clipboard image items (supports Finder multi-select copy).
     pub fn clipboardImageCount(self: *SystemSdk) SdkError!usize {
         try self.ensureOwnerThread();
         if (!self.capabilities.has(.clipboard_image)) return SdkError.NotSupported;
@@ -204,8 +205,8 @@ pub const SystemSdk = struct {
         return image_count(self.backend_ctx);
     }
 
-    /// 读取第 index 项剪贴板图片并解码为 premultiplied RGBA8。
-    /// null = 该 index 无图片。返回值用 `ClipboardImage.deinit(alloc)` 释放。
+    /// Read and decode clipboard image at index to premultiplied RGBA8.
+    /// null = no image at index. Release with `ClipboardImage.deinit(alloc)`.
     pub fn clipboardGetImageAlloc(self: *SystemSdk, alloc: Allocator, index: usize) SdkError!?ClipboardImage {
         try self.ensureOwnerThread();
         if (!self.capabilities.has(.clipboard_image)) return SdkError.NotSupported;
@@ -214,7 +215,7 @@ pub const SystemSdk = struct {
         return get_image(self.backend_ctx, alloc, index);
     }
 
-    /// 写入 PNG 编码图片到剪贴板（清空原内容）
+    /// Write PNG-encoded image to clipboard (clears prior content).
     pub fn clipboardSetImagePng(self: *SystemSdk, png_bytes: []const u8) SdkError!void {
         try self.ensureOwnerThread();
         if (!self.capabilities.has(.clipboard_image)) return SdkError.NotSupported;
@@ -223,7 +224,8 @@ pub const SystemSdk = struct {
         return set_image(self.backend_ctx, png_bytes);
     }
 
-    /// 弹出原生文件对话框（同步阻塞）。返回写入 buffer 的路径 slice；null = 用户取消。
+    /// Pop native file dialog (sync blocking). Returns path slice written to buffer;
+    /// null = user cancelled.
     pub fn runDialog(self: *SystemSdk, request: backend_mod.DialogRequest, buffer: []u8) SdkError!?[]const u8 {
         try self.ensureOwnerThread();
         if (!self.capabilities.has(.file_dialog)) return SdkError.NotSupported;
@@ -239,7 +241,7 @@ pub const SystemSdk = struct {
         try menu.set_model(self.backend_ctx, model);
     }
 
-    /// Begin an AppKit drag session from the current pointer event. The request
+    /// Begin a native drag session from the current pointer event. The request
     /// is copied synchronously. Completion/cancellation arrives as `.drag`
     /// kind 4 with the returned `source_token`; operation 0 means cancelled.
     pub fn beginDrag(self: *SystemSdk, window_id: events_mod.WindowId, request: backend_mod.DragRequest) SdkError!u64 {
@@ -251,7 +253,7 @@ pub const SystemSdk = struct {
     }
 
     /// Set the window-level destination operation policy. Empty operations
-    /// reject incoming drags; AppKit still intersects this with source policy
+    /// reject incoming drags; the platform intersects this with source policy
     /// and keyboard modifiers.
     pub fn setDragTargetOperations(self: *SystemSdk, window_id: events_mod.WindowId, operations: backend_mod.DragOperations) SdkError!void {
         try self.ensureOwnerThread();
@@ -288,24 +290,26 @@ pub const SystemSdk = struct {
         try api.set_shape(self.backend_ctx, window_id, shape);
     }
 
-    /// 位图光标是否可用（vtable.cursor.set_custom 存在）。UI 层用它决定
-    /// `.custom` 形状是下发位图还是降级到固定形状，避免每次切换都试错。
+    /// Bitmap cursor available (vtable.cursor.set_custom exists). UI layer uses
+    /// to decide if `.custom` shape sends bitmap or falls back to fixed shape;
+    /// avoid trial-and-error per switch.
     pub fn customCursorSupported(self: *const SystemSdk) bool {
         const api = self.vtable.cursor orelse return false;
         return api.set_custom != null;
     }
 
     pub const CustomCursorRequest = struct {
-        /// 预乘 RGBA8，长度必须等于 width*height*4，调用期借用
+        /// Premultiplied RGBA8; length must equal width*height*4; borrowed during call.
         rgba: []const u8,
         width: u32,
         height: u32,
-        /// 设备像素比（width/scale = 逻辑宽度）
+        /// Device pixel ratio (width/scale = logical width).
         scale: f32,
-        /// 热点，左上原点像素坐标
+        /// Hotspot: top-left origin pixel coords.
         hot_x: f32,
         hot_y: f32,
-        /// 内容寻址键：同一位图必须同键；后端按键缓存原生光标对象
+        /// Content-addressed key: same bitmap must have same key; backend caches
+        /// native cursor objects by key.
         key: u64,
     };
 
@@ -367,15 +371,15 @@ pub const SystemSdk = struct {
 };
 
 const MockBackend = struct {
-    clipboard_store: [256]u8 = [_]u8{0} ** 256,
+    clipboard_store: [256]u8 = @as([256]u8, @splat(0)),
     clipboard_len: usize = 0,
-    clipboard_html_store: [256]u8 = [_]u8{0} ** 256,
+    clipboard_html_store: [256]u8 = @as([256]u8, @splat(0)),
     clipboard_html_len: usize = 0,
     redraw_requests: u32 = 0,
     announce_requests: u32 = 0,
     focus_notifications: u32 = 0,
     property_notifications: u32 = 0,
-    last_announcement: [128]u8 = [_]u8{0} ** 128,
+    last_announcement: [128]u8 = @as([128]u8, @splat(0)),
     last_announcement_len: usize = 0,
     last_focus_snapshot: accessibility_mod.NodeSnapshot = .{},
     last_property_snapshot: accessibility_mod.NodeSnapshot = .{},
@@ -533,20 +537,20 @@ test "SystemSdk: rich clipboard writes text+HTML, HTML read falls back to null" 
     var sdk = SystemSdk.init(std.testing.allocator, &backend, &vtable, .{ .clipboard = true });
     defer sdk.deinit();
 
-    // 只有 plain text：HTML 读取返回 null
+    // Plain text only: HTML read returns null.
     try sdk.clipboardSetRichText(.{ .text = "plain" });
     try std.testing.expectEqual(@as(?[]const u8, null), try sdk.clipboardGetHtmlAlloc(std.testing.allocator));
     var buf: [16]u8 = undefined;
     try std.testing.expectEqualStrings("plain", try sdk.clipboardGetText(&buf));
 
-    // text + HTML 双 representation
+    // text + HTML dual representations.
     try sdk.clipboardSetRichText(.{ .text = "hello", .html = "<b>hello</b>" });
     const html = (try sdk.clipboardGetHtmlAlloc(std.testing.allocator)).?;
     defer std.testing.allocator.free(html);
     try std.testing.expectEqualStrings("<b>hello</b>", html);
     try std.testing.expectEqualStrings("hello", try sdk.clipboardGetText(&buf));
 
-    // 参数校验在 SDK 层拦截
+    // Parameter validation intercepted at SDK layer.
     try std.testing.expectError(SdkError.InvalidState, sdk.clipboardSetRichText(.{ .text = "" }));
     try std.testing.expectError(SdkError.InvalidState, sdk.clipboardSetRichText(.{ .text = "x", .html = "" }));
 }
@@ -801,7 +805,7 @@ test "SystemSdk: accessibility methods route through backend" {
 
 const SequencedBackend = struct {
     call_count: u32 = 0,
-    text_storage: [16]u8 = [_]u8{0} ** 16,
+    text_storage: [16]u8 = @as([16]u8, @splat(0)),
     text_len: usize = 0,
 
     fn deinit(_: *anyopaque, _: Allocator) void {}
@@ -920,7 +924,7 @@ test "SystemSdk: pump clears queue and preserves event order per cycle" {
 }
 
 const DragMockBackend = struct {
-    copied_payload: [64]u8 = [_]u8{0} ** 64,
+    copied_payload: [64]u8 = @as([64]u8, @splat(0)),
     copied_len: usize = 0,
     window_id: events_mod.WindowId = 0,
     target_operations: backend_mod.DragOperations = .{},

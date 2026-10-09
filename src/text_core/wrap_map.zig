@@ -1,9 +1,9 @@
-/// WrapMap，通用 Soft Wrap 映射
+/// WrapMap: universal soft wrap mapping.
 ///
-/// 维护 buffer line -> display line 映射。每个 display line 固定行高，
-/// wrap 只改变一个 buffer line 占几个 display line。
+/// Maintains buffer line -> display line mapping. Each display line has fixed line height; wrap
+/// changes how many display lines a buffer line occupies.
 ///
-/// 泛型参数 Doc: 任何提供以下 read-only API 的文档类型:
+/// Generic parameter Doc: any doc type providing read-only API:
 ///   lineCount() -> usize
 ///   totalLength() -> usize
 ///   getLineStart(line) -> usize
@@ -11,10 +11,10 @@
 ///   getTextBuf(start, len, buf) -> ![]const u8
 ///   getTextAlloc(alloc, start, len) -> ![]const u8
 ///
-/// Phase 1B: Fenwick Tree 加速前缀和
-/// - applyEdit 行数不变时: O(K·logN) 增量更新（替代 O(N) rebuildPrefixSums）
-/// - bufferLineToDisplayLine: O(logN)（原 prefix_sums O(1)，但调用频率低）
-/// - displayLineInfo: O(logN)（原二分查找也是 O(logN)）
+/// A Fenwick tree accelerates prefix sums.
+/// - applyEdit with unchanged line count: O(K*logN) incremental update (vs O(N) rebuildPrefixSums)
+/// - bufferLineToDisplayLine: O(logN)
+/// - displayLineInfo: O(logN)
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const FenwickTree = @import("fenwick_tree.zig").FenwickTree;
@@ -32,8 +32,8 @@ fn displayLineDelta(old: u32, new: u32) i32 {
     return @intCast(std.math.clamp(delta, std.math.minInt(i32), std.math.maxInt(i32)));
 }
 
-/// 取一个 grapheme cluster 切片的首个码点（断行规则只看簇首码点，
-/// 与渲染端 text_layout.decodeUtf8 的取法一致）。
+/// Get first codepoint of a grapheme cluster slice (line break rules only look at cluster-initial
+/// codepoint, matches render side text_layout.decodeUtf8).
 fn firstCodepoint(cluster: []const u8) u21 {
     if (cluster.len == 0) return 0;
     const len = std.unicode.utf8ByteSequenceLength(cluster[0]) catch return 0xFFFD;
@@ -41,57 +41,56 @@ fn firstCodepoint(cluster: []const u8) u21 {
     return std.unicode.utf8Decode(cluster[0..len]) catch 0xFFFD;
 }
 
-/// 文本宽度测量函数（与 UIContext.measure_fn 签名一致）
+/// Text width measure function (signature matches UIContext.measure_fn).
 pub const MeasureFn = *const fn ([*]const u8, usize, f32, u16, bool) f32;
 pub const MeasureCtxFn = *const fn (*anyopaque, [*]const u8, usize, f32, u16, bool) f32;
 
-/// 单个 buffer line 的 wrap 信息
+/// Wrap info for single buffer line.
 pub const WrapEntry = struct {
-    /// wrap 断点字节偏移列表（相对于行首）
-    /// N 个断点 -> N+1 个 display line
+    /// Wrap break byte offset list (relative to line start). N breaks -> N+1 display lines.
     breaks: []u32 = &.{},
-    /// 断点是否由 WrapMap 分配（需要 free）
+    /// Breaks allocated by WrapMap (need free).
     owned: bool = false,
-    /// 宽度无关的预处理段缓存，用于宽度变化时避免重新扫全文
+    /// Width-independent preprocessing segment cache; avoid full-text rescan when width changes.
     prepared: ?*PreparedWrapLine = null,
-    /// 本行的 breaks 是否为 interpolated 占位（wrap 未精确计算，下一帧 rewrap）
+    /// Line breaks are interpolated placeholder (wrap not precisely computed, rewrap next frame).
     is_interpolated: bool = false,
 };
 
-/// 编辑 / rewrap 产生的脏区 patch。下游（DisplaySnapshot / HighlightSnapshot）
-/// 消费此 patch 决定如何失效。
+/// Edit / rewrap dirty-zone patch. Downstream (DisplaySnapshot /
+/// HighlightSnapshot) consume patch decide invalidation.
 pub const WrapPatch = struct {
-    /// 受影响的 buffer_line 范围（半开区间）
+    /// Affected buffer_line range (half-open).
     dirty_start_line: u32,
     dirty_end_line: u32,
-    /// display_line 总数变化（+ / -）
+    /// display_line count change (+ / -).
     display_delta: i32,
-    /// WrapMap revision（snapshot 版本号，单调递增）
+    /// WrapMap revision (snapshot version, monotone increment).
     revision: u64,
-    /// 该 patch 是由 wrap width / toggle 变化产生的（影响全文）
+    /// This patch from wrap width / toggle change (affects whole doc).
     is_global: bool = false,
 };
 
-/// Display 行信息（由 displayLineInfo 返回）
+/// Display line information (from displayLineInfo return).
 pub const DisplayLineInfo = struct {
-    /// 对应的 buffer 行号
+    /// Corresponding buffer line number.
     buffer_line: usize,
-    /// 在该 buffer line 中的 wrap 索引（0 = 首行）
+    /// Wrap index in that buffer line (0 = first line).
     wrap_index: usize,
-    /// 与当前 display line 对应的 segment 起止索引。
-    /// 当前 wrap 路径下等价于单个 wrap 段；供上层 long-line 显示层复用。
+    /// This display line's segment start/end index. Current wrap path equals
+    /// single wrap segment; for upper-layer long-line display reuse.
     segment_start_index: usize = 0,
     segment_end_index: usize = 1,
-    /// 该 display line 在 buffer line 内的起始字节偏移
+    /// This display line start byte offset within buffer line.
     byte_start: usize,
-    /// 该 display line 在 buffer line 内的结束字节偏移
+    /// This display line end byte offset within buffer line.
     byte_end: usize,
 };
 
-/// Display 坐标（buffer 坐标转换结果）
+/// Display coordinates (buffer coordinate conversion result).
 pub const DisplayPoint = struct {
     display_line: u32,
-    display_col: usize, // 相对于 display line 起始的字节偏移
+    display_col: usize, // Byte offset relative to display line start.
 };
 
 pub const BufferLineRange = struct {
@@ -104,14 +103,15 @@ pub const DisplayLineRange = struct {
     end: usize,
 };
 
-/// WrapMap，通用 Soft Wrap 映射
-/// Doc: 任何提供 lineCount/getLineStart/getLineLength/getTextBuf/getTextAlloc/totalLength 的类型
-/// 从 Doc 类型推断 snapshot 返回值的 payload 类型
-/// 位置 i 之前那个**字符**的首字节（跳过 UTF-8 continuation 字节）。
-/// wrap 断词的"CJK/emoji 之后可断"规则必须看前一字符的 lead byte,
-/// 直接看 text[i-1] 对多字节字符拿到的是 continuation（<0xE0），规则永不生效，
-/// 导致 "，后跟拉丁词" 时断点退到 "，" 之前：标点被推去下一行行首，
-/// 与渲染端的折行不一致（选区矩形/光标整段错位）。
+/// WrapMap, generic soft wrap mapping. Doc: any type providing lineCount/
+/// getLineStart/getLineLength/getTextBuf/getTextAlloc/totalLength. Infers the
+/// snapshot payload type from Doc type.
+/// Lead (first) byte of the **character** preceding position i (skipping UTF-8 continuation
+/// bytes). The wrap word-break "CJK/emoji
+/// after breakable" rule must see the previous char's lead byte; text[i-1] on a multibyte char
+/// gives a continuation byte (<0xE0), the rule never fires, and the break point retreats
+/// before punctuation ("punct followed by Latin word"): punct is pushed to the next line head,
+/// misaligning with render fold (selection rect/cursor misaligned for the whole segment).
 fn prevCharLead(text: []const u8, i: usize) u8 {
     var j = i;
     while (j > 0) {
@@ -133,7 +133,7 @@ fn SnapshotType(comptime Doc: type) type {
 }
 
 pub fn WrapMap(comptime Doc: type) type {
-    // Doc 必须提供 snapshot API 才能支持后台 rewrap
+    // Doc must provide snapshot API to support background rewrap.
     const has_snapshot = @hasDecl(Doc, "snapshot");
 
     return struct {
@@ -141,14 +141,15 @@ pub fn WrapMap(comptime Doc: type) type {
         pub const SupportsAsync = has_snapshot;
 
         allocator: Allocator,
+        io: std.Io,
         enabled: bool = false,
         wrap_width: f32 = 0,
 
-        /// 每个 buffer line 的 wrap 断点
-        line_wraps: std.ArrayListUnmanaged(WrapEntry) = .{},
+        /// Each buffer line's wrap breaks.
+        line_wraps: std.ArrayListUnmanaged(WrapEntry) = .empty,
 
-        /// Fenwick Tree: 每个 buffer line 的 display line 数作为值
-        /// prefixSum(i) = 前 i+1 个 buffer line 的 display line 总数
+        /// Fenwick Tree: each buffer line's display line count as value. prefixSum(i)
+        /// = front i+1 buffer lines' display line total.
         fenwick: ?FenwickTree = null,
 
         total_display_lines: u32 = 0,
@@ -159,37 +160,38 @@ pub fn WrapMap(comptime Doc: type) type {
         measure_ctx: ?*anyopaque = null,
         font_size: f32 = 14,
         font_weight: u16 = 400,
-        /// 等宽字体的单字符宽度（ASCII），用于快速 wrap 计算
+        /// Monospace single-char width (ASCII), used quick wrap calc.
         char_width: f32 = 0,
-        /// 是否启用精确换行（逐字符真实测量，精度高但更慢）
+        /// Enable exact wrap (per-char true measure, high precision but slower).
         precise_wrap: bool = false,
-        /// Tab 展开大小（默认 4）
+        /// Tab expand size (default 4).
         tab_size: usize = 4,
 
-        // ── Interpolation / Patch 状态 ──
-        /// snapshot 版本号：每次产生 patch（apply edit / rewrap / width change）递增
+        // ── Interpolation / Patch state ──.
+        /// Snapshot version: increment each patch (apply edit / rewrap / width
+        /// change).
         revision: u64 = 0,
-        /// 待消费的 patch（主线程每帧 takePendingPatch）
+        /// Pending patch (UI thread every frame takePendingPatch).
         pending_patch: ?WrapPatch = null,
-        /// 当前有 interpolated 行 -> 下一帧需要做精确 rewrap
+        /// Has interpolated lines -> next frame need exact rewrap.
         has_interpolated_lines: bool = false,
         /// Structural allocation failed: use a coherent 1:1 mapping until retry.
         needs_rebuild: bool = false,
 
-        // ── 后台 rewrap 状态（仅当 Doc 提供 snapshot 时启用）──
+        // ── Background rewrap state (only active when Doc provides snapshot) ──.
         bg_thread: if (has_snapshot) ?std.Thread else void = if (has_snapshot) null else {},
         bg_done: if (has_snapshot) std.atomic.Value(bool) else void = if (has_snapshot) std.atomic.Value(bool).init(false) else {},
-        /// 后台返回的 (buffer_line, breaks) 结果列表
-        bg_result: if (has_snapshot) std.ArrayListUnmanaged(BgRewrapResult) else void = if (has_snapshot) .{} else {},
-        /// 启动后台任务时的参数快照
+        /// Background thread return (buffer_line, breaks) result list.
+        bg_result: if (has_snapshot) std.ArrayListUnmanaged(BgRewrapResult) else void = if (has_snapshot) .empty else {},
+        /// Parameter snapshot when spawn task.
         bg_doc_snapshot: if (has_snapshot) ?SnapshotType(Doc) else void = if (has_snapshot) null else {},
         bg_wrap_width: f32 = 0,
         bg_wrap_columns: usize = 0,
         bg_tab_size: usize = 0,
         bg_char_width: f32 = 0,
-        /// 启动时的文档 edit_version（stale 校验）
+        /// Doc edit_version at launch (stale check).
         bg_doc_version: u64 = 0,
-        /// 启动时的 WrapMap revision（stale 校验）
+        /// WrapMap revision at launch (stale check).
         bg_base_revision: u64 = 0,
 
         pub const BgRewrapResult = struct {
@@ -197,8 +199,8 @@ pub fn WrapMap(comptime Doc: type) type {
             breaks: []u32, // owned by WrapMap.allocator
         };
 
-        pub fn init(allocator: Allocator) Self {
-            var self = Self{ .allocator = allocator };
+        pub fn init(allocator: Allocator, io: std.Io) Self {
+            var self = Self{ .allocator = allocator, .io = io };
             if (has_snapshot) {
                 self.bg_done = std.atomic.Value(bool).init(false);
             }
@@ -227,18 +229,18 @@ pub fn WrapMap(comptime Doc: type) type {
 
         // ── Patch API ──
 
-        /// 拉取并清空待消费的 patch
+        /// Pull and clear pending patch.
         pub fn takePendingPatch(self: *Self) ?WrapPatch {
             const p = self.pending_patch;
             self.pending_patch = null;
             return p;
         }
 
-        /// 合并/发出 patch
+        /// Merge/emit patch.
         fn emitPatch(self: *Self, dirty_start: u32, dirty_end: u32, display_delta: i32, is_global: bool) void {
             self.revision +%= 1;
             if (self.pending_patch) |*p| {
-                // 合并多个 patch：取范围并集 + 累加 delta
+                // Merge multiple patches: range union + cumulate delta.
                 p.dirty_start_line = @min(p.dirty_start_line, dirty_start);
                 p.dirty_end_line = @max(p.dirty_end_line, dirty_end);
                 p.display_delta +|= display_delta;
@@ -255,11 +257,10 @@ pub fn WrapMap(comptime Doc: type) type {
             }
         }
 
-        /// 设置 wrap 宽度。
-        ///
-        /// **不再同步全量重算**：只更新 width 参数 + 标记所有行 interpolated + emit global patch。
-        /// 调用方（editor_before_render）负责在下一帧调 `rewrapInterpolated(budget_us)` 做精确收敛，
-        /// 或 `startBackgroundRewrap()` 进后台。
+        /// Set wrap width. **No longer sync full recompute**: only update width
+        /// param + mark all lines interpolated + emit global patch. Caller
+        /// (editor_before_render) responsible next frame call `rewrapInterpolated
+        /// (budget_us)` exact converge, or `startBackgroundRewrap()` to background.
         pub fn setWrapWidth(self: *Self, width: f32, doc: *const Doc) void {
             if (@abs(self.wrap_width - width) < 1.0) return;
             self.wrap_width = width;
@@ -268,10 +269,9 @@ pub fn WrapMap(comptime Doc: type) type {
             self.emitPatch(0, @intCast(doc.lineCount()), 0, true);
         }
 
-        /// 启用/禁用 wrap。
-        ///
-        /// **不再同步全量重算**：启用时初始化 entries（每行 breaks=&.{} + interpolated=true），
-        /// 禁用时清空。精确 wrap 计算延迟到 `rewrapInterpolated`。
+        /// Enable/disable wrap. **No longer sync full recompute**: enable init
+        /// entries (each line breaks=&.{} + interpolated=true), disable clear. Exact
+        /// wrap calc defer to `rewrapInterpolated`.
         pub fn setEnabled(self: *Self, enabled: bool, doc: *const Doc) void {
             if (self.enabled == enabled and !self.needs_rebuild) return;
             const old_total = self.total_display_lines;
@@ -291,13 +291,13 @@ pub fn WrapMap(comptime Doc: type) type {
             self.emitPatch(0, saturatingU32(doc.lineCount()), displayLineDelta(old_total, self.total_display_lines), true);
         }
 
-        /// 把所有行标记 interpolated（wrap width 变化时使用）
+        /// Mark all lines interpolated (when wrap width changes).
         fn markAllInterpolated(self: *Self) void {
             for (self.line_wraps.items) |*entry| entry.is_interpolated = true;
             self.has_interpolated_lines = self.needs_rebuild or self.line_wraps.items.len > 0;
         }
 
-        /// 全量重算所有行
+        /// Full recompute all lines.
         pub fn rebuildAll(self: *Self, doc: *const Doc) void {
             // Publish a global patch and invalidate older background results.
             const old_total = self.total_display_lines;
@@ -306,7 +306,7 @@ pub fn WrapMap(comptime Doc: type) type {
                 self.clearAll(doc.lineCount());
                 return;
             }
-            var next: std.ArrayListUnmanaged(WrapEntry) = .{};
+            var next: std.ArrayListUnmanaged(WrapEntry) = .empty;
             next.ensureTotalCapacity(self.allocator, doc.lineCount()) catch {
                 self.clearAll(doc.lineCount());
                 self.needs_rebuild = true;
@@ -327,21 +327,21 @@ pub fn WrapMap(comptime Doc: type) type {
             self.rebuildFenwickFromWraps();
         }
 
-        /// 从 display_counts 重建 Fenwick Tree
+        /// Rebuild Fenwick Tree from display_counts.
         fn rebuildFenwick(self: *Self, display_counts: []const u32) void {
             if (self.fenwick) |*ft| ft.deinit();
             self.fenwick = FenwickTree.buildFrom(self.allocator, display_counts) catch null;
             if (self.fenwick) |ft| {
                 self.total_display_lines = ft.total();
             } else {
-                // fallback: 累加
+                // Fallback: cumulate.
                 var total: u32 = 0;
                 for (display_counts) |c| total +|= c;
                 self.total_display_lines = total;
             }
         }
 
-        /// 清空 wrap（禁用时恢复 1:1 映射）
+        /// Clear wrap (restore 1:1 when disabled).
         fn clearAll(self: *Self, line_count: usize) void {
             for (self.line_wraps.items) |*entry| self.freeWrapEntry(entry);
             self.line_wraps.clearRetainingCapacity();
@@ -352,18 +352,17 @@ pub fn WrapMap(comptime Doc: type) type {
             self.has_interpolated_lines = false;
         }
 
-        /// 增量编辑：**只做 interpolation**，不做精确 wrap 计算。
-        ///
-        /// 编辑产生的所有受影响行被标记为 `is_interpolated=true`，
-        /// breaks 保持旧值（坐标仍然可用，但 wrap 位置可能陈旧）。
-        /// 精确 wrap 交由下一帧 `rewrapInterpolated(budget_us)` 完成，
-        /// 预算不够的行交给 `startBackgroundRewrap`。
-        ///
-        /// 时间复杂度：O(K) 行数变化 + O(N) fenwick 重建（仅当行数变化时）。
-        /// 行数不变时：O(K) fenwick set（K = 受影响行数），零 wrap 计算。
+        /// Incremental edit: **only interpolate, don't compute exact wrap**. All
+        /// affected lines are marked `is_interpolated=true`, breaks keep old values (coords
+        /// usable, wrap positions might be stale). Exact wrap finishes next frame in
+        /// `rewrapInterpolated(budget_us)`; lines exceeding budget go to `startBackgroundRewrap`.
+        /// Complexity: O(K) line count change + O(N) fenwick rebuild (only when count
+        /// changes). No count change: O(K) fenwick set (K = affected lines), zero wrap
+        /// calc.
         pub fn applyEdit(self: *Self, doc: *const Doc, start_line: usize, old_line_count: usize, new_line_count: usize) void {
             if (!self.enabled) {
-                // wrap 禁用时维护 1:1 映射，只增量调整 line_wraps 数组和 fenwick
+                // When wrap disabled maintain 1:1 mapping, only incremental adjust
+                // line_wraps array and fenwick.
                 self.applyEditDisabled(doc.lineCount(), start_line, old_line_count, new_line_count);
                 return;
             }
@@ -386,7 +385,8 @@ pub fn WrapMap(comptime Doc: type) type {
             }
 
             if (old_line_count == new_line_count) {
-                // 行数不变：只标记受影响行 interpolated；wrap 不变化则 display_delta = 0
+                // Line count unchanged: only mark affected interpolated; if no wrap
+                // change then display_delta = 0.
                 const total_lines = doc.lineCount();
                 const end = @min(start_line + new_line_count, total_lines);
                 for (@min(start_line, end)..end) |i| {
@@ -395,7 +395,8 @@ pub fn WrapMap(comptime Doc: type) type {
                     }
                 }
             } else if (new_line_count > old_line_count) {
-                // 行数增加：插入空 entry + 标记整个编辑段为 interpolated
+                // Line count increase: insert empty entry + mark whole edit segment
+                // interpolated.
                 const added = new_line_count - old_line_count;
                 const insert_at = start_line + old_line_count;
                 self.line_wraps.ensureTotalCapacity(self.allocator, new_doc_lines) catch {
@@ -409,21 +410,21 @@ pub fn WrapMap(comptime Doc: type) type {
                     self.line_wraps.insert(self.allocator, insert_at + j, .{
                         .is_interpolated = true,
                     }) catch {
-                        // OOM: 回退到 rebuild（罕见）
+                        // OOM: fallback rebuild (rare).
                         self.rebuildAll(doc);
                         return;
                     };
                 }
-                // 编辑段内所有旧行也 interpolated
+                // All old lines within edit segment also interpolated.
                 const old_end = @min(start_line + old_line_count, self.line_wraps.items.len);
                 for (start_line..old_end) |i| {
                     self.markInterpolated(i);
                 }
 
-                // fenwick 需要 resize
+                // Fenwick needs resize.
                 self.rebuildFenwickFromWraps();
             } else {
-                // 行数减少
+                // Line count decrease.
                 const removed = old_line_count - new_line_count;
                 const remove_start = start_line + new_line_count;
                 const remove_end = @min(remove_start + removed, self.line_wraps.items.len);
@@ -435,7 +436,7 @@ pub fn WrapMap(comptime Doc: type) type {
                     _ = self.line_wraps.orderedRemove(remove_start);
                 }
 
-                // 剩余编辑段内行标记 interpolated
+                // Remaining edit segment lines mark interpolated.
                 const end = @min(start_line + new_line_count, self.line_wraps.items.len);
                 for (@min(start_line, end)..end) |i| {
                     self.markInterpolated(i);
@@ -455,17 +456,19 @@ pub fn WrapMap(comptime Doc: type) type {
             );
         }
 
-        /// 将 entry 标记为 interpolated（保留旧 breaks 作为坐标占位）
+        /// Mark entry interpolated (keep old breaks as coord placeholder).
         fn markInterpolated(self: *Self, line_idx: usize) void {
             if (line_idx >= self.line_wraps.items.len) return;
             const entry = &self.line_wraps.items[line_idx];
             entry.is_interpolated = true;
             self.has_interpolated_lines = true;
-            // 拆掉 prepared 引信：该缓存是**编辑前**文本的 segment 快照，
-            // content_hash 全仓从未被比较过。生产组件都设 precise_wrap=true
-            // 绕开快路径才没踩中，任何新消费者忘设这个 flag，
-            // rewrapInterpolated 就会用旧 segment 重算换行（光标/选区错位）。
-            // 行已标插值 ⇒ 快照必然过期，直接释放，快路径自然退化到重读文档。
+            // Defuse the stale `prepared` cache (a latent trap): it is a segment snapshot of the
+            // **pre-edit** text and content_hash is never compared anywhere in the repo.
+            // Production components set precise_wrap=true, which bypasses the fast path, so it
+            // never bit; any new consumer that forgets the flag would have rewrapInterpolated
+            // recompute breaks from the old segments (cursor/selection misaligned). The line is
+            // already marked interpolated, so the snapshot is necessarily stale: free it directly
+            // and the fast path falls back to re-reading the document.
             if (entry.prepared) |prepared| {
                 prepared.deinit(self.allocator);
                 self.allocator.destroy(prepared);
@@ -473,7 +476,7 @@ pub fn WrapMap(comptime Doc: type) type {
             }
         }
 
-        /// 统计 interpolated 行数（用于 scheduler 决策）
+        /// Tally interpolated line count (scheduler decides).
         pub fn interpolatedLineCount(self: *const Self) usize {
             if (self.needs_rebuild) return self.total_display_lines;
             if (!self.has_interpolated_lines) return 0;
@@ -485,15 +488,16 @@ pub fn WrapMap(comptime Doc: type) type {
         }
 
         pub const RewrapResult = struct {
-            /// 本次 rewrap 精确计算的行数
+            /// This rewrap exact-compute line count.
             lines_rewrapped: usize,
-            /// 仍然 interpolated 的行数（预算耗尽留给下一帧或后台）
+            /// Still interpolated line count (budget exhausted leave next frame or
+            /// background).
             lines_remaining: usize,
         };
 
-        /// 对 interpolated 行做精确 wrap 计算，预算控制。
-        /// `budget_us = null` 表示无限预算（同步收敛所有 interpolated 行）。
-        /// 返回本次处理/剩余统计；如果 display line 数量变化会 emit patch。
+        /// Exact wrap calc for interpolated lines, budget control. `budget_us =
+        /// null` means unlimited (sync converge all interpolated lines). Return
+        /// process/remain tally; if display line count changed emit patch.
         fn retryRebuild(self: *Self, doc: *const Doc) ?RewrapResult {
             if (!self.needs_rebuild) return null;
             self.rebuildAll(doc);
@@ -504,13 +508,13 @@ pub fn WrapMap(comptime Doc: type) type {
             if (self.retryRebuild(doc)) |result| return result;
             if (!self.has_interpolated_lines) return .{ .lines_rewrapped = 0, .lines_remaining = 0 };
             if (!self.enabled) {
-                // wrap 禁用时不需要 rewrap，直接清理 interpolated 标记
+                // Wrap disabled no need rewrap, just clear interpolated mark.
                 for (self.line_wraps.items) |*e| e.is_interpolated = false;
                 self.has_interpolated_lines = false;
                 return .{ .lines_rewrapped = 0, .lines_remaining = 0 };
             }
 
-            var timer: ?std.time.Timer = if (budget_us != null) std.time.Timer.start() catch null else null;
+            var timer: ?@import("zenit_time").Timer = if (budget_us != null) @import("zenit_time").Timer.start(self.io) catch null else null;
             var processed: usize = 0;
             var min_dirty: u32 = std.math.maxInt(u32);
             var max_dirty: u32 = 0;
@@ -527,19 +531,21 @@ pub fn WrapMap(comptime Doc: type) type {
 
                 const old_display_count: i32 = @intCast(entry.breaks.len + 1);
 
-                // 快路径：若已有 prepared，直接用它重新按列数切分，不需要重读文档
+                // Fast path: if already has prepared, directly resplit by column count,
+                // no need redoc.
                 if (!(self.precise_wrap and self.hasPreciseMeasure())) {
                     if (entry.prepared) |prepared| {
                         if (entry.owned and entry.breaks.len > 0) {
                             self.allocator.free(entry.breaks);
                         }
                         entry.breaks = prepared.breaksForColumns(self.allocator, wrap_columns, self.tab_size) catch {
-                            // 失败 fallback 到 wrapSingleLine
+                            // Failure fallback to wrapSingleLine.
                             entry.breaks = &.{};
                             entry.owned = false;
-                            // 不得先置 entry.prepared = null, freeWrapEntry 靠
-                            // `if (entry.prepared)` 释放 PreparedWrapLine（含 segments
-                            // 堆数组），提前抹掉指针 = 整块泄漏（它内部会置 null）
+                            // Don't first set entry.prepared = null, freeWrapEntry relies
+                            // `if (entry.prepared)` free PreparedWrapLine (has segments heap
+                            // array),
+                            // early clear pointer = whole leak (it internally null).
                             self.freeWrapEntry(entry);
                             entry.* = self.wrapSingleLine(doc, i);
                             const ndc: i32 = @intCast(entry.breaks.len + 1);
@@ -566,7 +572,7 @@ pub fn WrapMap(comptime Doc: type) type {
                     }
                 }
 
-                // 慢路径：没有 prepared，或 precise_wrap 模式 -> 重读 doc
+                // Slow path: no prepared, or precise_wrap mode -> redoc.
                 self.freeWrapEntry(entry);
                 entry.* = self.wrapSingleLine(doc, i);
                 const new_display_count: i32 = @intCast(entry.breaks.len + 1);
@@ -581,10 +587,10 @@ pub fn WrapMap(comptime Doc: type) type {
                 processed += 1;
             }
 
-            // 刷新 total
+            // Refresh total.
             self.refreshTotal();
 
-            // 检查是否还有 interpolated 行
+            // Check any interpolated remain.
             var remaining: usize = 0;
             for (self.line_wraps.items) |entry| {
                 if (entry.is_interpolated) remaining += 1;
@@ -597,14 +603,14 @@ pub fn WrapMap(comptime Doc: type) type {
             return .{ .lines_rewrapped = processed, .lines_remaining = remaining };
         }
 
-        /// 便利 API：同步收敛所有 interpolated 行（预算无限）
+        /// Convenient API: sync converge all interpolated (unlimited budget).
         pub fn rewrapInterpolatedAll(self: *Self, doc: *const Doc) RewrapResult {
             return self.rewrapInterpolated(doc, null);
         }
 
-        /// 只同步收敛 [start_line, end_line) 范围内的 interpolated 行（预算无限）。
-        /// 用于编辑路径：立即精确 rewrap 编辑涉及的少量行，避免 VL adjustLineCount 抖动；
-        /// 范围外的 interpolated 行仍留给 maintainWrapMap 处理。
+        /// Sync converge only [start_line, end_line) interpolated (unlimited
+        /// budget). For edit path: exact rewrap few edit lines immediately, avoid VL
+        /// adjustLineCount jitter; outside-range interpolated still leave maintainWrapMap.
         pub fn rewrapInterpolatedRange(self: *Self, doc: *const Doc, start_line: usize, end_line_exclusive: usize) RewrapResult {
             if (self.retryRebuild(doc)) |result| return result;
             if (!self.has_interpolated_lines or !self.enabled) {
@@ -620,7 +626,7 @@ pub fn WrapMap(comptime Doc: type) type {
                 const entry = &self.line_wraps.items[i];
                 if (!entry.is_interpolated) continue;
                 const old_display_count: i32 = @intCast(entry.breaks.len + 1);
-                // 快路径 + 慢路径（同 rewrapInterpolated）
+                // Fast+slow path (same rewrapInterpolated).
                 if (!(self.precise_wrap and self.hasPreciseMeasure())) {
                     if (entry.prepared) |prepared| {
                         if (entry.owned and entry.breaks.len > 0) {
@@ -629,9 +635,10 @@ pub fn WrapMap(comptime Doc: type) type {
                         entry.breaks = prepared.breaksForColumns(self.allocator, wrap_columns, self.tab_size) catch {
                             entry.breaks = &.{};
                             entry.owned = false;
-                            // 不得先置 entry.prepared = null, freeWrapEntry 靠
-                            // `if (entry.prepared)` 释放 PreparedWrapLine（含 segments
-                            // 堆数组），提前抹掉指针 = 整块泄漏（它内部会置 null）
+                            // Don't first set entry.prepared = null, freeWrapEntry relies
+                            // `if (entry.prepared)` free PreparedWrapLine (has segments heap
+                            // array),
+                            // early clear pointer = whole leak (it internally null).
                             self.freeWrapEntry(entry);
                             entry.* = self.wrapSingleLine(doc, i);
                             const ndc: i32 = @intCast(entry.breaks.len + 1);
@@ -669,7 +676,7 @@ pub fn WrapMap(comptime Doc: type) type {
                 processed += 1;
             }
             self.refreshTotal();
-            // 检查全局 remaining
+            // Check global remaining.
             var remaining: usize = 0;
             for (self.line_wraps.items) |e| if (e.is_interpolated) {
                 remaining += 1;
@@ -681,18 +688,18 @@ pub fn WrapMap(comptime Doc: type) type {
             return .{ .lines_rewrapped = processed, .lines_remaining = remaining };
         }
 
-        // ========================================================================
-        // 后台 Rewrap Task（仅当 Doc 支持 snapshot 时启用）
-        // ========================================================================
+        // ============================================================================
+        // Background rewrap task (enabled only when Doc supports snapshot)
+        // ============================================================================
 
         pub const BgPollResult = union(enum) {
-            /// 后台还在跑
+            /// Background still running.
             none,
-            /// 后台完成且已 apply
+            /// Background done and applied.
             applied: RewrapApplyStats,
-            /// 后台完成但编辑版本已变 -> 结果丢弃
+            /// Background done but doc edit version changed -> result discard.
             stale,
-            /// 后台失败（OOM / snapshot 失败等）
+            /// Background failed (OOM / snapshot fail etc.).
             failed,
         };
 
@@ -705,19 +712,18 @@ pub fn WrapMap(comptime Doc: type) type {
         // Background Rewrap
         // ────────────────────────────────────────────────────────
 
-        /// 启动后台 rewrap：
-        ///   - snapshot 当前文档
-        ///   - 收集当前 interpolated 行号列表
-        ///   - spawn worker 线程，逐行精确 rewrap
-        ///   - 完成后由 UI 线程 `pollBackgroundRewrap` 拉取并 apply
-        /// 只有在 `has_snapshot=true` 时可调用；已有任务在跑则跳过。
-        /// `doc_version` 由调用方提供（通常是 state.edit_count），用于 stale 判定。
+        /// Spawn background rewrap: - snapshot current doc - collect current
+        /// interpolated line list - spawn worker thread, exact rewrap per line -
+        /// complete UI thread `pollBackgroundRewrap` pulls apply. Only callable when
+        /// `has_snapshot=true`; skip if task already running. `doc_version` by caller
+        /// provide (usually state.edit_count), used stale judge.
         pub fn startBackgroundRewrap(self: *Self, doc: *Doc, doc_version: u64) void {
             if (!has_snapshot) return;
             if (self.bg_thread != null) return;
             if (!self.enabled or !self.has_interpolated_lines or self.needs_rebuild) return;
 
-            // snapshot doc（需要 *Doc：snapshot 内部持 mutex 与主线程 mutation 互斥）
+            // Snapshot doc (needs *Doc: snapshot internal holds mutex vs UI thread
+            // mutation exclusive).
             var snap = doc.snapshot(self.allocator) catch return;
             errdefer snap.deinit();
             self.bg_doc_snapshot = snap;
@@ -729,7 +735,7 @@ pub fn WrapMap(comptime Doc: type) type {
             self.bg_base_revision = self.revision;
             self.bg_done.store(false, .release);
 
-            // 清空上次残留结果
+            // Clear last residue result.
             for (self.bg_result.items) |*r| {
                 if (r.breaks.len > 0) self.allocator.free(r.breaks);
             }
@@ -751,7 +757,7 @@ pub fn WrapMap(comptime Doc: type) type {
             const snap = &self.bg_doc_snapshot.?;
             const line_count = snap.lineCount();
 
-            var work_buf: std.ArrayListUnmanaged(BgRewrapResult) = .{};
+            var work_buf: std.ArrayListUnmanaged(BgRewrapResult) = .empty;
             defer {
                 for (work_buf.items) |*r| {
                     if (r.breaks.len > 0) self.allocator.free(r.breaks);
@@ -808,11 +814,11 @@ pub fn WrapMap(comptime Doc: type) type {
             work_buf = .{};
         }
 
-        /// 后台线程用的 wrap 计算（独立于 self 的 wrap_width / char_width 等字段，
-        /// 使用启动时 snapshot 的参数 bg_*）
+        /// Background thread wrap calc (independent self's wrap_width / char_width
+        /// etc., uses launch snapshot params bg_*).
         fn bgComputeBreaks(self: *Self, text: []const u8) ![]u32 {
             if (!has_snapshot) return &.{};
-            var breaks_list: std.ArrayListUnmanaged(u32) = .{};
+            var breaks_list: std.ArrayListUnmanaged(u32) = .empty;
             errdefer breaks_list.deinit(self.allocator);
 
             const cw = if (self.bg_char_width > 0) self.bg_char_width else @as(f32, 8.0);
@@ -827,8 +833,8 @@ pub fn WrapMap(comptime Doc: type) type {
             var grapheme_cursor = grapheme.BoundaryCursor.init(text);
             while (i < text.len) {
                 const byte = text[i];
-                // 按 grapheme cluster 步进（1e2bee4 修了 computeWraps/Precise，
-                // 这里是当时的遗漏兄弟）：按码点会把 ZWJ emoji/组合字符切开
+                // Advance by grapheme cluster (1e2bee4 fixed computeWraps/Precise,
+                // this brother forgotten then): by codepoint splits ZWJ emoji/combining.
                 const next_i = grapheme_cursor.next(i);
                 if (i > seg_start) {
                     if (byte == ' ' or byte == '\t') {
@@ -866,8 +872,8 @@ pub fn WrapMap(comptime Doc: type) type {
             return breaks_list.toOwnedSlice(self.allocator);
         }
 
-        /// 每帧轮询后台结果。
-        /// `current_doc_version` 用于 stale 判定（与 startBackgroundRewrap 的 doc_version 对比）。
+        /// Poll background result every frame. `current_doc_version` stale judge
+        /// (compare launch startBackgroundRewrap's doc_version).
         pub fn pollBackgroundRewrap(self: *Self, current_doc_version: u64) BgPollResult {
             if (!has_snapshot) return .none;
             if (self.bg_thread == null) return .none;
@@ -881,7 +887,8 @@ pub fn WrapMap(comptime Doc: type) type {
                 self.bg_doc_snapshot = null;
             }
 
-            // stale: 编辑版本已变 -> 丢弃结果（编辑改变了行号映射，强行 apply 会错位）
+            // Stale: doc version changed -> discard result (edit changed line map,
+            // force apply misaligns).
             if (current_doc_version != self.bg_doc_version or self.bg_base_revision != self.revision or !self.enabled or self.needs_rebuild) {
                 for (self.bg_result.items) |*r| {
                     if (r.breaks.len > 0) self.allocator.free(r.breaks);
@@ -890,7 +897,7 @@ pub fn WrapMap(comptime Doc: type) type {
                 return .stale;
             }
 
-            // Apply: 对每个结果 swap breaks + 更新 fenwick
+            // Apply: each result swap breaks + fenwick update.
             var delta: i32 = 0;
             var min_dirty: u32 = std.math.maxInt(u32);
             var max_dirty: u32 = 0;
@@ -904,14 +911,14 @@ pub fn WrapMap(comptime Doc: type) type {
                 const entry = &self.line_wraps.items[i];
                 const old_display_count: i32 = @intCast(entry.breaks.len + 1);
 
-                // swap: free 旧 breaks, 装上新 breaks
+                // Swap: free old breaks, install new breaks.
                 if (entry.owned and entry.breaks.len > 0) {
                     self.allocator.free(entry.breaks);
                 }
                 entry.breaks = result.breaks;
                 entry.owned = result.breaks.len > 0;
                 entry.is_interpolated = false;
-                // prepared 保留（供后续 wrap width 变化快路径）
+                // Keep prepared (for next wrap width change fast-path).
 
                 const new_display_count: i32 = @intCast(entry.breaks.len + 1);
                 delta += new_display_count - old_display_count;
@@ -926,7 +933,7 @@ pub fn WrapMap(comptime Doc: type) type {
 
             self.refreshTotal();
 
-            // 检查是否还有 interpolated 行（后台 snapshot 时刻之后新编辑的行）
+            // Check any interpolated remain (lines new-edit after snapshot).
             var remaining: usize = 0;
             for (self.line_wraps.items) |entry| {
                 if (entry.is_interpolated) remaining += 1;
@@ -944,7 +951,7 @@ pub fn WrapMap(comptime Doc: type) type {
             return self.bg_thread != null;
         }
 
-        /// 从 line_wraps 重建 fenwick（行数变化时用）
+        /// Rebuild fenwick from line_wraps (when line count changed).
         fn refreshTotal(self: *Self) void {
             if (self.fenwick) |ft| {
                 self.total_display_lines = ft.total();
@@ -974,7 +981,7 @@ pub fn WrapMap(comptime Doc: type) type {
             self.clearAll(total_lines);
         }
 
-        /// 对单行执行 wrap 计算
+        /// Wrap calc single line.
         fn wrapSingleLine(self: *Self, doc: *const Doc, line: usize) WrapEntry {
             if (self.wrap_width <= 0) return .{};
 
@@ -1047,9 +1054,9 @@ pub fn WrapMap(comptime Doc: type) type {
             }
 
             const prepared = prepared_wrap_line.prepareLine(self.allocator, text) catch return self.computeWraps(text);
-            // 注意：本函数返回类型非 !T，errdefer 永远不会触发（曾有一段
-            // errdefer 死代码给了"已覆盖"的假象）。失败路径必须显式清理,
-            // 对比 prepareAndComputeWrapsChunked 的正确写法。
+            // Note: this fn return type non-!T, errdefer never triggers (once had
+            // errdefer dead code gave "covered" false image). Failure path must explicit
+            // cleanup, contrast prepareAndComputeWrapsChunked correct write.
             const breaks = prepared.breaksForColumns(self.allocator, self.wrapWidthColumns(), self.tab_size) catch {
                 prepared.deinit(self.allocator);
                 self.allocator.destroy(prepared);
@@ -1067,7 +1074,7 @@ pub fn WrapMap(comptime Doc: type) type {
             return @max(1, @as(usize, @intFromFloat(@floor(self.wrap_width / @max(cw, 0.5)))));
         }
 
-        /// wrap 断点计算核心算法
+        /// Wrap break calc core algorithm.
         fn computeWraps(self: *Self, text: []const u8) WrapEntry {
             if (self.precise_wrap and self.hasPreciseMeasure()) {
                 return self.computeWrapsPrecise(text);
@@ -1075,7 +1082,7 @@ pub fn WrapMap(comptime Doc: type) type {
 
             var breaks_stack: [256]u32 = undefined;
             var stack_count: usize = 0;
-            var breaks_heap: std.ArrayListUnmanaged(u32) = .{};
+            var breaks_heap: std.ArrayListUnmanaged(u32) = .empty;
             var use_heap = false;
             defer if (use_heap) breaks_heap.deinit(self.allocator);
 
@@ -1085,14 +1092,14 @@ pub fn WrapMap(comptime Doc: type) type {
             var seg_start: usize = 0;
             var last_word_boundary: usize = 0;
             var accumulated_w: f32 = 0;
-            var col: usize = 0; // 当前列（用于 tab stop 计算）
+            var col: usize = 0; // Current column (for tab stop calc).
             var i: usize = 0;
             var grapheme_cursor = grapheme.BoundaryCursor.init(text);
 
             while (i < text.len) {
                 const byte = text[i];
-                // 同 computeWrapsPrecise：按 grapheme cluster 步进，断点不得落在
-                // 簇内部（估算路径同样会被下游当作显示行段起点）。
+                // Same computeWrapsPrecise: advance by grapheme cluster, break not inside
+                // cluster (estimate path same downstream as display line segment start).
                 const next_i = grapheme_cursor.next(i);
 
                 if (i > seg_start) {
@@ -1163,11 +1170,12 @@ pub fn WrapMap(comptime Doc: type) type {
             return .{ .breaks = breaks, .owned = true };
         }
 
-        /// 精确换行：逐字符真实测量宽度（用于需要高精度的 UI 文本框）
+        /// Exact wrap: per-char true measure width (for high-precision UI text
+        /// box).
         fn computeWrapsPrecise(self: *Self, text: []const u8) WrapEntry {
             var breaks_stack: [256]u32 = undefined;
             var stack_count: usize = 0;
-            var breaks_heap: std.ArrayListUnmanaged(u32) = .{};
+            var breaks_heap: std.ArrayListUnmanaged(u32) = .empty;
             var use_heap = false;
             defer if (use_heap) breaks_heap.deinit(self.allocator);
 
@@ -1183,12 +1191,14 @@ pub fn WrapMap(comptime Doc: type) type {
 
             while (i < text.len) {
                 const byte = text[i];
-                // 步进单位必须是 extended grapheme cluster，不是码点：ZWJ 序列
-                // （👨‍👩‍👧）、肤色修饰（👋🏻）、VS16（❤️）、组合音标都是多码点单字形。
-                // 按码点走会把一个字形拆成多段，既按半个字形累加 advance，
-                // 又可能把断点/last_word_boundary 落在簇内部，导致下游显示行段
-                // 起点非字形边界，光标 x 与选区宽度随之错位（emoji 光标停左边、
-                // 选区只盖半个）。整簇测量同时保证 advance 与 shaping 同源。
+                // Advance unit must be an extended grapheme cluster, not a codepoint: ZWJ sequence
+                // (family emoji = 8 codepoints / 1 glyph), skin tone, VS16, combining
+                // diacritics are all multi-codepoint single glyphs. By codepoint, a single glyph's
+                // advance is split and accumulated over several segments, and
+                // break/last_word_boundary can
+                // land inside a cluster. Display line segment start then isn't a glyph boundary, so
+                // cursor x and selection rect misalign: emoji caret left, selection half-glyph.
+                // Whole-cluster measure keeps advance same-origin with shaping.
                 const next_i = grapheme_cursor.next(i);
 
                 const char_w: f32 = if (byte == '\t') blk: {
@@ -1232,12 +1242,13 @@ pub fn WrapMap(comptime Doc: type) type {
                     continue;
                 }
 
-                // 断点规则与渲染端 text_layout.findLineBreak 严格同源：CJK 之后
-                // 可断；其余位置按 UAX #14 pair table（i18n.linebreak）。记录必须
-                // 发生在溢出判定之后，当前簇若已溢出，断点只能取之前的簇。
-                // 旧的 lead-byte 启发式把 emoji 当 CJK（前后都可断），而渲染端
-                // classify 把 emoji 归为 AL（AL×AL 不断）：同一处溢出时两边选到
-                // 不同断点，WrapMap 行段与渲染行从此错位，选区/光标整段偏移。
+                // Break rules and render side text_layout.findLineBreak exact same-origin:
+                // breakable after CJK; other positions per UAX #14 pair table (i18n.linebreak).
+                // Record must after overflow judge, current cluster overflow, break only before.
+                // Old lead-byte heuristic treated emoji CJK (both sides breakable), render
+                // classify emoji AL (AL×AL not break): same overflow two sides select different
+                // break, WrapMap segment and render line thereafter misaligned, selection/cursor
+                // whole-segment offset.
                 if (i > seg_start) {
                     const cp = firstCodepoint(text[i..next_i]);
                     if (i18n.linebreak.isCJK(cp)) {
@@ -1265,7 +1276,7 @@ pub fn WrapMap(comptime Doc: type) type {
             return .{ .breaks = breaks, .owned = true };
         }
 
-        /// 测量文本宽度
+        /// Measure text width.
         fn measureText(self: *const Self, text: []const u8) f32 {
             if (text.len == 0) return 0;
             if (self.measure_ctx_fn) |mfn| {
@@ -1276,7 +1287,7 @@ pub fn WrapMap(comptime Doc: type) type {
             if (self.measure_fn) |mfn| {
                 return mfn(text.ptr, text.len, self.font_size, self.font_weight, false);
             }
-            // 等宽 fallback（char_width 估算，仅用于无 GPU 的测试环境）
+            // Monospace fallback (char_width estimate, only test env without GPU).
             const cw = if (self.char_width > 0) self.char_width else @as(f32, 8.0);
             var w: f32 = 0;
             var i: usize = 0;
@@ -1289,7 +1300,7 @@ pub fn WrapMap(comptime Doc: type) type {
             return w;
         }
 
-        /// buffer line -> 该行的首个 display line 编号（Fenwick O(logN)）
+        /// buffer line -> that line first display line number (Fenwick O(logN)).
         pub fn bufferLineToDisplayLine(self: *const Self, buf_line: usize) u32 {
             if (!self.enabled or self.needs_rebuild) return saturatingU32(buf_line);
             if (self.fenwick) |ft| {
@@ -1302,7 +1313,7 @@ pub fn WrapMap(comptime Doc: type) type {
             return total;
         }
 
-        /// buffer 坐标 -> display 坐标
+        /// buffer coords -> display coords.
         pub fn bufferToDisplay(self: *const Self, buf_line: usize, byte_col: usize) DisplayPoint {
             if (!self.enabled or self.needs_rebuild) return .{ .display_line = saturatingU32(buf_line), .display_col = byte_col };
 
@@ -1336,11 +1347,12 @@ pub fn WrapMap(comptime Doc: type) type {
             return self.bufferLineToDisplayLine(buf_line) + @as(u32, @intCast(self.wrapIndexForBufferByte(buf_line, byte_col)));
         }
 
-        /// display line -> buffer line + wrap 段信息（Fenwick O(logN)）。
+        /// display line -> buffer line + wrap segment info (Fenwick O(logN)).
         ///
-        /// `line_wraps` 在增量编辑后的插值窗口中可能暂时保留旧断点，因此
-        /// 必须用当前文档行长钳位。把 `doc` 作为必需参数可保证所有调用者
-        /// 都拿到可直接切片的范围，而不是依赖消费层记得逐处防御 stale breaks。
+        /// `line_wraps` after incremental edit interpolation window may temporary
+        /// keep old breaks, must clamp current doc line-len. Passing `doc` required
+        /// param ensures all callers get directly-sliceable range, not depend consumer
+        /// remember per-place defend stale breaks.
         pub fn displayLineInfo(self: *const Self, display_line: u32, doc: *const Doc) DisplayLineInfo {
             if (!self.enabled or self.line_wraps.items.len == 0) {
                 const buffer_line: usize = display_line;
@@ -1373,7 +1385,8 @@ pub fn WrapMap(comptime Doc: type) type {
             }
 
             const entry = self.line_wraps.items[buf_line];
-            // wrap_index 合法区间为 [0, breaks.len]，其中 breaks.len 表示最后一段（到行尾）。
+            // wrap_index valid range [0, breaks.len], breaks.len is last segment (to
+            // line end).
             const wrap_index = @min(wrap_index_raw, entry.breaks.len);
             const line_len = if (buf_line < doc.lineCount()) doc.getLineLength(buf_line) else 0;
             const stale_start: usize = if (wrap_index == 0) 0 else entry.breaks[wrap_index - 1];
@@ -1397,13 +1410,13 @@ pub fn WrapMap(comptime Doc: type) type {
             return self.findBufferLineForClamped(self.clampDisplayLine(display_line));
         }
 
-        /// 总 display 行数
+        /// Total display line count.
         pub fn displayLineCount(self: *const Self) u32 {
             if (!self.enabled) return 0;
             return self.total_display_lines;
         }
 
-        /// 获取某个 buffer line 的 display line 数量
+        /// Get buffer line display count.
         pub fn displayLinesForBuffer(self: *const Self, buf_line: usize) u32 {
             if (!self.enabled or buf_line >= self.line_wraps.items.len) return 1;
             return @intCast(self.line_wraps.items[buf_line].breaks.len + 1);
@@ -1432,7 +1445,7 @@ pub fn WrapMap(comptime Doc: type) type {
             return .{ .start = start_buf, .end = end_buf };
         }
 
-        /// 获取某个 buffer line 的 wrap 断点切片
+        /// Get buffer line wrap breaks slice.
         pub fn breaksForBuffer(self: *const Self, buf_line: usize) []const u32 {
             if (!self.enabled or buf_line >= self.line_wraps.items.len) return &.{};
             return self.line_wraps.items[buf_line].breaks;
@@ -1531,7 +1544,7 @@ test "WrapMap reuses prepared lines on wrap width change" {
         .alloc_reads = &alloc_reads,
     };
 
-    var wm = WrapMap(MockDoc).init(testing.allocator);
+    var wm = WrapMap(MockDoc).init(testing.allocator, @import("std").testing.io);
     defer wm.deinit();
     wm.char_width = 1;
     wm.tab_size = 4;
@@ -1565,7 +1578,7 @@ test "WrapMap applyEdit rebuilds on inconsistent edit ranges" {
         .buf_reads = &buf_reads,
         .alloc_reads = &alloc_reads,
     };
-    var wm = WrapMap(MockDoc).init(testing.allocator);
+    var wm = WrapMap(MockDoc).init(testing.allocator, @import("std").testing.io);
     defer wm.deinit();
     wm.char_width = 1;
     wm.setWrapWidth(4, &doc);
@@ -1577,7 +1590,7 @@ test "WrapMap applyEdit rebuilds on inconsistent edit ranges" {
 }
 
 test "WrapMap chunked long line avoids heap line allocation during rewrap" {
-    var text: std.ArrayList(u8) = .{};
+    var text: std.ArrayList(u8) = .empty;
     defer text.deinit(testing.allocator);
     for (0..12000) |_| {
         try text.append(testing.allocator, 'x');
@@ -1593,7 +1606,7 @@ test "WrapMap chunked long line avoids heap line allocation during rewrap" {
         .alloc_reads = &alloc_reads,
     };
 
-    var wm = WrapMap(MockDoc).init(testing.allocator);
+    var wm = WrapMap(MockDoc).init(testing.allocator, @import("std").testing.io);
     defer wm.deinit();
     wm.char_width = 1;
     wm.tab_size = 4;
@@ -1632,7 +1645,7 @@ test "WrapMap context measurement stays isolated across windows" {
     var narrow_font = MeasureState{ .advance = 1 };
     var wide_font = MeasureState{ .advance = 3 };
 
-    var narrow = WrapMap(MockDoc).init(testing.allocator);
+    var narrow = WrapMap(MockDoc).init(testing.allocator, @import("std").testing.io);
     defer narrow.deinit();
     narrow.precise_wrap = true;
     narrow.measure_fn = MeasureState.legacy;
@@ -1642,7 +1655,7 @@ test "WrapMap context measurement stays isolated across windows" {
     narrow.setEnabled(true, &doc);
     _ = narrow.rewrapInterpolatedAll(&doc);
 
-    var wide = WrapMap(MockDoc).init(testing.allocator);
+    var wide = WrapMap(MockDoc).init(testing.allocator, @import("std").testing.io);
     defer wide.deinit();
     wide.precise_wrap = true;
     wide.measure_fn = MeasureState.legacy;
@@ -1656,17 +1669,15 @@ test "WrapMap context measurement stays isolated across windows" {
     try testing.expect(wide.displayLinesForBuffer(0) > narrow.displayLinesForBuffer(0));
 }
 
-// 软换行断点必须落在 extended grapheme cluster 边界上。
-//
-// 回归根因：两个 wrap 循环都按“UTF-8 码点”步进（lead byte 推 1/2/3/4 字节）。
-// ZWJ 序列（👨‍👩‍👧 = 8 码点 / 1 字形）、肤色修饰（👋🏻）、VS16（❤️）、组合音标
-// 都是多码点单字形，按码点走既把单字形的 advance 拆成多段累加，又会把断点
-// （以及 last_word_boundary）落到簇内部。下游把 display line 的 byte_start
-// 当作显示行段起点喂给 shaping/caret，段首是“半个字形”时整段 caret x 与
-// 选区矩形集体错位：emoji 光标停在左边、选区只盖半个字形。
-//
-// 修复后断点单位 = grapheme cluster，此测试锁住该不变量（修复前 ZWJ/肤色
-// 两例 byte_start 落在簇内 -> 断言红）。
+// Soft wrap breaks must land on extended grapheme cluster boundaries. Root cause being
+// locked: wrap loops advancing by UTF-8 codepoint (lead byte gives 1/2/3/4 bytes). ZWJ
+// sequence (family emoji = 8 codepoints / 1 glyph), skin tone, VS16, combining
+// diacritics are multi-codepoint single glyphs; by codepoint, glyph advance is split
+// across segments and break/last_word_boundary fall inside a cluster. Downstream takes display
+// line byte_start as display-segment start for shaping/caret, so a start in the middle of a
+// glyph misaligns caret x and selection rect for the whole segment: emoji caret left,
+// selection half-glyph. Break unit = grapheme cluster; this test locks that invariant
+// (ZWJ/skin tone examples assert byte_start is not inside a cluster).
 test "soft wrap 断点落在 grapheme cluster 边界（emoji/ZWJ/肤色/组合）" {
     const M = struct {
         fn ctx(_: *anyopaque, ptr: [*]const u8, len: usize, _: f32, _: u16, _: bool) f32 {
@@ -1675,12 +1686,12 @@ test "soft wrap 断点落在 grapheme cluster 边界（emoji/ZWJ/肤色/组合�
         }
     };
     const cases = [_][]const u8{
-        "aaaa\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}aaaa", // ZWJ 家庭
+        "aaaa\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}aaaa", // ZWJ family.
         "aaaa\u{2764}\u{FE0F}aaaa", // BMP + VS16
-        "aaaae\u{0301}aaaa", // 组合音标
-        "aaaa\u{1F44B}\u{1F3FB}aaaa", // 肤色修饰
-        "aaaa\u{1F60A}aaaa", // 单码点 SMP emoji
-        "aaaa\u{4E2D}\u{6587}aaaa", // CJK 全角
+        "aaaae\u{0301}aaaa", // Combining diacritic.
+        "aaaa\u{1F44B}\u{1F3FB}aaaa", // Skin tone modifier.
+        "aaaa\u{1F60A}aaaa", // Single-codepoint SMP emoji.
+        "aaaa\u{4E2D}\u{6587}aaaa", // CJK fullwidth
     };
     var dummy: u8 = 0;
     for (cases) |txt| {
@@ -1688,7 +1699,7 @@ test "soft wrap 断点落在 grapheme cluster 边界（emoji/ZWJ/肤色/组合�
         var br: usize = 0;
         var ar: usize = 0;
         const doc = MockDoc{ .text = txt, .starts = &starts, .buf_reads = &br, .alloc_reads = &ar };
-        var wm = WrapMap(MockDoc).init(testing.allocator);
+        var wm = WrapMap(MockDoc).init(testing.allocator, @import("std").testing.io);
         defer wm.deinit();
         wm.precise_wrap = true;
         wm.measure_ctx_fn = M.ctx;
@@ -1707,19 +1718,19 @@ test "soft wrap 断点落在 grapheme cluster 边界（emoji/ZWJ/肤色/组合�
     }
 }
 
-// precise wrap 的断点规则必须与渲染端 text_layout.findLineBreak 一致（UAX #14
-// pair table + isCJK）。
+// Precise wrap break rule must match render side text_layout.findLineBreak (UAX #14 pair table +
+// isCJK).
 //
-// 回归根因：旧实现用 lead-byte 启发式（任何 ≥0xE0 的字符前后都可断），把 emoji
-// 当 CJK；渲染端 i18n.linebreak.classify 把 emoji 归为 AL（AL×AL 不断）。文本
-// "asfd🎩一样的欠fds🍰奥asdfasdf" 在 🍰 处溢出时：渲染端退回"欠"后断行
-// （line1 = "fds🍰…"），WrapMap 却在 🍰 前断行（line1 = "🍰…"），编辑态
-// 选区/光标基于 WrapMap 行段，从第一个 wrap 起与渲染整段错位。
+// Regression root: old impl used lead-byte heuristic (any char >= 0xE0 breakable before/after),
+// treated emoji as CJK; render side i18n.linebreak.classify categorizes emoji as AL (AL x AL no
+// break). Text 'asfd🎩like_missing_fds🍰oddassdfasdf' overflows at 🍰: render backed to 'missing' line
+// (line1 = 'fds🍰...'), WrapMap broke at 🍰 (line1 = '🍰...'), edit cursor/selection based on WrapMap
+// lines misaligned from render since first wrap.
 test "precise wrap 断点规则与渲染端一致：emoji 前不断行" {
     const M = struct {
         fn ctx(_: *anyopaque, ptr: [*]const u8, len: usize, _: f32, _: u16, _: bool) f32 {
             _ = ptr;
-            // 模拟真实度量：拉丁 ~7px、CJK 16px、emoji 21px（按字节长区分）。
+            // Simulate realistic measurements: Latin ~7px, CJK 16px, emoji 21px (by byte length).
             return switch (len) {
                 1 => 7.0,
                 3 => 16.0,
@@ -1734,14 +1745,16 @@ test "precise wrap 断点规则与渲染端一致：emoji 前不断行" {
     var br: usize = 0;
     var ar: usize = 0;
     const doc = MockDoc{ .text = txt, .starts = &starts, .buf_reads = &br, .alloc_reads = &ar };
-    var wm = WrapMap(MockDoc).init(testing.allocator);
+    var wm = WrapMap(MockDoc).init(testing.allocator, @import("std").testing.io);
     defer wm.deinit();
     wm.precise_wrap = true;
     wm.measure_ctx_fn = M.ctx;
     var dummy: u8 = 0;
     wm.measure_ctx = @ptrCast(&dummy);
-    // "asfd🎩一样的欠fds" = 4*7+21+4*16+3*7 = 134 ≤ 140；+🍰(21) = 155 > 140。
-    // 渲染端：🍰(AL) 前不可断 -> 退回"欠"后（byte 20）。旧实现会在 🍰 前断（byte 23）。
+    // txt = 4 ASCII + hat emoji + 4 CJK chars + 'fds' + cake emoji + ...:
+    // 4*7+21+4*16+3*7 = 134 <= 140; +cake emoji (21) = 155 > 140. Render: the cake emoji (AL) is
+    // non-breakable before -> falls back to after the 4th CJK char (byte 20). Old impl broke at
+    // the cake emoji (byte 23).
     wm.setWrapWidth(140, &doc);
     wm.setEnabled(true, &doc);
     _ = wm.rewrapInterpolatedAll(&doc);
@@ -1762,7 +1775,7 @@ test "displayLineInfo clamps interpolated stale breaks to current line length" {
         .buf_reads = &buf_reads,
         .alloc_reads = &alloc_reads,
     };
-    var wm = WrapMap(MockDoc).init(testing.allocator);
+    var wm = WrapMap(MockDoc).init(testing.allocator, @import("std").testing.io);
     defer wm.deinit();
     wm.char_width = 8;
     wm.setWrapWidth(16, &long_doc);
@@ -1790,7 +1803,7 @@ test "WrapMap missing Fenwick retains wrapped coordinate prefixes" {
     var reads: usize = 0;
     var alloc_reads: usize = 0;
     const doc: MockDoc = .{ .text = "abcdefgh\nijklmnop", .starts = &.{ 0, 9 }, .buf_reads = &reads, .alloc_reads = &alloc_reads };
-    var wm = WrapMap(MockDoc).init(testing.allocator);
+    var wm = WrapMap(MockDoc).init(testing.allocator, @import("std").testing.io);
     defer wm.deinit();
     wm.char_width = 8;
     wm.wrap_width = 16;
@@ -1812,7 +1825,7 @@ test "WrapMap failed rebuild keeps current document coordinates usable and retri
     const old: MockDoc = .{ .text = "abcdefgh", .starts = &.{0}, .buf_reads = &reads, .alloc_reads = &alloc_reads };
     const current: MockDoc = .{ .text = "abcdefgh\nijklmnop", .starts = &.{ 0, 9 }, .buf_reads = &reads, .alloc_reads = &alloc_reads };
     var failing = testing.FailingAllocator.init(testing.allocator, .{});
-    var wm = WrapMap(MockDoc).init(failing.allocator());
+    var wm = WrapMap(MockDoc).init(failing.allocator(), @import("std").testing.io);
     defer wm.deinit();
     wm.char_width = 8;
     wm.wrap_width = 16;
@@ -1874,7 +1887,7 @@ test "WrapMap rebuild enable and growth allocation failures keep coherent mappin
         var completed = false;
         for (0..150) |failure| {
             var failing = testing.FailingAllocator.init(testing.allocator, .{});
-            var wm = WrapMap(MockDoc).init(failing.allocator());
+            var wm = WrapMap(MockDoc).init(failing.allocator(), @import("std").testing.io);
             defer wm.deinit();
             wm.char_width = 8;
             wm.wrap_width = 16;
@@ -1913,11 +1926,11 @@ test "WrapMap rebuild enable and growth allocation failures keep coherent mappin
 test "WrapMap line wrap allocation failure stays pending through whole and range refresh" {
     var reads: usize = 0;
     var alloc_reads: usize = 0;
-    const text = "abcdefgh" ** 1200;
+    const text = (@as([("abcdefgh").len * (1200)]u8, @bitCast(@as([1200][("abcdefgh").len]u8, @splat(("abcdefgh").*)))) ++ "");
     const doc: MockDoc = .{ .text = text, .starts = &.{0}, .buf_reads = &reads, .alloc_reads = &alloc_reads };
     for ([_]bool{ false, true }) |range| {
         var failing = testing.FailingAllocator.init(testing.allocator, .{});
-        var wm = WrapMap(MockDoc).init(failing.allocator());
+        var wm = WrapMap(MockDoc).init(failing.allocator(), @import("std").testing.io);
         defer wm.deinit();
         wm.char_width = 8;
         wm.wrap_width = 160;
@@ -1949,7 +1962,7 @@ test "WrapMap background publication rejects obsolete mapping epochs" {
         }
     };
     for (0..4) |mutation| {
-        var wm = WrapMap(AsyncDoc).init(testing.allocator);
+        var wm = WrapMap(AsyncDoc).init(testing.allocator, @import("std").testing.io);
         defer wm.deinit();
         wm.enabled = true;
         try wm.line_wraps.append(testing.allocator, .{ .is_interpolated = true });

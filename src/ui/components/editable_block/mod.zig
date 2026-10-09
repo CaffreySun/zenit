@@ -20,12 +20,12 @@ pub const InputType = enum {
     tel,
 };
 
-/// 单行 Input 的定长文本缓冲上限（字节）。
+/// Single-line Input fixed text buffer limit (bytes).
 ///
-/// canonical buffer 仍内联在 TextInputState 中，但 undo/redo 快照已改为
-/// 按当时文本实际长度分配，因此提高输入上限不再把每个实例的
-/// 64×2 个历史槽一起放大。多行 Textarea/EditableText 仍走独立的
-/// TextareaDocument + TaUndoEntry 路径。
+/// The canonical buffer is still inlined in TextInputState, but undo/redo snapshots allocate
+/// by actual text size, so raising the limit does not multiply the 64*2 history slots per
+/// instance. Multi-line Textarea/EditableText use the separate TextareaDocument + TaUndoEntry
+/// path.
 pub const MAX_INPUT_BYTES: usize = 2048;
 
 pub const UndoSnapshot = struct {
@@ -90,7 +90,7 @@ pub fn applyConfig(
 /// Returns true when width changed enough to require rerender.
 pub fn syncInnerWidthFromNode(state: anytype, node: *const core.Node) bool {
     const horizontal_padding = state.padding_h * 2;
-    // 全局 hook 读 rect（epoch==0 时 fallback 到 node.rect）。
+    // Read rect via global hook (fallback to node.rect when epoch==0).
     const r = node.rectFromWorldOrFallback();
     const next_inner_w = @max(@as(f32, 0), r.w - horizontal_padding);
     const changed = @abs(next_inner_w - state.input_inner_w) > 0.25;
@@ -123,7 +123,7 @@ pub fn computeRenderCoords(node: *const Node, padding_h: f32, padding_v: f32) Re
         current = n.parent;
     }
 
-    // 全局 hook 读 rect（epoch==0 时 fallback 到 node.rect）。
+    // Read rect via global hook (fallback to node.rect when epoch==0).
     const r = node.rectFromWorldOrFallback();
     const layout_x = r.x;
     const layout_y = r.y;
@@ -203,17 +203,17 @@ pub fn isImeSelectionSpace(text: []const u8) bool {
     return false;
 }
 
-/// 统一 IME cursor 偏移语义：
-/// - 常规: 取系统上报 cursor_utf8_offset（并 clamp 到 preedit 长度）
-/// - 选词高亮阶段: 某些 IME 会上报 0，此时应把光标视为 preedit 末尾
+/// Unify IME cursor offset semantics:
+/// - Regular: take system-reported cursor_utf8_offset (clamped to preedit length)
+/// - Composition highlight: some IMEs report 0, treat cursor as preedit end
 pub fn effectiveImeCursorOffset(preedit_len: usize, cursor_utf8_offset: usize, selection_highlight: bool) usize {
     const raw = @min(cursor_utf8_offset, preedit_len);
     if (selection_highlight and raw == 0 and preedit_len > 0) return preedit_len;
     return raw;
 }
 
-/// 将 preedit 文本融合到 base_text 的 insert_offset 位置，写入 out 缓冲区。
-/// 返回融合后的切片（可能因 out 容量不足而截断）。
+/// Merge preedit text into base_text at insert_offset position, write to out buffer.
+/// Return merged slice (may truncate if out capacity exceeded).
 pub fn composePreeditIntoBuffer(base_text: []const u8, insert_offset: usize, preedit: []const u8, out: []u8) []const u8 {
     const split = @min(insert_offset, base_text.len);
     const prefix = base_text[0..split];
@@ -314,7 +314,7 @@ pub fn sanitizeInputText(state: anytype, input: []const u8, out: []u8) []const u
 }
 
 test "computeRenderCoords separates layout and global coordinates" {
-    var ctx = try core.Cx.init(std.testing.allocator);
+    var ctx = try core.Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try core.box(ctx, .{ .width = .{ .px = 200 }, .height = .{ .px = 120 } }, .{});

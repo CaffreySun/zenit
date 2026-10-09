@@ -1,7 +1,8 @@
-//! DateRangePicker 样式层（zenit-styling-revamp）：
-//! trigger/panel/月面板/日期格样式函数 + 交互态取色纯函数 +
-//! day cell 状态取色矩阵（DayCellVisual / computeDayCellVisual）。
-//! 依赖 mod.zig 的 State 与日期比较逻辑（循环 import，Zig 惰性分析允许）。
+//! DateRangePicker styling layer (zenit-styling-revamp): trigger/panel/month panel/
+//! date cell style functions + interaction color pure functions + day cell state color
+//! matrix (DayCellVisual / computeDayCellVisual). Depends on mod.zig's State and date
+//! comparison logic (circular import, Zig lazy analysis allows).
+const control_shell = @import("../control_shell/mod.zig");
 const core = @import("../../core.zig");
 const theme = core.theme;
 const Color = core.Color;
@@ -11,10 +12,10 @@ const mod = @import("mod.zig");
 const DateRangePickerState = mod.DateRangePickerState;
 const SimpleDate = @import("../calendar/mod.zig").SimpleDate;
 
-// ========== 具名样式函数（样式层） ==========
-// 迁移自 mount/mountMonthSection/buildMonthGrid/updateDisplayLabel/syncTriggerVisual
-// 的内联样式与颜色决策；数值原样保留（zenit-styling-revamp）。
-// day cell 的状态取色矩阵本就在 computeDayCellVisual（纯函数样式层），不动。
+// ========== Named style functions (styling layer) ==========
+// Inline styles and color decisions from mount/mountMonthSection/buildMonthGrid/
+// updateDisplayLabel/syncTriggerVisual (zenit-styling-revamp).
+// Day cell state color matrix lives in computeDayCellVisual (pure function, styling layer).
 
 pub const nav_icon_size: f32 = 16;
 pub const panel_radius: f32 = 14;
@@ -22,27 +23,27 @@ pub const day_cell_size: f32 = 32;
 pub const day_font_size: f32 = 13;
 
 pub fn triggerBorderColor(open: bool, has_value: bool, t: *const theme.ThemeTokens) Color {
-    return if (open) t.color.border_focus else if (has_value) t.color.border_strong else t.color.border;
+    return if (open) t.tokens.color.border_focus else if (has_value) t.tokens.color.border_strong else t.tokens.color.border;
 }
 
 pub fn leadingIconTint(has_value: bool, t: *const theme.ThemeTokens) Color {
-    return if (has_value) t.color.fg_secondary else t.color.fg_tertiary;
+    return if (has_value) t.tokens.color.fg_secondary else t.tokens.color.fg_tertiary;
 }
 
 pub fn chevronTint(open: bool, t: *const theme.ThemeTokens) Color {
-    return if (open) t.color.accent else t.color.fg_tertiary;
+    return if (open) t.tokens.color.accent else t.tokens.color.fg_tertiary;
 }
 
 pub fn valueTextColor(has_value: bool, t: *const theme.ThemeTokens) Color {
-    return if (has_value) t.color.fg_primary else t.color.fg_tertiary;
+    return if (has_value) t.tokens.color.fg_primary else t.tokens.color.fg_tertiary;
 }
 
 pub fn dashColor(has_any_value: bool, t: *const theme.ThemeTokens) Color {
-    return if (has_any_value) t.color.fg_secondary else t.color.fg_tertiary;
+    return if (has_any_value) t.tokens.color.fg_secondary else t.tokens.color.fg_tertiary;
 }
 
-pub fn rangeTextStyle(t: *const theme.ThemeTokens, cm: theme.ControlMetrics) core.TextProps {
-    return .{ .content = "", .color = t.color.fg_tertiary, .font_size = cm.font_size, .line_height = cm.line_height };
+pub fn rangeTextStyle(t: *const theme.ThemeTokens, cm: control_shell.ControlMetrics) core.TextStyle {
+    return .{ .color = t.tokens.color.fg_tertiary, .font_size = cm.font_size, .line_height = cm.line_height };
 }
 
 pub fn panelStyle(t: *const theme.ThemeTokens) core.BoxStyle {
@@ -50,8 +51,8 @@ pub fn panelStyle(t: *const theme.ThemeTokens) core.BoxStyle {
         .width = .{ .fit = .{} },
         .height = .{ .fit = .{} },
         .direction = .row,
-        .background = t.color.bg_primary,
-        .border = .{ .width = 1, .color = t.color.border, .radius = panel_radius },
+        .background = t.tokens.color.bg_primary,
+        .border = .{ .width = 1, .color = t.tokens.color.border, .radius = panel_radius },
         .shadow = Shadow{ .color = Color.rgba(0, 0, 0, 18), .blur = 24, .offset_x = 0, .offset_y = 8 },
     };
 }
@@ -60,7 +61,7 @@ pub fn panelDividerStyle(t: *const theme.ThemeTokens) core.BoxStyle {
     return .{
         .width = .{ .px = 1 },
         .height = .{ .grow = .{} },
-        .background = t.color.border,
+        .background = t.tokens.color.border,
     };
 }
 
@@ -84,8 +85,8 @@ pub fn monthHeaderStyle(_: *const theme.ThemeTokens) core.BoxStyle {
     };
 }
 
-pub fn monthTitleTextStyle(t: *const theme.ThemeTokens) core.TextProps {
-    return .{ .content = "", .color = t.color.fg_primary, .font_size = 14, .font_weight = 600 };
+pub fn monthTitleTextStyle(t: *const theme.ThemeTokens) core.TextStyle {
+    return .{ .color = t.tokens.color.fg_primary, .font_size = 14, .font_weight = 600 };
 }
 
 pub fn weekdayCellStyle(_: *const theme.ThemeTokens) core.BoxStyle {
@@ -97,8 +98,8 @@ pub fn weekdayCellStyle(_: *const theme.ThemeTokens) core.BoxStyle {
     };
 }
 
-pub fn weekdayTextStyle(t: *const theme.ThemeTokens) core.TextProps {
-    return .{ .content = "", .color = t.color.fg_tertiary, .font_size = 11, .font_weight = 600 };
+pub fn weekdayTextStyle(t: *const theme.ThemeTokens) core.TextStyle {
+    return .{ .color = t.tokens.color.fg_tertiary, .font_size = 11, .font_weight = 600 };
 }
 
 pub fn monthGridStyle(_: *const theme.ThemeTokens) core.BoxStyle {
@@ -126,7 +127,7 @@ pub fn dayPlaceholderStyle(_: *const theme.ThemeTokens) core.BoxStyle {
     };
 }
 
-/// day cell 的 box 样式 = computeDayCellVisual 的几何/取色落到 BoxStyle
+/// day cell box style = computeDayCellVisual's geometry/color mapping to BoxStyle
 pub fn dayCellBoxStyle(visual: DayCellVisual) core.BoxStyle {
     return .{
         .width = .{ .px = day_cell_size },
@@ -145,14 +146,14 @@ pub fn iconBtnStyle(t: *const theme.ThemeTokens) core.BoxStyle {
         .direction = .row,
         .justify = .center,
         .align_items = .center,
-        .background = t.color.bg_hover,
-        .border = .{ .width = 0, .color = t.color.border, .radius = 8 },
+        .background = t.tokens.color.bg_hover,
+        .border = .{ .width = 0, .color = t.tokens.color.border, .radius = 8 },
     };
 }
 
-/// 月份导航按钮 hover 动画取色源（useAnimatedBackground）
+/// Month nav button hover animation color source (useAnimatedBackground)
 pub fn iconBtnAnimColors(t: *const theme.ThemeTokens) struct { normal: Color, hover: Color } {
-    return .{ .normal = t.color.bg_hover, .hover = t.color.bg_active };
+    return .{ .normal = t.tokens.color.bg_hover, .hover = t.tokens.color.bg_active };
 }
 
 pub const DayCellVisual = struct {
@@ -175,21 +176,21 @@ pub fn computeDayCellVisual(state: *const DateRangePickerState, date: SimpleDate
 
     return .{
         .bg_color = if (is_start or is_end)
-            t.color.accent
+            t.tokens.color.accent
         else if (in_range)
-            t.color.accent_subtle
+            t.tokens.color.accent_subtle
         else
             Color.TRANSPARENT,
         .text_color = if (is_start or is_end)
-            t.color.fg_inverse
+            t.tokens.color.fg_inverse
         else if (in_range)
-            t.color.accent
+            t.tokens.color.accent
         else if (in_current_month)
-            t.color.fg_primary
+            t.tokens.color.fg_primary
         else
-            t.color.fg_tertiary,
+            t.tokens.color.fg_tertiary,
         .border_width = if (is_today and !(is_start or is_end)) 1 else 0,
-        .border_color = t.color.accent,
+        .border_color = t.tokens.color.accent,
         .corner_radius = if (is_start and is_end)
             core.CornerRadius.uniform(10)
         else if (is_start)

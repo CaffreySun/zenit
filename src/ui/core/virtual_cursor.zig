@@ -5,6 +5,14 @@
 //! UI and inspector paint.  It never participates in layout or hit testing.
 
 const std = @import("std");
+
+var hidden_env_cache: ?bool = null;
+fn hiddenByEnv() bool {
+    if (hidden_env_cache) |v| return v;
+    const v = @import("zenit_environment").has("ZENIT_E2E_HIDE_VIRTUAL_CURSOR");
+    hidden_env_cache = v;
+    return v;
+}
 const icon_ir = @import("icon_ir");
 const icons = @import("zenit_system_icons");
 const paint = @import("paint_table.zig");
@@ -65,6 +73,8 @@ pub const VirtualCursor = struct {
     /// Returns true while the cursor needs another animation frame.
     pub fn renderOverlay(self: *VirtualCursor, cx: anytype, now_ms: f64) bool {
         if (!self.visible) return false;
+        // Don't draw when frame-by-frame comparison (cursor obscures tested control)
+        if (hiddenByEnv()) return false;
         if (self.shape == .none) return false;
 
         var wants_animation = false;
@@ -91,8 +101,9 @@ fn renderShape(cx: anytype, cursor: VirtualCursor, now_ms: f64) bool {
     const x = cursor.x;
     const y = cursor.y;
     switch (cursor.shape) {
-        // .custom 的真实位图（NSCursor 等）在系统合成层，自动化虚拟指针
-        // 这里画不出位图内容，用默认箭头兜底；e2e 断言走状态探针而非视觉。
+        // .custom's real bitmap (NSCursor etc) in system composition, virtual cursor
+        // can't draw bitmap here, fall back to default arrow; e2e asserts via state probe not
+        // visual.
         .inherit, .default, .custom => {
             if (cursor.pressed) {
                 appendIconWithHalo(cx, icons.cursor_click, x - 9, y - 9, 24, 0);
@@ -211,7 +222,7 @@ test "virtual cursor is draw-only until automation makes it visible" {
     const FakeCx = struct {
         allocator: std.mem.Allocator,
         lowering: struct {
-            main_paint: std.ArrayListUnmanaged(paint.DisplayItem) = .{},
+            main_paint: std.ArrayListUnmanaged(paint.DisplayItem) = .empty,
         } = .{},
     };
     var cx = FakeCx{ .allocator = std.testing.allocator };
@@ -228,7 +239,7 @@ test "pointer and grab draw distinct art" {
     const FakeCx = struct {
         allocator: std.mem.Allocator,
         lowering: struct {
-            main_paint: std.ArrayListUnmanaged(paint.DisplayItem) = .{},
+            main_paint: std.ArrayListUnmanaged(paint.DisplayItem) = .empty,
         } = .{},
 
         fn iconIdFor(self: *@This(), shape: CursorShape) !u64 {
@@ -259,7 +270,7 @@ test "virtual cursor renders text shape and animates release pulse" {
     const FakeCx = struct {
         allocator: std.mem.Allocator,
         lowering: struct {
-            main_paint: std.ArrayListUnmanaged(paint.DisplayItem) = .{},
+            main_paint: std.ArrayListUnmanaged(paint.DisplayItem) = .empty,
         } = .{},
     };
     var cx = FakeCx{ .allocator = std.testing.allocator };

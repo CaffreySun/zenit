@@ -1,7 +1,7 @@
-/// Metal CommandEncoder 实现
+/// Metal CommandEncoder implementation.
 ///
-/// 提供高层命令编码 API，封装底层 Metal C API
-/// 遵循 wgpu API 设计，实现状态机模式
+/// Provides high-level command encoding API, wraps Metal C API.
+/// Follows wgpu API design, implements state machine pattern.
 const std = @import("std");
 const gpu = @import("../gpu.zig");
 const mtl = @import("metal_bindings.zig");
@@ -9,9 +9,9 @@ const resources = @import("resources.zig");
 const bind_group_mod = @import("bind_group.zig");
 const Queue = @import("queue.zig").Queue;
 
-/// CommandEncoder - 命令编码器
+/// CommandEncoder - command encoder.
 ///
-/// 用于记录 GPU 命令，可以创建 RenderPass 和 ComputePass
+/// Records GPU commands, can create RenderPass and ComputePass.
 pub const CommandEncoder = struct {
     raw: *mtl.MTLCommandBuffer,
     state: State = .initial,
@@ -24,17 +24,17 @@ pub const CommandEncoder = struct {
     /// rejected in Zig before their raw pointer reaches Objective-C.
     next_pass_generation: u64 = 1,
     active_pass_generation: u64 = 0,
-    /// 当前活跃 pass 的 +1 owned MTL*CommandEncoder。正常路径由 pass.end()
-    /// endEncoding + release；错误路径（帧中途 try 失败）靠 deinit 兜底，
-    /// 否则 encoder 泄漏且 command buffer 带着未 endEncoding 的 encoder 被释放。
+    /// Current active pass's +1 owned MTL*CommandEncoder. Normal path: pass.end()
+    /// endEncoding + release; error path (try fails mid-frame): deinit catches, else encoder
+    /// leaks and command buffer released with un-endEncoded encoder.
     active_pass_raw: ?*anyopaque = null,
 
     const State = enum {
-        initial, // 初始状态，可以开始编码
-        render_pass, // 正在编码渲染通道
-        compute_pass, // 正在编码计算通道
-        blit, // 正在编码拷贝操作
-        finished, // 已完成，不能再编码
+        initial, // Initial state, can start encoding.
+        render_pass, // Encoding render pass.
+        compute_pass, // Encoding compute pass.
+        blit, // Encoding blit operation.
+        finished, // Finished, can't encode.
     };
 
     fn activatePass(self: *CommandEncoder, state: State) u64 {
@@ -64,12 +64,13 @@ pub const CommandEncoder = struct {
         self.state = .initial;
     }
 
-    /// 从 Queue 创建 CommandEncoder
+    /// Create CommandEncoder from Queue.
     pub fn init(queue: *Queue) !CommandEncoder {
-        // ABI 合同：bridge 的 create/new/copy/nextDrawable 系列用 __bridge_retained
-        // 返回 **+1 owned** 对象（metal_bridge.m:625），调用方直接接管所有权。
-        // 这里**不能**再 retain，之前多 retain 一次而 deinit 只 release 一次，
-        // 每帧净泄漏一个 MTLCommandBuffer。
+        // ABI contract: bridge's create/new/copy/nextDrawable series use __bridge_retained to
+        // return
+        // **+1 owned** object (metal_bridge.m:625), caller takes ownership directly. **Can't**
+        // retain
+        // again here; extra retain once but deinit releases once leaks MTLCommandBuffer per frame.
         const cmd_buffer = mtl.metal_queue_command_buffer(queue.raw) orelse
             return error.CommandBufferCreationFailed;
 
@@ -79,7 +80,7 @@ pub const CommandEncoder = struct {
         };
     }
 
-    /// 开始渲染通道
+    /// Begin render pass.
     pub fn beginRenderPass(self: *CommandEncoder, desc: gpu.RenderPassDescriptor) !RenderPass {
         if (self.state != .initial) {
             return error.InvalidEncoderState;
@@ -88,32 +89,32 @@ pub const CommandEncoder = struct {
         var pool = mtl.AutoreleasePool.init();
         defer pool.deinit();
 
-        // 创建 Metal RenderPassDescriptor
+        // Create Metal RenderPassDescriptor.
         const pass_desc = mtl.metal_render_pass_descriptor_new();
 
-        // 配置颜色附件
+        // Configure color attachment.
         for (desc.color_attachments, 0..) |attachment, i| {
             const color_attachment = mtl.metal_render_pass_get_color_attachment(pass_desc, @intCast(i));
 
-            // 设置纹理
+            // Set texture.
             mtl.metal_color_attachment_set_texture(color_attachment, attachment.view.raw);
 
-            // 设置加载操作
+            // Set load action.
             const load_action: mtl.MTLLoadAction = switch (attachment.load_op) {
                 .load => .Load,
                 .clear => .Clear,
                 .dont_care => .DontCare,
             };
-            mtl.metal_color_attachment_set_load_action(color_attachment, @intFromEnum(load_action));
+            mtl.metal_color_attachment_set_load_action(color_attachment, @backingInt(load_action));
 
-            // 设置存储操作
+            // Set store action.
             const store_action: mtl.MTLStoreAction = switch (attachment.store_op) {
                 .store => .Store,
                 .discard => .DontCare,
             };
-            mtl.metal_color_attachment_set_store_action(color_attachment, @intFromEnum(store_action));
+            mtl.metal_color_attachment_set_store_action(color_attachment, @backingInt(store_action));
 
-            // 设置清除颜色
+            // Set clear color.
             if (attachment.load_op == .clear) {
                 mtl.metal_color_attachment_set_clear_color(
                     color_attachment,
@@ -124,13 +125,13 @@ pub const CommandEncoder = struct {
                 );
             }
 
-            // 设置 resolve target（MSAA）
+            // Set resolve target (MSAA).
             if (attachment.resolve_target) |resolve| {
                 mtl.metal_color_attachment_set_resolve_texture(color_attachment, resolve.raw);
             }
         }
 
-        // 配置深度/模板附件
+        // Configure depth/stencil attachment.
         if (desc.depth_stencil_attachment) |ds_attachment| {
             const depth_attachment = mtl.metal_render_pass_get_depth_attachment(pass_desc);
             mtl.metal_depth_attachment_set_texture(depth_attachment, ds_attachment.view.raw);
@@ -140,13 +141,13 @@ pub const CommandEncoder = struct {
                 .clear => .Clear,
                 .dont_care => .DontCare,
             };
-            mtl.metal_depth_attachment_set_load_action(depth_attachment, @intFromEnum(depth_load));
+            mtl.metal_depth_attachment_set_load_action(depth_attachment, @backingInt(depth_load));
 
             const depth_store: mtl.MTLStoreAction = switch (ds_attachment.depth_store_op) {
                 .store => .Store,
                 .discard => .DontCare,
             };
-            mtl.metal_depth_attachment_set_store_action(depth_attachment, @intFromEnum(depth_store));
+            mtl.metal_depth_attachment_set_store_action(depth_attachment, @backingInt(depth_store));
 
             if (ds_attachment.depth_load_op == .clear) {
                 mtl.metal_depth_attachment_set_clear_depth(depth_attachment, ds_attachment.depth_clear_value);
@@ -161,29 +162,28 @@ pub const CommandEncoder = struct {
                 .clear => .Clear,
                 .dont_care => .DontCare,
             };
-            mtl.metal_stencil_attachment_set_load_action(stencil_attachment, @intFromEnum(stencil_load));
+            mtl.metal_stencil_attachment_set_load_action(stencil_attachment, @backingInt(stencil_load));
 
             const stencil_store: mtl.MTLStoreAction = switch (ds_attachment.stencil_store_op) {
                 .store => .Store,
                 .discard => .DontCare,
             };
-            mtl.metal_stencil_attachment_set_store_action(stencil_attachment, @intFromEnum(stencil_store));
+            mtl.metal_stencil_attachment_set_store_action(stencil_attachment, @backingInt(stencil_store));
 
             if (ds_attachment.stencil_load_op == .clear) {
                 mtl.metal_stencil_attachment_set_clear_stencil(stencil_attachment, ds_attachment.stencil_clear_value);
             }
         }
 
-        // 创建 Render Encoder。
-        // ABI 合同：bridge 用 __bridge_retained 返回 +1 owned（metal_bridge.m:766），
-        // 这里直接接管，**不再 retain**, RenderPass.end() 只 release 一次，
-        // 多retain 会让每个 render pass 泄漏一个 MTLRenderCommandEncoder。
+        // Create Render Encoder. ABI contract: bridge uses __bridge_retained to return +1 owned
+        // (metal_bridge.m:766), take ownership directly, **don't retain again**, RenderPass.end()
+        // releases once; over-retaining leaks MTLRenderCommandEncoder per render pass.
         const encoder = mtl.metal_command_buffer_create_render_encoder(self.raw, pass_desc) orelse {
             mtl.release(pass_desc);
             return error.RenderEncoderCreationFailed;
         };
 
-        // 释放 descriptor（encoder 已经持有引用）
+        // Release descriptor (encoder already holds reference).
         mtl.release(pass_desc);
 
         const generation = self.activatePass(.render_pass);
@@ -205,7 +205,7 @@ pub const CommandEncoder = struct {
         return .{ .encoder = encoder, .command_encoder = self, .generation = generation };
     }
 
-    /// 完成编码，返回 CommandBuffer
+    /// Finish encoding, return CommandBuffer.
     pub fn finish(self: *CommandEncoder) !CommandBuffer {
         if (self.state == .finished) return error.EncoderAlreadyFinished;
         if (self.state != .initial) return error.InvalidEncoderState;
@@ -217,11 +217,11 @@ pub const CommandEncoder = struct {
         };
     }
 
-    /// 销毁 CommandEncoder（如果未完成）
+    /// Destroy CommandEncoder (if not finished).
     pub fn deinit(self: *CommandEncoder) void {
         if (self.state == .finished) return;
-        // 错误路径：仍有 pass 未 end（其 RenderPass/BlitPass 值被丢弃）。
-        // 先 endEncoding + release 它，再释放 command buffer。
+        // Error path: pass still not ended (its RenderPass/BlitPass value discarded). First
+        // endEncoding + release it, then release command buffer.
         if (self.active_pass_raw) |raw| {
             switch (self.state) {
                 .render_pass => mtl.metal_render_encoder_end_encoding(@ptrCast(@alignCast(raw))),
@@ -292,9 +292,9 @@ pub const BlitPass = struct {
     }
 };
 
-/// RenderPass - 渲染通道
+/// RenderPass - render pass.
 ///
-/// 用于记录渲染命令
+/// Records render commands.
 pub const RenderPass = struct {
     encoder: *mtl.MTLRenderCommandEncoder,
     command_encoder: *CommandEncoder,
@@ -308,13 +308,13 @@ pub const RenderPass = struct {
         return self.command_encoder.passIsActive(.render_pass, self.generation);
     }
 
-    /// 设置渲染管线
+    /// Set render pipeline.
     pub fn setPipeline(self: *RenderPass, pipeline: *const RenderPipeline) void {
         self.assertActive();
         mtl.metal_render_encoder_set_render_pipeline_state(self.encoder, pipeline.raw);
     }
 
-    /// 设置视口
+    /// Set viewport.
     pub fn setViewport(
         self: *RenderPass,
         x: f32,
@@ -336,25 +336,25 @@ pub const RenderPass = struct {
         );
     }
 
-    /// 设置裁剪矩形
+    /// Set scissor rectangle.
     pub fn setScissorRect(self: *RenderPass, x: u32, y: u32, width: u32, height: u32) void {
         self.assertActive();
         mtl.metal_render_encoder_set_scissor_rect(self.encoder, x, y, width, height);
     }
 
-    /// 设置顶点缓冲区
+    /// Set vertex buffer.
     pub fn setVertexBuffer(self: *RenderPass, slot: u32, buffer: *const resources.Buffer, offset: u64) void {
         self.assertActive();
         mtl.metal_render_encoder_set_vertex_buffer(self.encoder, buffer.raw, offset, slot);
     }
 
-    /// 设置片段缓冲区
+    /// Set fragment buffer.
     pub fn setFragmentBuffer(self: *RenderPass, slot: u32, buffer: *const resources.Buffer, offset: u64) void {
         self.assertActive();
         mtl.metal_render_encoder_set_fragment_buffer(self.encoder, buffer.raw, offset, slot);
     }
 
-    /// 设置片段纹理
+    /// Set fragment texture.
     pub fn setFragmentTexture(self: *RenderPass, slot: u32, texture: *const resources.Texture) void {
         self.assertActive();
         mtl.metal_render_encoder_set_fragment_texture(self.encoder, texture.raw, slot);
@@ -365,13 +365,13 @@ pub const RenderPass = struct {
         mtl.metal_render_encoder_set_fragment_texture(self.encoder, texture.raw, slot);
     }
 
-    /// 设置片段纹理（原始 MTLTexture 指针）
+    /// Set fragment texture (raw MTLTexture pointer).
     pub fn setFragmentTextureRaw(self: *RenderPass, slot: u32, texture: ?*mtl.MTLTexture) void {
         self.assertActive();
         mtl.metal_render_encoder_set_fragment_texture(self.encoder, texture, slot);
     }
 
-    /// 设置片段采样器（原始 MTLSamplerState 指针）
+    /// Set fragment sampler (raw MTLSamplerState pointer).
     pub fn setFragmentSamplerRaw(self: *RenderPass, slot: u32, sampler: ?*mtl.MTLSamplerState) void {
         self.assertActive();
         mtl.metal_render_encoder_set_fragment_sampler(self.encoder, sampler, slot);
@@ -387,19 +387,19 @@ pub const RenderPass = struct {
         );
     }
 
-    /// 设置顶点字节数据（push constants）
+    /// Set vertex bytes (push constants).
     pub fn setVertexBytes(self: *RenderPass, slot: u32, data: []const u8) void {
         self.assertActive();
         mtl.metal_render_encoder_set_vertex_bytes(self.encoder, data.ptr, data.len, slot);
     }
 
-    /// 设置片段字节数据（push constants）
+    /// Set fragment bytes (push constants).
     pub fn setFragmentBytes(self: *RenderPass, slot: u32, data: []const u8) void {
         self.assertActive();
         mtl.metal_render_encoder_set_fragment_bytes(self.encoder, data.ptr, data.len, slot);
     }
 
-    /// 绘制基元
+    /// Draw primitives.
     pub fn draw(
         self: *RenderPass,
         vertex_count: u32,
@@ -408,21 +408,21 @@ pub const RenderPass = struct {
         first_instance: u32,
     ) void {
         self.assertActive();
-        // 计数必须覆盖**两条** draw 路径。此前只有 drawIndexed 计数，
-        // 而 UI 主路径（SDF/text/image/icon 实例化）走的正是这里的非索引
-        // draw，于是 draw call 统计长期严重低估（审查报告 §4）。
+        // Count must cover **both** draw paths. Previously only drawIndexed counted, but UI main
+        // path (SDF/text/image/icon instancing) uses non-indexed draw here, so draw call stats
+        // long under-estimated (review report §4).
         frame_draw_call_count += 1;
         if (instance_count == 1 and first_instance == 0) {
             mtl.metal_render_encoder_draw_primitives(
                 self.encoder,
-                @intFromEnum(mtl.MTLPrimitiveType.Triangle),
+                @backingInt(mtl.MTLPrimitiveType.Triangle),
                 first_vertex,
                 vertex_count,
             );
         } else if (first_instance == 0) {
             mtl.metal_render_encoder_draw_primitives_instanced(
                 self.encoder,
-                @intFromEnum(mtl.MTLPrimitiveType.Triangle),
+                @backingInt(mtl.MTLPrimitiveType.Triangle),
                 first_vertex,
                 vertex_count,
                 instance_count,
@@ -430,7 +430,7 @@ pub const RenderPass = struct {
         } else {
             mtl.metal_render_encoder_draw_primitives_instanced_base_instance(
                 self.encoder,
-                @intFromEnum(mtl.MTLPrimitiveType.Triangle),
+                @backingInt(mtl.MTLPrimitiveType.Triangle),
                 first_vertex,
                 vertex_count,
                 instance_count,
@@ -439,12 +439,12 @@ pub const RenderPass = struct {
         }
     }
 
-    /// 全局 frame draw call 计数器（矩阵 #5 < 400）。
-    /// FrameSync.beginFrame 处 reset；drawIndexed 调用时 +1（不分 instance count,
-    /// 一次 drawIndexed* 调用 = 一次 draw call，与 instance 数无关）。
+    /// Global frame draw call counter (matrix #5 < 400). Reset at FrameSync.beginFrame; +1
+    /// on drawIndexed call (ignores instance count; one drawIndexed* call = one draw call,
+    /// independent of instance count).
     pub var frame_draw_call_count: u32 = 0;
 
-    /// 绘制索引基元
+    /// Draw indexed primitives.
     pub fn drawIndexed(
         self: *RenderPass,
         index_count: u32,
@@ -472,18 +472,18 @@ pub const RenderPass = struct {
         if (instance_count == 1 and first_instance == 0 and base_vertex == 0) {
             mtl.metal_render_encoder_draw_indexed_primitives(
                 self.encoder,
-                @intFromEnum(mtl.MTLPrimitiveType.Triangle),
+                @backingInt(mtl.MTLPrimitiveType.Triangle),
                 index_count,
-                @intFromEnum(mtl_index_type),
+                @backingInt(mtl_index_type),
                 index_buffer.raw,
                 offset,
             );
         } else if (first_instance == 0 and base_vertex == 0) {
             mtl.metal_render_encoder_draw_indexed_primitives_instanced(
                 self.encoder,
-                @intFromEnum(mtl.MTLPrimitiveType.Triangle),
+                @backingInt(mtl.MTLPrimitiveType.Triangle),
                 index_count,
-                @intFromEnum(mtl_index_type),
+                @backingInt(mtl_index_type),
                 index_buffer.raw,
                 offset,
                 instance_count,
@@ -491,9 +491,9 @@ pub const RenderPass = struct {
         } else {
             mtl.metal_render_encoder_draw_indexed_primitives_full(
                 self.encoder,
-                @intFromEnum(mtl.MTLPrimitiveType.Triangle),
+                @backingInt(mtl.MTLPrimitiveType.Triangle),
                 index_count,
-                @intFromEnum(mtl_index_type),
+                @backingInt(mtl_index_type),
                 index_buffer.raw,
                 offset,
                 instance_count,
@@ -503,16 +503,16 @@ pub const RenderPass = struct {
         }
     }
 
-    /// 设置 BindGroup
+    /// Set BindGroup.
     ///
-    /// 将 BindGroup 中的资源绑定到 Metal encoder。
-    /// group_index 用于偏移 buffer slot，避免多个 BindGroup 冲突。
+    /// Bind resources from BindGroup to Metal encoder. group_index offsets buffer slot to
+    /// avoid BindGroup conflicts.
     pub fn setBindGroup(self: *RenderPass, group_index: u32, bind_group: *const bind_group_mod.BindGroup) void {
         self.assertActive();
         bind_group.applyToRenderEncoder(self.encoder, group_index);
     }
 
-    /// 结束渲染通道
+    /// End render pass.
     pub fn end(self: *RenderPass) void {
         self.assertActive();
         mtl.metal_render_encoder_end_encoding(self.encoder);
@@ -521,19 +521,19 @@ pub const RenderPass = struct {
     }
 };
 
-/// ComputePass - 计算通道
+/// ComputePass - compute pass.
 ///
-/// 用于记录计算命令
+/// Records compute commands.
 pub const ComputePass = struct {
     encoder: *mtl.MTLComputeCommandEncoder,
     command_encoder: *CommandEncoder,
 
-    /// 设置计算管线
+    /// Set compute pipeline.
     pub fn setPipeline(self: *ComputePass, pipeline: *const ComputePipeline) void {
         mtl.metal_compute_encoder_set_compute_pipeline_state(self.encoder, pipeline.raw);
     }
 
-    /// 分发计算
+    /// Dispatch compute.
     pub fn dispatch(
         self: *ComputePass,
         threadgroups: [3]u32,
@@ -550,12 +550,12 @@ pub const ComputePass = struct {
         );
     }
 
-    /// 设置 BindGroup
+    /// Set BindGroup.
     pub fn setBindGroup(self: *ComputePass, group_index: u32, bind_group: *const bind_group_mod.BindGroup) void {
         bind_group.applyToComputeEncoder(self.encoder, group_index);
     }
 
-    /// 结束计算通道
+    /// End compute pass.
     pub fn end(self: *ComputePass) void {
         mtl.metal_compute_encoder_end_encoding(self.encoder);
         mtl.release(self.encoder);
@@ -563,26 +563,27 @@ pub const ComputePass = struct {
     }
 };
 
-/// CommandBuffer - 已编码的命令缓冲区
+/// CommandBuffer - encoded command buffer.
 ///
-/// 可以提交到 Queue 执行
+/// Can be submitted to Queue for execution.
 pub const CommandBuffer = struct {
     raw: *mtl.MTLCommandBuffer,
 
-    /// 进程级 command buffer 失败计数（诊断/soak 断言用）。
+    /// Process-level command buffer failure count (for diagnostics/soak assertions).
     pub var error_count: std.atomic.Value(u64) = .init(0);
 
     fn onCommandBufferError(context: ?*anyopaque, code: c_long, desc: [*:0]const u8) callconv(.c) void {
         _ = context;
         const n = CommandBuffer.error_count.fetchAdd(1, .monotonic);
-        // 前几次全量报告，之后抽样，GPU fault 一旦发生往往逐帧复现，
-        // 不能刷屏，但也绝不能静默（此前的行为：完全没人看 status）。
+        // First few times report fully, then sample. GPU fault, once occurs, usually repeats
+        // frame-by-frame; can't spam but must never silent (old behavior: nobody watched status).
         if (n < 5 or n % 64 == 0) {
             std.log.err("[metal] command buffer failed (code={d}, total={d}): {s}", .{ code, n + 1, desc });
         }
     }
 
-    /// 提交命令。附带错误观测：GPU fault / hang / 设备移除不再静默。
+    /// Submit commands. Include error observation: GPU fault / hang / device removal no longer
+    /// silent.
     pub fn submit(self: *CommandBuffer) void {
         mtl.metal_command_buffer_notify_error(self.raw, null, &onCommandBufferError);
         mtl.metal_command_buffer_commit(self.raw);
@@ -597,8 +598,8 @@ pub const CommandBuffer = struct {
         mtl.metal_command_buffer_wait_until_completed(self.raw);
     }
 
-    /// 非阻塞查询本 buffer 是否已到终态。让调用方可以把"完成后才能读的
-    /// 数据"做成机会式读取，而不必阻塞主线程。
+    /// Non-blocking query whether buffer reached terminal state. Lets caller do opportunistic
+    /// reads of 'data only readable after completion', no main thread block.
     pub fn isCompleted(self: *const CommandBuffer) bool {
         return mtl.metal_command_buffer_is_completed(self.raw);
     }
@@ -612,22 +613,22 @@ pub const CommandBuffer = struct {
         return @intFromFloat((end - start) * std.time.us_per_s);
     }
 
-    /// 呈现 drawable
+    /// Present drawable.
     pub fn presentDrawable(self: *CommandBuffer, drawable: *mtl.CAMetalDrawable) void {
         mtl.metal_command_buffer_present_drawable(self.raw, drawable);
     }
 
-    /// 销毁
+    /// Destroy.
     pub fn deinit(self: *CommandBuffer) void {
         mtl.release(self.raw);
     }
 };
 
-// 使用 pipeline.zig 中的定义
+// Use definitions from pipeline.zig.
 const pipeline_mod = @import("pipeline.zig");
 pub const RenderPipeline = pipeline_mod.RenderPipeline;
 
-/// ComputePipeline - 计算管线（占位，后续实现）
+/// ComputePipeline - compute pipeline (placeholder, future implementation).
 pub const ComputePipeline = struct {
     raw: *mtl.MTLComputePipelineState,
 

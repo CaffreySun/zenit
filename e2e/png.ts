@@ -1,13 +1,13 @@
-/// png.ts，最小 PNG 解码器（8-bit RGB/RGBA、非交错），供 e2e 做像素级断言。
-/// 只依赖 Bun.inflateSync；harness 截图固定为此格式。
-import { readFileSync } from "node:fs";
-import { inflateSync } from "node:zlib";
+/// png.ts, minimal PNG decoder (8-bit RGB/RGBA, non-interlaced), for e2e pixel-level assertions.
+/// Only depends on Bun.inflateSync; harness screenshots fixed to this format.
+import { readFileSync, writeFileSync } from "node:fs";
+import { inflateSync, deflateSync } from "node:zlib";
 
 export interface DecodedPng {
   width: number;
   height: number;
   channels: number; // 3 (RGB) or 4 (RGBA)
-  pixels: Uint8Array; // width*height*channels, 行优先
+  pixels: Uint8Array; // width*height*channels, row-major
 }
 
 export function decodePng(path: string): DecodedPng {
@@ -71,8 +71,9 @@ export function decodePng(path: string): DecodedPng {
   return { width, height, channels, pixels };
 }
 
-/// 统计矩形区域内亮度低于 threshold 的像素数（即"深色文字/图形"像素）。
-/// rect 为逻辑坐标，scale 为截图物理/逻辑比（默认自动按 png 宽 / logicalWidth 推）。
+/// Count pixels below brightness threshold in rect area (dark text/graphics pixels). rect is
+/// logical coords, scale is screenshot physical/logical ratio (default auto-infer by png width /
+/// logicalWidth).
 export function countDarkPixels(
   png: DecodedPng,
   rect: { x: number; y: number; w: number; h: number },
@@ -94,15 +95,16 @@ export function countDarkPixels(
   return count;
 }
 
-/// 统计区域内「与背景色不同」的像素数。
+/// Count pixels differing from the background color in a region.
 ///
-/// `countDarkPixels` 的 threshold=100 是近黑判据，只适合深色文字。浅色图形
-/// （spinner 的细线圈、skeleton 的浅灰占位块）在正常渲染下也只有个位数深色
-/// 像素，用深色判据会把「画对了」误判成「像素空白」。
+/// `countDarkPixels` (threshold=100, near-black) only fits dark text. Light graphics (spinner fine
+/// rings, light-gray skeleton placeholders) render with only single-digit dark pixels, so a dark
+/// criterion mistakes 'drawn correctly' for 'pixels empty'.
 ///
-/// 这个函数改问「这块区域是不是一片纯背景」：与背景色的亮度差超过 `minDelta`
-/// 即计数。它能同时抓住深色文字缺失和浅色图形缺失，代价是需要估计背景色
-/// （取区域四角亮度的中位数，见下）。
+/// This function asks 'is this area pure background': pixels whose brightness delta from the
+/// background exceeds `minDelta` count. It catches both missing dark text and missing light
+/// graphics, at the cost of estimating the background (median of four corner brightnesses, see
+/// below).
 export function countNonBackgroundPixels(
   png: DecodedPng,
   rect: { x: number; y: number; w: number; h: number },
@@ -120,8 +122,8 @@ export function countNonBackgroundPixels(
     return 0.299 * png.pixels[i] + 0.587 * png.pixels[i + 1] + 0.114 * png.pixels[i + 2];
   };
 
-  // 背景色取四角的中位数：四角落在图形上的概率远低于落在背景上，
-  // 取中位数还能容忍其中一两个角恰好被图形覆盖。
+  // Background from four corners median: probability of corners landing on graphics far lower than
+  // background, median also tolerates one-two corners hit by graphics.
   const corners = [
     lumAt(x0, y0),
     lumAt(x1 - 1, y0),
@@ -137,4 +139,19 @@ export function countNonBackgroundPixels(
     }
   }
   return count;
+}
+
+export function writeRgbPng(path: string, width: number, height: number, pixels: Uint8Array) {
+  const crc32 = (bytes: Uint8Array) => {
+    let crc = 0xffffffff;
+    for (const byte of bytes) { crc ^= byte; for (let i=0;i<8;i++) crc=(crc>>>1)^((crc&1)?0xedb88320:0); }
+    return (crc ^ 0xffffffff) >>> 0;
+  };
+  const chunk = (type: string, data: Uint8Array) => {
+    const b=Buffer.alloc(data.length+12); b.writeUInt32BE(data.length);b.write(type,4);b.set(data,8);b.writeUInt32BE(crc32(b.subarray(4,-4)),b.length-4);return b;
+  };
+  const header=Buffer.alloc(13);header.writeUInt32BE(width);header.writeUInt32BE(height,4);header[8]=8;header[9]=2;
+  const raw=Buffer.alloc(height*(width*3+1));
+  for(let y=0;y<height;y++) raw.set(pixels.subarray(y*width*3,(y+1)*width*3),y*(width*3+1)+1);
+  writeFileSync(path,Buffer.concat([Buffer.from([137,80,78,71,13,10,26,10]),chunk("IHDR",header),chunk("IDAT",deflateSync(raw)),chunk("IEND",new Uint8Array())]));
 }

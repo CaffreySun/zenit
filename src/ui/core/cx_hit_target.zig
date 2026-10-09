@@ -1,4 +1,4 @@
-//! 命中目标解析：interaction / inspect delegate 链与 devtools 命中调试输出。
+//! Hit target parsing: interaction / inspect delegate chain and devtools hit debug output.
 
 const std = @import("std");
 const core = @import("../core.zig");

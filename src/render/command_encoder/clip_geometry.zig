@@ -1,23 +1,22 @@
-//! Clip 几何代数，与 encoder 状态零耦合的纯函数簇。
+//! Clip geometry algebra: pure functions decoupled from encoder state.
 //!
-//! 从 command_encoder.zig 析出（2026-08-05）。这一簇回答的是同一个问题域：
-//! **两个 clip 形状等价吗 / 两个矩形的交是什么 / 外部 duck-typed 多边形怎么
-//! 归一成 encoder 的定长 ClipPolygon**。全部只吃值、只返回值，不触 self、
-//! 不分配、无副作用，与 encoder 的 clip 栈状态（clip_depth /
-//! logical_clip_stack / effective_rect_clip_stack）刻意分离：
-//! 栈的**推进/回退**留在 encoder（有状态），栈元素之间的**比较与归一**在这里。
+//! This cluster answers: **are two clip shapes equivalent / what is the intersection of two
+//! rectangles / how do external duck-typed polygons normalize to the encoder's fixed-length
+//! ClipPolygon**. All take and return values only: no self, no allocation, no side effects. Stack
+//! **push/pop** stays in the encoder (clip_depth / logical_clip_stack / effective_rect_clip_stack);
+//! **comparison and normalization** of stack elements live here.
 //!
-//! 等价比较统一用 approxEqAbs(1e-4)：clip 坐标经过 world->local 投影与 DPI
-//! 缩放，位精确比较会把"同一个 clip"判成不同，导致每帧无谓重建 clip mask。
+//! Equivalence always uses approxEqAbs(1e-4): clip coords go through world->local projection and
+//! DPI scaling, so bitwise comparison would treat the same clip as different and rebuild the clip
+//! mask every frame.
 //!
-//! command_encoder.zig 保留同名 re-export（含 pub 的 intersectClipRects），
-//! 公共 API 与既有调用点、单测全部不变。
+//! command_encoder.zig re-exports the same names (including pub intersectClipRects).
 
 const std = @import("std");
 
-/// 这几个类型仍由 command_encoder.zig 拥有（是它的公共 API 面），
-/// 这里按结构约定接收，传入 comptime 类型参数会让签名比搬运本身更复杂，
-/// 故用 anytype + 显式返回类型保持调用点零改动。
+/// These types still owned by command_encoder.zig (its public API surface), received here per
+/// struct contract; passing comptime type params makes signature more complex than migration
+/// itself, so use anytype + explicit return type keeps call sites zero-change.
 pub fn clipPolygonEqual(a: anytype, b: @TypeOf(a)) bool {
     if (a.point_count != b.point_count or a.contour_count != b.contour_count or a.fill_rule != b.fill_rule) return false;
     const max_contours = a.contour_end_points.len;
@@ -37,7 +36,8 @@ pub fn clipPolygonEqual(a: anytype, b: @TypeOf(a)) bool {
     return true;
 }
 
-/// 圆角 clip 状态等价。null == null 视为等价（都表示"无圆角 clip"）。
+/// Rounded clip state equivalence. null == null treated as equivalent (both mean 'no rounded
+/// clip').
 pub fn roundedClipEqual(a: anytype, b: @TypeOf(a)) bool {
     if (a == null and b == null) return true;
     if (a == null or b == null) return false;
@@ -52,8 +52,8 @@ pub fn roundedClipEqual(a: anytype, b: @TypeOf(a)) bool {
         clipPolygonEqual(lhs.polygon, rhs.polygon);
 }
 
-/// 两个 [x, y, w, h] 矩形求交。不相交时返回零面积矩形（保留左上角，
-/// 让调用方的 scissor 设置仍是合法输入而非负宽高）。
+/// Intersect two [x, y, w, h] rects. No overlap returns zero-area rect (keep top-left so caller's
+/// scissor stays legal input not negative width/height).
 pub fn intersectClipRects(a: [4]f32, b: [4]f32) [4]f32 {
     const x1 = @max(a[0], b[0]);
     const y1 = @max(a[1], b[1]);
@@ -63,11 +63,11 @@ pub fn intersectClipRects(a: [4]f32, b: [4]f32) [4]f32 {
     return .{ x1, y1, x2 - x1, y2 - y1 };
 }
 
-/// duck-typed 外部多边形 -> encoder 定长 ClipPolygon。
+/// Duck-typed external polygon -> encoder fixed-length ClipPolygon.
 ///
-/// `Out` 是 command_encoder.ClipPolygon；`coerceFillRule` 把来源侧的
-/// fill_rule 枚举转成 encoder 侧同序枚举。缺字段的来源类型退化为空多边形，
-/// 超出定长容量的点/轮廓按上限钳掉（encoder 的 clip 多边形是定长数组）。
+/// `Out` is command_encoder.ClipPolygon; `coerceFillRule` converts source fill_rule enum to encoder
+/// side same-sequence enum. Source types missing fields degrade to empty polygon, points/outlines
+/// exceeding fixed-length capacity clamped to limit (encoder clip polygon is fixed array).
 pub fn coerceClipPolygon(
     comptime Out: type,
     polygon: anytype,

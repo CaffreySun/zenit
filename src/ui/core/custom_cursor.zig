@@ -1,21 +1,20 @@
-//! 自定义位图光标存储，从 `Cx` 析出。
+//! Custom bitmap cursor storage, extracted from `Cx`.
 //!
-//! 原本是 `Cx` 上的四个字段（custom_cursors / active_custom_cursor /
-//! current_custom_key / custom_cursor_fallback）加两个方法，依赖只有
-//! `allocator` 与 SVG 光栅化。下发到系统那一步需要 `system_sdk` / `window_id`，
-//! 那是 `Cx.updateCursorShape` 的职责，接口因此切在：
+//! Depends only on `allocator` and SVG rasterization. System dispatch needs
+//! `system_sdk` / `window_id` and stays in Cx.updateCursorShape, so the interface cut is:
 //!
-//!   **store 负责「把 desc 光栅化成位图并按内容寻址缓存」，下发留在 Cx。**
+//! **the store rasterizes a desc to a bitmap and content-address caches it; dispatch
+//! stays in Cx.**
 //!
-//! 搬出来之后，预乘 alpha、内容寻址键、同 key 幂等、光栅化失败/插入失败的
-//! 清理，全都可以脱离 SystemSdk mock 单测。
+//! Premultiply alpha, the content-addressing key, same-key idempotence and
+//! rasterize/insert failure cleanup are testable without a SystemSdk mock.
 
 const std = @import("std");
 const types = @import("types.zig");
 
 const CursorShape = types.CursorShape;
 
-/// 宿主提交的自定义光标描述（输入）。
+/// host-submitted custom cursor description (input).
 pub const CustomCursorDesc = struct {
     svg_data: []const u8,
     size_pt: f32,
@@ -23,7 +22,8 @@ pub const CustomCursorDesc = struct {
     hot_x: f32 = 0,
     hot_y: f32 = 0,
 
-    /// 内容寻址键：同 SVG + 同参数 ⇒ 同位图。native 侧也以此键缓存光标对象。
+    /// content-addressing key: same SVG + same params => same bitmap. native side also caches
+    /// cursor objects by this key.
     pub fn contentKey(self: CustomCursorDesc) u64 {
         var h = std.hash.Wyhash.init(0);
         h.update(self.svg_data);
@@ -33,7 +33,7 @@ pub const CustomCursorDesc = struct {
     }
 };
 
-/// 已光栅化的自定义光标位图（预乘 RGBA）。hot 为像素坐标（左上原点）。
+/// rasterized custom cursor bitmap (premultiplied RGBA). hot is pixel coordinate (top-left origin).
 pub const CustomCursorEntry = struct {
     width: u32,
     height: u32,
@@ -43,8 +43,8 @@ pub const CustomCursorEntry = struct {
     pixels: []u8,
 };
 
-/// svg.rasterize 输出 straight-alpha RGBA；位图光标走 CGBitmapContext 的
-/// kCGImageAlphaPremultipliedLast，拷入前原地预乘。
+/// svg.rasterize outputs straight-alpha RGBA; bitmap cursor uses CGBitmapContext
+/// kCGImageAlphaPremultipliedLast, premultiply in-place before copy.
 pub fn premultiplyRgbaInPlace(pixels: []u8) void {
     var i: usize = 0;
     while (i + 4 <= pixels.len) : (i += 4) {
@@ -57,13 +57,13 @@ pub fn premultiplyRgbaInPlace(pixels: []u8) void {
 
 pub const CustomCursorStore = struct {
     entries: std.AutoHashMapUnmanaged(u64, CustomCursorEntry) = .{},
-    /// 当前被选中的自定义光标（还没必然下发到系统）。
+    /// currently selected custom cursor (not necessarily dispatched to system yet).
     active: ?u64 = null,
-    /// 已下发到系统的 key。幂等判据是「shape 相同**且** key 相同」,
-    /// shape 停在 `.custom` 期间换位图内容也必须重新下发。
+    /// key dispatched to system. idempotency check is 'shape identical **and** key identical',
+    /// changing bitmap content while shape in `.custom` must re-dispatch.
     submitted: ?u64 = null,
-    /// 后端不支持位图光标（或未注册位图）时 `.custom` 的降级形状。
-    /// 默认 crosshair：自定义光标的典型用途是精确绘制工具。
+    /// fallback shape for `.custom` when backend doesn't support bitmap cursors (or bitmap
+    /// unregistered). default crosshair: custom cursors typically used for precision drawing tools.
     fallback: CursorShape = .crosshair,
 
     pub fn deinit(self: *CustomCursorStore, allocator: std.mem.Allocator) void {
@@ -72,8 +72,9 @@ pub const CustomCursorStore = struct {
         self.entries.deinit(allocator);
     }
 
-    /// 光栅化产物（与 `svg.rasterize` 的返回形状一致，但本模块不 import svg：
-    /// 光栅化函数由调用方注入，store 因此可以脱离 SVG 管线独立单测）。
+    /// rasterization output (same shape as `svg.rasterize` return, but module doesn't import svg:
+    /// rasterize function injected by caller, store thus independent of SVG pipeline for unit
+    /// testing).
     pub const Raster = struct { width: u32, height: u32, pixels: []u8 };
     pub const RasterizeFn = *const fn (
         allocator: std.mem.Allocator,
@@ -81,10 +82,10 @@ pub const CustomCursorStore = struct {
         target_width: u32,
     ) anyerror!Raster;
 
-    /// 光栅化并登记一个自定义光标，随后把它设为 active。
+    /// rasterize and register custom cursor, then set it active.
     ///
-    /// 失败（光栅化失败 / 插入失败）时静默保持原状：光标只是观感，拿不到
-    /// 位图就继续用当前光标，不该让宿主崩。同 key 重复提交是 no-op。
+    /// on failure (rasterize/insert fail) silently keep current: cursor is visual only, if no
+    /// bitmap use current, shouldn't crash host. duplicate submit of same key is no-op.
     pub fn set(
         self: *CustomCursorStore,
         allocator: std.mem.Allocator,
@@ -116,20 +117,20 @@ pub const CustomCursorStore = struct {
         return self.active;
     }
 
-    /// 取 active 对应的位图；没有 active 或位图未登记时返回 null
-    /// （调用方应当降级到 `fallback`）。
+    /// get bitmap for active; return null if no active or bitmap unregistered (caller should fall
+    /// back to `fallback`).
     pub fn activeEntry(self: *const CustomCursorStore) ?CustomCursorEntry {
         const key = self.active orelse return null;
         return self.entries.get(key);
     }
 };
 
-// ── 测试 ───────────────────────────────────────────────────────────────
+// -- tests --
 
 const tiny_svg = "<svg viewBox=\"0 0 8 8\"><path d=\"M0 0 L8 0 L8 8 Z\" fill=\"#ff0000\"/></svg>";
 
-/// 假光栅化器：产出全不透明的 w×w RGBA。注入它之后，这组测试完全不依赖
-/// 真实 SVG 管线，这正是把 rasterize 做成参数的收益。
+/// mock rasterizer: outputs fully opaque w×w RGBA. injecting it makes these tests completely
+/// independent of real SVG pipeline, that's the benefit of making rasterize a parameter.
 fn fakeRasterize(allocator: std.mem.Allocator, svg_data: []const u8, target_width: u32) anyerror!CustomCursorStore.Raster {
     if (std.mem.eql(u8, svg_data, "FAIL")) return error.RasterizeFailed;
     const w = @max(target_width, 1);
@@ -151,7 +152,7 @@ test "premultiplyRgbaInPlace: alpha 全透明时 RGB 归零" {
 }
 
 test "premultiplyRgbaInPlace: 半透明按 round 而非截断" {
-    // 200 * 128 / 255 = 100.4；加 127 再整除 = 100（四舍五入）
+    // 200 * 128 / 255 = 100.4; add 127 then divide = 100 (rounding)
     var px = [_]u8{ 200, 200, 200, 128 };
     premultiplyRgbaInPlace(&px);
     try std.testing.expectEqual(@as(u8, 100), px[0]);
@@ -159,7 +160,7 @@ test "premultiplyRgbaInPlace: 半透明按 round 而非截断" {
 }
 
 test "premultiplyRgbaInPlace: 尾部不足 4 字节不越界" {
-    var px = [_]u8{ 10, 20, 30 }; // 只有 3 字节
+    var px = [_]u8{ 10, 20, 30 }; // only 3 bytes
     premultiplyRgbaInPlace(&px);
     try std.testing.expectEqualSlices(u8, &[_]u8{ 10, 20, 30 }, &px);
 }
@@ -195,7 +196,7 @@ test "store: 登记后 active 指向该位图，重复提交是 no-op" {
     try std.testing.expectEqual(@as(?u64, desc.contentKey()), store.activeKey());
     try std.testing.expectEqual(@as(u32, 1), store.entries.count());
 
-    // 同 desc 再来一次：不应重复光栅化
+    // same desc again: should not rasterize twice
     store.set(alloc, desc, fakeRasterize);
     try std.testing.expectEqual(@as(u32, 1), store.entries.count());
 }
@@ -216,7 +217,7 @@ test "store: 光栅化失败时保持原状而不是崩" {
     defer store.deinit(alloc);
 
     store.set(alloc, .{ .svg_data = "FAIL", .size_pt = 16 }, fakeRasterize);
-    // 失败路径：不登记、不设 active
+    // failure path: don't register, don't set active
     try std.testing.expectEqual(@as(u32, 0), store.entries.count());
     try std.testing.expectEqual(@as(?u64, null), store.activeKey());
 }

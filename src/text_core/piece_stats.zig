@@ -1,39 +1,25 @@
-//! 单遍文本统计扫描，从 `PieceTree` 析出。
-//!
-//! 原先是 piece_tree.zig 里 `PieceTree` 的私有嵌套函数 `scanTextStats`：输入一段
-//! 字节，输出 newline_count + first/last/longest_row_chars（对齐 Zed
-//! `TextSummary::from(str)`）。这些数字是 `PieceSummary` 做跨 piece 最长行合并的
-//! 全部依据，错一个，编辑器的横向滚动宽度就跟着错。
-//!
-//! 它对 PieceTree / SumTree / allocator **零依赖**（`[]const u8` 进、四个标量出），
-//! 却埋在两千多行的宿主文件里，只能跟着公共 API 间接测。接口因此切在：
-//!
-//!   **scan 只认字节，不认 piece / source / buffer。**
-//!
-//! 「统计怎么聚合成 Summary、怎么挂到 B-tree 上」仍是 piece_tree 的职责；
-//! `TreePiece.fromText` 在构造 piece 时调用这里。
-//!
-//! 踩过的坑（搬动时原样保留；第一条按实测行为修正过，见下方测试）：
-//!   - 「字符」= Unicode code point。推进量由 std.unicode.utf8ByteSequenceLength
-//!     决定，它只认 0x00-0x7F(1) / 0xC0-0xDF(2) / 0xE0-0xEF(3) / 0xF0-0xF7(4)
-//!     为合法 lead，其余（裸 continuation 0x80..0xBF、非法 lead 0xF8..0xFF）
-//!     一律 catch 成 1。注意两点：0xC0/0xC1 是过长的 2 字节 lead，scan 不验
-//!     continuation，会连带吞掉身后 1 个字节、整段只记 1 个字符；截断判断
-//!     `i + cp_len <= text.len` 只看长度不看内容。无论走哪条路径 i 都必须
-//!     前进，不能 panic 也不能死循环。
-//!   - 行宽用 `+|=` 饱和累加：超长行不允许把 u32 溢出回 0。
-//!   - first_line_chars 只在遇到第一个 '\n' 时定格；全文无 '\n' 时等于全长。
-//!   - 已知怪癖（锁定现状，不修）：多字节 lead 之后紧跟 '\n' 且序列在缓冲区
-//!     末尾方向被截断时，`i + cp_len <= text.len` 会把 '\n' 圈进序列长度，
-//!     导致 advance 越过一个本应单独计数的换行符，该行行宽 +1、
-//!     newline_count -1。只发生在「截断序列 + 紧贴 '\n'」的组合上；单靠
-//!     `scan` 无法区分「序列被截断」和「序列合法但下一个字节恰好是 '\n'」，
-//!     修复需要改变 advance 语义并连带修 PieceSummary 合并，超出本次
-//!     「行为零变化」的边界。相关测试只断言自洽性，不硬编码怪癖算术。
+//! Single-pass text statistics scan: bytes in, newline_count + first/last/longest_row_chars out
+//! (matches Zed TextSummary::from(str)).
+//! These numbers drive PieceSummary's cross-piece longest-line merge; if wrong, editor horizontal
+//! scroll width follows. No dependency on PieceTree / SumTree / allocator.
+//! How stats aggregate into Summary on the B-tree is piece_tree's job; TreePiece.fromText calls
+//! here.
+//! Pitfalls: (1) character = Unicode code point, advanced by std.unicode.utf8ByteSequenceLength:
+//! only 0x00-0x7F(1) / 0xC0-0xDF(2) / 0xE0-0xEF(3) / 0xF0-0xF7(4) are valid leads.
+//! Bare continuation 0x80..0xBF and invalid lead 0xF8..0xFF count as 1. 0xC0/0xC1 are overlong
+//! 2-byte leads: scan skips continuation validation, consuming 1 trailing byte and counting 1 char;
+//! the truncation check `i + cp_len <= text.len` checks length only, not content. All paths must
+//! advance i; no panic or loop. (2) Line width uses saturating +|= so very long lines don't wrap
+//! u32 to 0. (3) first_line_chars locks at the first '\n'; no newline = whole length.
+//! (4) Known quirk (locked, not fixed): a multibyte lead followed by '\n' with the sequence
+//! truncated at buffer end passes `i + cp_len <= text.len` and advances past the '\n' that should
+//! count alone: line width +1, newline_count -1. Scan cannot distinguish a truncated sequence from
+//! a valid sequence followed by '\n'. Fixing needs advance semantics change and PieceSummary
+//! merge update. Related tests assert self-consistency, not hardcoded quirk arithmetic.
 
 const std = @import("std");
 
-/// 一段文本的行统计（字段与 `PieceSummary` 的四个标量一一对应）。
+/// Line statistics of text (fields map one-to-one to PieceSummary's four scalars).
 pub const TextStats = struct {
     newline_count: usize,
     first_line_chars: u32,
@@ -41,7 +27,7 @@ pub const TextStats = struct {
     longest_row_chars: u32,
 };
 
-/// 单遍扫描：newline_count + first/last/longest_row_chars（O(n)，无分配）。
+/// Single-pass scan: newline_count + first/last/longest_row_chars (O(n), no allocation).
 pub fn scan(text: []const u8) TextStats {
     var newline_count: usize = 0;
     var first_line_chars: u32 = 0;
@@ -67,7 +53,7 @@ pub fn scan(text: []const u8) TextStats {
             current_line_chars +|= 1;
             i += 1;
         } else {
-            // UTF-8 多字节：算 1 个字符
+            // UTF-8 multibyte: counts as 1 character
             const cp_len = std.unicode.utf8ByteSequenceLength(b) catch 1;
             const advance = if (i + cp_len <= text.len) cp_len else 1;
             current_line_chars +|= 1;
@@ -75,7 +61,7 @@ pub fn scan(text: []const u8) TextStats {
         }
     }
 
-    // 处理最后一行（没有 \n 结尾）
+    // Handle last line (no trailing \n)
     if (!first_line_done) {
         first_line_chars = current_line_chars;
     }
@@ -91,11 +77,9 @@ pub fn scan(text: []const u8) TextStats {
     };
 }
 
-// ── 测试 ───────────────────────────────────────────────────────────────
-// 收集机制：text_core.zig 里 `pub const piece_stats = @import(...)` + 根文件的
-// `test { refAllDecls }`。只有 `pub const X = @import(...)` 再导出**不会**让
-// 这里的 test 被收集，必须被 refAllDecls 引用到（见 build.zig 里 font_catalog
-// 的教训注释）。
+// Collection mechanism: text_core.zig has `pub const piece_stats = @import(...)` + root file's
+// `test { refAllDecls }`. Exporting via `pub const X = @import(...)` alone does NOT collect
+// tests here; must be referenced by refAllDecls (see build.zig font_catalog comment).
 
 test "scan: 空字符串全零" {
     const s = scan("");
@@ -163,7 +147,7 @@ test "scan: 最长行在中间" {
 
 test "scan: 多字节 UTF-8 按码点计数" {
     const s = scan("h\u{00E9}llo\nw\u{00F6}rld\n");
-    // h é l l o = 5 码点（é 是 2 字节）；w ö r l d 同理
+    // h e l l o = 5 code points (e with acute is 2 bytes); w o r l d likewise
     try std.testing.expectEqual(@as(usize, 2), s.newline_count);
     try std.testing.expectEqual(@as(u32, 5), s.first_line_chars);
     try std.testing.expectEqual(@as(u32, 0), s.last_line_chars);
@@ -179,8 +163,8 @@ test "scan: 3/4 字节码点各算一个字符" {
 }
 
 test "scan: 缓冲区末尾截断的多字节序列按单字节推进" {
-    // "abc你" 砍掉最后一个字节：0xE4 后只剩 0xBD 且后面再无字节，
-    // i+3>len ⇒ 走 advance=1 的防御分支（不能越界也不能死循环）
+    // "abc<U+4F60>" with the last byte cut off: after 0xE4 only 0xBD remains with no byte after it,
+    // i+3>len => takes the advance=1 defensive branch (must not go out of bounds or loop forever)
     const s = scan("abc\u{4F60}"[0..5]);
     try std.testing.expectEqual(@as(usize, 0), s.newline_count);
     try std.testing.expectEqual(@as(u32, 5), s.first_line_chars);
@@ -189,19 +173,20 @@ test "scan: 缓冲区末尾截断的多字节序列按单字节推进" {
 }
 
 test "scan: 非法 lead / 裸 continuation 不死循环（逐字节推演真实口径）" {
-    // 字节序列长度 ≠ 字符数。推进量由 std.unicode.utf8ByteSequenceLength 决定：
-    // 它只认 0x00-0x7F(1) / 0xC0-0xDF(2) / 0xE0-0xEF(3) / 0xF0-0xF7(4)，其余判非法。
+    // Byte sequence length != character count. Advance uses std.unicode.utf8ByteSequenceLength:
+    // only 0x00-0x7F(1) / 0xC0-0xDF(2) / 0xE0-0xEF(3) / 0xF0-0xF7(4) are valid leads, the rest
+    // illegal.
     //
-    // "\xff\xfe\xc0\x80\x8f" 逐字节推演：
-    //   i=0 0xff  非法 lead              -> advance 1，记 1 字符
-    //   i=1 0xfe  非法 lead              -> advance 1，记 1 字符
-    //   i=2 0xc0  合法 2 字节 lead        -> 连 0x80 一起吞，advance 2，记 1 字符
-    //   i=4 0x8f  裸 continuation（<0xC0，不是 lead）-> 非法，advance 1，记 1 字符
-    // 合计 5 字节 -> **4** 个"字符"。
+    // "\xff\xfe\xc0\x80\x8f" byte by byte:
+    //   i=0 0xff  illegal lead              -> advance 1, count 1 character
+    //   i=1 0xfe  illegal lead              -> advance 1, count 1 character
+    //   i=2 0xc0  valid 2-byte lead         -> consume 0x80 too, advance 2, count 1 character
+    //   i=4 0x8f  bare continuation (<0xC0, not a lead) -> illegal, advance 1, count 1 character
+    // Total 5 bytes -> **4** "characters".
     //
-    // 这是 scan 的真实口径，不是 bug：它不验证 continuation 的合法性，非法输入
-    // 本就没有唯一正确答案。这条测试只要求「不 panic、不死循环、i 单调前进」，
-    // 并把当前口径钉住以便将来改动时看见差异。
+    // This is scan's actual behavior, not a bug: it does not validate continuations and invalid
+    // input has no unique correct answer. The test requires no panic/loop, monotonic i, and pins
+    // the current behavior so future changes show up as differences.
     const s = scan("\xff\xfe\xc0\x80\x8f");
     try std.testing.expectEqual(@as(usize, 0), s.newline_count);
     try std.testing.expectEqual(@as(u32, 4), s.first_line_chars);
@@ -210,8 +195,8 @@ test "scan: 非法 lead / 裸 continuation 不死循环（逐字节推演真实�
 }
 
 test "scan: ≥0xF8 的非法 lead 才走「1 字节 = 1 字符」防御分支" {
-    // 与上一条互补：0xF8..0xFF 是 utf8ByteSequenceLength 唯一判非法的区间，
-    // 每个都退回 advance=1，逐字节各算一字符。
+    // Complements previous: 0xF8..0xFF is the only range utf8ByteSequenceLength marks illegal,
+    // each regresses to advance=1, counted individually.
     const s = scan("\xf8\xf9\xfa\xfb\xfc\xfd\xfe\xff");
     try std.testing.expectEqual(@as(usize, 0), s.newline_count);
     try std.testing.expectEqual(@as(u32, 8), s.first_line_chars);
@@ -249,14 +234,17 @@ test "scan: 超长单行不溢出 u32" {
 }
 
 test "scan: 逐 token 构造的期望统计（构造即预言）" {
-    // 用「字符数已知」的 token 拼缓冲：期望值在构造时累加，scan 必须只凭字节
-    // 恢复出同样的统计。这是多字节 / 非法字节解码路径的独立 oracle，若把
-    // 「é 算 2 个字符」这类 bug 写进 scan，这里会立刻红。
-    // 注意 token 集刻意不含「多字节 lead + 紧贴 '\n'」的组合：那会触发模块头
-    // 记录的已知怪癖（advance 吞 '\n'），oracle 无法表达。怪癖由下方的显式
-    // 现状锁定测试覆盖。
+    // Assemble a buffer from tokens with known char counts: expected values are computed up front
+    // and
+    // scan must recover the same statistics from bytes alone. Independent oracle for
+    // multibyte/illegal
+    // decoding; a scan bug such as "e-acute counts as 2" fails here. The token set intentionally
+    // omits
+    // multibyte-lead + tight-newline: it triggers the module-head quirk (advance swallows '\n')
+    // which
+    // the oracle cannot express. The quirk is covered by the explicit status-lock test below.
     const alloc = std.testing.allocator;
-    var buf = std.ArrayList(u8){};
+    var buf = @as(std.ArrayList(u8), .empty);
     defer buf.deinit(alloc);
 
     var exp_lines: usize = 0;
@@ -273,10 +261,11 @@ test "scan: 逐 token 构造的期望统计（构造即预言）" {
         .{ .text = "\xff", .chars = 1, .newlines = 0 },
         .{ .text = "bcd", .chars = 3, .newlines = 0 },
         .{ .text = "\n", .chars = 0, .newlines = 1 },
-        .{ .text = "\xc0\xaf", .chars = 1, .newlines = 0 }, // 「/」的过长编码。0xC0 是**合法**的 2 字节 lead，
-        // 所以 scan 把 \xaf 一起吞掉记 1 字符，它不验证 continuation 合法性。
+        .{ .text = "\xc0\xaf", .chars = 1, .newlines = 0 }, // Overlong encoding of '/'. 0xC0 is **valid** 2-byte lead,
+        // so scan consumes \xaf together, counting 1 character; does not validate continuation
+        // validity.
         .{ .text = "\n", .chars = 0, .newlines = 1 },
-        .{ .text = "\u{00E9}", .chars = 1, .newlines = 0 }, // é（2 字节）
+        .{ .text = "\u{00E9}", .chars = 1, .newlines = 0 }, // e-acute (2 bytes)
     };
 
     var seed: u64 = 4242;
@@ -311,22 +300,23 @@ test "scan: 逐 token 构造的期望统计（构造即预言）" {
     try std.testing.expectEqual(exp_longest, got.longest_row_chars);
 }
 
-// 下面两条随代码从 piece_tree.zig 迁来（原 "PieceTree: scanTextStats *"），
-// 再加一条对模块头记录的已知怪癖的现状锁定：advance 会吞掉紧贴在截断序列
-// 后面的 '\n'。若将来修了这个怪癖，本条必须改期望值（并同步改 PieceSummary）。
+// These two migrated from piece_tree.zig (was PieceTree::scanTextStats), plus status-lock for
+// module-head quirk: advance swallows '\n' tight after truncated sequence. If quirk is fixed,
+// update expectation here (and PieceSummary merge).
 
 test "scan: 现状锁定 —— 截断的多字节序列会吞掉紧随的换行符（已知怪癖）" {
-    // "你"(E4 BD A0) + 截断尾(E4 BD) + '\n'  共 6 字节，逐字节推演：
-    //   i=0 0xE4 声明 3 字节，i+3<=6 成立 -> advance 3，记 1 字符（完整的"你"）
-    //   i=3 0xE4 声明 3 字节，i+3<=6 **也成立** -> advance 3，记 1 字符
-    //       但这 3 字节是 BD 0A，把身后的 '\n' 一起吞了
-    //   i=6 结束
-    // 所以：2 个"字符"、**0 个换行**。那个 '\n' 没有被计数。
+    // U+4F60 (E4 BD A0) + truncated tail (E4 BD) + '\n', 6 bytes total, traced byte by byte:
+    //   i=0 0xE4 declares 3 bytes, i+3<=6 holds -> advance 3, count 1 char (the complete U+4F60)
+    //   i=3 0xE4 declares 3 bytes, i+3<=6 **also holds** -> advance 3, count 1 char
+    //       but those 3 bytes are BD 0A, swallowing the trailing '\n' with them
+    //   i=6 done
+    // So: 2 "chars", **0 newlines**. The '\n' is not counted.
     //
-    // 这是现状锁定测试，不是在断言"应该这样"：scan 只保证不 panic / 不死循环 /
-    // i 单调前进，对截断的多字节序列没有定义良好的答案。钉住它是为了将来若
-    // 改动推进逻辑（比如改成校验 continuation），这里会红，提醒你换行计数的
-    // 口径变了，而换行计数是 PieceSummary 跨 piece 合并的依据。
+    // Characterization test, not an assertion that this is how it "should" behave: scan only
+    // guarantees no panic / no infinite loop / monotonic i, and has no well-defined answer for
+    // truncated multi-byte sequences. Pinned so that if the advance logic changes (e.g. validating
+    // continuation bytes), this goes red to flag changed newline-counting semantics, which
+    // PieceSummary merging across pieces relies on.
     const s = scan("\u{4F60}\u{4F60}"[0..5] ++ "\n");
     try std.testing.expectEqual(@as(usize, 0), s.newline_count);
     try std.testing.expectEqual(@as(u32, 2), s.first_line_chars);

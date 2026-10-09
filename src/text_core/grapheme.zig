@@ -1,38 +1,38 @@
-//! Grapheme cluster 边界，Unicode 17.0.0 UAX #29 extended grapheme clusters
+//! Grapheme cluster boundary, Unicode 17.0.0 UAX #29 extended grapheme clusters
 //!
-//! 为什么需要：光标移动 / 退格 / 选区若按 codepoint 走，用户会看到
-//! "退格 7 次才删掉一个家庭 emoji"、"光标停在 e 和组合音符之间"、
-//! "旗帜被拆成两个方块"、"肤色修饰符被单独删掉"，这些都是把
-//! 「一个用户感知字符」（extended grapheme cluster）当成多个字符处理的后果。
+//! Why: moving/backspacing/selecting by codepoint produces 'backspace 7 times to delete one family
+//! emoji', 'cursor between e and combining mark', 'flag split into two blocks', 'skin-tone
+//! modifier deleted alone': all from treating one user-perceived character (extended grapheme
+//! cluster) as several.
 //!
-//! ## 实现的规则（UAX #29, Table 1c "Extended grapheme cluster boundary rules"）
-//! - GB1  / GB2   : 文本首尾一定是边界
-//! - GB3          : CR × LF（CRLF 不可拆）
-//! - GB4  / GB5   : Control|CR|LF 前后一定断开
-//! - GB6/7/8      : Hangul 音节序列 L/V/T/LV/LVT 组合不断
-//! - GB9          : × (Extend | ZWJ)，组合记号、变体选择符、肤色修饰符
-//! - GB9a         : × SpacingMark，印度语系间距组合记号
-//! - GB9b         : Prepend ×
-//! - GB11         : Extended_Pictographic Extend* ZWJ × Extended_Pictographic
-//!                  （ZWJ emoji 序列，如 👨‍👩‍👧‍👦）
-//! - GB12 / GB13  : Regional_Indicator 成对（旗帜），偶数个才断
-//! - GB999        : 其余一律断开
+//! ## Rules implemented (UAX #29, Table 1c 'Extended grapheme cluster boundary rules')
+//! - GB1/GB2: text start/end always boundary
+//! - GB3: CR LF (CRLF unsplittable)
+//! - GB4/GB5: Control|CR|LF always break before/after
+//! - GB6/7/8: Hangul syllable L/V/T/LV/LVT combos don't break
+//! - GB9: (Extend | ZWJ), combining mark, variant selector, skin-tone
+//! - GB9a: SpacingMark, Indic spacing combining mark
+//! - GB9b: Prepend
+//! - GB11: Extended_Pictographic Extend* ZWJ Extended_Pictographic
+//!          (ZWJ emoji sequences such as family emoji)
+//! - GB12/GB13: Regional_Indicator pairs (flags), even count breaks
+//! - GB999: else always break
 //!
 //! Grapheme_Cluster_Break, Extended_Pictographic, and Indic_Conjunct_Break
-//! come from the vendored Unicode 17.0.0 data files. The full official
-//! GraphemeBreakTest corpus is executed as part of `test-text-core`.
+//! come from vendored Unicode 17.0.0 data files. The full official
+//! GraphemeBreakTest corpus runs as part of `test-text-core`.
 //!
 //! ## API
-//! 两套适配器，规则引擎共用：
-//! - `nextBoundary(text, pos)` / `prevBoundary(text, pos)`，平坦 []const u8
-//! - `nextBoundaryDoc(Doc, doc, pos)` / `prevBoundaryDoc(...)`，任何提供
-//!   `getByteAt(usize) ?u8` + `totalLength() usize` 的文档（PieceTree 等）
+//! Two adapter stacks, shared rule engine:
+//! - `nextBoundary(text, pos)` / `prevBoundary(text, pos)`, flat []const u8
+//! - `nextBoundaryDoc(Doc, doc, pos)` / `prevBoundaryDoc(...)`, any doc supplying
+//!   `getByteAt(usize) ?u8` + `totalLength() usize` (PieceTree etc)
 
 const std = @import("std");
 const testing = std.testing;
 const unicode_data = @import("grapheme_data_generated.zig");
 
-// ===== Grapheme_Cluster_Break 属性 =====
+// ===== Grapheme_Cluster_Break property =====
 
 pub const Prop = enum(u8) {
     other,
@@ -49,11 +49,11 @@ pub const Prop = enum(u8) {
     t,
     lv,
     lvt,
-    /// Extend 且同时是 Extended_Pictographic 的没有；这里表示 ExtPict 基字符
+    /// Extend and Extended_Pictographic simultaneously has none; here marks ExtPict base
     ext_pict,
 };
 
-/// codepoint -> Grapheme_Cluster_Break 属性
+/// codepoint -> Grapheme_Cluster_Break property
 pub fn propOf(cp: u21) Prop {
     const gcb = gcbProp(cp);
     return if (gcb == .other and unicode_data.isExtendedPictographic(cp)) .ext_pict else gcb;
@@ -79,20 +79,20 @@ fn classOf(cp: u21) Class {
     };
 }
 
-/// GB11 需要的左侧上下文：前面是否为 `ExtPict Extend*`
-/// GB12/13 需要的左侧上下文：连续 RI 的奇偶
+/// GB11 need left context: is preceding ExtPict Extend*
+/// GB12/13 need left context: consecutive RI odd/even
 pub const State = struct {
-    /// 上一个 cluster 起点之后连续 RI 的个数（用于 GB12/13）
+    /// Count consecutive RI after previous cluster start (for GB12/13)
     ri_odd: bool = false,
-    /// 左侧匹配 `ExtPict Extend*`（用于 GB11）
+    /// Left side match ExtPict Extend* (for GB11)
     ext_pict_seq: bool = false,
-    /// 左侧匹配 InCB=Consonant (Extend|Linker)* 且已经包含 Linker（GB9c）。
+    /// Left side match InCB=Consonant (Extend|Linker)* already contain Linker (GB9c).
     incb_consonant_seq: bool = false,
     incb_linker_seen: bool = false,
 };
 
-/// 判定 prev(属性=a) 与 next(属性=b) 之间是否为 grapheme cluster 边界。
-/// `st` 携带跨 codepoint 的上下文，调用者需要按扫描顺序维护（见 advance）。
+/// Judge prev(prop=a) and next(prop=b) between grapheme cluster boundary.
+/// `st` carry cross-codepoint context, caller maintain by scan order (see advance).
 pub fn isBoundary(a: Prop, b: Prop, st: State) bool {
     return isBoundaryClass(
         .{ .gcb = if (a == .ext_pict) .other else a, .extended_pictographic = a == .ext_pict, .incb = .none },
@@ -122,14 +122,14 @@ fn isBoundaryClass(a: Class, b: Class, st: State) bool {
     if (b.incb == .consonant and st.incb_consonant_seq and st.incb_linker_seen) return false;
     // GB11: ExtPict Extend* ZWJ × ExtPict
     if (a.gcb == .zwj and b.extended_pictographic and st.ext_pict_seq) return false;
-    // GB12/GB13: RI RI（成对）
+    // GB12/GB13: RI RI (paired)
     if (a.gcb == .regional_indicator and b.gcb == .regional_indicator and st.ri_odd) return false;
     // GB999
     return true;
 }
 
-/// 把 state 推进到「已消费 prop 为 p 的 codepoint」之后。
-/// `broke_before` = 该 codepoint 之前是否刚发生了 cluster 边界。
+/// Advance state past 'consumed p-propertied codepoint'.
+/// `broke_before` = cluster boundary just happen before this codepoint.
 pub fn advance(st: State, p: Prop, broke_before: bool) State {
     return advanceClass(st, .{
         .gcb = if (p == .ext_pict) .other else p,
@@ -140,13 +140,13 @@ pub fn advance(st: State, p: Prop, broke_before: bool) State {
 
 fn advanceClass(st: State, p: Class, broke_before: bool) State {
     var out = st;
-    // RI 计数：边界处重置
+    // RI count: reset at boundary
     if (p.gcb == .regional_indicator) {
         out.ri_odd = if (broke_before) true else !st.ri_odd;
     } else {
         out.ri_odd = false;
     }
-    // GB11 左上下文：ExtPict 开启；Extend / ZWJ 保持；其余清空
+    // GB11 left context: ExtPict on; Extend/ZWJ keep; else clear
     if (p.extended_pictographic) {
         out.ext_pict_seq = true;
     } else switch (p.gcb) {
@@ -174,9 +174,9 @@ fn advanceClass(st: State, p: Class, broke_before: bool) State {
     return out;
 }
 
-// ===== 字节层适配 =====
+// ===== Byte-level adapter =====
 
-/// 任何提供 getByteAt / totalLength 的只读文档
+/// Any read-only doc providing getByteAt/totalLength
 pub fn ByteReader(comptime Doc: type) type {
     return struct {
         pub fn byteAt(doc: *const Doc, i: usize) ?u8 {
@@ -199,14 +199,15 @@ const SliceReader = struct {
 };
 
 fn utf8SeqLen(b: u8) usize {
-    return if (b < 0x80) 1 else if (b < 0xC0) 1 // 孤立 continuation：当成单字节容错
+    return if (b < 0x80) 1 else if (b < 0xC0) 1 // Isolated continuation: treat as single-byte fault-tolerance
     else if (b < 0xE0) 2 else if (b < 0xF0) 3 else 4;
 }
 
-/// 通用引擎：泛型在 (Doc, R) 上，R 提供 byteAt/len。
+/// Generic engine: generic on (Doc, R), R provide byteAt/len.
 fn Engine(comptime Doc: type, comptime R: type) type {
     return struct {
-        /// 解码 offset 处的 codepoint，返回 {cp, 字节长度}。非法字节按 U+FFFD 单字节处理。
+        /// Decode codepoint at offset, return {cp, byte length}. Invalid bytes treat as U+FFFD
+        /// single-byte.
         fn decodeAt(doc: *const Doc, offset: usize) struct { cp: u21, size: usize } {
             const total = R.len(doc);
             const b0 = R.byteAt(doc, offset) orelse return .{ .cp = 0xFFFD, .size = 1 };
@@ -226,7 +227,7 @@ fn Engine(comptime Doc: type, comptime R: type) type {
             return .{ .cp = cp, .size = n };
         }
 
-        /// 前一个 codepoint 起点（纯 UTF-8 回溯）
+        /// Previous codepoint start (pure UTF-8 backtrack)
         fn prevCpStart(doc: *const Doc, offset: usize) usize {
             if (offset == 0) return 0;
             var i = offset - 1;
@@ -237,23 +238,24 @@ fn Engine(comptime Doc: type, comptime R: type) type {
                 i -= 1;
             }
             const b = R.byteAt(doc, i) orelse return offset - 1;
-            if ((b & 0xC0) == 0x80) return offset - 1; // 越界的 continuation 串：容错
+            if ((b & 0xC0) == 0x80) return offset - 1; // Out-of-bounds continuation stream: fault-tolerance
             return i;
         }
 
-        /// 从文本开头扫到 offset，得到 offset 处的 State + 前一个 codepoint 属性。
-        /// 为避免 O(n)，只回溯到最近一个"安全起点"（见下）。
+        /// Scan from text start to offset, get State at offset + prev codepoint prop.
+        /// To avoid O(n), only backtrack to nearest 'safe start' (see below).
         fn contextAt(doc: *const Doc, offset: usize) struct { prev: ?Class, st: State } {
             if (offset == 0) return .{ .prev = null, .st = .{} };
-            // 安全起点：回溯到不参与 RI、GB9c、GB11 或 Prepend 序列的字符。
-            // 不能设置固定窗口：UAX #29 允许这些序列任意长，截断会改变 RI 奇偶性。
+            // Safe start: backtrack to char not participate in RI, GB9c, GB11 or Prepend sequence.
+            // Can't set fixed window: UAX #29 allows these sequences any length, truncate change RI
+            // parity.
             var start = offset;
             while (start > 0) {
                 const s = prevCpStart(doc, start);
                 const d = decodeAt(doc, s);
                 const p = classOf(d.cp);
                 start = s;
-                // other/control/cr/lf/spacing_mark 之前一定是边界，可安全作为扫描起点
+                // other/control/cr/lf/spacing_mark before always boundary, safe scan start
                 if ((p.gcb == .other and p.incb == .none and !p.extended_pictographic) or
                     p.gcb == .control or p.gcb == .cr or p.gcb == .lf) break;
             }
@@ -276,7 +278,7 @@ fn Engine(comptime Doc: type, comptime R: type) type {
             if (offset >= total) return total;
             var ctx = contextAt(doc, offset);
             var i = offset;
-            // 消费第一个 codepoint
+            // Consume first codepoint
             {
                 const d = decodeAt(doc, i);
                 const p = classOf(d.cp);
@@ -298,7 +300,7 @@ fn Engine(comptime Doc: type, comptime R: type) type {
 
         pub fn prev(doc: *const Doc, offset: usize) usize {
             if (offset == 0) return 0;
-            // 从 offset 往回逐 codepoint 退，取第一个真正的 cluster 边界。
+            // Backtrack from offset per-codepoint, find first true cluster boundary.
             var cand = prevCpStart(doc, offset);
             while (true) {
                 if (cand == 0) return 0;
@@ -307,7 +309,7 @@ fn Engine(comptime Doc: type, comptime R: type) type {
             }
         }
 
-        /// offset 是否落在 cluster 边界上
+        /// Is offset on cluster boundary
         pub fn isBoundaryAt(doc: *const Doc, offset: usize) bool {
             if (offset == 0 or offset >= R.len(doc)) return true;
             const ctx = contextAt(doc, offset);
@@ -320,7 +322,7 @@ fn Engine(comptime Doc: type, comptime R: type) type {
 
 const SliceEngine = Engine([]const u8, SliceReader);
 
-/// 下一个 grapheme cluster 边界（[]const u8）
+/// Next grapheme cluster boundary ([]const u8)
 pub fn nextBoundary(text: []const u8, pos: usize) usize {
     return SliceEngine.next(&text, pos);
 }
@@ -392,22 +394,22 @@ pub const BoundaryCursor = struct {
     }
 };
 
-/// 上一个 grapheme cluster 边界（[]const u8）
+/// Previous grapheme cluster boundary ([]const u8)
 pub fn prevBoundary(text: []const u8, pos: usize) usize {
     return SliceEngine.prev(&text, pos);
 }
 
-/// 下一个 grapheme cluster 边界（文档适配）
+/// Next grapheme cluster boundary (doc adapter)
 pub fn nextBoundaryDoc(comptime Doc: type, doc: *const Doc, pos: usize) usize {
     return Engine(Doc, ByteReader(Doc)).next(doc, pos);
 }
 
-/// 上一个 grapheme cluster 边界（文档适配）
+/// Previous grapheme cluster boundary (doc adapter)
 pub fn prevBoundaryDoc(comptime Doc: type, doc: *const Doc, pos: usize) usize {
     return Engine(Doc, ByteReader(Doc)).prev(doc, pos);
 }
 
-/// 统计 text 中 grapheme cluster 个数（测试/度量用）
+/// Count grapheme cluster count in text (test/measurement)
 pub fn count(text: []const u8) usize {
     var n: usize = 0;
     var i: usize = 0;
@@ -419,7 +421,7 @@ pub fn count(text: []const u8) usize {
     return n;
 }
 
-// ===== 测试 =====
+// ===== Tests =====
 
 const family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}"; // 👨‍👩‍👧‍👦
 const flag_cn = "\u{1F1E8}\u{1F1F3}"; // 🇨🇳
@@ -537,7 +539,7 @@ test "GB9: 组合尖音符不与基字符分离" {
 test "GB12/13: regional indicator 成对" {
     try testing.expectEqual(@as(usize, 1), count(flag_cn));
     try testing.expectEqual(@as(usize, 0), prevBoundary(flag_cn, flag_cn.len));
-    // 两面旗 = 两个 cluster，不能贪心吃四个 RI
+    // Two flags = two clusters, can't greedily consume four RI
     const two = flag_cn ++ flag_cn;
     try testing.expectEqual(@as(usize, 2), count(two));
     try testing.expectEqual(@as(usize, 8), nextBoundary(two, 0));
@@ -553,7 +555,7 @@ test "GB3/GB4/GB5: CRLF 与 control" {
     try testing.expectEqual(@as(usize, 1), count("\r\n"));
     try testing.expectEqual(@as(usize, 2), count("\n\n"));
     try testing.expectEqual(@as(usize, 2), count("a\n"));
-    // Extend 不能黏到 CR/LF 上
+    // Extend can't stick to CR/LF
     try testing.expectEqual(@as(usize, 2), count("\n\u{0301}"));
 }
 

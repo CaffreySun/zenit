@@ -1,20 +1,21 @@
-//! Phase 0, Point / PointUtf16 / OffsetUtf16
+//! Point / PointUtf16 / OffsetUtf16
 //!
-//! 对齐 Zed `crates/text/src/text.rs` 的文本坐标类型。
+//! Aligns with Zed `crates/text/src/text.rs` text coordinate types.
 //!
-//! `Point { row, column }` 是 **字节列** 坐标系（row 是 0-based 行号，column 是行内字节偏移）。
-//! `PointUtf16` / `OffsetUtf16` 是 UTF-16 code unit 坐标系，供将来 LSP 对齐用。
+//! `Point { row, column }` is a **byte-column** coordinate system (row = 0-based line number,
+//! column = byte offset in line). `PointUtf16` / `OffsetUtf16` are UTF-16 code unit systems,
+//! reserved for future LSP alignment.
 //!
-//! 当前 Phase 0 仅定义类型 + 基本比较/加减；Phase 2 的 Rope.offsetToPoint/pointToOffset
-//! 才会真正产生这些 Point。
+//! Currently only types + basic compare/add/subtract are defined; Rope.offsetToPoint/pointToOffset
+//! will produce these Points.
 //!
-//! 注意：`src/core/wrap_map.zig` 里已有一个 `DisplayPoint { row, column }`，
-//! 那是 **display 层** 的坐标，和这里的 **buffer 层** Point 是不同坐标系。
-//! Phase 5 会把 DisplayPoint 从 core 移到 display_map/，此处保持独立。
+//! Note: `src/core/wrap_map.zig` has `DisplayPoint { row, column }`, a **display layer**
+//! coordinate, distinct from the **buffer layer** Point here. DisplayPoint is planned to move to
+//! display_map/; this type stays independent.
 
 const std = @import("std");
 
-/// Buffer 坐标系的 (row, column)。column 是字节列。
+/// Buffer coordinate system (row, column). column is byte column.
 pub const Point = struct {
     row: u32 = 0,
     column: u32 = 0,
@@ -26,7 +27,7 @@ pub const Point = struct {
         return .{ .row = row, .column = column };
     }
 
-    /// 两个 Point 的顺序：先比 row，row 相同比 column。
+    /// Order of two Point: compare row first, column if rows equal.
     pub fn cmp(a: Point, b: Point) std.math.Order {
         if (a.row != b.row) return std.math.order(a.row, b.row);
         return std.math.order(a.column, b.column);
@@ -36,8 +37,8 @@ pub const Point = struct {
         return a.row == b.row and a.column == b.column;
     }
 
-    /// 累加一个 Point：若 other 横跨行则 row += other.row 且 column 变为 other.column；
-    /// 否则 row 不变、column += other.column。对齐 Zed `Point::add`。
+    /// Add a Point: if other spans rows then row += other.row and column becomes other.column; else
+    /// row unchanged, column += other.column. Align Zed `Point::add`.
     pub fn add(self: Point, other: Point) Point {
         if (other.row == 0) {
             return .{ .row = self.row, .column = self.column + other.column };
@@ -45,8 +46,8 @@ pub const Point = struct {
         return .{ .row = self.row + other.row, .column = other.column };
     }
 
-    /// 两点相减：假设 a >= b。用于 Summary.add 的逆操作。
-    /// 对齐 Zed `Point::sub`：若同一行则 (0, a.col - b.col)；否则 (a.row - b.row, a.col)。
+    /// Subtract two points: assume a >= b. For Summary.add inverse. Align Zed `Point::sub`: same
+    /// row gives (0, a.col - b.col); else (a.row - b.row, a.col).
     pub fn sub(a: Point, b: Point) Point {
         std.debug.assert(cmp(a, b) != .lt);
         if (a.row == b.row) {
@@ -60,7 +61,8 @@ pub const Point = struct {
     }
 };
 
-/// UTF-16 code unit 坐标系的 (row, column)。为 LSP 协议对齐留位；Phase 0 不实现内部逻辑。
+/// UTF-16 code unit coordinate system (row, column). Reserved for LSP alignment; Phase 0 doesn't
+/// implement internals.
 pub const PointUtf16 = struct {
     row: u32 = 0,
     column: u32 = 0,
@@ -72,7 +74,7 @@ pub const PointUtf16 = struct {
     }
 };
 
-/// 全局 UTF-16 offset（单一数字坐标），对齐 Zed `OffsetUtf16`。
+/// Global UTF-16 offset (single number coordinate), align Zed `OffsetUtf16`.
 pub const OffsetUtf16 = struct {
     value: u64 = 0,
 

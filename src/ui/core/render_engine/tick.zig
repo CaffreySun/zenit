@@ -1,12 +1,14 @@
-/// 帧前 tick：声明式 Transition 推进、命令式动画 tick、on_before_render 钩子、视口裁剪遍历
+/// Pre-frame tick: declarative Transition advance, imperative animation
+/// tick, on_before_render hook, viewport clip traversal
 const std = @import("std");
 const tick_node_dirty = @import("../node_dirty.zig");
 
 const types = @import("../types.zig");
 const node_mod = @import("../node.zig");
 const geometry = @import("geometry.zig");
-// 帧时间全局变量由 mod.zig 定义，tick 函数通过参数接收 now_ms，
-// tickBeforeRender 调用方（mod.zig）传入 current_frame_time_ms
+const a11y_preferences = @import("../../a11y/preferences.zig");
+// Global frame time defined in mod.zig; tick receives now_ms;
+// tickBeforeRender caller (mod.zig) passes current_frame_time_ms
 
 const Allocator = std.mem.Allocator;
 const ComputedRect = types.ComputedRect;
@@ -23,8 +25,18 @@ fn transitionPropAffectsTransform(prop: types.TransitionProp) bool {
     };
 }
 
-/// 声明式 Transition tick：推进所有活跃过渡的进度，更新 style 值
-/// 返回 true 表示仍有活跃过渡（需要继续重绘）
+/// "Dynamic" properties: position, size, scale, rotation. Reduced
+/// motion skips interpolation. Color, opacity, radius, stroke-width are
+/// visual transitions, excluded.
+fn transitionPropIsMotion(prop: types.TransitionProp) bool {
+    return switch (prop) {
+        .translate_x, .translate_y, .scale_x, .scale_y, .rotate, .width => true,
+        else => false,
+    };
+}
+
+/// Declarative Transition tick: advance active transitions' progress,
+/// update style. Return true = active transitions (need more redraws).
 pub fn tickTransitions(node: *Node, slots: *types.TransitionSlots, allocator: Allocator, now_ms: f64) bool {
     var still_active = false;
     var interaction_changed = false;
@@ -32,16 +44,25 @@ pub fn tickTransitions(node: *Node, slots: *types.TransitionSlots, allocator: Al
     var render_changed = false;
     var requested_linger = false;
 
-    // 收集完成回调（延迟到循环结束后触发，避免回调中销毁节点导致 use-after-free）
+    // Collect completion callbacks (deferred to loop end to avoid node
+    // destruction in callback causing UAF)
     var pending_callbacks: [12]struct { cb: *const fn (*anyopaque) void, ctx: *anyopaque } = undefined;
     var pending_count: u5 = 0;
 
     for (slots.slots[0..slots.count]) |*slot| {
         if (!slot.active) continue;
 
-        // 绝对时间戳驱动：progress = (now - start) / duration，零累积误差
+        // Absolute timestamp driven: progress = (now - start) / duration,
+        // zero cumulative error
         const elapsed = @as(f32, @floatCast(now_ms - slot.start_time_ms));
-        const progress = if (slot.spec.duration_ms > 0)
+        // Two "reduced motion" modes differ:
+        // - current_reduced_motion (frame-clock level): renderer downgrade / explicit host disable,
+        //   all transitions jump to end;
+        // - reduce motion effect (system a11y pref): only translation jumps, colors/opacity still
+        //   transition.
+        const reduce = @import("mod.zig").current_reduced_motion or
+            (a11y_preferences.reduceMotion() and transitionPropIsMotion(slot.prop));
+        const progress = if (slot.spec.duration_ms > 0 and !reduce)
             std.math.clamp(elapsed / slot.spec.duration_ms, 0, 1)
         else
             @as(f32, 1.0);
@@ -56,7 +77,7 @@ pub fn tickTransitions(node: *Node, slots: *types.TransitionSlots, allocator: Al
                 node.requestCompositeAnimationLinger(affects_opacity, affects_transform);
                 requested_linger = true;
             }
-            // 收集完成回调（不立即触发）
+            // Collect completion callbacks (don't trigger immediately)
             if (slot.on_complete) |cb| {
                 if (slot.on_complete_ctx) |ctx| {
                     if (pending_count < 12) {
@@ -73,10 +94,11 @@ pub fn tickTransitions(node: *Node, slots: *types.TransitionSlots, allocator: Al
 
         const t = slot.spec.easing.apply(progress);
 
-        // 完成时精确赋终值，避免 from + (to - from) * 1.0 的浮点舍入误差
+        // At completion assign exact end value, avoid float rounding from
+        // from + (to - from) * 1.0
         const lerped = if (is_complete) slot.to_value else slot.from_value + (slot.to_value - slot.from_value) * t;
 
-        // 应用插值到 style
+        // Apply interpolation to style
         switch (slot.prop) {
             .background => {
                 node.setBackgroundRaw(if (is_complete) slot.to_color else types.Color.lerp(slot.from_color, slot.to_color, t));
@@ -130,12 +152,21 @@ pub fn tickTransitions(node: *Node, slots: *types.TransitionSlots, allocator: Al
                 node.style.width = .{ .px = @max(0, lerped) };
                 node.markLayoutDirty();
             },
+            .text_color => {
+                if (node.getText()) |cur| {
+                    var tp = cur;
+                    tp.color = if (is_complete) slot.to_color else types.Color.lerp(slot.from_color, slot.to_color, t);
+                    node.setText(tp);
+                }
+                render_changed = true;
+            },
         }
     }
 
     slots.any_active = still_active;
-    // composite 类属性统一走权威失效组合（markCompositePropDirty = interaction +
-    // composite + invalidateRenderCache），与 node_animator / hooks / setter 一致。
+    // composite properties all use authoritative dirty marking
+    // (markCompositePropDirty = interaction + composite +
+    // invalidateRenderCache), consistent with node_animator/hooks/setter.
     if (composite_changed) {
         node.markCompositePropDirty();
     } else {
@@ -143,7 +174,8 @@ pub fn tickTransitions(node: *Node, slots: *types.TransitionSlots, allocator: Al
         if (render_changed) node.markRenderDirty();
     }
 
-    // 循环结束后触发延迟回调（此时 node 访问已完成，回调可安全销毁节点）
+    // After loop trigger deferred callbacks (node traversal complete,
+    // safe to destroy nodes)
     for (pending_callbacks[0..pending_count]) |entry| {
         entry.cb(entry.ctx);
     }
@@ -151,62 +183,60 @@ pub fn tickTransitions(node: *Node, slots: *types.TransitionSlots, allocator: Al
     return still_active or requested_linger;
 }
 
-/// DEBUG: 全局帧计数（用于限频 log）
+/// DEBUG: global frame count (for log rate-limiting)
 pub var g_debug_frame: u64 = 0;
-/// DEBUG: 当前帧内触发 markRenderDirty 的 hook 计数
+/// DEBUG: current frame markRenderDirty hook count
 pub var g_debug_dirty_hooks: u32 = 0;
 
 var dirty_hook_debug_cache: ?bool = null;
 
 fn dirtyHookDebugEnabled() bool {
     return dirty_hook_debug_cache orelse blk: {
-        const enabled = std.posix.getenv("ZENIT_RENDER_DIRTY_DEBUG") != null;
+        const enabled = @import("zenit_environment").has("ZENIT_RENDER_DIRTY_DEBUG");
         dirty_hook_debug_cache = enabled;
         break :blk enabled;
     };
 }
 
-/// self-only 担保的运行期稽核（仅 Debug/ReleaseSafe）。
+/// Runtime self-only audit (Debug/ReleaseSafe only).
 ///
-/// 背景：before_render_hook_affects_self_only 是**调用方担保**，而框架里存在
-/// 一批"无副作用写入口"（setBackgroundRaw / setOpacityRaw，生产代码 151 处），
-/// 它们不标脏、不 bump content_version。担保一旦说谎，跨帧缓存会复用陈旧
-/// DisplayItem, transform 类写入有 property_tree 每帧重算兜底，但**颜色/
-/// 不透明度这类烘焙进 item 的值没有兜底，画面会静默错到下一次真脏**。
+/// before_render_hook_affects_self_only is caller-guaranteed, but the framework has many
+/// "side-effect-free writes" (setBackgroundRaw / setOpacityRaw, 151 places) that don't mark
+/// dirty or bump content_version. If the guarantee breaks, the cross-frame cache reuses a stale
+/// DisplayItem; transform writes have a property_tree recalc fallback, but color/opacity baked
+/// into the item do not, so corruption is silent until the next real dirty.
 ///
-/// 稽核的判据必须**恰好等于威胁模型**，否则就会惩罚合法用法（两次交叉审查
-/// 各抓到一次，都已用探针复现）：
-///   - 只看"值变了"-> hook 自己 mount 一个新后代也会被判违约（新节点不存在
-///     陈旧复用问题）。首个真实采纳者（编辑器 hook 每帧驱动 VirtualList
-///     挂载/回收）会每帧崩。
-///   - 只看"值变了"-> 连 panic 文案推荐的修法（改走 setBackground，会标脏、
-///     缓存语义安全）也照样触发 panic，自相矛盾。
-/// 所以这里比对的是 **(节点身份, 绘制值, content_version) 三元组**，且只针对
-/// **跑 hook 之前就已存在**的节点：
-///   - 新增节点：不参与（本帧全新构建，无陈旧可复用）；
-///   - 消失节点：不参与（不会被复用）；
-///   - 既存节点值变了**且 content_version 也变了**：合法（标脏写，缓存会失效）；
-///   - 既存节点值变了**而 content_version 没变**：**这才是违约**，未标脏的
-///     写入，跨帧缓存会复用陈旧值。
+/// The audit criterion must **exactly match the threat model**, else it punishes legal usage:
+/// - checking only "value changed" also flags a hook mounting a new descendant (no stale-reuse
+///   issue); an editor hook doing VirtualList mount/reclaim every frame would crash every frame.
+/// - checking only "value changed" also flags the recommended fix (switch to setBackground,
+///   which marks dirty and is safe), which is self-contradictory.
+/// So check the **(node id, drawn value, content_version) triple** on pre-existing nodes only:
+/// - new nodes excluded (fresh build this frame, no stale reuse);
+/// - disappeared nodes excluded (won't be reused);
+/// - pre-existing value changed **and content_version changed**: legal (dirty-write);
+/// - pre-existing value changed **but content_version unchanged**: **breach**, unmarked write,
+///   cache reuses stale.
 const SelfScopeAuditEntry = struct {
     node: *Node,
     paint_hash: u64,
     content_version: u32,
 };
 
-/// 稽核样本上限。超出则跳过稽核（宁可不查，也不为诊断设施分配/失败）。
+/// Audit sample limit. Exceed -> skip audit (better skip than fail
+/// diagnostic).
 const self_scope_audit_max: usize = 4096;
 
-/// 指纹覆盖面 = "烘焙进 DisplayItem 且**没有**每帧重算兜底"的那些值。
+/// Fingerprint covers = "baked into DisplayItem and **no** per-frame recalc fallback".
 ///
-/// 收进来：background rgba、opacity、border（宽/色/半径），它们都是被直接
-/// 写进 fill_rect/stroke_rect 的常量（display_list.zig:66-90 的 color/radius/
-/// shape 字段），缓存复用时原样replay，错了就一直错到下次真脏。
+/// Included: background rgba, opacity, border (width/color/radius), written as constants into
+/// fill_rect/stroke_rect (display_list.zig 66-90 color/radius/shape). Cache replay uses them,
+/// so a wrong value stays wrong until the next real dirty.
 ///
-/// **故意不收 transform/translate**：缓存 item 存的是 local 坐标 + transform_id，
-/// lower 时读当帧 property_tree 矩阵（每帧 clear 重建），平移天然自愈。
-/// 已实测：谎报的 hook 逐帧改后代 translate（7->56），drawn_x 每帧都跟得上、
-/// 零陈旧。把它收进指纹只会制造误报，不会提高安全性。
+/// **Intentionally exclude transform/translate**: a cached item has local coords + transform_id;
+/// lowering reads the current-frame property_tree matrix (cleared/rebuilt each frame), so
+/// translate self-heals. Verified: a lying hook changing descendant translate (7->56) each frame
+/// keeps drawn_x current, zero stale. Fingerprinting it only adds false positives.
 fn paintHashOf(node: *Node) u64 {
     var h: u64 = 1469598103934665603;
     const bg = node.getBackground();
@@ -214,7 +244,8 @@ fn paintHashOf(node: *Node) u64 {
         h = (h ^ @as(u64, c)) *% 1099511628211;
     }
     h = (h ^ @as(u64, @bitCast(@as(f64, node.getOpacity())))) *% 1099511628211;
-    // border 三项同样烘焙进 item 且无兜底（交叉审查指出的覆盖面缺口）
+    // border three fields equally baked into item without fallback
+    // (cross-review coverage gap)
     const b = node.style.border;
     h = (h ^ @as(u64, @bitCast(@as(f64, b.width)))) *% 1099511628211;
     h = (h ^ @as(u64, @bitCast(@as(f64, b.radius)))) *% 1099511628211;
@@ -225,10 +256,11 @@ fn paintHashOf(node: *Node) u64 {
 }
 
 var self_scope_audit_every_frame_cache: ?bool = null;
-/// ZENIT_SELF_SCOPE_AUDIT_EVERY_FRAME=1：恢复逐帧稽核（默认每 64 帧采样一次）。
+/// ZENIT_SELF_SCOPE_AUDIT_EVERY_FRAME=1: restore per-frame audit
+/// (default sample every 64 frames).
 fn selfScopeAuditEveryFrameEnabled() bool {
     return self_scope_audit_every_frame_cache orelse blk: {
-        const v = std.posix.getenv("ZENIT_SELF_SCOPE_AUDIT_EVERY_FRAME") != null;
+        const v = @import("zenit_environment").has("ZENIT_SELF_SCOPE_AUDIT_EVERY_FRAME");
         self_scope_audit_every_frame_cache = v;
         break :blk v;
     };
@@ -241,7 +273,7 @@ fn collectSelfScopeAudit(
     count: *usize,
 ) void {
     if (node != exclude) {
-        if (count.* >= buf.len) return; // 容量不足：调用方据此放弃本次稽核
+        if (count.* >= buf.len) return; // Capacity insufficient: caller gives up this audit
         buf[count.*] = .{
             .node = node,
             .paint_hash = paintHashOf(node),
@@ -254,7 +286,7 @@ fn collectSelfScopeAudit(
     }
 }
 
-/// 从 node 向上找到渲染根（没有 parent 的那个）。
+/// Find render root from node upward (one without parent).
 fn renderRootOf(node: *Node) *Node {
     var cur = node;
     while (cur.parent) |p| cur = p;
@@ -265,20 +297,15 @@ pub fn runBeforeRenderHook(node: *Node, hook: *const fn (*Node) void) bool {
     const was_dirty = node.frame_state.state_bits.dirty.core.render;
     node.frame_state.state_bits.dirty.core.render = false;
 
-    // 只在安全构建里稽核，且只对真正声明了 self-only 的节点付这份遍历成本。
-    //
-    // ⚠️ 降频采样（2026-09-18）：这份稽核对**每个** self-only hook 都从渲染根
-    // 遍历整棵树并对每个节点算 paint hash，跑 hook 前后各一遍。实测一屏
-    // 代码块文档里每帧 38 次稽核、**遍历 143,564 个节点**，而 tick 本身只需
-    // 走 583 个，放大 246 倍，br_tick 2.6ms -> 19.2ms，Debug 下滚动直接掉帧。
-    //
-    // 与同文件 assertLayoutSyncIntegrity 的处理一致：它也是纯诊断走树，
-    // 早已降频为每 64 帧一次并在注释里写明理由（"每帧跑把 Debug 帧税抬高
-    // ~5ms，而这类回归是持续性的，采样 64 帧内必然命中"）。
-    // 担保被违反同样是持续性的（每帧都会重复那次未标脏写入），采样必然命中。
-    // ZENIT_SELF_SCOPE_AUDIT_EVERY_FRAME=1 恢复逐帧稽核（排查具体违约时用）。
+    // Only audit in safe builds, only for nodes declaring self-only; sampled because of traversal
+    // cost. WARNING: the audit walks from the render root to leaves and hashes paint per node
+    // before/after each self-only hook. Real screen: 38 audits/frame, 143,564 nodes traversed vs.
+    // tick's 583 (246x), br_tick 2.6ms -> 19.2ms, Debug scrolling drops frames. Consistent with
+    // assertLayoutSyncIntegrity (also a tree diagnostic): sampled every 64 frames. Guarantee
+    // violations are continuous (the unmarked write repeats every frame), so the sample hits.
+    // ZENIT_SELF_SCOPE_AUDIT_EVERY_FRAME=1 restores per-frame auditing (debugging).
     const audit_sampled = selfScopeAuditEveryFrameEnabled() or (g_debug_frame % 64 == 1);
-    const audit = (@import("builtin").mode == .Debug or @import("builtin").mode == .ReleaseSafe) and
+    const audit = (@import("builtin").mode == .debug or @import("builtin").mode == .safe) and
         node.frame_state.state_bits.flags.before_render_hook_affects_self_only and
         audit_sampled;
     var audit_buf: [self_scope_audit_max]SelfScopeAuditEntry = undefined;
@@ -286,7 +313,8 @@ pub fn runBeforeRenderHook(node: *Node, hook: *const fn (*Node) void) bool {
     var audit_overflow = false;
     if (audit) {
         collectSelfScopeAudit(renderRootOf(node), node, &audit_buf, &audit_count);
-        // 采样到上限说明树比缓冲大，样本不完整 -> 放弃本次稽核而不是误判。
+        // Sample reaches limit = tree larger than buffer, incomplete sample
+        // -> skip audit not misdiagnose.
         audit_overflow = audit_count >= self_scope_audit_max;
     }
 
@@ -294,11 +322,13 @@ pub fn runBeforeRenderHook(node: *Node, hook: *const fn (*Node) void) bool {
 
     if (audit and !audit_overflow) {
         for (audit_buf[0..audit_count]) |entry| {
-            // 只看 hook 之前就存在的节点。节点若已被 freeNode 排队，帧内指针
-            // 仍可解引用（延迟销毁），读到的值也仍是它自己的，不影响判定。
+            // Only pre-existing nodes before hook. If node enqueued by freeNode,
+            // intra-frame pointer still dereferenceable (delayed destroy), read values
+            // still own, doesn't affect.
             const now_hash = paintHashOf(entry.node);
             if (now_hash == entry.paint_hash) continue;
-            // 值变了但 content_version 也变了 = 走了标脏入口 = 缓存会失效 = 合法。
+            // Value changed but content_version changed = dirty-write path =
+            // cache invalidates = legal.
             if (entry.node.meta.per_frame.caches.versions.content != entry.content_version) continue;
             std.debug.panic(
                 "before_render_hook_affects_self_only 担保被违反：hook 所在 node_id={d} " ++
@@ -317,7 +347,7 @@ pub fn runBeforeRenderHook(node: *Node, hook: *const fn (*Node) void) bool {
         }
     }
     if (node.frame_state.state_bits.dirty.core.render) {
-        // DEBUG: hook 自身调了 markRenderDirty
+        // DEBUG: hook itself called markRenderDirty
         g_debug_dirty_hooks += 1;
         if (dirtyHookDebugEnabled() and g_debug_frame % 300 == 1 and g_debug_dirty_hooks <= 8) {
             std.debug.print("[hook-dirty] frame={d} hook_set_dirty node_id={d} component={s} test_id={s}\n", .{
@@ -331,7 +361,7 @@ pub fn runBeforeRenderHook(node: *Node, hook: *const fn (*Node) void) bool {
     }
     if (was_dirty) {
         node.frame_state.state_bits.dirty.core.render = true;
-        // DEBUG: was_dirty 恢复
+        // DEBUG: was_dirty restored
         g_debug_dirty_hooks += 1;
         if (dirtyHookDebugEnabled() and g_debug_frame % 300 == 1 and g_debug_dirty_hooks <= 8) {
             std.debug.print("[hook-dirty] frame={d} was_dirty_restored node_id={d} component={s} test_id={s}\n", .{
@@ -345,23 +375,24 @@ pub fn runBeforeRenderHook(node: *Node, hook: *const fn (*Node) void) bool {
     return false;
 }
 
-/// 返回 true 表示有 on_before_render 钩子请求了重绘（活跃动画）
-/// now_ms: 由调用方（mod.zig）传入 current_frame_time_ms
+/// Return true = on_before_render hook requested redraw (active
+/// animation). now_ms: caller (mod.zig) passes current_frame_time_ms
 pub var g_tick_node_count: u32 = 0;
 pub var g_tick_hook_count: u32 = 0;
 pub var g_slow_hook_us: u64 = 0;
-pub var g_slow_hook_name: [64]u8 = [_]u8{0} ** 64;
+pub var g_slow_hook_name: [64]u8 = @as([64]u8, @splat(0));
 pub var g_slow_hook_name_len: u8 = 0;
-/// devtools performance 面板打开时置 true；关闭时每个 hook 免掉两次时钟读取。
+/// devtools performance panel open sets true; closed saves two clock
+/// reads per hook.
 pub var g_profile_hooks: bool = false;
 
 var hook_trace_cache: ?bool = null;
-/// ZENIT_HOOK_TRACE=1：强制开启逐 hook 计时,并把 >5ms 的 hook 逐条打日志。
-/// 用途：帧级 SLOW 日志显示 before_render 巨大但 slow_hook 归因为空时
-/// （g_profile_hooks 默认关,只有 devtools perf 面板开）,用它抓真凶。
+/// ZENIT_HOOK_TRACE=1: force per-hook timing, log >5ms hooks. Use:
+/// frame SLOW shows huge before_render but slow_hook empty (g_profile_hooks
+/// defaults off, devtools perf only), use this to find culprit.
 fn hookTraceEnabled() bool {
     return hook_trace_cache orelse blk: {
-        const v = std.posix.getenv("ZENIT_HOOK_TRACE") != null;
+        const v = @import("zenit_environment").has("ZENIT_HOOK_TRACE");
         hook_trace_cache = v;
         break :blk v;
     };
@@ -370,7 +401,8 @@ fn hookTraceEnabled() bool {
 fn runHookTimed(node: *Node, hook: *const fn (*Node) void) bool {
     const trace = hookTraceEnabled();
     if (!g_profile_hooks and !trace) return runBeforeRenderHook(node, hook);
-    var ht = std.time.Timer.start() catch undefined;
+    const io = @import("mod.zig").current_frame_io orelse return runBeforeRenderHook(node, hook);
+    var ht = @import("zenit_time").Timer.start(io) catch return runBeforeRenderHook(node, hook);
     const requested = runBeforeRenderHook(node, hook);
     const elapsed = ht.read() / 1000;
     if (elapsed > g_slow_hook_us) {
@@ -407,22 +439,23 @@ pub fn tickBeforeRender(node: *Node, offset_x: f32, offset_y: f32, clip_opt: ?Co
     var redraw_requested = false;
     g_tick_node_count += 1;
 
-    // 子树 hook 标志自愈折叠：组件层大量 `before_render.main =` 直赋值不经过
-    // addBeforeRender（40+ 处），靠这里在 hook 真执行时置位 + 沿祖先冒泡，
-    // 消化"绕过 setter 的写路径"（下一帧 render 的 hasBeforeRenderHookSubtree
-    // 一定看得到）。tick 在 render 之前全树执行，标志只增不减 -> 语义是旧递归
-    // 实现的保守超集。旧实现对"已卸载 hook"会少算 true，本实现保持 true,
-    // 消费方（缓存资格判定）只会因此更保守，方向安全。
+    // Subtree hook flag self-heals: the component layer has 40+ places doing `before_render.main =`
+    // directly without addBeforeRender. At actual hook execution we set the flag and bubble it up
+    // (digest "bypass-setter write"); next frame's render hasBeforeRenderHookSubtree sees it. tick
+    // runs before render over the whole tree and the flag only grows, so semantics = the old
+    // recursive conservative superset. It may keep the flag for an unmounted hook, which is only
+    // more conservative, the safe direction.
     if (node.hasBeforeRenderHooks()) node.markSubtreeBeforeRenderHook();
 
-    // 从全局 World hook 读 rect。
+    // Read rect from global World hook.
     const local_rect = node.rectFromWorldOrFallback();
 
     if (node.consumeCompositeAnimationLingerFrame()) {
         redraw_requested = true;
     }
 
-    // -1. 更新 out_of_viewport 标记，供 on_before_render hook 使用（如 Skeleton shimmer、Spinner）
+    // -1. Update out_of_viewport flag for on_before_render hook (Skeleton
+    // shimmer, Spinner)
     if (clip_opt) |clip| {
         const nx = local_rect.x + node.style.translate_x + node.frame_state.frame_local.runtime.sticky.x + offset_x;
         const ny = local_rect.y + node.style.translate_y + node.frame_state.frame_local.runtime.sticky.y + offset_y;
@@ -434,7 +467,7 @@ pub fn tickBeforeRender(node: *Node, offset_x: f32, offset_y: f32, clip_opt: ?Co
         node.frame_state.state_bits.flags.out_of_viewport = true;
     }
 
-    // 0. 声明式 Transition tick（绝对时间戳驱动）
+    // 0. Declarative Transition tick (absolute timestamp driven)
     if (node.frame_state.frame_local.runtime.transitions) |slots| {
         if (slots.any_active) {
             if (tickTransitions(node, slots, allocator, now_ms)) {
@@ -444,7 +477,7 @@ pub fn tickBeforeRender(node: *Node, offset_x: f32, offset_y: f32, clip_opt: ?Co
         }
     }
 
-    // 0.5 命令式节点动画 tick（绝对时间戳驱动）
+    // 0.5 imperative node animation tick (absolute timestamp driven)
     if (node.frame_state.frame_local.runtime.commands) |anims| {
         if (anims.count > 0) {
             if (anims.tick(node, allocator, now_ms)) {
@@ -459,7 +492,8 @@ pub fn tickBeforeRender(node: *Node, offset_x: f32, offset_y: f32, clip_opt: ?Co
         }
     }
 
-    // 1. 有钩子的节点无条件执行（确保 ScrollArea 弹簧回弹、动画 tick 等继续运行）
+    // 1. Unconditionally execute nodes with hooks (ensure ScrollArea bounce,
+    // animation tick continue)
     if (node.meta.per_frame.hooks.before_render.main) |hook| {
         g_tick_hook_count += 1;
         if (runHookTimed(node, hook)) redraw_requested = true;
@@ -481,7 +515,7 @@ pub fn tickBeforeRender(node: *Node, offset_x: f32, offset_y: f32, clip_opt: ?Co
         return redraw_requested;
     }
 
-    // 1.5 overflow_hidden 收紧 clip 区域
+    // 1.5 overflow_hidden tighten clip region
     const tbr_tx = node.style.translate_x;
     const tbr_ty = node.style.translate_y;
     var effective_clip = clip_opt;
@@ -498,32 +532,28 @@ pub fn tickBeforeRender(node: *Node, offset_x: f32, offset_y: f32, clip_opt: ?Co
             node_clip;
     }
 
-    // 1.6 sticky offset 计算（需要在 effective_clip 确定后、child_offset 之前）
-    // 吸附区域用祖先的 clip_opt（不含自身的 overflow_hidden）；为 null（交集为空）时也要调用，
-    // 由 computeStickyOffset 清零偏移与状态并标脏，不能保留陈旧值。
+    // 1.6 sticky offset calculation (needs effective_clip set, before
+    // child_offset). Sticky uses ancestor clip_opt (excludes self overflow);
+    // null (empty intersection) still calls computeStickyOffset to clear offset/
+    // state and mark dirty, can't keep stale.
     if (node.style.position == .sticky) {
         geometry.computeStickyOffset(node, offset_x, offset_y, clip_opt);
     }
 
-    // 2. 计算子节点的累积偏移（rect + translate + sticky_offset 传递）
-    // 相对坐标系：child_offset 包含父节点的 rect 位置
+    // 2. Calculate child cumulative offset (rect + translate +
+    // sticky_offset pass through). Relative coords: child_offset includes
+    // parent rect position.
     const child_offset_x = offset_x + local_rect.x + tbr_tx + node.frame_state.frame_local.runtime.sticky.x;
     const child_offset_y = offset_y + local_rect.y + tbr_ty + node.frame_state.frame_local.runtime.sticky.y;
 
-    // 3. 递归子节点，带视口裁剪
-    //
-    // ⚠️ 迭代期 mutation 安全（2026-07-29 修，原为 segfault / UAF）：
-    // 上面第 1 步跑的 before_render hook、以及第 0.5 步动画 tick 的**完成
-    // 回调**，都可以在本帧内销毁节点，典型路径是
-    // `animateOpacity(..., done)` 的 done 回调里 dispose 组件 scope，
-    // scope cleanup 走 detachChild + freeNode（见 snapshot_layer.zig:136-144）。
-    // detachChild -> removeChildIncremental 会**就地修改 node.children**，
-    // 于是原来的 `for (node.children.items)` 会：
-    //   - 迭代到已被 free 的 *Node（读到 0xaaaa… 毒值 -> segfault），或
-    //   - 因数组左移而漏掉/重复访问兄弟节点。
-    // 用**下标 + 每轮重读 items** 的方式迭代，并在每轮校验当前槽位仍是
-    // 我们预期的那个子节点；若本轮发生了删除（长度变短或槽位换人），
-    // 就地重新对齐而不前进，保证既不越界也不漏项。
+    // 3. Recurse children with viewport clip. WARNING: iteration must be safe under mutation:
+    // before_render hooks and animation completion callbacks (steps 1, 0.5) can destroy nodes this
+    // frame (typical: animateOpacity(..., done) whose done callback disposes the scope, and cleanup
+    // runs detachChild + freeNode). detachChild -> removeChildIncremental modifies node.children
+    // in place, so `for (node.children.items)` hits a freed *Node (segfault) or skips/re-visits
+    // from the array left-shift. Iterate by index, re-read items each round, and validate the slot
+    // is still the expected child; if a deletion occurred (length shrunk or slot changed), realign
+    // without advancing. This guarantees no bounds violation and no skips.
     var child_idx: usize = 0;
     while (child_idx < node.children.items.len) {
         const child = node.children.items[child_idx];
@@ -532,7 +562,7 @@ pub fn tickBeforeRender(node: *Node, offset_x: f32, offset_y: f32, clip_opt: ?Co
             // child. Advance by identity, not by comparing list lengths.
             if (child_idx < node.children.items.len and node.children.items[child_idx] == child) child_idx += 1;
         }
-        // 全局 hook 读 rect。
+        // Read rect from global hook.
         const child_rect = child.rectFromWorldOrFallback();
         if (child.style.overflow_hidden and
             (child_rect.w <= 0.1 or child_rect.h <= 0.1) and
@@ -543,11 +573,13 @@ pub fn tickBeforeRender(node: *Node, offset_x: f32, offset_y: f32, clip_opt: ?Co
             continue;
         }
 
-        // opacity == 0 且无钩子且自身无活跃 transition/animation -> 完全不可见，跳过子树渲染递归。
-        // 但仍要补 tick 子树深处的活跃 transition/animation：否则 hidden subtree 里的 active slot
-        // 永远不会被推进到 complete，slots.any_active 永驻 true，让 hasPendingSceneWork() 每帧
-        // 返回 true，整个 app 卡在 60fps 持续 redraw（quick-open 等隐藏面板的 Input border_color
-        // transition 是典型案例）。
+        // opacity==0 with no hooks and no active transition/animation is completely invisible, so
+        // skip
+        // child render recursion. Still tick active transitions deep in a hidden subtree: otherwise
+        // active slots never complete, slots.any_active stays true, hasPendingSceneWork() returns
+        // true
+        // every frame, and the app locks at 60fps redraw (typical: hidden panel Input border_color
+        // transition).
         if (child.isPaintSkipped() and !child.hasBeforeRenderHooks() and
             (child.frame_state.frame_local.runtime.transitions == null or !child.frame_state.frame_local.runtime.transitions.?.any_active) and
             (child.frame_state.frame_local.runtime.commands == null or child.frame_state.frame_local.runtime.commands.?.count == 0))
@@ -566,9 +598,10 @@ pub fn tickBeforeRender(node: *Node, offset_x: f32, offset_y: f32, clip_opt: ?Co
         const child_w = child_rect.w;
         const child_h = child_rect.h;
 
-        // 如果子节点有尺寸、没有钩子、非 sticky、无 translate 偏移、且完全在视口外 -> 跳过整棵子树
-        // sticky 节点不能被跳过：其 sticky_offset 需要每帧重新计算
-        // translate 节点不能被跳过：translate 用于滚动，AABB 不反映实际可见区域
+        // If child sized, no hooks, not sticky, no translate offset,
+        // completely outside viewport -> skip whole subtree. Sticky can't skip:
+        // sticky_offset needs recalc each frame. Translate can't skip: used for
+        // scroll, AABB doesn't reflect actual visible region.
         const child_has_translate = child_tx != 0 or child_ty != 0;
         if (child_w > 0 and child_h > 0 and !child.hasBeforeRenderHooks() and child.style.position != .sticky and !child_has_translate) {
             const margin: f32 = 48;
@@ -585,10 +618,11 @@ pub fn tickBeforeRender(node: *Node, offset_x: f32, offset_y: f32, clip_opt: ?Co
                 out_of_clip = true;
             }
             if (out_of_clip) {
-                // 视口外：仍需推进整个子树内所有活跃 transition，防止 any_active 永久不清零
+                // Out of viewport: still tick active transitions in subtree to prevent
+                // any_active stuck at true
                 tickOffscreenAnimationsInSubtree(child, allocator, now_ms);
                 if (isRetiring(node)) return true;
-                continue; // 跳过子树渲染递归
+                continue; // Skip child render recursion
             }
         }
 
@@ -630,7 +664,8 @@ fn clearHiddenSubtreeSceneDirty(node: *Node) void {
     }
 }
 
-/// 递归推进视口外子树中的活跃动画，防止它们停在 active 状态导致 idle-skip 失效。
+/// Recursively advance active animations in out-of-viewport subtree to
+/// prevent stuck-active state disabling idle-skip.
 fn tickOffscreenAnimationsInSubtree(node: *Node, allocator: Allocator, now_ms: f64) void {
     if (isRetiring(node)) return;
     if (node.frame_state.frame_local.runtime.transitions) |slots| {
@@ -669,7 +704,8 @@ fn nodeAnimationsActive(anims: *const @import("../../animation/node_animator.zig
     return false;
 }
 
-/// 快速检查子树是否有活跃动画（避免无效递归）。
+/// Quick check if subtree has active animations (avoid useless
+/// recursion).
 fn subtreeHasActiveAnimation(node: *Node) bool {
     if (node.frame_state.frame_local.runtime.transitions) |slots| {
         if (slots.any_active) return true;

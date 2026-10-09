@@ -1,48 +1,46 @@
-/// Tween Animation
+/// Tween Animation - smooth transition from a start to a target value over a given time.
 ///
-/// 补间动画：在指定时间内从起始值平滑过渡到目标值
-///
-/// 特性:
-/// - 可配置持续时间
-/// - 支持所有缓动函数
-/// - 支持循环和 yoyo
-/// - 支持延迟
+/// Features:
+/// - configurable duration
+/// - all easing functions
+/// - loop and yoyo
+/// - delay
 const std = @import("std");
 const values = @import("value.zig");
 const Easing = @import("easing.zig").Easing;
 const AnimationState = @import("mod.zig").AnimationState;
 const render_engine = @import("../core/render_engine/mod.zig");
 
-/// Tween 配置
+/// Tween config
 pub const TweenConfig = struct {
-    /// 起始值
+    /// start value
     from: f32 = 0.0,
-    /// 目标值
+    /// target value
     to: f32 = 1.0,
-    /// 持续时间 (秒)
+    /// duration (seconds)
     duration: f32 = 0.3,
-    /// 延迟时间 (秒)
+    /// delay (seconds)
     delay: f32 = 0.0,
-    /// 缓动函数
+    /// easing function
     easing: Easing = .ease_out_quad,
-    /// 循环次数 (0 = 无限)
+    /// loop count (0 = infinite)
     loops: u32 = 1,
-    /// Yoyo 模式 (来回)
+    /// yoyo mode (back and forth)
     yoyo: bool = false,
-    /// 完成回调
+    /// completion callback
     on_complete: ?*const fn (*anyopaque) void = null,
-    /// 更新回调
+    /// update callback
     on_update: ?*const fn (f32, *anyopaque) void = null,
-    /// 回调上下文
+    /// callback context
     context: ?*anyopaque = null,
 };
 
-/// 补间动画
+/// tween animation
 pub const Tween = struct {
     config: TweenConfig,
-    /// 绝对起始时间戳（毫秒）
+    /// absolute start timestamp (milliseconds)
     start_time_ms: f64 = 0,
-    /// 暂停时记录的时间戳（毫秒）
+    /// timestamp recorded when paused (milliseconds)
     pause_time_ms: f64 = 0,
     state: AnimationState = .idle,
     updating: bool = false,
@@ -51,7 +49,7 @@ pub const Tween = struct {
     direction: i8 = 1, // 1 = forward, -1 = backward (for yoyo)
     current_value: f32 = 0.0,
 
-    /// 创建 Tween
+    /// create Tween
     pub fn init(config: TweenConfig) Tween {
         var normalized = config;
         normalized.from = values.finiteOr(config.from, 0);
@@ -59,14 +57,14 @@ pub const Tween = struct {
         return Tween{ .config = normalized, .current_value = normalized.from };
     }
 
-    /// 快速创建
+    /// quick create
     pub fn from(initial: f32) TweenBuilder {
         return TweenBuilder{
             .config = .{ .from = initial, .to = initial },
         };
     }
 
-    /// 开始播放
+    /// start playing
     pub fn start(self: *Tween) void {
         self.control_revision +%= 1;
         self.state = .running;
@@ -78,7 +76,7 @@ pub const Tween = struct {
         self.current_value = self.config.from;
     }
 
-    /// 暂停
+    /// pause
     pub fn pause(self: *Tween) void {
         if (self.state == .running) {
             self.control_revision +%= 1;
@@ -87,24 +85,24 @@ pub const Tween = struct {
         }
     }
 
-    /// 恢复
+    /// resume
     pub fn unpause(self: *Tween) void {
         if (self.state == .paused) {
             self.control_revision +%= 1;
             self.state = .running;
-            // 偏移 start_time_ms 以补偿暂停期间的时间流逝
+            // offset start_time_ms to compensate for time elapsed during pause
             const paused_duration = render_engine.current_frame_time_ms - self.pause_time_ms;
             self.start_time_ms += paused_duration;
         }
     }
 
-    /// 停止
+    /// stop
     pub fn stop(self: *Tween) void {
         self.control_revision +%= 1;
         self.state = .idle;
     }
 
-    /// 重置
+    /// reset
     pub fn reset(self: *Tween) void {
         self.control_revision +%= 1;
         self.start_time_ms = render_engine.current_frame_time_ms;
@@ -116,8 +114,8 @@ pub const Tween = struct {
         self.current_value = self.config.from;
     }
 
-    /// 更新动画 (每帧调用)
-    /// now_ms: 当前帧的绝对时间戳（毫秒）
+    /// update animation (call every frame)
+    /// now_ms: current frame absolute timestamp (milliseconds)
     /// Keep standalone storage alive and stable throughout callbacks.
     pub fn update(self: *Tween, now_ms: f64) void {
         if (self.state != .running or self.updating) return;
@@ -174,17 +172,17 @@ pub const Tween = struct {
         return if (std.math.isFinite(rounded)) @as(f64, rounded) else @as(f64, seconds) * 1000;
     }
 
-    /// 获取当前值
+    /// get current value
     pub fn getValue(self: *const Tween) f32 {
         return self.current_value;
     }
 
-    /// 是否正在运行
+    /// whether running
     pub fn isRunning(self: *const Tween) bool {
         return self.state == .running;
     }
 
-    /// 是否完成
+    /// whether completed
     pub fn isCompleted(self: *const Tween) bool {
         return self.state == .completed;
     }
@@ -249,9 +247,9 @@ pub const TweenBuilder = struct {
     }
 };
 
-// ========== 测试 ==========
+// ========== tests ==========
 
-/// 测试辅助：设置全局模拟时间
+/// test helper: set global simulation time
 fn setTestTime(ms: f64) void {
     render_engine.current_frame_time_ms = ms;
 }
@@ -267,11 +265,11 @@ test "Tween: basic animation" {
     tween.start();
     try std.testing.expect(tween.isRunning());
 
-    // 模拟 0.5 秒
+    // simulate 0.5 seconds
     tween.update(1500.0);
     try std.testing.expectApproxEqAbs(@as(f32, 50.0), tween.getValue(), 0.1);
 
-    // 完成
+    // finished
     tween.update(2000.0);
     try std.testing.expect(tween.isCompleted());
     try std.testing.expectApproxEqAbs(@as(f32, 100.0), tween.getValue(), 0.1);
@@ -287,11 +285,11 @@ test "Tween: with delay" {
 
     tween.start();
 
-    // 在延迟期间（300ms < 500ms delay），值不变
+    // during delay (300ms < 500ms delay), value unchanged
     tween.update(1300.0);
     try std.testing.expectEqual(@as(f32, 0.0), tween.getValue());
 
-    // 延迟结束后开始动画（1000ms > 500ms delay）
+    // after delay ends animation starts (1000ms > 500ms delay)
     tween.update(2000.0);
     try std.testing.expect(tween.getValue() > 0.0);
 }
@@ -308,11 +306,11 @@ test "Tween: yoyo" {
 
     tween.start();
 
-    // 第一次前进
+    // first forward
     tween.update(1500.0);
     try std.testing.expectApproxEqAbs(@as(f32, 10.0), tween.getValue(), 0.1);
 
-    // 第二次后退 (yoyo)
+    // second reverse (yoyo)
     tween.update(2000.0);
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), tween.getValue(), 0.1);
 
@@ -321,7 +319,7 @@ test "Tween: yoyo" {
 
 test "Tween: callback" {
     setTestTime(1000.0);
-    // 使用单一结构体存储两个状态
+    // use single struct to store two states
     const TestState = struct {
         callback_value: f32 = 0,
         complete_called: bool = false,

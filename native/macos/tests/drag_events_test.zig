@@ -10,7 +10,7 @@ test "real native drag head survives SDK queue OOM and full payload outlives con
     const ptr = zenit_test_drag_window_create();
     defer zenit_test_drag_window_destroy(ptr);
     var window: Window = .{ .window_ptr = ptr, .view_ptr = undefined, .width = 0, .height = 0 };
-    const paths = "/tmp/漢.png\n" ** 1000;
+    const paths = (@as([("/tmp/漢.png\n").len * (1000)]u8, @bitCast(@as([1000][("/tmp/漢.png\n").len]u8, @splat(("/tmp/漢.png\n").*)))) ++ "");
     zenit_test_drag_enqueue(ptr, paths, paths.len, 3);
     zenit_test_drag_enqueue(ptr, "", 0, 4);
     var failing = t.FailingAllocator.init(t.allocator, .{ .fail_index = 0 });

@@ -1,7 +1,7 @@
-/// 文本折行计算模块
-///
-/// 在布局阶段根据可用宽度计算断行点，支持 word 和 char 两种模式。
-/// 折行结果缓存在 TextLayout 中，仅 content/available_width 变化时重算。
+/// Text line-breaking calculation module. Computes break points during
+/// layout based on available width, supports word and char modes. Break
+/// results cached in TextLayout, recalculated only when content/available_width
+/// changes.
 const std = @import("std");
 const builtin = @import("builtin");
 const types = @import("types.zig");
@@ -18,28 +18,27 @@ fn usePlatformTextMeasure() bool {
     return comptime (builtin.os.tag == .macos and !builtin.is_test);
 }
 
-/// 外部注入的测量函数（使用预加载字体，与渲染一致）
-/// 参数: text_ptr, text_len, font_size, font_weight, use_italic
-///
-/// 线程安全约束：在 runApp 初始化时通过 setMeasureFn 设置一次，之后只读。
-/// 当前单线程架构下安全。若未来引入多线程布局，需改为 atomic 或线程局部变量。
+/// External injected measure function (uses preloaded fonts, consistent
+/// with rendering). Parameters: text_ptr, text_len, font_size, font_weight,
+/// use_italic. Thread safety: set once in runApp init via setMeasureFn,
+/// then read-only. Safe while single-threaded; multithreaded layout would
+/// need atomic or thread-local.
 pub const MeasureFn = *const fn ([*]const u8, usize, f32, u16, bool) f32;
 var external_measure_fn: ?MeasureFn = null;
 var external_monospace_measure_fn: ?MeasureFn = null;
 
-/// 带 context 的测量回调，多 App / 多窗口所需。
-///
-/// 旧的 `MeasureFn` 不带 context，调用方（zenit_app.runtime）只能用一个
-/// **进程级全局** `g_font_selector_for_measure` 把字体选择器偷渡进来；
-/// 两个 App 并存时后者会覆盖前者，导致前一个窗口的文本用错字体测量。
-/// 这是多窗口最后两处非 World 全局依赖之一（另一处是 a11y active context）。
-///
-/// 有 context 版本优先于无 context 版本；两者都没设时走平台/回退路径。
+/// Measure callback with context, needed for multiple Apps / multiple windows.
+/// The old MeasureFn lacks context; the caller (zenit_app.runtime) only has one process-level
+/// global g_font_selector_for_measure, so with two coexisting Apps the later one overwrites
+/// the earlier and the first window measures text with the wrong font. One of the last two
+/// non-World global dependencies in multiwindow (other is a11y active context).
+/// Context version takes priority over no-context version; neither set falls back to
+/// platform/fallback paths.
 pub const MeasureCtxFn = *const fn (ctx: *anyopaque, [*]const u8, usize, f32, u16, bool) f32;
 var external_measure_ctx_fn: ?MeasureCtxFn = null;
 var external_measure_ctx: ?*anyopaque = null;
 
-/// 当前测量上下文的身份，并进 MeasureKey。无 ctx 时为 0。
+/// Current measure context identity, enters MeasureKey. 0 when no ctx.
 fn currentMeasureCtxId() u64 {
     const ctx = external_measure_ctx orelse return 0;
     return @intFromPtr(ctx);
@@ -49,44 +48,40 @@ pub fn setMeasureCtxFn(f: ?MeasureCtxFn, ctx: ?*anyopaque) void {
     if (external_measure_ctx_fn == f and external_measure_ctx == ctx) return;
     external_measure_ctx_fn = f;
     external_measure_ctx = ctx;
-    // 不再清表：ctx 身份已经是 MeasureKey 的一部分（见 measure_ctx_id），
-    // 不同 ctx 的条目天然不会互相命中。此前这里无条件 invalidate，导致
-    // MultiWindowApp 每帧顺序跑各窗口 layout() 时每次都清空整张 16384 条
-    // 的表，多窗口下命中率恒为 0。
-    //
-    // 注意残留前提：ctx 指针相同但其内容被原地改掉（比如把同一个
-    // FontSelector 换族/换态）时，旧宽度仍会被复用。框架内 setFontSelector
-    // 的用法都是传入新对象指针，不会踩到；宿主若要原地改，需自行调用
-    // invalidateMeasureCache()。
+    // Doesn't clear the table: ctx identity is already part of MeasureKey (see
+    // measure_ctx_id), so different ctx entries never collide. (Clearing on every ctx change
+    // made MultiWindowApp, which runs each window's layout() sequentially, wipe the entire
+    // 16384-entry table each time: hit rate always 0.)
+    // Stale assumption: ctx pointer same but contents replaced in-place (e.g., same FontSelector
+    // switched family/state) reuses old widths. Framework setFontSelector always passes a new
+    // object pointer, so it won't hit; a host mutating in-place must call
+    // invalidateMeasureCache() manually.
 }
 
 pub fn setMeasureFn(f: ?MeasureFn) void {
-    // 幂等：Cx.layout() 每次布局都会调本 fn 同步 measure_fn。fn 没变时绝不能
-    // invalidate，否则 measure cache 每次 layout 被整体清空，形同虚设
-    //（列表场景每帧 N 次未缓存 CoreText 调用的真根因）。
+    // Idempotent: Cx.layout() always calls this fn to sync measure_fn. Fn
+    // unchanged must never invalidate, else measure cache cleared entire table
+    // each layout, becoming decorative (true root cause of N uncached CoreText
+    // calls per frame in list scenarios).
     if (external_measure_fn == f) return;
     external_measure_fn = f;
     invalidateMeasureCache();
 }
 
-/// 设置 monospace 专用测量函数（用于等宽文本场景）
+/// Set monospace-specific measure function (for monospace text scenarios).
 pub fn setMonospaceMeasureFn(f: ?MeasureFn) void {
     if (external_monospace_measure_fn == f) return;
     external_monospace_measure_fn = f;
     invalidateMeasureCache();
 }
 
-/// 注入式 GlyphRun pipeline 测量回调。
-///
-/// 当 caller (layoutNode 入口) 在测量上下文激活时设这个回调，
-/// measureProportional 内部优先调它走 GlyphRun cache -> ShapingCache hit /
-/// TextShaper.shape miss-path。返 NaN 表示 pipeline 不可用 (cache 未挂、
-/// font lookup 失败等)，自动 fallback 到 platform measure。
-///
-/// 这是真正让 layout/findLineBreak/computeTextLayout 等 *所有* legacy 路径
-/// 自动走 GlyphRun pipeline 的关键 hook，不用改一堆 caller。
-///
-/// 线程安全约束同 setMeasureFn：layoutNode 入口设、退出还原。
+/// Inject GlyphRun pipeline measure callback. layoutNode entry sets it when activating the
+/// measure context; measureProportional prioritizes calling it for GlyphRun cache ->
+/// ShapingCache hit / TextShaper.shape miss-path. Returning NaN means pipeline
+/// unavailable (cache unhooked, font lookup failed, etc.), auto-fallback to
+/// platform measure. This makes all legacy paths (layout/findLineBreak/
+/// computeTextLayout etc.) use the GlyphRun pipeline without changing callers.
+/// Thread safety same as setMeasureFn: layoutNode entry sets, exit restores.
 pub const ShapeMeasureFn = *const fn (text: []const u8, font_size: f32, font_weight: u16, use_italic: bool, use_monospace: bool) f32;
 var g_shape_measure_fn: ?ShapeMeasureFn = null;
 
@@ -94,44 +89,45 @@ pub fn setShapeMeasureFn(f: ?ShapeMeasureFn) void {
     g_shape_measure_fn = f;
 }
 
-/// 诊断用:当前是否装着 GlyphRun 测量钩子。
-///
-/// 为什么需要它:钩子只在 `layoutNode` 期间装着(见上面的线程安全约束),
-/// **draw / overlay 阶段是空的**。于是同一段文字在布局期按 shaping 宽度算、
-/// 在 overlay 期按平台 fallback 算,两者不一致，选区高亮与光标就会与
-/// 字形错位。谁要在 layout 之外测量文字,先用这个断言自己处在哪种世界。
+/// Diagnostic: is GlyphRun measure hook currently installed. The hook is only active during
+/// layoutNode (see thread-safety above), empty during draw/overlay phases. Thus the same text
+/// measures by shaping width during layout but by platform fallback during overlay, and the
+/// mismatch misaligns selection highlight and cursor with glyphs. Anyone measuring text
+/// outside layout should first assert which world they are in with this.
 pub fn hasShapeMeasure() bool {
     return g_shape_measure_fn != null;
 }
 
-/// 清空 measure cache。在 measure fn 变更时必须调（不同 fn 同 key 应给不同 width）。
+/// Clear measure cache. Must call when measure fn changes (different fns,
+/// same key should give different widths).
 pub fn invalidateMeasureCache() void {
     for (&g_measure_cache) |*e| e.valid = false;
 }
 
-// measure cache, text_hash + font params -> width。
-// 矩阵 #8：shape cache > 95%。命中跳过 CoreText shape 调用（~10-100µs）。
-// 单线程，2-way set-assoc，LRU eviction。同帧内同文本被复用是高频路径
-// （列表里 100 行同 "Item N" 文本各自布局时 measure_x 调 N 次）。
-// 容量依据（2026-08）：表格密集 40KB 中文文档单次冷开产生 ~16.5k 个独特
-// (segment, font) key, 4096 容量在一次打开内就被驱逐两轮，回滚/重开时同串
-// 全部重 shape。16384 × ~48B ≈ 786KB，让整篇文档的 segment 常驻。
+// Measure cache: text_hash + font params -> width. Target: shape cache > 95% hit. Hit skips
+// CoreText shape call (~10-100us). Single-threaded, 2-way set-assoc, LRU eviction. Same
+// text is reused at high frequency within a frame (100 list rows with the same "Item N"
+// text each call measure_x N times). Capacity basis: a dense 40KB Chinese document cold-open
+// produces ~16.5k unique (segment, font) keys; 4096 capacity evicted twice in a single
+// open, so revert/reopen redid all shaping.
+// 16384 x ~48B = ~786KB, keeps whole document segments resident.
 const MEASURE_CACHE_CAP: usize = 16384;
 const MeasureKey = packed struct {
     text_hash: u64,
-    font_size_bits: u32, // f32 reinterpret 用作整 key 部分
+    font_size_bits: u32, // f32 reinterpret used as integral key part.
     font_weight: u16,
     use_italic: u8, // bool 0/1
-    text_len_low: u8, // text length 低 8 位（防短碰撞）
-    /// mono 与 proportional 同 (text,size,weight) 宽度不同，必须分 key，
-    /// 否则谁先测谁的值就被另一方错误复用。
+    text_len_low: u8, // text length low 8 bits (prevent short collision).
+    /// Mono and proportional have different widths for same (text,size,weight),
+    /// must separate keys, else whoever measures first their value wrongly reused
+    /// by other.
     use_monospace: u8 = 0,
-    /// 测量上下文身份（`external_measure_ctx` 的指针值，无 ctx 时为 0）。
-    ///
-    /// 多窗口下每个 App 的 measure_ctx 是各自 `&app.font_selector` 的地址，
-    /// 天然互不相同。把它并进 key 之后，不同窗口的测量结果可以在同一张表里
-    /// 共存；否则只能靠"ctx 一变就清全表"来保证不串味，而 MultiWindowApp
-    /// 每帧顺序跑每个窗口的 layout()，等于每帧每窗口清一次表，命中率归零。
+    /// Measure context identity (pointer value of external_measure_ctx, 0 when
+    /// no ctx). In multiwindow each App's measure_ctx is the address of its own
+    /// &app.font_selector, so they are naturally distinct. With it in the key, results from
+    /// different windows coexist in one table; otherwise cross-contamination could only be
+    /// prevented by clearing the whole table on ctx change, which MultiWindowApp (each window's
+    /// layout() run sequentially per frame) would do every frame: hit rate zero.
     measure_ctx_id: u64 = 0,
 };
 const MeasureEntry = struct {
@@ -140,7 +136,7 @@ const MeasureEntry = struct {
     last_used: u64,
     valid: bool = false,
 };
-var g_measure_cache: [MEASURE_CACHE_CAP]MeasureEntry = [_]MeasureEntry{.{ .key = undefined, .width = 0, .last_used = 0, .valid = false }} ** MEASURE_CACHE_CAP;
+var g_measure_cache: [MEASURE_CACHE_CAP]MeasureEntry = @as([MEASURE_CACHE_CAP]MeasureEntry, @splat(.{ .key = undefined, .width = 0, .last_used = 0, .valid = false }));
 var g_measure_cache_clock: u64 = 0;
 var g_measure_cache_hits: u64 = 0;
 var g_measure_cache_misses: u64 = 0;
@@ -171,13 +167,15 @@ inline fn measureKeyEq(a: MeasureKey, b: MeasureKey) bool {
         a.use_italic == b.use_italic and
         a.text_len_low == b.text_len_low and
         a.use_monospace == b.use_monospace and
-        // 注意：本函数逐字段比较而非按整体比特比较，新增 MeasureKey 字段时
-        // 必须同步加在这里，否则该字段等于没进 key（不同值会互相命中）。
+        // Note: this function compares field-by-field not bitwise whole, adding
+        // MeasureKey fields must also sync here, else that field (different values
+        // hit each other).
         a.measure_ctx_id == b.measure_ctx_id;
 }
 
-// 2-way set-associative：direct-mapped 时热键冲突互相踢（反复重测 CoreText），
-// 组内两槽 + 组内 LRU 覆盖显著降低 thrash，容量不变。
+// 2-way set-associative: direct-mapped hot key conflicts kick each other
+// (repeated CoreText remeasure), two slots/group + group LRU eviction
+// significantly lowers thrash, same capacity.
 fn measureCacheLookup(key: MeasureKey) ?f32 {
     const base = (key.text_hash % MEASURE_CACHE_CAP) & ~@as(u64, 1);
     inline for (0..2) |way| {
@@ -207,18 +205,15 @@ fn measureCacheStore(key: MeasureKey, width: f32) void {
     };
 }
 
-/// 内部 proportional 测量 + cache。是 measureTextWidthByFontKind /
-/// measureMonospaceTextWidth fallback 的唯一聚集点。
-///
-/// **历史**：原 pub fn (已物理删除 Phase E commit)。整条
-/// ASCII-first measure API 的 *外部* 入口现在统一是 measureTextWidthByFontKind；
-/// GlyphRun pipeline 主路径在 cx.shapeText / measureSegmentWidthCtx /
-/// measureIntrinsicTextWidthCtx 接管，本 fn 只是 fallback 的最后一站。
+/// Internal proportional measure + cache. Sole aggregation point for
+/// measureTextWidthByFontKind / measureMonospaceTextWidth fallback. The GlyphRun
+/// pipeline main path is in cx.shapeText / measureSegmentWidthCtx /
+/// measureIntrinsicTextWidthCtx; this fn is the fallback's last stop.
 fn measureProportional(text: []const u8, font_size: f32, font_weight: u16, use_italic: bool) f32 {
     if (text.len == 0) return 0;
-    // GlyphRun pipeline fast path（命中即返 cache 内
-    // total_advance；miss 时 callback 内 shape + insert 然后返）。NaN 视为
-    // 不可用 (pipeline 没挂或 shape 失败)，回到 platform measure。
+    // GlyphRun pipeline fast path (hit returns cache total_advance; miss
+    // callback shapes + inserts then returns). NaN treated unavailable (pipeline
+    // unhooked or shape failed), fallback to platform measure.
     if (g_shape_measure_fn) |shape_fn| {
         const w = shape_fn(text, font_size, font_weight, use_italic, false);
         if (!std.math.isNan(w)) return w;
@@ -236,8 +231,9 @@ fn measureProportional(text: []const u8, font_size: f32, font_weight: u16, use_i
     if (measureCacheLookup(key)) |w| return w;
 
     const computed: f32 = blk: {
-        // 带 context 的回调优先，它能定位到**具体那个 App** 的字体选择器，
-        // 而无 context 版本只能读进程级全局（多窗口下会串台）。
+        // Context-aware callback priority, locates that specific App's font
+        // selector, while no-context version only reads process-level global
+        // (multiwindow cross-talks).
         if (external_measure_ctx_fn) |f| {
             if (external_measure_ctx) |ctx| {
                 break :blk f(ctx, text.ptr, text.len, font_size, font_weight, use_italic);
@@ -252,8 +248,9 @@ fn measureProportional(text: []const u8, font_size: f32, font_weight: u16, use_i
             }
             break :blk native_text.coretext_measure_text_width_utf8(text.ptr, @intCast(text.len), font_size);
         }
-        // 回退: 按 codepoint 粗估(ASCII 0.6em,非 ASCII 视为全宽 1.0em)。
-        // 不能按字节数，CJK 每字符 3 字节,按字节会超测 ~3×(选区/光标错位)。
+        // Fallback: rough estimate by codepoint (ASCII 0.6em, non-ASCII full-width
+        // 1.0em). Can't use byte count; CJK 3 bytes/char, byte count overestimates
+        // ~3x (selection/cursor misaligned).
         var est: f32 = 0;
         const view = std.unicode.Utf8View.init(text) catch
             break :blk @as(f32, @floatFromInt(text.len)) * font_size * 0.6;
@@ -267,17 +264,18 @@ fn measureProportional(text: []const u8, font_size: f32, font_weight: u16, use_i
     return computed;
 }
 
-/// monospace 文本宽度测量（优先走 monospace 专用函数）
+/// Monospace text width measurement (priority walk monospace-specific
+/// function).
 pub fn measureMonospaceTextWidth(text: []const u8, font_size: f32, font_weight: u16, use_italic: bool) f32 {
     if (text.len == 0) return 0;
-    // 同 proportional 路径优先走 GlyphRun pipeline。
+    // Same as proportional path priority walk GlyphRun pipeline.
     if (g_shape_measure_fn) |shape_fn| {
         const w = shape_fn(text, font_size, font_weight, use_italic, true);
         if (!std.math.isNan(w)) return w;
     }
     if (external_monospace_measure_fn) |f| {
-        // 走缓存（use_monospace=1 分 key）：外部 mono 测量同样是 FFI/shaping 级
-        // 开销，之前这条腿完全没缓存。
+        // Walk cache (use_monospace=1 separate key): external mono measure same
+        // FFI/shaping overhead, before uncached.
         const key = MeasureKey{
             .text_hash = std.hash.Wyhash.hash(0, text),
             .font_size_bits = @bitCast(font_size),
@@ -295,12 +293,11 @@ pub fn measureMonospaceTextWidth(text: []const u8, font_size: f32, font_weight: 
     return measureProportional(text, font_size, font_weight, use_italic);
 }
 
-/// 按 font kind 测量文本宽度（monospace fast path）。
-/// 公开作 render_engine + input components 的统一入口，避免重复 wrapper。
-///
-/// GlyphRun pipeline 主路径在 cx.shapeText / measureSegmentWidthCtx /
-/// measureIntrinsicTextWidthCtx 接管。本 fn 是 fallback 的最后一站（无 cx
-/// / shape 失败时降级路径）。
+/// Measure text width by font kind (monospace fast path). Unified entry for
+/// render_engine + input components, avoids duplicate wrappers. GlyphRun
+/// pipeline main path is in cx.shapeText / measureSegmentWidthCtx /
+/// measureIntrinsicTextWidthCtx. This fn is the fallback's last stop
+/// (no cx / shape failed degradation path).
 pub inline fn measureTextWidthByFontKind(text: []const u8, font_size: f32, font_weight: u16, use_italic: bool, use_monospace: bool) f32 {
     return if (use_monospace)
         measureMonospaceTextWidth(text, font_size, font_weight, use_italic)
@@ -339,9 +336,9 @@ pub fn inlineBoxMetricsForFragment(span: TextSpan, frag_start: u32, frag_end: u3
     };
 }
 
-/// 按 TextSpan 分段测量文本宽度
-/// 与 renderLineWithSpans 逻辑一致：遍历 [start..end] 范围，
-/// 有 span 覆盖的段用 span.font_weight/italic，无覆盖的用 base_fw/base_italic。
+/// Measure text width by TextSpan segments. Logic consistent with
+/// renderLineWithSpans: iterate [start..end] range, span-covered segments use
+/// span.font_weight/italic, uncovered use base_fw/base_italic.
 pub fn measureTextWidthWithSpans(
     content: []const u8,
     start: u32,
@@ -366,12 +363,12 @@ pub fn measureTextWidthWithSpans(
         const seg_end = @min(span.end, end);
         if (seg_start >= seg_end) continue;
 
-        // span 之前的间隙用 base_fw/base_italic
+        // Gap before span uses base_fw/base_italic.
         if (pos < seg_start) {
             total += measureTextWidthByFontKind(content[pos..seg_start], font_size, base_fw, base_italic, base_use_monospace);
         }
 
-        // span 段用 span 自己的 fw/italic/monospace
+        // Span segment uses span's own fw/italic/monospace.
         const seg_fw = span.font_weight orelse base_fw;
         const seg_italic = span.use_italic_font or base_italic;
         const seg_monospace = span.use_monospace_font or base_use_monospace;
@@ -381,7 +378,7 @@ pub fn measureTextWidthWithSpans(
         pos = seg_end;
     }
 
-    // 尾部无 span 覆盖的文本
+    // Tail text without span coverage.
     if (pos < end) {
         total += measureTextWidthByFontKind(content[pos..end], font_size, base_fw, base_italic, base_use_monospace);
     }
@@ -389,9 +386,10 @@ pub fn measureTextWidthWithSpans(
     return total;
 }
 
-/// 一条视觉行在内容宽 `avail_w` 内按 `text_align` 的起点偏移（px，≥ 0）。
-/// 渲染（text_item_render）与宿主的光标 / 命中 / 选区换算必须共用这一个公式，
-/// 否则居中文字上的光标会与字形错位。行比可用宽还宽（溢出）时不偏移。
+/// Visual line start offset (px, >= 0) at content width `avail_w` per
+/// `text_align`. Rendering (text_item_render) and host's cursor/hit/selection
+/// conversion must share this one formula, else centered text's cursor misaligns
+/// with glyphs. Line wider than available (overflow) doesn't offset.
 pub fn alignLineOffset(text_align: types.TextAlign, avail_w: f32, line_w: f32) f32 {
     if (text_align == .start) return 0;
     if (!std.math.isFinite(avail_w) or !std.math.isFinite(line_w)) return 0;
@@ -413,16 +411,18 @@ test "alignLineOffset: start/center/end, overflow and non-finite input" {
     try std.testing.expectEqual(@as(f32, 0), alignLineOffset(.end, std.math.inf(f32), 10));
 }
 
-/// 斜体字形常有 typographic advance 之外的右侧 overhang。
-/// 这里提供一个统一的启发式 padding，专门用于背景/选区矩形的视觉扩展，
-/// 不参与 hit-test 或光标定位，避免逻辑宽度漂移。
+/// Italic glyphs often have typographic advance overhang on right. Provides
+/// unified heuristic padding for visual extension of background/selection
+/// rectangles, doesn't participate in hit-test or cursor positioning, avoids
+/// logical width drift.
 pub fn estimateItalicOverhangPadding(font_size: f32, use_italic: bool) f32 {
     if (!use_italic) return 0;
     return std.math.clamp(font_size * 0.12, 1.0, 4.0);
 }
 
-// Phase 5: 上限 64 -> 1024。完整 ArrayList 化在 Phase 6 文本管线重写时做
-//（届时与 text_core PieceTree 整合一起切换）；当前 1024 已远超任何 UI 文本场景。
+// Phase 5: cap 64 -> 1024. Full ArrayList conversion in Phase 6 text
+// pipeline rewrite (integrate with text_core PieceTree together); current
+// 1024 far exceeds any UI text scenario.
 pub const MAX_LINES = 1024;
 pub const INTERACTION_PREFIX_MAX_CHARS: usize = 1024;
 const INTERACTION_PREFIX_CACHE_SIZE: usize = 512;
@@ -430,7 +430,7 @@ const INTERACTION_PREFIX_CACHE_SIZE: usize = 512;
 const INTERACTION_PREFIX_INDEX_SIZE: usize = 2048;
 const INTERACTION_PREFIX_INDEX_MASK: usize = INTERACTION_PREFIX_INDEX_SIZE - 1;
 const INTERACTION_PREFIX_INDEX_PROBE_LIMIT: usize = 8;
-/// 哨兵：sidecar 槽空 / 已驱逐
+/// Sentinel: sidecar slot empty / evicted.
 const INVALID_CACHE_IDX: u16 = std.math.maxInt(u16);
 
 pub const LineInfo = struct {
@@ -444,7 +444,7 @@ pub const TextLayout = struct {
     line_count: u16 = 0,
     total_height: f32 = 0,
     max_line_width: f32 = 0,
-    // 缓存 key，使用 ptr+len+hash 三重校验
+    // Cache key, triple-check ptr+len+hash.
     cached_content_ptr: [*]const u8 = undefined,
     cached_content_len: usize = 0,
     cached_content_hash: u64 = 0,
@@ -458,10 +458,9 @@ pub const TextLayout = struct {
     cached_spans_hash: u64 = 0,
 };
 
-// Hot header, accessed every lookup. ~64 bytes（一个 cache line）。
-// 旧实现把 ~4.2MB 的 boundaries+prefix_widths 和 metadata 混在一个 entry 里，
-// linear scan 时每个 entry 都 cache miss。先做 header/payload split（~32KB headers
-// 装入 L1），再用 sidecar hash 索引把 lookup 从 O(N) 降到 O(1)。
+// Hot header, accessed every lookup. ~64 bytes (one cache line). Header/payload split:
+// ~32KB of headers fit L1 (boundaries+prefix_widths payload is ~4.2MB), and a sidecar hash
+// index makes lookup O(1) instead of a linear scan with a cache miss per entry.
 const InteractionPrefixCacheHeader = struct {
     valid: bool = false,
     use_italic: bool = false,
@@ -476,27 +475,29 @@ const InteractionPrefixCacheHeader = struct {
     font_size: f32 = 0,
     last_used_gen: u32 = 0,
     spans_hash: u64 = 0,
-    key_hash: u64 = 0, // 完整 key 的预算 hash，sidecar lookup 用
+    key_hash: u64 = 0, // Full key pre-computed hash, sidecar lookup uses.
 };
 
 const InteractionPrefixCachePayload = struct {
-    boundaries: [INTERACTION_PREFIX_MAX_CHARS + 1]u32 = [_]u32{0} ** (INTERACTION_PREFIX_MAX_CHARS + 1),
-    prefix_widths: [INTERACTION_PREFIX_MAX_CHARS + 1]f32 = [_]f32{0} ** (INTERACTION_PREFIX_MAX_CHARS + 1),
+    boundaries: [INTERACTION_PREFIX_MAX_CHARS + 1]u32 = @as([(INTERACTION_PREFIX_MAX_CHARS + 1)]u32, @splat(0)),
+    prefix_widths: [INTERACTION_PREFIX_MAX_CHARS + 1]f32 = @as([(INTERACTION_PREFIX_MAX_CHARS + 1)]f32, @splat(0)),
 };
 
-/// 构建失败（range 超长）的 key memo：失败一次后同 key 不再重试整表构建。
-/// 32 条环形覆盖"同屏若干条超长行被反复交互"的场景；key 含 content_version，
-/// 编辑后自动失效。
-var g_prefix_build_failed_ring: [32]u64 = [_]u64{0} ** 32;
+/// Build failure (range too long) key memo: after one failure same key
+/// doesn't retry full table. 32-entry ring covers "same screen several long
+/// lines repeated interaction"; key includes content_version, auto-invalidates
+/// after edit.
+var g_prefix_build_failed_ring: [32]u64 = @as([32]u64, @splat(0));
 var g_prefix_build_failed_cursor: usize = 0;
 
 var interaction_prefix_cache_headers: [INTERACTION_PREFIX_CACHE_SIZE]InteractionPrefixCacheHeader =
-    [_]InteractionPrefixCacheHeader{.{}} ** INTERACTION_PREFIX_CACHE_SIZE;
+    @as([INTERACTION_PREFIX_CACHE_SIZE]InteractionPrefixCacheHeader, @splat(.{}));
 var interaction_prefix_cache_payloads: [INTERACTION_PREFIX_CACHE_SIZE]InteractionPrefixCachePayload =
-    [_]InteractionPrefixCachePayload{.{}} ** INTERACTION_PREFIX_CACHE_SIZE;
-/// sidecar：bucket -> entry index in headers/payloads。INVALID_CACHE_IDX 表示空槽。
+    @as([INTERACTION_PREFIX_CACHE_SIZE]InteractionPrefixCachePayload, @splat(.{}));
+/// Sidecar: bucket -> entry index in headers/payloads. INVALID_CACHE_IDX
+/// means empty slot.
 var interaction_prefix_cache_index: [INTERACTION_PREFIX_INDEX_SIZE]u16 =
-    [_]u16{INVALID_CACHE_IDX} ** INTERACTION_PREFIX_INDEX_SIZE;
+    @as([INTERACTION_PREFIX_INDEX_SIZE]u16, @splat(INVALID_CACHE_IDX));
 var interaction_prefix_cache_gen: u32 = 1;
 
 inline fn computeInteractionPrefixKeyHash(
@@ -527,7 +528,7 @@ inline fn cacheIndexBucket(key_hash: u64) usize {
     return @as(usize, @intCast(key_hash & INTERACTION_PREFIX_INDEX_MASK));
 }
 
-/// sidecar 中查找 key_hash -> entry idx
+/// Lookup key_hash in sidecar -> entry idx.
 fn sidecarLookup(key_hash: u64) ?u16 {
     var probe: usize = 0;
     while (probe < INTERACTION_PREFIX_INDEX_PROBE_LIMIT) : (probe += 1) {
@@ -555,11 +556,12 @@ fn sidecarInsert(key_hash: u64, entry_idx: u16) void {
             return;
         }
     }
-    // 探测溢出：覆盖第一个 bucket（罕见，PROBE_LIMIT=8 已留充足空间）
+    // Probe overflow: cover first bucket (rare, PROBE_LIMIT=8 has ample
+    // space).
     interaction_prefix_cache_index[cacheIndexBucket(key_hash)] = entry_idx;
 }
 
-/// 当 entry 被驱逐时清除 sidecar 中指向它的所有 bucket。
+/// When entry evicted, clear all buckets in sidecar pointing to it.
 fn sidecarRemoveByIndex(entry_idx: u16) void {
     for (&interaction_prefix_cache_index) |*slot| {
         if (slot.* == entry_idx) slot.* = INVALID_CACHE_IDX;
@@ -587,8 +589,8 @@ fn allocInteractionPrefixCacheIndex() usize {
     var lru_idx: usize = 0;
     var lru_gen: u32 = std.math.maxInt(u32);
 
-    // O(N) LRU 扫描在 alloc 路径上仍然存在，但 alloc 只在 cache miss 时调用，
-    // 远比 lookup 频率低。N=512 的扫描 ~512 cycles，可接受。
+    // O(N) LRU scan still exists on alloc path, but alloc only called on cache
+    // miss, far lower than lookup frequency. N=512 scan ~512 cycles, acceptable.
     for (&interaction_prefix_cache_headers, 0..) |*h, idx| {
         if (!h.valid) {
             h.* = .{};
@@ -601,7 +603,7 @@ fn allocInteractionPrefixCacheIndex() usize {
         }
     }
 
-    // 驱逐：先从 sidecar 中清除指向该 entry 的 bucket
+    // Evict: first clear bucket in sidecar pointing to entry.
     sidecarRemoveByIndex(@intCast(lru_idx));
     interaction_prefix_cache_headers[lru_idx] = .{};
     interaction_prefix_cache_headers[lru_idx].last_used_gen = nextInteractionCacheGen();
@@ -627,14 +629,14 @@ pub fn buildPrefixWidthsForRange(
     boundaries[0] = 0;
     prefix_widths[0] = 0;
 
-    // 分块增量测量。旧实现每个 grapheme 都从 range_start 重测整个前缀：
-    // O(N²) shaped bytes，且每个前缀是不同字符串 -> measure cache 命中率恒 0，
-    // 500 字符行的首次构建 = 500 次对平均 250 字节串的全价 CoreText。
-    // 现在每 PREFIX_CHUNK_GRAPHEMES 个 grapheme 落一个 checkpoint，块内只测
-    // [checkpoint, next_off)（span 语义不变：measureTextWidthWithSpans 本来就按
-    // content 全局偏移收 span），前缀宽度 = checkpoint 累计 + 块内宽度。
-    // 代价：checkpoint 边界处的 kerning 丢失（CJK 为 0，拉丁 pair 亚像素级、
-    // 每 64 字素至多一次）；binary search 需要的单调性不受影响。
+    // Chunked incremental measurement. Re-measuring the entire prefix from range_start for each
+    // grapheme would be O(N^2) shaped bytes, and each prefix is a different string so the
+    // measure cache never hits (500-char line = 500 full-price CoreText calls on avg 250-byte
+    // strings). Instead drop a checkpoint every PREFIX_CHUNK_GRAPHEMES and measure only
+    // [checkpoint, next) (span semantics unchanged: measureTextWidthWithSpans collects spans by
+    // content global offset); prefix width = checkpoint cumulative + chunk width.
+    // Cost: kerning lost at checkpoint boundary (CJK=0, Latin pair subpixel, at most once per 64
+    // graphemes); binary search monotonicity unaffected.
     var off: usize = 0;
     var count: usize = 1;
     var chunk_base_off: u32 = 0;
@@ -670,9 +672,10 @@ pub fn buildPrefixWidthsForRange(
     return count;
 }
 
-/// buildPrefixWidthsForRange 的 checkpoint 间隔。越小越接近整前缀测量的
-/// kerning 语义，越大单次测量串越长；64 字素 ≈ 256 字节 CJK / 64 字节 ASCII，
-/// 块内子串短到 measure cache miss 也便宜。
+/// Checkpoint interval for buildPrefixWidthsForRange. Smaller closer to full
+/// prefix measurement kerning semantics, larger single-measurement string
+/// longer; 64 graphemes ≈ 256 bytes CJK / 64 bytes ASCII, chunk-internal
+/// substring short enough measure cache miss also cheap.
 const PREFIX_CHUNK_GRAPHEMES: usize = 64;
 
 pub fn hitTestPrefixBoundaries(
@@ -850,9 +853,10 @@ fn getInteractionPrefixCacheIndex(
         use_monospace,
     );
     if (findInteractionPrefixCacheIndexByHash(key_hash)) |idx| return idx;
-    // 失败 memo：超过 INTERACTION_PREFIX_MAX_CHARS 的 range 构建必然失败，
-    // 但失败前已经烧掉一整表的测量。同 key 的失败只烧一次，命中 memo 直接
-    // 走调用方 fallback。key 含 content_version/spans/字体，内容一变自然重试。
+    // Failure memo: range exceeding INTERACTION_PREFIX_MAX_CHARS build must
+    // fail, but failure already burned full table measure. Same key failure only
+    // burns once, hit memo calls caller fallback. Key includes content_version/
+    // spans/font, auto-retries after content changes.
     for (g_prefix_build_failed_ring) |fk| {
         if (fk == key_hash) return null;
     }
@@ -995,14 +999,15 @@ pub fn floorPrefixBoundaryByWidthCached(
     };
 }
 
-/// 判断是否为 CJK 字符（中日韩统一表意文字范围，可在任意位置断行）。
-/// 实现收敛在 i18n.linebreak.isCJK（WrapMap precise 断点共用同一判定）。
+/// Determine if CJK character (CJK unified ideographs range, breakable at
+/// any position). Implementation converges on i18n.linebreak.isCJK (WrapMap
+/// precise breakpoints share same check).
 pub fn isCJK(codepoint: u21) bool {
     const i18n = @import("i18n");
     return i18n.linebreak.isCJK(codepoint);
 }
 
-/// cluster-aware 是否可断（UAX #14，接 i18n.linebreak）。
+/// Cluster-aware breakability (UAX #14, per i18n.linebreak).
 pub fn isBreakableCluster(prev_cp: u32, next_cp: u32) bool {
     const i18n = @import("i18n");
     const prev_class = i18n.linebreak.classify(prev_cp);
@@ -1010,7 +1015,7 @@ pub fn isBreakableCluster(prev_cp: u32, next_cp: u32) bool {
     return i18n.linebreak.canBreakBetween(prev_class, next_class);
 }
 
-/// 获取 UTF-8 字符的字节长度
+/// Get UTF-8 character byte length.
 pub fn utf8CharLen(first_byte: u8) u3 {
     if (first_byte < 0x80) return 1;
     if (first_byte & 0xE0 == 0xC0) return 2;
@@ -1019,7 +1024,7 @@ pub fn utf8CharLen(first_byte: u8) u3 {
     return 1; // invalid, treat as single byte
 }
 
-/// 解码 UTF-8 code point
+/// Decode UTF-8 code point.
 pub fn decodeUtf8(bytes: []const u8) u21 {
     if (bytes.len == 0) return 0;
     const b0 = bytes[0];
@@ -1036,17 +1041,17 @@ pub fn decodeUtf8(bytes: []const u8) u21 {
     return 0xFFFD; // replacement character
 }
 
-/// 计算文本折行布局
+/// Compute text line-break layout.
 ///
-/// 参数:
-/// - content: UTF-8 文本内容
-/// - available_width: 可用宽度（像素）
-/// - wrap: 折行模式
-/// - max_lines: 最大行数限制（0=无限制）
-/// - font_size: 字体大小
-/// - line_height: 行高倍数
-/// - use_italic: 基础 italic 开关
-/// - spans: TextSpan 数组，有 span 覆盖时用 span.font_weight/italic 测量
+/// Parameters:
+/// - content: UTF-8 text
+/// - available_width: available width (pixels)
+/// - wrap: wrap mode
+/// - max_lines: max line count (0 = unlimited)
+/// - font_size: font size
+/// - line_height: line height multiplier
+/// - use_italic: base italic toggle
+/// - spans: TextSpan array; span-covered segments are measured with span.font_weight/italic
 pub fn computeTextLayout(
     content: []const u8,
     available_width: f32,
@@ -1069,7 +1074,7 @@ pub fn computeTextLayout(
     }
 
     if (wrap == .none) {
-        // 不换行：单行
+        // No wrap: single line.
         layout.line_count = 1;
         layout.lines[0] = .{
             .byte_start = 0,
@@ -1082,12 +1087,12 @@ pub fn computeTextLayout(
     }
 
     if (wrap == .newline_only) {
-        // 只在 \n 断行，不做宽度折行（code fence 等场景）
+        // Break only on \n, no width wrapping (code fence scenarios).
         var line_start: u32 = 0;
         var lc: u16 = 0;
         var mw: f32 = 0;
         while (line_start <= content.len and lc < MAX_LINES) {
-            // 找到行尾（\n 或 EOF）
+            // Find line end (\n or EOF).
             var line_end: u32 = line_start;
             while (line_end < content.len and content[line_end] != '\n') line_end += 1;
 
@@ -1097,7 +1102,7 @@ pub fn computeTextLayout(
             lc += 1;
 
             if (line_end >= content.len) break;
-            line_start = line_end + 1; // 跳过 \n
+            line_start = line_end + 1; // Skip \n.
         }
         if (lc == 0) {
             lc = 1;
@@ -1128,7 +1133,7 @@ pub fn computeTextLayout(
     var max_width: f32 = 0;
 
     while (line_start < content.len and line_count < effective_max) {
-        // 寻找当前行的断行点
+        // Find current line break point.
         const result = findLineBreak(content, line_start, available_width, wrap, font_size, font_weight, use_italic, use_monospace, spans);
         const line_end = line_start + result.byte_len;
         const line_width = result.width;
@@ -1143,7 +1148,7 @@ pub fn computeTextLayout(
 
         line_start = @intCast(line_end);
 
-        // 跳过断行后的空格（word wrap 模式）
+        // Skip space after break (word wrap mode).
         if (wrap == .word) {
             while (line_start < content.len and content[line_start] == ' ') {
                 line_start += 1;
@@ -1177,7 +1182,7 @@ pub fn computeTextLayout(
     layout.max_line_width = max_width;
     layout.total_height = @as(f32, @floatFromInt(line_count)) * font_size * line_height;
 
-    // 缓存 key（ptr+len 快速路径 + hash 防止指针复用时误命中）
+    // Cache key (ptr+len fast path + hash prevent pointer reuse false-hit).
     layout.cached_content_ptr = content.ptr;
     layout.cached_content_len = content.len;
     layout.cached_content_hash = std.hash.Wyhash.hash(0, content);
@@ -1193,7 +1198,8 @@ pub fn computeTextLayout(
     return layout;
 }
 
-/// 内部辅助：span 感知测量（有 spans 时分段，无 spans 时直接测量）
+/// Internal helper: span-aware measure (segment when spans, direct measure
+/// without).
 fn measureSpanAware(content: []const u8, start: u32, end: u32, font_size: f32, base_fw: u16, use_italic: bool, use_monospace: bool, spans: []const TextSpan) f32 {
     if (spans.len == 0) return measureTextWidthByFontKind(content[start..end], font_size, base_fw, use_italic, use_monospace);
     return measureTextWidthWithSpans(content, start, end, font_size, base_fw, use_italic, use_monospace, spans);
@@ -1210,8 +1216,8 @@ const LineBreakResult = struct {
     width: f32,
 };
 
-/// 在给定宽度内找到一行的断行点
-/// content: 完整文本, line_start: 本行在 content 中的起始偏移
+/// Find line break point within given width. content: full text, line_start:
+/// this line's start offset in content.
 fn findLineBreak(
     content: []const u8,
     line_start: u32,
@@ -1225,11 +1231,11 @@ fn findLineBreak(
 ) LineBreakResult {
     const text = content[line_start..];
 
-    // 快速路径：先找到本行的自然结束位置（\n 或 EOF）
+    // Fast path: find this line's natural end (\n or EOF) first.
     var natural_end: u32 = 0;
     while (natural_end < text.len and text[natural_end] != '\n') natural_end += 1;
-    // 整行测量一次：如果整行宽度 <= available_width，直接返回，
-    // 避免逐字符推进（从 O(N) 次 CoreText 调用降到 O(1)）
+    // Measure entire line once: if line width <= available_width, return
+    // directly, avoid per-character advance (drops O(N) CoreText calls to O(1)).
     if (natural_end > 0) {
         const full_width = measureSpanAware(content, line_start, line_start + natural_end, font_size, font_weight, use_italic, use_monospace, spans);
         if (full_width <= available_width) {
@@ -1237,12 +1243,13 @@ fn findLineBreak(
         }
     }
 
-    // 分块增量测量（与 buildPrefixWidthsForRange 同方案）：旧实现每个
-    // grapheme 从 line_start 重测整个前缀 = O(N²) shaped bytes 且每个前缀
-    // 都是唯一字符串（measure cache 恒 miss）。首帧布局对每个折行文本节点
-    // 都要走到这里，md 打开帧 215ms 布局成本的主力。每 64 字素落一个
-    // checkpoint，块内只测 [checkpoint, next)，前缀宽 = 累计 + 块内宽。
-    // checkpoint 边界 kerning 损失：CJK=0，拉丁亚像素级（G3 同款取舍）。
+    // Chunked incremental measurement (same approach as buildPrefixWidthsForRange):
+    // re-measuring the entire prefix from line_start for each grapheme is O(N^2) shaped bytes,
+    // and each prefix is a unique string (measure cache always misses). First-frame layout of
+    // every wrap-text node hits here.
+    // Drop a checkpoint every 64 graphemes, measure only [checkpoint, next); prefix
+    // width = cumulative + chunk width. Kerning lost at checkpoint boundary: CJK=0,
+    // Latin subpixel (same tradeoff as buildPrefixWidthsForRange).
     var pos: u32 = 0;
     var width_so_far: f32 = 0;
     var last_break_pos: u32 = 0;
@@ -1254,7 +1261,7 @@ fn findLineBreak(
     var grapheme_cursor = grapheme.BoundaryCursor.init(text);
 
     while (pos < text.len) {
-        // 遇到换行符，在此结束本行
+        // Hit newline, end this line here.
         if (text[pos] == '\n') {
             return .{ .byte_len = pos, .width = width_so_far };
         }
@@ -1281,25 +1288,25 @@ fn findLineBreak(
         }
 
         if (width_so_far > available_width and pos > 0) {
-            // 超出可用宽度
+            // Exceed available width.
             if (wrap == .word and has_break_point) {
-                // word 模式：回退到上一个断行点
+                // Word mode: backtrack to last break point.
                 return .{ .byte_len = last_break_pos, .width = last_break_width };
             }
-            // char 模式或无断行点：在当前字符前断行
+            // Char mode or no break point: break before current character.
             return .{ .byte_len = pos, .width = previous_width };
         }
 
-        // 记录可能的断行点
+        // Record possible break point.
         if (wrap == .word) {
             const cp = decodeUtf8(text[pos..@min(pos + 4, @as(u32, @intCast(text.len)))]);
             if (isCJK(cp)) {
-                // CJK 字符后可断行
+                // CJK character, breakable after.
                 last_break_pos = @intCast(next_pos);
                 last_break_width = width_so_far;
                 has_break_point = true;
             } else if (next_pos < text.len) {
-                // UAX #14：当前 cp 与下一 cp 之间是否可断
+                // UAX #14: is current cp and next cp breakable between.
                 const next_cp_bytes = text[@intCast(next_pos)..@min(@as(usize, @intCast(next_pos)) + 4, text.len)];
                 const next_cp = decodeUtf8(next_cp_bytes);
                 if (isBreakableCluster(cp, next_cp)) {
@@ -1313,13 +1320,13 @@ fn findLineBreak(
         pos = @intCast(next_pos);
     }
 
-    // 未超出宽度，整段放在一行
+    // Didn't exceed width, whole segment on one line.
     return .{ .byte_len = pos, .width = width_so_far };
 }
 
-/// 检查缓存是否有效
-/// 使用 ptr+len 快速路径 + hash 校验防止指针复用时误命中
-/// 宽度使用 0.5px epsilon 比较，避免浮点精度导致的无效重计算
+/// Check cache validity. Use ptr+len fast path + hash verify prevent
+/// pointer reuse false-hit. Width uses 0.5px epsilon compare, avoid float
+/// precision invalid recomputation.
 pub fn isCacheValid(layout: *const TextLayout, content: []const u8, available_width: f32, font_weight: u16, font_size: f32, use_italic: bool, use_monospace: bool, wrap: TextWrap, max_lines: u16, spans: []const TextSpan) bool {
     if (layout.line_count == 0) return false;
     if (layout.cached_content_len != content.len) return false;
@@ -1332,10 +1339,10 @@ pub fn isCacheValid(layout: *const TextLayout, content: []const u8, available_wi
     if (layout.cached_max_lines != max_lines) return false;
     if (layout.cached_spans_hash != hashSpans(spans)) return false;
 
-    // 快速路径：ptr 相同且 hash 匹配
+    // Fast path: ptr same and hash match.
     if (layout.cached_content_ptr == content.ptr) return true;
 
-    // 慢路径：ptr 不同但内容可能相同（内存重新分配后）
+    // Slow path: ptr different but content possibly same (memory reallocated).
     return layout.cached_content_hash == std.hash.Wyhash.hash(0, content);
 }
 
@@ -1581,8 +1588,9 @@ test "measureTextWidthWithSpans respects base monospace across gaps and spans" {
 }
 
 test "monospace measurement handles CJK fallback correctly" {
-    // 模拟一个真 monospace measure：ASCII 1 byte = font_size，CJK 3 byte = 2 * font_size
-    // 这是 Menlo + PingFang fallback 的典型行为：CJK 占两个 cell。
+    // Simulate true monospace measure: ASCII 1 byte = font_size, CJK 3 bytes
+    // = 2 * font_size. This is typical Menlo + PingFang fallback: CJK takes
+    // two cells.
     const Helpers = struct {
         fn monospaceMeasure(text_ptr: [*]const u8, text_len: usize, font_size: f32, _: u16, _: bool) f32 {
             const slice = text_ptr[0..text_len];
@@ -1594,7 +1602,7 @@ test "monospace measurement handles CJK fallback correctly" {
                     width += font_size;
                     i += 1;
                 } else {
-                    // UTF-8 multibyte，模拟 CJK 占两个 cell
+                    // UTF-8 multibyte, simulate CJK takes two cells.
                     const cp_len = std.unicode.utf8ByteSequenceLength(b) catch 1;
                     width += font_size * 2;
                     i += cp_len;
@@ -1610,24 +1618,24 @@ test "monospace measurement handles CJK fallback correctly" {
     const font_size: f32 = 10;
     const font_weight: u16 = 400;
 
-    // 纯 ASCII，应该 = len * font_size
+    // Pure ASCII, should = len * font_size.
     const ascii_only = measureMonospaceTextWidth("hello", font_size, font_weight, false);
     try std.testing.expectApproxEqAbs(@as(f32, 50), ascii_only, 0.001);
 
-    // 纯 CJK 3 个字符 = 9 字节，应该 = 3 * 2 * font_size = 60
+    // Pure CJK 3 chars = 9 bytes, should = 3 * 2 * font_size = 60.
     const cjk_only = measureMonospaceTextWidth("你好啊", font_size, font_weight, false);
     try std.testing.expectApproxEqAbs(@as(f32, 60), cjk_only, 0.001);
 
-    // 混合：5 ASCII + 2 CJK = 5 * 10 + 2 * 20 = 90
+    // Mixed: 5 ASCII + 2 CJK = 5 * 10 + 2 * 20 = 90.
     const mixed = measureMonospaceTextWidth("hello你好", font_size, font_weight, false);
     try std.testing.expectApproxEqAbs(@as(f32, 90), mixed, 0.001);
 
-    // 至关重要：含 CJK 的字符串绝不能走 ASCII fast path
-    // （fast path 会把 8 字节算成 8 * font_size = 80，比正确值 90 少 10）
+    // Critical: string with CJK must never walk ASCII fast path (fast path
+    // calculates 8 bytes as 8 * font_size = 80, less than correct 90 by 10).
     try std.testing.expect(mixed != 80);
 }
 
-// 矩阵 #8, shape cache > 95%
+// Metrics #8, shape cache > 95%.
 test "measure cache produces > 95% hit rate on repeated text" {
     const Helpers = struct {
         fn fakeMeasure(_: [*]const u8, text_len: usize, font_size: f32, _: u16, _: bool) f32 {
@@ -1640,7 +1648,8 @@ test "measure cache produces > 95% hit rate on repeated text" {
     invalidateMeasureCache();
     resetMeasureCacheStats();
 
-    // 模拟列表场景：100 行同 text 各测一次（cache miss 第 1 次，hit 后 99 次）
+    // Simulate list scenario: 100 rows same text each measure once (cache miss
+    // 1st, hit 99 times after).
     const sample_text = "Hello World";
     var i: u32 = 0;
     while (i < 100) : (i += 1) {
@@ -1748,7 +1757,7 @@ test "inline box prefix widths include leading and trailing padding exactly once
     try std.testing.expectEqual(@as(usize, 0), hitTestPrefixBoundaries(boundaries[0..count], prefix_widths[0..count], count, 1.0));
 }
 
-// v0.5 §5 GlyphRun-B 测试用 mock callback
+// v0.5 §5 GlyphRun-B test uses mock callback.
 const TestShapeContext = struct {
     var call_count: u32 = 0;
     var last_text: []const u8 = "";
@@ -1787,7 +1796,7 @@ test "shape measure callback NaN return falls back to platform measure" {
 
     const w = measureProportional("test", 14.0, 400, false);
     try std.testing.expectEqual(@as(u32, 1), TestShapeContext.call_count);
-    // NaN fallback -> 走 platform measure，结果 > 0 (回退估算 4 * 14 * 0.6 = 33.6)
+    // NaN fallback -> platform measure, result > 0 (fallback estimate 4 * 14 * 0.6 = 33.6).
     try std.testing.expect(w > 0);
     try std.testing.expect(!std.math.isNan(w));
 }
@@ -1804,16 +1813,17 @@ test "monospace measure also routes through shape callback" {
     try std.testing.expectEqual(@as(u32, 1), TestShapeContext.call_count);
 }
 
-// ── 折行结果必须与视图缩放无关 ──────────────────────────────────────────
+// -- Line break result must be scale-independent --
 //
-// 缩放是纯几何变换：整体等比缩小时，"第几个字断行"不该改变。宿主（下游应用白板）
-// 的回归点是：字号有 6px 下限，若换行宽度仍按 scale 继续缩小，两者不再成比例，
-// 文字就会在缩小时被重新换行、甚至溢出框外。
-//
-// 这里锁住的是**公式的不变量**：只要 `可用宽度 / 字号` 恒定，断行点就恒定。
-// 宿主 syncObjectLabel 用同一个 eff 换算宽度与字号，故满足该前提。
+// Scale is pure geometry: a whole proportional shrink must not change which character
+// wraps. Hosts with a 6px font-size floor break if the wrap width still shrinks per scale:
+// the ratio changes and text rewraps on shrink, even overflows. This locks the **formula
+// invariant**: as long as `available width / font_size` is constant, the break point is
+// constant. Host syncObjectLabel uses the same eff to convert width and size, satisfying
+// that precondition.
 
-/// 复刻宿主的"有效几何缩放"：字号触到下限后，布局几何一起停在同一档。
+/// Replicate host's "effective geometry scale": font size hits floor, layout
+/// geometry stops at same tier.
 fn hostEffectiveScale(world_font: f32, scale: f32, min_font_px: f32) f32 {
     if (!(world_font > 0)) return scale;
     return @max(scale, min_font_px / world_font);
@@ -1830,7 +1840,7 @@ test "text wrap is invariant under view scale (downstream zoom regression)" {
         world_w: f32,
         inset_world: f32,
     };
-    // 用户报告的两个真实对象
+    // User-reported two real objects.
     const cases = [_]Case{
         .{ .name = "textbox", .content = "asdfsdfasdfasdf asdfsdf", .world_w = 240, .inset_world = 4 },
         .{ .name = "sticky", .content = "杠杆顶起 asdfsd塔顶", .world_w = 180, .inset_world = 10 },
@@ -1838,7 +1848,7 @@ test "text wrap is invariant under view scale (downstream zoom regression)" {
     const scales = [_]f32{ 1.0, 0.75, 0.5, 0.375, 0.25, 0.12, 0.10, 0.05, 0.02 };
 
     for (cases) |c| {
-        // 基准：scale = 1（世界坐标下的真实断行）
+        // Baseline: scale = 1 (world coordinates true break points).
         const base = computeTextLayout(
             c.content,
             (c.world_w - c.inset_world * 2),
@@ -1871,7 +1881,7 @@ test "text wrap is invariant under view scale (downstream zoom regression)" {
                 &.{},
             );
 
-            // 1) 行数与 scale 无关
+            // 1) Line count independent of scale.
             if (got.line_count != base.line_count) {
                 std.debug.print(
                     "[{s}] scale={d}: line_count {d} != base {d} (font_px={d:.2} avail={d:.2})\n",
@@ -1879,7 +1889,7 @@ test "text wrap is invariant under view scale (downstream zoom regression)" {
                 );
                 return error.LineCountChangedWithScale;
             }
-            // 2) 断行位置（byte 偏移）与 scale 无关
+            // 2) Break point (byte offset) independent of scale.
             var i: u16 = 0;
             while (i < base.line_count) : (i += 1) {
                 if (got.lines[i].byte_start != base.lines[i].byte_start or
@@ -1892,17 +1902,19 @@ test "text wrap is invariant under view scale (downstream zoom regression)" {
                     return error.WrapPositionChangedWithScale;
                 }
             }
-            // 3) 每一档都必须有"可见的文字表达"：完整文字（字号够大）
-            //    或像素块（宿主按 LineInfo.width 画条带）。两者都要求本档
-            //    量出了非空的行几何，不允许某一档什么都没有。
+            // 3) Each tier must have "visible text expression": complete text (font
+            // size large enough) or pixel strip (host draws per LineInfo.width). Both
+            // require this tier measures non-empty line geometry, can't have any tier
+            // with nothing.
             try std.testing.expect(got.line_count > 0);
             try std.testing.expect(got.max_line_width > 0);
         }
     }
 }
 
-// 多窗口 measure cache 共存测试用的假测量回调：按 ctx 返回不同宽度，
-// 以此验证两个 ctx 的条目既能共存、又不会互相串味。
+// Multiwindow measure cache coexistence test fake callback: return
+// different widths per ctx, verify two ctx entries coexist yet don't
+// cross-contaminate.
 const TestCtxMeasure = struct {
     var calls: u32 = 0;
     var ctx_a: u8 = 0;
@@ -1914,7 +1926,7 @@ const TestCtxMeasure = struct {
         _ = weight;
         _ = italic;
         calls += 1;
-        // ctx_a 记 10/字符，ctx_b 记 20/字符
+        // ctx_a records 10/char, ctx_b records 20/char.
         const is_a = ctx == @as(*anyopaque, @ptrCast(&ctx_a));
         return @as(f32, @floatFromInt(len)) * (if (is_a) @as(f32, 10) else @as(f32, 20));
     }
@@ -1928,25 +1940,27 @@ test "切换 measure ctx 不清空缓存，且两个 ctx 的条目互不串味" 
     const b: *anyopaque = @ptrCast(&TestCtxMeasure.ctx_b);
     defer setMeasureCtxFn(null, null);
 
-    // 窗口 A 测一次，miss，真调
+    // Window A measure once, miss, real call.
     setMeasureCtxFn(&TestCtxMeasure.measure, a);
     const wa1 = measureProportional("abcd", 14.0, 400, false);
     try std.testing.expectEqual(@as(u32, 1), TestCtxMeasure.calls);
     try std.testing.expectEqual(@as(f32, 40), wa1);
 
-    // 切到窗口 B 测同一串，必须 miss（不能复用 A 的宽度），真调
+    // Switch to window B measure same string, must miss (can't reuse A's
+    // width), real call.
     setMeasureCtxFn(&TestCtxMeasure.measure, b);
     const wb1 = measureProportional("abcd", 14.0, 400, false);
     try std.testing.expectEqual(@as(u32, 2), TestCtxMeasure.calls);
     try std.testing.expectEqual(@as(f32, 80), wb1);
 
-    // 切回 A, A 的条目必须还在（这正是修复点：此前切 ctx 会清全表）
+    // Switch back A, A's entry must still exist (this is the fix: before
+    // switching ctx would clear whole table).
     setMeasureCtxFn(&TestCtxMeasure.measure, a);
     const wa2 = measureProportional("abcd", 14.0, 400, false);
-    try std.testing.expectEqual(@as(u32, 2), TestCtxMeasure.calls); // 没有新增真调 = 命中
+    try std.testing.expectEqual(@as(u32, 2), TestCtxMeasure.calls); // No new real call = hit.
     try std.testing.expectEqual(@as(f32, 40), wa2);
 
-    // 再切回 B，同样应命中
+    // Switch back to B, should also hit.
     setMeasureCtxFn(&TestCtxMeasure.measure, b);
     const wb2 = measureProportional("abcd", 14.0, 400, false);
     try std.testing.expectEqual(@as(u32, 2), TestCtxMeasure.calls);

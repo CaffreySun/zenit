@@ -1,4 +1,5 @@
-/// 文本渲染：文字属性解析、多行/单行文字渲染、Span 分段、省略号、溢出淡出
+/// Text rendering: text property resolve, multi-line/single-line rendering, Span segmentation,
+/// ellipsis, overflow fade
 const types = @import("../types.zig");
 const node_mod = @import("../node.zig");
 const text_utils = @import("text_utils.zig");
@@ -15,13 +16,13 @@ pub fn resolveNodeLogicalTextProps(node: *Node) ?types.TextProps {
     return t;
 }
 
-/// 计算 overflow_hidden 容器直接子节点的内容边界（相对于容器左上角）
-/// 返回 (min_x, min_y, max_x, max_y)，含 translate/padding 偏移
+/// Compute content bounds of an overflow_hidden container's direct children (relative to container
+/// top-left); returns (min_x, min_y, max_x, max_y), including translate/padding offset.
 ///
-/// 三种滚动机制都覆盖：
-/// - translate_x/y（ScrollArea 等）
-/// - 负 padding（Input 的 padding.left = -scroll_x）
-/// - 子节点超出容器（内容自然溢出）
+/// Covers three scroll mechanisms:
+/// - translate_x/y (ScrollArea etc)
+/// - negative padding (Input padding.left = -scroll_x)
+/// - children exceeding the container (content naturally overflows)
 pub const ContentExtent = struct { min_x: f32, min_y: f32, max_x: f32, max_y: f32 };
 
 pub fn computeContentExtent(node: *Node) ContentExtent {
@@ -32,21 +33,23 @@ pub fn computeContentExtent(node: *Node) ContentExtent {
     var first = true;
     for (node.children.items) |child| {
         if (child.getOpacity() == 0) continue;
-        // 全局 hook 读 rect。
+        // Global hook read rect.
         const cr = child.rectFromWorldOrFallback();
-        // 跳过宽高都为 0 的辅助节点（如 selection_node/cursor_node/preedit_underline_node），
-        // 它们的 rect 默认 {0,0,0,0} 会误判为"内容溢出顶部"
+        // Skip helper nodes with zero width/height
+        // (selection_node/cursor_node/preedit_underline_node); their default {0,0,0,0} rect
+        // misclassifies as "content above top".
         if (cr.w <= 0 and cr.h <= 0) continue;
         const child_pad = child.style.padding;
-        // 内容起点：rect 位置 + translate + padding（负 padding -> 内容前移）
+        // Content start: rect position + translate + padding (negative padding -> content shifted
+        // forward)
         const x1 = cr.x + child.style.translate_x + @min(child_pad.left, @as(f32, 0));
         const y1 = cr.y + child.style.translate_y + @min(child_pad.top, @as(f32, 0));
-        // 内容终点：rect 边界 + translate（rect.w 已含正 padding）
+        // Content end: rect boundary + translate (rect.w already includes positive padding)
         var x2 = cr.x + child.style.translate_x + cr.w - @min(child_pad.right, @as(f32, 0));
         const y2 = cr.y + child.style.translate_y + cr.h - @min(child_pad.bottom, @as(f32, 0));
 
-        // 文本节点在某些布局路径下 rect.w 可能是"可见片段宽度"，不是完整文本宽度。
-        // overflow_fade 需要完整内容边界，因此用文本 intrinsic 宽度兜底。
+        // Text node rect.w may be "visible segment width" under some layout paths, not full text
+        // width. overflow_fade needs complete content bounds, so fall back to text intrinsic width.
         if (child.getText()) |text_props| {
             if (text_props.content.len > 0) {
                 const approx_char_w = @max(@as(f32, 1), text_props.font_size * 0.55);
@@ -71,10 +74,10 @@ pub fn computeContentExtent(node: *Node) ContentExtent {
     return .{ .min_x = min_x, .min_y = min_y, .max_x = max_x, .max_y = max_y };
 }
 
-/// paint pass overflow_fade 已不直接 emit；display_list 端
-/// (mod.zig appendNodeOverflowFade) 写 gradient_rect，lowering 时产出对应
-/// DisplayItem.gradient_rect，视觉等价。本函数保留空壳是因为调用方仍在
-/// paint pass 内调；下刀连调用方一起删。
+/// Paint pass overflow_fade no longer emits directly; display_list side (mod.zig
+/// appendNodeOverflowFade) writes gradient_rect, lowering produces matching
+/// DisplayItem.gradient_rect, visually equivalent. Function stub remains because caller still in
+/// paint pass; remove caller too on next pass.
 pub fn renderOverflowFade(
     cx: *render_context_mod.RenderContext,
     node: *Node,

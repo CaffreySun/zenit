@@ -1,67 +1,71 @@
-/// Tooltip Component
-///
-/// 悬浮提示组件，基于 Popover hover 路径实现，和 DatePicker/Popover
-/// 共享同一套 overlay enter/prewarm 生命周期，避免两套动画逻辑分叉。
+/// Tooltip Component.
+/// Hover tooltip based on Popover hover path; shares overlay enter/prewarm lifecycle
+/// with DatePicker/Popover to avoid forked animation logic.
 const std = @import("std");
 const core = @import("../../core.zig");
+const view = @import("../../view.zig");
 const Cx = core.Cx;
 const Node = core.Node;
 const box = core.box;
 const Color = core.Color;
 const theme = core.theme;
 const Padding = core.Padding;
-const Scope = @import("../../reactive.zig").Scope;
+const reactive = @import("../../reactive.zig");
+const Scope = reactive.Scope;
+const Source = reactive.Source;
+const Model = reactive.Model;
+const Signal = reactive.Signal;
+const Handler = core.Handler;
+const bind_mod = @import("../../bind.zig");
 const popover_mod = @import("../popover/mod.zig");
 
-// ── 样式层在 styles.zig ──
+// -- Styling in styles.zig --
 const styles = @import("styles.zig");
 
-/// Tooltip 位置（复用 Popover 的 12 种 placement）
+/// Tooltip position (reuse 12 Popover placements).
 pub const TooltipPosition = popover_mod.PopoverPosition;
 
-/// Tooltip 属性
+/// Tooltip properties.
 pub const TooltipProps = struct {
-    text: []const u8,
+    /// Hint text (accepts signal / derived value).
+    text: Source([]const u8),
     position: TooltipPosition = .top,
     offset: f32 = 6,
-    /// hover 后到 tooltip 开始显示的延迟（ms）；期间移开指针则不显示。
+    /// Delay after hover until tooltip shows (ms); if pointer leaves, doesn't show.
     open_delay_ms: f32 = 200,
+    /// Toggle: default driven by hover; pass `*Signal(bool)` to programmatically show/hide.
+    open: Model(bool) = .{ .local = false },
+    on_open_change: ?Handler(bool) = null,
     background: ?Color = null,
     text_color: ?Color = null,
     font_size: f32 = 12,
 };
 
-/// 创建 Tooltip
-pub fn Tooltip(props: TooltipProps) TooltipBuilder {
-    return TooltipBuilder{ .props = props };
+/// Create Tooltip: `W.Tooltip(.{ .text = "Copy link" })`.
+pub fn Tooltip(props: anytype) TooltipBuilder {
+    return .{ .props = reactive.props.coerce(TooltipProps, props) };
 }
 
-/// TooltipBuilder.mount 的返回结果
-pub const TooltipResult = struct { wrapper: *Node, trigger: *Node, content: *Node };
+/// TooltipBuilder.mount return value.
+pub const TooltipResult = struct {
+    wrapper: *Node,
+    trigger: *Node,
+    content: *Node,
+    /// Toggle signal (null when split).
+    open: ?*Signal(bool),
+    /// `ui.view` integration (see src/ui/view_parts.zig).
+    pub fn viewParts(self: TooltipResult) core.ViewParts {
+        return .{ .root = self.wrapper, .trigger = self.trigger };
+    }
+};
 
 pub const TooltipBuilder = struct {
     props: TooltipProps,
 
-    pub fn text(self: TooltipBuilder, t: []const u8) TooltipBuilder {
-        var new = self;
-        new.props.text = t;
-        return new;
-    }
-
-    pub fn position(self: TooltipBuilder, p: TooltipPosition) TooltipBuilder {
-        var new = self;
-        new.props.position = p;
-        return new;
-    }
-
-    pub fn offset(self: TooltipBuilder, o: f32) TooltipBuilder {
-        var new = self;
-        new.props.offset = o;
-        return new;
-    }
-
-    /// 保留模式: mount
+    /// Retain mode: mount.
     pub fn mount(self: TooltipBuilder, scope: *Scope, cx: *Cx) !TooltipResult {
+        cx.owner.enterMount();
+        defer cx.owner.exitMount();
         const allocator = cx.allocator;
         const t = cx.tokens;
         const p = self.props;
@@ -71,22 +75,25 @@ pub const TooltipBuilder = struct {
             .trigger = .hover,
             .offset = .{ .static = p.offset },
             .open_delay_ms = p.open_delay_ms,
+            .open = p.open,
+            .on_open_change = p.on_open_change,
             .close_on_outside_click = false,
             .close_on_escape = false,
             .prewarm_hidden_layout = false,
             .tier = .tooltip,
         }).mount(scope, cx);
-        // Popover.mount 返回后，wrapper 子树（含 trigger/content/overlay 层）只被
-        // my_scope 绑定，bindScopeToNode 的 destroy 只解绑不释放，所以调用方
-        // scope.dispose() 不会回收它。下面还有 box / appendChild 会失败，中途失败
-        // 必须由这里释放。与 Popover.mount 内部同型（freeNode 会顺带 dispose 绑定的
-        // 子 scope）。md mount OOM 注入 index 2226 实测：整棵 popover 子树泄漏。
+        // After Popover.mount, wrapper subtree (trigger/content/overlay layers) bound only to
+        // my_scope;
+        // bindScopeToNode destroy unbinds but doesn't release, so caller's scope.dispose() won't
+        // reclaim it.
+        // Below: ensureExt / text mount / binding can fail; mid-fail must release here (freeNode
+        // auto-disposes bound subscope).
         errdefer cx.freeNode(result.wrapper);
 
         result.wrapper.meta.ownership.meta.component_name = "Tooltip";
         result.wrapper.behavior.interaction.a11y = .{};
         result.content.meta.ownership.meta.component_name = "TooltipContent";
-        result.content.behavior.interaction.a11y = .{ .role = .tooltip, .label = p.text };
+        result.content.behavior.interaction.a11y = .{ .role = .tooltip };
         result.content.setHitTestVisible(false);
         result.content.setBackgroundRaw(styles.tooltipContentBackground(p.background, t));
         result.content.style.padding = styles.tooltip_content_padding;
@@ -97,26 +104,32 @@ pub const TooltipBuilder = struct {
         content_ext.hit_shape = .{ .rounded_rect = styles.tooltip_radius };
         content_ext.clip_shape = .{ .rounded_rect = styles.tooltip_radius };
 
-        const label = try box(cx, .{
-            .width = .{ .fit = .{} },
-            .height = .{ .fit = .{} },
-        }, .{});
-        var label_txt = styles.tooltipLabelStyle(p.text_color, p.font_size, t);
-        label_txt.content = p.text;
-        label.setText(label_txt);
-        // label 建好到挂进 content 之间是游离节点，setText 已 dupe 文本，
-        // append 失败时连同它一起漏。
-        errdefer cx.freeNode(label);
-        try result.content.appendChild(allocator, label);
+        // Built and mounted: after that, released with wrapper if binding fails. Hangs under
+        // Popover's scope (content in portal).
+        var label: *Node = undefined;
+        try view.mount(result.scope, cx, result.content, view.capture(&label, view.text(
+            .{ .style = styles.tooltipLabelStyle(p.text_color, p.font_size, t) },
+            p.text.peek(),
+        )));
+        // Tooltip a11y name points to label's text copy; re-point when dynamic text updates.
+        if (result.content.behavior.interaction.a11y) |*a| a.label = label.getText().?.content;
+        if (!p.text.isStatic()) {
+            // Text binding must belong to Popover's scope: content in portal; on Popover unmount,
+            // dispose
+            // its scope first, then freeDetachedNodeAfterScopeDispose content (unbind children,
+            // don't dispose).
+            // If binding hangs elsewhere, unmount still writes freed label.
+            try bind_mod.bindTextLabel(cx, result.scope, p.text, label, result.content);
+        }
 
-        return .{ .wrapper = result.wrapper, .trigger = result.trigger, .content = result.content };
+        return .{ .wrapper = result.wrapper, .trigger = result.trigger, .content = result.content, .open = result.open };
     }
 };
 
-// ========= 测试 =========
+// ========= Tests =========
 
 test "Tooltip: basic" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
@@ -135,7 +148,7 @@ test "Tooltip: basic" {
     const btn = try box(ctx, .{
         .width = .{ .px = 100 },
         .height = .{ .px = 32 },
-        .background = theme.dark.color.accent,
+        .background = theme.dark.tokens.color.accent,
     }, .{
         try core.text(ctx, "Hover me", .{}),
     });
@@ -152,7 +165,7 @@ test "Tooltip: basic" {
 }
 
 test "Tooltip: hover shows" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
@@ -184,7 +197,7 @@ test "Tooltip: hover shows" {
 
 test "Tooltip: first 10 open frames progress from enter state instead of flashing" {
     const render_engine = @import("../../core/render_engine/mod.zig");
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     ctx.setViewport(400, 300);
 
@@ -197,7 +210,8 @@ test "Tooltip: first 10 open frames progress from enter state instead of flashin
     const result = try Tooltip(.{
         .text = "Smooth tooltip",
         .position = .bottom,
-        // 本测试只看 enter 动画曲线，10 帧窗口盖不住默认 200ms display delay
+        // Test only checks enter animation curve; 10-frame window can't hide default 200ms display
+        // delay.
         .open_delay_ms = 0,
     }).mount(scope, ctx);
     try root.appendChild(std.testing.allocator, result.wrapper);
@@ -252,7 +266,40 @@ test "Tooltip: first 10 open frames progress from enter state instead of flashin
     }
 }
 
-// styles.zig 的测试收集，这行是必需的，见 docs/STYLING.md
+// Test collection from styles.zig; this line required (see docs/STYLING.md).
+test "Tooltip: dynamic text updates the label and the tooltip a11y name; unmount stops the binding" {
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
+    const root = try box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
+    ctx.root = root;
+    const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
+    defer scope.dispose();
+
+    const tip = try scope.createText("Copy", .{});
+    const result = try Tooltip(.{ .text = tip }).mount(scope, ctx);
+    try root.appendChild(std.testing.allocator, result.wrapper);
+    const label = result.content.children.items[result.content.children.items.len - 1];
+    try std.testing.expectEqualStrings("Copy", label.getText().?.content);
+    tip.set("Copied!");
+    try std.testing.expectEqualStrings("Copied!", label.getText().?.content);
+    try std.testing.expectEqual(label.getText().?.content.ptr, result.content.behavior.interaction.a11y.?.label.?.ptr);
+
+    // Change text after unmount tooltip: binding released with label's scope; can't write freed
+    // node.
+    ctx.detachChild(root, result.wrapper);
+    ctx.freeNode(result.wrapper);
+    tip.set("after unmount");
+}
+
+test "Tooltip: 动态文本的 mount 在任意分配点失败时不泄漏（sweep）" {
+    try @import("../oom_sweep.zig").sweepMount("tooltip(dynamic)", struct {
+        fn m(scope: *Scope, cx: *Cx) anyerror!?*Node {
+            const tip = try scope.createText("Copy", .{});
+            return (try Tooltip(.{ .text = tip }).mount(scope, cx)).wrapper;
+        }
+    }.m);
+}
+
 test {
     _ = @import("styles.zig");
 }

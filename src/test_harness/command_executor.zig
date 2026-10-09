@@ -1,7 +1,7 @@
-/// command_executor，主线程消费命令并执行 UI 操作
+/// command_executor: main thread consumes commands and executes UI operations.
 ///
-/// 极简版本：支持 IME / click / type / key / query / focused / screenshot。
-/// 命令派发到 cx.handleX() API。
+/// Minimal: supports IME / click / type / key / query / focused / screenshot.
+/// Command dispatch to cx.handleX() API.
 const std = @import("std");
 const ui = @import("ui");
 const Cx = ui.Cx;
@@ -14,6 +14,57 @@ const CommandQueue = command_queue.CommandQueue;
 const TestCommand = command_queue.TestCommand;
 const tree_serializer = @import("tree_serializer.zig");
 const JsonWriter = @import("json_writer.zig").JsonWriter;
+
+// Bounded observation on the UI thread. Keep IDs, never pointers to removable nodes.
+const FrameSample = struct { ms: f64, x: f32, y: f32, w: f32, h: f32, opacity: f32, effective_opacity: f32 };
+var frame_target: ?command_queue.TestIdPayload = null;
+var frame_samples: [128]FrameSample = undefined;
+var frame_count: usize = 0;
+var frame_missing: usize = 0;
+var frame_overflow: bool = false;
+var frame_started: i128 = 0;
+var frame_context: usize = 0;
+var frame_escape_on_enter: bool = false;
+var frame_action_index: ?usize = null;
+var frame_capture_path: ?command_queue.TestIdPayload = null;
+var frame_capture_after_ms: f64 = 0;
+var frame_capture_index: ?usize = null;
+var frame_capture_failed: bool = false;
+
+pub fn observeSubmittedFrame(ctx: *Cx) void {
+    const target = frame_target orelse return;
+    if (getCtx() != ctx or frame_context != @intFromPtr(ctx)) return; // Only the currently bound automation window.
+    const root = ctx.root orelse return;
+    const node = tree_serializer.findByTestId(root, target.getText()) orelse {
+        frame_missing += 1;
+        return;
+    };
+    if (frame_count == frame_samples.len) {
+        frame_overflow = true;
+        return;
+    }
+    const r = node.globalRect();
+    frame_samples[frame_count] = .{ .ms = @as(f64, @floatFromInt(@import("zenit_time").monotonicTimestamp(ctx.io) - frame_started)) / 1e6, .x = r.x, .y = r.y, .w = r.w, .h = r.h, .opacity = node.getOpacity(), .effective_opacity = tree_serializer.effectiveOpacity(node, &ctx.overlay_stack) };
+    frame_count += 1;
+    if (frame_capture_path) |path| {
+        if (frame_samples[frame_count - 1].ms >= frame_capture_after_ms) {
+            // Capture only the already submitted surface. Disarm before callback;
+            // later RPC latency cannot change which frame is returned.
+            frame_capture_path = null;
+            frame_capture_index = frame_count - 1;
+            frame_capture_failed = if (g_capture_screenshot_fn) |capture| !capture(path.getText()) else true;
+        }
+    }
+    const alpha = frame_samples[frame_count - 1].effective_opacity;
+    const prior = if (frame_count > 1) frame_samples[frame_count - 2].effective_opacity else 0;
+    if (frame_escape_on_enter and alpha > 0 and alpha < 0.999 and alpha > prior) {
+        // Record the submitted state before dispatch; the next render observes
+        // the reversal. Disarm first because handlers can remove the target.
+        frame_escape_on_enter = false;
+        frame_action_index = frame_count - 1;
+        ctx.handleKeyDown(.escape, .{});
+    }
+}
 
 // ── Callbacks ──
 
@@ -30,9 +81,9 @@ pub const RecordingState = struct {
     file_size: u64 = 0,
     frame_count: u64 = 0,
     dropped_frames: u64 = 0,
-    path: [command_queue.RecordingStartPayload.PATH_CAP]u8 = [_]u8{0} ** command_queue.RecordingStartPayload.PATH_CAP,
+    path: [command_queue.RecordingStartPayload.PATH_CAP]u8 = @as([command_queue.RecordingStartPayload.PATH_CAP]u8, @splat(0)),
     path_len: u16 = 0,
-    error_message: [256]u8 = [_]u8{0} ** 256,
+    error_message: [256]u8 = @as([256]u8, @splat(0)),
     error_len: u16 = 0,
 
     pub fn setPath(self: *RecordingState, value: []const u8) void {
@@ -59,56 +110,87 @@ pub const RecordingState = struct {
 pub const StartRecordingFn = *const fn (path: []const u8, fps: u32) RecordingState;
 pub const RecordingStateFn = *const fn () RecordingState;
 
-/// FrameStats 快照（renderer.FrameStats 的 harness 子集；不引 zenit_app 避免依赖环）
+/// FrameStats snapshot (harness subset of renderer.FrameStats; don't link zenit_app to avoid
+/// cycles).
 pub const FrameStatsSnapshot = struct {
+    renderer_backend: ?[]const u8 = null,
     retained_hits: u32 = 0,
     retained_misses: u32 = 0,
     retained_partial_repaints: u32 = 0,
-    /// 离屏纹理池 acquire 彻底失败的累计次数。> 0 = 画面上出现过**静默降级**
-    /// （blur 少几级 / 合成层不画），是"多个玻璃岛同步闪烁"的直接指标。
+    /// Cumulative count of complete offscreen texture pool acquire failures. > 0 = silent
+    /// degradation appeared on screen (blur fewer levels / composite layer not drawn),
+    /// direct indicator of 'multiple glass islands flickering together'.
     offscreen_pool_exhausted: u64 = 0,
-    /// text 管线 uniform 槽位溢出到备用 buffer 的累计次数。
+    /// Cumulative count of text pipeline uniform slot overflows into the backup buffer.
     ///
-    /// 与 offscreen_pool_exhausted 同类：是"一帧内 clip 切换次数远超预期"的
-    /// 直接指标。修复后溢出**不再丢字**（会切到溢出 buffer 继续画），但持续
-    /// 增长仍说明 clip 链在逐行重发，该去查 clip 前缀保留，而不是调大上限。
-    /// 修复前这里每 +1 就等于**一整批文字没画出来**（症状：整段中文消失、
-    /// 位置留白、逐帧闪烁），且因为失败时实例不清空，该帧后续文本全部丢失。
+    /// Like offscreen_pool_exhausted: a direct indicator of 'clip switches far exceed expected per
+    /// frame'. Overflow no longer drops text (it switches to the overflow buffer and keeps
+    /// drawing), but continued growth still means the clip chain is re-emitted per line; check
+    /// clip-prefix retention instead of raising the limit. (Historically, each +1 meant an entire
+    /// batch of text was not drawn.)
     text_uniform_overflow: u64 = 0,
     path_draw_calls: u32 = 0,
     frame_count: u64 = 0,
-    /// backdrop 亮度自适应实测值；-1 = 无（未启用/无玻璃）
+    /// Backdrop brightness auto-adapt measured value; -1 = absent (disabled/no glass).
     backdrop_luminance: f32 = -1,
+    /// Render invariant: cumulative repeated fill rect count (same node one frame emits identical
+    /// fill twice), > 0 = cached-replay double-emit bug.
+    paint_duplicate_fills: u64 = 0,
+    /// Last double-emit node id (0 = never).
+    paint_duplicate_node: u32 = 0,
 
-    // ── 计时（微秒）──
-    // 这些字段此前缺失：真 GPU 时间在 renderer.FrameStats 里一直有，但从没投影
-    // 到 harness，导致 GPU 侧性能回退在 e2e 完全不可观测（零门禁）。
+    // -- Timing (microseconds) --
+    // These fields were absent: real GPU time always in renderer.FrameStats, never projected to
+    // harness, GPU perf regressions completely unobservable (zero gate).
     //
-    // **单帧值**（噪声大，仅供 log 参考，不要拿来做断言）：
-    /// 上一帧真 GPU 执行时间（MTLCommandBuffer GPUEndTime-GPUStartTime）
+    // **Per-frame value** (noisy, log reference only, not for assertions):
+    /// Latest completed valid GPU time bracket (Metal command buffer / D3D11 query).
     gpu_execute_us: u64 = 0,
-    /// 上一帧纯 CPU 管线耗时（不含 wait/acquire）
+    /// Previous frame pure CPU pipeline time (excludes wait/acquire).
     cpu_frame_us: u64 = 0,
-    /// 细分：定位回退落在哪一段
+    /// Breakdown: which segment regressed.
     layout_us: u64 = 0,
     render_gen_us: u64 = 0,
     gpu_encode_us: u64 = 0,
-    /// 上一帧总耗时
+    // CPU wall-clock breakdown. null means the backend does not publish it.
+    wait_for_frame_us: ?u64 = null,
+    acquire_texture_us: ?u64 = null,
+    encode_us: ?u64 = null,
+    flush_us: ?u64 = null,
+    glass_count: u32 = 0,
+    glass_us: u64 = 0,
+    texture_creates: u32 = 0,
+    render_passes: u32 = 0,
+    blit_passes: u32 = 0,
+    pass_native_us: u64 = 0,
+    /// Previous frame total time.
     total_frame_us: u64 = 0,
 
-    // **跨帧 P95**（门禁断言用的抗噪统计量；取最近 ~120 个真渲染帧）：
+    // **Cross-frame P95** (gate assertion anti-noise statistic; ~120 recent render frames):
     gpu_p95_us: u64 = 0,
     cpu_p95_us: u64 = 0,
     total_p95_us: u64 = 0,
-    /// P95 的有效样本数，断言前必须检查它足够大，否则是在对空环/少量样本
-    /// 做判断（会得到 0，即"永远绿"的假信号）。
+    /// P95 valid sample count, check sufficient before asserting, else judging empty/sparse window
+    /// (returns 0 = forever green fake signal).
     timing_samples: u32 = 0,
+    /// CPU samples may exist even when GPU timestamps are rejected.
+    cpu_timing_samples: u32 = 0,
+    gpu_timing_disjoint_samples: u64 = 0,
+    gpu_timing_failed_samples: u64 = 0,
+    gpu_timing_pending_queries: u32 = 0,
+    gpu_timing_query_supported: ?bool = null,
 };
 pub const GetFrameStatsFn = *const fn () FrameStatsSnapshot;
-/// 清空跨帧计时采样环（性能门禁进场景后调用）
+/// Clear cross-frame timing sample ring (call after perf gate scenario entry).
 pub const ResetTimingFn = *const fn () void;
 
 var g_get_ctx_fn: ?GetCtxFn = null;
+// Main-thread-only barrier for the process's submitted-surface archive. Once
+// acknowledged, no window may start another frame artifact write.
+var g_frame_capture_finished = false;
+pub fn frameCaptureFinished() bool {
+    return g_frame_capture_finished;
+}
 var g_capture_screenshot_fn: ?CaptureScreenshotFn = null;
 var g_start_recording_fn: ?StartRecordingFn = null;
 var g_recording_status_fn: ?RecordingStateFn = null;
@@ -148,6 +230,89 @@ pub fn setResizeWindowFn(f: ResizeWindowFn) void {
 fn getCtx() ?*Cx {
     if (g_get_ctx_fn) |f| return f();
     return null;
+}
+
+// -- Per-frame tracking --
+// Animation progress assertions ('did transition play') can't poll via RPC: inter-RPC gap depends
+// on machine load, exceeding animation duration samples nothing (Notification animation e2e
+// intermittent fail). track_start records test_id, host each frame after render calls afterFrame
+// logging screen rect, track_stop retrieves all samples at once.
+const TrackSample = struct { t_ms: f64, x: f32, y: f32, w: f32, h: f32, found: bool };
+const max_track_samples = 2048;
+var g_track_id: command_queue.TestIdPayload = .{};
+var g_tracking = false;
+var g_track_t0: i128 = 0;
+var g_track_io: ?std.Io = null;
+var g_track_samples: [max_track_samples]TrackSample = undefined;
+var g_track_count: usize = 0;
+/// Window context at track start; mid-test harness rebind to other window (multi-window rebind)
+/// invalidates samples (not same node), track_stop errors.
+var g_track_ctx: ?*Cx = null;
+var g_track_ctx_changed = false;
+
+/// Host calls after each frame render (runtime mainloop wired): if tracking, record one sample.
+pub fn afterFrame() void {
+    if (!g_tracking) return;
+    recordTrackSample();
+}
+
+fn recordTrackSample() void {
+    if (g_track_count >= max_track_samples) return;
+    const io = g_track_io orelse return;
+    const t_ms = @as(f64, @floatFromInt(@import("zenit_time").monotonicTimestamp(io) - g_track_t0)) / 1e6;
+    var sample: TrackSample = .{ .t_ms = t_ms, .x = 0, .y = 0, .w = 0, .h = 0, .found = false };
+    const current = getCtx();
+    if (current != g_track_ctx) {
+        g_track_ctx_changed = true;
+        return;
+    }
+    if (current) |ctx| if (ctx.root) |root| if (tree_serializer.findByTestId(root, g_track_id.getText())) |node| {
+        const r = node.globalRect();
+        sample = .{ .t_ms = t_ms, .x = r.x, .y = r.y, .w = r.w, .h = r.h, .found = true };
+    };
+    g_track_samples[g_track_count] = sample;
+    g_track_count += 1;
+}
+
+fn publishTrackSamples(queue: *CommandQueue) void {
+    var buf: [max_track_samples * 96 + 64]u8 = undefined;
+    if (g_track_ctx_changed) {
+        queue.result.setError("tracking window changed while tracking (harness rebound to another window)");
+        return;
+    }
+    var w = std.Io.Writer.fixed(&buf);
+    writeTrackSamples(&w, g_track_samples[0..g_track_count], g_track_count >= max_track_samples) catch {
+        // Fail loud, never truncate JSON mid-flight.
+        queue.result.setError("track samples exceed the result buffer");
+        return;
+    };
+    queue.result.setJson(w.buffered());
+}
+
+/// Truncated: sample count hit limit, later frames unrecorded.
+fn writeTrackSamples(w: *std.Io.Writer, samples: []const TrackSample, truncated: bool) std.Io.Writer.Error!void {
+    try w.print("{{\"truncated\":{},\"samples\":[", .{truncated});
+    for (samples, 0..) |s, i| {
+        try w.print("{s}{{\"t\":{d:.1},\"x\":{d:.1},\"y\":{d:.1},\"w\":{d:.1},\"h\":{d:.1},\"found\":{}}}", .{ if (i == 0) "" else ",", s.t_ms, s.x, s.y, s.w, s.h, s.found });
+    }
+    try w.writeAll("]}");
+}
+
+test "逐帧追踪：样本序列化带 truncated 标记，缓冲写不下时返回错误而不是半截 JSON" {
+    const samples = [_]TrackSample{
+        .{ .t_ms = 0, .x = 1, .y = 2, .w = 3, .h = 4, .found = true },
+        .{ .t_ms = 16.7, .x = 0, .y = 0, .w = 0, .h = 0, .found = false },
+    };
+    var buf: [256]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try writeTrackSamples(&w, &samples, false);
+    try std.testing.expectEqualStrings(
+        "{\"truncated\":false,\"samples\":[{\"t\":0.0,\"x\":1.0,\"y\":2.0,\"w\":3.0,\"h\":4.0,\"found\":true},{\"t\":16.7,\"x\":0.0,\"y\":0.0,\"w\":0.0,\"h\":0.0,\"found\":false}]}",
+        w.buffered(),
+    );
+    var small: [40]u8 = undefined;
+    var ws = std.Io.Writer.fixed(&small);
+    try std.testing.expectError(error.WriteFailed, writeTrackSamples(&ws, &samples, true));
 }
 
 fn publishRecordingState(queue: *CommandQueue, state: RecordingState) void {
@@ -192,19 +357,49 @@ fn publishRecordingState(queue: *CommandQueue, state: RecordingState) void {
     }
 }
 
-// ── 主入口 ──
+// -- Main entry --
 
 pub fn drainCommands(queue: *CommandQueue) void {
+    _ = drainCommandsRequestFrame(queue);
+}
+
+/// Returns a one-shot submission request for the commands consumed in this
+/// batch. Polling/query wakes alone must not add another animation drawable.
+pub fn drainCommandsRequestFrame(queue: *CommandQueue) bool {
+    var request_frame = false;
     while (queue.dequeue()) |cmd| {
+        request_frame = commandRequestsFrame(cmd) or request_frame;
         const handled = executeCommand(queue, cmd);
         if (handled) {
             queue.signalDone();
         }
     }
+    return request_frame;
 }
 
-/// 宿主自定义路由处理器：返回写进 `out` 的 JSON 切片，null = 不认这条路由。
-/// **在主线程调用**（drainCommands 内），因此可以安全读写宿主的 UI 状态。
+fn commandRequestsFrame(cmd: TestCommand) bool {
+    return switch (cmd) {
+        // These commands observe state; reset_timing changes measurements only.
+        .health,
+        .query_tree,
+        .query_selector,
+        .get_focused,
+        .screen_pos,
+        .recording_status,
+        .input_state,
+        .frame_stats,
+        .reset_timing,
+        .console_query,
+        => false,
+        // Input, resize, screenshots and recording/control mutations request
+        // one immediate frame. Custom routes have no readonly declaration, so
+        // they conservatively follow the same contract, even with an empty body.
+        else => true,
+    };
+}
+
+/// Host custom route handler: return JSON slice written to `out`, null = unrecognized route.
+/// **Called from main thread** (drainCommands inside), safe to read/write host UI state.
 pub const AppRouteFn = *const fn (path: []const u8, body: []const u8, out: []u8) ?[]const u8;
 var g_app_route_fn: ?AppRouteFn = null;
 
@@ -232,15 +427,18 @@ fn executeCommand(queue: *CommandQueue, cmd_in: TestCommand) bool {
         },
         .click => |c| {
             if (getCtx()) |ctx| {
-                // handleMouseUp 内部已通过 dispatcher 合成 click event (含 click_count)。
-                // 不能再调 handleClick，那会再触发一次 mouse_down/up -> 多算一次 click
-                // -> consecutive_clicks=2 -> textarea/input 误判 double-click -> selectWordAt。
-                // down 与 up 都要带修饰键：宿主判定"加选还是独占选中"通常在
-                // up，只在 down 带会让 ⇧ 多选类 e2e 静默失效。
-                ctx.handleMouseDown(c.x, c.y, c.modifiers());
-                ctx.updateAutomationCursor(c.x, c.y, true);
-                ctx.handleMouseUpEx(c.x, c.y, .left, c.modifiers());
-                ctx.updateAutomationCursor(c.x, c.y, false);
+                // handleMouseUp already synthesizes click event (includes click_count) via
+                // dispatcher. Don't call handleClick again—fires mouse_down/up -> extra click ->
+                // consecutive_clicks=2 -> textarea/input misidentifies double-click ->
+                // selectWordAt. Both down/up must carry modifiers: host judges 'add to selection vs
+                // exclusive' usually on up, only down carrying means shift-multiselect e2e silently
+                // breaks.
+                for (0..c.count) |_| {
+                    ctx.handleMouseDown(c.x, c.y, c.modifiers());
+                    ctx.updateAutomationCursor(c.x, c.y, true);
+                    ctx.handleMouseUpEx(c.x, c.y, .left, c.modifiers());
+                    ctx.updateAutomationCursor(c.x, c.y, false);
+                }
                 queue.result.setJson("{\"ok\":true}");
             } else {
                 queue.result.setError("no context");
@@ -252,10 +450,36 @@ fn executeCommand(queue: *CommandQueue, cmd_in: TestCommand) bool {
             if (getCtx()) |ctx| {
                 if (ctx.root) |root| {
                     if (tree_serializer.findByTestId(root, test_id)) |node| {
-                        scrollNodeIntoView(ctx, node);
-                        const r = node.globalRect();
-                        const x = r.x + r.w * 0.5;
-                        const y = r.y + r.h * 0.5;
+                        const handle = ctx.node_registry.handleFor(node);
+                        scrollNodeIntoView(ctx, node, false);
+                        const visible = ctx.node_registry.resolve(handle, &ctx.perf) orelse {
+                            queue.result.setError("click target removed during scroll");
+                            return true;
+                        };
+                        var r = visible.globalRect();
+                        var x = r.x + r.w * 0.5;
+                        var y = r.y + r.h * 0.5;
+                        if (!clickTargetMatches(ctx, handle, x, y)) {
+                            const current = ctx.node_registry.resolve(handle, &ctx.perf) orelse {
+                                queue.result.setError("click target removed during scene refresh");
+                                return true;
+                            };
+                            // A viewport-visible control may still be covered by
+                            // a portal. Scroll it toward the top, then hit-test
+                            // again before dispatching a real pointer click.
+                            scrollNodeIntoView(ctx, current, true);
+                            const refreshed = ctx.node_registry.resolve(handle, &ctx.perf) orelse {
+                                queue.result.setError("click target removed during scroll");
+                                return true;
+                            };
+                            r = refreshed.globalRect();
+                            x = r.x + r.w * 0.5;
+                            y = r.y + r.h * 0.5;
+                            if (!clickTargetMatches(ctx, handle, x, y)) {
+                                queue.result.setError("click target is occluded or not hit-testable");
+                                return true;
+                            }
+                        }
                         ctx.handleMouseDown(x, y, .{});
                         ctx.updateAutomationCursor(x, y, true);
                         ctx.handleMouseUp(x, y);
@@ -309,9 +533,8 @@ fn executeCommand(queue: *CommandQueue, cmd_in: TestCommand) bool {
         },
         .mouse_up => |c| {
             if (getCtx()) |ctx| {
-                // 必须走 Ex 并带 modifiers：handleMouseUp 会硬塞 `.{}`，
-                // 那样 e2e 永远覆盖不到"抬手时刻修饰键"这条路径
-                // （mouse_up 的 modifiers 恒为 false 的缺陷就是这么漏掉的）。
+                // Must use Ex with modifiers: handleMouseUp hardcodes `.{}`, e2e can never cover
+                // 'modifiers on up' path (mouse_up modifiers=false bug hidden this way).
                 ctx.handleMouseUpEx(c.x, c.y, .left, c.modifiers());
                 ctx.updateAutomationCursor(c.x, c.y, false);
                 queue.result.setJson("{\"ok\":true}");
@@ -344,8 +567,8 @@ fn executeCommand(queue: *CommandQueue, cmd_in: TestCommand) bool {
                     .y = c.y,
                     .dx = c.dx,
                     .dy = c.dy,
-                    .phase = @enumFromInt(c.phase),
-                    .momentum = @enumFromInt(c.momentum),
+                    .phase = @fromBackingInt(@intCast(c.phase)),
+                    .momentum = @fromBackingInt(@intCast(c.momentum)),
                     .modifiers = .{ .shift = c.shift, .ctrl = c.ctrl, .alt = c.alt, .super = c.super },
                 });
                 ctx.updateAutomationCursor(c.x, c.y, null);
@@ -357,7 +580,7 @@ fn executeCommand(queue: *CommandQueue, cmd_in: TestCommand) bool {
         },
         .magnify => |c| {
             if (getCtx()) |ctx| {
-                ctx.handleMagnify(c.magnification, c.x, c.y, @enumFromInt(c.phase));
+                ctx.handleMagnify(c.magnification, c.x, c.y, @fromBackingInt(@intCast(c.phase)));
                 ctx.updateAutomationCursor(c.x, c.y, null);
                 queue.result.setJson("{\"ok\":true}");
             } else {
@@ -412,12 +635,12 @@ fn executeCommand(queue: *CommandQueue, cmd_in: TestCommand) bool {
         },
         .query_tree => {
             if (getCtx()) |ctx| {
-                // 强制刷一帧，让前置 mutating 命令（imeCommit / text_input / key_down）
-                // 走完 before_render hook + layout，rect/world 才是最新。
+                // Force frame flush: preceding mutating commands (imeCommit / text_input /
+                // key_down) complete before_render hook + layout, rect/world up-to-date.
                 _ = ctx.render();
                 if (ctx.root) |root| {
-                    // 直接写进结果缓冲（不经 128KB 栈缓冲再截断拷贝）；装不下显式报错，
-                    // 绝不返回半截 JSON。
+                    // Write direct to result buffer (no 128KB stack intermediate then truncate);
+                    // fail explicit if doesn't fit, never return partial JSON.
                     const json = tree_serializer.serializeTree(root, &ctx.overlay_stack, &queue.result.buf) catch {
                         queue.result.setError("tree too large for RESULT_BUF_SIZE");
                         return true;
@@ -453,8 +676,8 @@ fn executeCommand(queue: *CommandQueue, cmd_in: TestCommand) bool {
         .frame_stats => {
             if (g_get_frame_stats_fn) |f| {
                 const st = f();
-                // 16 个数值字段，512B 已不够（JsonWriter 静默截断会产出
-                // 非法 JSON，客户端只会看到 parse 错而非明确失败）。
+                // 16 numeric fields, 512B insufficient (JsonWriter silent truncate produces invalid
+                // JSON, client sees parse error not clear failure).
                 var buf: [1536]u8 = undefined;
                 var jw = JsonWriter.init(&buf);
                 jw.beginObject();
@@ -472,8 +695,33 @@ fn executeCommand(queue: *CommandQueue, cmd_in: TestCommand) bool {
                 jw.numberValue(@intCast(st.path_draw_calls));
                 jw.key("frame_count");
                 jw.numberValue(@intCast(st.frame_count));
+                jw.key("clock_budget_ms");
+                if (getCtx()) |ctx| (if (ctx.test_clock_budget_ms) |b| jw.floatValue(@floatCast(b)) else jw.nullValue()) else jw.nullValue();
+                jw.key("frame_time_ms");
+                if (getCtx()) |ctx| jw.floatValue(@floatCast(ctx.frame_time_ms)) else jw.nullValue();
+                jw.key("renderer_backend");
+                if (st.renderer_backend) |backend| jw.stringValue(backend) else jw.nullValue();
+                jw.key("window_scale");
+                if (getCtx()) |ctx| jw.floatValue(ctx.window_scale) else jw.nullValue();
+                // new-glass first-frame family probes (Cx.glass_probe_stats, cumulative)
+                jw.key("glass_probe");
+                if (getCtx()) |ctx| {
+                    const ps = ctx.glass_probe_stats;
+                    jw.beginObject();
+                    jw.key("resolved");
+                    jw.numberValue(@intCast(ps.resolved));
+                    jw.key("timed_out");
+                    jw.numberValue(@intCast(ps.timed_out));
+                    jw.key("max_frames");
+                    jw.numberValue(@intCast(ps.max_frames));
+                    jw.endObject();
+                } else jw.nullValue();
                 jw.key("backdrop_luminance_milli");
                 jw.numberValue(@intFromFloat(st.backdrop_luminance * 1000));
+                jw.key("paint_duplicate_fills");
+                jw.numberValue(@intCast(st.paint_duplicate_fills));
+                jw.key("paint_duplicate_node");
+                jw.numberValue(@intCast(st.paint_duplicate_node));
                 jw.key("gpu_execute_us");
                 jw.numberValue(@intCast(st.gpu_execute_us));
                 jw.key("cpu_frame_us");
@@ -484,6 +732,14 @@ fn executeCommand(queue: *CommandQueue, cmd_in: TestCommand) bool {
                 jw.numberValue(@intCast(st.render_gen_us));
                 jw.key("gpu_encode_us");
                 jw.numberValue(@intCast(st.gpu_encode_us));
+                inline for (.{ "wait_for_frame_us", "acquire_texture_us", "encode_us", "flush_us" }) |field| {
+                    jw.key(field);
+                    if (@field(st, field)) |value| jw.numberValue(@intCast(value)) else jw.nullValue();
+                }
+                inline for (.{ "glass_count", "glass_us", "texture_creates", "render_passes", "blit_passes", "pass_native_us" }) |field| {
+                    jw.key(field);
+                    jw.numberValue(@intCast(@field(st, field)));
+                }
                 jw.key("total_frame_us");
                 jw.numberValue(@intCast(st.total_frame_us));
                 jw.key("gpu_p95_us");
@@ -494,11 +750,193 @@ fn executeCommand(queue: *CommandQueue, cmd_in: TestCommand) bool {
                 jw.numberValue(@intCast(st.total_p95_us));
                 jw.key("timing_samples");
                 jw.numberValue(@intCast(st.timing_samples));
+                jw.key("cpu_timing_samples");
+                jw.numberValue(@intCast(@max(st.cpu_timing_samples, st.timing_samples)));
+                jw.key("gpu_timing_disjoint_samples");
+                jw.numberValue(@intCast(st.gpu_timing_disjoint_samples));
+                jw.key("gpu_timing_failed_samples");
+                jw.numberValue(@intCast(st.gpu_timing_failed_samples));
+                jw.key("gpu_timing_pending_queries");
+                jw.numberValue(@intCast(st.gpu_timing_pending_queries));
+                jw.key("gpu_timing_query_supported");
+                if (st.gpu_timing_query_supported) |supported| jw.booleanValue(supported) else jw.nullValue();
                 jw.endObject();
                 queue.result.setJson(jw.getWritten());
             } else {
                 queue.result.setError("frame_stats not supported");
             }
+            return true;
+        },
+        .force_frames => |on| {
+            const ctx = getCtx() orelse {
+                queue.result.setError("no context");
+                return true;
+            };
+            ctx.test_force_frames = on;
+            ctx.needs_redraw = true;
+            queue.result.setJson("{\"ok\":true}");
+            return true;
+        },
+        .animation_clock => |step| {
+            const ctx = getCtx() orelse {
+                queue.result.setError("no context");
+                return true;
+            };
+            ctx.setTestFrameStep(if (step == 0) null else step) catch {
+                queue.result.setError("invalid step_ms");
+                return true;
+            };
+            ctx.test_clock_budget_ms = null;
+            queue.result.setJson("{\"ok\":true}");
+            return true;
+        },
+        .animation_clock_locked => |step| {
+            const ctx = getCtx() orelse {
+                queue.result.setError("no context");
+                return true;
+            };
+            ctx.setTestFrameStep(step) catch {
+                queue.result.setError("invalid step_ms");
+                return true;
+            };
+            ctx.test_clock_budget_ms = 0;
+            queue.result.setJson("{\"ok\":true}");
+            return true;
+        },
+        .clock_advance => |ms| {
+            const ctx = getCtx() orelse {
+                queue.result.setError("no context");
+                return true;
+            };
+            const budget = ctx.test_clock_budget_ms orelse {
+                queue.result.setError("clock is not locked");
+                return true;
+            };
+            ctx.test_clock_budget_ms = budget + ms;
+            ctx.needs_redraw = true;
+            queue.result.setJson("{\"ok\":true}");
+            return true;
+        },
+        .finish_frame_capture => {
+            if (!g_frame_capture_finished) std.log.info("[test_harness] frame capture finished", .{});
+            g_frame_capture_finished = true;
+            queue.result.setJson("{\"ok\":true,\"finished\":true}");
+            return true;
+        },
+        .frames_start => |payload| {
+            // Per-frame observation backend-independent (read layout/opacity after each submit);
+            // macOS runtime and Windows paint both call post-submit. Timed screenshot reads
+            // 'already-submitted' frame only; Windows callback satisfies this, other platforms
+            // drive another frame, can't use here.
+            if (payload.capture_path != null and @import("builtin").os.tag != .windows) {
+                queue.result.setJson("{\"supported\":false}");
+                return true;
+            }
+            const ctx = getCtx() orelse {
+                queue.result.setError("no context");
+                return true;
+            };
+            const root = ctx.root orelse {
+                queue.result.setError("no root");
+                return true;
+            };
+            if (tree_serializer.findByTestId(root, payload.target.getText()) == null) {
+                queue.result.setError("test_id not found");
+                return true;
+            }
+            if (payload.capture_path != null and g_capture_screenshot_fn == null) {
+                queue.result.setError("screenshot not supported");
+                return true;
+            }
+            frame_capture_path = payload.capture_path;
+            frame_capture_after_ms = payload.capture_after_ms;
+            frame_capture_index = null;
+            frame_capture_failed = false;
+            frame_context = @intFromPtr(ctx);
+            frame_target = payload.target;
+            frame_escape_on_enter = payload.escape_on_enter;
+            frame_action_index = null;
+            frame_count = 0;
+            frame_missing = 0;
+            frame_overflow = false;
+            frame_started = @import("zenit_time").monotonicTimestamp(ctx.io);
+            if (payload.click_target) |click_target| {
+                // Observe before dispatching the action on this same UI-thread
+                // turn. Reuse hit testing/scrolling and never send native input.
+                _ = executeCommand(queue, .{ .click_test_id = click_target });
+                if (!queue.result.success) {
+                    frame_target = null;
+                    frame_capture_path = null;
+                    frame_escape_on_enter = false;
+                    return true;
+                }
+            }
+            queue.result.setJson("{\"supported\":true}");
+            return true;
+        },
+        .frames_capture_read => {
+            if (frame_capture_failed) {
+                frame_target = null;
+                queue.result.setError("timed frame capture failed");
+            } else if (frame_capture_index) |index| {
+                frame_target = null;
+                const sample = frame_samples[index];
+                var buf: [512]u8 = undefined;
+                var jw = JsonWriter.init(&buf);
+                jw.beginObject();
+                jw.key("ok");
+                jw.booleanValue(true);
+                jw.key("sample_ms");
+                jw.floatValue(@floatCast(sample.ms));
+                jw.key("requested_ms");
+                jw.floatValue(@floatCast(frame_capture_after_ms));
+                jw.key("frame_index");
+                jw.numberValue(@intCast(index));
+                jw.key("x");
+                jw.floatValue(sample.x);
+                jw.key("effective_opacity");
+                jw.floatValue(sample.effective_opacity);
+                jw.endObject();
+                queue.result.setJson(jw.getWritten());
+            } else queue.result.setJson("{\"ready\":false}");
+            return true;
+        },
+        .frames_read => {
+            frame_target = null;
+            frame_capture_path = null;
+            frame_escape_on_enter = false;
+            var buf: [32768]u8 = undefined;
+            var jw = JsonWriter.init(&buf);
+            jw.beginObject();
+            jw.key("action_frame_index");
+            if (frame_action_index) |index| jw.numberValue(@intCast(index)) else jw.nullValue();
+            jw.key("overflow");
+            jw.booleanValue(frame_overflow);
+            jw.key("missing");
+            jw.numberValue(@intCast(frame_missing));
+            jw.key("frames");
+            jw.beginArray();
+            for (frame_samples[0..frame_count]) |sample| {
+                jw.beginObject();
+                jw.key("ms");
+                jw.floatValue(@floatCast(sample.ms));
+                jw.key("x");
+                jw.floatValue(sample.x);
+                jw.key("y");
+                jw.floatValue(sample.y);
+                jw.key("w");
+                jw.floatValue(sample.w);
+                jw.key("h");
+                jw.floatValue(sample.h);
+                jw.key("opacity");
+                jw.floatValue(sample.opacity);
+                jw.key("effective_opacity");
+                jw.floatValue(sample.effective_opacity);
+                jw.endObject();
+            }
+            jw.endArray();
+            jw.endObject();
+            if (jw.hasOverflowed()) queue.result.setError("frame observation JSON overflow") else queue.result.setJson(jw.getWritten());
             return true;
         },
         .reset_timing => {
@@ -636,7 +1074,7 @@ fn executeCommand(queue: *CommandQueue, cmd_in: TestCommand) bool {
                 _ = ctx.render();
                 if (ctx.root) |root| {
                     if (tree_serializer.findByTestId(root, payload.getText())) |node| {
-                        scrollNodeIntoView(ctx, node);
+                        scrollNodeIntoView(ctx, node, false);
                         const r = node.globalRect();
                         var buf: [256]u8 = undefined;
                         const out = std.fmt.bufPrint(&buf, "{{\"x\":{d:.1},\"y\":{d:.1},\"w\":{d:.1},\"h\":{d:.1}}}", .{ r.x, r.y, r.w, r.h }) catch "{}";
@@ -652,13 +1090,30 @@ fn executeCommand(queue: *CommandQueue, cmd_in: TestCommand) bool {
             }
             return true;
         },
+        .track_start => |payload| {
+            g_track_id = payload;
+            g_tracking = true;
+            g_track_count = 0;
+            g_track_ctx = getCtx();
+            g_track_ctx_changed = false;
+            g_track_io = queue.io;
+            g_track_t0 = @import("zenit_time").monotonicTimestamp(queue.io);
+            recordTrackSample(); // Track start position.
+            queue.result.setJson("{\"ok\":true}");
+            return true;
+        },
+        .track_stop => {
+            g_tracking = false;
+            publishTrackSamples(queue);
+            return true;
+        },
         .input_state => |payload| {
-            // 查 input/textarea 内部 state (event_context 是 *TextInputState)
+            // Query input/textarea internal state (event_context is *TextInputState).
             if (getCtx()) |ctx| {
                 _ = ctx.render();
                 if (ctx.root) |root| {
                     if (tree_serializer.findByTestId(root, payload.getText())) |node| {
-                        // 在 wrapper 子树里找一个挂了 inputEventHandler 的 input_container
+                        // Find input_container with inputEventHandler in wrapper subtree.
                         const ic = findInputContainer(node) orelse {
                             queue.result.setError("no input_container under test_id");
                             return true;
@@ -667,10 +1122,10 @@ fn executeCommand(queue: *CommandQueue, cmd_in: TestCommand) bool {
                             queue.result.setError("no event_context on input_container");
                             return true;
                         };
-                        // textarea / single-line input 是两种不同的 state struct，
-                        // 不能盲 cast 成 TextInputState（内存 layout 差异 -> buffer_len
-                        // 落到指针字段会读出 ~10^18 量级垃圾值 -> @intCast(i64) panic）。
-                        // 按 on_event 函数指针辨别：inputEventHandler vs textareaEventHandler。
+                        // textarea / single-line are different state structs, can't blind-cast to
+                        // TextInputState (layout difference -> buffer_len lands on pointer field ->
+                        // read ~10^18 garbage -> @intCast(i64) panic). Discriminate via on_event
+                        // function ptr: inputEventHandler vs textareaEventHandler.
                         const TextInputState = ui.widgets.input.TextInputState;
                         const TextareaState = ui.widgets.input.TextareaState;
                         const inputEventHandler = ui.widgets.input.inputEventHandler;
@@ -815,6 +1270,8 @@ fn executeCommand(queue: *CommandQueue, cmd_in: TestCommand) bool {
                             jw.stringValue("textarea");
                             jw.key("scroll_x");
                             jw.floatValue(0);
+                            jw.key("scroll_y");
+                            jw.floatValue(if (state.vl_state) |vl| vl.scroll_state.effectiveScrollY() else 0);
                             jw.endObject();
                         } else {
                             queue.result.setError("unknown on_event handler — not input or textarea");
@@ -862,6 +1319,16 @@ fn executeCommand(queue: *CommandQueue, cmd_in: TestCommand) bool {
             }
             return true;
         },
+        .visual_quality => |command| {
+            if (g_visual_quality_fn) |f| {
+                if (f(command)) |quality| {
+                    var buf: [128]u8 = undefined;
+                    const json = std.fmt.bufPrint(&buf, "{{\"quality\":\"{s}\"}}", .{quality}) catch unreachable;
+                    queue.result.setJson(json);
+                } else queue.result.setError("visual quality unsupported");
+            } else queue.result.setError("visual quality unsupported");
+            return true;
+        },
         .recording_start => |payload| {
             if (g_start_recording_fn) |f| {
                 publishRecordingState(queue, f(payload.getPath(), payload.fps));
@@ -889,13 +1356,23 @@ fn executeCommand(queue: *CommandQueue, cmd_in: TestCommand) bool {
     }
 }
 
-/// 在 wrapper 子树中找一个挂了 event_context 的 input_container (tag=.input)
+/// Find input_container with event_context in wrapper subtree (tag=.input).
 fn findInputContainer(node: *Node) ?*Node {
     if (node.tag == .input and node.behavior.events.event_context != null) return node;
     for (node.children.items) |child| {
         if (findInputContainer(child)) |found| return found;
     }
     return null;
+}
+
+fn clickTargetMatches(ctx: *Cx, handle: anytype, x: f32, y: f32) bool {
+    const hit = ctx.hitTest(x, y) orelse return false;
+    const target = ctx.node_registry.resolve(handle, &ctx.perf) orelse return false;
+    var current: ?*Node = hit;
+    while (current) |n| : (current = n.parent) if (n == target) return true;
+    current = target;
+    while (current) |n| : (current = n.parent) if (n == hit) return true;
+    return false;
 }
 
 /// Nearest `.scroll` ancestor of `node` (exclusive), or null if none.
@@ -907,21 +1384,21 @@ fn nearestScrollAncestor(node: *Node) ?*Node {
     return null;
 }
 
-/// Bring `node` into its scroll container's vertical viewport so its
-/// `globalRect()` lands on-screen, used before harness click/screen_pos so a
-/// row scrolled out of view (e.g. a long sidebar nav list) is still clickable.
+/// Bring `node` into its scroll container's vertical viewport so `globalRect()` lands on-screen,
+/// used before harness click/screen_pos so row scrolled out of view (e.g. long sidebar nav) stays
+/// clickable.
 ///
-/// **必须驱动 ScrollArea 的真实 `ScrollState.scroll_y`，不能直接写
-/// `content.style.translate_y`**, `scrollbarBeforeRender` 每帧从
-/// `state.scroll_y` 重算 translate_y（含 maxScroll re-clamp），手写 translate
-/// 会被下一帧 hook 覆盖回去（scroll_y 仍 0），导致命中坐标与视觉脱节、点到错行。
-/// 改法：算出 node 在 content 坐标系里的偏移 -> 设 `state.scroll_y`（clamp 到
-/// [0, content_h-view_h]，max 直接从 rect 算而非 state，state 尺寸命令执行时机
-/// 可能还是旧值）-> 同步 translate_y + state 尺寸 + layout()+render()，之后
-/// globalRect 才反映新偏移。只处理最近的 .scroll 祖先（storybook sidebar 够用）。
-fn scrollNodeIntoView(ctx: *Cx, node: *Node) void {
+/// **Must drive real ScrollArea `ScrollState.scroll_y`, not direct `content.style.translate_y`**:
+/// `scrollbarBeforeRender` re-calculates translate_y each frame from `state.scroll_y` (including
+/// maxScroll re-clamp), hand-written translate overwritten next frame (scroll_y still 0),
+/// position/visual mismatch, wrong row hit. Solution: calculate node offset in content coords ->
+/// set `state.scroll_y` (clamp to [0, content_h-view_h], max from rect not state, state dimensions
+/// at command-exec time may be stale) -> sync translate_y + state dims + layout()+render(), after
+/// that globalRect reflects new offset. Only nearest .scroll ancestor (storybook sidebar
+/// sufficient).
+fn scrollNodeIntoView(ctx: *Cx, node: *Node, align_top: bool) void {
     const scroll = nearestScrollAncestor(node) orelse return;
-    // 通过 container 的 event_context 拿真实 ScrollState（而非猜 children[0]/translate）。
+    // Get real ScrollState via container event_context (not guess children[0]/translate).
     const scroll_area = ui.widgets.scroll_area;
     if (scroll.behavior.events.on_event != scroll_area.scrollEventHandler) return;
     const ev_ctx: *scroll_area.ScrollEventCtx = @ptrCast(@alignCast(scroll.behavior.events.event_context orelse return));
@@ -934,37 +1411,37 @@ fn scrollNodeIntoView(ctx: *Cx, node: *Node) void {
     const content_rect = content.globalRect();
     const view_h = scroll_rect.h - scroll.style.padding.vertical();
 
-    // node 在 content 坐标系里的 top（与当前 scroll 无关：content 与 node 一起平移）。
+    // Node top in content coords (independent of current scroll: content and node shift together).
     const offset_in_content = node_rect.y - content_rect.y;
-    // 当前可见坐标里 node 距容器顶。
+    // Node distance to container top in visible coords.
     const rel_top = node_rect.y - scroll_rect.y;
 
-    // 已完全在视口内则不动。
-    if (rel_top >= margin and rel_top + node_rect.h <= view_h - margin) return;
+    // Fully on-screen: no movement.
+    if (!align_top and rel_top >= margin and rel_top + node_rect.h <= view_h - margin) return;
 
     var target_scroll = state.scroll_y;
-    if (rel_top < margin) {
-        // node 在上方被裁 -> 让它顶部对齐到 margin。
+    if (align_top or rel_top < margin) {
+        // Node clipped above -> align top to margin.
         target_scroll = offset_in_content - margin;
     } else {
-        // node 在下方被裁 -> 让它底部对齐到 view_h - margin。
+        // Node clipped below -> align bottom to view_h - margin.
         target_scroll = offset_in_content + node_rect.h - (view_h - margin);
     }
-    // maxScrollY 直接从 rect 算（不靠 state.content_height/viewport_height，那两个
-    // 由 before_render hook 从 rect 填，命令执行时机可能还是上一帧的旧值甚至 0，
-    // 用旧值会把目标 scroll re-clamp 没了，正是「点到错行/上一目标」的根因）。
+    // maxScrollY from rect direct (not state.content_height/viewport_height, filled by
+    // before_render hook, may be stale or 0 at command-exec time, old value re-clamps target scroll
+    // gone, 'wrong row' root cause).
     const max_y = @max(content_rect.h - view_h, 0);
     if (target_scroll < 0) target_scroll = 0;
     if (target_scroll > max_y) target_scroll = max_y;
 
     if (target_scroll != state.scroll_y) {
         state.scroll_y = target_scroll;
-        // 把 viewport/content 尺寸也同步给 state，避免下一帧 before_render hook 的
-        // maxScroll re-clamp 用旧尺寸又把 scroll_y 拽回去。
+        // Sync viewport/content dims to state too, prevent next-frame before_render re-clamp using
+        // old dims and pulling scroll_y back.
         if (view_h > 0) state.viewport_height = view_h;
         if (!state.external_content_height and content_rect.h > 0) state.content_height = content_rect.h;
-        // 同步施加 translate_y（与 scroll_y 一致 -> before_render hook 不会再纠偏）。
-        // idle 帧 hook 不主动重算 translate_y（只在 bounce/re-clamp 时算），故这里显式写。
+        // Sync translate_y (matches scroll_y -> before_render hook won't re-correct). Idle frame
+        // hook doesn't re-calc translate_y (only on bounce/re-clamp), force it here.
         content.style.translate_y = state.contentTranslateY();
         content.markInteractionDirty();
         content.markRenderDirty();
@@ -986,7 +1463,7 @@ fn parseKeyName(name: []const u8) KeyCode {
     if (std.mem.eql(u8, name, "down")) return .down;
     if (std.mem.eql(u8, name, "home")) return .home;
     if (std.mem.eql(u8, name, "end")) return .end;
-    // 字符键
+    // Character key.
     if (name.len == 1) {
         const c = name[0];
         switch (c) {
@@ -1016,7 +1493,7 @@ fn parseKeyName(name: []const u8) KeyCode {
             'x' => return .x,
             'y' => return .y,
             'z' => return .z,
-            // 符号键：⌘[ / ⌘] 这类层级快捷键要靠它们才测得到。
+            // Symbol key: cmd[ / cmd] class layer shortcuts only reachable via it.
             '[' => return .left_bracket,
             ']' => return .right_bracket,
             '-' => return .minus,
@@ -1055,7 +1532,7 @@ fn getNoTestCtx() ?*Cx {
 }
 
 test "console harness query serializes events and clear mutates the target Cx" {
-    var cx = try Cx.init(std.testing.allocator);
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
     defer cx.deinit();
     cx.console().configure(.{ .terminal_level = null });
     cx.console().writeAt(.err, @src(), "harness-needle", .{});
@@ -1067,7 +1544,7 @@ test "console harness query serializes events and clear mutates the target Cx" {
         setGetCtxFn(getNoTestCtx);
     }
 
-    var queue = CommandQueue{ .allocator = std.testing.allocator };
+    var queue = CommandQueue{ .io = std.testing.io, .allocator = std.testing.allocator };
     try std.testing.expect(executeCommand(&queue, .{ .console_query = .{ .after_seq = 0, .limit = 10 } }));
     const body = queue.result.getData();
     try std.testing.expect(std.mem.indexOf(u8, body, "\"message\":\"harness-needle\"") != null);
@@ -1079,8 +1556,49 @@ test "console harness query serializes events and clear mutates the target Cx" {
     try std.testing.expectEqualStrings("{\"ok\":true}", queue.result.getData());
 }
 
+test "test-id click rejects an occluding sibling without dispatching to it" {
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    cx.setWindowMetrics(200, 200, 1);
+    const root = try ui.box(cx, .{ .width = .{ .px = 200 }, .height = .{ .px = 200 } }, .{});
+    cx.root = root;
+    const target = try ui.box(cx, .{ .position = .absolute, .width = .{ .px = 100 }, .height = .{ .px = 40 } }, .{});
+    const cover = try ui.box(cx, .{ .position = .absolute, .width = .{ .px = 100 }, .height = .{ .px = 40 } }, .{});
+    target.meta.ownership.meta.test_id = "covered-control";
+    var target_clicked = false;
+    var cover_clicked = false;
+    const Callback = struct {
+        fn click(context: *anyopaque) void {
+            const value: *bool = @ptrCast(@alignCast(context));
+            value.* = true;
+        }
+    };
+    target.behavior.events.on_click = Cx.simpleHandler(Callback.click, &target_clicked);
+    cover.behavior.events.on_click = Cx.simpleHandler(Callback.click, &cover_clicked);
+    try root.appendChild(cx.allocator, target);
+    try root.appendChild(cx.allocator, cover);
+    cx.layout();
+    _ = cx.render();
+    g_console_test_ctx = cx;
+    setGetCtxFn(getConsoleTestCtx);
+    defer {
+        g_console_test_ctx = null;
+        setGetCtxFn(getNoTestCtx);
+    }
+    var payload = command_queue.TestIdPayload{ .len = "covered-control".len };
+    @memcpy(payload.buf[0..payload.len], "covered-control");
+    var queue = CommandQueue{ .io = std.testing.io, .allocator = std.testing.allocator };
+    try std.testing.expect(executeCommand(&queue, .{ .click_test_id = payload }));
+    try std.testing.expect(!queue.result.success);
+    try std.testing.expect(!target_clicked and !cover_clicked);
+    cover.setHitTestVisible(false);
+    try std.testing.expect(executeCommand(&queue, .{ .click_test_id = payload }));
+    try std.testing.expect(queue.result.success);
+    try std.testing.expect(target_clicked and !cover_clicked);
+}
+
 test "recording state serialization exposes cadence and artifact metadata" {
-    var queue: CommandQueue = .{};
+    var queue: CommandQueue = .{ .io = std.testing.io };
     var state: RecordingState = .{
         .ok = true,
         .active = true,
@@ -1100,4 +1618,289 @@ test "recording state serialization exposes cadence and artifact metadata" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"frame_count\":73") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"dropped_frames\":2") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"path\":\"/tmp/zenit recording.mp4\"") != null);
+}
+
+test "submitted frame observation is bounded, window-specific and stops on read" {
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    var other = try Cx.init(std.testing.allocator, std.testing.io);
+    defer other.deinit();
+    const root = try ui.box(cx, .{ .width = .{ .px = 100 }, .height = .{ .px = 40 } }, .{});
+    root.meta.ownership.meta.test_id = "observed";
+    cx.root = root;
+    cx.layout();
+    g_console_test_ctx = cx;
+    setGetCtxFn(getConsoleTestCtx);
+    defer {
+        frame_target = null;
+        g_console_test_ctx = null;
+        setGetCtxFn(getNoTestCtx);
+    }
+    var payload = command_queue.TestIdPayload{ .len = "observed".len };
+    @memcpy(payload.buf[0..payload.len], "observed");
+    frame_target = payload;
+    frame_context = @intFromPtr(cx);
+    frame_started = @import("zenit_time").monotonicTimestamp(cx.io);
+    frame_count = 0;
+    frame_missing = 0;
+    frame_overflow = false;
+    observeSubmittedFrame(other);
+    try std.testing.expectEqual(@as(usize, 0), frame_count);
+    for (0..129) |_| observeSubmittedFrame(cx);
+    try std.testing.expectEqual(@as(usize, 128), frame_count);
+    try std.testing.expect(frame_overflow);
+    // Removing the ID must be detected without dereferencing a saved node.
+    root.meta.ownership.meta.test_id = "replaced";
+    observeSubmittedFrame(cx);
+    try std.testing.expectEqual(@as(usize, 1), frame_missing);
+    var queue = CommandQueue{ .io = std.testing.io, .allocator = std.testing.allocator };
+    try std.testing.expect(executeCommand(&queue, .{ .frames_read = {} }));
+    try std.testing.expect(queue.result.success);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, queue.result.getData(), .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 128), parsed.value.object.get("frames").?.array.items.len);
+    try std.testing.expect(parsed.value.object.get("overflow").?.bool);
+    try std.testing.expect(frame_target == null);
+    root.meta.ownership.meta.test_id = "observed";
+    observeSubmittedFrame(cx);
+    try std.testing.expectEqual(@as(usize, 128), frame_count);
+}
+
+test "frame Escape action fires once on visible entrance and ignores other windows" {
+    const cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    const other = try Cx.init(std.testing.allocator, std.testing.io);
+    defer other.deinit();
+    const root = try ui.box(cx, .{ .width = .{ .px = 100 }, .height = .{ .px = 40 } }, .{});
+    root.meta.ownership.meta.test_id = "action-target";
+    cx.root = root;
+    cx.layout();
+    g_console_test_ctx = cx;
+    setGetCtxFn(getConsoleTestCtx);
+    defer {
+        frame_target = null;
+        frame_escape_on_enter = false;
+        frame_action_index = null;
+        g_console_test_ctx = null;
+        setGetCtxFn(getNoTestCtx);
+    }
+    var payload = command_queue.TestIdPayload{ .len = "action-target".len };
+    @memcpy(payload.buf[0..payload.len], "action-target");
+    frame_target = payload;
+    frame_context = @intFromPtr(cx);
+    frame_started = @import("zenit_time").monotonicTimestamp(cx.io);
+    frame_count = 0;
+    frame_missing = 0;
+    frame_overflow = false;
+    frame_escape_on_enter = true;
+    frame_action_index = null;
+    observeSubmittedFrame(other);
+    try std.testing.expectEqual(@as(usize, 0), frame_count);
+    root.setOpacity(0);
+    observeSubmittedFrame(cx);
+    try std.testing.expect(frame_action_index == null);
+    root.setOpacity(0.25);
+    observeSubmittedFrame(cx);
+    try std.testing.expectEqual(@as(?usize, 1), frame_action_index);
+    try std.testing.expect(!frame_escape_on_enter);
+    root.setOpacity(0.5);
+    observeSubmittedFrame(cx);
+    try std.testing.expectEqual(@as(?usize, 1), frame_action_index);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25), frame_samples[1].effective_opacity, 0.001);
+}
+
+test "locked animation clock advances only by granted time" {
+    const cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    cx.root = try ui.box(cx, .{ .width = .{ .px = 50 }, .height = .{ .px = 50 } }, .{});
+    cx.frame_time_ms = 500;
+    g_console_test_ctx = cx;
+    setGetCtxFn(getConsoleTestCtx);
+    defer {
+        g_console_test_ctx = null;
+        setGetCtxFn(getNoTestCtx);
+    }
+    var queue = CommandQueue{
+        .io = std.testing.io,
+    };
+    try std.testing.expect(executeCommand(&queue, .{ .animation_clock_locked = 20 }));
+    // Frozen: active frames render without moving time.
+    for (0..3) |_| {
+        cx.needs_redraw = true;
+        cx.advanceFrameClock();
+    }
+    try std.testing.expectEqual(@as(f64, 500), cx.frame_time_ms);
+    try std.testing.expect(!cx.wantsFrame() or cx.hasPendingSceneWork());
+    // A 50 ms grant: active frames step 20, 20, 10, then stop; frames are wanted
+    // until the grant is spent.
+    try std.testing.expect(executeCommand(&queue, .{ .clock_advance = 50 }));
+    try std.testing.expect(cx.wantsFrame());
+    for ([_]f64{ 520, 540, 550, 550 }) |expected| {
+        cx.needs_redraw = true;
+        cx.advanceFrameClock();
+        try std.testing.expectEqual(expected, cx.frame_time_ms);
+    }
+    // An idle scene spends a grant in one step so timers still come due.
+    try std.testing.expect(executeCommand(&queue, .{ .clock_advance = 2000 }));
+    cx.layout();
+    _ = cx.render();
+    cx.needs_redraw = false;
+    cx.advanceFrameClock();
+    try std.testing.expectEqual(@as(f64, 2550), cx.frame_time_ms);
+    try std.testing.expectEqual(@as(?f64, 0), cx.test_clock_budget_ms);
+    // Realtime clears the lock; advancing an unlocked clock is an error.
+    try std.testing.expect(executeCommand(&queue, .{ .animation_clock = 0 }));
+    try std.testing.expectEqual(@as(?f64, null), cx.test_clock_budget_ms);
+    _ = executeCommand(&queue, .{ .clock_advance = 10 });
+    try std.testing.expect(std.mem.indexOf(u8, queue.result.getData(), "not locked") != null);
+}
+
+test "animation clock fixed steps preserve time and restore realtime" {
+    const cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    cx.root = try ui.box(cx, .{ .width = .{ .px = 50 }, .height = .{ .px = 50 } }, .{});
+    cx.frame_time_ms = 500;
+    g_console_test_ctx = cx;
+    setGetCtxFn(getConsoleTestCtx);
+    defer {
+        g_console_test_ctx = null;
+        setGetCtxFn(getNoTestCtx);
+    }
+    var queue = CommandQueue{
+        .io = std.testing.io,
+    };
+    try std.testing.expect(executeCommand(&queue, .{ .animation_clock = 33 }));
+    try std.testing.expectEqual(@as(?f32, 33), cx.test_frame_step_ms);
+    for (0..3) |_| {
+        cx.needs_redraw = true;
+        cx.advanceFrameClock();
+    }
+    try std.testing.expectEqual(@as(f64, 599), cx.frame_time_ms);
+    try std.testing.expectEqual(@as(f32, 33), cx.frame_dt_ms);
+    // Events stamp the fixed-step frame time, not the wall clock: an animation
+    // started by a click must begin at the time the next steps advance from.
+    try std.Io.sleep(cx.io, .fromNanoseconds(700 * std.time.ns_per_ms), .awake);
+    try std.testing.expectEqual(cx.frame_time_ms, cx.eventTimeMs());
+    cx.layout();
+    _ = cx.render();
+    cx.needs_redraw = false;
+    cx.advanceFrameClock();
+    try std.testing.expectEqual(@as(f64, 599), cx.frame_time_ms);
+    try std.testing.expectError(error.InvalidFrameStep, cx.setTestFrameStep(std.math.nan(f32)));
+    try std.testing.expectError(error.InvalidFrameStep, cx.setTestFrameStep(101));
+    try std.testing.expectError(error.InvalidFrameStep, cx.setTestFrameStep(-1));
+    try std.testing.expectEqual(@as(?f32, 33), cx.test_frame_step_ms);
+    try std.testing.expect(executeCommand(&queue, .{ .animation_clock = 0 }));
+    try std.testing.expectEqual(@as(?f32, null), cx.test_frame_step_ms);
+    cx.needs_redraw = true;
+    cx.advanceFrameClock();
+    try std.testing.expectEqual(@as(f64, 599), cx.frame_time_ms);
+    // Returning to deterministic mode also preserves the logical epoch.
+    try cx.setTestFrameStep(20);
+    cx.needs_redraw = true;
+    cx.advanceFrameClock();
+    try std.testing.expectEqual(@as(f64, 619), cx.frame_time_ms);
+}
+
+test "timed capture reads one submitted frame after deadline and disarms on read" {
+    const Capture = struct {
+        var calls: usize = 0;
+        fn screenshot(path: []const u8) bool {
+            calls += 1;
+            return std.mem.eql(u8, path, "timed.bmp");
+        }
+    };
+    const cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    const root = try ui.box(cx, .{ .width = .{ .px = 100 }, .height = .{ .px = 40 } }, .{});
+    root.meta.ownership.meta.test_id = "sample";
+    cx.root = root;
+    cx.layout();
+    g_console_test_ctx = cx;
+    setGetCtxFn(getConsoleTestCtx);
+    const old_capture = g_capture_screenshot_fn;
+    g_capture_screenshot_fn = Capture.screenshot;
+    defer {
+        frame_target = null;
+        frame_capture_path = null;
+        frame_capture_index = null;
+        frame_capture_failed = false;
+        g_capture_screenshot_fn = old_capture;
+        g_console_test_ctx = null;
+        setGetCtxFn(getNoTestCtx);
+    }
+    var target: command_queue.TestIdPayload = .{ .len = 6 };
+    @memcpy(target.buf[0..6], "sample");
+    var path: command_queue.TestIdPayload = .{ .len = 9 };
+    @memcpy(path.buf[0..9], "timed.bmp");
+    frame_target = target;
+    frame_capture_path = path;
+    frame_context = @intFromPtr(cx);
+    frame_count = 0;
+    frame_capture_after_ms = 120;
+    frame_capture_index = null;
+    frame_capture_failed = false;
+    frame_escape_on_enter = false;
+    Capture.calls = 0;
+    // Future start avoids wall-clock flakiness without sleeping in this unit test.
+    frame_started = @import("zenit_time").monotonicTimestamp(cx.io) + std.time.ns_per_s;
+    observeSubmittedFrame(cx);
+    try std.testing.expectEqual(@as(usize, 0), Capture.calls);
+    frame_started = @import("zenit_time").monotonicTimestamp(cx.io) - 130 * std.time.ns_per_ms;
+    observeSubmittedFrame(cx);
+    try std.testing.expectEqual(@as(usize, 1), Capture.calls);
+    try std.testing.expectEqual(@as(?usize, 1), frame_capture_index);
+    observeSubmittedFrame(cx);
+    try std.testing.expectEqual(@as(usize, 1), Capture.calls);
+    var queue = CommandQueue{ .io = std.testing.io, .allocator = std.testing.allocator };
+    _ = executeCommand(&queue, .{ .frames_capture_read = {} });
+    try std.testing.expect(queue.result.success);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, queue.result.getData(), .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.get("ok").?.bool);
+    try std.testing.expect(frame_target == null);
+    frame_target = target;
+    frame_capture_path = path;
+    _ = executeCommand(&queue, .{ .frames_read = {} });
+    observeSubmittedFrame(cx);
+    try std.testing.expectEqual(@as(usize, 1), Capture.calls);
+    try std.testing.expect(frame_capture_path == null);
+}
+
+pub const VisualQualityCommand = @import("command_queue.zig").VisualQualityCommand;
+pub const VisualQualityFn = *const fn (VisualQualityCommand) ?[]const u8;
+var g_visual_quality_fn: ?VisualQualityFn = null;
+pub fn setVisualQualityFn(f: VisualQualityFn) void {
+    g_visual_quality_fn = f;
+}
+
+test "harness pacing: readonly queries do not force an animation submission" {
+    const commands = [_]TestCommand{
+        .{ .health = {} },         .{ .query_tree = {} },  .{ .query_selector = .{} },
+        .{ .get_focused = {} },    .{ .screen_pos = .{} }, .{ .recording_status = {} },
+        .{ .input_state = .{} },   .{ .frame_stats = {} }, .{ .reset_timing = {} },
+        .{ .console_query = .{} },
+    };
+    for (commands) |cmd| try std.testing.expect(!commandRequestsFrame(cmd));
+}
+
+test "harness pacing: input screenshots and opaque routes require an immediate frame" {
+    try std.testing.expect(commandRequestsFrame(.{ .mouse_down = .{ .x = 1, .y = 2 } }));
+    try std.testing.expect(commandRequestsFrame(.{ .key_down = .{} }));
+    try std.testing.expect(commandRequestsFrame(.{ .resize_window = .{ .width = 640, .height = 480 } }));
+    try std.testing.expect(commandRequestsFrame(.{ .screenshot = .{} }));
+    try std.testing.expect(commandRequestsFrame(.{ .app_route = command_queue.AppRoutePayload.init("/custom", "").? }));
+}
+
+test "harness pacing: a consumed batch requests a frame once without a persistent wake" {
+    var queue: CommandQueue = .{ .io = std.testing.io };
+    queue.commands[0] = .{ .health = {} };
+    queue.tail.store(1, .release);
+    try std.testing.expect(!drainCommandsRequestFrame(&queue));
+    try std.testing.expect(!drainCommandsRequestFrame(&queue));
+
+    queue.commands[1] = .{ .app_route = command_queue.AppRoutePayload.init("/custom", "").? };
+    queue.tail.store(2, .release);
+    try std.testing.expect(drainCommandsRequestFrame(&queue));
+    try std.testing.expect(!drainCommandsRequestFrame(&queue));
 }

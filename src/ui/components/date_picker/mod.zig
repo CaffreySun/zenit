@@ -1,11 +1,11 @@
-/// DatePicker Component
+/// DatePicker component: date picker based on Popover + Calendar.
 ///
-/// 日期选择器，基于 Popover + Calendar
-///
-/// 特性:
-/// - Input 风格触发器
-/// - 弹出 Calendar 选择
-/// - 选中日期回显
+/// Features:
+/// - Input-style trigger
+/// - Popup Calendar selection
+/// - Selected date echo
+/// - Signal-first: `value: Model(?SimpleDate)`; the embedded Calendar uses a split Model onto the
+///   same data source
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const core = @import("../../core.zig");
@@ -18,7 +18,11 @@ const Color = core.Color;
 const Shadow = core.Shadow;
 const Padding = core.Padding;
 const theme = core.theme;
-const Scope = @import("../../reactive.zig").Scope;
+const reactive = @import("../../reactive.zig");
+const Scope = reactive.Scope;
+const Model = reactive.Model;
+const Source = reactive.Source;
+const Handler = core.Handler;
 const events = @import("../../events.zig");
 const popover_mod = @import("../popover/mod.zig");
 const Popover = popover_mod.Popover;
@@ -27,122 +31,174 @@ const CalendarComp = calendar_mod.Calendar;
 const SimpleDate = calendar_mod.SimpleDate;
 const svg_assets = @import("../../svg_assets.zig");
 const styles = @import("styles.zig");
+const view = @import("../../view.zig");
 
-/// DatePicker 属性
+/// DatePicker properties
 pub const DatePickerProps = struct {
     placeholder: []const u8 = "Select date...",
-    selected_date: ?SimpleDate = null,
-    initial_year: u16 = 2025,
-    initial_month: u8 = 1,
+    /// Selected date: `?SimpleDate` uncontrolled init; `*Signal(?SimpleDate)` controlled
+    /// (interaction writes directly); `ui.split` intercepts
+    value: Model(?SimpleDate) = .{ .local = null },
     width: f32 = 220,
-    /// 控件尺寸（与 Button / Input / Select 同一 ControlSize，默认 md）
-    size: theme.ControlSize = .md,
-    disabled: bool = false,
-    on_change: ?core.HandlerRef = null,
+    /// Control size (same ControlSize as Button / Input / Select, default md)
+    size: control_shell.ControlSize = .md,
+    /// Disabled (can pass signal): when disabled, clicking trigger does not toggle
+    disabled: Source(bool) = .{ .value = false },
+    /// Panel toggle
+    open: Model(bool) = .{ .local = false },
+    on_open_change: ?Handler(bool) = null,
+    /// User selected date and landed, call (settled value)
+    on_change: ?Handler(SimpleDate) = null,
     calendar_icon_asset: ?svg_assets.Asset = null,
     prev_icon_asset: ?svg_assets.Asset = null,
     next_icon_asset: ?svg_assets.Asset = null,
     test_id: ?[]const u8 = null,
 };
 
-/// DatePicker 状态
+/// DatePicker runtime (owned by Popover scope). view = f(value, open)
 pub const DatePickerState = struct {
-    selected_date: ?SimpleDate,
+    value: reactive.Bound(?SimpleDate),
+    /// Currently displayed selected date (derived from data source)
+    selected_date: ?SimpleDate = null,
     display_node: *Node,
     trigger_node: *Node,
     leading_icon_node: *Node,
     chevron_node: *Node,
     panel_node: *Node,
-    calendar_state: *calendar_mod.CalendarState,
-    is_open: *Signal(bool),
-    on_change: ?core.HandlerRef,
+    calendar_state: *calendar_mod.CalendarState = undefined,
+    /// Panel toggle data source (shared with Popover)
+    open: Source(bool),
+    /// Request close / toggle: goes through Popover toggle pipeline
+    close: Handler(void),
+    toggle: Handler(void),
+    disabled: Source(bool),
+    shown_open: bool = false,
+    shown_disabled: bool = false,
+    shell_config: control_shell.ControlShellConfig,
+    /// Embedded calendar visible month; reset to null on each open (follow selected date)
+    calendar_month: *Signal(?calendar_mod.YearMonth),
+    on_change: ?Handler(SimpleDate),
     placeholder: []const u8,
     cx: *Cx,
-    /// a11y: trigger value_text（"Mar 22, 2026"）的持久存储，a11y 投影每帧
-    /// 读这个 slice，栈上 buf 会悬垂。
+    /// a11y: trigger value_text ("Mar 22, 2026") persistent storage, a11y projection reads
+    /// this slice every frame, stack buf becomes invalid.
     a11y_value_buf: [24]u8 = undefined,
 
-    /// 程序化设置选中日期（null = 清空，显示 placeholder）。
-    ///
-    /// 此前 DatePickerState 公开但 `updateDisplayLabel` 是私有自由函数,
-    /// 直接写 `state.selected_date` **不会刷新显示文本**，属于
-    /// "暴露了 state 却没有生效的写入口"。
-    ///
-    /// 同步日历面板的选中态；不触发 on_change（程序化设值非用户交互）。
-    pub fn setSelectedDate(self: *DatePickerState, date: ?SimpleDate) void {
-        self.selected_date = date;
-        self.calendar_state.selected_date = date;
+    fn view(self: *DatePickerState, comptime tracked: bool) void {
+        self.selected_date = self.value.readAs(tracked);
+        const open = self.open.read(tracked);
+        // On each open, calendar returns to month of selected date (regardless of opener: click /
+        // external open write)
+        if (open and !self.shown_open) self.calendar_month.set(null);
+        self.shown_open = open;
+        const disabled = self.disabled.read(tracked);
+        if (disabled != self.shown_disabled) self.applyDisabled(disabled);
         updateDisplayLabel(self);
+        syncTriggerVisual(self, open);
     }
 
-    /// 清空选择（`setSelectedDate(null)` 的语义糖）。
-    pub fn clearSelection(self: *DatePickerState) void {
-        self.setSelectedDate(null);
+    /// Dynamic disabled: disable styling by recipe, click entry gated by disabled
+    fn applyDisabled(self: *DatePickerState, disabled: bool) void {
+        self.shown_disabled = disabled;
+        const resolved = self.shell_config.resolvedConditionalStyle(self.cx.tokens).resolve(.{ .is_disabled = disabled });
+        if (resolved.background) |bg| self.trigger_node.setBackground(if (disabled) bg else self.cx.tokens.tokens.color.bg_primary);
+        self.trigger_node.style.cursor = if (disabled) .not_allowed else .pointer;
+        if (self.trigger_node.behavior.interaction.a11y) |*a| a.disabled = disabled;
+        self.trigger_node.markRenderDirty();
+    }
+
+    fn onTriggerClick(ptr: *anyopaque) void {
+        const self: *DatePickerState = @ptrCast(@alignCast(ptr));
+        if (self.disabled.peek()) return;
+        self.toggle.invoke();
+    }
+
+    fn viewEffect(self: *DatePickerState) void {
+        self.view(true);
+    }
+
+    /// Calendar select (via split write back) / Today: propose, close panel, call on_change (final
+    /// step)
+    fn pick(self: *DatePickerState, date: ?SimpleDate) void {
+        const d = date orelse return;
+        const on_change = self.on_change;
+        const landed = self.value.commit(d);
+        self.close.invoke();
+        if (landed) |l| {
+            if (l) |v| {
+                if (on_change) |h| h.call(v);
+            }
+        }
     }
 };
 
-/// DatePicker mount 结果
+/// DatePicker mount result
 pub const DatePickerResult = struct {
     wrapper: *Node,
-    state: *DatePickerState,
+    /// Selected date signal (`ui.split` -> null)
+    value: ?*Signal(?SimpleDate),
+    /// Toggle signal (`ui.split` -> null)
+    open: ?*Signal(bool),
+    /// `ui.view` integration (see src/ui/view_parts.zig).
+    pub fn viewParts(self: DatePickerResult) core.ViewParts {
+        return .{ .root = self.wrapper };
+    }
 };
 
-/// 创建 DatePicker
-pub fn DatePicker(props: DatePickerProps) DatePickerBuilder {
-    return DatePickerBuilder{ .props = props };
+/// Create DatePicker: `W.DatePicker(.{ .value = due })`
+pub fn DatePicker(props: anytype) DatePickerBuilder {
+    return .{ .props = reactive.props.coerce(DatePickerProps, props) };
 }
 
 pub const DatePickerBuilder = struct {
     props: DatePickerProps,
 
-    pub fn placeholder(self: DatePickerBuilder, ph: []const u8) DatePickerBuilder {
-        var new = self;
-        new.props.placeholder = ph;
-        return new;
-    }
-
-    pub fn selectedDate(self: DatePickerBuilder, d: SimpleDate) DatePickerBuilder {
-        var new = self;
-        new.props.selected_date = d;
-        return new;
-    }
-
-    pub fn onChange(self: DatePickerBuilder, handler_ref: core.HandlerRef) DatePickerBuilder {
-        var new = self;
-        new.props.on_change = handler_ref;
-        return new;
-    }
-
-    /// 保留模式: mount
+    /// Preserve mode: mount
     pub fn mount(self: DatePickerBuilder, scope: *Scope, cx: *Cx) !DatePickerResult {
-        const my_scope = try scope.childScope();
+        cx.owner.enterMount();
+        defer cx.owner.exitMount();
         const allocator = cx.allocator;
         const t = cx.tokens;
         const p = self.props;
 
+        const disabled0 = p.disabled.peek();
+        // Static disabled handled by shell; dynamic disabled styled by view via recipe
+        const static_disabled = p.disabled.isStatic() and disabled0;
+
         // Popover
         const pop_result = try Popover(.{
             .position = .bottom_start,
-            .trigger = if (p.disabled) .manual else .click,
+            // Click handled by component itself (gated by disabled), toggle via same pipeline
+            .trigger = .manual,
+            .open = p.open,
+            .on_open_change = p.on_open_change,
             .offset = .{ .static = 4 },
             .flip = false,
             .close_on_outside_click = true,
             .close_on_escape = true,
-            // prewarm 已默认关闭：CA-pure surface 首开帧即完整渲染（逐帧截图验证），无需隐藏副本预热。
-        }).mount(my_scope, cx);
+            // prewarm defaults off: CA-pure surface fully renders on first open frame
+            // (frame-by-frame
+            // screenshot verification), no hidden copy prewarming needed.
+        }).mount(scope, cx);
 
-        // sweep：Popover 返回的 wrapper 由本组件持有，守到 return；下面的子树建好即 adopt
+        // sweep: Popover's wrapper held by this component, guarded to return; subtree built below
+        // adopted immediately. freeNode disposes Popover scope first (all hooks/resources
+        // registered above) then node.
         errdefer cx.freeNode(pop_result.wrapper);
-        // 失败时 hooks（useAnimatedBackground 等）登记在 my_scope 上、destroy 会解引用节点：
-        // 必须先 dispose my_scope（连带 Popover 子 scope 解绑）再 freeNode, errdefer 逆序，后声明的先跑。
-        errdefer my_scope.dispose();
+        // All DatePicker resources, hooks and effects owned by Popover scope: calendar in portal,
+        // freed together on unmount
+        const my_scope = pop_result.scope;
+        const value = try reactive.resolveModel(?SimpleDate, my_scope, p.value);
+        const initial_value = value.readAs(false);
         pop_result.wrapper.meta.ownership.meta.component_name = "DatePicker";
-        pop_result.wrapper.behavior.interaction.a11y = .{ .role = .textbox, .disabled = p.disabled };
+        // wrapper is layout container only: semantics on trigger (combobox). Old role=.textbox
+        // creates phantom "textbox" wrapper in AX tree containing combobox.
+        pop_result.wrapper.behavior.interaction.a11y = .{ .disabled = disabled0 };
         if (p.test_id) |tid| {
             pop_result.wrapper.meta.ownership.meta.test_id = tid;
         }
 
-        // 取消 Popover 默认 chrome，DatePicker 自己提供 panel shell。
+        // Cancel Popover default chrome, DatePicker provides panel shell itself.
         pop_result.content.setBackgroundRaw(Color.TRANSPARENT);
         pop_result.content.style.border = .{};
         pop_result.content.style.padding = Padding.ZERO;
@@ -151,42 +207,74 @@ pub const DatePickerBuilder = struct {
         pop_content_ext.hit_shape = .auto;
         pop_content_ext.clip_shape = .auto;
 
-        // ---- Trigger：与 Input / Select 同一个 ControlShell（.field）----
-        // icon_slot = 日历图标、content_slot = 日期文本（grow，可收缩裁剪）、
-        // append_slot = chevron。几何（padding / 圆角 / 行盒高度 / gap）全部来自
-        // ControlShell recipe，外框高度 = padding_y × 2 + 行高。
-        const has_value = p.selected_date != null;
-        const cm = t.control.get(p.size);
-        const shell = try control_shell.controlShell(.{
+        // ---- Trigger: same ControlShell (.field) as Input / Select ----
+        // icon_slot = calendar icon, content_slot = date text (grow, shrink-clip), append_slot =
+        // chevron.
+        // Geometry (padding / radius / line height / gap) all from ControlShell recipe, shell
+        // height =
+        // padding_y * 2 + line_height.
+        const has_value = initial_value != null;
+        const cm = control_shell.metrics(t, p.size);
+        const shell_config = control_shell.ControlShellConfig{ .size = p.size, .variant = .field };
+        const icon_size: core.Sizing = .{ .px = cm.icon_size };
+        var label_buf: [24]u8 = undefined;
+        const display_text = if (initial_value) |date| formatDisplayDate(date, &label_buf) else p.placeholder;
+        const TriggerParts = struct { leading_icon: *Node = undefined, display: *Node = undefined, chevron: *Node = undefined };
+        var tparts: TriggerParts = .{};
+        var shell: control_shell.ControlShellResult = undefined;
+        try view.mount(my_scope, cx, pop_result.trigger, view.capture(&shell, control_shell.ControlShell(.{
             .size = p.size,
             .variant = .field,
-            .disabled = p.disabled,
+            .disabled = static_disabled,
             .leading_icon = true,
+            .tag = .button,
             .style = .{
                 .width = .{ .px = p.width },
-                .background = t.color.bg_primary,
+                .background = t.tokens.color.bg_primary,
                 .border = .{ .width = 1, .color = styles.triggerBorderColor(false, has_value, t), .radius = cm.radius },
             },
-            // 边框色随 open / has_value 由 syncTriggerVisual 驱动；焦点与悬停不另画。
+            // Border color follows open / has_value driven by syncTriggerVisual; focus and hover
+            // not separately drawn.
             .interactive = false,
             .focus_ring = false,
-            .cursor = if (p.disabled) .not_allowed else .pointer,
-        }, my_scope, cx);
-        var icon_slot_detached = true;
-        errdefer if (icon_slot_detached) cx.freeNode(shell.icon_slot);
-        var append_slot_detached = true;
-        errdefer if (append_slot_detached) cx.freeNode(shell.append_slot);
-        const trigger = try core.adoptChild(cx, allocator, pop_result.trigger, shell.node);
-        trigger.tag = .button;
-        // aria role combobox + haspopup=dialog (Calendar popover)
-        // expanded/value_text 由 syncTriggerA11y 跟随开合与选中日期更新。
+            .cursor = if (disabled0) .not_allowed else .pointer,
+        }, .{
+            .icon = view.capture(&tparts.leading_icon, view.icon(.{
+                .style = .{ .width = icon_size, .height = icon_size },
+                .tint = styles.leadingIconTint(has_value, t),
+            }, p.calendar_icon_asset orelse svg_assets.common.calendar)),
+            // Display text (view.text copies node-owned copy, label_buf only needs to live until
+            // mount)
+            .content = view.capture(&tparts.display, view.text(.{ .style = core.TextStyle{
+                .color = styles.displayTextColor(has_value, t),
+                .font_size = cm.font_size,
+                .line_height = cm.line_height,
+            } }, display_text)),
+            .content_style = core.BoxStyle{
+                .width = .{ .grow = .{ .min = 0 } },
+                .flex_shrink = 1,
+                .overflow_hidden = true,
+                .min_width = 0,
+            },
+            .append = view.capture(&tparts.chevron, view.icon(.{
+                .style = .{ .width = icon_size, .height = icon_size },
+                .tint = styles.chevronTint(false, t),
+            }, svg_assets.common.chevron_down)),
+        })));
+        const trigger = shell.node;
+        // aria role combobox + haspopup=dialog (Calendar popover). expanded/value_text follow
+        // open/selected date updates via syncTriggerA11y.
         trigger.behavior.interaction.a11y = .{
             .role = .combobox,
             .has_popup = .dialog,
             .label = p.placeholder,
-            .disabled = p.disabled,
+            .disabled = disabled0,
             .expanded = false,
         };
+        const leading_icon = tparts.leading_icon;
+        const display_node = tparts.display;
+        const chevron_icon = tparts.chevron;
+        // test_id from p.test_id built at runtime, node holds copy (view's .test_id only borrows)
         if (p.test_id) |tid| {
             var buf: [128]u8 = undefined;
             const trigger_tid = std.fmt.bufPrint(&buf, "{s}.trigger", .{tid}) catch null;
@@ -194,135 +282,32 @@ pub const DatePickerBuilder = struct {
                 trigger.meta.ownership.meta.test_id = allocator.dupe(u8, s) catch null;
                 trigger.frame_state.state_bits.flags.test_id_owned = (trigger.meta.ownership.meta.test_id != null);
             }
-        }
-
-        const content = shell.content_slot;
-        content.style.width = .{ .grow = .{ .min = 0 } };
-        content.style.flex_shrink = 1;
-        content.style.overflow_hidden = true;
-        (try content.style.ensureExtFallible(allocator)).min_width = 0;
-
-        const calendar_icon_asset = p.calendar_icon_asset orelse svg_assets.common.calendar;
-        const leading_icon = try core.adoptChild(cx, allocator, shell.icon_slot, try core.iconTint(cx, calendar_icon_asset, styles.leadingIconTint(has_value, t), .{
-            .width = .{ .px = cm.icon_size },
-            .height = .{ .px = cm.icon_size },
-        }));
-        try trigger.replaceChildOrder(allocator, &.{ shell.icon_slot, content });
-        icon_slot_detached = false;
-
-        // 显示文本
-        var label_buf: [24]u8 = undefined;
-        const display_text = if (p.selected_date) |date| formatDisplayDate(date, &label_buf) else p.placeholder;
-        const display_node = try core.adoptChild(cx, allocator, content, try core.text(cx, display_text, .{}));
-        if (display_node.getText()) |old| {
-            var txt = old;
-            if (has_value) try txt.setContent(cx.allocator, display_text);
-            txt.color = styles.displayTextColor(has_value, t);
-            txt.font_size = cm.font_size;
-            txt.line_height = cm.line_height;
-            display_node.setText(txt);
-        }
-        if (p.test_id) |tid| {
-            var buf: [128]u8 = undefined;
             const label_tid = std.fmt.bufPrint(&buf, "{s}.label", .{tid}) catch null;
             if (label_tid) |s| {
                 display_node.meta.ownership.meta.test_id = allocator.dupe(u8, s) catch null;
                 display_node.frame_state.state_bits.flags.test_id_owned = (display_node.meta.ownership.meta.test_id != null);
             }
         }
-        const chevron_icon = try core.adoptChild(cx, allocator, shell.append_slot, try core.iconTint(cx, svg_assets.common.chevron_down, styles.chevronTint(false, t), .{
-            .width = .{ .px = cm.icon_size },
-            .height = .{ .px = cm.icon_size },
-        }));
-        append_slot_detached = false;
-        _ = try core.adoptChild(cx, allocator, trigger, shell.append_slot);
 
-        // ---- Calendar 内容 ----
-        const select_ctx = try allocator.create(DateSelectCtx);
-        select_ctx.* = .{ .state = undefined, .is_open = pop_result.is_open };
-        try my_scope.adoptResource(@ptrCast(select_ctx), struct {
-            fn cleanup(ptr: *anyopaque, alloc: Allocator) void {
-                alloc.destroy(@as(*DateSelectCtx, @ptrCast(@alignCast(ptr))));
-            }
-        }.cleanup);
-
-        const select_handler = core.HandlerRef{
-            .callback = dateSelectHandler,
-            .context = @ptrCast(select_ctx),
-        };
-
-        // panelStyle 内含 shadow（BoxStyle.shadow -> ensureExt.setShadow，等价旧的手动 ext 写入）
-        // panel 先建并挂进 popover content，日历 / Today 建好即 adopt
-        const panel = try core.adoptChild(cx, allocator, pop_result.content, try box(cx, styles.panelStyle(t), .{}));
-        panel.meta.ownership.meta.component_name = "DatePickerPanel";
-        if (p.test_id) |tid| {
-            var buf: [128]u8 = undefined;
-            const panel_tid = std.fmt.bufPrint(&buf, "{s}.panel", .{tid}) catch null;
-            if (panel_tid) |s| {
-                panel.meta.ownership.meta.test_id = allocator.dupe(u8, s) catch null;
-                panel.frame_state.state_bits.flags.test_id_owned = (panel.meta.ownership.meta.test_id != null);
-            }
-        }
-        const panel_ext = try panel.style.ensureExtFallible(allocator);
-        panel_ext.hit_shape = .{ .rounded_rect = styles.panel_radius };
-        panel_ext.clip_shape = .{ .rounded_rect = styles.panel_radius };
-        // 让 panel 空白区域也拦截指针事件，防止穿透到底层内容
-        panel_ext.hit_roles = .{ .pointer = true, .scroll = false, .inspect = true };
-
-        const cal_result = try CalendarComp(.{
-            .initial_year = p.initial_year,
-            .initial_month = p.initial_month,
-            .selected_date = p.selected_date,
-            .on_select = select_handler,
-            .cell_size = 32,
-            .prev_icon_asset = p.prev_icon_asset orelse svg_assets.common.chevron_left,
-            .next_icon_asset = p.next_icon_asset orelse svg_assets.common.chevron_right,
-        }).mount(my_scope, cx);
-        _ = try core.adoptChild(cx, allocator, panel, cal_result.wrapper);
-
-        // Calendar 内层去 chrome，交给 DatePicker panel shell。
-        cal_result.wrapper.style.width = .{ .grow = .{} };
-        cal_result.wrapper.setBackgroundRaw(Color.TRANSPARENT);
-        cal_result.wrapper.style.border = .{};
-        cal_result.wrapper.style.padding = Padding.ZERO;
-
-        // Today：Button 组件（尺寸跟随 control metrics，hover 走按钮自身动画）；
-        // 覆盖为浅填充、无边框、占满宽度。
-        const today_ctx = try allocator.create(TodayClickCtx);
-        today_ctx.* = .{ .select_ctx = select_ctx };
-        try my_scope.adoptResource(@ptrCast(today_ctx), struct {
-            fn cleanup(ptr: *anyopaque, alloc: Allocator) void {
-                alloc.destroy(@as(*TodayClickCtx, @ptrCast(@alignCast(ptr))));
-            }
-        }.cleanup);
-        const today_btn = try core.adoptChild(cx, allocator, panel, try button_mod.Button(.{
-            .label = "Today",
-            .variant = .secondary,
-            .size = p.size,
-            .style = styles.todayBtnOverride(t),
-            .hover_style = .{ .background = t.color.bg_active },
-            .on_click = core.Cx.simpleHandler(todayClickHandler, @ptrCast(today_ctx)),
-        }).mount(my_scope, cx));
-        if (p.test_id) |tid| {
-            var buf: [128]u8 = undefined;
-            const today_tid = std.fmt.bufPrint(&buf, "{s}.today", .{tid}) catch null;
-            if (today_tid) |s| {
-                today_btn.meta.ownership.meta.test_id = allocator.dupe(u8, s) catch null;
-                today_btn.frame_state.state_bits.flags.test_id_owned = (today_btn.meta.ownership.meta.test_id != null);
-            }
-        }
-
-        // State
-        const state = try allocator.create(DatePickerState);
+        // ---- Runtime (calendar and Today both callback it) ----
+        // Do failables before allocating state: no try between alloc and registration
+        const calendar_month = try my_scope.createSignal(?calendar_mod.YearMonth, null);
+        const state = try my_scope.allocator.create(DatePickerState);
         state.* = .{
-            .selected_date = p.selected_date,
+            .value = value,
+            .selected_date = initial_value,
             .display_node = display_node,
             .trigger_node = trigger,
             .leading_icon_node = leading_icon,
             .chevron_node = chevron_icon,
-            .panel_node = panel,
-            .calendar_state = cal_result.state,
-            .is_open = pop_result.is_open,
+            .panel_node = undefined,
+            .open = pop_result.open_read,
+            .close = pop_result.close,
+            .toggle = pop_result.toggle,
+            .disabled = p.disabled,
+            .shown_disabled = disabled0,
+            .shell_config = shell_config,
+            .calendar_month = calendar_month,
             .on_change = p.on_change,
             .placeholder = p.placeholder,
             .cx = cx,
@@ -332,79 +317,101 @@ pub const DatePickerBuilder = struct {
                 alloc.destroy(@as(*DatePickerState, @ptrCast(@alignCast(ptr))));
             }
         }.cleanup);
+        // Static disabled completely lazy (no click handler); dynamic disabled still hooks,
+        // entry gated by disabled
+        if (!static_disabled) pop_result.trigger.behavior.events.on_click = core.Cx.simpleHandler(DatePickerState.onTriggerClick, state);
+        pop_result.wrapper.addDebugState(@ptrCast(state));
 
-        select_ctx.state = state;
-        select_ctx.cal_state = cal_result.state;
-
-        // 初始选中日期也要进 a11y value（AT 打开界面第一次读就要有值）
-        syncTriggerA11y(state, false);
-
-        const open_ctx = try allocator.create(OpenEffectCtx);
-        open_ctx.* = .{ .state = state, .cx = cx };
-        try my_scope.adoptResource(@ptrCast(open_ctx), struct {
-            fn cleanup(ptr: *anyopaque, alloc: Allocator) void {
-                alloc.destroy(@as(*OpenEffectCtx, @ptrCast(@alignCast(ptr))));
+        // panel hung into popover content: calendar + Today. panelStyle has shadow
+        // (BoxStyle.shadow -> ensureExt.setShadow, equivalent old manual ext write)
+        const PanelParts = struct { panel: *Node = undefined, calendar: calendar_mod.CalendarResult = undefined, today: *Node = undefined };
+        var parts: PanelParts = .{};
+        try view.mount(my_scope, cx, pop_result.content, view.capture(&parts.panel, view.box(.{
+            .style = .{
+                styles.panelStyle(t),
+                core.BoxStyle{
+                    .hit_shape = .{ .rounded_rect = styles.panel_radius },
+                    .clip_shape = .{ .rounded_rect = styles.panel_radius },
+                    // Let panel blank area intercept pointer events, prevent pierce to underlying
+                    // content
+                    .hit_roles = .{ .pointer = true, .scroll = false, .inspect = true },
+                },
+            },
+        }, .{
+            // Calendar and DatePicker share same data source: read DatePicker value, write back
+            // via pick proposal and close panel. Calendar inner no chrome, DatePicker panel shell
+            // wraps it.
+            view.attrs(.{ .style = core.BoxStyle{
+                .width = .{ .grow = .{} },
+                .background = Color.TRANSPARENT,
+                .border = .{},
+                .padding = Padding.ZERO,
+            } }, view.capture(&parts.calendar, CalendarComp(.{
+                .value = Model(?SimpleDate){ .split = .{
+                    .read = value.read,
+                    .write = reactive.Callback(?SimpleDate).from(DatePickerState, state, DatePickerState.pick),
+                } },
+                .month = state.calendar_month,
+                .cell_size = 32,
+                .prev_icon_asset = p.prev_icon_asset orelse svg_assets.common.chevron_left,
+                .next_icon_asset = p.next_icon_asset orelse svg_assets.common.chevron_right,
+            }))),
+            // Today: Button component (size follows control metrics, hover via button animation);
+            // override to shallow fill, no border, full width.
+            view.capture(&parts.today, button_mod.Button(.{
+                .label = "Today",
+                .variant = .secondary,
+                .size = p.size,
+                .base_style = styles.todayBtnOverride(t),
+                .hover_style = .{ .background = t.tokens.color.bg_active },
+                .on_click = core.Cx.simpleHandler(todayClickHandler, @ptrCast(state)),
+            })),
+        })));
+        const panel = parts.panel;
+        panel.meta.ownership.meta.component_name = "DatePickerPanel";
+        if (p.test_id) |tid| {
+            var buf: [128]u8 = undefined;
+            const panel_tid = std.fmt.bufPrint(&buf, "{s}.panel", .{tid}) catch null;
+            if (panel_tid) |s| {
+                panel.meta.ownership.meta.test_id = allocator.dupe(u8, s) catch null;
+                panel.frame_state.state_bits.flags.test_id_owned = (panel.meta.ownership.meta.test_id != null);
             }
-        }.cleanup);
-        try my_scope.createEffect(.{
-            .is_open = pop_result.is_open,
-            .open_ctx = open_ctx,
-        }, struct {
-            fn update(c: anytype) void {
-                const oc: *OpenEffectCtx = c.open_ctx;
-                syncTriggerVisual(oc.state, c.is_open.get());
+        }
+        state.panel_node = panel;
+        state.calendar_state = @ptrCast(@alignCast(parts.calendar.wrapper.meta.ownership.debug_slots.state_ptrs[0].?));
+        const today_btn = parts.today;
+        if (p.test_id) |tid| {
+            var buf: [128]u8 = undefined;
+            const today_tid = std.fmt.bufPrint(&buf, "{s}.today", .{tid}) catch null;
+            if (today_tid) |s| {
+                today_btn.meta.ownership.meta.test_id = allocator.dupe(u8, s) catch null;
+                today_btn.frame_state.state_bits.flags.test_id_owned = (today_btn.meta.ownership.meta.test_id != null);
             }
-        }.update);
+        }
 
-        return .{ .wrapper = pop_result.wrapper, .state = state };
+        // view = f(value, open): display text, border / icon tint, a11y
+        state.view(false);
+        try my_scope.createEffect(state, DatePickerState.viewEffect);
+
+        return .{ .wrapper = pop_result.wrapper, .value = value.asSignal(), .open = pop_result.open };
     }
 };
 
-// ========== 内部辅助 ==========
+// ========== Internal helpers ==========
 
 const Signal = core.Signal;
 
-const DateSelectCtx = struct {
-    state: *DatePickerState,
-    is_open: *Signal(bool),
-    cal_state: *calendar_mod.CalendarState = undefined,
-};
-
-const TodayClickCtx = struct {
-    select_ctx: *DateSelectCtx,
-};
-
-const OpenEffectCtx = struct {
-    state: *DatePickerState,
-    cx: *Cx,
-};
-
-fn dateSelectHandler(ctx_ptr: ?*anyopaque) void {
-    if (ctx_ptr) |ctx| {
-        const dc: *DateSelectCtx = @ptrCast(@alignCast(ctx));
-        if (dc.cal_state.selected_date) |date| {
-            dc.state.selected_date = date;
-            updateDisplayLabel(dc.state);
-
-            // 关闭弹出
-            dc.is_open.set(false);
-
-            if (dc.state.on_change) |handler| handler.invoke();
-        }
-    }
-}
-
 fn todayClickHandler(ctx_ptr: *anyopaque) void {
-    const tc: *TodayClickCtx = @ptrCast(@alignCast(ctx_ptr));
+    const st: *DatePickerState = @ptrCast(@alignCast(ctx_ptr));
     const today = calendar_mod.currentLocalDate() orelse return;
-    tc.select_ctx.cal_state.selectDate(today);
-    tc.select_ctx.is_open.set(false);
+    st.calendar_month.set(null); // calendar follows selected date, jumps to today's month
+    st.pick(today);
 }
 
 fn updateDisplayLabel(state: *DatePickerState) void {
     var buf: [24]u8 = undefined;
     const label = if (state.selected_date) |date| formatDisplayDate(date, &buf) else state.placeholder;
-    // 分配式写入：inline 缓冲只有 16 字节，调用方给的 placeholder 会被截断。
+    // Allocating write: inline buffer only 16 bytes, caller's placeholder truncated.
     state.display_node.setTextContent(state.cx.allocator, label) catch {};
     if (state.display_node.getText()) |old| {
         var txt = old;
@@ -412,11 +419,11 @@ fn updateDisplayLabel(state: *DatePickerState) void {
         state.display_node.setText(txt);
     }
     state.display_node.markRenderDirty();
-    syncTriggerA11y(state, state.is_open.peek());
 }
 
-/// a11y 状态跟随交互（form_field 模式）：expanded 跟开合、value_text 跟选中
-/// 日期；撤回选择时 value 也必须撤回，否则 AT 播报的是已清空的旧值。
+/// a11y state follows interaction (form_field mode): expanded follows open, value_text
+/// follows selected date. When the selection is retracted, value_text must also be retracted;
+/// otherwise AT announces the old value that has already been cleared.
 fn syncTriggerA11y(state: *DatePickerState, open: bool) void {
     if (state.trigger_node.behavior.interaction.a11y) |*a| {
         a.expanded = open;
@@ -462,10 +469,14 @@ fn formatDisplayDate(date: SimpleDate, buf: []u8) []const u8 {
     return std.fmt.bufPrint(buf, "{s} {d}, {d}", .{ monthAbbrev(date.month), date.day, date.year }) catch "Invalid date";
 }
 
-// ========== 测试 ==========
+// ========== Tests ==========
+
+fn stateOf(r: DatePickerResult) *DatePickerState {
+    return @ptrCast(@alignCast(r.wrapper.meta.ownership.debug_slots.state_ptrs[0].?));
+}
 
 test "DatePicker: basic structure" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 500 }, .height = .{ .px = 500 } }, .{});
@@ -477,8 +488,8 @@ test "DatePicker: basic structure" {
     const result = try DatePicker(.{}).mount(scope, ctx);
 
     try root.appendChild(std.testing.allocator, result.wrapper);
-    try std.testing.expect(result.state.selected_date == null);
-    if (result.state.display_node.getText()) |txt| {
+    try std.testing.expect(stateOf(result).selected_date == null);
+    if (stateOf(result).display_node.getText()) |txt| {
         try std.testing.expectEqualStrings("Select date...", txt.content);
     } else {
         try std.testing.expect(false);
@@ -486,7 +497,7 @@ test "DatePicker: basic structure" {
 }
 
 test "DatePicker: with initial date" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 500 }, .height = .{ .px = 500 } }, .{});
@@ -496,13 +507,13 @@ test "DatePicker: with initial date" {
     defer scope.dispose();
 
     const result = try DatePicker(.{
-        .selected_date = .{ .year = 2025, .month = 6, .day = 15 },
+        .value = SimpleDate{ .year = 2025, .month = 6, .day = 15 },
     }).mount(scope, ctx);
 
     try root.appendChild(std.testing.allocator, result.wrapper);
-    try std.testing.expect(result.state.selected_date != null);
-    try std.testing.expectEqual(@as(u8, 15), result.state.selected_date.?.day);
-    if (result.state.display_node.getText()) |txt| {
+    try std.testing.expect(stateOf(result).selected_date != null);
+    try std.testing.expectEqual(@as(u8, 15), stateOf(result).selected_date.?.day);
+    if (stateOf(result).display_node.getText()) |txt| {
         try std.testing.expectEqualStrings("Jun 15, 2025", txt.content);
     } else {
         try std.testing.expect(false);
@@ -510,7 +521,7 @@ test "DatePicker: with initial date" {
 }
 
 test "DatePicker: selecting date updates label and closes popover" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 500 }, .height = .{ .px = 500 } }, .{});
@@ -522,12 +533,12 @@ test "DatePicker: selecting date updates label and closes popover" {
     const result = try DatePicker(.{}).mount(scope, ctx);
 
     try root.appendChild(std.testing.allocator, result.wrapper);
-    result.state.is_open.set(true);
-    result.state.calendar_state.selectDate(.{ .year = 2026, .month = 3, .day = 22 });
+    result.open.?.set(true);
+    stateOf(result).calendar_state.selectDate(.{ .year = 2026, .month = 3, .day = 22 });
 
-    try std.testing.expect(!result.state.is_open.peek());
-    try std.testing.expectEqual(@as(u16, 2026), result.state.selected_date.?.year);
-    if (result.state.display_node.getText()) |txt| {
+    try std.testing.expect(!result.open.?.peek());
+    try std.testing.expectEqual(@as(u16, 2026), stateOf(result).selected_date.?.year);
+    if (stateOf(result).display_node.getText()) |txt| {
         try std.testing.expectEqualStrings("Mar 22, 2026", txt.content);
     } else {
         try std.testing.expect(false);
@@ -535,11 +546,12 @@ test "DatePicker: selecting date updates label and closes popover" {
 }
 
 test "DatePicker: open render emits full calendar day texts after prewarm settles" {
-    // History: 此测试原名 "first open render already emits..."，期望 set(is_open=true)
-    // 后单帧就能看到 calendar texts。实测 popover prewarm 路径需要多帧才让 panel
-    // 内容进入 render command stream（可能 prewarm + animation initial 各占一帧）。
-    // 改成跑多帧直到 settle。这反映真实行为，用户视觉上"open"也是经过 transition。
-    var ctx = try Cx.init(std.testing.allocator);
+    // History: test was "first open render already emits...", expected set(is_open=true) then
+    // calendar texts visible next frame. Measured: popover prewarm path takes multiple frames for
+    // panel content to enter render command stream (prewarm + animation init each frame). Changed
+    // to run frames until settle. Reflects real behavior, user-perceived "open" is through
+    // transition.
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     ctx.setViewport(640, 480);
 
@@ -552,18 +564,17 @@ test "DatePicker: open render emits full calendar day texts after prewarm settle
     const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
     defer scope.dispose();
 
-    const result = try DatePicker(.{
-        .initial_year = 2026,
-        .initial_month = 3,
-    }).mount(scope, ctx);
+    const result = try DatePicker(.{}).mount(scope, ctx);
+    stateOf(result).calendar_month.set(calendar_mod.YearMonth{ .year = 2026, .month = 3 });
 
     try root.appendChild(std.testing.allocator, result.wrapper);
     ctx.layout();
     _ = ctx.render();
 
-    result.state.is_open.set(true);
+    result.open.?.set(true);
 
-    // 跑多帧让 popover prewarm + 入场动画 settle。当前实测 2 帧足够。
+    // Run multiple frames for popover prewarm + entrance settle. Currently 2 frames measured
+    // sufficient.
     var i: usize = 0;
     var day_text_count: usize = 0;
     var commands: []const @import("../../core.zig").paint_table.DisplayItem = &.{};
@@ -590,8 +601,8 @@ test "DatePicker: open render emits full calendar day texts after prewarm settle
 }
 
 test "DatePicker: open render emits day texts in panel after prewarm settles" {
-    // History: 同样需要多帧 settle 才能进入 panel render 状态（见上一 test 注释）。
-    var ctx = try Cx.init(std.testing.allocator);
+    // History: likewise needs multiple frames to settle into panel render state (see prior test).
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     ctx.setViewport(640, 480);
 
@@ -604,16 +615,14 @@ test "DatePicker: open render emits day texts in panel after prewarm settles" {
     const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
     defer scope.dispose();
 
-    const result = try DatePicker(.{
-        .initial_year = 2026,
-        .initial_month = 3,
-    }).mount(scope, ctx);
+    const result = try DatePicker(.{}).mount(scope, ctx);
+    stateOf(result).calendar_month.set(calendar_mod.YearMonth{ .year = 2026, .month = 3 });
 
     try root.appendChild(std.testing.allocator, result.wrapper);
     ctx.layout();
     _ = ctx.render();
 
-    result.state.is_open.set(true);
+    result.open.?.set(true);
 
     var commands: []const @import("../../core.zig").paint_table.DisplayItem = &.{};
     var day_idx: ?usize = null;
@@ -639,14 +648,15 @@ test "DatePicker: open render emits day texts in panel after prewarm settles" {
         if (day_idx != null and today_idx != null) break;
     }
 
-    // P6.3 后 DatePicker panel 走 composited_group surface。断言真正不变量「day text + Today 被绘制」，而非旧的 opacity-layer
-    // 包裹（那条 promoted-surface 路径会丢 children，见 docs/BUGS.md）。
+    // P6.3 onward DatePicker panel uses composited_group surface. Assert true invariant
+    // "day text + Today drawn", not old opacity-layer wrapper (promoted-surface path drops
+    // children, see docs/BUGS.md).
     try std.testing.expect(day_idx != null);
     try std.testing.expect(today_idx != null);
 }
 
 test "DatePicker: disabled stays inert and keeps overlay collapsed" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     ctx.setViewport(640, 480);
 
@@ -658,18 +668,17 @@ test "DatePicker: disabled stays inert and keeps overlay collapsed" {
 
     const result = try DatePicker(.{
         .disabled = true,
-        .initial_year = 2026,
-        .initial_month = 3,
     }).mount(scope, ctx);
+    stateOf(result).calendar_month.set(calendar_mod.YearMonth{ .year = 2026, .month = 3 });
     try root.appendChild(std.testing.allocator, result.wrapper);
 
     ctx.layout();
     _ = ctx.render();
 
-    try std.testing.expect(!result.state.is_open.peek());
+    try std.testing.expect(!result.open.?.peek());
     try std.testing.expectEqual(@as(usize, 1), result.wrapper.children.items.len);
     try std.testing.expect(result.wrapper.children.items[0].behavior.events.on_click == null);
-    const detached_panel_host = result.state.panel_node.parent.?;
+    const detached_panel_host = stateOf(result).panel_node.parent.?;
     try std.testing.expect(detached_panel_host.parent == null);
     try std.testing.expectEqual(@as(f32, 0), detached_panel_host.rectFromWorldOrFallback().w);
     try std.testing.expectEqual(@as(f32, 0), detached_panel_host.rectFromWorldOrFallback().h);
@@ -677,7 +686,7 @@ test "DatePicker: disabled stays inert and keeps overlay collapsed" {
 
 test "DatePicker: first 10 open frames progress from enter state instead of flashing" {
     const render_engine = @import("../../core/render_engine/mod.zig");
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
     ctx.setViewport(640, 480);
 
@@ -687,17 +696,15 @@ test "DatePicker: first 10 open frames progress from enter state instead of flas
     const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
     defer scope.dispose();
 
-    const result = try DatePicker(.{
-        .initial_year = 2026,
-        .initial_month = 3,
-    }).mount(scope, ctx);
+    const result = try DatePicker(.{}).mount(scope, ctx);
+    stateOf(result).calendar_month.set(calendar_mod.YearMonth{ .year = 2026, .month = 3 });
     try root.appendChild(std.testing.allocator, result.wrapper);
 
     ctx.layout();
     _ = ctx.render();
 
-    result.state.is_open.set(true);
-    const animated_container = result.state.panel_node.parent.?;
+    result.open.?.set(true);
+    const animated_container = stateOf(result).panel_node.parent.?;
 
     var opacities: [10]f32 = undefined;
     var scales: [10]f32 = undefined;
@@ -737,7 +744,7 @@ test "DatePicker: first 10 open frames progress from enter state instead of flas
 
 test "a11y: DatePicker expanded/value 跟随开合与选择且可撤回" {
     const testing = std.testing;
-    var ctx = try Cx.init(testing.allocator);
+    var ctx = try Cx.init(testing.allocator, std.testing.io);
     defer ctx.deinit();
     ctx.setViewport(640, 480);
     const root = try box(ctx, .{ .width = .{ .px = 640 }, .height = .{ .px = 480 } }, .{});
@@ -745,57 +752,57 @@ test "a11y: DatePicker expanded/value 跟随开合与选择且可撤回" {
     const scope = try Scope.init(testing.allocator, null, ctx.owner);
     defer scope.dispose();
 
-    const result = try DatePicker(.{
-        .initial_year = 2026,
-        .initial_month = 3,
-    }).mount(scope, ctx);
+    const result = try DatePicker(.{}).mount(scope, ctx);
+    stateOf(result).calendar_month.set(calendar_mod.YearMonth{ .year = 2026, .month = 3 });
     try root.appendChild(testing.allocator, result.wrapper);
     ctx.layout();
     _ = ctx.render();
 
-    // 断言 a11y 树（真正送给 AT 的），不是 props 结构体。
-    const eid = core.ElementId.fromRaw(result.state.trigger_node.element_id_raw);
+    // Assert a11y tree (what really reaches AT), not props struct.
+    const eid = core.ElementId.fromRaw(stateOf(result).trigger_node.element_id_raw);
     {
-        const n = ctx.accessibility_tree.get(eid).?;
+        const n = ctx.accessibility_tree.getNode(eid).?;
         try testing.expectEqual(core.a11y_tree.Role.combobox, n.role);
         try testing.expect(n.state.haspopup);
         try testing.expect(n.state.expanded_present);
         try testing.expect(!n.state.expanded);
-        try testing.expectEqual(@as(u64, 0), n.text_hash); // 未选择 → 无 value
+        try testing.expectEqual(@as(u64, 0), n.text_hash); // unselected -> no value
     }
 
-    // 打开 -> expanded=true
-    result.state.is_open.set(true);
+    // open -> expanded=true
+    result.open.?.set(true);
     ctx.layout();
     _ = ctx.render();
-    try testing.expect(ctx.accessibility_tree.get(eid).?.state.expanded);
+    try testing.expect(ctx.accessibility_tree.getNode(eid).?.state.expanded);
 
-    // 选中日期 -> 面板关闭（expanded 撤回）+ value 播报可读日期
-    result.state.calendar_state.selectDate(.{ .year = 2026, .month = 3, .day = 22 });
+    // select date -> panel close (expanded revert) + readable date announced
+    stateOf(result).calendar_state.selectDate(.{ .year = 2026, .month = 3, .day = 22 });
     ctx.layout();
     _ = ctx.render();
     {
-        const n = ctx.accessibility_tree.get(eid).?;
+        const n = ctx.accessibility_tree.getNode(eid).?;
         try testing.expect(!n.state.expanded);
         try testing.expectEqual(std.hash.Wyhash.hash(0, "Mar 22, 2026"), n.text_hash);
     }
 
-    // 清空选择 -> value 必须撤回（不能一直播报旧日期）
-    result.state.clearSelection();
+    // clear selection -> value must revert (not keep announcing old date)
+    result.value.?.set(null);
     ctx.layout();
     _ = ctx.render();
-    try testing.expectEqual(@as(u64, 0), ctx.accessibility_tree.get(eid).?.text_hash);
+    try testing.expectEqual(@as(u64, 0), ctx.accessibility_tree.getNode(eid).?.text_hash);
 }
 
 test "DatePicker: trigger 主体槽吃满剩余宽度，chevron 贴右（与 Select content_slot 同合同）" {
-    // 回归：旧版主体槽 fit 宽度只包住「图标 + 文本」，与 chevron 之间留一段
-    // 不属于任何元素的空白（220 宽 trigger 空 ~88px）；长文本还会把 chevron 顶出 trigger。
+    // Regression: old version content slot fit width only held icon + text, leaving gap
+    // with chevron (220w trigger ~88px empty); long text pushed chevron out. Second set: narrow
+    // trigger cannot hold content -> content slot shrink-clip, chevron still right-attached.
     const testing = std.testing;
-    // 第二组：窄 trigger 放不下内容 -> 主体槽收缩裁剪，chevron 仍在 trigger 内贴右。
+    // Second group: narrow trigger undersized -> content slot shrinks-clip, chevron stays
+    // right-edge of trigger.
     inline for (.{ .{ "Pick a date", 220 }, .{ "A very long placeholder that cannot possibly fit inside", 120 } }) |case| {
         const placeholder = case[0];
         const w: f32 = case[1];
-        var ctx = try Cx.init(testing.allocator);
+        var ctx = try Cx.init(testing.allocator, std.testing.io);
         defer ctx.deinit();
         ctx.setViewport(640, 480);
         const root = try box(ctx, .{ .width = .{ .px = 640 }, .height = .{ .px = 480 } }, .{});
@@ -807,35 +814,141 @@ test "DatePicker: trigger 主体槽吃满剩余宽度，chevron 贴右（与 Sel
         try root.appendChild(testing.allocator, result.wrapper);
         ctx.layout();
 
-        // 全部取全局 rect（chevron 在 append_slot 里，局部 rect 不同帧）；padding / gap
-        // 取 trigger 实际样式（ControlShell recipe 产出）。
-        const tn = result.state.trigger_node;
+        // All take global rect (chevron in append_slot, local rect differs frames); padding/gap
+        // from trigger actual style (ControlShell recipe product).
+        const tn = stateOf(result).trigger_node;
         const trigger = tn.globalRect();
         const icon_slot = tn.children.items[0].globalRect();
-        const slot = result.state.display_node.parent.?.globalRect();
-        const chevron = result.state.chevron_node.globalRect();
+        const slot = stateOf(result).display_node.parent.?.globalRect();
+        const chevron = stateOf(result).chevron_node.globalRect();
         const pad = tn.style.padding;
         const gap = tn.style.gap;
 
         try testing.expectApproxEqAbs(w, trigger.w, 0.5);
-        // chevron 贴右侧 padding 边
+        // chevron tight to right padding edge
         try testing.expectApproxEqAbs(trigger.x + trigger.w - pad.right, chevron.x + chevron.w, 0.5);
-        // 主体槽从图标槽后的 gap 一直延伸到 chevron 前的 gap，中间无空白
+        // content slot spans gap-after-icon through gap-before-chevron, no gap between
         try testing.expectApproxEqAbs(icon_slot.x + icon_slot.w + gap, slot.x, 0.5);
         try testing.expectApproxEqAbs(chevron.x - gap, slot.x + slot.w, 0.5);
     }
 }
 
-// styles.zig 的测试收集，这行是必需的，见 docs/STYLING.md
+// Test collection from styles.zig, this line required, see docs/STYLING.md
 test {
     _ = @import("styles.zig");
 }
 
-// 逐分配点 OOM sweep，见 src/ui/components/oom_sweep.zig
+test "DatePicker: bound value — external set updates the label; picking writes back, closes, reports the landed date" {
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
+    const root = try box(ctx, .{ .width = .{ .px = 500 }, .height = .{ .px = 500 } }, .{});
+    ctx.root = root;
+    const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
+    defer scope.dispose();
+
+    const due = try scope.createSignal(?SimpleDate, null);
+    var changes: u32 = 0;
+    const result = try DatePicker(.{ .value = due, .on_change = ctx.on(u32, &changes, struct {
+        fn f(c: *u32, _: SimpleDate) void {
+            c.* += 1;
+        }
+    }.f) }).mount(scope, ctx);
+    try root.appendChild(std.testing.allocator, result.wrapper);
+    const st = stateOf(result);
+
+    due.set(SimpleDate{ .year = 2025, .month = 6, .day = 15 });
+    try std.testing.expectEqualStrings("Jun 15, 2025", st.display_node.getText().?.content);
+    try std.testing.expectEqual(@as(u8, 6), st.calendar_state.view_month); // calendar follows
+    try std.testing.expectEqual(@as(u32, 0), changes);
+
+    result.open.?.set(true);
+    st.calendar_state.selectDate(.{ .year = 2025, .month = 6, .day = 20 });
+    try std.testing.expectEqual(@as(u8, 20), due.peek().?.day);
+    try std.testing.expect(!result.open.?.peek());
+    try std.testing.expectEqual(@as(u32, 1), changes);
+    try std.testing.expectEqualStrings("Jun 20, 2025", st.display_node.getText().?.content);
+}
+
+test "DatePicker: reopening shows the selected month even after navigating away" {
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
+    ctx.setViewport(500, 500);
+    const root = try box(ctx, .{ .width = .{ .px = 500 }, .height = .{ .px = 500 } }, .{});
+    ctx.root = root;
+    const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
+    defer scope.dispose();
+
+    const result = try DatePicker(.{ .value = SimpleDate{ .year = 2025, .month = 6, .day = 15 } }).mount(scope, ctx);
+    try root.appendChild(std.testing.allocator, result.wrapper);
+    ctx.layout();
+    const st = stateOf(result);
+    st.calendar_state.nextMonth();
+    st.calendar_state.nextMonth();
+    try std.testing.expectEqual(@as(u8, 8), st.calendar_state.view_month);
+    // user click trigger: view resets calendar month to follow selected date
+    _ = ctx.dispatcher.dispatch(.{ .click = .{ .x = 0, .y = 0, .button = .left, .click_count = 1 } }, st.trigger_node);
+    try std.testing.expect(result.open.?.peek());
+    try std.testing.expectEqual(@as(u8, 6), st.calendar_state.view_month);
+
+    // external open write likewise back to selected month
+    result.open.?.set(false);
+    st.calendar_state.nextMonth();
+    result.open.?.set(true);
+    try std.testing.expectEqual(@as(u8, 6), st.calendar_state.view_month);
+}
+
+test "DatePicker: disabled 来自 signal —— 禁用时点击不开合；open 可受控 / ui.split 拦截" {
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
+    ctx.setViewport(500, 500);
+    const root = try box(ctx, .{ .width = .{ .px = 500 }, .height = .{ .px = 500 } }, .{});
+    ctx.root = root;
+    const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
+    defer scope.dispose();
+    const d = try scope.createSignal(bool, true);
+    const result = try DatePicker(.{ .disabled = d }).mount(scope, ctx);
+    try root.appendChild(std.testing.allocator, result.wrapper);
+    ctx.layout();
+    const st = stateOf(result);
+    const click = core.Event{ .click = .{ .x = 0, .y = 0, .button = .left, .click_count = 1 } };
+    _ = ctx.dispatcher.dispatch(click, st.trigger_node);
+    try std.testing.expect(!result.open.?.peek());
+    try std.testing.expect(st.trigger_node.behavior.interaction.a11y.?.disabled);
+    d.set(false);
+    _ = ctx.dispatcher.dispatch(click, st.trigger_node);
+    try std.testing.expect(result.open.?.peek());
+    try std.testing.expect(!st.trigger_node.behavior.interaction.a11y.?.disabled);
+
+    const Parent = struct {
+        o: *Signal(bool),
+        fn write(_: *@This(), _: bool) void {}
+    };
+    var parent = Parent{ .o = try scope.createSignal(bool, false) };
+    const r2 = try DatePicker(.{ .open = reactive.split(parent.o, ctx.on(Parent, &parent, Parent.write)) }).mount(scope, ctx);
+    try root.appendChild(std.testing.allocator, r2.wrapper);
+    ctx.layout();
+    try std.testing.expect(r2.open == null);
+    _ = ctx.dispatcher.dispatch(click, stateOf(r2).trigger_node);
+    try std.testing.expect(!stateOf(r2).shown_open);
+    parent.o.set(true);
+    try std.testing.expect(stateOf(r2).shown_open);
+}
+
+// OOM sweep at each allocation point, see src/ui/components/oom_sweep.zig
 test "date_picker: mount 在任意分配点失败时不泄漏（sweep）" {
     try @import("../oom_sweep.zig").sweepMount("date_picker", struct {
         fn m(scope: *Scope, cx: *Cx) anyerror!?*Node {
-            const r = try DatePicker(.{ .initial_year = 2026, .initial_month = 9 }).mount(scope, cx);
+            const r = try DatePicker(.{}).mount(scope, cx);
+            return r.wrapper;
+        }
+    }.m);
+}
+
+test "date_picker: 受控值的 mount 在任意分配点失败时不泄漏（sweep）" {
+    try @import("../oom_sweep.zig").sweepMount("date_picker(bound)", struct {
+        fn m(scope: *Scope, cx: *Cx) anyerror!?*Node {
+            const due = try scope.createSignal(?SimpleDate, SimpleDate{ .year = 2026, .month = 9, .day = 1 });
+            const r = try DatePicker(.{ .value = due }).mount(scope, cx);
             return r.wrapper;
         }
     }.m);

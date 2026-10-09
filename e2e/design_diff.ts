@@ -1,34 +1,34 @@
 /**
- * design_diff.ts，设计稿 vs 实现 的结构化像素比对。
+ * design_diff.ts: structured pixel comparison design vs implementation.
  *
- * 改动后请跑 `--self-test`（6 个用例）。
+ * After changes run `--self-test` (6 test cases).
  *
- * 与 `golden_compare.ts` 的分工（不要混用）：
- *   - golden_compare: 回归门禁。同尺寸基线，尺寸不等直接 throw，只给两个全局标量。
- *   - design_diff（本文件）: 还原辅助。**尺寸天然不同**（设计稿 2x 导出 vs 应用截图），
- *     自动对齐尺寸，并输出「差在哪、差多少、往哪个方向差」，让 AI 不必读图就能改。
+ * Workflow vs `golden_compare.ts` (don't mix):
+ *   - golden_compare: regression gate. Same-size baseline, unequal size throws, gives two global scalars only.
+ *   - design_diff (this file): recovery aid. **Sizes naturally differ** (design export 2x vs app screenshot),
+ *     auto-aligns sizes, outputs "where differs, how much, which direction", lets AI fix without reading image.
  *
- * 设计目标：输出必须能直接驱动下一步修改。所以不只给分数，还给：
- *   - 网格热力图：哪一块差（8x8 网格 + ASCII 可视化）
- *   - 边缘投影差：行/列内容边界的偏移量 -> 直接对应 padding/gap/位置错误
- *   - 主色差异：调色板比对 -> 直接对应用错 token
+ * Design goal: output must directly drive next fix. So give more than scores:
+ *   - grid heatmap: which block differs (8x8 grid + ASCII viz)
+ *   - edge projection diff: row/col content boundary offset -> maps directly to padding/gap/position errors
+ *   - color diff: palette comparison -> maps directly to wrong token usage
  *
- * 用法:
+ * Usage:
  *   bun e2e/design_diff.ts DESIGN.png ACTUAL.png [--json] [--grid N] [--top N]
  *   bun e2e/design_diff.ts --self-test
  */
 import { existsSync } from "node:fs";
 import { decodePng, type DecodedPng } from "./png";
 
-// ── 基础工具 ──
+// ── Basic tools ──
 
 /**
- * 把带 alpha 的图合成到不透明底色上。
+ * Composite alpha image onto opaque background.
  *
- * 这一步是必须的，不是可选优化：pencil 的 `export_nodes` 导出的组件 PNG
- * 通常带透明背景，透明像素的 RGB 往往是 (0,0,0)。若直接比 RGB，设计稿会被
- * 当成"黑底"，而应用截图是白底，结果是 ~99% 像素差 + RMSE 250 的假报警，
- * 而两张图人眼看几乎一样。实测踩过这个坑，故有下面的 self-test 兜底。
+ * This step is mandatory, not optional: pencil `export_nodes` export component PNG
+ * typically has transparent background, transparent pixel RGB often (0,0,0). Comparing RGB directly,
+ * design treated as "black bg" while app screenshot white bg, result ~99% pixel diff + RMSE 250 false alarm,
+ * yet images look nearly identical to human eye. Hit this pit in practice, self-test below catches it.
  */
 export function flattenOnto(png: DecodedPng, matte: [number, number, number]): DecodedPng {
   if (png.channels < 4) return png;
@@ -42,7 +42,7 @@ export function flattenOnto(png: DecodedPng, matte: [number, number, number]): D
   return { width: png.width, height: png.height, channels: 3, pixels: out };
 }
 
-/** 双线性重采样到目标尺寸。设计稿导出常是 2x，截图是 Retina 2x，尺寸仍可能不等。 */
+/** Bilinear resample to target size. Design export often 2x, screenshot Retina 2x, sizes may differ. */
 export function resample(src: DecodedPng, width: number, height: number): DecodedPng {
   if (src.width === width && src.height === height) return src;
   const out = new Uint8Array(width * height * 3);
@@ -77,14 +77,14 @@ function luma(png: DecodedPng, idx: number): number {
   return 0.299 * png.pixels[o] + 0.587 * png.pixels[o + 1] + 0.114 * png.pixels[o + 2];
 }
 
-// ── 1. 网格热力图：差异定位到区块 ──
+// ── 1. Grid heatmap: locate diff to blocks ──
 
 export interface GridCell {
   row: number;
   col: number;
-  /** 该格平均通道差 (0-255) */
+  /** Avg channel diff (0-255) for this cell */
   delta: number;
-  /** 该格超阈值像素占比 */
+  /** This cell exceeded-threshold pixel ratio */
   changedRatio: number;
 }
 
@@ -117,7 +117,7 @@ export function gridDiff(a: DecodedPng, b: DecodedPng, grid: number, threshold: 
   return cells;
 }
 
-/** ASCII 热力图。空=一致，数字越大差越多，# 为最严重。 */
+/** ASCII heatmap. space=match, larger digits=more diff, # worst. */
 export function renderHeatmap(cells: GridCell[], grid: number): string {
   const rows: string[] = [];
   for (let r = 0; r < grid; r++) {
@@ -133,11 +133,11 @@ export function renderHeatmap(cells: GridCell[], grid: number): string {
   return rows.join("\n");
 }
 
-// ── 2. 边缘投影：把差异翻译成「偏移了多少像素」 ──
+// ── 2. Edge projection: translate diff into 'pixels offset' ──
 
 /**
- * 内容边界投影。对每行/每列求「非背景像素」数量，得到内容分布曲线。
- * 两张图的曲线错位量 = 布局偏移量，直接对应 padding/gap/margin 错误。
+ * Content boundary projection. For each row/col compute "non-background pixel" count, yield content distribution curve.
+ * Curve misalignment between images = layout offset, maps directly to padding/gap/margin errors.
  */
 export function projection(png: DecodedPng, axis: "row" | "col", bgLuma: number): number[] {
   const n = axis === "row" ? png.height : png.width;
@@ -154,7 +154,7 @@ export function projection(png: DecodedPng, axis: "row" | "col", bgLuma: number)
   return out;
 }
 
-/** 估计背景亮度：取四角与边缘中点的中位数。 */
+/** Estimate background brightness: median of corners and edge midpoints. */
 export function estimateBackgroundLuma(png: DecodedPng): number {
   const pts = [
     [0, 0], [png.width - 1, 0], [0, png.height - 1], [png.width - 1, png.height - 1],
@@ -164,7 +164,7 @@ export function estimateBackgroundLuma(png: DecodedPng): number {
   return vals[Math.floor(vals.length / 2)];
 }
 
-/** 互相关求最佳整体位移（±maxShift），返回位移量与该位移下的残差。 */
+/** Cross-correlation for best overall shift (±maxShift), return shift amount and residual at that shift. */
 export function bestShift(a: number[], b: number[], maxShift: number): { shift: number; residual: number } {
   let best = { shift: 0, residual: Infinity };
   for (let s = -maxShift; s <= maxShift; s++) {
@@ -182,7 +182,7 @@ export function bestShift(a: number[], b: number[], maxShift: number): { shift: 
   return best;
 }
 
-/** 内容包围盒：内容区的首尾非背景行/列，用于比对整体尺寸与位置。 */
+/** Content bounding box: first/last non-background rows/cols, for comparing overall size and position. */
 export function contentBounds(proj: number[]): { start: number; end: number } {
   const peak = Math.max(...proj);
   const floor = Math.max(1, peak * 0.02);
@@ -192,11 +192,11 @@ export function contentBounds(proj: number[]): { start: number; end: number } {
   return { start, end };
 }
 
-// ── 3. 调色板比对：抓「用错颜色 token」 ──
+// ── 3. Palette comparison: catch 'wrong color token' ──
 
 export interface PaletteEntry { hex: string; ratio: number; }
 
-/** 量化到 5 位/通道后统计主色。 */
+/** Quantize to 5 bits/channel then tabulate dominant colors. */
 export function palette(png: DecodedPng, topN: number): PaletteEntry[] {
   const hist = new Map<number, number>();
   const total = png.width * png.height;
@@ -219,7 +219,7 @@ function hexToRgb(hex: string): [number, number, number] {
   return [parseInt(hex.slice(1, 3), 16), parseInt(hex.slice(3, 5), 16), parseInt(hex.slice(5, 7), 16)];
 }
 
-/** 为设计稿主色找实现中最接近的色，距离大 = 颜色用错。 */
+/** Find closest color in implementation for each design primary. Large distance = wrong color. */
 export function paletteDiff(design: PaletteEntry[], actual: PaletteEntry[]) {
   return design.map((d) => {
     const [dr, dg, db] = hexToRgb(d.hex);
@@ -233,7 +233,7 @@ export function paletteDiff(design: PaletteEntry[], actual: PaletteEntry[]) {
   });
 }
 
-// ── 汇总 ──
+// ── Summary ──
 
 export interface DiffReport {
   designSize: string;
@@ -258,12 +258,13 @@ export function compare(
   actualPng: DecodedPng,
   opts: { grid: number; threshold: number; top: number; matte?: [number, number, number] },
 ): DiffReport {
-  // 先按 alpha 合成到同一底色，必须在重采样与任何差值之前做。
+  // Composite alpha to same background first, must be before resampling and any diff.
   const matte = opts.matte ?? [255, 255, 255];
   const designFlat = flattenOnto(designPng, matte);
   const actualFlat = flattenOnto(actualPng, matte);
 
-  // 统一到实现截图的尺寸（保留实现的真实分辨率作为坐标系）。
+  // Unify to implementation screenshot size (preserve implementation true resolution as coordinate
+  // system).
   const w = actualFlat.width, h = actualFlat.height;
   const design = resample(designFlat, w, h);
   const actual = actualFlat;
@@ -299,7 +300,7 @@ export function compare(
   const paletteIssues = paletteDiff(palette(design, 6), palette(actual, 12))
     .filter((p) => p.distance > 24);
 
-  // 把数字翻译成可执行的修改建议。
+  // Translate numbers into actionable fix suggestions.
   const hints: string[] = [];
   if (Math.abs(xShift.shift) >= 2) {
     hints.push(`整体水平偏移 ${xShift.shift > 0 ? "右" : "左"} ${Math.abs(xShift.shift)}px — 检查左右 padding / margin / justify`);
@@ -322,7 +323,7 @@ export function compare(
     hints.push("无整体位移/尺寸/配色偏差，差异集中在局部 — 看 worstCells 定位区块（可能是字体、圆角、阴影或图标）");
   }
 
-  // 分数：changedRatio 与 rmse 综合，100 = 完全一致。
+  // Score: changedRatio and rmse combined, 100 = perfect match.
   const score = Math.max(0, 100 - changedRatio * 100 * 0.7 - Math.min(30, rmse));
 
   return {
@@ -342,7 +343,7 @@ export function compare(
   };
 }
 
-// ── 自检 ──
+// ── Self-check ──
 
 function selfTest(): void {
   const solid = (w: number, h: number, rgb: [number, number, number]): DecodedPng => {
@@ -366,7 +367,7 @@ function selfTest(): void {
     return out;
   };
 
-  // 1. 相同图 -> 满分、无提示
+  // 1. Identical image -> full score, no hints
   const white = solid(64, 64, [255, 255, 255]);
   const a = withRect(white, 10, 10, 20, 20, [0, 0, 0]);
   const same = compare(a, a, { grid: 8, threshold: 8, top: 3 });
@@ -374,39 +375,39 @@ function selfTest(): void {
   if (same.score !== 100) throw new Error(`identical score should be 100, got ${same.score}`);
   if (same.hints.length !== 0) throw new Error("identical image should yield no hints");
 
-  // 2. 纯位移 -> 必须报出正确方向与量级
+  // 2. Pure offset -> must report correct direction and magnitude
   const shifted = withRect(white, 16, 10, 20, 20, [0, 0, 0]);
   const shiftRep = compare(a, shifted, { grid: 8, threshold: 8, top: 3 });
   if (shiftRep.offset.x !== 6) throw new Error(`expected x offset 6, got ${shiftRep.offset.x}`);
   if (shiftRep.offset.y !== 0) throw new Error(`expected y offset 0, got ${shiftRep.offset.y}`);
   if (!shiftRep.hints.some((s) => s.includes("水平偏移"))) throw new Error("shift hint missing");
 
-  // 3. 尺寸不同也能比（自动重采样），不再 throw
+  // 3. Different sizes also compare (auto resample), no throw
   const big = solid(128, 128, [255, 255, 255]);
   const bigRect = withRect(big, 20, 20, 40, 40, [0, 0, 0]);
   const scaled = compare(bigRect, a, { grid: 8, threshold: 8, top: 3 });
   if (scaled.comparedAt !== "64x64") throw new Error("resample target should be actual size");
   if (scaled.changedRatio > 0.05) throw new Error(`2x-scaled identical content should match, got ${scaled.changedRatio}`);
 
-  // 4. 变色 -> 必须报调色板问题
+  // 4. Color change -> must report palette issue
   const red = withRect(white, 10, 10, 20, 20, [220, 30, 30]);
   const colorRep = compare(a, red, { grid: 8, threshold: 8, top: 3 });
   if (colorRep.paletteIssues.length === 0) throw new Error("palette diff should flag a recolor");
   if (!colorRep.hints.some((s) => s.includes("颜色偏差"))) throw new Error("color hint missing");
 
-  // 5. 内容尺寸差 -> 必须报宽度差
+  // 5. Content size diff -> must report width delta
   const wider = withRect(white, 10, 10, 34, 20, [0, 0, 0]);
   const widthRep = compare(a, wider, { grid: 8, threshold: 8, top: 3 });
   if (!widthRep.hints.some((s) => s.includes("内容宽度差"))) throw new Error("width hint missing");
 
-  // 6. 回归：透明背景的设计稿 vs 白底截图，必须判为「几乎一致」。
-  //    这是实测踩过的真坑，修复前此用例报 0.8/100、98.9% 差异像素。
+  // 6. Regression: transparent design vs white-bg screenshot must judge as 'nearly identical'.
+  //    This is real pit from testing, fixed case reported 0.8/100, 98.9% diff pixels.
   const rgbaTransparentBg = (w2: number, h2: number): DecodedPng => {
-    const pixels = new Uint8Array(w2 * h2 * 4); // 全 0 = 透明且 RGB 为黑
+    const pixels = new Uint8Array(w2 * h2 * 4); // All 0 = transparent and RGB black
     for (let y = 10; y < 30; y++) {
       for (let x = 10; x < 30; x++) {
         const i = (y * w2 + x) * 4;
-        pixels[i] = 0; pixels[i + 1] = 0; pixels[i + 2] = 0; pixels[i + 3] = 255; // 不透明黑内容
+        pixels[i] = 0; pixels[i + 1] = 0; pixels[i + 2] = 0; pixels[i + 3] = 255; // Opaque black content
       }
     }
     return { width: w2, height: h2, channels: 4, pixels };
@@ -426,15 +427,15 @@ function main(): void {
   const args = process.argv.slice(2);
   if (args.length === 1 && args[0] === "--self-test") return selfTest();
 
-  // 手动解析 positional：--json 是布尔 flag，--grid/--top/--threshold 各带一个值。
-  // 旧实现 `args.filter(a => !a.startsWith("--"))` 会把 flag 的值也算进 positional
-  // （如 `--grid 8` 的 `8`），导致 `--json --grid 8` 被误判为 3 个 positional -> exit 64。
+  // Parse positional manually: --json is bool flag, --grid/--top/--threshold each take one value.
+  // Old impl `args.filter(a => !a.startsWith("--"))` would count flag's value as positional
+  // (like `--grid 8`'s `8`), so `--json --grid 8` wrongly parsed as 3 positional -> exit 64.
   const valueFlags = new Set(["--grid", "--top", "--threshold"]);
   const positional: string[] = [];
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (a.startsWith("--")) {
-      if (valueFlags.has(a)) i++; // 消费该 flag 的值
+      if (valueFlags.has(a)) i++; // Consume this flag's value
       continue;
     }
     positional.push(a);

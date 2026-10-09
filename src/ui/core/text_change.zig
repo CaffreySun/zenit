@@ -13,7 +13,7 @@ pub const Signature = struct {
 fn hashValue(h: *std.hash.Wyhash, value: anytype) void {
     const T = @TypeOf(value);
     switch (@typeInfo(T)) {
-        .@"struct" => inline for (std.meta.fields(T)) |f| hashValue(h, @field(value, f.name)),
+        .@"struct" => inline for (@import("zenit_reflection").fields(T)) |f| hashValue(h, @field(value, f.name)),
         .optional => {
             hashValue(h, value != null);
             if (value) |v| hashValue(h, v);
@@ -35,7 +35,7 @@ pub fn signature(text: ?types.TextProps) Signature {
         inline for (.{ "font_size", "font_weight", "font_family", "line_height", "wrap", "max_lines", "baseline_ratio", "use_symbols_font", "use_monospace_font", "use_italic_font", "monospace_char_width", "spans_affect_layout" }) |field| {
             hashValue(&layout, @field(t, field));
         }
-        inline for (std.meta.fields(types.TextProps)) |f| {
+        inline for (@import("zenit_reflection").fields(types.TextProps)) |f| {
             if (comptime !std.mem.eql(u8, f.name, "content") and !std.mem.eql(u8, f.name, "inline_buf") and !std.mem.eql(u8, f.name, "inline_len") and !std.mem.eql(u8, f.name, "owned") and !std.mem.eql(u8, f.name, "spans") and !std.mem.eql(u8, f.name, "spans_owned")) {
                 hashValue(&paint, @field(t, f.name));
             }

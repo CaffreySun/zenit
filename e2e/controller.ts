@@ -1,20 +1,20 @@
 /**
- * e2e/controller.ts, scenario dashboard 的 localhost 后端
+ * e2e/controller.ts: localhost backend for scenario dashboard
  *
- * 前端是 SolidJS + @zax/ui（tools/scenario-dashboard/，build 后 dist/）。
- * 同一套执行逻辑：触发跑 = spawn `scenario_runner.ts`（不另造执行逻辑）。
+ * Frontend: SolidJS + @zax/ui (tools/scenario-dashboard/; dist/ after build).
+ * Same execution logic: triggering a run = spawn `scenario_runner.ts` (no separate execution logic).
  *
- * 用法:
- *   bun e2e/controller.ts            # 默认 http://127.0.0.1:3900
+ * Usage:
+ *   bun e2e/controller.ts            # default: http://127.0.0.1:3900
  *
  * API:
- *   GET  /                            dashboard（tools/scenario-dashboard/dist）
- *   GET  /api/reports                列 report（含状态汇总）
- *   GET  /api/reports/:scenario/:run 单报告详情（产物路径重写为相对 base）
- *   GET  /api/scenarios              列 scenario
- *   POST /api/runs                   {scenario} -> 触发跑
- *   GET  /api/runs/:id               运行状态 + 日志尾
- *   GET  /reports/*                  静态服务 report 产物（html/json/png/mp4）
+ *   GET  /                            dashboard (tools/scenario-dashboard/dist)
+ *   GET  /api/reports                list reports (with status summary)
+ *   GET  /api/reports/:scenario/:run single report details (artifact paths rewritten as relative to base)
+ *   GET  /api/scenarios              list scenarios
+ *   POST /api/runs                   {scenario} -> trigger a run
+ *   GET  /api/runs/:id               run status + log tail
+ *   GET  /reports/*                  serve report artifacts statically (html/json/png/mp4)
  */
 
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
@@ -64,7 +64,7 @@ function listReports() {
           ...statusCounts(report.cases ?? []),
           reportPath: `reports/${scenario}/${run}/report.html`,
         });
-      } catch { /* 忽略损坏的 report */ }
+      } catch { /* ignore a corrupted report */ }
     }
   }
   return out.sort((a, b) => String(b.timestamp ?? "").localeCompare(String(a.timestamp ?? "")));
@@ -148,7 +148,7 @@ Bun.serve({
       return new Response(readFileSync(index), { headers: { "content-type": "text/html; charset=utf-8" } });
     }
 
-    // 单报告详情（产物路径重写为相对 base）
+    // Single report details (rewrite product paths relative to base)
     if (p.startsWith("/api/reports/")) {
       const rest = p.slice("/api/reports/".length).split("/");
       if (rest.length === 2 && rest[0] && rest[1]) return getReport(rest[0], rest[1]);
@@ -166,7 +166,7 @@ Bun.serve({
       return run ? json(run) : json({ error: "not found" }, 404);
     }
     if (p.startsWith("/reports/")) return serveReport(p.slice("/reports/".length));
-    // dashboard 静态资源（dist/assets/* 等）
+    // Dashboard static assets (dist/assets/* etc)
     if (p.startsWith("/assets/")) return serveDist(p.slice(1));
 
     return json({ error: "not found" }, 404);

@@ -25,7 +25,7 @@ pub const Level = enum(u8) {
 
     fn passes(self: Level, minimum: ?Level) bool {
         const min = minimum orelse return false;
-        return @intFromEnum(self) >= @intFromEnum(min);
+        return @backingInt(self) >= @backingInt(min);
     }
 };
 
@@ -100,9 +100,9 @@ pub const Config = struct {
 /// deterministic for tests, while `zenit_app.Config` uses this policy.
 pub fn defaultConfig() Config {
     return switch (builtin.mode) {
-        .Debug => .{},
-        .ReleaseSafe => .{ .terminal_level = .info, .capture_level = .info },
-        .ReleaseFast, .ReleaseSmall => .{ .terminal_level = .warn, .capture_level = null },
+        .debug => .{},
+        .safe => .{ .terminal_level = .info, .capture_level = .info },
+        .fast, .small => .{ .terminal_level = .warn, .capture_level = null },
     };
 }
 
@@ -141,7 +141,8 @@ const CounterState = struct { value: u64 };
 /// Address-stable diagnostic store. Do not copy after initialization.
 pub const Console = struct {
     allocator: std.mem.Allocator,
-    mutex: std.Thread.Mutex = .{},
+    io: std.Io,
+    mutex: std.Io.Mutex = .init,
     config: Config,
     events: std.ArrayList(Event) = .empty,
     head: usize = 0,
@@ -159,11 +160,12 @@ pub const Console = struct {
 
     threadlocal var in_emit: bool = false;
 
-    pub fn init(allocator: std.mem.Allocator, config: Config) Console {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, config: Config) Console {
         return .{
             .allocator = allocator,
+            .io = io,
             .config = normalizedConfig(config),
-            .started_ns = std.time.nanoTimestamp(),
+            .started_ns = @import("zenit_time").monotonicTimestamp(io),
             .group_depths = std.AutoHashMap(std.Thread.Id, u16).init(allocator),
             .counters = std.StringHashMap(CounterState).init(allocator),
             .timers = std.StringHashMap(i128).init(allocator),
@@ -171,8 +173,8 @@ pub const Console = struct {
     }
 
     pub fn deinit(self: *Console) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         self.freeAllEventsLocked();
         self.events.deinit(self.allocator);
         self.group_depths.deinit();
@@ -183,8 +185,8 @@ pub const Console = struct {
     }
 
     pub fn configure(self: *Console, config: Config) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         self.config = normalizedConfig(config);
         self.enforceBoundsLocked();
         self.bumpRevisionLocked();
@@ -259,8 +261,8 @@ pub const Console = struct {
     }
 
     fn countResetScoped(self: *Console, scope: []const u8, label: []const u8) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         const key = self.stateKeyLocked(scope, label) catch {
             self.dropped_oom += 1;
             self.bumpRevisionLocked();
@@ -276,22 +278,22 @@ pub const Console = struct {
 
     fn timeScoped(self: *Console, scope: []const u8, label: []const u8) void {
         var already_exists = false;
-        self.mutex.lock();
+        self.mutex.lockUncancelable(self.io);
         const key = self.stateKeyLocked(scope, label) catch {
             self.dropped_oom += 1;
             self.bumpRevisionLocked();
-            self.mutex.unlock();
+            self.mutex.unlock(self.io);
             return;
         };
         if (self.timers.contains(key)) {
             self.allocator.free(key);
             already_exists = true;
-        } else self.timers.put(key, std.time.nanoTimestamp()) catch {
+        } else self.timers.put(key, @import("zenit_time").monotonicTimestamp(self.io)) catch {
             self.allocator.free(key);
             self.dropped_oom += 1;
             self.bumpRevisionLocked();
         };
-        self.mutex.unlock();
+        self.mutex.unlock(self.io);
         if (already_exists) self.emitFmt(.warn, .timer, scope, "Timer '{s}' already exists", .{label}, null);
     }
 
@@ -324,16 +326,16 @@ pub const Console = struct {
     }
 
     pub fn clear(self: *Console) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         self.freeAllEventsLocked();
         self.clear_generation +%= 1;
         self.bumpRevisionLocked();
     }
 
     pub fn stats(self: *Console) Stats {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         const live = self.liveCountLocked();
         return .{
             .oldest_seq = if (live == 0) 0 else self.events.items[self.head].seq,
@@ -348,8 +350,8 @@ pub const Console = struct {
     }
 
     pub fn snapshotSince(self: *Console, allocator: std.mem.Allocator, after_seq: u64, max_events: usize) !Snapshot {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         const live = self.liveCountLocked();
         const oldest = if (live == 0) 0 else self.events.items[self.head].seq;
         const newest = if (live == 0) 0 else self.events.items[self.events.items.len - 1].seq;
@@ -387,8 +389,8 @@ pub const Console = struct {
         }
         in_emit = true;
         defer in_emit = false;
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         // Configuration is mutable, so sink thresholds must be read under the
         // same lock as configure(). This keeps logging safe while a harness
         // changes capture limits from another thread.
@@ -434,7 +436,7 @@ pub const Console = struct {
             return;
         }
         const thread_id = std.Thread.getCurrentId();
-        const now = std.time.nanoTimestamp();
+        const now = @import("zenit_time").monotonicTimestamp(self.io);
         const delta = @max(@as(i128, 0), now - self.started_ns);
         const event: Event = .{
             .seq = self.next_seq,
@@ -496,8 +498,8 @@ pub const Console = struct {
 
     fn adjustGroupDepth(self: *Console, delta: i8) void {
         const thread_id = std.Thread.getCurrentId();
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         const old = self.group_depths.get(thread_id) orelse 0;
         if (delta > 0) {
             self.group_depths.put(thread_id, old +| 1) catch {
@@ -513,8 +515,8 @@ pub const Console = struct {
     }
 
     fn incrementCounter(self: *Console, scope: []const u8, label: []const u8) !u64 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         const key = try self.stateKeyLocked(scope, label);
         if (self.counters.getPtr(key)) |state| {
             self.allocator.free(key);
@@ -527,8 +529,8 @@ pub const Console = struct {
     }
 
     fn elapsedTimerMs(self: *Console, scope: []const u8, label: []const u8, remove: bool) ?f64 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         const key = self.stateKeyLocked(scope, label) catch {
             self.dropped_oom += 1;
             self.bumpRevisionLocked();
@@ -540,7 +542,7 @@ pub const Console = struct {
             const entry = self.timers.fetchRemove(key).?;
             self.allocator.free(entry.key);
         }
-        const elapsed_ns = @max(@as(i128, 0), std.time.nanoTimestamp() - start);
+        const elapsed_ns = @max(@as(i128, 0), @import("zenit_time").monotonicTimestamp(self.io) - start);
         return @as(f64, @floatFromInt(elapsed_ns)) / @as(f64, std.time.ns_per_ms);
     }
 
@@ -549,10 +551,10 @@ pub const Console = struct {
     }
 
     fn noteOom(self: *Console) void {
-        self.mutex.lock();
+        self.mutex.lockUncancelable(self.io);
         self.dropped_oom += 1;
         self.bumpRevisionLocked();
-        self.mutex.unlock();
+        self.mutex.unlock(self.io);
     }
 };
 
@@ -621,7 +623,7 @@ fn normalizedConfig(config: Config) Config {
     return out;
 }
 
-/// 统一走 text_core.utf8（此前这里是同一个扫描的第三份拷贝）
+/// Unified via text_core.utf8 (previously third copy of same scan here)
 fn validUtf8PrefixLen(text: []const u8, limit: usize) usize {
     return utf8.validPrefixLen(text, limit);
 }
@@ -632,7 +634,7 @@ fn freeStringMapKeys(comptime V: type, allocator: std.mem.Allocator, map: *std.S
 }
 
 test "console captures levels, source and monotonic sequence" {
-    var console = Console.init(std.testing.allocator, .{ .terminal_level = null });
+    var console = Console.init(std.testing.allocator, std.testing.io, .{ .terminal_level = null });
     defer console.deinit();
     console.writeAt(.info, @src(), "hello {d}", .{42});
     console.warn("careful", .{});
@@ -646,7 +648,7 @@ test "console captures levels, source and monotonic sequence" {
 }
 
 test "console eviction is bounded" {
-    var console = Console.init(std.testing.allocator, .{ .terminal_level = null, .max_entries = 2, .max_bytes = 1024 });
+    var console = Console.init(std.testing.allocator, std.testing.io, .{ .terminal_level = null, .max_entries = 2, .max_bytes = 1024 });
     defer console.deinit();
     console.log("one", .{});
     console.log("two", .{});
@@ -660,7 +662,7 @@ test "console eviction is bounded" {
 }
 
 test "console clear keeps sequence monotonic" {
-    var console = Console.init(std.testing.allocator, .{ .terminal_level = null });
+    var console = Console.init(std.testing.allocator, std.testing.io, .{ .terminal_level = null });
     defer console.deinit();
     console.log("before", .{});
     console.clear();
@@ -673,7 +675,7 @@ test "console clear keeps sequence monotonic" {
 }
 
 test "console group counter and timer helpers emit events" {
-    var console = Console.init(std.testing.allocator, .{ .terminal_level = null });
+    var console = Console.init(std.testing.allocator, std.testing.io, .{ .terminal_level = null });
     defer console.deinit();
     console.group("work", .{});
     console.count("retry");
@@ -690,9 +692,9 @@ test "console group counter and timer helpers emit events" {
 }
 
 test "two consoles never share events" {
-    var a = Console.init(std.testing.allocator, .{ .terminal_level = null });
+    var a = Console.init(std.testing.allocator, std.testing.io, .{ .terminal_level = null });
     defer a.deinit();
-    var b = Console.init(std.testing.allocator, .{ .terminal_level = null });
+    var b = Console.init(std.testing.allocator, std.testing.io, .{ .terminal_level = null });
     defer b.deinit();
     a.info("only-a", .{});
     b.err("only-b", .{});
@@ -705,7 +707,7 @@ test "two consoles never share events" {
 }
 
 test "console truncation preserves valid UTF-8 and reports truncation" {
-    var console = Console.init(std.testing.allocator, .{ .terminal_level = null, .max_entry_bytes = 5 });
+    var console = Console.init(std.testing.allocator, std.testing.io, .{ .terminal_level = null, .max_entry_bytes = 5 });
     defer console.deinit();
     console.log("ééé", .{});
     var snapshot = try console.snapshotSince(std.testing.allocator, 0, 10);
@@ -717,7 +719,7 @@ test "console truncation preserves valid UTF-8 and reports truncation" {
 }
 
 test "console invalid UTF-8 prefix scan is linear and stops at first bad byte" {
-    var invalid = [_]u8{0x80} ** (64 * 1024);
+    var invalid = @as([(64 * 1024)]u8, @splat(0x80));
     try std.testing.expectEqual(@as(usize, 0), validUtf8PrefixLen(&invalid, invalid.len / 2));
 
     const mixed = "ok" ++ [_]u8{ 0xF0, 0x28, 0x8C, 0x28 };
@@ -725,7 +727,7 @@ test "console invalid UTF-8 prefix scan is linear and stops at first bad byte" {
 }
 
 test "console snapshot pagination and eviction gap are explicit" {
-    var console = Console.init(std.testing.allocator, .{ .terminal_level = null, .max_entries = 3 });
+    var console = Console.init(std.testing.allocator, std.testing.io, .{ .terminal_level = null, .max_entries = 3 });
     defer console.deinit();
     for (0..5) |i| console.log("event-{d}", .{i});
 
@@ -744,7 +746,7 @@ test "console snapshot pagination and eviction gap are explicit" {
 }
 
 test "console accepts concurrent writers without losing sequence uniqueness" {
-    var console = Console.init(std.testing.allocator, .{ .terminal_level = null, .max_entries = 1000 });
+    var console = Console.init(std.testing.allocator, std.testing.io, .{ .terminal_level = null, .max_entries = 1000 });
     defer console.deinit();
 
     const Writer = struct {
@@ -763,7 +765,7 @@ test "console accepts concurrent writers without losing sequence uniqueness" {
 }
 
 test "counter labels are isolated by thread and scope" {
-    var console = Console.init(std.testing.allocator, .{ .terminal_level = null });
+    var console = Console.init(std.testing.allocator, std.testing.io, .{ .terminal_level = null });
     defer console.deinit();
     const CounterWriter = struct {
         fn run(target: *Console, scope_name: []const u8) void {

@@ -56,7 +56,7 @@ in the Zenit package for the complete contract.
 
 `zenit.attach(zenit_dep, exe)` is a public API of zenit's root `build.zig` —
 `const zenit = @import("zenit");` at the top of your `build.zig` makes it
-available (Zig 0.15.2). A single call does three things:
+available (Zig 0.17.0). A single call does three things:
 
 1. Adds the `@import("ui")` and `@import("zenit_app")` module imports to your
    exe's root module.

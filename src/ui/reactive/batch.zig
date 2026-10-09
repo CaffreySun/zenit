@@ -1,30 +1,29 @@
 const std = @import("std");
 const EffectBase = @import("effect_base.zig").EffectBase;
 
-/// BatchContext: 批量更新上下文
+/// BatchContext: batch update context
 ///
-/// 调度逻辑全部委托到 ReactiveGraph（owner.graph）。
-/// 此结构保留：
-///   1. nesting_level：维持嵌套 batch 计数（公共 API 不变）
-///   2. is_batching：is_batching getter 兼容查询
-/// queueEffect / flush / pending_effects 路径已废弃，signal.set 不再
-/// 经此队列；调度走 graph.markSignalWritten + graph.endBatch 拓扑序 drain。
+/// Scheduling is delegated to ReactiveGraph (owner.graph). This struct retains:
+///   1. nesting_level: nested batch count (public API)
+///   2. is_batching: getter for compatibility queries
+/// queueEffect / flush / pending_effects paths are deprecated; signal.set does not use this queue.
+/// Scheduling uses graph.markSignalWritten + graph.endBatch topological drain.
 pub const BatchContext = struct {
-    /// 待执行的 Effect 队列
+    /// Queue of Effects to execute
     pending_effects: std.ArrayList(*EffectBase),
 
-    /// 是否处于批量模式
+    /// Whether in batch mode
     is_batching: bool = false,
 
-    /// 嵌套层级
+    /// Nesting level
     nesting_level: u32 = 0,
 
-    /// 父 allocator
+    /// Parent allocator
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator) BatchContext {
         return .{
-            .pending_effects = std.ArrayList(*EffectBase){},
+            .pending_effects = @as(std.ArrayList(*EffectBase), .empty),
             .allocator = allocator,
         };
     }
@@ -33,7 +32,7 @@ pub const BatchContext = struct {
         self.pending_effects.deinit(self.allocator);
     }
 
-    /// 开始批量更新
+    /// Begin batch update
     pub fn begin(self: *BatchContext) !void {
         self.nesting_level += 1;
         if (self.nesting_level == 1) {
@@ -42,40 +41,36 @@ pub const BatchContext = struct {
         }
     }
 
-    /// 结束批量更新
+    /// End batch update
     ///
-    /// owner: *SignalOwner (类型擦除为 anyopaque,避免循环依赖)
+    /// owner: *SignalOwner (type-erased to anyopaque, avoid circular dependency)
     pub fn end(self: *BatchContext, owner: anytype) void {
         if (self.nesting_level == 0) return;
 
         self.nesting_level -= 1;
 
-        // 只有最外层 batch 结束时才执行
+        // Execute only when outermost batch ends
         if (self.nesting_level == 0) {
-            // 注意：不在此处设 is_batching=false，flush 内部管理 batching 状态
-            // 这确保 flush 期间产生的新 Effect 仍然走 batch 路径（queueEffect）
+            // Note: do not set is_batching=false here; flush manages batching state internally.
+            // This ensures new Effects during flush still use batch path (queueEffect).
             self.flush(owner);
         }
     }
 
-    /// 添加 Effect 到待执行队列
+    /// Add Effect to execution queue
     pub fn queueEffect(self: *BatchContext, effect: *EffectBase) !void {
-        // 避免重复添加
+        // Avoid duplicate additions
         if (effect.is_queued) return;
 
         try self.pending_effects.append(self.allocator, effect);
         effect.is_queued = true;
     }
 
-    /// 执行所有待处理的 Effect
-    ///
-    /// 使用"drain loop"策略：flush 期间保持 batching 开启，
-    /// Effect 执行中产生的新 Signal 变化会继续 queueEffect 到列表中。
-    /// 循环直到队列为空或达到安全上限。
-    ///
-    /// 历史债避免（吸取 Phase 0 审查的"16 次硬上限静默清空"问题）：
-    /// 上限提到 1024，且达到上限时**panic（debug）/ error log（release）**
-    /// 而非静默丢，业务上应当观察到，因为这是真实的循环依赖 bug。
+    /// Execute all pending Effects with a drain loop (batching stays on during flush).
+    /// New Signal changes inside an Effect queue more Effects. Loop until empty or the
+    /// 1024-iteration
+    /// limit. At the limit: panic (debug) / error log (release), never silent discard, since it
+    /// indicates a real circular dependency bug.
     fn flush(self: *BatchContext, owner: anytype) void {
         const max_iterations: u32 = 1024;
         var iteration: u32 = 0;
@@ -83,17 +78,17 @@ pub const BatchContext = struct {
         while (self.pending_effects.items.len > 0 and iteration < max_iterations) {
             iteration += 1;
 
-            // 保持 batching 开启，让 flush 中产生的新 Effect 进入队列
+            // Keep batching on; new Effects during flush enter queue.
             self.is_batching = true;
 
-            // 快照当前队列长度，只执行本轮已有的 Effect
+            // Snapshot current queue length; execute only Effects from this round.
             const count = self.pending_effects.items.len;
             for (self.pending_effects.items[0..count]) |effect| {
                 effect.is_queued = false;
                 effect.runWithTracking(owner, self.allocator);
             }
 
-            // 移除已执行的（可能有新 Effect 被追加到末尾）
+            // Remove executed Effects (new ones may be appended).
             if (self.pending_effects.items.len > count) {
                 std.mem.copyForwards(
                     *EffectBase,
@@ -109,8 +104,8 @@ pub const BatchContext = struct {
         self.is_batching = false;
 
         if (iteration >= max_iterations and self.pending_effects.items.len > 0) {
-            // 真正的循环依赖；不静默丢，给开发者一个清晰错误。
-            // debug：panic；release：高严重日志 + 清队列防死循环（非静默）。
+            // True circular dependency; not silent discard, clear error for developer.
+            // Debug: panic; release: severe log + clear queue to prevent deadloop (not silent).
             if (std.debug.runtime_safety) {
                 std.debug.panic(
                     "[reactive.BatchContext] flush did not converge after {d} iterations, {d} effects pending — likely cyclic dependency",
@@ -130,7 +125,7 @@ pub const BatchContext = struct {
     }
 };
 
-// ===== 测试 =====
+// ===== Tests =====
 
 test "BatchContext: init/deinit" {
     var ctx = BatchContext.init(std.testing.allocator);
@@ -148,19 +143,19 @@ test "BatchContext: nesting" {
     try std.testing.expect(ctx.is_batching == true);
     try std.testing.expectEqual(@as(u32, 1), ctx.nesting_level);
 
-    try ctx.begin(); // 嵌套
+    try ctx.begin(); // Nested batches
     try std.testing.expectEqual(@as(u32, 2), ctx.nesting_level);
 
-    // 模拟 owner (简化测试)
+    // Mock owner (simplified test)
     var mock_owner = struct {
         current_effect: ?*EffectBase = null,
     }{};
 
     ctx.end(&mock_owner);
-    try std.testing.expect(ctx.is_batching == true); // 还在批量模式
+    try std.testing.expect(ctx.is_batching == true); // Still in batch mode
     try std.testing.expectEqual(@as(u32, 1), ctx.nesting_level);
 
     ctx.end(&mock_owner);
-    try std.testing.expect(ctx.is_batching == false); // 退出批量模式
+    try std.testing.expect(ctx.is_batching == false); // Exited batch mode
     try std.testing.expectEqual(@as(u32, 0), ctx.nesting_level);
 }

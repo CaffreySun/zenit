@@ -15,11 +15,11 @@ uint8_t* macos_load_image_from_url(const char* url_cstr,
 
         NSData *data = nil;
         if ([urlString hasPrefix:@"file://"]) {
-            // 本地文件：直接读取（支持相对和绝对路径）
+            // local file: read directly (supports relative and absolute paths)
             NSString *path = [urlString substringFromIndex:7];
             data = [NSData dataWithContentsOfFile:path];
         } else {
-            // 远程 URL：通过网络下载
+            // remote URL: download via network
             NSURL *url = [NSURL URLWithString:urlString];
             if (!url) return NULL;
 
@@ -93,8 +93,7 @@ void macos_free_image_data(uint8_t* data) {
     free(data);
 }
 
-/// 将 RGBA8 像素写入 PNG 文件。
-/// 返回 0 成功，-1 参数错误，-2 编码失败，-3 写盘失败。
+/// write RGBA8 pixels to PNG file. returns 0 success, -1 param error, -2 encode fail, -3 disk fail.
 int macos_write_png_from_rgba(
     const char* path_cstr,
     const uint8_t* rgba,
@@ -109,7 +108,7 @@ int macos_write_png_from_rgba(
         if (!path || path.length == 0) return -1;
 
         unsigned char *planes[5] = {0};
-        planes[0] = (unsigned char *)rgba; // NSBitmapImageRep 不会拷贝，调用方需保证内存在函数返回前有效
+        planes[0] = (unsigned char *)rgba; // NSBitmapImageRep doesn't copy, caller must ensure memory valid before function return
         NSBitmapImageRep *rep = [[NSBitmapImageRep alloc]
             initWithBitmapDataPlanes:planes
                           pixelsWide:(NSInteger)width
@@ -123,9 +122,9 @@ int macos_write_png_from_rgba(
                         bitsPerPixel:32];
         if (!rep) return -2;
 
-        // 解码端(macos_decode_image_file)输出的是 sRGB 像素;这里必须
-        // 同样打 sRGB 标签,否则解码→编码往返会叠加一次 GenericRGB↔sRGB
-        // 转换,像素值逐次漂移(整图褪色)。retag 只换标签不动像素。
+        // decode side (macos_decode_image_file) outputs sRGB pixels; must tag sRGB here too, else
+        // decode->encode roundtrip stacks one GenericRGB<->sRGB conversion, pixel values drift
+        // (image fades). retag only changes tag, not pixels.
         rep = [rep bitmapImageRepByRetaggingWithColorSpace:[NSColorSpace sRGBColorSpace]];
         if (!rep) return -2;
 
@@ -138,9 +137,9 @@ int macos_write_png_from_rgba(
     }
 }
 
-// ===== 异步下载 + 文件解码（后台线程调用）=====
+// ===== async download + file decode (background thread) =====
 
-/// 解码内存数据到 RGBA（内部共用逻辑）
+/// decode memory data to RGBA (internal shared logic)
 static uint8_t* decode_image_data_to_rgba(NSData *data,
                                            uint32_t* out_width,
                                            uint32_t* out_height) {
@@ -198,8 +197,8 @@ static uint8_t* decode_image_data_to_rgba(NSData *data,
     return pixels;
 }
 
-/// 使用 NSURLSession 下载图片到磁盘文件（后台线程调用，阻塞当前线程）
-/// 返回: 0 成功, -1 网络错误, -2 文件写入错误
+/// download image to disk file via NSURLSession (background thread, blocks current thread). returns
+/// 0 success, -1 network error, -2 file write error
 int macos_download_image_to_file(const char* url_cstr, const char* dest_path) {
     @autoreleasepool {
         if (!url_cstr || !dest_path) return -1;
@@ -210,7 +209,7 @@ int macos_download_image_to_file(const char* url_cstr, const char* dest_path) {
 
         NSString *destString = [NSString stringWithUTF8String:dest_path];
 
-        // 使用 dispatch_semaphore 使异步 NSURLSession 在后台线程上同步等待
+        // use dispatch_semaphore to make async NSURLSession wait synchronously on background thread
         __block NSData *downloadedData = nil;
         __block NSError *downloadError = nil;
         dispatch_semaphore_t sem = dispatch_semaphore_create(0);
@@ -229,7 +228,7 @@ int macos_download_image_to_file(const char* url_cstr, const char* dest_path) {
             if (error) {
                 downloadError = error;
             } else {
-                // 检查 HTTP 状态码
+                // check HTTP status code
                 if ([response isKindOfClass:[NSHTTPURLResponse class]]) {
                     NSInteger statusCode = ((NSHTTPURLResponse *)response).statusCode;
                     if (statusCode >= 400) {
@@ -245,7 +244,7 @@ int macos_download_image_to_file(const char* url_cstr, const char* dest_path) {
         }];
         [task resume];
 
-        // 等待完成（在后台线程阻塞可以接受）
+        // wait for completion (blocking on background thread acceptable)
         dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
         [session finishTasksAndInvalidate];
 
@@ -253,7 +252,7 @@ int macos_download_image_to_file(const char* url_cstr, const char* dest_path) {
             return -1;
         }
 
-        // 先写到临时文件，再 atomic rename
+        // write to temp file first, then atomic rename
         NSString *tmpPath = [destString stringByAppendingString:@".tmp"];
         if (![downloadedData writeToFile:tmpPath atomically:NO]) {
             return -2;
@@ -261,7 +260,7 @@ int macos_download_image_to_file(const char* url_cstr, const char* dest_path) {
 
         NSError *moveError = nil;
         NSFileManager *fm = [NSFileManager defaultManager];
-        // 如果目标已存在则先删除
+        // delete target if already exists
         [fm removeItemAtPath:destString error:nil];
         if (![fm moveItemAtPath:tmpPath toPath:destString error:&moveError]) {
             [fm removeItemAtPath:tmpPath error:nil];
@@ -272,8 +271,8 @@ int macos_download_image_to_file(const char* url_cstr, const char* dest_path) {
     }
 }
 
-/// 从文件解码为 RGBA（后台线程调用）
-/// 返回 malloc'd RGBA buffer，调用者需通过 macos_free_image_data 释放
+/// decode file to RGBA (background thread). returns malloc'd RGBA buffer, caller frees via
+/// macos_free_image_data
 uint8_t* macos_decode_image_file(const char* file_path,
                                   uint32_t* out_width,
                                   uint32_t* out_height) {
@@ -286,7 +285,7 @@ uint8_t* macos_decode_image_file(const char* file_path,
     }
 }
 
-/// 用系统默认应用（浏览器）打开 URL。返回 1=ok / 0=fail
+/// open URL in default app (browser). returns 1=ok / 0=fail
 int macos_open_url(const char* url) {
     if (!url) return 0;
     @autoreleasepool {
@@ -299,12 +298,12 @@ int macos_open_url(const char* url) {
     }
 }
 
-// ===== 剪贴板图片读取 =====
+// ===== clipboard image read =====
 //
-// 类型优先级（探测顺序，直接决定粘贴成功率）：
-//   public.png → public.jpeg → public.heic → public.tiff（macOS 截图工具常给 TIFF）
-//   → public.file-url（Finder 复制文件，扩展名过滤图片）
-// 优先取原始编码字节；不走 NSImage（会丢原始编码，重编码有损且膨胀）。
+// Type priority (probe order, directly decides paste success):
+// public.png -> public.jpeg -> public.heic -> public.tiff (macOS screenshot tool often
+// gives TIFF) -> public.file-url (Finder copy; filter by image extension).
+// Prefer raw encoded bytes; avoid NSImage (loses encoding, lossy bloated re-encode).
 
 static NSArray<NSString *> *clipboardImageDataTypes(void) {
     return @[ @"public.png", @"public.jpeg", @"public.heic", @"public.tiff" ];
@@ -312,9 +311,9 @@ static NSArray<NSString *> *clipboardImageDataTypes(void) {
 
 static BOOL pathExtensionLooksLikeImage(NSString *ext) {
     if (ext.length == 0) return NO;
-    // 不用 dispatch_once：其内联宏会触发 Zig Debug 构建的 UBSan
-    // invalid-builtin 检查，剪贴板含 file-url 时直接 panic（下游回归）。
-    // 剪贴板 API 只在主线程调用，平凡懒初始化足够。
+    // don't use dispatch_once: its inline macro triggers UBSan invalid-builtin check in Zig Debug
+    // build, panics on pasteboard file-url (downstream regression). pasteboard API only called on
+    // main thread, simple lazy init sufficient.
     static NSSet<NSString *> *exts = nil;
     if (!exts) {
         exts = [[NSSet alloc] initWithArray:@[ @"png", @"jpg", @"jpeg", @"heic", @"heif",
@@ -323,7 +322,8 @@ static BOOL pathExtensionLooksLikeImage(NSString *ext) {
     return [exts containsObject:ext.lowercaseString];
 }
 
-/// 取第 index 个含图片的剪贴板项的原始字节。outUti 返回 UTI（file-url 项返回扩展名推断的描述）。
+/// get raw bytes of index-th image-containing pasteboard item. outUti returns UTI (file-url item
+/// returns extension-inferred description).
 static NSData *clipboardImageDataAtIndex(uint32_t index, NSString **outUti) {
     NSPasteboard *pb = [NSPasteboard generalPasteboard];
     uint32_t seen = 0;
@@ -357,8 +357,8 @@ static NSData *clipboardImageDataAtIndex(uint32_t index, NSString **outUti) {
     return nil;
 }
 
-/// 兜底：pasteboard 项没有原始图片字节时，试着让 NSImage 解释整个剪贴板
-/// （只对 index 0 生效），转 TIFF 交给通用解码。有损/膨胀，故仅作最后手段。
+/// fallback: when pasteboard item has no raw image bytes, try NSImage to interpret whole pasteboard
+/// (index 0 only), convert to TIFF for generic decode. lossy/bloated, last resort only.
 static NSData *clipboardImageDataViaNSImage(void) {
     NSPasteboard *pb = [NSPasteboard generalPasteboard];
     if (![NSImage canInitWithPasteboard:pb]) return nil;
@@ -367,7 +367,8 @@ static NSData *clipboardImageDataViaNSImage(void) {
     return [img TIFFRepresentation];
 }
 
-/// 探测剪贴板可提供的类型（位掩码：1=text, 2=image, 4=file_urls）。不解码，成本极低。
+/// probe pasteboard available types (bitmask: 1=text, 2=image, 4=file_urls). no decode, negligible
+/// cost.
 uint32_t macos_clipboard_probe(void) {
     @autoreleasepool {
         NSPasteboard *pb = [NSPasteboard generalPasteboard];
@@ -384,13 +385,13 @@ uint32_t macos_clipboard_probe(void) {
                 if (url.isFileURL && pathExtensionLooksLikeImage(url.pathExtension)) kinds |= 2;
             }
         }
-        // NSImage 兜底：某些应用只放非标准图片类型
+        // NSImage fallback: some apps only put non-standard image types
         if (!(kinds & 2) && [NSImage canInitWithPasteboard:pb]) kinds |= 2;
         return kinds;
     }
 }
 
-/// 剪贴板中的图片项数（支持 Finder 多选复制）
+/// count of image items in pasteboard (supports Finder multi-select copy)
 uint32_t macos_clipboard_image_count(void) {
     @autoreleasepool {
         NSPasteboard *pb = [NSPasteboard generalPasteboard];
@@ -409,14 +410,15 @@ uint32_t macos_clipboard_image_count(void) {
             }
             if (has) count++;
         }
-        // NSImage 兜底：原始字节路径全空但剪贴板整体可作图片解释时算 1 项
+        // NSImage fallback: count 1 if no raw byte path but pasteboard as whole can be interpreted
+        // as image
         if (count == 0 && [NSImage canInitWithPasteboard:pb]) count = 1;
         return count;
     }
 }
 
-/// 读取第 index 项并解码为 RGBA8（premultiplied）。
-/// 返回 malloc'd buffer，调用方用 macos_free_image_data() 释放。
+/// read index-th item and decode to RGBA8 (premultiplied). returns malloc'd buffer, caller frees
+/// with macos_free_image_data().
 uint8_t *macos_clipboard_read_image(uint32_t index, uint32_t *out_width, uint32_t *out_height) {
     @autoreleasepool {
         if (!out_width || !out_height) return NULL;
@@ -427,7 +429,7 @@ uint8_t *macos_clipboard_read_image(uint32_t index, uint32_t *out_width, uint32_
     }
 }
 
-/// 写入 PNG 图片到剪贴板（清空原内容）。返回 1=ok / 0=fail。
+/// write PNG image to pasteboard (clear original). returns 1=ok / 0=fail.
 int macos_clipboard_set_image_png(const uint8_t *bytes, size_t len) {
     @autoreleasepool {
         if (!bytes || len == 0) return 0;
@@ -438,9 +440,9 @@ int macos_clipboard_set_image_png(const uint8_t *bytes, size_t len) {
     }
 }
 
-/// 读取第 index 项的原始编码字节（不解码），用于原样归档。
-/// 返回 malloc'd buffer，调用方用 macos_free_image_data() 释放。
-/// uti_buf（可为 NULL）写入 NUL 结尾的 UTI 字符串。
+/// read index-th item's raw encoded bytes (no decode), for as-is archival. returns malloc'd buffer,
+/// caller frees with macos_free_image_data(). uti_buf (may be NULL) writes NUL-terminated UTI
+/// string.
 uint8_t *macos_clipboard_read_image_bytes(uint32_t index, size_t *out_len,
                                           char *uti_buf, size_t uti_buf_len) {
     @autoreleasepool {

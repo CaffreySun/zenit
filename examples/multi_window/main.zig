@@ -1,104 +1,48 @@
-/// multi_window，两个真原生窗口并存的 demo（多窗口交付验证）
+/// multi_window: demo of two true native windows coexisting
 ///
-/// 验证点：
-///   - `MultiWindowApp` 管理两个窗口（各自 Window/GPU surface/SystemSdk/Cx）
-///   - Cx.init 并发守卫已拆：第二个 Cx.init 不 panic
-///   - 事件按 window 路由：各窗口的按钮各自计数，互不串扰
-///   - 文本测量 per-App context：两窗口字体独立测量
-///   - a11y C ABI 按 window_id 路由（初始化即注册，不互相覆盖）
-///   - 关闭 A 后 B 继续泵事件/渲染；关闭最后一个窗口才退出
+/// Verification points:
+///   - `MultiWindowApp` manages two windows (each Window/GPU surface/SystemSdk/Cx)
+///   - Second Cx.init doesn't panic (no concurrency guard)
+///   - Events route per window: each window's button counts independently, no cross-talk
+///   - Text measure is per-App context: two windows measure fonts independently
+///   - a11y C ABI routes per window_id (registered at init, no mutual override)
+///   - Close A, B continues pump/render; closing the last window exits
 ///
-/// 主循环由公开 `MultiWindowApp.run()` 驱动：第一个窗口的 pump 可阻塞，
-/// 其余窗口非阻塞 drain，事件与菜单命令按原生 window_id 路由。
+/// Main loop is driven by public `MultiWindowApp.run()`: first window pump can block, other windows
+/// drain non-blocking, events and menu commands route per native window_id.
 ///
-/// 冒烟验证：ZENIT_SMOKE_FRAMES=N 跑 N 帧后自动退出（exit 0），供脚本/CI 断言
-/// 「两个窗口都真正渲染过」而无需人工关窗。
+/// Each window's UI is in view.yix (`WindowUi`, props distinguish A/B).
+///
+/// Smoke test: ZENIT_SMOKE_FRAMES=N runs N frames then auto-exits (exit 0), so scripts/CI can
+/// assert "both windows truly rendered" without manual close.
 const std = @import("std");
 const ui = @import("ui");
 const zenit_app = @import("zenit_app");
 const MultiWindowApp = zenit_app.MultiWindowApp;
-
-const Padding = ui.Padding;
-
-const Counter = struct {
-    n: u32 = 0,
-    label: ?*ui.Node = null,
-    buf: [64]u8 = undefined,
-    tag: []const u8 = "?",
-
-    pub fn increment(self: *Counter) void {
-        self.n += 1;
-        const node = self.label orelse return;
-        const content = std.fmt.bufPrint(&self.buf, "[{s}] clicked {d} times", .{ self.tag, self.n }) catch return;
-        if (node.getText()) |old| {
-            var t = old;
-            t.content = content;
-            node.setText(t);
-        }
-        node.markRenderDirty();
-    }
-};
-
-fn buildWindowUi(cx: *ui.Cx, scope: *ui.Scope, comptime tag: []const u8, comptime heading: []const u8) !*ui.Node {
-    const allocator = cx.allocator;
-
-    const counter = try cx.bindState(Counter, .{ .tag = tag });
-    const click = cx.on(Counter, counter, Counter.increment);
-    _ = scope;
-
-    const root = try ui.box(cx, .{
-        .width = .fill(),
-        .height = .fill(),
-        .direction = .column,
-        .gap = 16,
-        .padding = Padding.all(40),
-        .background = cx.tokens.color.bg_primary,
-        .align_items = .center,
-        .justify = .center,
-    }, .{});
-
-    try root.appendChild(allocator, try ui.text(cx, heading, .{
-        .font_size = 24,
-        .font_weight = 600,
-        .color = cx.tokens.color.fg_primary,
-    }));
-
-    try root.appendChild(allocator, try ui.widgets.Button(.{
-        .label = "Click me (" ++ tag ++ ")",
-        .variant = .primary,
-        .on_click = click,
-    }).mount(cx.root_scope.?, cx));
-
-    const label = try ui.text(cx, "[" ++ tag ++ "] clicked 0 times", .{
-        .font_size = 14,
-        .color = cx.tokens.color.fg_secondary,
-    });
-    counter.label = label;
-    try root.appendChild(allocator, label);
-
-    return root;
-}
+const WindowUi = @import("_view.yix.zig").WindowUi;
 
 fn mountWindowA(cx: *ui.Cx, scope: *ui.Scope) anyerror!*ui.Node {
-    return buildWindowUi(cx, scope, "A", "zenit multi-window: A");
+    return ui.view.render(scope, cx, WindowUi(.{ .tag = "A", .heading = "zenit multi-window: A", .button = "Click me (A)" }));
 }
 
 fn mountWindowB(cx: *ui.Cx, scope: *ui.Scope) anyerror!*ui.Node {
-    return buildWindowUi(cx, scope, "B", "zenit multi-window: B");
+    return ui.view.render(scope, cx, WindowUi(.{ .tag = "B", .heading = "zenit multi-window: B", .button = "Click me (B)" }));
 }
 
-fn verifyApplicationQuitContract(allocator: std.mem.Allocator) !void {
+fn verifyApplicationQuitContract(allocator: std.mem.Allocator, io: std.Io) !void {
     var application = MultiWindowApp.init(allocator, .{ .pump_timeout_ms = 0 });
     defer application.deinit();
 
     // Exercise both public creation styles in the real native lifecycle.
     const app_a = try application.createWindow(.{
+        .io = io,
         .window = .{ .width = 420, .height = 300, .title = "zenit quit-contract A" },
         .frame_pacing = .poll,
         .idle_skip_frames = false,
     });
     try app_a.mount(mountWindowA);
     const app_b = try application.createWindowWith(.{
+        .io = io,
         .window = .{ .width = 420, .height = 300, .title = "zenit quit-contract B" },
         .frame_pacing = .poll,
         .idle_skip_frames = false,
@@ -123,14 +67,14 @@ fn verifyApplicationQuitContract(allocator: std.mem.Allocator) !void {
         return error.QuitDestroyedWindowsEarly;
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+pub fn main(init: std.process.Init) !void {
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
     const smoke_frames: ?u64 = blk: {
-        const v = std.posix.getenv("ZENIT_SMOKE_FRAMES") orelse break :blk null;
-        break :blk std.fmt.parseInt(u64, v, 10) catch null;
+        const env = @import("zenit_environment").getBorrowed("ZENIT_SMOKE_FRAMES") orelse break :blk null;
+        break :blk std.fmt.parseInt(u64, env, 10) catch null;
     };
     const frame_pacing: zenit_app.runtime.FramePacing = if (smoke_frames != null) .poll else .display_link;
     const idle_skip_frames = smoke_frames == null;
@@ -139,12 +83,14 @@ pub fn main() !void {
     defer application.deinit();
 
     const app_a = try application.createWindowWith(.{
+        .io = init.io,
         .window = .{ .width = 520, .height = 380, .title = "zenit A" },
         .frame_pacing = frame_pacing,
         .idle_skip_frames = idle_skip_frames,
     }, mountWindowA);
 
     const app_b = try application.createWindowWith(.{
+        .io = init.io,
         .window = .{ .width = 520, .height = 380, .title = "zenit B" },
         .frame_pacing = frame_pacing,
         .idle_skip_frames = idle_skip_frames,
@@ -181,7 +127,7 @@ pub fn main() !void {
             return error.LastWindowDidNotExit;
         std.log.info("[multi_window] last-window exit ok: native=0", .{});
 
-        try verifyApplicationQuitContract(allocator);
+        try verifyApplicationQuitContract(allocator, init.io);
         if (MultiWindowApp.nativeWindowCount() != 0) return error.ApplicationQuitCleanupFailed;
         std.log.info("[multi_window] app-quit cleanup ok: create styles + activation + native=0", .{});
         return;

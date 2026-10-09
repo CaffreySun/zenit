@@ -49,5 +49,5 @@ test "IME text owns exact bytes across inline boundary filtering moves and alloc
         try t.expectEqualSlices(u8, input[0..moved.len], moved.text());
     }
     var failing = t.FailingAllocator.init(t.allocator, .{ .fail_index = 0 });
-    try t.expectError(error.OutOfMemory, ImeText.init(failing.allocator(), "x" ** 257));
+    try t.expectError(error.OutOfMemory, ImeText.init(failing.allocator(), (@as([("x").len * (257)]u8, @bitCast(@as([257][("x").len]u8, @splat(("x").*)))) ++ "")));
 }

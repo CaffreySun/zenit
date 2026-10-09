@@ -1,25 +1,25 @@
-/// Timeline, GSAP 风格时间线编排
+/// Timeline: GSAP-style timeline orchestration
 ///
-/// 时间线容器，支持灵活的相对定位 (Position 参数)，
-/// 统一播放控制 (play/pause/seek/reverse/timeScale)，
-/// 嵌套时间线和标签定位。
+/// Timeline container supporting flexible relative positioning (Position param),
+/// unified playback control (play/pause/seek/reverse/timeScale),
+/// nested timelines and label positioning.
 ///
-/// 用法:
+/// Usage:
 /// ```zig
 /// var tl = Timeline.init(allocator);
 /// defer tl.deinit();
 ///
-/// // 编排动画
-/// try tl.add(&fade_in, Position.start);           // 0s 开始
-/// try tl.add(&slide_up, Position.with);            // 同时开始 ("<")
-/// try tl.add(&scale_bounce, .{ .after_prev = 0.1 }); // 上一个结束后 0.1s (">+0.1")
+/// // arrange animations
+/// try tl.add(&fade_in, Position.start);           // start at 0s
+/// try tl.add(&slide_up, Position.with);            // start together ("<")
+/// try tl.add(&scale_bounce, .{ .after_prev = 0.1 }); // 0.1s after prev ends (">+0.1")
 ///
-/// // 标签定位
+/// // label positioning
 /// try tl.addLabel("phase2");
 /// try tl.add(&color_change, .{ .at_label = .{ .name = "phase2", .offset = 0 } });
 ///
 /// tl.play();
-/// // 每帧:
+/// // per frame:
 /// if (tl.tick(dt)) requestRedraw();
 /// ```
 const std = @import("std");
@@ -31,25 +31,25 @@ const PlayState = ctrl_mod.PlayState;
 const CallbackFn = ctrl_mod.CallbackFn;
 const render_engine = @import("../core/render_engine/mod.zig");
 
-/// 时间线定位参数，GSAP 风格的相对定位
+/// Timeline positioning parameter, GSAP-style relative positioning.
 pub const Position = union(enum) {
-    /// 绝对时间（秒）
+    /// Absolute time (seconds).
     absolute: f32,
-    /// 上一个条目结束后偏移 (">" 语义)
+    /// Offset after previous entry ends (">" semantics).
     after_prev: f32,
-    /// 与上一个条目同时开始偏移 ("<" 语义)
+    /// Offset starting together with previous entry ("<" semantics).
     with_prev: f32,
-    /// 标签定位 + 偏移
+    /// Label positioning + offset.
     at_label: struct { name: []const u8, offset: f32 = 0 },
-    /// 从当前末尾偏移（默认行为）
+    /// Offset from current end (default behavior).
     append: f32,
 
-    // 常用常量
-    /// 时间线起点 (0s)
+    // Common constants.
+    /// Timeline start (0s).
     pub const start = Position{ .absolute = 0 };
-    /// 上一个结束后立即开始 (">")
+    /// Start immediately after previous (">")
     pub const after = Position{ .after_prev = 0 };
-    /// 与上一个同时开始 ("<")
+    /// Start together with previous ("<")
     pub const with = Position{ .with_prev = 0 };
 };
 
@@ -127,12 +127,12 @@ const PlaybackConfig = struct {
     }
 };
 
-/// 时间线上的一个条目
+/// An entry on the timeline.
 pub const TimelineEntry = struct {
-    /// 动画控制器
+    /// Animation controller.
     controller: *AnimationController,
     registration: ?*ControllerRegistration = null,
-    /// 在 timeline 中的起始时间（秒）
+    /// Start time in timeline (seconds).
     start_time: f32,
     /// Complete configured lifetime, including a live replacement's held prefix.
     /// Unbounded entries use inf. Positions are resolved once at insertion.
@@ -142,19 +142,19 @@ pub const TimelineEntry = struct {
     /// before it holds the replacement's initial value; discarded history is not replayed.
     trajectory_offset: f32 = 0,
     initial_direction: f32 = 1,
-    /// 是否已启动
+    /// Whether started.
     started: bool = false,
     last_clock_ms: f64 = 0,
     last_timeline_time: f32 = 0,
 };
 
-/// 标签
+/// Label.
 const Label = struct {
     name: []const u8,
     time: f32,
 };
 
-/// GSAP 风格时间线
+/// GSAP-style timeline.
 pub const Timeline = struct {
     manager_registrations: ?*@import("manager.zig").Registration = null,
     lifetime_scope: ?*Scope = null,
@@ -165,10 +165,10 @@ pub const Timeline = struct {
     disposed: bool = false,
     control_revision: u64 = 0,
     allocator: Allocator,
-    entries: std.ArrayListUnmanaged(TimelineEntry) = .{},
-    labels: std.ArrayListUnmanaged(Label) = .{},
+    entries: std.ArrayListUnmanaged(TimelineEntry) = .empty,
+    labels: std.ArrayListUnmanaged(Label) = .empty,
 
-    /// 时间线总时长（自动计算）
+    /// Timeline total duration (auto-computed).
     total_duration: f32 = 0,
     /// Invalid live configuration holds scheduling until repaired. refresh()
     /// returns the same error; no partial duration/phase update is committed.
@@ -176,23 +176,23 @@ pub const Timeline = struct {
     /// Reversing an unbounded schedule captures the finite observed extent.
     /// Parent repeat/yoyo uses this window; manual forward/stop clears it.
     reverse_extent: ?f32 = null,
-    /// 当前播放时间
+    /// Current playhead time.
     current_time: f32 = 0,
     pause_time_ms: f64 = 0,
     seek_on_play: bool = false,
 
-    /// 播放状态
+    /// Playback state.
     play_state: PlayState = .idle,
-    /// 播放方向
+    /// Playback direction.
     direction: f32 = 1.0,
-    /// 时间缩放
+    /// Time scale.
     time_scale: f32 = 1.0,
-    /// 循环配置
+    /// Loop configuration.
     loops: u32 = 1,
     yoyo: bool = false,
     current_loop: u32 = 0,
 
-    /// 回调
+    /// Callbacks.
     on_complete: ?CallbackFn = null,
     on_complete_ctx: ?*anyopaque = null,
 
@@ -217,19 +217,19 @@ pub const Timeline = struct {
         }
         self.entries.deinit(self.allocator);
         self.labels.deinit(self.allocator);
-        self.entries = .{};
-        self.labels = .{};
+        self.entries = .empty;
+        self.labels = .empty;
     }
 
-    // ============ 编排 ============
+    // ============ Composition ============
 
+    /// Add animation to timeline.
     /// Hook controllers automatically detach when their Scope is disposed.
     /// Other controllers are borrowed until remove() or deinit(). Keep both
     /// objects at stable addresses while linked; raw copies do not transfer links.
     /// A controller can appear in only one entry across all Timelines; conflicting
     /// borrows return ControllerAlreadyScheduled before changing either schedule.
     /// Appends during tick are visited starting with the next tick.
-    /// 添加动画到时间线
     pub fn add(self: *Timeline, ctrl: *AnimationController, position: Position) !void {
         if (self.disposed or self.scopeIsRetiring()) return error.TimelineDisposed;
         if (ctrl.isScopeRetiring()) return error.AnimationDisposed;
@@ -298,7 +298,7 @@ pub const Timeline = struct {
         }
     }
 
-    /// 添加标签
+    /// Add label.
     pub fn addLabel(self: *Timeline, name: []const u8) !void {
         if (self.disposed or self.scopeIsRetiring()) return error.TimelineDisposed;
         try self.refresh();
@@ -368,14 +368,16 @@ pub const Timeline = struct {
         return true;
     }
 
-    /// 单条子动画的排程是否已与其 controller 的原始字段脱节（O(1)）。
-    /// prepareEntry 出错（非法时长）也算脱节，交给 syncSchedule 记 schedule_error。
+    /// Whether single sub-animation's schedule has decoupled from controller's original fields
+    /// (O(1)).
+    /// prepareEntry error (invalid duration) also counts as decoupled; syncSchedule records
+    /// schedule_error.
     fn entryScheduleStale(self: *const Timeline, entry: *const TimelineEntry) bool {
         const next = self.prepareEntry(entry) catch return true;
         return !std.meta.eql(next.timing, entry.timing) or next.duration != entry.duration;
     }
 
-    // ============ 播放控制 ============
+    // ============ Playback Control ============
 
     pub fn play(self: *Timeline) void {
         if (self.disposed or self.scopeIsRetiring()) return;
@@ -522,9 +524,9 @@ pub const Timeline = struct {
         self.play();
     }
 
-    // ============ 帧驱动 ============
+    // ============ Frame Driving ============
 
-    /// 推进时间线，返回 true 表示仍在播放
+    /// Advance timeline, return true if still playing.
     /// dt (seconds) drives both the playhead and child clocks. Wall-clock gaps
     /// are rebased out, including pauses at the manager level.
     /// Keep non-hook timelines at a stable address through callbacks. deinit()
@@ -585,8 +587,9 @@ pub const Timeline = struct {
         const bounded_window = self.reverse_extent != null;
         if (bounded_window) self.current_time = std.math.clamp(self.current_time, 0, playback_end);
         const reversing = self.direction < 0;
-        // 反向播放钳在 0（seek 同款下界）：无界负值会让所有 entry 的
-        // local_time < 0 恒判 any_active，完成检查永不可达（时间线永转）
+        // Reverse play clamps at 0 (seek's lower bound): unbounded negative values keep all
+        // entries'
+        // local_time < 0, completion check unreachable (timeline runs forever).
         if (reversing and self.current_time < 0) self.current_time = 0;
 
         var any_active = false;
@@ -602,13 +605,18 @@ pub const Timeline = struct {
         const guard = Guard{ .timeline = self, .revision = revision, .playback = PlaybackConfig.capture(self) };
         const initial_count = self.entries.items.len;
         var cleanup_dispatched = false;
-        // 某个子动画的用户回调跑过之后，后面的子动画在被触碰前要先核对自己的排程
-        //（回调可以直接改任意子动画的 duration/loops 等原始字段）。此前是每次回调后对整条
-        // Timeline 做一次全表 refresh, N 个真实 update 回调 = 每帧 N² 次 prepareEntry
-        //（基准：2048 条 18.1ms/tick）。现在改成"惰性逐条核对"：只对**接下来要处理的**那一条
-        // 做一次 prepareEntry 比对（O(1)），有变化才走完整 refresh（它会 bump control_revision、
-        // 让本次遍历失效，与旧语义一致）；没变化就一路 O(N)。已处理过的更早子动画若被改了，
-        // 下一帧开头的 syncSchedule 照旧接住（这一点与旧实现相同：它们本帧已经按旧排程发过样本）。
+        // After a sub-animation's user callback, following sub-animations must check their schedule
+        // before
+        // being touched (a callback can directly modify any sub-animation's duration/loops etc).
+        // Lazy
+        // per-entry check: prepareEntry compares only the **next-to-process** entry (O(1)); a full
+        // refresh
+        // runs only if it changed (bumps control_revision, invalidating this traversal); unchanged
+        // path is
+        // O(N). A full refresh after every callback would cost N^2 prepareEntry per frame. Earlier
+        // sub-animations modified later are caught by syncSchedule at the next frame start (they
+        // already
+        // sampled the old schedule this frame).
         var callback_seen = false;
         var i: usize = 0;
         while (i < initial_count) : (i += 1) {
@@ -749,7 +757,8 @@ pub const Timeline = struct {
         if (self.ownerDisposalPending()) return true;
         if (!allow_loop) return self.isActive();
 
-        // 完成边界：正向到 total_duration、反向退到 0（镜像检查）
+        // Completion boundary: forward reaches total_duration, reverse retreats to 0 (mirror
+        // check).
         if (!reversing and self.current_time >= playback_end and !any_active) {
             return self.handleComplete(now_ms, @max(0, cycleMilliseconds(next_time) - cycleMilliseconds(playback_end)));
         }
@@ -785,17 +794,17 @@ pub const Timeline = struct {
         return scope.owner.deferred_disposals.head != null;
     }
 
-    /// 是否正在播放
+    /// Whether currently playing.
     pub fn isActive(self: *const Timeline) bool {
         return self.play_state == .playing;
     }
 
-    /// 是否已完成
+    /// Whether completed.
     pub fn isCompleted(self: *const Timeline) bool {
         return self.play_state == .completed;
     }
 
-    /// 当前进度 [0, 1]
+    /// Current progress [0, 1].
     pub fn progress(self: *const Timeline) f32 {
         const duration = self.playbackDuration();
         if (duration <= 0) return 1.0;
@@ -803,7 +812,7 @@ pub const Timeline = struct {
         return std.math.clamp(self.current_time / duration, 0, 1);
     }
 
-    // ============ 内部 ============
+    // ============ Internal ============
 
     fn handleComplete(self: *Timeline, now_ms: f64, overshoot: f64) bool {
         const playback_duration = self.playbackDuration();
@@ -968,13 +977,13 @@ pub const Timeline = struct {
         for (self.labels.items) |label| {
             if (std.mem.eql(u8, label.name, name)) return label.time;
         }
-        return self.total_duration; // 找不到则返回末尾
+        return self.total_duration; // return end if not found.
     }
 };
 
-// ========== 测试 ==========
+// ========== Tests ==========
 
-/// 测试辅助：设置全局模拟时间
+/// Test helper: set global mock time.
 fn setTestTime(ms: f64) void {
     render_engine.current_frame_time_ms = ms;
     render_engine.current_frame_dt_ms = 1000.0 / 60.0;
@@ -989,13 +998,13 @@ test "Timeline: sequence (default append)" {
     defer tl.deinit();
 
     try tl.add(&ctrl1, Position.start);
-    try tl.add(&ctrl2, Position.after); // 上一个结束后
+    try tl.add(&ctrl2, Position.after); // after previous ends.
 
     try std.testing.expectApproxEqAbs(@as(f32, 0.8), tl.total_duration, 0.001);
 
     tl.play();
 
-    // 运行到完成
+    // Run to completion.
     const dt: f32 = 1.0 / 60.0;
     var now: f64 = 1000.0;
     var i: usize = 0;
@@ -1019,14 +1028,14 @@ test "Timeline: parallel (with_prev)" {
     defer tl.deinit();
 
     try tl.add(&ctrl1, Position.start);
-    try tl.add(&ctrl2, Position.with); // 同时开始
+    try tl.add(&ctrl2, Position.with); // start together.
 
-    // 两个同时，总时长应为 0.5
+    // Both simultaneous, total duration should be 0.5.
     try std.testing.expectApproxEqAbs(@as(f32, 0.5), tl.total_duration, 0.001);
 
     tl.play();
 
-    // 运行 0.25s，两个都应该在中途
+    // Run 0.25s, both should be midway.
     const dt: f32 = 1.0 / 60.0;
     var now: f64 = 1000.0;
     for (0..15) |_| {
@@ -1048,8 +1057,8 @@ test "Timeline: stagger (incremental after_prev)" {
     defer tl.deinit();
 
     try tl.add(&ctrl1, Position.start);
-    try tl.add(&ctrl2, .{ .after_prev = -0.1 }); // 0.1s 重叠
-    try tl.add(&ctrl3, .{ .after_prev = -0.1 }); // 0.1s 重叠
+    try tl.add(&ctrl2, .{ .after_prev = -0.1 }); // 0.1s overlap.
+    try tl.add(&ctrl3, .{ .after_prev = -0.1 }); // 0.1s overlap.
 
     // ctrl1: 0..0.2, ctrl2: 0.1..0.3, ctrl3: 0.2..0.4
     try std.testing.expectApproxEqAbs(@as(f32, 0.4), tl.total_duration, 0.001);
@@ -1066,7 +1075,7 @@ test "Timeline: label positioning" {
     try tl.addLabel("midpoint");
     try tl.add(&ctrl2, .{ .at_label = .{ .name = "midpoint", .offset = 0.1 } });
 
-    // ctrl2 应该在 0.3(label) + 0.1(offset) = 0.4 开始
+    // ctrl2 should start at 0.3(label) + 0.1(offset) = 0.4.
     const entry2 = tl.entries.items[1];
     try std.testing.expectApproxEqAbs(@as(f32, 0.4), entry2.start_time, 0.001);
 }
@@ -1113,9 +1122,10 @@ test "Timeline: pause and unpause" {
 }
 
 test "Timeline: reverse 播到 0 必须完成，current_time 不越界为负" {
-    // 回归：reverse 后 current_time 无下界递减，local_time < 0 恒把
-    // any_active 钉 true，完成检查（>= total_duration and !any_active）
-    // 永不可达，时间线永转、重绘被钉死。
+    // Regression: after reverse, current_time unbounded negative, local_time < 0 always pins
+    // any_active=true, completion check (>= total_duration and !any_active) unreachable, timeline
+    // runs
+    // forever, redraw stuck.
     setTestTime(1000.0);
     var ctrl = AnimationController.initTween(.{ .from = 0, .to = 10, .duration = 0.5, .easing = .linear });
 
@@ -1124,7 +1134,7 @@ test "Timeline: reverse 播到 0 必须完成，current_time 不越界为负" {
     try tl.add(&ctrl, Position.start);
     tl.play();
 
-    // 正向推进到中途
+    // Forward advance to midway.
     const dt: f32 = 1.0 / 60.0;
     var now: f64 = 1000.0;
     var i: usize = 0;
@@ -1135,7 +1145,7 @@ test "Timeline: reverse 播到 0 必须完成，current_time 不越界为负" {
     }
     try std.testing.expect(tl.current_time > 0);
 
-    // 反向：有限步数内必须停下来（旧实现永转）
+    // Reverse: must stop in finite steps (old impl ran forever).
     tl.reverse();
     var still_active = true;
     i = 0;
@@ -1169,27 +1179,34 @@ test "Timeline: 回调改后面子动画的时长，后者在本帧被触碰前�
     var tl = Timeline.init(std.testing.allocator);
     defer tl.deinit();
     try tl.add(&a, Position.start);
-    try tl.add(&b, Position.start); // 与 a 并行，排在 a 之后遍历
+    try tl.add(&b, Position.start); // parallel with a, traversed after a.
     try std.testing.expectApproxEqAbs(@as(f32, 0.5), tl.total_duration, 0.001);
     tl.play();
 
-    // 第一帧：a 的 update 回调把 b 的 duration 从 0.3 改成 1.0。
-    // 旧实现：回调后全表 refresh；新实现：遍历到 b 之前只核对 b 这一条。两者都必须让 b 的排程在本帧就是 1.0，
-    // 且时长变化使本次遍历失效（control_revision 变），修前的"回调之后不同步"会让 b 先按 0.3 的排程走一帧。
+    // First frame: a's update callback changes b's duration from 0.3 to 1.0. Old impl: full table
+    // refresh after callback; new impl: before traversing b, check only b. Both must make b's
+    // schedule
+    // 1.0 this frame; duration change invalidates this traversal (control_revision changes); before
+    // fix
+    // 'unsync after callback' would sample b by 0.3 schedule first frame.
     const revision_before = tl.control_revision;
     setTestTime(1000.0 + 16.0);
     _ = tl.tick(0.016);
     try std.testing.expect(Edit.calls >= 1);
-    // 排程变化使本次遍历失效：b 在本帧**没有**被触碰（entry 的 duration/anchor 记账还是 0.3s 的旧排程，
-    // 而 controller 采样读的是改后的原始字段，两者脱节的那一帧不能发样本）。
-    // 负向实测：关掉惰性核对后 b 本帧被采样到 20 × 0.016 / 1.0 = 0.32；有同步（无论全表还是惰性）仍是 0。
+    // Schedule change invalidates this traversal: b **not** sampled this frame (entry's
+    // duration/anchor
+    // bookkeeping still 0.3s old schedule; controller sample-reads modified original fields;
+    // decoupled
+    // frame can't sample). Negative test: turning off lazy check, b samples this frame to 20 ×
+    // 0.016 /
+    // 1.0 = 0.32; with sync (full or lazy) stays 0.
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), b.value, 0.001);
     try std.testing.expect(!tl.entries.items[1].started);
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), tl.entries.items[1].duration, 0.001);
     try std.testing.expect(tl.control_revision != revision_before);
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), tl.total_duration, 0.001);
 
-    // 之后正常跑完：b 走满 1.0s 才完成（不是 0.3s）
+    // Later runs normally: b completes after full 1.0s (not 0.3s).
     var now: f64 = 1016.0;
     var i: usize = 0;
     while (tl.isActive() and i < 120) : (i += 1) {

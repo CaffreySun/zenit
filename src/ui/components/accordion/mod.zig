@@ -1,16 +1,18 @@
 /// Accordion / Collapsible Component
 ///
-/// 可折叠面板组件，支持展开/折叠动画
+/// Collapsible panel component with expand/collapse animation.
 ///
-/// 特性:
-/// - AccordionItem: header 标题 + content 展开内容
-/// - 点击 header 展开/折叠
-/// - max_height 插值 + overflow_hidden 实现平滑折叠动画
-/// - exclusive 模式: 一次只展开一个
-/// - on_change 回调
+/// Features:
+/// - AccordionItem: header title + expandable content
+/// - Click header to expand/collapse
+/// - max_height interpolation + overflow_hidden for smooth collapse animation
+/// - Signal-first: `expanded: Model(bool)`, `title: Source`; mutual expand via data:
+///   `Accordion(.{ .open = section })` + each `.expanded = try acc.item(i)`
+/// - on_change callback (after user action lands)
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const core = @import("../../core.zig");
+const view = @import("../../view.zig");
 const Cx = core.Cx;
 const Node = core.Node;
 const box = core.box;
@@ -24,21 +26,23 @@ const events = @import("../../events.zig");
 const Event = events.Event;
 const EventResult = events.EventResult;
 const svg_assets = @import("../../svg_assets.zig");
-const Scope = @import("../../reactive.zig").Scope;
+const reactive = @import("../../reactive.zig");
+const Scope = reactive.Scope;
+const Source = reactive.Source;
+const Model = reactive.Model;
+const Handler = core.Handler;
+const bind_mod = @import("../../bind.zig");
 const node_animator = @import("../../animation/node_animator.zig");
 const recipe_mod = @import("../../recipe.zig");
 const styles = @import("styles.zig");
 
-// ============================================================================
-// AccordionItemRecipe, recipe(variant) 统一 AccordionItem 样式
-//
-// variant 维度:
-//   - default: 填充背景 + 圆角，无边框
-//   - outline: 透明背景 + 1px 边框 + 圆角
-//   - ghost:   完全透明，无边框无圆角
-// ============================================================================
+// AccordionItemRecipe, recipe(variant) unifies AccordionItem styling.
+// variant dimension:
+//   - default: filled background + rounded corner, no border
+//   - outline: transparent background + 1px border + rounded corner
+//   - ghost:   fully transparent, no border no corner
 
-/// AccordionItem 变体
+/// AccordionItem variant.
 pub const AccordionVariant = enum {
     default,
     outline,
@@ -51,61 +55,48 @@ pub const AccordionItemRecipe = styles.AccordionItemRecipe;
 
 const Signal = core.Signal;
 
-/// AccordionItem 内部状态
+/// AccordionItem view and animation state (scope-owned). `expanded` is
+/// last-applied value to view; before_render compares with `last_expanded` to
+/// initiate height / chevron animation.
 pub const AccordionItemState = struct {
     expanded: bool = false,
-    /// 上一帧的 expanded（用于 before_render 检测变化）
+    /// Previous frame expanded (for before_render change detection).
     last_expanded: bool = false,
-    /// 动画状态：idle -> measuring(展开需要测量) -> animating
+    /// Animation state: idle -> measuring (expand needs measurement) -> animating.
     anim_phase: enum { idle, measure_expand, animating } = .idle,
-    /// content 节点引用
+    /// content node reference.
     content_node: ?*Node = null,
-    /// body 节点引用（用于直接读取 intrinsic 高度，避免展开时多等一帧测量）
+    /// body node reference (for direct intrinsic height read, avoid extra frame wait on
+    /// expand).
     body_node: ?*Node = null,
-    /// 容器节点引用（用于 markRenderDirty + border-color 动画）
+    /// container node reference (for markRenderDirty + border-color animation).
     container_node: ?*Node = null,
-    /// chevron 图标节点（通过 rotate 动画旋转：0° 折叠 -> 90° 展开）
+    /// chevron icon node (rotate animation: 0 degrees collapsed -> 90 degrees expanded).
     chevron_node: ?*Node = null,
-    /// 标题文本节点（展开时 weight 600，折叠时 500）
+    /// title text node (weight 600 expanded, 500 collapsed).
     title_node: ?*Node = null,
-    /// header 按钮节点（a11y expanded 挂在它身上）
+    /// header button node (a11y expanded attribute on it).
     header_node: ?*Node = null,
-    /// item 容器的 hover 信号（展开时 hover -> border 显现）
+    /// item container hover signal (expanded hover -> border appears).
     item_hovered: ?*Signal(bool) = null,
-    /// hover 时的 border 颜色
+    /// border color on hover.
     hover_border_color: Color = Color.TRANSPARENT,
-    /// 外部回调
-    /// 2026-07-31 并轨：统一 ?core.HandlerRef，用 invokeWithBool 触发。
-    on_change: ?core.HandlerRef = null,
-    /// 所属 Accordion 的 exclusive 控制器（可选）
-    group: ?*AccordionState = null,
-    /// 在 group 中的索引
-    group_index: usize = 0,
-    /// 动画分配器（必须与节点的 allocator 一致，beforeRender 回调中使用）
+    /// animation allocator (must match node allocator, used in beforeRender callback).
     alloc: Allocator = std.heap.page_allocator,
 
-    /// 切换展开/折叠
-    pub fn toggle(self: *AccordionItemState) void {
-        if (self.group) |group| {
-            group.toggleItem(self.group_index);
-        } else {
-            self.setExpanded(!self.expanded);
-        }
-    }
-
-    /// 设置展开状态
-    pub fn setExpanded(self: *AccordionItemState, expanded: bool) void {
+    /// Apply expanded state to view (a11y, title weight, request redraw); animation
+    /// initiated by before_render.
+    fn applyExpanded(self: *AccordionItemState, expanded: bool) void {
         if (self.expanded == expanded) return;
         self.expanded = expanded;
 
-        // aria-expanded 是 accordion 唯一真正重要的状态位：没有它，AT 用户
-        // 按下 header 后完全无从得知内容是展开了还是折叠了。此前 mount 只设
-        // role=button，expanded 从头到尾没人写过。
+        // aria-expanded: without it, AT users can't tell if content expanded after pressing
+        // header.
         if (self.header_node) |header| {
             if (header.behavior.interaction.a11y) |*a| a.expanded = expanded;
         }
 
-        // 展开时标题加粗 600，折叠时恢复 500
+        // title weight 600 when expanded, 500 when collapsed.
         if (self.title_node) |title| {
             if (title.getText()) |old| {
                 var t = old;
@@ -114,30 +105,46 @@ pub const AccordionItemState = struct {
             }
         }
 
-        if (self.on_change) |h| h.invokeWithBool(expanded);
-
         if (self.container_node) |node| {
             node.markRenderDirty();
         }
     }
 };
 
-/// AccordionItem 渲染前钩子：检测 expanded 变化 -> 发起 height 动画
+/// AccordionItem runtime: expand state data source and write-back pipeline.
+const ItemRuntime = struct {
+    expanded: reactive.Bound(bool),
+    on_change: ?Handler(bool),
+    state: *AccordionItemState,
+
+    fn viewEffect(self: *ItemRuntime) void {
+        self.state.applyExpanded(self.expanded.readAs(true));
+    }
+
+    /// Click / space / enter: proposal only, view effect refreshes after data source lands.
+    fn toggle(self: *ItemRuntime) void {
+        if (self.expanded.commit(!self.state.expanded)) |landed| {
+            if (self.on_change) |h| h.call(landed);
+        }
+    }
+};
+
+/// AccordionItem before-render hook: detect expanded change -> initiate height animation.
 fn accordionItemBeforeRender(node: *Node) void {
     const state: *AccordionItemState = @ptrCast(@alignCast(node.behavior.events.event_context orelse return));
     const content = state.content_node orelse return;
     const alloc = state.alloc;
 
-    // 0. hover -> item 容器 border 显现（直接切换，无过渡）
+    // 0. hover -> item container border appears (direct switch, no transition).
     if (state.item_hovered) |hovered_sig| {
         node.style.border.color = if (hovered_sig.get()) state.hover_border_color else Color.TRANSPARENT;
     }
 
-    // 1. 检测 expanded 状态变化
+    // 1. detect expanded state change.
     if (state.expanded != state.last_expanded) {
         state.last_expanded = state.expanded;
 
-        // chevron rotate 动画：折叠 0° -> 展开 π/2
+        // chevron rotate animation: collapsed 0 degrees -> expanded pi/2.
         if (state.chevron_node) |chevron| {
             const target_rotate: f32 = if (state.expanded) std.math.pi / 2.0 else 0.0;
             const from_rotate: f32 = if (state.expanded) 0.0 else std.math.pi / 2.0;
@@ -175,8 +182,8 @@ fn accordionItemBeforeRender(node: *Node) void {
                 });
                 state.anim_phase = .animating;
             } else {
-                // fallback：先设 height=.fit + overflow_hidden 让布局引擎计算真实高度
-                // 下一帧（measure_expand）再读取并发起动画
+                // fallback: first set height=.fit + overflow_hidden to let layout engine compute
+                // true height, then read and initiate animation next frame (measure_expand).
                 content.style.height = .{ .fit = .{} };
                 content.style.overflow_hidden = true;
                 content.markLayoutDirty();
@@ -184,7 +191,7 @@ fn accordionItemBeforeRender(node: *Node) void {
                 node.markRenderDirty();
             }
         } else {
-            // 折叠：直接从当前高度动画到 0
+            // collapse: animate directly from current height to 0.
             const current_h = content.rectFromWorldOrFallback().h;
             content.style.height = .{ .px = current_h };
             content.style.overflow_hidden = true;
@@ -204,11 +211,12 @@ fn accordionItemBeforeRender(node: *Node) void {
         return;
     }
 
-    // 2. 展开测量帧：读取布局后的真实高度，发起 0 -> realHeight 动画
+    // 2. expand measure frame: read true height post-layout, initiate 0 -> realHeight
+    // animation.
     if (state.anim_phase == .measure_expand) {
         const real_h = content.rectFromWorldOrFallback().h;
         if (real_h > 0) {
-            // 拿到真实高度，从 0 开始动画
+            // Got true height, start animation from 0.
             content.style.height = .{ .px = 0 };
             content.markLayoutDirty();
 
@@ -223,13 +231,13 @@ fn accordionItemBeforeRender(node: *Node) void {
             });
             state.anim_phase = .animating;
         } else {
-            // 还没布局完，等下一帧
+            // Layout not complete yet, wait next frame.
             node.markRenderDirty();
         }
         return;
     }
 
-    // 3. 动画进行中持续刷新
+    // 3. continuous refresh while animation in progress.
     if (state.anim_phase == .animating) {
         if (content.frame_state.frame_local.runtime.commands) |anims| {
             if (anims.count > 0) {
@@ -243,7 +251,7 @@ fn accordionItemBeforeRender(node: *Node) void {
     }
 }
 
-/// 展开动画完成：切回 height=.fit 让内容自由伸缩
+/// expand animation complete: switch back to height=.fit for free content resize.
 fn expandComplete(ctx: *anyopaque) void {
     const state: *AccordionItemState = @ptrCast(@alignCast(ctx));
     if (state.content_node) |content| {
@@ -254,7 +262,7 @@ fn expandComplete(ctx: *anyopaque) void {
     state.anim_phase = .idle;
 }
 
-/// 折叠动画完成：保持 height=0 + overflow_hidden
+/// collapse animation complete: keep height=0 + overflow_hidden.
 fn collapseComplete(ctx: *anyopaque) void {
     const state: *AccordionItemState = @ptrCast(@alignCast(ctx));
     if (state.content_node) |content| {
@@ -265,18 +273,18 @@ fn collapseComplete(ctx: *anyopaque) void {
     state.anim_phase = .idle;
 }
 
-/// AccordionItem 点击事件处理器
+/// AccordionItem click event handler.
 fn accordionItemClickHandler(event: Event, context: ?*anyopaque) EventResult {
-    const state: *AccordionItemState = @ptrCast(@alignCast(context orelse return .ignored));
+    const rt: *ItemRuntime = @ptrCast(@alignCast(context orelse return .ignored));
 
     switch (event) {
         .click => {
-            state.toggle();
+            rt.toggle();
             return .handled;
         },
         .key_down => |e| {
             if (e.key == .space or e.key == .@"return") {
-                state.toggle();
+                rt.toggle();
                 return .handled;
             }
             return .ignored;
@@ -285,63 +293,65 @@ fn accordionItemClickHandler(event: Event, context: ?*anyopaque) EventResult {
     }
 }
 
-/// AccordionItem 属性
+/// AccordionItem properties.
 pub const AccordionItemProps = struct {
-    /// 标题文本
-    title: []const u8 = "",
-    /// 初始展开状态
-    expanded: bool = false,
-    /// 视觉变体
+    /// Title text.
+    title: Source([]const u8) = .{ .value = "" },
+    /// Expand state: `bool` uncontrolled initial; `*Signal(bool)` controlled (interaction
+    /// writes directly); `ui.split` parent intercepts; mutual expand uses `acc.item(i)`.
+    expanded: Model(bool) = .{ .local = false },
+    /// Visual variant.
     variant: AccordionVariant = .default,
-    /// 展开/折叠回调
-    on_change: ?core.HandlerRef = null,
-    /// 回调上下文
-    context: ?*anyopaque = null,
-    /// Chevron 图标（可选，默认用文本 ">"）
+    /// Called after user expand/collapse lands.
+    on_change: ?Handler(bool) = null,
+    /// Chevron icon (optional, default chevron_right).
     chevron_asset: ?svg_assets.Asset = null,
 };
 
-/// 创建 AccordionItem
-pub fn AccordionItem(props: AccordionItemProps) AccordionItemBuilder {
-    return AccordionItemBuilder{ .props = props };
+/// Create AccordionItem: `W.AccordionItem(.{ .title = "Details", .expanded = open })`.
+pub fn AccordionItem(props: anytype) AccordionItemBuilder {
+    return .{ .props = reactive.props.coerce(AccordionItemProps, props) };
 }
 
-/// AccordionItemBuilder.mount 的返回结果
-pub const AccordionItemResult = struct { item: *Node, body: *Node };
+/// Result of AccordionItemBuilder.mount.
+pub const AccordionItemResult = struct {
+    item: *Node,
+    body: *Node,
+
+    /// `ui.view` integration (see src/ui/view_parts.zig).
+    pub fn viewParts(self: AccordionItemResult) core.ViewParts {
+        return .{ .root = self.item, .slot = self.body };
+    }
+};
+
+/// AT ExpandCollapse: explicit target state, uses same write-back pipeline as click
+/// (mutual expand guaranteed by `acc.item(i)` data source, no manual sibling collapse
+/// here).
+fn setAccessibleExpanded(raw: *anyopaque, expanded: bool) bool {
+    const rt: *ItemRuntime = @ptrCast(@alignCast(raw));
+    if (rt.state.expanded == expanded) return true;
+    const landed = rt.expanded.commit(expanded) orelse return false;
+    if (rt.on_change) |h| h.call(landed);
+    return landed == expanded;
+}
 
 pub const AccordionItemBuilder = struct {
     props: AccordionItemProps,
 
-    pub fn title(self: AccordionItemBuilder, t: []const u8) AccordionItemBuilder {
-        var new = self;
-        new.props.title = t;
-        return new;
-    }
-
-    pub fn expanded(self: AccordionItemBuilder, e: bool) AccordionItemBuilder {
-        var new = self;
-        new.props.expanded = e;
-        return new;
-    }
-
-    pub fn variant(self: AccordionItemBuilder, v: AccordionVariant) AccordionItemBuilder {
-        var new = self;
-        new.props.variant = v;
-        return new;
-    }
-
-    pub fn onChange(self: AccordionItemBuilder, handler_ref: core.HandlerRef) AccordionItemBuilder {
-        var new = self;
-        new.props.on_change = handler_ref;
-        return new;
-    }
-
-    /// 保留模式: mount，返回 { item 根节点, content body 节点 }
+    /// Preserve mode: mount, return { item root node, content body node }.
     pub fn mount(self: AccordionItemBuilder, scope: *Scope, cx: *Cx) !AccordionItemResult {
+        cx.owner.enterMount();
+        defer cx.owner.exitMount();
         const my_scope = try scope.childScope();
+        // my_scope unowned before binding to item.
+        var scope_bound = false;
+        errdefer if (!scope_bound) my_scope.dispose();
         const allocator = cx.allocator;
         const t = cx.tokens;
         const p = self.props;
+        reactive.checkBorrow(my_scope, p.title);
+        const expanded_model = try reactive.resolveModel(bool, my_scope, p.expanded);
+        const initially_expanded = expanded_model.readAs(false);
 
         // === Recipe resolve ===
         const item_cs = AccordionItemRecipe.resolve(.{ .variant = p.variant }, t);
@@ -350,12 +360,11 @@ pub const AccordionItemBuilder = struct {
         const item_bg = item_resolved.background orelse Color.TRANSPARENT;
         const border_color = styles.accordionHoverBorderColor(item_bg, t);
 
-        // 分配内部状态
+        // allocate internal state.
         const state = try my_scope.allocator.create(AccordionItemState);
         state.* = .{
-            .expanded = p.expanded,
-            .last_expanded = p.expanded,
-            .on_change = p.on_change,
+            .expanded = initially_expanded,
+            .last_expanded = initially_expanded,
             .hover_border_color = border_color,
             .alloc = allocator,
         };
@@ -365,205 +374,255 @@ pub const AccordionItemBuilder = struct {
                 alloc.destroy(s);
             }
         }.destroy);
+        const rt = try my_scope.allocator.create(ItemRuntime);
+        rt.* = .{ .expanded = expanded_model, .on_change = p.on_change, .state = state };
+        try my_scope.adoptResource(@ptrCast(rt), struct {
+            fn destroy(ptr: *anyopaque, alloc: Allocator) void {
+                alloc.destroy(@as(*ItemRuntime, @ptrCast(@alignCast(ptr))));
+            }
+        }.destroy);
 
-        // 外层容器（纵向排列: header + content），样式由 Recipe variant 决定
-        const item = try box(cx, .{
+        // outer container (vertical: header + content); style from Recipe variant; rounded
+        // corners + border extracted from recipe (border initially transparent, appears via
+        // transition on hover).
+        const item_radius = item_resolved.corner_radius orelse 0;
+        var item_border: Border = .{};
+        item_border.color = Color.TRANSPARENT;
+        item_border.width = 1;
+        if (item_resolved.border) |b| {
+            item_border.radius = b.radius;
+        } else if (item_radius > 0) {
+            item_border.radius = item_radius;
+        }
+        const item_style: core.BoxStyle = .{
             .width = .{ .grow = .{} },
             .height = .{ .fit = .{} },
-            .direction = .column,
             .background = item_bg,
-        }, .{});
-        // sweep：item 守卫一直武装到 return；可失败函数里不用 ensureExtPanic（sweep 实测直接 abort）
+            .corner_radius = if (item_radius > 0) item_radius else null,
+            .border = item_border,
+        };
+        // Chevron indicator (rotate around icon's own center).
+        const chevron_size: core.Sizing = .{ .px = styles.accordion_chevron_size };
+        const chevron_style: core.BoxStyle = .{
+            .width = chevron_size,
+            .height = chevron_size,
+            .transform_origin = core.TransformOrigin.centered(),
+            .will_change_transform = true,
+            .rotate = if (initially_expanded) std.math.pi / 2.0 else null,
+        };
+
+        const Parts = struct { header: *Node = undefined, chevron: *Node = undefined, title: *Node = undefined, content: *Node = undefined, body: *Node = undefined };
+        var parts: Parts = .{};
+        const item = try view.render(my_scope, cx, view.col(.{ .style = item_style }, .{
+            // === Header (clickable) ===.
+            view.capture(&parts.header, view.box(.{
+                .style = styles.accordionHeaderStyle(t),
+                .focusable = true,
+                // header is button semantic node.
+                .tag = .button,
+                .a11y = core.A11yProps{
+                    .role = .button,
+                    .expanded = initially_expanded,
+                    .expansion = .{ .context = @ptrCast(rt), .set = setAccessibleExpanded },
+                },
+            }, .{
+                view.capture(&parts.chevron, view.icon(.{ .style = chevron_style, .tint = t.tokens.color.fg_secondary, .hit_test = false }, p.chevron_asset orelse svg_assets.common.chevron_right)),
+                // title text: fills header remaining width (long titles clipped in header, same as
+                // box text node).
+                view.capture(&parts.title, view.attrs(.{ .style = core.BoxStyle{ .width = .{ .grow = .{} } } }, view.text(.{ .style = styles.accordionTitleText(initially_expanded, t), .hit_test = false }, p.title.peek()))),
+            })),
+            // === Content container (overflow_hidden + height animation) ===
+            // Only observable expand state exit: height set 0 when collapsed, fit when expanded.
+            // body child rect.h is content height, unchanged by collapse (clipping happens in
+            // render phase, not layout rect), so e2e must check this layer.
+            view.capture(&parts.content, view.col(.{
+                .style = .{
+                    .width = .{ .grow = .{} },
+                    .height = if (initially_expanded) core.Sizing{ .fit = .{} } else core.Sizing{ .px = 0 },
+                    .overflow_hidden = !initially_expanded,
+                },
+                .test_id = "accordion.content",
+            }, .{
+                // content body; left indent contract in accordionBodyStyle.
+                view.capture(&parts.body, view.box(.{ .style = styles.accordionBodyStyle(t) }, {})),
+            })),
+        }));
+        // sweep: item guard armed until return.
         errdefer cx.freeNode(item);
-        // 圆角 + 边框从 recipe 提取（border 初始透明，hover 时通过 transition 显现）
-        const item_radius = item_resolved.corner_radius orelse 0;
-        if (item_radius > 0) {
-            (try item.style.ensureExtFallible(allocator)).corner_radius = .{ .all = item_radius };
-        }
-        item.style.border.color = Color.TRANSPARENT;
-        item.style.border.width = 1;
-        if (item_resolved.border) |b| {
-            item.style.border.radius = b.radius;
-        } else if (item_radius > 0) {
-            item.style.border.radius = item_radius;
-        }
         const item_hovered = try hooks.useHover(my_scope, item);
         state.item_hovered = item_hovered;
 
         item.meta.ownership.meta.component_name = "AccordionItem";
         try core.bindScopeToNode(my_scope, item);
+        scope_bound = true;
         state.container_node = item;
 
-        // === Header（可点击） ===
-        const header = try core.adoptChild(cx, allocator, item, try box(cx, styles.accordionHeaderStyle(t), .{}));
-        header.tag = .button;
-        header.setFocusable(true);
-        header.behavior.interaction.a11y = .{
-            .role = .button,
-            .label = p.title,
-            .expanded = p.expanded,
-        };
+        const header = parts.header;
         state.header_node = header;
+        state.chevron_node = parts.chevron;
 
-        // Chevron 指示器（直接以图标自身中心为轴旋转）
-        const chevron = try core.adoptChild(cx, allocator, header, try core.iconTint(cx, p.chevron_asset orelse svg_assets.common.chevron_right, t.color.fg_secondary, .{
-            .width = .{ .px = styles.accordion_chevron_size },
-            .height = .{ .px = styles.accordion_chevron_size },
-        }));
-        const chevron_ext = try chevron.style.ensureExtFallible(allocator);
-        chevron_ext.transform_origin = core.TransformOrigin.centered();
-        chevron_ext.will_change_transform = true;
-        if (p.expanded) {
-            chevron_ext.rotate = std.math.pi / 2.0;
-        }
-        chevron.setHitTestVisible(false);
-        state.chevron_node = chevron;
-
-        // 标题文本
-        const title_node = try core.adoptChild(cx, allocator, header, try box(cx, .{
-            .width = .{ .grow = .{} },
-            .height = .{ .fit = .{} },
-        }, .{}));
-        var title_txt = styles.accordionTitleText(p.expanded, t);
-        title_txt.content = p.title;
-        title_node.setText(title_txt);
-        title_node.setHitTestVisible(false);
-        title_node.behavior.events.event_context = state;
+        const title_node = parts.title;
+        // header a11y label points to title node copy; re-assigned after dynamic title
+        // update.
+        if (header.behavior.interaction.a11y) |*a| a.label = title_node.getText().?.content;
+        try bind_mod.bindTextLabel(cx, my_scope, p.title, title_node, header);
+        title_node.behavior.events.event_context = rt;
         title_node.behavior.events.on_event = accordionItemClickHandler;
         state.title_node = title_node;
 
-        // Header 交互（header 不响应 hover 背景变化，border 由 item 容器统一管理）
-        header.behavior.events.event_context = state;
+        // Header interaction (header doesn't respond to hover background change, border
+        // managed by item container).
+        header.behavior.events.event_context = rt;
         header.behavior.events.on_event = accordionItemClickHandler;
         try hooks.useFocusRing(my_scope, cx, header, .{});
 
-        // === Content 容器（overflow_hidden + height 动画） ===
-        const content = try core.adoptChild(cx, allocator, item, try box(cx, .{
-            .width = .{ .grow = .{} },
-            .direction = .column,
-        }, .{}));
-        content.style.height = if (p.expanded) .{ .fit = .{} } else .{ .px = 0 };
-        content.style.overflow_hidden = !p.expanded;
-        state.content_node = content;
-        // 展开态的唯一可观测出口：折叠时 height 被设成 0，展开时是 fit。
-        // body 子节点的 rect.h 是内容高度、不随折叠变化（裁剪发生在渲染阶段，
-        // 不改 layout rect），所以 e2e 必须看这一层。
-        content.meta.ownership.meta.test_id = "accordion.content";
-
-        // 内容 body，左缩进合同见 accordionBodyStyle
-        const body = try core.adoptChild(cx, allocator, content, try box(cx, styles.accordionBodyStyle(t), .{}));
+        state.content_node = parts.content;
+        const body = parts.body;
         state.body_node = body;
 
-        // 设置 on_before_render 动画（必须在 useFocusRing 之后，因为它会链式保存）
+        // Set on_before_render animation (must come after useFocusRing, which chains saves).
         item.behavior.events.event_context = state;
         item.meta.per_frame.hooks.before_render.main = accordionItemBeforeRender;
 
+        // expanded is Model: local is also signal, click changes it, must have effect.
+        try my_scope.createEffect(rt, ItemRuntime.viewEffect);
         return .{ .item = item, .body = body };
     }
 };
 
-// ==================== Accordion (容器) ====================
+// ==================== Accordion (container) ====================.
 
-/// Accordion 内部状态（管理 exclusive 模式）
-pub const AccordionState = struct {
-    items: [MAX_ITEMS]?*AccordionItemState = [_]?*AccordionItemState{null} ** MAX_ITEMS,
-    count: usize = 0,
-    exclusive: bool = false,
+/// Accordion runtime: mutual expand data source (caller scope owns, see mount).
+pub const AccordionRuntime = struct {
+    open: reactive.Bound(?usize),
+    scope: *Scope,
 
-    const MAX_ITEMS = 16;
+    /// Item expanded = `open == index`; write true to set item, write false clears
+    /// only if it's current item.
+    const ItemSlot = struct {
+        rt: *AccordionRuntime,
+        index: usize,
 
-    /// 注册一个 item
-    pub fn registerItem(self: *AccordionState, item_state: *AccordionItemState) void {
-        if (self.count >= MAX_ITEMS) return;
-        item_state.group = self;
-        item_state.group_index = self.count;
-        self.items[self.count] = item_state;
-        self.count += 1;
-    }
+        fn compute(slot: *ItemSlot) bool {
+            const cur = slot.rt.open.read.get() orelse return false;
+            return cur == slot.index;
+        }
 
-    /// exclusive 模式下切换某个 item
-    pub fn toggleItem(self: *AccordionState, index: usize) void {
-        if (index >= self.count) return;
-        const target = self.items[index] orelse return;
-
-        if (self.exclusive) {
-            // 先折叠所有其他
-            for (self.items[0..self.count]) |maybe_item| {
-                if (maybe_item) |item| {
-                    if (item != target and item.expanded) {
-                        item.setExpanded(false);
-                    }
-                }
+        fn write(slot: *ItemSlot, expanded: bool) void {
+            if (expanded) {
+                _ = slot.rt.open.commit(slot.index);
+            } else if (slot.rt.open.read.peek()) |cur| {
+                if (cur == slot.index) _ = slot.rt.open.commit(null);
             }
         }
-        // 切换目标
-        target.setExpanded(!target.expanded);
+    };
+
+    fn item(self: *AccordionRuntime, index: usize) !Model(bool) {
+        const slot = try self.scope.allocator.create(ItemSlot);
+        slot.* = .{ .rt = self, .index = index };
+        try self.scope.adoptResource(@ptrCast(slot), struct {
+            fn destroy(ptr: *anyopaque, alloc: Allocator) void {
+                alloc.destroy(@as(*ItemSlot, @ptrCast(@alignCast(ptr))));
+            }
+        }.destroy);
+        const expanded = try self.scope.createMemo(bool, slot, ItemSlot.compute);
+        return .{ .split = reactive.split(expanded, reactive.Callback(bool).from(ItemSlot, slot, ItemSlot.write)) };
     }
 };
 
-/// Accordion 属性
+/// Declarative mutual expand: no Accordion mount result needed; derives the item's
+/// expanded from the parent's `*Signal(?usize)` at compile-time `index` (same semantics
+/// as `AccordionResult.item`: expanded = `open == index`; write true sets the item,
+/// write false clears only if it's the current one). No alloc:
+/// `v.with(W.AccordionItem(.{ .title = "Billing", .expanded = W.accordionItemOpen(section, 1) }),
+/// .{ ... })`.
+pub fn accordionItemOpen(open: *Signal(?usize), comptime index: usize) Model(bool) {
+    const Slot = struct {
+        fn isOpen(cur: ?usize) bool {
+            const c = cur orelse return false;
+            return c == index;
+        }
+        fn write(sig: *Signal(?usize), expanded: bool) void {
+            if (expanded) {
+                sig.set(index);
+            } else if (sig.peek()) |cur| {
+                if (cur == index) sig.set(null);
+            }
+        }
+    };
+    return .{ .split = reactive.split(reactive.map(open, Slot.isOpen), reactive.Callback(bool).from(Signal(?usize), open, Slot.write)) };
+}
+
+/// Accordion properties.
 pub const AccordionProps = struct {
-    /// exclusive 模式: 一次只展开一个
-    exclusive: bool = false,
-    /// 间距
+    /// Mutual expand current item index (null = all collapsed): `?usize` uncontrolled
+    /// initial; `*Signal(?usize)` controlled (interaction writes directly), `ui.split`
+    /// intercepts. Only affects items with `.expanded = try acc.item(i)`; others expand
+    /// independently.
+    open: Model(?usize) = .{ .local = null },
+    /// spacing.
     gap: f32 = 8,
 };
 
-/// 创建 Accordion
-pub fn Accordion(props: AccordionProps) AccordionBuilder {
-    return AccordionBuilder{ .props = props };
+/// Create Accordion: `W.Accordion(.{ .open = section })`.
+pub fn Accordion(props: anytype) AccordionBuilder {
+    return .{ .props = reactive.props.coerce(AccordionProps, props) };
 }
 
-/// AccordionBuilder.mount 的返回结果
-pub const AccordionResult = struct { container: *Node, state: *AccordionState };
+/// Result of AccordionBuilder.mount.
+pub const AccordionResult = struct {
+    container: *Node,
+    /// Mutual expand signal (null when `ui.split`).
+    open: ?*Signal(?usize),
+    runtime: *AccordionRuntime,
+
+    /// Model of item `index`'s expanded state, pass to `AccordionItem(.{ .expanded
+    /// = ... })`. Derived value allocated in mount-time scope, released with it
+    /// (container release only, no reclaim); mutual expand by index match, same index
+    /// opens/closes together.
+    pub fn item(self: AccordionResult, index: usize) !Model(bool) {
+        return self.runtime.item(index);
+    }
+    /// `ui.view` integration (see src/ui/view_parts.zig).
+    pub fn viewParts(self: AccordionResult) core.ViewParts {
+        return .{ .root = self.container, .slot = self.container };
+    }
+};
 
 pub const AccordionBuilder = struct {
     props: AccordionProps,
 
-    pub fn exclusive(self: AccordionBuilder, e: bool) AccordionBuilder {
-        var new = self;
-        new.props.exclusive = e;
-        return new;
-    }
-
-    pub fn gap(self: AccordionBuilder, g: f32) AccordionBuilder {
-        var new = self;
-        new.props.gap = g;
-        return new;
-    }
-
-    /// 保留模式: mount，返回 { container 节点, AccordionState }
+    /// Preserve mode: mount, return { container node, open signal, runtime }.
+    ///
+    /// Runtime, open signal, and `item(i)` derived values all live in the caller `scope`:
+    /// items under the same scope must read derived values from the ancestor chain (in
+    /// Accordion's own child scope, items would read sibling scope data with no unload order
+    /// guarantee).
     pub fn mount(self: AccordionBuilder, scope: *Scope, cx: *Cx) !AccordionResult {
-        const my_scope = try scope.childScope();
         const p = self.props;
-
-        // 分配 group 状态
-        const state = try my_scope.allocator.create(AccordionState);
-        state.* = .{ .exclusive = p.exclusive };
-        try my_scope.adoptResource(@ptrCast(state), struct {
+        const open = try reactive.resolveModel(?usize, scope, p.open);
+        const rt = try scope.allocator.create(AccordionRuntime);
+        rt.* = .{ .open = open, .scope = scope };
+        try scope.adoptResource(@ptrCast(rt), struct {
             fn destroy(ptr: *anyopaque, alloc: Allocator) void {
-                const s: *AccordionState = @ptrCast(@alignCast(ptr));
-                alloc.destroy(s);
+                alloc.destroy(@as(*AccordionRuntime, @ptrCast(@alignCast(ptr))));
             }
         }.destroy);
 
-        const container = try box(cx, .{
+        const container = try view.render(scope, cx, view.col(.{ .style = .{
             .width = .{ .grow = .{} },
             .height = .{ .fit = .{} },
-            .direction = .column,
             .gap = p.gap,
-        }, .{});
+        } }, {}));
         container.meta.ownership.meta.component_name = "Accordion";
-        try core.bindScopeToNode(my_scope, container);
-
-        return .{ .container = container, .state = state };
+        return .{ .container = container, .open = open.asSignal(), .runtime = rt };
     }
 };
 
-// ========== 测试 ==========
+// ========== Tests ==========.
 
 test "AccordionItem: basic collapsed" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
@@ -572,22 +631,20 @@ test "AccordionItem: basic collapsed" {
     const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
     defer scope.dispose();
 
-    const result = try AccordionItem(.{})
-        .title("Section 1")
-        .mount(scope, ctx);
+    const result = try AccordionItem(.{ .title = "Section 1" }).mount(scope, ctx);
 
     try root.appendChild(std.testing.allocator, result.item);
 
-    // item 有 2 个子节点: header + content
+    // item has 2 children: header + content.
     try std.testing.expectEqual(@as(usize, 2), result.item.children.items.len);
-    // 折叠: content height=0, overflow_hidden=true
+    // Collapsed: content height=0, overflow_hidden=true.
     const content = result.item.children.items[1];
     try std.testing.expectEqual(core.Sizing{ .px = 0 }, content.style.height);
     try std.testing.expect(content.style.overflow_hidden);
 }
 
 test "AccordionItem: expanded" {
-    var ctx = try Cx.init(std.testing.allocator);
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();
 
     const root = try box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
@@ -596,14 +653,11 @@ test "AccordionItem: expanded" {
     const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
     defer scope.dispose();
 
-    const result = try AccordionItem(.{})
-        .title("Section 1")
-        .expanded(true)
-        .mount(scope, ctx);
+    const result = try AccordionItem(.{ .title = "Section 1", .expanded = true }).mount(scope, ctx);
 
     try root.appendChild(std.testing.allocator, result.item);
 
-    // 展开: content height=.fit, overflow_hidden=false
+    // Expanded: content height=.fit, overflow_hidden=false.
     const content = result.item.children.items[1];
     try std.testing.expectEqual(core.Sizing{ .fit = .{} }, content.style.height);
     try std.testing.expect(!content.style.overflow_hidden);
@@ -613,74 +667,117 @@ test "AccordionItem: expanded" {
     try std.testing.expectApproxEqAbs(std.math.pi / 2.0, chevron.style.rotate(), 0.0001);
 }
 
-test "AccordionItem: state toggle" {
-    var state = AccordionItemState{ .expanded = false };
-
-    state.setExpanded(true);
-    try std.testing.expect(state.expanded);
-
-    state.setExpanded(false);
-    try std.testing.expect(!state.expanded);
+fn itemState(result: AccordionItemResult) *AccordionItemState {
+    return @ptrCast(@alignCast(result.item.behavior.events.event_context.?));
 }
 
-test "AccordionItem: toggle callback" {
-    const CallbackCtx = struct {
-        last_value: bool = false,
-        call_count: u32 = 0,
+fn clickHeader(result: AccordionItemResult) void {
+    const header = result.item.children.items[0];
+    _ = accordionItemClickHandler(.{ .click = .{ .x = 0, .y = 0, .button = .left, .click_count = 1 } }, header.behavior.events.event_context);
+}
+
+test "AccordionItem: bound expanded — external set, click writes back, on_change gets landed value" {
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
+    const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
+    defer scope.dispose();
+
+    const open = try scope.createSignal(bool, false);
+    const Rec = struct {
+        calls: u32 = 0,
+        last: bool = false,
+        fn changed(self: *@This(), v: bool) void {
+            self.calls += 1;
+            self.last = v;
+        }
     };
+    var rec = Rec{};
+    const result = try AccordionItem(.{ .title = "Details", .expanded = open, .on_change = ctx.on(Rec, &rec, Rec.changed) }).mount(scope, ctx);
+    defer ctx.freeNode(result.item);
+    const header = result.item.children.items[0];
 
-    var cb_ctx = CallbackCtx{};
+    open.set(true); // external drive.
+    try std.testing.expect(itemState(result).expanded);
+    try std.testing.expect(header.behavior.interaction.a11y.?.expanded.?);
+    try std.testing.expectEqual(@as(u32, 0), rec.calls); // programmatic write doesn't trigger on_change.
 
-    var state = AccordionItemState{
-        .expanded = false,
-        .on_change = core.Cx.boolHandlerFrom(CallbackCtx, &cb_ctx, struct {
-            fn handler(c: *CallbackCtx, new_val: bool) void {
-                c.last_value = new_val;
-                c.call_count += 1;
-            }
-        }.handler),
+    clickHeader(result);
+    try std.testing.expect(!open.peek());
+    try std.testing.expect(!header.behavior.interaction.a11y.?.expanded.?);
+    try std.testing.expectEqual(@as(u32, 1), rec.calls);
+    try std.testing.expect(!rec.last);
+}
+
+test "AccordionItem: a split parent can refuse to collapse" {
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
+    const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
+    defer scope.dispose();
+
+    const Parent = struct {
+        open: *core.Signal(bool),
+        fn write(self: *@This(), v: bool) void {
+            if (v) self.open.set(true); // only allow expand.
+        }
     };
+    var parent = Parent{ .open = try scope.createSignal(bool, true) };
+    const result = try AccordionItem(.{ .title = "Pinned", .expanded = reactive.split(parent.open, ctx.on(Parent, &parent, Parent.write)) }).mount(scope, ctx);
+    defer ctx.freeNode(result.item);
+    clickHeader(result);
+    try std.testing.expect(parent.open.peek());
+    try std.testing.expect(itemState(result).expanded);
+}
 
-    state.setExpanded(true);
-    try std.testing.expect(cb_ctx.last_value);
-    try std.testing.expectEqual(@as(u32, 1), cb_ctx.call_count);
+test "AccordionItem: dynamic title updates the text and the header a11y label" {
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
+    const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
+    defer scope.dispose();
+
+    const title = try scope.createText("Files", .{});
+    const result = try AccordionItem(.{ .title = title }).mount(scope, ctx);
+    defer ctx.freeNode(result.item);
+    const header = result.item.children.items[0];
+    title.set("Files (3 changed)");
+    const title_node = itemState(result).title_node.?;
+    try std.testing.expectEqualStrings("Files (3 changed)", title_node.getText().?.content);
+    try std.testing.expectEqual(title_node.getText().?.content.ptr, header.behavior.interaction.a11y.?.label.?.ptr);
 }
 
 test "AccordionItem: expand uses body intrinsic height when available" {
     const alloc = std.testing.allocator;
-    var ctx = try Cx.init(alloc);
+    var ctx = try Cx.init(alloc, std.testing.io);
     defer ctx.deinit();
     ctx.setViewport(480, 320);
 
     const root = try box(ctx, .{
         .width = .{ .px = 480 },
         .height = .{ .px = 320 },
-        .background = ctx.tokens.color.bg_primary,
+        .background = ctx.tokens.tokens.color.bg_primary,
     }, .{});
     ctx.root = root;
 
     const scope = try Scope.init(alloc, null, ctx.owner);
     defer scope.dispose();
 
-    const result = try AccordionItem(.{})
-        .title("Section 1")
-        .mount(scope, ctx);
+    const open = try scope.createSignal(bool, false);
+    const result = try AccordionItem(.{ .title = "Section 1", .expanded = open }).mount(scope, ctx);
     try root.appendChild(alloc, result.item);
 
     const body_text = try box(ctx, .{
         .width = .{ .fit = .{} },
         .height = .{ .fit = .{} },
     }, .{});
-    body_text.setText(.{ .content = "Expandable content", .font_size = 13, .color = ctx.tokens.color.fg_secondary });
+    body_text.setText(.{ .content = "Expandable content", .font_size = 13, .color = ctx.tokens.tokens.color.fg_secondary });
     try result.body.appendChild(alloc, body_text);
 
     ctx.layout();
 
-    const state: *AccordionItemState = @ptrCast(@alignCast(result.item.behavior.events.event_context.?));
+    const state = itemState(result);
     try std.testing.expect(state.body_node != null);
     try std.testing.expect(state.body_node.?.rectFromWorldOrFallback().h > 0);
 
-    state.setExpanded(true);
+    open.set(true);
     if (result.item.meta.per_frame.hooks.before_render.main) |hook| {
         hook(result.item);
     }
@@ -689,51 +786,100 @@ test "AccordionItem: expand uses body intrinsic height when available" {
     try std.testing.expect(state.content_node.?.frame_state.frame_local.runtime.commands != null);
 }
 
-test "Accordion: exclusive mode" {
-    var group = AccordionState{ .exclusive = true };
-    var item_a = AccordionItemState{};
-    var item_b = AccordionItemState{};
+test "Accordion: acc.item(i) makes items mutually exclusive through the open signal" {
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
+    const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
+    defer scope.dispose();
 
-    group.registerItem(&item_a);
-    group.registerItem(&item_b);
+    const section = try scope.createSignal(?usize, 0);
+    const acc = try Accordion(.{ .open = section }).mount(scope, ctx);
+    defer ctx.freeNode(acc.container);
+    var items: [3]AccordionItemResult = undefined;
+    for (&items, 0..) |*it, i| {
+        it.* = try AccordionItem(.{ .title = "Section", .expanded = try acc.item(i) }).mount(scope, ctx);
+        try acc.container.appendChild(std.testing.allocator, it.item);
+    }
+    try std.testing.expect(itemState(items[0]).expanded);
+    try std.testing.expect(!itemState(items[1]).expanded);
 
-    // 展开 A
-    group.toggleItem(0);
-    try std.testing.expect(item_a.expanded);
-    try std.testing.expect(!item_b.expanded);
+    clickHeader(items[1]); // expand 1 -> 0 auto-collapse.
+    try std.testing.expectEqual(@as(?usize, 1), section.peek());
+    try std.testing.expect(!itemState(items[0]).expanded);
+    try std.testing.expect(itemState(items[1]).expanded);
 
-    // 展开 B -> A 应自动折叠
-    group.toggleItem(1);
-    try std.testing.expect(!item_a.expanded);
-    try std.testing.expect(item_b.expanded);
+    clickHeader(items[1]); // click 1 again -> all collapse.
+    try std.testing.expectEqual(@as(?usize, null), section.peek());
+    try std.testing.expect(!itemState(items[1]).expanded);
 
-    // 再次点击 B -> B 折叠
-    group.toggleItem(1);
-    try std.testing.expect(!item_b.expanded);
+    section.set(2); // external drive.
+    try std.testing.expect(itemState(items[2]).expanded);
+    try std.testing.expect(!itemState(items[0]).expanded and !itemState(items[1]).expanded);
 }
 
-test "Accordion: non-exclusive mode" {
-    var group = AccordionState{ .exclusive = false };
-    var item_a = AccordionItemState{};
-    var item_b = AccordionItemState{};
+test "Accordion: exclusive click inside a host batch reports the landed value once" {
+    // Real clicks all in host entry batch: effect deferred until batch end, commit
+    // must still read write-back value from lazy memo, else on_change never triggers.
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
+    const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
+    defer scope.dispose();
 
-    group.registerItem(&item_a);
-    group.registerItem(&item_b);
+    const section = try scope.createSignal(?usize, 0);
+    const acc = try Accordion(.{ .open = section }).mount(scope, ctx);
+    defer ctx.freeNode(acc.container);
+    const Rec = struct {
+        calls: [2]u32 = .{ 0, 0 },
+        last: [2]bool = .{ false, false },
+        fn first(self: *@This(), v: bool) void {
+            self.calls[0] += 1;
+            self.last[0] = v;
+        }
+        fn second(self: *@This(), v: bool) void {
+            self.calls[1] += 1;
+            self.last[1] = v;
+        }
+    };
+    var rec = Rec{};
+    const a = try AccordionItem(.{ .title = "A", .expanded = try acc.item(0), .on_change = ctx.on(Rec, &rec, Rec.first) }).mount(scope, ctx);
+    try acc.container.appendChild(std.testing.allocator, a.item);
+    const b = try AccordionItem(.{ .title = "B", .expanded = try acc.item(1), .on_change = ctx.on(Rec, &rec, Rec.second) }).mount(scope, ctx);
+    try acc.container.appendChild(std.testing.allocator, b.item);
 
-    group.toggleItem(0);
-    group.toggleItem(1);
+    ctx.owner.beginBatch();
+    clickHeader(b);
+    ctx.owner.endBatch();
+    try std.testing.expectEqual(@as(?usize, 1), section.peek());
+    try std.testing.expectEqual(@as(u32, 1), rec.calls[1]);
+    try std.testing.expect(rec.last[1]);
+    try std.testing.expectEqual(@as(u32, 0), rec.calls[0]); // passive collapse doesn't fire on_change.
+    try std.testing.expect(!itemState(a).expanded and itemState(b).expanded);
+}
 
-    // 两个都应展开
-    try std.testing.expect(item_a.expanded);
-    try std.testing.expect(item_b.expanded);
+test "Accordion: items with their own expanded stay independent" {
+    var ctx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
+    const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
+    defer scope.dispose();
+
+    const acc = try Accordion(.{}).mount(scope, ctx);
+    defer ctx.freeNode(acc.container);
+    const a = try AccordionItem(.{ .title = "A" }).mount(scope, ctx);
+    try acc.container.appendChild(std.testing.allocator, a.item);
+    const b = try AccordionItem(.{ .title = "B" }).mount(scope, ctx);
+    try acc.container.appendChild(std.testing.allocator, b.item);
+    clickHeader(a);
+    clickHeader(b);
+    try std.testing.expect(itemState(a).expanded and itemState(b).expanded);
 }
 
 test "Accordion: hit-test follows layout after a sibling expands (regression)" {
-    // 复现用户报的 bug：展开上方 item 把下方 item 往下推之后，对下方 item header
-    // 的点击应命中下方 item（hit-test 用新布局），而不是旧布局里那个位置的节点。
+    // Reproduce user-reported bug: expanding upper item pushes lower item down; click
+    // on lower item header should hit lower item (hit-test uses new layout), not node
+    // at that position in old layout.
     const render_engine = @import("../../core/render_engine/mod.zig");
     const alloc = std.testing.allocator;
-    var ctx = try Cx.init(alloc);
+    var ctx = try Cx.init(alloc, std.testing.io);
     defer ctx.deinit();
     ctx.setViewport(600, 400);
 
@@ -743,21 +889,24 @@ test "Accordion: hit-test follows layout after a sibling expands (regression)" {
     const scope = try Scope.init(alloc, null, ctx.owner);
     defer scope.dispose();
 
-    const acc = try Accordion(.{ .exclusive = false, .gap = 8 }).mount(scope, ctx);
+    const acc = try Accordion(.{ .gap = 8 }).mount(scope, ctx);
     try root.appendChild(alloc, acc.container);
 
-    // 对齐 storybook 场景：item 0 初始 expanded（mount 时经动画展开）。
+    // Align with storybook scenario: item 0 initially expanded (expands via animation
+    // on mount).
     var items: [3]*Node = undefined;
+    var opens: [3]*core.Signal(bool) = undefined;
     inline for (.{ "Section One", "Section Two", "Section Three" }, 0..) |title, i| {
-        const it = try AccordionItem(.{ .title = title, .expanded = (i == 0) }).mount(scope, ctx);
+        opens[i] = try scope.createSignal(bool, i == 0);
+        const it = try AccordionItem(.{ .title = title, .expanded = opens[i] }).mount(scope, ctx);
         const body_text = try box(ctx, .{ .width = .{ .fit = .{} }, .height = .{ .fit = .{} } }, .{});
-        body_text.setText(.{ .content = "Panel body content.", .font_size = 13, .color = ctx.tokens.color.fg_secondary });
+        body_text.setText(.{ .content = "Panel body content.", .font_size = 13, .color = ctx.tokens.tokens.color.fg_secondary });
         try it.body.appendChild(alloc, body_text);
         try acc.container.appendChild(alloc, it.item);
         items[i] = it.item;
     }
 
-    // settle 初始布局 + item0 的 mount 展开动画（多帧）。
+    // settle initial layout + item0's mount expand animation (multiple frames).
     var t: f64 = 0;
     var warm: usize = 0;
     while (warm < 60) : (warm += 1) {
@@ -768,7 +917,8 @@ test "Accordion: hit-test follows layout after a sibling expands (regression)" {
         _ = ctx.render();
     }
 
-    // 初始展开 settle 后，三个 header 各自当前位置都应命中对应 item（基线：还没点过）。
+    // After initial expand settles, all three header positions should hit
+    // corresponding items (baseline: not clicked yet).
     inline for (.{ 0, 1, 2 }) |idx| {
         const hdr0 = items[idx].children.items[0];
         const hr0 = hdr0.globalRect();
@@ -776,14 +926,15 @@ test "Accordion: hit-test follows layout after a sibling expands (regression)" {
         try std.testing.expect(nodeIsInSubtree(h0, items[idx]));
     }
 
-    // 记录三个 item header 的初始顶部 y（header 是 item.children[0]）。
+    // Record initial top y of all three item headers (header is item.children[0]).
     const header2_y0 = items[2].children.items[0].globalRect().y;
 
-    // 展开 Section Two（item 1）-> 触发高度动画，把 Section Three 往下推。
-    const state1: *AccordionItemState = @ptrCast(@alignCast(items[1].behavior.events.event_context.?));
-    state1.setExpanded(true);
+    // Expand Section Two (item 1) -> trigger height animation, push Section Three
+    // down.
+    opens[1].set(true);
 
-    // 跑足够多帧让展开动画 + 收尾（expandComplete -> height=.fit）settle。
+    // Run enough frames for expand animation + finalization (expandComplete ->
+    // height=.fit) to settle.
     var frame: usize = 0;
     while (frame < 60) : (frame += 1) {
         t += 16;
@@ -793,19 +944,20 @@ test "Accordion: hit-test follows layout after a sibling expands (regression)" {
         _ = ctx.render();
     }
 
-    // Section Three header 现在应该被推到更下方。
+    // Section Three header should now be pushed further down.
     const header2 = items[2].children.items[0];
     const r2 = header2.globalRect();
-    try std.testing.expect(r2.y > header2_y0 + 10); // 确实下移了
+    try std.testing.expect(r2.y > header2_y0 + 10); // indeed moved down.
 
-    // 关键断言：在 Section Three header 的**新**位置做 hit-test，必须命中它
-    // （或它的子节点 / 它自己）。旧布局 bug 下这里会命中别的 item 或空。
+    // Key assertion: hit-test at Section Three header's **new** position must hit
+    // it (or its child / itself). Old layout bug hits different item or nothing.
     const hit = ctx.hitTest(r2.x + r2.w * 0.5, r2.y + r2.h * 0.5);
     try std.testing.expect(hit != null);
     try std.testing.expect(nodeIsInSubtree(hit, items[2]));
 
-    // 全覆盖：展开 Section Two 后，三个 header 各自当前位置的 hit-test 都必须命中
-    // **对应**的 item（防止 off-by-one：点 item1 header 却命中 item2 之类）。
+    // Full coverage: after expanding Section Two, hit-test at all three header
+    // positions must hit **corresponding** item (prevent off-by-one: click item1 header
+    // but hit item2, etc).
     inline for (.{ 0, 1, 2 }) |idx| {
         const hdr = items[idx].children.items[0];
         const hr = hdr.globalRect();
@@ -823,12 +975,28 @@ fn nodeIsInSubtree(node: ?*Node, ancestor: *Node) bool {
     return false;
 }
 
-// styles.zig 的测试收集，这行是必需的，见 docs/STYLING.md
+// styles.zig test collection, this line required, see docs/STYLING.md.
 test {
     _ = @import("styles.zig");
 }
 
-// 逐分配点 OOM sweep，见 src/ui/components/oom_sweep.zig
+test "accordion: 动态标题 + 互斥 Model 的 mount 在任意分配点失败时不泄漏（sweep）" {
+    try @import("../oom_sweep.zig").sweepMount("accordion(exclusive)", struct {
+        fn m(scope: *Scope, cx: *Cx) anyerror!?*Node {
+            const acc = try Accordion(.{ .open = 0 }).mount(scope, cx);
+            errdefer cx.freeNode(acc.container);
+            const title = try scope.createText("Section", .{});
+            const it = try AccordionItem(.{ .title = title, .expanded = try acc.item(0) }).mount(scope, cx);
+            acc.container.appendChild(cx.allocator, it.item) catch |err| {
+                cx.freeNode(it.item);
+                return err;
+            };
+            return acc.container;
+        }
+    }.m);
+}
+
+// per-allocation-point OOM sweep, see src/ui/components/oom_sweep.zig.
 test "accordion_item: mount 在任意分配点失败时不泄漏（sweep）" {
     try @import("../oom_sweep.zig").sweepMount("accordion_item", struct {
         fn m(scope: *Scope, cx: *Cx) anyerror!?*Node {

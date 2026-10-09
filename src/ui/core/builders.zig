@@ -30,34 +30,44 @@ const HandlerRef = types.HandlerRef;
 const GridTrackSize = types.GridTrackSize;
 const GridConfig = types.GridConfig;
 
-/// 统一的节点创建入口，**不依赖进程级全局**。
-///
-/// P0-3：`Node.create` 靠 `g_node_create_hook` + `g_active_world` 这对全局
-/// 把节点注册到 World；多个 Cx 并存时它会注册到"最后一个 init 的 Cx"，
-/// 而不是调用者自己的那个。builder 手上本来就有 cx，没有理由绕全局。
-///
-/// 用 `@hasField` 探测是为了兼容 cx 为 anytype 的既有签名（少数测试传的是
-/// 精简 mock，没有 world/world_id 字段），那种情况退回旧路径。
+/// Unified node creation entry, does not depend on process-level globals.
+/// Node.create used g_node_create_hook + g_active_world, which with multiple Cx picks the
+/// last-init'd
+/// Cx, not the caller's. @hasField probes cx anytype compatibility (lean test mocks lack
+/// world/world_id): falls back to the old path. Takes ownership of the style heap (StyleExt and
+/// GridConfig above it): success transfers to the node, failure releases here; caller must not
+/// reclaim.
 fn createNode(cx: anytype, tag: types.ElementTag, style: Style) !*Node {
     const CxT = @TypeOf(cx.*);
-    if (@hasField(CxT, "world") and @hasField(CxT, "world_id")) {
-        return node_mod.createIn(cx.allocator, &cx.world, cx.world_id, cx.nextId(), tag, style);
-    }
-    return Node.create(cx.allocator, cx.nextId(), tag, style);
+    const created = if (@hasField(CxT, "world") and @hasField(CxT, "world_id"))
+        node_mod.createIn(cx.allocator, &cx.world, cx.world_id, cx.nextId(), tag, style)
+    else
+        Node.create(cx.allocator, cx.nextId(), tag, style);
+    return created catch |err| {
+        discardStyleExt(cx.allocator, style);
+        return err;
+    };
 }
 
-/// box - 通用容器节点
+/// Release heap part of Style not handed to node (matches node-release reclamation).
+fn discardStyleExt(allocator: std.mem.Allocator, style: Style) void {
+    const ext = style.ext orelse return;
+    if (ext.grid) |gc| allocator.destroy(gc);
+    allocator.destroy(ext);
+}
+
+/// box - generic container node
 ///
-/// 用法:
+/// Usage:
 /// ```
 /// try ui.box(cx, .{ .direction = .row, .gap = 8 }, .{
 ///     ui.text("Hello", .{}),
 ///     ui.text("World", .{}),
 /// });
 /// ```
-/// 把 BoxStyle 的 background/opacity（已不在 Style）经
-/// SoA 写入口落到 World.paint_state。必须在 linkNodeToWorld 之后调用，
-/// 这样 element_id 已分配，setBackgroundRaw 走 World 而非 standalone。
+/// BoxStyle background/opacity (not in Style) are written via the SoA write port into
+/// World.paint_state. Must be called after linkNodeToWorld so element_id is allocated and
+/// setBackgroundRaw routes to World, not standalone.
 pub fn applyPaintOverride(node: *Node, ov: types.BoxStyle.PaintOverride) void {
     if (ov.background) |c| node.setBackgroundRaw(c);
     if (ov.opacity) |o| node.setOpacityRaw(o);
@@ -71,15 +81,11 @@ fn boxWithOrigin(
     origin_kind: @import("world.zig").StyleOriginKind,
 ) !*Node {
     const resolved = try style.toStyleFallible(cx.allocator);
-    const node = createNode(cx, .box, resolved) catch |err| {
-        if (resolved.ext) |ext| cx.allocator.destroy(ext);
-        return err;
-    };
-    // node 建好之后到 return 之前，它是一棵无人持有的游离子树：
-    // appendChildrenFromTuple 里的任何一次分配失败都会让它整棵泄漏。
-    // 消费方下游编辑器做 mount 路径的逐分配点 OOM 注入时，
-    // 交叉 review 把「box 自身是否事务化」列为待验证前提，查证结果是**不是**，
-    // 这里补上。box 是全仓库最高频的构造入口，这一处覆盖面很大。
+    const node = try createNode(cx, .box, resolved);
+    // From node creation until return, subtree is orphaned: any alloc failure in
+    // appendChildrenFromTuple leaks it. Downstream OOM injection at mount path cross-review
+    // marked box transaction safety for verification; answer is no. Box highest-frequency
+    // constructor repo-wide, fix covers large surface.
     errdefer cx.freeDetachedNodeAfterScopeDispose(node);
     cx.linkNodeToWorld(node);
     applyPaintOverride(node, style.paintOverride());
@@ -92,16 +98,14 @@ pub fn box(cx: anytype, style: BoxStyle, children_tuple: anytype) !*Node {
     return boxWithOrigin(cx, style, children_tuple, @returnAddress(), .inline_builder);
 }
 
-// ============================================================================
-// Styled builders，主题安全的具名样式函数消费端
+// Styled builders: theme-safe named style function consumption.
 //
-// `styles.zig` 约定的消费入口：样式是 `fn (*const ThemeTokens) BoxStyle` 纯函数，
-// mount 时求值一次，同时挂 on_theme hook；`Cx.setTheme` 全树遍历会带新 tokens
-// 重放样式函数（applyTo + paint override + markLayoutDirty），普通 `box(cx, .{...})`
-// 的字面量样式在换主题后是死值，这里不是。
-// on_theme 不是 before_render hook：不参与每帧执行，也不影响 promoted 渲染缓存资格。
-// 覆盖范围：setTheme 只遍历 cx.root 子树，独立 overlay 树外的节点不在其中。
-// ============================================================================
+// styles.zig convention: style is fn(*const ThemeTokens) BoxStyle pure function, evaluated once at
+// mount, hooks on_theme; Cx.setTheme tree-traverses with new tokens replaying styles (applyTo +
+// paint override + markLayoutDirty). Literal-style box(cx, .{...}) dead-valued after theme change;
+// not so here. on_theme is not before_render hook: not per-frame, does not affect promoted render
+// cache eligibility. Coverage: setTheme traverses only cx.root subtree; independent overlay tree
+// outside scope.
 
 fn boxThemeHookFor(comptime style_fn: fn (*const theme.ThemeTokens) BoxStyle) node_mod.ThemeHook {
     return struct {
@@ -109,18 +113,19 @@ fn boxThemeHookFor(comptime style_fn: fn (*const theme.ThemeTokens) BoxStyle) no
             const s = style_fn(t);
             s.applyTo(&n.style, allocator);
             applyPaintOverride(n, s.paintOverride());
-            // invokeThemeHookRecursive 只标 render/composite；样式函数可能输出
-            // padding/width/font_size 等布局字段，这里统一标 layout（换主题低频，无热路径成本）
+            // invokeThemeHookRecursive marks render/composite only; style function may emit layout
+            // fields (padding/width/font_size etc.), uniformly mark layout (theme switch rare,
+            // hot-path free).
             n.markLayoutDirty();
         }
     }.hook;
 }
 
-/// boxStyled - 主题安全的 box：样式来自具名纯函数而非内联字面量
+/// boxStyled - theme-safe box: style from a named pure function, not an inline literal
 ///
-/// 用法:
+/// Usage:
 /// ```
-/// // styles.zig:  pub fn card(t: *const ThemeTokens) BoxStyle { return .{ .background = t.color.bg_secondary, ... }; }
+/// // styles.zig:  pub fn card(t: *const ThemeTokens) BoxStyle { return .{ .background = t.tokens.color.bg_secondary, ... }; }
 /// const node = try ui.boxStyled(cx, S.card, .{ ...children });
 /// ```
 pub fn boxStyled(cx: anytype, comptime style_fn: fn (*const theme.ThemeTokens) BoxStyle, children_tuple: anytype) !*Node {
@@ -130,7 +135,7 @@ pub fn boxStyled(cx: anytype, comptime style_fn: fn (*const theme.ThemeTokens) B
     return node;
 }
 
-/// hstackStyled - 主题安全的 hstack（direction 在重放时也保持 .row）
+/// hstackStyled - theme-safe hstack (direction stays .row on replay)
 pub fn hstackStyled(cx: anytype, comptime style_fn: fn (*const theme.ThemeTokens) BoxStyle, children_tuple: anytype) !*Node {
     const wrapped = struct {
         fn f(t: *const theme.ThemeTokens) BoxStyle {
@@ -146,7 +151,7 @@ pub fn hstackStyled(cx: anytype, comptime style_fn: fn (*const theme.ThemeTokens
     return node;
 }
 
-/// vstackStyled - 主题安全的 vstack（direction 在重放时也保持 .column）
+/// vstackStyled - theme-safe vstack (direction stays .column on replay)
 pub fn vstackStyled(cx: anytype, comptime style_fn: fn (*const theme.ThemeTokens) BoxStyle, children_tuple: anytype) !*Node {
     const wrapped = struct {
         fn f(t: *const theme.ThemeTokens) BoxStyle {
@@ -167,61 +172,80 @@ fn textThemeHookFor(comptime style_fn: fn (*const theme.ThemeTokens) TextStyle) 
         fn hook(n: *Node, t: *const theme.ThemeTokens, allocator: std.mem.Allocator) void {
             _ = allocator;
             const s = style_fn(t);
-            // getText -> 改样式字段 -> setText 原样写回：content 指针不变，
-            // ContentTable.setText 的指针守卫保证不误 free owned 内容。
+            // getText -> mutate style fields -> setText same: content pointer unchanged,
+            // ContentTable.setText guard guarantees no misfire on owned content free.
             var props = n.getText() orelse return;
-            props.color = s.color;
-            props.font_size = s.font_size;
-            props.font_weight = s.font_weight;
-            props.line_height = s.line_height;
-            props.wrap = s.wrap;
-            props.max_lines = s.max_lines;
+            _ = s.applyTo(&props);
             n.setText(props);
             n.markLayoutDirty();
         }
     }.hook;
 }
 
-/// textStyled - 主题安全的 text：样式来自 `fn (*const ThemeTokens) TextStyle` 纯函数
+/// textStyled - theme-safe text: style from `fn (*const ThemeTokens) TextStyle` pure function
 pub fn textStyled(cx: anytype, comptime style_fn: fn (*const theme.ThemeTokens) TextStyle, content: []const u8) !*Node {
     const node = try textWithOrigin(cx, content, style_fn(cx.tokens), @intFromPtr(&style_fn), .styled);
     node.meta.per_frame.hooks.on_theme = textThemeHookFor(style_fn);
     return node;
 }
 
-/// hstack - 水平布局 (direction = .row)
+/// hstack - horizontal layout (direction = .row)
 pub fn hstack(cx: anytype, style: BoxStyle, children_tuple: anytype) !*Node {
     var s = style;
     s.direction = .row;
     return boxWithOrigin(cx, s, children_tuple, @returnAddress(), .inline_builder);
 }
 
-/// vstack - 垂直布局 (direction = .column)
+/// vstack - vertical layout (direction = .column)
 pub fn vstack(cx: anytype, style: BoxStyle, children_tuple: anytype) !*Node {
     var s = style;
     s.direction = .column;
     return boxWithOrigin(cx, s, children_tuple, @returnAddress(), .inline_builder);
 }
 
-/// text 节点的样式参数（具名类型，供 textStyled 的样式函数复用）
+/// Text node style params (named type, reused by textStyled style functions)
 pub const TextStyle = struct {
-    color: Color = theme.dark.color.fg_primary,
+    color: Color = theme.dark.tokens.color.fg_primary,
     font_size: f32 = 14,
     font_weight: u16 = 400,
-    /// 字体族 id(zenit_app.FontRegistry)。0 = 默认族。
+    /// Font family id (zenit_app.FontRegistry). 0 = default.
     font_family: u16 = 0,
     line_height: f32 = 1.4,
     wrap: types.TextWrap = .none,
     max_lines: u16 = 0,
-    /// 逐视觉行水平对齐（见 TextProps.text_align）
+    /// Per-visual-line horizontal align (see TextProps.text_align)
     text_align: types.TextAlign = .start,
+    // Below fields one-to-one match TextProps (see TextProps comment)
+    selectable: bool = true,
+    baseline_ratio: f32 = 0,
+    use_symbols_font: bool = false,
+    use_monospace_font: bool = false,
+    use_italic_font: bool = false,
+    font_smoothing: bool = true,
+    strikethrough: bool = false,
+    monospace_char_width: f32 = 0,
+    text_overflow: types.TextOverflow = .clip,
+    fade_right: f32 = 0,
+
+    /// Write style fields into TextProps (content/spans/owned unchanged). Field names one-to-one
+    /// TextProps, new fields auto-track. Return: any fields changed.
+    pub fn applyTo(self: TextStyle, props: *types.TextProps) bool {
+        var changed = false;
+        inline for (@import("zenit_reflection").fields(TextStyle)) |f| {
+            if (!std.meta.eql(@field(props.*, f.name), @field(self, f.name))) {
+                @field(props.*, f.name) = @field(self, f.name);
+                changed = true;
+            }
+        }
+        return changed;
+    }
 };
 
-/// text - 文本节点
+/// text - text node
 fn textStyleFieldMask() u64 {
-    return (@as(u64, 1) << @intFromEnum(types.StyleField.text_color)) |
-        (@as(u64, 1) << @intFromEnum(types.StyleField.text_font_size)) |
-        (@as(u64, 1) << @intFromEnum(types.StyleField.text_font_weight));
+    return (@as(u64, 1) << @backingInt(types.StyleField.text_color)) |
+        (@as(u64, 1) << @backingInt(types.StyleField.text_font_size)) |
+        (@as(u64, 1) << @backingInt(types.StyleField.text_font_weight));
 }
 
 fn textWithOrigin(
@@ -236,22 +260,18 @@ fn textWithOrigin(
         .height = .{ .fit = .{} },
     });
     errdefer cx.freeNode(node);
-    // Content lifetime contract: builder 内部 take ownership 避免 caller 误用
-    // frame_arena dupe (下一帧 reset -> content 悬垂)。
-    // - ≤16 bytes: 走 inline_buf，零额外 alloc
-    // - >16 bytes: cx.allocator.dupe，并设 owned=true 让 Node.destroy 释放
-    var t = types.TextProps{
-        .color = props.color,
-        .font_size = props.font_size,
-        .font_weight = props.font_weight,
-        .font_family = props.font_family,
-        .line_height = props.line_height,
-        .wrap = props.wrap,
-        .max_lines = props.max_lines,
-        .text_align = props.text_align,
-    };
-    try t.setContent(cx.allocator, content);
-    // linkNodeToWorld 先于 setText，确保 mirror 写入有 element_id。
+    // Content lifetime contract: builder takes ownership, non-empty duped to node's heap copy
+    // (same strategy as Node.setTextContent, freed on node destroy/text swap). Skip <=16 bytes
+    // inline_buf: inline content inside text table entry, table expand relocates, component
+    // borrowing `getText().content` to a11y label/live_text dangling (Component Wall real
+    // segfault).
+    var t = types.TextProps{};
+    _ = props.applyTo(&t);
+    if (content.len > 0) {
+        t.content = try cx.allocator.dupe(u8, content);
+        t.owned = true;
+    }
+    // linkNodeToWorld before setText, ensures mirror write has element_id.
     cx.linkNodeToWorld(node);
     node.setText(t);
     node.recordStyleBaseOrigin(textStyleFieldMask(), origin_address, origin_kind);
@@ -262,7 +282,7 @@ pub fn text(cx: anytype, content: []const u8, props: TextStyle) !*Node {
     return textWithOrigin(cx, content, props, @returnAddress(), .inline_builder);
 }
 
-/// image - 图片节点（纹理 ID）
+/// image - image node (texture ID)
 pub fn image(cx: anytype, texture_id: u32, style: Style) !*Node {
     const node = try createNode(cx, .image, style);
     cx.linkNodeToWorld(node);
@@ -278,7 +298,7 @@ pub fn imageSvgHit(cx: anytype, texture_id: u32, style: Style, svg_data: []const
     return node;
 }
 
-/// imageTint - 图片节点（纹理 ID + tint）
+/// imageTint - image node (texture ID + tint)
 pub fn imageTint(cx: anytype, texture_id: u32, tint: Color, style: Style) !*Node {
     const node = try createNode(cx, .image, style);
     errdefer cx.freeNode(node);
@@ -321,7 +341,15 @@ pub fn iconTint(cx: anytype, asset: svg_assets_mod.Asset, tint: Color, style: St
 /// BoxStyle variant of iconTint. Unlike the legacy Style entry point this can
 /// apply SoA paint fields such as opacity at construction time.
 pub fn iconTintStyled(cx: anytype, asset: svg_assets_mod.Asset, tint: Color, style: BoxStyle) !*Node {
-    const node = try iconTint(cx, asset, tint, style.toStyle(cx.allocator));
+    // Style heap part to iconTint -> createNode (fail: it recycles)
+    const node = try iconTint(cx, asset, tint, try style.toStyleFallible(cx.allocator));
+    applyPaintOverride(node, style.paintOverride());
+    return node;
+}
+
+/// BoxStyle imageTint (texture image); style heap to createNode.
+pub fn imageTintStyled(cx: anytype, texture_id: u32, tint: Color, style: BoxStyle) !*Node {
+    const node = try imageTint(cx, texture_id, tint, try style.toStyleFallible(cx.allocator));
     applyPaintOverride(node, style.paintOverride());
     return node;
 }
@@ -332,13 +360,23 @@ pub fn iconStyled(cx: anytype, asset: svg_assets_mod.Asset, style: BoxStyle) !*N
 
 pub fn svg(cx: anytype, svg_data: []const u8, style: Style) !*Node {
     const raster_size = svg_geometry.resolveSvgRasterSize(cx.window_scale, svg_data, style);
-    const texture_id = try cx.svg_textures.load(svg_data, raster_size[0], raster_size[1]);
+    // style heap to this builder (see createNode): texture load fail before node create
+    // still recycles
+    const texture_id = cx.svg_textures.load(svg_data, raster_size[0], raster_size[1]) catch |err| {
+        discardStyleExt(cx.allocator, style);
+        return err;
+    };
     return imageSvgHit(cx, texture_id, style, svg_data);
 }
 
 pub fn svgTint(cx: anytype, svg_data: []const u8, tint: Color, style: Style) !*Node {
     const raster_size = svg_geometry.resolveSvgRasterSize(cx.window_scale, svg_data, style);
-    const texture_id = try cx.svg_textures.load(svg_data, raster_size[0], raster_size[1]);
+    // style heap to this builder (see createNode): texture load fail before node create
+    // still recycles
+    const texture_id = cx.svg_textures.load(svg_data, raster_size[0], raster_size[1]) catch |err| {
+        discardStyleExt(cx.allocator, style);
+        return err;
+    };
     return imageTintSvgHit(cx, texture_id, tint, style, svg_data);
 }
 
@@ -362,7 +400,7 @@ fn applyIconHitGeometry(cx: anytype, node: *Node, rep: icon_ir.Rep) !void {
     } } };
 }
 
-/// spacer - 弹性空白 (填充可用空间)
+/// spacer - elastic whitespace (fill available)
 pub fn spacer(cx: anytype) !*Node {
     return createNode(cx, .spacer, .{
         .width = .{ .grow = .{} },
@@ -370,14 +408,26 @@ pub fn spacer(cx: anytype) !*Node {
     });
 }
 
-/// Grid 容器样式配置
+/// anchor - control flow region boundary mark (see `ElementTag.anchor`). display:none +
+/// zero size: layout/gap/hit/a11y all skip, takes one slot in children only.
+pub fn anchor(cx: anytype) !*Node {
+    const node = try createNode(cx, .anchor, .{
+        .width = .{ .px = 0 },
+        .height = .{ .px = 0 },
+        .display = .none,
+    });
+    cx.linkNodeToWorld(node);
+    return node;
+}
+
+/// Grid container style config
 pub const GridStyle = struct {
     columns: []const GridTrackSize = &.{},
     rows: []const GridTrackSize = &.{},
     column_gap: f32 = 0,
     row_gap: f32 = 0,
 
-    // 常用 Style 字段透传
+    // Common Style field pass-through
     background: Color = Color.TRANSPARENT,
     padding: Padding = Padding.ZERO,
     width: Sizing = .{ .grow = .{} },
@@ -388,11 +438,11 @@ pub const GridStyle = struct {
     border: Border = .{},
     corner_radius: ?types.CornerRadius = null,
     margin: Padding = Padding.ZERO,
-    /// 完整 margin 声明（支持 auto）。若设置，则覆盖 margin。
+    /// Complete margin decl (supports auto). If set, overrides margin.
     margin_spec: ?types.Margin = null,
 };
 
-/// grid - Grid 容器（CSS Grid 布局）
+/// grid - Grid container (CSS Grid layout)
 pub fn grid(cx: anytype, config: GridStyle, children_tuple: anytype) !*Node {
     var style = Style{
         .padding = config.padding,
@@ -404,8 +454,11 @@ pub fn grid(cx: anytype, config: GridStyle, children_tuple: anytype) !*Node {
         .border = config.border,
         .margin = config.margin,
     };
+    // Before createNode style heap: any step fail = recycle here
+    var style_owned = true;
+    errdefer if (style_owned) discardStyleExt(cx.allocator, style);
     if (config.margin_spec) |v| {
-        style.setMarginSpec(cx.allocator, v);
+        try style.setMarginSpecFallible(cx.allocator, v);
     }
     if (config.corner_radius) |cr| {
         (try style.ensureExtFallible(cx.allocator)).corner_radius = cr;
@@ -429,31 +482,34 @@ pub fn grid(cx: anytype, config: GridStyle, children_tuple: anytype) !*Node {
     }
     gc.row_count = nrows;
 
-    (try style.ensureExtFallible(cx.allocator)).grid = gc;
+    const ext = style.ensureExtFallible(cx.allocator) catch |err| {
+        cx.allocator.destroy(gc);
+        return err;
+    };
+    ext.grid = gc;
 
+    style_owned = false; // createNode takes over (fail: it recycles)
     const node = try createNode(cx, .box, style);
+    errdefer cx.freeDetachedNodeAfterScopeDispose(node);
     cx.linkNodeToWorld(node);
     if (config.background.a != 0) node.setBackgroundRaw(config.background);
     try appendChildrenFromTuple(cx, node, children_tuple);
     return node;
 }
 
-/// clickable - 给任意节点添加点击事件
+/// clickable - add click event to any node
 pub fn clickable(node: *Node, on_click: HandlerRef) *Node {
     node.behavior.events.on_click = on_click;
     return node;
 }
 
-/// 将 comptime children tuple 展开为 Node 子节点。
-///
-/// tuple 中的元素可以是:
-///   - *Node: 直接添加
-///   - 实现了 render(*Cx) !*Node 的 struct: 调用 render()
-///   - ?*Node: 可选节点 (null 跳过)
+/// Expand comptime children tuple to Node children. Tuple elements can be:
+///   - *Node: direct add
+///   - struct with render(*Cx) !*Node: call render()
+///   - ?*Node: optional node (null skip)
 pub fn appendChildrenFromTuple(cx: anytype, parent: *Node, children_tuple: anytype) !void {
     const T = @TypeOf(children_tuple);
-    const info = @typeInfo(T);
-    const fields = info.@"struct".fields;
+    const fields = @import("zenit_reflection").fields(T);
 
     inline for (fields) |field| {
         const child = @field(children_tuple, field.name);
@@ -469,13 +525,13 @@ fn appendSingleChild(cx: anytype, parent: *Node, child: anytype) !void {
         return;
     }
 
-    // *Node - 直接添加
+    // *Node - direct add
     if (T == *Node) {
         try parent.appendChild(cx.allocator, child);
         return;
     }
 
-    // ?*Node - 条件渲染
+    // ?*Node - conditional render
     if (T == ?*Node) {
         if (child) |c| {
             try parent.appendChild(cx.allocator, c);

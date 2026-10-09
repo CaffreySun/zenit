@@ -1,35 +1,37 @@
-/// Popover，样式层
+/// Popover, style layer
 ///
-/// 浮层面板的外观声明；overlay 生命周期/portal/定位逻辑在 mod.zig。
+/// Floating panel appearance declaration; overlay lifecycle / portal / positioning logic in
+/// mod.zig.
 const core = @import("../../core.zig");
 const theme = core.theme;
 const Color = core.Color;
 const Border = core.Border;
 const Shadow = core.Shadow;
 
-/// 面板圆角，border.radius 与 hit/clip shape 共用同一标量
+/// Panel corner radius, border.radius and hit/clip shape share same scalar
 pub fn popoverRadius(t: *const theme.ThemeTokens) f32 {
-    return t.radius.md;
+    return t.tokens.radius.md;
 }
 
 pub fn popoverContentBackground(t: *const theme.ThemeTokens) Color {
-    return t.color.bg_secondary;
+    return t.tokens.color.bg_secondary;
 }
 
 pub fn popoverContentBorder(t: *const theme.ThemeTokens) Border {
     return .{
         .width = 1,
-        .color = t.color.border,
+        .color = t.tokens.color.border,
         .radius = popoverRadius(t),
     };
 }
 
-/// 主投影层，token shadow.md
+/// Main shadow layer, token shadow.md
 pub fn popoverKeyShadow(t: *const theme.ThemeTokens) Shadow {
-    return t.shadow.md;
+    return t.tokens.shadow.md;
 }
 
-/// 环境光阴影层：大范围软阴影模拟 elevation（MD3 风格双层阴影）
+/// Ambient light shadow layer: large-extent soft shadow simulates elevation (MD3 double-shadow
+/// style)
 pub const popover_ambient_shadow: Shadow = .{
     .color = Color.rgba(0, 0, 0, 18),
     .blur = 40,

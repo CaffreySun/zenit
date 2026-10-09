@@ -1,19 +1,16 @@
-/// Metal Pipeline 实现
-///
-/// 提供 ShaderModule 和 RenderPipeline 封装
+/// Metal Pipeline implementation. Provides ShaderModule and RenderPipeline wrapper.
 const std = @import("std");
 const gpu = @import("../gpu.zig");
 const mtl = @import("metal_bindings.zig");
 const conv = @import("conv.zig");
 const Device = @import("device.zig").Device;
 
-/// ShaderModule - 着色器模块
-///
-/// 封装 MTLLibrary，包含编译后的着色器函数
+/// ShaderModule - shader module. Encapsulates MTLLibrary, contains compiled
+/// shader functions.
 pub const ShaderModule = struct {
     library: *mtl.MTLLibrary,
 
-    /// 从 Metal Shading Language 源码创建
+    /// Created from Metal Shading Language source.
     pub fn initFromSource(
         device: *Device,
         source: []const u8,
@@ -21,8 +18,9 @@ pub const ShaderModule = struct {
         var pool = mtl.AutoreleasePool.init();
         defer pool.deinit();
 
-        // 需要 null-terminated 字符串（shader 源码较大，使用 page_allocator）
-        const source_z = try std.heap.page_allocator.dupeZ(u8, source);
+        // Requires null-terminated string (shader source can be large, use
+        // page_allocator).
+        const source_z = try std.heap.page_allocator.dupeSentinel(u8, source, 0);
         defer std.heap.page_allocator.free(source_z);
 
         var compile_error: ?[*:0]u8 = null;
@@ -45,9 +43,10 @@ pub const ShaderModule = struct {
         };
     }
 
-    /// 获取函数
+    /// Get function.
     pub fn getFunction(self: *ShaderModule, name: []const u8) !ShaderFunction {
-        // 函数名通常很短（< 128 字节），使用栈缓冲区避免 page_allocator 的 mmap 开销
+        // Function names typically short (< 128 bytes); use stack buffer to avoid
+        // page_allocator mmap overhead.
         var buf: [128]u8 = undefined;
         if (name.len < buf.len) {
             @memcpy(buf[0..name.len], name);
@@ -56,8 +55,8 @@ pub const ShaderModule = struct {
                 return error.FunctionNotFound;
             return .{ .raw = raw };
         }
-        // 超长名称回退到 page_allocator
-        const name_z = try std.heap.page_allocator.dupeZ(u8, name);
+        // Very long names fall back to page_allocator.
+        const name_z = try std.heap.page_allocator.dupeSentinel(u8, name, 0);
         defer std.heap.page_allocator.free(name_z);
         const raw = mtl.metal_library_new_function(self.library, name_z.ptr) orelse
             return error.FunctionNotFound;
@@ -82,9 +81,7 @@ pub const ShaderFunction = struct {
     }
 };
 
-/// RenderPipeline - 渲染管线
-///
-/// 封装 MTLRenderPipelineState
+/// RenderPipeline - render pipeline. Encapsulates MTLRenderPipelineState.
 pub const RenderPipeline = struct {
     raw: *mtl.MTLRenderPipelineState,
 
@@ -93,9 +90,8 @@ pub const RenderPipeline = struct {
     }
 };
 
-/// RenderPipelineDescriptor - 渲染管线描述符
-///
-/// 用于创建 RenderPipeline 的配置
+/// RenderPipelineDescriptor - render pipeline descriptor. Configuration used to
+/// create RenderPipeline.
 pub const RenderPipelineDescriptor = struct {
     vertex_function: ?*const ShaderFunction = null,
     fragment_function: ?*const ShaderFunction = null,
@@ -107,21 +103,21 @@ pub const RenderPipelineDescriptor = struct {
     blend_state: ?BlendState = null,
 };
 
-/// 顶点缓冲区布局描述符
+/// Vertex buffer layout descriptor.
 pub const VertexBufferLayoutDescriptor = struct {
     stride: u64,
     step_mode: gpu.VertexStepMode = .vertex,
     attributes: []const VertexAttributeDescriptor,
 };
 
-/// 顶点属性描述符
+/// Vertex attribute descriptor.
 pub const VertexAttributeDescriptor = struct {
     format: gpu.VertexFormat,
     offset: u64,
     shader_location: u32,
 };
 
-/// 混合状态
+/// Blend state.
 pub const BlendState = struct {
     source_rgb: BlendFactor = .one,
     destination_rgb: BlendFactor = .zero,
@@ -166,28 +162,22 @@ pub const BlendOperation = enum(c_ulong) {
     max = 4,
 };
 
-/// 创建 RenderPipeline
+/// Create RenderPipeline.
 ///
-/// ⚠️ 别加 descriptor-hash PSO 缓存（GPU 评审 §B3 建议过）。2026-08-07 实测
-/// 翻车：descriptor 里的 shader 函数只能按 `MTLFunction` **对象地址**指纹，
-/// 而调用点（ensureBlurPipeline / buildGlassPipeline 等）建完 PSO 就
-/// `defer func.deinit()` 释放函数与 ShaderModule。地址随即被 ObjC 回收复用，
-/// 于是 glass 的 descriptor 与先建的 Kawase blur descriptor **指纹相同**,
-/// 缓存把 blur PSO 当成 glass PSO 返回，玻璃退化成一坨不折射的乳白圆盘。
+/// WARNING: Do not add a descriptor-hash PSO cache. Shader functions in the
+/// descriptor can only be fingerprinted by `MTLFunction` **object address**. Callers
+/// (ensureBlurPipeline, buildGlassPipeline, etc.) `defer func.deinit()` right after
+/// PSO creation, so the address is reclaimed and reused by ObjC. The glass descriptor
+/// then gets the same fingerprint as Kawase blur, the cache returns the blur PSO as
+/// the glass PSO, and glass degrades to an opaque milky disk. e2e pixel assertions
+/// do not catch 'wrong shader'; only screenshots show it.
 ///
-/// 关键教训：e2e 当时仍报 87/87 全绿（像素断言抓不住"用错 shader"），
-/// 是逐张看截图才发现的。
+/// The cache also has no benefit: over the full storybook lifetime PSOs are created
+/// only 10 times (1.26ms total), with zero repeats. Callsites already have
+/// `if (pipeline != null) return` + PersistentGpuCache cross-frame dedup (see
+/// PersistentGpuCache in command_encoder.zig).
 ///
-/// **更重要的是：这个缓存本来就没有收益。** 2026-08-07 在本函数插桩实测
-/// 整个 storybook 生命周期（41 组件 / 87 个 e2e 场景 / 全部 glass+blur 场景）：
-///   PSO 累计只建 **10 次、总计 1.26ms**（单次最贵 0.44ms，其余 0.03~0.15ms），
-///   且**零次重复**。
-/// 评审 §B3 假设的"同一组合在多个 renderer 里重复编译"不成立，各调用点
-/// 早有 `if (pipeline != null) return` + PersistentGpuCache 跨帧持久去重
-/// （见 command_encoder.zig 的 PersistentGpuCache）。缓存的收益上限是这
-/// 一次性的 1.26ms（不在帧路径上），代价却是整块 glass 渲染错误：负收益。
-///
-/// 真要重开此议题，先复现出"PSO 重复编译"的实测证据，再谈实现。
+/// If revisiting, first gather evidence of actual PSO re-compilation.
 pub fn createRenderPipeline(
     device: *Device,
     desc: RenderPipelineDescriptor,
@@ -195,11 +185,11 @@ pub fn createRenderPipeline(
     var pool = mtl.AutoreleasePool.init();
     defer pool.deinit();
 
-    // 创建 pipeline descriptor
+    // Create pipeline descriptor.
     const pipeline_desc = mtl.metal_render_pipeline_descriptor_new();
     defer mtl.release(pipeline_desc);
 
-    // 设置顶点和片段函数
+    // Set vertex and fragment functions.
     mtl.metal_render_pipeline_descriptor_set_vertex_function(
         pipeline_desc,
         if (desc.vertex_function) |function| function.raw else null,
@@ -209,55 +199,55 @@ pub fn createRenderPipeline(
         if (desc.fragment_function) |function| function.raw else null,
     );
 
-    // 设置颜色附件格式
+    // Set color attachment format.
     for (desc.color_attachment_formats, 0..) |format, i| {
         const mtl_format = conv.toMetalPixelFormat(format);
         mtl.metal_render_pipeline_descriptor_set_color_attachment_format(
             pipeline_desc,
             @intCast(i),
-            @intFromEnum(mtl_format),
+            @backingInt(mtl_format),
         );
 
-        // 设置混合状态
+        // Set blend state.
         if (desc.blend_state) |blend| {
             mtl.metal_render_pipeline_color_attachment_set_blending_enabled(pipeline_desc, @intCast(i), 1);
-            mtl.metal_render_pipeline_color_attachment_set_source_rgb_blend_factor(pipeline_desc, @intCast(i), @intFromEnum(blend.source_rgb));
-            mtl.metal_render_pipeline_color_attachment_set_destination_rgb_blend_factor(pipeline_desc, @intCast(i), @intFromEnum(blend.destination_rgb));
-            mtl.metal_render_pipeline_color_attachment_set_rgb_blend_operation(pipeline_desc, @intCast(i), @intFromEnum(blend.rgb_operation));
-            mtl.metal_render_pipeline_color_attachment_set_source_alpha_blend_factor(pipeline_desc, @intCast(i), @intFromEnum(blend.source_alpha));
-            mtl.metal_render_pipeline_color_attachment_set_destination_alpha_blend_factor(pipeline_desc, @intCast(i), @intFromEnum(blend.destination_alpha));
-            mtl.metal_render_pipeline_color_attachment_set_alpha_blend_operation(pipeline_desc, @intCast(i), @intFromEnum(blend.alpha_operation));
+            mtl.metal_render_pipeline_color_attachment_set_source_rgb_blend_factor(pipeline_desc, @intCast(i), @backingInt(blend.source_rgb));
+            mtl.metal_render_pipeline_color_attachment_set_destination_rgb_blend_factor(pipeline_desc, @intCast(i), @backingInt(blend.destination_rgb));
+            mtl.metal_render_pipeline_color_attachment_set_rgb_blend_operation(pipeline_desc, @intCast(i), @backingInt(blend.rgb_operation));
+            mtl.metal_render_pipeline_color_attachment_set_source_alpha_blend_factor(pipeline_desc, @intCast(i), @backingInt(blend.source_alpha));
+            mtl.metal_render_pipeline_color_attachment_set_destination_alpha_blend_factor(pipeline_desc, @intCast(i), @backingInt(blend.destination_alpha));
+            mtl.metal_render_pipeline_color_attachment_set_alpha_blend_operation(pipeline_desc, @intCast(i), @backingInt(blend.alpha_operation));
         }
     }
 
-    // 设置深度附件格式
+    // Set depth attachment format.
     if (desc.depth_attachment_format) |format| {
         const mtl_format = conv.toMetalPixelFormat(format);
         mtl.metal_render_pipeline_descriptor_set_depth_attachment_format(
             pipeline_desc,
-            @intFromEnum(mtl_format),
+            @backingInt(mtl_format),
         );
     }
 
-    // 设置模板附件格式
+    // Set stencil attachment format.
     if (desc.stencil_attachment_format) |format| {
         const mtl_format = conv.toMetalPixelFormat(format);
         mtl.metal_render_pipeline_descriptor_set_stencil_attachment_format(
             pipeline_desc,
-            @intFromEnum(mtl_format),
+            @backingInt(mtl_format),
         );
     }
 
-    // 设置采样数
+    // Set sample count.
     mtl.metal_render_pipeline_descriptor_set_sample_count(pipeline_desc, desc.sample_count);
 
-    // 设置顶点描述符
+    // Set vertex descriptor.
     if (desc.vertex_buffers.len > 0) {
         const vertex_desc = mtl.metal_vertex_descriptor_new();
         defer mtl.release(vertex_desc);
 
         for (desc.vertex_buffers, 0..) |buffer_layout, buffer_index| {
-            // 设置布局
+            // Set layout.
             mtl.metal_vertex_descriptor_set_layout_stride(
                 vertex_desc,
                 @intCast(buffer_index),
@@ -279,13 +269,13 @@ pub fn createRenderPipeline(
                 1,
             );
 
-            // 设置属性
+            // Set attributes.
             for (buffer_layout.attributes) |attr| {
                 const mtl_format = vertexFormatToMetal(attr.format);
                 mtl.metal_vertex_descriptor_set_attribute_format(
                     vertex_desc,
                     attr.shader_location,
-                    @intFromEnum(mtl_format),
+                    @backingInt(mtl_format),
                 );
                 mtl.metal_vertex_descriptor_set_attribute_offset(
                     vertex_desc,
@@ -303,7 +293,7 @@ pub fn createRenderPipeline(
         mtl.metal_render_pipeline_descriptor_set_vertex_descriptor(pipeline_desc, vertex_desc);
     }
 
-    // 创建 pipeline state（不使用 error_out，简化实现）
+    // Create pipeline state (no error_out for simplicity).
     const pipeline_state = mtl.metal_device_new_render_pipeline_state(
         device.raw_device,
         pipeline_desc,
@@ -321,7 +311,7 @@ pub fn createRenderPipeline(
     };
 }
 
-/// 转换顶点格式到 Metal
+/// Convert vertex format to Metal.
 fn vertexFormatToMetal(format: gpu.VertexFormat) mtl.MTLVertexFormat {
     return switch (format) {
         .uint8x2 => .UChar2,

@@ -7,56 +7,47 @@ const BatchContext = @import("batch.zig").BatchContext;
 const graph_mod = @import("graph.zig");
 pub const ReactiveGraph = graph_mod.ReactiveGraph;
 
-/// SignalOwner: 响应式系统的生命周期管理器
+/// SignalOwner: lifecycle manager of the reactive system.
 ///
-/// 核心职责:
-/// - 管理组件内所有 Signal/Effect 的生命周期
-/// - 使用 Arena allocator 一次性回收所有内存
-/// - 组件销毁时自动清理所有依赖关系
-///
-/// 设计理念:
-/// - 每个组件拥有一个 Owner
-/// - Owner 管理该组件内所有 Signal/Effect
-/// - 组件销毁时,Owner.deinit() 自动清理一切
+/// - Each component owns one Owner
+/// - Owner manages all Signals/Effects in that component
+/// - Uses an Arena allocator to reclaim all memory at once
+/// - On component destruction, Owner.deinit() cleans up all dependencies
 pub const SignalOwner = struct {
     pub const DeferredDisposal = @import("deferred_disposal.zig").Entry;
 
-    /// Arena allocator: 所有 Signal/Effect 都从这里分配
+    /// Arena allocator: all Signal/Effect allocated from here
     arena: std.heap.ArenaAllocator,
 
-    /// 父 allocator (用于 Arena 自身)
+    /// Parent allocator (for Arena itself)
     parent_allocator: Allocator,
 
-    /// 创建时的线程 ID (用于线程亲和性断言)
+    /// Thread ID when created (for thread-affinity asserts)
     thread_id: std.Thread.Id,
 
-    /// 所有 Signal 列表 (用于清理)
+    /// All Signal list (for cleanup)
     signals: std.ArrayList(*SignalBase),
 
-    /// 所有 Effect 列表 (用于清理和执行)
+    /// All Effect list (for cleanup and execution)
     effects: std.ArrayList(*EffectBase),
 
-    /// 批量更新上下文
+    /// Batch update context
     batch_ctx: BatchContext,
 
-    /// 是否启用依赖追踪
-    is_tracking: bool = true,
-
-    /// 当前正在执行的 Effect (用于依赖追踪)
+    /// Currently executing Effect (for dependency tracking)
     current_effect: ?*EffectBase = null,
 
-    /// 调用 untrack 时需要临时禁用追踪的 Effect。
-    /// 仅对该 Effect 生效，避免影响 untrack 内触发的其他 Effect。
-    untracked_effect: ?*EffectBase = null,
-
-    // graph 主路径切换。
-    // 每个 SignalOwner 持有一个 ReactiveGraph 作为新主路径调度器。
-    // Signal/Memo/Effect facade 在 create 时同时在 graph 里注册 NodeId；
-    // set/get/recompute 走 graph（拓扑序 + 版本戳 + lazy memo）。
-    // 旧 push DFS 路径（signal.notifyImpl 直接 effect.runWithTracking）保留作
-    // fallback；当 use_graph_path = true 时全部走 graph。
+    // Graph main path.
+    // Each SignalOwner holds one ReactiveGraph as the scheduler.
+    // Signal/Memo/Effect facades register a NodeId in the graph at creation;
+    // set/get/recompute go through the graph (topological order + version stamps + lazy memo).
+    // The old push DFS path (signal.notifyImpl directly calls effect.runWithTracking) is kept
+    // as fallback; when use_graph_path = true, everything goes through the graph.
     graph: ReactiveGraph,
     use_graph_path: bool = true,
+
+    /// Debug diagnostic counters (docs/SIGNAL_API_DESIGN.md §4.11). Empty struct in Release.
+    debug: DebugCounters = .{},
 
     /// Scope disposal requested from inside an effect/memo callback must wait
     /// until the outer reactive facade has stopped touching its allocation.
@@ -64,76 +55,134 @@ pub const SignalOwner = struct {
     deferred_disposals: @import("deferred_disposal.zig").Queue = .{},
     draining_disposals: bool = false,
 
-    /// 创建 SignalOwner
+    pub const debug_checks = @import("builtin").mode == .debug;
+    const tracking_stack_reserve = 2 * graph_mod.max_reactive_recursion_depth;
+
+    /// Spec §4.11 clause 5: these counters are decision evidence for 'are raw pointers enough'.
+    pub const DebugCounters = if (debug_checks) struct {
+        /// Number of writes that actually changed a signal's value (basis for deciding that a split
+        /// write did not land synchronously)
+        signal_writes: u64 = 0,
+        /// Borrow-check warning (borrowed signal not in consumer scope's ancestor chain)
+        borrow_warnings: u32 = 0,
+        /// effect / memo wrote signal it read in this batch
+        self_write_warnings: u32 = 0,
+        /// After split.write, data source unchanged and no signal writes occurred
+        split_unlanded_hints: u32 = 0,
+        /// Owned text set allocation failed (value unchanged)
+        text_store_failures: u32 = 0,
+        /// Component mount nesting depth (`enterMount` / `exitMount`)
+        mount_depth: u32 = 0,
+        /// Tracking read during mount, not inside effect / memo computation (value won't update,
+        /// pain point 5)
+        mount_tracked_reads: u32 = 0,
+        /// `Derived.peek` nesting depth: get() on source in derived function is part of snapshot,
+        /// not raw read
+        snapshot_depth: u32 = 0,
+    } else struct {};
+
+    /// Component mount start / end (paired, `defer owner.exitMount()`). Debug: 'raw read during
+    /// mount' warning; Release: no-op.
+    pub fn enterMount(self: *SignalOwner) void {
+        if (debug_checks) self.debug.mount_depth += 1;
+    }
+
+    pub fn exitMount(self: *SignalOwner) void {
+        if (debug_checks) self.debug.mount_depth -= 1;
+    }
+
+    /// Debug: during mount and currently no real reader (tracking stack empty or top is untrack
+    /// sentinel), tracking read of signal value read but won't update on source change. Component
+    /// should use ui.bind / Show / textFmt.
+    pub fn noteTrackedRead(self: *SignalOwner, comptime what: []const u8) void {
+        if (!debug_checks) return;
+        if (self.debug.mount_depth == 0 or self.debug.snapshot_depth > 0) return;
+        const stack = self.graph.tracking_stack.items;
+        if (stack.len != 0 and !stack[stack.len - 1].isNull()) return;
+        self.debug.mount_tracked_reads += 1;
+        std.log.warn("[reactive] " ++ what ++ ".get() during mount outside an effect: the value will not update; use ui.bind / Show / textFmt (or peek() if a snapshot is intended)", .{});
+    }
+
+    /// Create a SignalOwner
     ///
-    /// parent_alloc: 父 allocator,用于创建 Arena
+    /// parent_alloc: parent allocator, used to create Arena.
     pub fn init(parent_alloc: Allocator) !*SignalOwner {
         const owner = try parent_alloc.create(SignalOwner);
         owner.* = .{
             .arena = std.heap.ArenaAllocator.init(parent_alloc),
             .parent_allocator = parent_alloc,
             .thread_id = std.Thread.getCurrentId(),
-            .signals = .{},
-            .effects = .{},
+            .signals = .empty,
+            .effects = .empty,
             .batch_ctx = BatchContext.init(parent_alloc),
             .graph = ReactiveGraph.init(parent_alloc),
         };
+        errdefer {
+            owner.arena.deinit();
+            owner.graph.deinit();
+            owner.batch_ctx.deinit();
+            parent_alloc.destroy(owner);
+        }
+        // Pre-allocate tracking stack: untrack pushing sentinel shouldn't fail at runtime (fallback
+        // is global disable tracking, which loses deps on first-calculate memo inside untrack). 256
+        // = 2x the recursion depth limit of 128, covering one extra untrack nested at every level.
+        try owner.graph.tracking_stack.ensureTotalCapacity(parent_alloc, tracking_stack_reserve);
         return owner;
     }
 
-    /// 销毁 SignalOwner 并清理所有资源
+    /// Destroy SignalOwner and clean up all resources.
     ///
-    /// 单轨清理路径，graph.deinit 处理所有 reactive node 的 source /
-    /// observer 边；不再遍历 SignalBase.subscribers / EffectBase.dependencies
-    /// 列表（这两个字段在 v0.3-P4/P5 删除）。
+    /// Single cleanup path: graph.deinit handles all reactive node source/observer
+    /// edges; SignalBase.subscribers / EffectBase.dependencies lists are not traversed.
     ///
-    /// 执行顺序:
-    /// 1. graph.deinit 关闭所有 node + 释放图结构
-    /// 2. 释放 self.signals / self.effects ArrayLists 自身
+    /// Cleanup order:
+    /// 1. graph.deinit closes all nodes + frees graph structure
+    /// 2. Free self.signals / self.effects ArrayLists themselves
     /// 3. batch_ctx.deinit
-    /// 4. 一次性回收 Arena 释放所有 Signal/Effect 实例内存
+    /// 4. Arena reclaims all Signal/Effect instance memory at once.
     pub fn deinit(self: *SignalOwner) void {
         self.assertThread();
         std.debug.assert(self.reactive_callback_depth == 0);
         _ = self.drainDeferredDisposals();
-        // 单轨清理，graph.deinit 处理所有 reactive node。
-        // EffectBase.dependencies / SignalBase.subscribers 字段已删除。
-        // 注意 SignalBase.subscribers 仍存在于 P1.5 完成前，此处不调用以保持单轨。
+        // Single cleanup path: graph.deinit handles all reactive nodes.
+        // EffectBase.dependencies / SignalBase.subscribers fields removed.
+        // Note: SignalBase.subscribers still exists before P1.5 complete, skip here to keep single
+        // path.
 
-        // 释放 ArrayLists (用 parent_allocator 分配)
+        // Free ArrayLists (allocated with parent_allocator)
         self.effects.deinit(self.parent_allocator);
         self.signals.deinit(self.parent_allocator);
 
-        // 4. 清理批量上下文
+        // 4. Clean batch context
         self.batch_ctx.deinit();
 
-        // 5. 清理 graph（v0.2-P1）
+        // 5. Clean graph (v0.2-P1)
         self.graph.deinit();
 
-        // 6. 一次性回收所有内存 (Arena 会释放所有 Signal/Effect)
+        // 6. Reclaim all memory once (Arena frees all Signal/Effect)
         self.arena.deinit();
 
-        // 7. 释放 owner 自身
+        // 7. Free owner itself
         self.parent_allocator.destroy(self);
     }
 
-    // 注意：这里刻意没有 reset()。曾存在一个"每帧重建 UI 树"用途的
-    // reset（Arena 整代回收 + 各字段复位），那是 immediate-mode 的遗留，
-    // zenit 是保留模式框架，全仓从无调用方，2026-08-16 决策删除。
-    // owner 的生命周期只有 init/deinit 两点。
+    // Note: intentionally no reset() here. A reset (whole-generation Arena reclaim + field reset)
+    // once existed for the 'rebuild UI tree every frame' use; that was immediate-mode legacy and
+    // zenit is retained-mode, with no callers anywhere, so it was deleted. An owner's lifetime is
+    // only init/deinit.
 
-    /// 获取 Arena allocator (供 Signal/Effect 使用)
+    /// Get Arena allocator (for Signal/Effect use)
     pub fn allocator(self: *SignalOwner) Allocator {
         return self.arena.allocator();
     }
 
-    /// 注册 Signal (供 Signal.init 内部调用)
+    /// Register Signal (for Signal.init internal call)
     pub fn registerSignal(self: *SignalOwner, signal: *SignalBase) !void {
         self.assertThread();
         try self.signals.append(self.parent_allocator, signal);
     }
 
-    /// 注册 Effect (供 createEffect 内部调用)
+    /// Register Effect (for createEffect internal call)
     pub fn registerEffect(self: *SignalOwner, effect: *EffectBase) !void {
         self.assertThread();
         try self.effects.append(self.parent_allocator, effect);
@@ -187,9 +236,9 @@ pub const SignalOwner = struct {
         return dispatched;
     }
 
-    /// 批量更新
+    /// Batch updates
     ///
-    /// 用法:
+    /// Usage:
     /// ```zig
     /// try owner.batch(struct {
     ///     fn update(ctx: anytype) void {
@@ -203,25 +252,39 @@ pub const SignalOwner = struct {
         comptime batchFn: anytype,
         args: anytype,
     ) !void {
-        self.assertThread();
-        try self.batch_ctx.begin();
-        // 同步推 graph batch_depth；graph.markSignalWritten 在 batch_depth>0
-        // 时只 propagate 不 drain，等 endBatch 时拓扑序 drain。
-        self.graph.beginBatch();
-        defer {
-            // 顺序：先 graph 退批，触发拓扑序 drain；再 batch_ctx.end（旧路径已无效但保留 nesting 计数）。
-            self.graph.endBatch() catch |err| {
-                std.log.err("[reactive.SignalOwner] graph.endBatch failed: {}", .{err});
-            };
-            self.batch_ctx.end(self);
-        }
-
+        self.beginBatch();
+        defer self.endBatch();
         batchFn(args);
     }
 
-    /// 取消依赖追踪
+    /// Non-closure batch form; must pair with `endBatch` (`defer owner.endBatch()`).
+    /// Can nest; the outermost endBatch runs accumulated effects topologically once.
     ///
-    /// 用法:
+    /// The framework wraps this around event dispatch, timer callbacks, before_render/after_layout
+    /// hooks and deferred tasks, so when a handler sets multiple signals, dependent effects run
+    /// once and see the full state after all writes.
+    pub fn beginBatch(self: *SignalOwner) void {
+        self.assertThread();
+        // BatchContext.begin only counts, won't fail.
+        self.batch_ctx.begin() catch unreachable;
+        // Sync push graph batch_depth; graph.markSignalWritten during batch only propagates not
+        // drains, endBatch drains in topo order.
+        self.graph.beginBatch();
+    }
+
+    pub fn endBatch(self: *SignalOwner) void {
+        self.assertThread();
+        // Order: graph exits the batch first (triggers topo-order drain); then batch_ctx.end (old
+        // path is dead but its nesting count is kept).
+        self.graph.endBatch() catch |err| {
+            std.log.err("[reactive.SignalOwner] graph.endBatch failed: {}", .{err});
+        };
+        self.batch_ctx.end(self);
+    }
+
+    /// Untrack dependencies
+    ///
+    /// Usage:
     /// ```zig
     /// const value = owner.untrack(signal.*, struct {
     ///     fn read(s: *Signal(i32)) i32 {
@@ -235,19 +298,26 @@ pub const SignalOwner = struct {
         args: anytype,
     ) @TypeOf(untrackedFn(args)) {
         self.assertThread();
-        const prev_tracking = self.is_tracking;
-        const prev_untracked_effect = self.untracked_effect;
-        self.is_tracking = false;
-        self.untracked_effect = self.current_effect;
-        defer {
-            self.untracked_effect = prev_untracked_effect;
-            self.is_tracking = prev_tracking;
-        }
+        // Push a null reader sentinel onto the graph track stack: the current reader's reads of
+        // signal / memo don't register as dependencies (trackRead takes the stack top as reader,
+        // a null id adds no edge). Lazily computed memos or newly run effects inside untrack
+        // push their own id and track normally.
+        //
+        // Flag-based untracking (is_tracking / untracked_effect on owner letting Signal.get skip
+        // the
+        // 'current effect') is wrong: a memo computed during untrack's first read also runs under
+        // that
+        // current_effect, so its signal reads would be skipped and it would get no deps.
+        //
+        // Stack capacity is reserved at init; overflow fails immediately, because degrading to
+        // unguarded global tracking would silently break memo deps.
+        self.graph.pushTracking(graph_mod.NodeId.NULL) catch @panic("OOM: untrack sentinel (tracking stack beyond reserve)");
+        defer self.graph.popTracking();
 
         return untrackedFn(args);
     }
 
-    /// 线程亲和性断言 (仅在开启 runtime_safety 时生效)
+    /// Thread-affinity assert (active only with runtime_safety enabled)
     pub fn assertThread(self: *SignalOwner) void {
         if (!std.debug.runtime_safety) return;
         const current = std.Thread.getCurrentId();
@@ -260,7 +330,7 @@ pub const SignalOwner = struct {
     }
 };
 
-// ===== 测试 =====
+// ===== Tests =====
 
 test "SignalOwner: init/deinit" {
     var owner = try SignalOwner.init(std.testing.allocator);
@@ -274,14 +344,14 @@ test "SignalOwner: allocator" {
     var owner = try SignalOwner.init(std.testing.allocator);
     defer owner.deinit();
 
-    // 从 Arena 分配一些内存
+    // Allocate some memory from Arena
     const slice = try owner.allocator().alloc(u8, 100);
     @memset(slice, 42);
 
     try std.testing.expectEqual(@as(u8, 42), slice[0]);
     try std.testing.expectEqual(@as(u8, 42), slice[99]);
 
-    // 不需要手动释放,deinit 会一次性回收
+    // No manual free needed, deinit reclaims once
 }
 
 test "SignalOwner: memory isolation" {
@@ -291,7 +361,7 @@ test "SignalOwner: memory isolation" {
     var owner2 = try SignalOwner.init(std.testing.allocator);
     defer owner2.deinit();
 
-    // 两个 owner 的内存是隔离的
+    // Two owners' memory is isolated
     const data1 = try owner1.allocator().create(i32);
     const data2 = try owner2.allocator().create(i32);
 

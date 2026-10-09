@@ -1,15 +1,7 @@
-/// Image Renderer - GPU 图片渲染管线
-///
-/// 基于 image.metal 的纹理渲染:
-/// - 纹理采样 + SDF 圆角裁剪
-/// - 着色 (tint) 和不透明度
-/// - 纹理缓存管理
-///
-/// 用法:
-/// 1. init() 创建渲染器
-/// 2. loadTexture() 加载纹理（从 RGBA 像素数据）
-/// 3. addImage() 添加图片实例
-/// 4. render() 提交到 GPU
+/// Image Renderer - GPU image rendering pipeline. Based on image.metal:
+/// texture sampling + SDF rounded clip, tinting and opacity, texture caching.
+/// Usage: (1) init() create renderer, (2) loadTexture() load from RGBA pixel data,
+/// (3) addImage() add instance, (4) render() submit to GPU
 const std = @import("std");
 const gpu = @import("gpu");
 
@@ -19,10 +11,10 @@ const MAX_CLIP_POLYGON_CONTOURS = 8;
 extern fn macos_load_image_from_url(url: [*:0]const u8, out_width: *u32, out_height: *u32) ?[*]u8;
 extern fn macos_free_image_data(data: [*]u8) void;
 
-/// Image Shader 源码（单一事实源）
-const image_shader_source: []const u8 = @embedFile("shaders/image.metal");
+/// Image Shader source (single source of truth)
+const image_shader_source: []const u8 = @import("shader_sources.zig").image;
 
-/// Uniforms 结构，与 SDF renderer 相同
+/// Uniforms struct, same as SDF renderer
 const Uniforms = extern struct {
     viewport_size: [2]f32,
     scale_factor: f32,
@@ -32,15 +24,15 @@ const Uniforms = extern struct {
     clip_fill_rule: u32 = 0,
     clip_point_count: u32 = 0,
     clip_contour_count: u32 = 0,
-    clip_polygon_end_points: [MAX_CLIP_POLYGON_CONTOURS]u32 = [_]u32{0} ** MAX_CLIP_POLYGON_CONTOURS,
-    clip_polygon_points: [MAX_CLIP_POLYGON_POINTS][2]f32 = [_][2]f32{.{ 0, 0 }} ** MAX_CLIP_POLYGON_POINTS,
+    clip_polygon_end_points: [MAX_CLIP_POLYGON_CONTOURS]u32 = @as([MAX_CLIP_POLYGON_CONTOURS]u32, @splat(0)),
+    clip_polygon_points: [MAX_CLIP_POLYGON_POINTS][2]f32 = @as([MAX_CLIP_POLYGON_POINTS][2]f32, @splat(.{ 0, 0 })),
 };
 
-/// 图片实例数据，对齐 image.metal ImageInstanceData
+/// Image instance data, aligned with image.metal ImageInstanceData
 pub const ImageInstance = extern struct {
-    rect: [4]f32, // x, y, w, h (逻辑像素)
-    uv_rect: [4]f32, // u0, v0, u1, v1 (纹理坐标)
-    tint_color: [4]f32, // RGBA float (1,1,1,1 = 无着色)
+    rect: [4]f32, // x, y, w, h (logical pixels)
+    uv_rect: [4]f32, // u0, v0, u1, v1 (texture coordinates)
+    tint_color: [4]f32, // RGBA float (1,1,1,1 = no tinting)
     transform_linear: [4]f32 = .{ 1, 0, 0, 1 }, // a, b, c, d
     transform_translation: [2]f32 = .{ 0, 0 }, // tx, ty
     corner_radius: f32,
@@ -48,7 +40,7 @@ pub const ImageInstance = extern struct {
     source_premultiplied: f32 = 0,
     // MSL aligns the trailing float4 to 16 bytes; keep CPU/GPU instance layout identical.
     _rect_clip_padding: [3]f32 = .{ 0, 0, 0 },
-    rect_clip: [4]f32 = .{ 0, 0, -1, -1 }, // x, y, w, h (逻辑像素); negative size = disabled
+    rect_clip: [4]f32 = .{ 0, 0, -1, -1 }, // x, y, w, h (logical pixels); negative size = disabled
 
     comptime {
         if (@offsetOf(ImageInstance, "rect_clip") != 96) {
@@ -60,10 +52,10 @@ pub const ImageInstance = extern struct {
     }
 };
 
-/// 纹理 ID
+/// Texture ID
 pub const TextureId = u32;
 
-/// 纹理槽位
+/// Texture slot
 const TextureSlot = struct {
     kind: TextureKind,
     binding: gpu.Backend.TextureBinding,
@@ -89,20 +81,24 @@ const AtlasAllocation = struct {
     y: u32,
 };
 
-/// 最大实例数
+/// Max instance count
 const MAX_INSTANCES = 4096;
 const MAX_UNIFORM_UPDATES = 256;
+// D3D12 CBV addresses require 256-byte alignment. Append aligned slots so
+// normal shared draws can bind the retained frame buffer without snapshots.
+// D3D12 CBV addresses need 256-byte alignment; Metal buffer offsets need 16.
+const UNIFORM_STRIDE = std.mem.alignForward(usize, @sizeOf(Uniforms), if (gpu.backend_kind == .d3d12) 256 else 16);
 
-/// Triple buffering 常量
+/// Triple buffering constant
 const BUFFER_COUNT = 3;
 
-/// 最大纹理数
+/// Max texture count
 const MAX_TEXTURES = 4096;
 const ATLAS_PAGE_SIZE = 2048;
 const ATLAS_MAX_TEXTURE_SIZE = 256;
 const ATLAS_GUTTER = 1;
 
-/// 白色常量
+/// White constant
 const WHITE: [4]f32 = .{ 1, 1, 1, 1 };
 
 const TextureKind = enum {
@@ -112,17 +108,16 @@ const TextureKind = enum {
     external,
 };
 
-/// Metal Image Renderer
-/// 图片管线累计计数器（进程级单调递增；帧值 = 与上帧快照的差）。
-/// 图片画布场景 N 张截图 ≈ N 次 draw call + N 次纹理绑定，
-/// 这些计数是验证合批/图集优化是否生效的依据。
+/// Metal Image Renderer. Accumulated counters per pipeline (process-level
+/// monotonic; frame value = delta from previous frame). N images/screenshots ~=
+/// N draw calls + N texture binds; these verify batch/atlas optimizations work.
 pub var image_draw_calls: u64 = 0;
 pub var image_instances_drawn: u64 = 0;
 pub var image_texture_binds: u64 = 0;
 
-/// 纹理内存用量快照（供应用侧 LRU 预算驱逐决策，避免影子记账漂移）。
+/// Texture memory snapshot (app-side LRU eviction budget avoids shadow drift).
 pub const TextureMemoryStats = struct {
-    /// 独立纹理数（不含 atlas 页）
+    /// Standalone texture count (excludes atlas pages)
     texture_count: u32,
     /// RGBA8 texel bytes over every mip level, including whole atlas pages.
     /// Excludes driver padding and storage retained by pending/in-flight draws.
@@ -139,23 +134,18 @@ const SLOT_BITS = 12;
 const SLOT_MASK = MAX_TEXTURES - 1;
 const MAX_GENERATION = (SHARED_TEXTURE_BIT - 1) >> SLOT_BITS;
 
-/// 借用型（external）绑定专用槽位区间 [EXTERNAL_SLOT_BASE, MAX_TEXTURES)。
-///
-/// 背景：offscreen / retained / glass 合成每帧 register+unregister 数十次，
-/// 每次 unregister 都 bump 槽位 generation；generation 到 MAX_GENERATION 的
-/// 槽位永久退役。按 20-30 次/帧 @120Hz，全部 4096×2^19 次注册约一周耗尽，
-/// 之后所有离屏层 TooManyTextures（整片 overlay 消失）。
-///
-/// 解法：external 槽位与持久纹理槽位隔离，且 external 槽位的 generation
-/// **允许回绕**。ABA 论证：
-///   - generation 的作用是让缓存在 display list 里的**旧句柄**失效。持久纹理
-///     句柄可以被 app 长期持有，所以持久槽位仍然"耗尽即退役"，绝不回绕。
-///   - external 句柄的生命周期严格限于一次编码（register -> draw -> flush ->
-///     unregister，调用点见 opacity_layer / backdrop_blur），从不跨帧缓存。
-///     回绕后要与某个旧句柄撞号，需要该旧句柄在同一槽位又经历 2^19 次
-///     register/unregister 之后仍被使用，远超单帧可能的注册次数。
-///   - 区间隔离保证持久句柄永远不会落在会回绕的槽位上（否则持久句柄可能
-///     被回绕后的新 external 绑定"复活"成别的纹理）。
+/// External (borrowed) bindings use a dedicated slot range [EXTERNAL_SLOT_BASE, MAX_TEXTURES).
+/// Offscreen/retained/glass composite register+unregister tens of times per frame, and each
+/// unregister bumps the generation; slots at MAX_GENERATION retire forever. At 20-30x/frame
+/// @120Hz that exhausts all 4096*2^19 registrations in ~1 week, after which every offscreen
+/// layer hits TooManyTextures (overlay vanishes). So external slots are isolated from
+/// persistent ones and their generation wraps.
+/// ABA argument: generation invalidates old *cached* handles in display lists. External
+/// lifetime spans one encoding (register->draw->flush->unregister) and is never cached, so a
+/// wraparound collision needs the same slot after 2^19 more register/unregisters while still
+/// in use, which exceeds single-frame registrations. Persistent handles (held long-term by the
+/// app) never wrap; slot isolation keeps them out of wrapping slots, else a new external
+/// registration after wraparound would revive a persistent handle.
 const EXTERNAL_SLOT_COUNT = 256;
 const EXTERNAL_SLOT_BASE = MAX_TEXTURES - EXTERNAL_SLOT_COUNT;
 
@@ -166,10 +156,10 @@ pub const ImageTextureStore = struct {
     allocator: std.mem.Allocator,
     device: *gpu.Backend.Device,
     namespace: u32,
-    textures: [MAX_TEXTURES]?TextureSlot = [_]?TextureSlot{null} ** MAX_TEXTURES,
-    generations: [MAX_TEXTURES]u32 = [_]u32{0} ** MAX_TEXTURES,
+    textures: [MAX_TEXTURES]?TextureSlot = @as([MAX_TEXTURES]?TextureSlot, @splat(null)),
+    generations: [MAX_TEXTURES]u32 = @as([MAX_TEXTURES]u32, @splat(0)),
     texture_count: u32 = 0,
-    atlas_pages: std.ArrayList(AtlasPage) = .{},
+    atlas_pages: std.ArrayList(AtlasPage) = .empty,
     /// Admission limit for resident storage; configure before the first upload.
     memory_budget_bytes: u64 = std.math.maxInt(u64),
 
@@ -187,7 +177,7 @@ pub const ImageTextureStore = struct {
         }
         for (self.atlas_pages.items) |*page| page.texture.destroy();
         self.atlas_pages.deinit(self.allocator);
-        self.atlas_pages = .{};
+        self.atlas_pages = .empty;
     }
 
     fn handle(self: *const ImageTextureStore, index: u32) TextureId {
@@ -225,15 +215,14 @@ pub const ImageTextureStore = struct {
         }
         self.textures[index] = null;
         if (index >= EXTERNAL_SLOT_BASE) {
-            // external 专用槽位：generation 回绕（ABA 论证见 EXTERNAL_SLOT_BASE）。
+            // External-only slot: generation wraps (ABA argument in EXTERNAL_SLOT_BASE).
             self.generations[index] = if (self.generations[index] >= MAX_GENERATION) 0 else self.generations[index] + 1;
         } else {
             self.generations[index] += 1; // exhausted persistent slots are never reused
         }
     }
 
-    /// 加载纹理（从 RGBA 像素数据）
-    /// 返回纹理 ID
+    /// Load texture from RGBA pixel data. Return texture ID.
     pub fn loadTexture(self: *ImageTextureStore, width: u32, height: u32, rgba_data: []const u8) !TextureId {
         const expected_len = try pixelLength(width, height);
         if (rgba_data.len < expected_len) return error.InvalidPixelData;
@@ -271,21 +260,21 @@ pub const ImageTextureStore = struct {
     fn loadStandaloneTexture(self: *ImageTextureStore, width: u32, height: u32, rgba_data: []const u8) !TextureId {
         const mip_level_count = calcMipLevelCount(width, height);
 
-        // 创建 RGBA8 sRGB 纹理（带 mipmap）
+        // Create RGBA8 sRGB texture (with mipmap)
         var texture = try self.device.createTexture(self.allocator, .{
             .label = "Zenit.Image.Standalone",
             .size = .{ .width = width, .height = height },
             .mip_level_count = mip_level_count,
-            .format = .rgba8_unorm_srgb,
+            .format = .rgba8_unorm,
             .usage = .{ .copy_dst = true, .texture_binding = true },
             .memory = .host_upload,
         });
         errdefer texture.destroy();
 
-        // 上传 base level
+        // Upload base level
         try texture.writeRegion(0, 0, 0, width, height, rgba_data, width * 4);
 
-        // 生成并上传 mip levels（CPU box filter）
+        // Generate and upload mip levels (CPU box filter)
         if (mip_level_count > 1) {
             try self.uploadMipChain(&texture, width, height, rgba_data, mip_level_count);
         }
@@ -337,7 +326,7 @@ pub const ImageTextureStore = struct {
 
     /// Register a borrowed backend texture binding. The caller owns its lifetime.
     /// Used to sample an offscreen render target through the image pipeline.
-    /// 句柄只在本次编码内有效（必须在同一帧 unregister），见 EXTERNAL_SLOT_BASE。
+    /// Handle valid only this encoding (must unregister same frame), see EXTERNAL_SLOT_BASE.
     pub fn registerTextureBinding(self: *ImageTextureStore, binding: gpu.Backend.TextureBinding, width: u32, height: u32) !TextureId {
         const id = try self.allocateExternalSlot();
         self.textures[id] = TextureSlot{
@@ -347,7 +336,8 @@ pub const ImageTextureStore = struct {
             .height = height,
             .mip_level_count = 1,
         };
-        // texture_count 只覆盖持久区间（内存统计用）；external 槽位不计入。
+        // texture_count covers only persistent range (memory stats);
+        // external slots not included.
         return self.handle(id);
     }
 
@@ -365,7 +355,7 @@ pub const ImageTextureStore = struct {
             .label = "Zenit.Image.Stream",
             .size = .{ .width = width, .height = height },
             .mip_level_count = 1,
-            .format = .rgba8_unorm_srgb,
+            .format = .rgba8_unorm,
             .usage = .{ .copy_dst = true, .texture_binding = true },
             .memory = .host_upload,
         });
@@ -396,7 +386,8 @@ pub const ImageTextureStore = struct {
         for (self.textures[0..self.texture_count]) |maybe_slot| {
             const slot = maybe_slot orelse continue;
             stats.slots_used += 1;
-            // atlas 槽位共享页纹理，页内存在下面按页统计，避免重复计入
+            // atlas slots share page texture; page memory accounted below
+            // per-page to avoid duplication.
             if (slot.kind == .atlas_region) continue;
             stats.texture_count += 1;
             stats.estimated_bytes +|= textureByteLength(slot.width, slot.height, slot.mip_level_count);
@@ -413,7 +404,8 @@ pub const ImageTextureStore = struct {
         return self.textures[index];
     }
 
-    /// 持久纹理槽位（[0, EXTERNAL_SLOT_BASE)），耗尽 generation 的槽位跳过。
+    /// Persistent texture slots ([0, EXTERNAL_SLOT_BASE));
+    /// slots with exhausted generation are skipped.
     fn allocateTextureSlot(self: *ImageTextureStore) !u32 {
         for (self.textures[0..EXTERNAL_SLOT_BASE], 0..) |slot, index| {
             if (slot == null and self.generations[index] <= MAX_GENERATION) return @intCast(index);
@@ -421,7 +413,8 @@ pub const ImageTextureStore = struct {
         return error.TooManyTextures;
     }
 
-    /// external（帧内借用）槽位：[EXTERNAL_SLOT_BASE, MAX_TEXTURES)，generation 回绕。
+    /// external (frame-borrowed) slots: [EXTERNAL_SLOT_BASE, MAX_TEXTURES);
+    /// generation wraps.
     fn allocateExternalSlot(self: *ImageTextureStore) !u32 {
         for (self.textures[EXTERNAL_SLOT_BASE..], EXTERNAL_SLOT_BASE..) |slot, index| {
             if (slot == null) return @intCast(index);
@@ -450,7 +443,7 @@ pub const ImageTextureStore = struct {
         return self.device.createTexture(self.allocator, .{
             .label = label,
             .size = .{ .width = ATLAS_PAGE_SIZE, .height = ATLAS_PAGE_SIZE },
-            .format = .rgba8_unorm_srgb,
+            .format = .rgba8_unorm,
             .usage = .{ .copy_dst = true, .texture_binding = true },
             .memory = .host_upload,
         });
@@ -492,45 +485,48 @@ pub const ImageTextureStore = struct {
 };
 
 pub const ImageRenderer = struct {
+    // Owned by texture_store, released with all other renderer textures.
+    solid_fallback_texture: ?TextureId = null,
     allocator: std.mem.Allocator,
     device: *gpu.Backend.Device,
     pipeline: gpu.Backend.RenderPipeline,
-    /// Triple-buffered uniform buffers，必须与 instance buffers 一样按帧轮转。
-    /// 曾经是**单个** buffer 而每帧把 uniform_write_offset 归零：三帧在飞时第 N+1
-    /// 帧会覆写 GPU 尚未消费的第 N 帧 viewport/clip/scale，表现为偶发闪烁/错误裁剪。
+    unmasked_pipeline: ?gpu.Backend.RenderPipeline = null,
+    /// Triple-buffered uniform buffers must rotate per-frame like instance
+    /// buffers. Previously single buffer resetting uniform_write_offset per frame:
+    /// with 3 frames in flight, frame N+1 overwrites N's viewport/clip/scale still
+    /// unconsumed, causing random flicker/wrong clips.
     uniform_buffers: [BUFFER_COUNT]gpu.Backend.Buffer,
     uniform_write_offset: usize = 0,
-    /// 单帧 uniform 槽位溢出次数（诊断用）
+    /// Single-frame uniform slot overflow count (diagnostic)
     uniform_overflow_count: u64 = 0,
     /// Triple-buffered instance buffers
     instance_buffers: [BUFFER_COUNT]gpu.Backend.Buffer,
     current_buffer: usize = 0,
 
-    /// 溢出实例缓冲（每帧槽位各一个，随需增长后**保留**）。
-    ///
-    /// 旧实现在 MAX_INSTANCES 用尽后对**每一批**都 createBuffer + destroy,
-    /// 重内容帧每帧多次 driver 分配（走驱动，非 malloc）。改为按帧槽位持有
-    /// 一个可增长的 buffer：容量够就直接复用，不够才重建一次。槽位随
-    /// current_buffer 轮转，因此不会覆写 GPU 尚在消费的在飞帧数据。
-    /// 与 sdf_renderer 的保留池同款。
-    /// 溢出 uniform 缓冲（每帧槽位各一个，随需增长后**保留**）。
-    /// 与 text_renderer 同款：槽位用尽不再丢批（丢批时 instances 不清空，
-    /// 下一批带着旧实例再溢出，该帧剩余内容全部不画），改为切到按需增长、
-    /// 跨帧保留的溢出 buffer 继续画。
-    uniform_overflow_buffers: [BUFFER_COUNT]?gpu.Backend.Buffer = [_]?gpu.Backend.Buffer{null} ** BUFFER_COUNT,
-    uniform_overflow_capacities: [BUFFER_COUNT]usize = [_]usize{0} ** BUFFER_COUNT,
+    /// Overflowed instance buffer (one per frame slot, retained after growth). Growable per frame:
+    /// sufficient capacity is reused, insufficient is rebuilt once, instead of a
+    /// createBuffer+destroy
+    /// per batch once MAX_INSTANCES is exhausted. Slots rotate with current_buffer, so no GPU
+    /// in-flight overwrite. Same retention as sdf_renderer.
+    /// Overflowed uniform buffer (one per frame slot, retained). Same as text_renderer: batches are
+    /// not dropped when slots are exhausted (otherwise instances stay dirty and the next batch
+    /// overflows the old ones, leaving the rest invisible). Grown on demand, retained across
+    /// frames.
+    uniform_overflow_buffers: [BUFFER_COUNT]?gpu.Backend.Buffer = @as([BUFFER_COUNT]?gpu.Backend.Buffer, @splat(null)),
+    uniform_overflow_capacities: [BUFFER_COUNT]usize = @as([BUFFER_COUNT]usize, @splat(0)),
     uniform_overflow_used: usize = 0,
-    overflow_buffers: [BUFFER_COUNT]?gpu.Backend.Buffer = [_]?gpu.Backend.Buffer{null} ** BUFFER_COUNT,
-    overflow_capacities: [BUFFER_COUNT]usize = [_]usize{0} ** BUFFER_COUNT,
-    /// 本帧槽位内溢出缓冲的写入游标（字节），保证同帧多批次不互相覆写。
+    overflow_buffers: [BUFFER_COUNT]?gpu.Backend.Buffer = @as([BUFFER_COUNT]?gpu.Backend.Buffer, @splat(null)),
+    overflow_capacities: [BUFFER_COUNT]usize = @as([BUFFER_COUNT]usize, @splat(0)),
+    /// Frame slot overflow buffer write cursor (bytes);
+    /// ensures multiple batches don't overwrite.
     overflow_write_offset: usize = 0,
     sampler: ?gpu.Backend.Sampler,
 
-    // 纹理管理
+    // Texture management
     texture_store: ImageTextureStore,
     shared_texture_store: ?*ImageTextureStore = null,
 
-    // 实例分组（按纹理 ID 分组渲染）
+    // Instance grouping (group render by texture ID)
     instances: std.ArrayList(ImageInstance),
     instance_textures: std.ArrayList(struct { binding: gpu.Backend.TextureBinding, view: gpu.Backend.TextureView }),
 
@@ -543,16 +539,17 @@ pub const ImageRenderer = struct {
     clip_fill_rule: u32 = 0,
     clip_point_count: u32 = 0,
     clip_contour_count: u32 = 0,
-    clip_polygon_end_points: [MAX_CLIP_POLYGON_CONTOURS]u32 = [_]u32{0} ** MAX_CLIP_POLYGON_CONTOURS,
-    clip_polygon_points: [MAX_CLIP_POLYGON_POINTS][2]f32 = [_][2]f32{.{ 0, 0 }} ** MAX_CLIP_POLYGON_POINTS,
+    clip_polygon_end_points: [MAX_CLIP_POLYGON_CONTOURS]u32 = @as([MAX_CLIP_POLYGON_CONTOURS]u32, @splat(0)),
+    clip_polygon_points: [MAX_CLIP_POLYGON_POINTS][2]f32 = @as([MAX_CLIP_POLYGON_POINTS][2]f32, @splat(.{ 0, 0 })),
     current_rect_clip: [4]f32 = .{ 0, 0, -1, -1 },
     instance_high_water_mark: usize = 0,
-    /// flush 偏移：同一帧内多次 flush 时追加写入，避免覆盖前面的 draw call 数据
+    /// flush offset: multiple flushes in same frame append,
+    /// not overwrite previous draw call data
     buffer_write_offset: usize = 0,
 
-    /// 初始化
+    /// Initialization
     pub fn init(allocator: std.mem.Allocator, device: *gpu.Backend.Device) !ImageRenderer {
-        // 编译 shader
+        // Compile shader
         var shader = try gpu.Backend.ShaderModule.initFromSource(device, image_shader_source);
         defer shader.deinit();
 
@@ -561,11 +558,11 @@ pub const ImageRenderer = struct {
         var fragment_func = try shader.getFunction("image_fragment_main");
         defer fragment_func.deinit();
 
-        // 创建 pipeline（带 alpha 混合）
+        // Create pipeline (with alpha blending)
         var pipeline = try gpu.Backend.createRenderPipeline(device, .{
             .vertex_function = &vertex_func,
             .fragment_function = &fragment_func,
-            .color_attachment_formats = &[_]gpu.TextureFormat{.bgra8_unorm_srgb},
+            .color_attachment_formats = &[_]gpu.TextureFormat{gpu.color_format},
             .blend_state = .{
                 .source_rgb = .one,
                 .destination_rgb = .one_minus_src_alpha,
@@ -577,16 +574,28 @@ pub const ImageRenderer = struct {
         });
 
         errdefer pipeline.deinit();
+        var unmasked_pipeline: ?gpu.Backend.RenderPipeline = null;
+        errdefer if (unmasked_pipeline) |*value| value.deinit();
+        if (gpu.backend_kind == .d3d12) {
+            var unmasked_fragment = try shader.getFunction("image_unmasked_fragment_main");
+            defer unmasked_fragment.deinit();
+            unmasked_pipeline = try gpu.Backend.createRenderPipeline(device, .{
+                .vertex_function = &vertex_func,
+                .fragment_function = &unmasked_fragment,
+                .color_attachment_formats = &.{gpu.color_format},
+                .blend_state = .{ .source_rgb = .one, .destination_rgb = .one_minus_src_alpha, .source_alpha = .one, .destination_alpha = .one_minus_src_alpha },
+            });
+        }
 
-        // Uniform buffer（errdefer 必须在循环外，循环体内的 errdefer 随迭代
-        // 作用域失效，等于死代码，这里曾经就是这么写的）
+        // Uniform buffer (errdefer must be outside loop; inside loop body
+        // it dies with iteration scope = dead code; was the bug here once)
         var uniform_buffers: [BUFFER_COUNT]gpu.Backend.Buffer = undefined;
         var uniform_created: usize = 0;
         errdefer for (uniform_buffers[0..uniform_created]) |*ub| ub.destroy();
         for (&uniform_buffers) |*ubuf| {
             ubuf.* = try device.createBuffer(allocator, .{
                 .label = "Zenit.Image.Uniforms",
-                .size = @sizeOf(Uniforms) * MAX_UNIFORM_UPDATES,
+                .size = UNIFORM_STRIDE * MAX_UNIFORM_UPDATES,
                 .usage = .{ .vertex = true, .map_write = true },
             });
             uniform_created += 1;
@@ -607,7 +616,7 @@ pub const ImageRenderer = struct {
             instance_created += 1;
         }
 
-        // 创建 Linear + Mip 采样器（图片缩小时减少闪烁）
+        // Create Linear + Mip sampler (reduce flicker when image shrinks)
         const sampler = try device.createSampler(allocator, .{
             .label = "Zenit.Image.LinearMipSampler",
             .min_filter = .linear,
@@ -621,19 +630,20 @@ pub const ImageRenderer = struct {
             .allocator = allocator,
             .device = device,
             .pipeline = pipeline,
+            .unmasked_pipeline = unmasked_pipeline,
             .uniform_buffers = uniform_buffers,
             .instance_buffers = instance_buffers,
             .sampler = sampler,
             .texture_store = ImageTextureStore.init(allocator, device, false),
-            .instances = .{},
-            .instance_textures = .{},
+            .instances = .empty,
+            .instance_textures = .empty,
             .viewport_width = 800,
             .viewport_height = 600,
             .scale_factor = 1.0,
         };
     }
 
-    /// 销毁
+    /// Destruction
     pub fn deinit(self: *ImageRenderer) void {
         self.clearInstances();
         self.texture_store.deinit();
@@ -648,8 +658,16 @@ pub const ImageRenderer = struct {
             if (maybe_buf.*) |*buf| buf.destroy();
         }
         for (&self.uniform_buffers) |*ubuf| ubuf.destroy();
+        if (self.unmasked_pipeline) |*value| value.deinit();
         self.pipeline.deinit();
         std.log.info("[ImageRenderer] Destroyed", .{});
+    }
+
+    pub fn solidFallbackTexture(self: *ImageRenderer) !TextureId {
+        if (self.solid_fallback_texture) |id| return id;
+        const id = try self.loadTexture(1, 1, &.{ 255, 255, 255, 255 });
+        self.solid_fallback_texture = id;
+        return id;
     }
 
     pub fn loadTexture(self: *ImageRenderer, width: u32, height: u32, rgba: []const u8) !TextureId {
@@ -679,14 +697,15 @@ pub const ImageRenderer = struct {
         self.instances.clearRetainingCapacity();
     }
 
-    /// 开始新帧
+    /// Start new frame
     pub fn beginFrame(self: *ImageRenderer, width: f32, height: f32, scale: f32) void {
         self.clearInstances();
         self.buffer_write_offset = 0;
         self.current_buffer = (self.current_buffer + 1) % BUFFER_COUNT;
         self.uniform_write_offset = 0;
         self.uniform_overflow_used = 0;
-        // 新槽位的溢出缓冲从头写起（该槽位上一次使用已隔了 BUFFER_COUNT 帧）
+        // New slot's overflow buffer starts fresh
+        // (slot's last use was BUFFER_COUNT frames ago)
         self.overflow_write_offset = 0;
         self.viewport_width = width * scale;
         self.viewport_height = height * scale;
@@ -697,12 +716,13 @@ pub const ImageRenderer = struct {
         self.clip_fill_rule = 0;
         self.clip_point_count = 0;
         self.clip_contour_count = 0;
-        self.clip_polygon_end_points = [_]u32{0} ** MAX_CLIP_POLYGON_CONTOURS;
-        self.clip_polygon_points = [_][2]f32{.{ 0, 0 }} ** MAX_CLIP_POLYGON_POINTS;
+        self.clip_polygon_end_points = @as([MAX_CLIP_POLYGON_CONTOURS]u32, @splat(0));
+        self.clip_polygon_points = @as([MAX_CLIP_POLYGON_POINTS][2]f32, @splat(.{ 0, 0 }));
         self.current_rect_clip = .{ 0, 0, -1, -1 };
     }
 
-    /// 仅更新 viewport 尺寸（离屏合成 render pass 切换时使用）
+    /// Update only viewport size (used when offscreen composite
+    /// render pass switches)
     pub fn setViewport(self: *ImageRenderer, width: f32, height: f32, scale: f32) void {
         self.viewport_width = width * scale;
         self.viewport_height = height * scale;
@@ -726,8 +746,8 @@ pub const ImageRenderer = struct {
             self.clip_fill_rule = 0;
             self.clip_point_count = 0;
             self.clip_contour_count = 0;
-            self.clip_polygon_end_points = [_]u32{0} ** MAX_CLIP_POLYGON_CONTOURS;
-            self.clip_polygon_points = [_][2]f32{.{ 0, 0 }} ** MAX_CLIP_POLYGON_POINTS;
+            self.clip_polygon_end_points = @as([MAX_CLIP_POLYGON_CONTOURS]u32, @splat(0));
+            self.clip_polygon_points = @as([MAX_CLIP_POLYGON_POINTS][2]f32, @splat(.{ 0, 0 }));
         }
     }
 
@@ -735,7 +755,7 @@ pub const ImageRenderer = struct {
         self.current_rect_clip = rect orelse .{ 0, 0, -1, -1 };
     }
 
-    /// 添加图片实例
+    /// Add image instance
     pub fn addImage(
         self: *ImageRenderer,
         texture_id: TextureId,
@@ -760,7 +780,7 @@ pub const ImageRenderer = struct {
         );
     }
 
-    /// 添加图片实例（自定义 UV 区域，用于图集）
+    /// Add image instance (custom UV region, for atlas)
     pub fn addImageUV(
         self: *ImageRenderer,
         texture_id: TextureId,
@@ -848,7 +868,9 @@ pub const ImageRenderer = struct {
         return .{ 1, 0, 0, 1, x, y };
     }
 
-    fn affineRectRotate(x: f32, y: f32, w: f32, h: f32, rotate: f32) [6]f32 {
+    /// Quad (x, y, w, h) rotated about its centre; the blend composite inverts
+    /// this same affine (blend_composite.rectRotateAffine).
+    pub fn affineRectRotate(x: f32, y: f32, w: f32, h: f32, rotate: f32) [6]f32 {
         if (@abs(rotate) <= 0.0001) return affineTranslation(x, y);
         const cos_r = @cos(rotate);
         const sin_r = @sin(rotate);
@@ -864,12 +886,13 @@ pub const ImageRenderer = struct {
         };
     }
 
-    /// 渲染所有实例（按纹理分组，自动分批防溢出，支持 buffer_write_offset 累加）
-    /// 保证本帧槽位的溢出 uniform buffer 至少能放下 `slots` 个 Uniforms。
+    /// Render all instances (group by texture, auto-batch overflow-safe,
+    /// supports buffer_write_offset accumulation).
+    /// Ensure frame slot's overflow uniform buffer fits `slots` Uniforms.
     fn ensureUniformOverflowCapacity(self: *ImageRenderer, slots: usize) !*gpu.Backend.Buffer {
-        const needed = slots * @sizeOf(Uniforms);
+        const needed = slots * UNIFORM_STRIDE;
         if (self.uniform_overflow_capacities[self.current_buffer] < needed) {
-            var new_capacity = @max(self.uniform_overflow_capacities[self.current_buffer], @sizeOf(Uniforms) * 64);
+            var new_capacity = @max(self.uniform_overflow_capacities[self.current_buffer], UNIFORM_STRIDE * 64);
             while (new_capacity < needed) new_capacity *= 2;
             const replacement = try self.device.createBuffer(self.allocator, .{
                 .label = "Zenit.Image.OverflowUniforms",
@@ -886,20 +909,20 @@ pub const ImageRenderer = struct {
     pub fn render(self: *ImageRenderer, render_pass: *gpu.Backend.RenderPass) !void {
         if (self.instances.items.len == 0) return;
 
-        // 更新 uniforms
-        // 溢出**不能** clamp 到最后一槽，那会让本批及后续 draw 别名同一块随后
-        // 被覆写的内存，静默画错。宁可丢掉这一批并计数告警。
+        // Update uniforms. Overflow can't clamp to last slot -- aliases
+        // with this batch/subsequent draw calls, silent corruption. Drop batch
+        // and alert instead.
         const uniform_buffer, const uniform_byte_offset = blk: {
             if (self.uniform_write_offset < MAX_UNIFORM_UPDATES) {
                 const slot = self.uniform_write_offset;
                 self.uniform_write_offset += 1;
-                break :blk .{ &self.uniform_buffers[self.current_buffer], slot * @sizeOf(Uniforms) };
+                break :blk .{ &self.uniform_buffers[self.current_buffer], slot * UNIFORM_STRIDE };
             }
             self.uniform_overflow_count += 1;
             const slot = self.uniform_overflow_used;
             self.uniform_overflow_used += 1;
             const buf = try self.ensureUniformOverflowCapacity(slot + 1);
-            break :blk .{ buf, slot * @sizeOf(Uniforms) };
+            break :blk .{ buf, slot * UNIFORM_STRIDE };
         };
         const uniforms = Uniforms{
             .viewport_size = .{ self.viewport_width, self.viewport_height },
@@ -916,12 +939,12 @@ pub const ImageRenderer = struct {
         const uniform_data = try uniform_buffer.getMappedRange(uniform_byte_offset, @sizeOf(Uniforms));
         @memcpy(uniform_data, std.mem.asBytes(&uniforms));
 
-        // 设置 pipeline
-        render_pass.setPipeline(&self.pipeline);
+        // Set pipeline
+        render_pass.setPipeline(if (self.clip_shape_kind == 0 and self.unmasked_pipeline != null) &self.unmasked_pipeline.? else &self.pipeline);
         render_pass.setVertexBuffer(0, uniform_buffer, @intCast(uniform_byte_offset));
         render_pass.setFragmentBuffer(0, uniform_buffer, @intCast(uniform_byte_offset));
 
-        // 绑定 sampler
+        // Bind sampler
         if (self.sampler) |smp| {
             render_pass.setFragmentSampler(0, &smp);
         }
@@ -930,7 +953,7 @@ pub const ImageRenderer = struct {
         self.instance_high_water_mark = @max(self.instance_high_water_mark, total);
         image_instances_drawn += total;
 
-        // 分批上传，追加写入 buffer（不覆盖前面 flush 的数据）
+        // Batch upload, append to buffer (don't overwrite previous flush)
         var global_offset: usize = 0;
         while (global_offset < total) {
             const remaining_total = total - global_offset;
@@ -941,7 +964,8 @@ pub const ImageRenderer = struct {
                 @min(remaining_total, remaining_capacity);
             const chunk_size = @sizeOf(ImageInstance) * chunk_count;
             if (remaining_capacity == 0) {
-                // 复用本帧槽位的溢出缓冲；容量不足才重建（几何增长，避免抖动）。
+                // Reuse frame slot's overflow buffer; rebuild if insufficient
+                // (geometric growth, avoid jitter).
                 const needed = self.overflow_write_offset + chunk_size;
                 if (self.overflow_capacities[self.current_buffer] < needed) {
                     var new_capacity = @max(self.overflow_capacities[self.current_buffer], chunk_size);
@@ -970,7 +994,7 @@ pub const ImageRenderer = struct {
                 self.buffer_write_offset += chunk_count;
             }
 
-            // 在当前 chunk 内按纹理分组
+            // Group by texture within current chunk
             var i: usize = 0;
             while (i < chunk_count) {
                 const current_texture = self.instance_textures.items[global_offset + i].binding;
@@ -990,7 +1014,7 @@ pub const ImageRenderer = struct {
         }
     }
 
-    /// 刷新
+    /// Flush
     pub fn flush(self: *ImageRenderer, render_pass: *gpu.Backend.RenderPass) !void {
         try self.render(render_pass);
         self.clearInstances();
@@ -1063,14 +1087,29 @@ fn allocAtlasOnPage(page: *AtlasPage, width: u32, height: u32) ?[2]u32 {
     return .{ inner_x, inner_y };
 }
 
+/// The region's exact edges. The gutter around it replicates the edge texels,
+/// so linear filtering at the edge equals clamp-to-edge and never reaches a
+/// neighbouring region. Insetting half a texel instead maps texel centres onto
+/// the quad edges: every image is shrunk by one texel, and a 2x2 texture turns
+/// into a full gradient (each quadrant centre must sample its own texel).
 fn atlasRegionUvRect(x: u32, y: u32, width: u32, height: u32, page_size: u32) [4]f32 {
     const inv = 1.0 / @as(f32, @floatFromInt(page_size));
     return .{
-        (@as(f32, @floatFromInt(x)) + 0.5) * inv,
-        (@as(f32, @floatFromInt(y)) + 0.5) * inv,
-        (@as(f32, @floatFromInt(x + width)) - 0.5) * inv,
-        (@as(f32, @floatFromInt(y + height)) - 0.5) * inv,
+        @as(f32, @floatFromInt(x)) * inv,
+        @as(f32, @floatFromInt(y)) * inv,
+        @as(f32, @floatFromInt(x + width)) * inv,
+        @as(f32, @floatFromInt(y + height)) * inv,
     };
+}
+
+test "atlasRegionUvRect maps texel centres to their own positions in the quad" {
+    // 2x2 region at (8, 4) on a 64 page: the centre of the top-left quadrant
+    // (quad fraction 0.25) must land on the first texel's centre.
+    const uv = atlasRegionUvRect(8, 4, 2, 2, 64);
+    const u = uv[0] + (uv[2] - uv[0]) * 0.25;
+    try std.testing.expectApproxEqAbs(@as(f32, 8.5), u * 64, 1e-4);
+    const v = uv[1] + (uv[3] - uv[1]) * 0.75;
+    try std.testing.expectApproxEqAbs(@as(f32, 5.5), v * 64, 1e-4);
 }
 
 fn composeUvRect(base: [4]f32, uv: [4]f32) [4]f32 {
@@ -1127,7 +1166,7 @@ fn downsampleRgbaBox(src: []const u8, src_w: u32, src_h: u32, dst: []u8, dst_w: 
             const idx11 = (@as(usize, sy1) * @as(usize, src_w) + @as(usize, sx1)) * 4;
             const di = (@as(usize, y) * @as(usize, dst_w) + @as(usize, x)) * 4;
 
-            // RGB 在 linear 空间做 box filter，再编码回 sRGB，避免 mip 偏灰
+            // RGB in linear space box filter, re-encode to sRGB; avoids mip graying
             var c: usize = 0;
             while (c < 3) : (c += 1) {
                 const l0 = srgb8ToLinear(src[idx00 + c]);
@@ -1138,30 +1177,21 @@ fn downsampleRgbaBox(src: []const u8, src_w: u32, src_h: u32, dst: []u8, dst_w: 
                 dst[di + c] = linearToSrgb8(lavg);
             }
 
-            // Alpha 在线性标量空间做平均
+            // Alpha averaged in linear scalar space
             const alpha_sum: u32 = @as(u32, src[idx00 + 3]) + @as(u32, src[idx10 + 3]) + @as(u32, src[idx01 + 3]) + @as(u32, src[idx11 + 3]);
             dst[di + 3] = @intCast(alpha_sum / 4);
         }
     }
 }
 
-// ============================================================================
-// sRGB ↔ linear 转换查表
+// sRGB <-> linear conversion LUT.
 //
-// mip 链生成（uploadMipChain -> downsampleRgbaBox）对**每个像素的每个通道**
-// 都要做一次往返转换。原实现每次调 std.math.pow，一张 6016×3384 的 Retina
-// 全屏截图整条 mip 链约需 6800 万次 pow，实测 ReleaseFast 下耗时 1195ms，
-// 主线程直接卡死一秒多。
-//
-// 正向输入是 u8，只有 256 种取值 -> 256 项表，**与原实现逐位相同，无精度损失**。
-// 反向输入是 f32，用 12bit 量化表近似；mip 是缩略图，该精度绰绰有余
-// （最大误差 < 1/255，肉眼与逐位比对均不可见）。
-//
-// 实测（ReleaseFast，6016×3384 完整 mip 链）：
-//   原实现          1195 ms
-//   仅正向 LUT        88 ms   (13.6×)
-//   正反向都 LUT      21 ms   (57×)
-// ============================================================================
+// Mip chain generation (uploadMipChain -> downsampleRgbaBox) round-trips every pixel channel;
+// std.math.pow per call stalls the main thread (6016x3384 full-screen: ~68M pow calls,
+// 1195ms ReleaseFast). Forward input is 256 values -> 256-entry LUT, bit-identical to pow,
+// zero precision loss. Reverse input is f32, 12-bit quantized approximation; the mip is a
+// thumbnail, max error <1/255 is invisible. ReleaseFast full mip chain: pow 1195ms,
+// forward-only LUT 88ms (13.6x), both LUTs 21ms (57x).
 
 const SRGB_TO_LINEAR_LUT: [256]f32 = blk: {
     @setEvalBranchQuota(100_000);
@@ -1176,8 +1206,8 @@ const SRGB_TO_LINEAR_LUT: [256]f32 = blk: {
     break :blk table;
 };
 
-/// 反向表的量化档数（12bit）。+1 是为了让 v==1.0 能直接索引到末项，
-/// 省掉一次 clamp 分支。
+/// Inverse table quantization bins (12bit). +1 lets v==1.0 index final
+/// entry, skips clamp branch.
 const LINEAR_TO_SRGB_STEPS = 4096;
 
 const LINEAR_TO_SRGB_LUT: [LINEAR_TO_SRGB_STEPS + 1]u8 = blk: {
@@ -1204,9 +1234,9 @@ inline fn linearToSrgb8(v: f32) u8 {
     return LINEAR_TO_SRGB_LUT[idx];
 }
 
-/// Whether a slot kind owns its texture storage (destroyed by this renderer).
-/// atlas_region 共享图集页（页由 atlas_pages 循环统一释放，再放就是 double-release
-/// -> 退出必崩，下游回归）；external storage remains caller-owned.
+/// Whether slot kind owns texture storage (destroyed by this renderer).
+/// atlas_region shares atlas page (page freed by atlas_pages rotation,
+/// refree -> crash exit regression); external remains caller-owned.
 fn slotOwnsTexture(kind: TextureKind) bool {
     return kind == .standalone or kind == .stream;
 }
@@ -1219,7 +1249,8 @@ test "deinit texture ownership: standalone and stream own storage (downstream re
 }
 
 test "srgb8ToLinear LUT is bit-exact vs reference pow implementation" {
-    // 正向输入只有 256 种取值，查表必须与直算**逐位相同**（不是近似）。
+    // Forward input only 256 values; LUT must match direct calculation
+    // bit-for-bit (not approximate).
     for (0..256) |i| {
         const v: u8 = @intCast(i);
         const c = @as(f32, @floatFromInt(v)) / 255.0;
@@ -1232,7 +1263,7 @@ test "srgb8ToLinear LUT is bit-exact vs reference pow implementation" {
 }
 
 test "linearToSrgb8 LUT stays within 1/255 of reference" {
-    // 反向是 12bit 量化近似；断言误差不超过 1 个 u8 级差。
+    // Inverse is 12bit quantized approximate; assert error <= 1 u8 step.
     var i: u32 = 0;
     while (i <= 2048) : (i += 1) {
         const v = @as(f32, @floatFromInt(i)) / 2048.0;
@@ -1248,7 +1279,7 @@ test "linearToSrgb8 LUT stays within 1/255 of reference" {
 }
 
 test "sRGB round-trip preserves endpoints exactly" {
-    // 端点必须精确：全黑/全白经过 mip 降采样不能漂移。
+    // Endpoints exact: full-black/white through mip downsampling can't drift.
     try std.testing.expectEqual(@as(u8, 0), linearToSrgb8(srgb8ToLinear(0)));
     try std.testing.expectEqual(@as(u8, 255), linearToSrgb8(srgb8ToLinear(255)));
 }
@@ -1316,7 +1347,8 @@ test "texture namespaces and generations reject released handles and wrong owner
     try std.testing.expect(shared.getTextureSize(shared_id) == null);
     try std.testing.expectEqual([2]u32{ 4, 5 }, shared.getTextureSize(replacement).?);
     shared.unregisterTextureBinding(replacement);
-    // 持久槽位：generation 耗尽即退役（旧句柄可能被 app 长期缓存，不能回绕）。
+    // Persistent slots: generation exhausted, slot retires (old handle
+    // might be cached long-term, can't wrap).
     shared.textures[0] = .{ .kind = .standalone, .binding = binding, .width = 1, .height = 1, .mip_level_count = 1 };
     shared.generations[0] = MAX_GENERATION;
     const last_persistent = shared.handle(0);
@@ -1326,15 +1358,17 @@ test "texture namespaces and generations reject released handles and wrong owner
 }
 
 test "external 绑定槽位 generation 回绕：高频 register/unregister 不会耗尽" {
-    // 回归：每次 unregister 都 bump generation，到 MAX_GENERATION 的槽位永久
-    // 退役。离屏/retained/glass 合成每帧注册数十次 -> 约一周后 TooManyTextures，
-    // 所有 opacity 层消失。
+    // Regression: each unregister bumps generation; slots reaching
+    // MAX_GENERATION retire forever. Offscreen/retained/glass composite
+    // register ~10s of times/frame -> ~1 week TooManyTextures, all opacity
+    // layers vanish.
     var device: gpu.Backend.Device = undefined;
     var store = ImageTextureStore.init(std.testing.allocator, &device, false);
     defer store.deinit();
     const binding = gpu.Backend.TextureBinding.testBinding(16, 1, 1);
 
-    // 把全部 external 槽位推到 generation 上限：旧实现下它们全部退役。
+    // Push all external slots to generation max: old implementation had
+    // them all retire.
     for (EXTERNAL_SLOT_BASE..MAX_TEXTURES) |i| store.generations[i] = MAX_GENERATION;
     var i: usize = 0;
     var prev: TextureId = 0;
@@ -1343,12 +1377,13 @@ test "external 绑定槽位 generation 回绕：高频 register/unregister 不�
         try std.testing.expect((id & SLOT_MASK) >= EXTERNAL_SLOT_BASE);
         try std.testing.expectEqual([2]u32{ 8, 8 }, store.getTextureSize(id).?);
         store.unregisterTextureBinding(id);
-        // 注销后旧句柄立即失效（回绕到 0 也不等于旧 generation）
+        // After unregister, old handle invalid immediately
+        // (wraparound to 0 != old generation)
         try std.testing.expect(store.getTextureSize(id) == null);
         if (i > 0) try std.testing.expect(id != prev);
         prev = id;
     }
-    // 持久区间一个槽位都没被 external 占用
+    // No persistent slot occupied by external
     for (store.textures[0..EXTERNAL_SLOT_BASE]) |slot| try std.testing.expect(slot == null);
     try std.testing.expectEqual(@as(u32, 0), store.generations[0]);
 }
@@ -1361,9 +1396,9 @@ test "image instance preparation failure cannot leave mismatched instance and te
         renderer.shared_texture_store = null;
         renderer.texture_store = ImageTextureStore.init(std.testing.allocator, undefined, false);
         defer renderer.texture_store.deinit();
-        renderer.instances = .{};
+        renderer.instances = .empty;
         defer renderer.instances.deinit(renderer.allocator);
-        renderer.instance_textures = .{};
+        renderer.instance_textures = .empty;
         defer renderer.instance_textures.deinit(renderer.allocator);
         renderer.current_rect_clip = .{ 0, 0, -1, -1 };
         const id = try renderer.texture_store.registerTextureBinding(gpu.Backend.TextureBinding.testBinding(16, 1, 1), 1, 1);

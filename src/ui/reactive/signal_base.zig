@@ -1,38 +1,36 @@
 const std = @import("std");
 
-/// SignalBase: 类型擦除的 Signal 基类
+/// SignalBase: type-erased Signal base class
 ///
-/// 为什么需要基类?
-/// - SignalOwner 需要统一管理所有类型的 Signal
-/// - 使用基类可以将 Signal(i32), Signal([]const u8) 等统一存储
-/// - 通过虚函数表实现多态
+/// Why a base class?
+/// - SignalOwner needs unified management of all Signal types
+/// - It allows Signal(i32), Signal([]const u8) etc. in unified storage
+/// - A virtual function table implements polymorphism
 ///
-/// 单轨追踪，subscribers 列表全部走 ReactiveGraph
-/// （src/ui/reactive/graph.zig）。旧 subscribers / addSubscriber / removeSubscriber /
-/// notifyAll / VTable.notify 全部删除，graph.observers 是唯一 observer 源；
-/// signal.set 走 graph.markSignalWritten 而非 notifyAll。
+/// Tracking is single-track: all subscribers go through ReactiveGraph (src/ui/reactive/graph.zig);
+/// graph.observers is the sole observer source, and signal.set goes through
+/// graph.markSignalWritten.
 pub const SignalBase = struct {
-    /// 虚函数表
+    /// Virtual function table
     vtable: *const VTable,
 
-    /// 用于 signal 自身分配（Scope 路径下为 scope.allocator；Arena 路径用 fallback）
+    /// For signal self allocation (Scope path uses scope.allocator; Arena path uses fallback)
     scope_allocator: ?std.mem.Allocator = null,
 
-    /// 在 ReactiveGraph 中的对应 NodeId（u32，0xFFFFFFFF = 未注册）。
-    /// Signal create 时同步注册到 graph；set 路径走 graph.markSignalWritten
-    /// 实现拓扑序 + 版本戳传播。
+    /// Corresponding NodeId in ReactiveGraph (u32, 0xFFFFFFFF = unregistered). Signal create
+    /// registers sync to graph; set path uses graph.markSignalWritten for topo order + version
+    /// stamp propagation.
     graph_node_raw: u32 = 0xFFFFFFFF,
 
     pub const VTable = struct {
-        /// 清理函数
+        /// Cleanup function
         cleanup: *const fn (*SignalBase) void,
 
-        /// 释放具体类型内存（Scope dispose 时使用）
-        /// 为 null 表示由 Arena 管理（旧路径）
+        /// Free concrete type memory (used on Scope dispose). null means Arena-managed (old path)
         destroy: ?*const fn (*SignalBase, std.mem.Allocator) void = null,
     };
 
-    /// 初始化 SignalBase
+    /// Initialize SignalBase
     pub fn init(allocator: std.mem.Allocator, vtable: *const VTable) SignalBase {
         _ = allocator;
         return .{
@@ -40,12 +38,12 @@ pub const SignalBase = struct {
         };
     }
 
-    /// 清理 Signal
+    /// Clean up Signal
     pub fn cleanup(self: *SignalBase) void {
         self.vtable.cleanup(self);
     }
 
-    /// 释放具体类型内存（由 Scope dispose 调用）
+    /// Free concrete type memory (called by Scope dispose)
     pub fn destroy(self: *SignalBase, allocator: std.mem.Allocator) void {
         if (self.vtable.destroy) |destroyFn| {
             destroyFn(self, allocator);

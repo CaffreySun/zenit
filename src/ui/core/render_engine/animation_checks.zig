@@ -1,12 +1,12 @@
-/// 动画与过渡状态检查工具
-/// 判断节点是否有活跃的 composite / opacity / transform 动画或过渡
+/// Animation and transition state check utils
+/// Check whether node has active composite / opacity / transform animation or transition
 const types = @import("../types.zig");
 const node_mod = @import("../node.zig");
 
 const Node = node_mod.Node;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Transition 属性分类
+// Transition property classification
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub fn transitionPropIsComposite(prop: types.TransitionProp) bool {
@@ -28,7 +28,7 @@ pub fn transitionPropIsTransform(prop: types.TransitionProp) bool {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 活跃 Transition 检查
+// Active Transition checking
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub fn hasActiveCompositeTransition(node: *Node) bool {
@@ -56,7 +56,7 @@ pub fn hasActiveTransformTransition(node: *Node) bool {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 活跃 NodeAnimation 检查
+// Active NodeAnimation checking
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub fn hasActiveOpacityNodeAnimation(node: *Node) bool {
@@ -79,7 +79,7 @@ pub fn hasActiveTransformNodeAnimation(node: *Node) bool {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 组合检查（transition + node_animation + manual）
+// Combined checking (transition + node_animation + manual)
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub fn hasActiveCompositeAnimation(node: *Node) bool {

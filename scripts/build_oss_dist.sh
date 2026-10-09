@@ -143,18 +143,23 @@ done < "$SOURCE_CANDIDATES"
 COPYFILE_DISABLE=1 tar -C "$ROOT" -cf "$SOURCE_ARCHIVE" --null -T "$SOURCE_FILES"
 
 echo "==> Applying build.zig.zon's public package allowlist"
-PACKAGE_HASH="$("$ZIG_BIN" fetch --global-cache-dir "$PACKAGE_CACHE" "$SOURCE_ARCHIVE")"
+PACKAGE_HASH="$(ZIG_GLOBAL_CACHE_DIR="$PACKAGE_CACHE" "$ZIG_BIN" fetch "$SOURCE_ARCHIVE")"
 if [[ ! "$PACKAGE_HASH" =~ ^[0-9A-Za-z][0-9A-Za-z._+-]*$ || "$PACKAGE_HASH" == *..* ]]; then
   echo "zig fetch returned an unsafe package hash: ${PACKAGE_HASH:-<empty>}" >&2
   exit 1
 fi
 PACKAGE_ROOT="$PACKAGE_CACHE/p/$PACKAGE_HASH"
+# Zig 0.17 stores fetched packages as archives; unpack the filtered payload.
+mkdir -p "$PACKAGE_ROOT"
+COPYFILE_DISABLE=1 tar -xzf "$PACKAGE_ROOT.tar.gz" -C "$PACKAGE_ROOT" --strip-components=1
 if [[ ! -s "$PACKAGE_ROOT/build.zig.zon" ]]; then
   echo "zig fetch did not create the expected package tree: $PACKAGE_ROOT" >&2
   exit 1
 fi
 
 cp -R "$PACKAGE_ROOT/." "$STAGING_DIR/"
+# Dependency extraction is generated state, not vendored source.
+find "$STAGING_DIR" -type d -name zig-pkg -prune -exec rm -rf {} +
 
 # Zig's package cache is immutable. A source archive should extract into a
 # normal editable tree with predictable portable permissions.
@@ -175,6 +180,14 @@ required_paths=(
   src/ui/icons_lucide_generated.zig
   src/ui/icons_common_generated.zig
   vendor/unicode/LICENSE.txt
+  vendor/zls/LICENSE
+  vendor/zls/PROVENANCE.md
+  vendor/zls/src/bsp.zig
+  vendor/zls/tests/build_system/zig017.py
+  tools/yix_lsp.zig
+  tools/yss_schema.zig
+  tests/yix/lsp/smoke.py
+  editors/vscode-yix/package-lock.json
 )
 for required_path in "${required_paths[@]}"; do
   if [[ ! -s "$STAGING_DIR/$required_path" ]]; then
@@ -184,8 +197,8 @@ for required_path in "${required_paths[@]}"; do
 done
 
 for forbidden_path in \
-  private .git .github .zig-cache zig-cache zig-out .bench-output \
-  .ci-evidence release-evidence docs/internal; do
+  private .git .github .zig-cache zig-cache zig-pkg zig-out .bench-output \
+  .ci-evidence release-evidence docs/internal docs/reviews scripts/glass_native_model; do
   if [[ -e "$STAGING_DIR/$forbidden_path" || -L "$STAGING_DIR/$forbidden_path" ]]; then
     echo "forbidden path leaked into public source export: $forbidden_path" >&2
     exit 1
@@ -196,7 +209,7 @@ BAD_PATH="$(find "$STAGING_DIR" \
   \( -name '.DS_Store' -o -name '._*' -o -name '.env' -o -name '.env.*' \
      -o -name '*.pyc' -o -name '*.pyo' -o -name '*.swp' -o -name '*.swo' \
      -o -name '*.log' -o -name '*.o' -o -name '*.a' -o -name '*.dylib' \
-     -o -name '*.so' -o -name '*.dSYM' \) -print -quit)"
+     -o -name '*.so' -o -name '*.dSYM' -o -name '.zig-cache' -o -name 'zig-out' -o -name 'zig-pkg' \) -print -quit)"
 if [[ -n "$BAD_PATH" ]]; then
   echo "generated/private/build artifact leaked into public source: ${BAD_PATH#"$STAGING_DIR/"}" >&2
   exit 1
@@ -234,17 +247,16 @@ if (( RUN_SMOKE_BUILD == 1 )); then
   echo "==> Compiling the public-default hello-button target"
   (
     cd "$STAGING_DIR"
-    "$ZIG_BIN" build hello-button -Dicon-set=lucide \
+    ZIG_GLOBAL_CACHE_DIR="$WORK_DIR/smoke-global-cache" "$ZIG_BIN" build hello-button -Dicon-set=lucide \
       --cache-dir "$WORK_DIR/smoke-cache" \
-      --global-cache-dir "$WORK_DIR/smoke-global-cache" \
       --prefix "$WORK_DIR/smoke-out" \
       --summary none
   )
   # zig still creates .zig-cache in each package root despite --cache-dir, and
   # those caches record local absolute paths. The source export was checked to
   # contain none above, so every one found now came from the smoke build.
-  find "$STAGING_DIR" -type d \( -name .zig-cache -o -name zig-cache \) -prune -exec rm -rf {} +
-  LEFTOVER_CACHE="$(find "$STAGING_DIR" -type d \( -name .zig-cache -o -name zig-cache \) -print -quit)"
+  find "$STAGING_DIR" -type d \( -name .zig-cache -o -name zig-cache -o -name zig-pkg \) -prune -exec rm -rf {} +
+  LEFTOVER_CACHE="$(find "$STAGING_DIR" -type d \( -name .zig-cache -o -name zig-cache -o -name zig-pkg \) -print -quit)"
   if [[ -n "$LEFTOVER_CACHE" ]]; then
     echo "smoke build cache left in public source: ${LEFTOVER_CACHE#"$STAGING_DIR/"}" >&2
     exit 1

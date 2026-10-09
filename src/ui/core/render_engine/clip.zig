@@ -1,4 +1,4 @@
-/// Clip 路径处理：Bezier 曲线细分、SVG path -> polygon 转换、clip spec 解析
+/// Clip path handling: Bezier subdivision, SVG path -> polygon conversion, clip spec parsing.
 const std = @import("std");
 
 const types = @import("../types.zig");
@@ -127,7 +127,7 @@ pub fn buildClipPolygonFromPathGeometry(geometry: PathGeometry, clip_rect: Compu
     if (geometry.commands.len == 0) return polygon;
 
     var points: [display_list_mod.max_clip_polygon_points]Point = undefined;
-    var contour_end_points: [display_list_mod.max_clip_polygon_contours]u8 = [_]u8{0} ** display_list_mod.max_clip_polygon_contours;
+    var contour_end_points: [display_list_mod.max_clip_polygon_contours]u8 = @as([display_list_mod.max_clip_polygon_contours]u8, @splat(0));
     var point_count: usize = 0;
     var contour_count: usize = 0;
     var contour_start_idx: usize = 0;
@@ -233,14 +233,15 @@ pub fn buildClipPolygonFromPathGeometry(geometry: PathGeometry, clip_rect: Compu
     return polygon;
 }
 
-/// owner 是否有画在「children overflow clip」之外的自身内容：阴影、outline、
-/// 可见描边（clip 收在描边内沿，描边本身在 clip 外）。
+/// Whether owner has own content outside "children overflow clip": shadow, outline, visible stroke
+/// (clip shrinks within stroke inset, stroke itself outside clip).
 ///
-/// 这类节点的 overflow clip 不能用「节点级」机制实现，rounded_clip effect 的
-/// mask、compositor 的 apply_clip 都在 owner 自身内容之前生效，会把阴影裁成
-/// border-box 矩形（Popover 圆角外的灰块）、把描边压到贴边内容下面。它们改走
-/// children 包围的 node-local push_clip（render_engine emitScrollClipBegin）。
-/// 没有这些内容的节点，裁到自身无可见差别，保留原有的 fold / apply_clip 快路径。
+/// These nodes' overflow clip cannot use node-level mechanism; rounded_clip effect's mask and
+/// compositor's apply_clip both activate before owner's own content, clipping shadows to border-box
+/// (gray block outside Popover arc), compressing stroke beneath border-adjacent content. They
+/// switch to node-local push_clip around children (render_engine emitScrollClipBegin). Nodes
+/// without this content clip equally without visual difference, retaining original fold /
+/// apply_clip fast path.
 pub fn ownerPaintsOutsideChildClip(node: *const Node) bool {
     if (node.style.shadowSlice().len > 0) return true;
     if (node.style.outline()) |o| {
@@ -254,17 +255,17 @@ pub fn ownerPaintsOutsideChildClip(node: *const Node) bool {
     return false;
 }
 
-/// overflow clip 的边界 = **padding box**（border 内沿），与 CSS 一致。
+/// Overflow clip boundary = **padding box** (border inset), matching CSS.
 ///
-/// zenit 的 border 画在 layout rect 内侧、不占布局空间，子节点可以铺到 border
-/// 底下；此前 clip 取 border-box，于是贴边/溢出的子内容（Popover 里的色块、表格
-/// 首末行）直接盖住描边，描边在内容处断开，圆角外沿露出内容的直角。收进内沿后
-/// 描边始终完整可见，边框下方透出的是节点自己的背景。
+/// The border paints inside the layout rect without consuming layout space, so children can tile
+/// under it. A border-box clip would let edge children (color blocks in Popover, first/last table
+/// rows) cover the stroke and expose child right angles at rounded corners. Clipping inward keeps
+/// the stroke intact; what shows under it is the node's own background.
 ///
-/// 只对**可见** border 生效：透明/零宽 border 不产生任何像素，收缩 clip 只会
-/// 凭空吃掉内容。backdrop_blur（玻璃）节点除外，它的 clip 同时是 rounded_clip
-/// effect 的 surface 范围，自身 border 也画在该 effect 内，收进去会把自己的描边
-/// 裁掉。
+/// Only applies to a **visible** border: a transparent/zero-width border paints nothing, so
+/// shrinking would only eat content. Exception: backdrop_blur (glass) nodes, where the clip is also
+/// the rounded_clip effect's surface range and the border paints inside that effect; shrinking
+/// would cut off its own stroke.
 fn clipBorderInsets(node: *const Node) [4]f32 {
     const border = node.style.border;
     if (border.color.a == 0) return .{ 0, 0, 0, 0 };
@@ -275,12 +276,14 @@ fn clipBorderInsets(node: *const Node) [4]f32 {
 fn insetApplies(node: *const Node, rect: ComputedRect, inset: [4]f32) bool {
     _ = node;
     if (inset[0] == 0 and inset[1] == 0 and inset[2] == 0 and inset[3] == 0) return false;
-    // 边框把整个盒子吃满时（极窄分隔线等）不收：零面积 clip 会让整棵子树被
-    // cull 掉，连 owner 自己的描边都不画。
+    // When border fills entire box (very narrow dividers etc.) don't shrink: zero-area clip culls
+    // entire subtree, even owner's stroke.
     return rect.w - inset[1] - inset[3] >= 0.1 and rect.h - inset[0] - inset[2] >= 0.1;
 }
 
-fn paddingBoxClipRect(node: *const Node, rect: ComputedRect) ComputedRect {
+/// Shared rectangular padding-box clip, including visible-border and glass
+/// exceptions. Accessibility uses the same bounds as paint for rect clips.
+pub fn paddingBoxClipRect(node: *const Node, rect: ComputedRect) ComputedRect {
     const inset = clipBorderInsets(node);
     if (!insetApplies(node, rect, inset)) return rect;
     return ComputedRect.init(
@@ -292,7 +295,7 @@ fn paddingBoxClipRect(node: *const Node, rect: ComputedRect) ComputedRect {
 }
 
 pub fn resolveNodeRenderClipSpec(cx: *@import("render_context.zig").RenderContext, node: *Node, allocator: Allocator, scale_min: f32) RenderClipSpec {
-    // World.LayoutTable 读 rect。
+    // Read rect from World.LayoutTable.
     const node_world_rect = cx.rectFromWorld(node);
     const node_local_rect = ComputedRect.init(0, 0, node_world_rect.w, node_world_rect.h);
     if (!node.style.overflow_hidden) {
@@ -309,10 +312,10 @@ pub fn resolveNodeRenderClipSpec(cx: *@import("render_context.zig").RenderContex
 
     const clip_shape = interaction_semantics.nodeClipShape(node);
     if (clip_shape == .custom) {
-        // 刻意吞错：custom_clip 由用户注入的 provider 生成，失败原因不限于
-        // OOM。下面 `.custom => lo_vec.fill.custom_clip orelse lo_vec.fill.path`
-        // 是显式声明的降级路径，退回节点自身 path 裁剪，仍是有效裁剪形状，
-        // 不会漏画到 clip 外。
+        // Intentional swallow: custom_clip generated by user-injected provider, failure reasons not
+        // limited to OOM. Below `.custom => lo_vec.fill.custom_clip orelse lo_vec.fill.path`
+        // explicitly declares fallback path, reverting to node's own path clipping, still valid
+        // clip shape, no overflow.
         node.ensureCustomClipGeometry(allocator) catch {};
     }
     const lo_vec = node.getLayoutOutput().vector;
@@ -371,7 +374,7 @@ pub fn resolveNodeRenderClipSpec(cx: *@import("render_context.zig").RenderContex
             };
         },
         .rounded_rect => |radius| {
-            // 内沿圆角 = 外沿圆角 − 边宽（CSS padding-box 的 inner radius）。
+            // Inner radius = outer radius - stroke width (CSS padding-box inner radius).
             const inset = clipBorderInsets(node);
             const max_inset = @max(@max(inset[0], inset[1]), @max(inset[2], inset[3]));
             const inner_radius = if (insetApplies(node, node_local_rect, inset)) @max(radius - max_inset, 0) else radius;

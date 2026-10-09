@@ -1,44 +1,53 @@
-/// App 模块，应用层封装
+/// App module, application layer wrapper
 ///
-/// 提供从 UI 声明到屏幕显示的完整管线。
+/// Provides complete pipeline from UI declaration to screen display.
 const renderer_mod = @import("renderer.zig");
+const builtin = @import("builtin");
 pub const AppRenderer = renderer_mod.AppRenderer;
+pub const VisualQuality = @import("render").visual_quality.Quality;
 pub const ClearColor = renderer_mod.ClearColor;
 pub const FrameStats = renderer_mod.FrameStats;
 
 pub const ResourcePath = @import("resource_path.zig").ResourcePath;
 
-/// 一站式应用运行时，见 runtime.zig
+/// All-in-one application runtime; see runtime.zig
 pub const runtime = @import("runtime.zig");
 
-/// E2E test harness 转发口（`-Dtest-mode=true` 时有效，否则整体编译期消除）。
+/// E2E test harness inlet (active with `-Dtest-mode=true`, otherwise compiled away).
 ///
-/// `runtime.App.run()` 会自己每帧调 `drainTestCommands()`；**自建主循环**的
-/// 宿主（下游应用等）必须在自己的循环里调它一次，否则 file-RPC 服务器收得到
-/// 请求却永远不执行、不写响应，客户端表现为全部超时。
+/// `runtime.App.run()` calls `drainTestCommands()` each frame itself; custom main-loop
+/// hosts must call it once per loop, or the file-RPC server receives requests but never
+/// executes or answers them, and clients hang until timeout.
 pub const test_harness = @import("test_harness");
 
-/// 每帧消费一次 E2E 命令队列。自建主循环的宿主在 `processEvents()` 后调用。
+/// Drain E2E command queue once per frame. Custom main-loop hosts call after processEvents().
 pub fn drainTestCommands() void {
     test_harness.drainCommands();
 }
 
-/// 注册宿主自定义 E2E 路由。见 `test_harness.setAppRouteHandler`。
+/// Call once per frame after render (track frame sampling points for track_start/track_stop).
+/// Custom main-loop hosts call after rendering.
+pub fn afterTestFrame() void {
+    test_harness.afterFrame();
+}
+
+/// Register custom E2E route handler. See test_harness.setAppRouteHandler.
 pub fn setTestRouteHandler(f: test_harness.AppRouteFn) void {
     test_harness.setAppRouteHandler(f);
 }
-/// 进程级字体族注册表(id ↔ 族名 + face 缓存)。宿主建一个、
-/// `App.setFontRegistry` 装上,画布/UI 才能按族渲染。
-/// 从 zenit_app 导出而不是 ui:ui 层不依赖 render(会造成层级倒置)。
+/// Process-level font family registry (id <-> family name + face cache). Host creates one,
+/// `App.setFontRegistry` installs it, canvas/UI render by family.
+/// Exported from zenit_app not ui to avoid layer inversion (ui doesn't depend on render).
 pub const FontRegistry = @import("render").FontRegistry;
 pub const FamilyId = @import("render").FamilyId;
 
-pub const App = runtime.App;
-pub const MultiWindowApp = runtime.MultiWindowApp;
-pub const Application = runtime.MultiWindowApp;
-pub const AppWindow = runtime.App;
-pub const MultiWindowConfig = runtime.MultiWindowConfig;
-pub const WindowConfig = runtime.WindowConfig;
+pub const App = if (builtin.target.os.tag == .windows) @import("windows_runtime.zig").App else runtime.App;
+pub const MultiWindowApp = if (builtin.target.os.tag == .windows) @import("windows_runtime.zig").MultiWindowApp else runtime.MultiWindowApp;
+pub const Application = MultiWindowApp;
+pub const AppWindow = App;
+pub const MultiWindowConfig = if (builtin.target.os.tag == .windows) @import("windows_runtime.zig").MultiWindowConfig else runtime.MultiWindowConfig;
+pub const TitlebarStyle = @import("window_config.zig").TitlebarStyle;
+pub const WindowConfig = if (builtin.target.os.tag == .windows) @import("windows_runtime.zig").WindowConfig else runtime.WindowConfig;
 pub const FontConfig = runtime.FontConfig;
 pub const window_lifecycle = @import("window_lifecycle.zig");
 
@@ -46,4 +55,10 @@ const std = @import("std");
 
 test {
     std.testing.refAllDecls(@This());
+    _ = @import("pointer_isolation.zig");
+    // Native window code calls these exports even when no App is initialized.
+    if (builtin.os.tag == .macos) {
+        _ = @import("ui").a11y.macos_bridge;
+        _ = @import("ui").a11y.preferences;
+    }
 }

@@ -17,10 +17,11 @@ if (( PORT < 1 || PORT > 65535 )); then
   exit 64
 fi
 
-# 每次 run 独占一个新目录（并发 run / 泄漏实例结构性无法互相抢答；
-# 2026-08-16 实测两份 e2e 共用固定目录 = query 打到另一实例的树，
-# 呈现为大面积 "nav.X not found" 假失败）。显式 ZENIT_E2E_FILE_RPC_DIR
-# 覆盖时尊重调用方（唯一性由调用方负责，server 侧仍有 owner.json 单主锁兜底）。
+# Each run uses a new exclusive dir: concurrent runs / leaked instances must not answer each
+# other's queries (a shared fixed dir makes queries hit another instance's tree, showing as
+# wide "nav.X not found" false failures).
+# An explicit ZENIT_E2E_FILE_RPC_DIR override is respected (uniqueness is the caller's
+# responsibility; the server still has the owner.json single-master lock as fallback).
 if [[ -n "${ZENIT_E2E_FILE_RPC_DIR:-}" ]]; then
   RPCDIR="$ZENIT_E2E_FILE_RPC_DIR"
   RPCDIR_AUTO=0
@@ -28,8 +29,9 @@ else
   RPCDIR="$(mktemp -d "/tmp/zenit_e2e_rpc.${PORT}.XXXXXX")" || { echo "mktemp failed" >&2; exit 71; }
   RPCDIR_AUTO=1
 fi
-# 顺手回收超过一天的历史自动目录（点号命名模式只匹配 mktemp 产物，
-# 不会碰手动工作流的固定目录 zenit_e2e_rpc_<port>）。
+# Incidentally reclaim historic auto dirs over 1 day old (dot-naming pattern only
+# matches mktemp products, won't touch manual workflow fixed dir
+# zenit_e2e_rpc_<port>).
 find /tmp -maxdepth 1 -type d -name "zenit_e2e_rpc.*.??????" -mmin +1440 -exec rm -rf {} + 2>/dev/null || true
 APP="${ZENIT_E2E_APP:-zig-out/zenit Storybook.app/Contents/MacOS/storybook}"
 BUN="${ZENIT_E2E_BUN:-bun}"
@@ -145,8 +147,9 @@ else
 fi
 
 echo "==> launch app"
-# 隔离真实鼠标：开发者边跑边用电脑时，系统指针事件不再覆盖 harness 注入的输入。
-# 需要真实鼠标参与时设 ZENIT_E2E_ISOLATE_POINTER=0。
+# Isolate real mouse: developer uses computer while running, system pointer
+# events no longer override harness-injected input. Set
+# ZENIT_E2E_ISOLATE_POINTER=0 when real mouse needed.
 ZENIT_E2E_ISOLATE_POINTER="${ZENIT_E2E_ISOLATE_POINTER:-1}" ZENIT_E2E_FILE_RPC_DIR="$RPCDIR" "$APP" >"$APP_LOG" 2>&1 &
 APP_PID=$!
 echo "    app pid=$APP_PID  log=$APP_LOG"

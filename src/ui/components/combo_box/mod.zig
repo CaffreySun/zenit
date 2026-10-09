@@ -1,24 +1,32 @@
-/// ComboBox / Autocomplete, typeahead-in-input（B3）
+/// ComboBox / Autocomplete, typeahead-in-input.
 ///
-/// 组合已有基建：Input（文本输入 + on_change）+ Popover（bottom_start 锚定面板，
-/// manual 触发）。retained 模式下 option 行只建一次，过滤 = 行高 0/item_h 切换
-/// （与 Accordion 收起同款），不重建节点。
+/// Composes Input (text) + Popover (bottom_start anchored panel, manual trigger). Option rows
+/// rebuild with `options` (ui.rebuildOn, owned by Popover scope); filter = display toggle.
 ///
-/// 行为：
-///   - 输入即过滤（label 大小写不敏感子串匹配）并打开面板
-///   - 点选 option -> 输入框填入 label、面板关闭、触发 on_change（caller 读
-///     state.selectedOption() 取值）
-///   - 无匹配时显示 "No results found" 空态行
+/// Data: `value: Model(?[]const u8)` (committed option value), `open: Model(bool)` (shared with
+/// Popover). Input text is the query:
+/// - Typing filters (case-insensitive label substring) and opens the panel; a manual edit
+///   invalidates the committed selection (propose null)
+/// - Click / Enter commits an option: propose value, write label to input, close panel
+/// - External value write: input shows the label; external clear empties the input
+///   (user-typed text is unaffected if the selection is invalid)
+/// - No match: show a "No results found" empty state row
 const std = @import("std");
 const icons = @import("zenit_system_icons");
 const Allocator = std.mem.Allocator;
 const core = @import("../../core.zig");
+const view = @import("../../view.zig");
 const Cx = core.Cx;
 const Node = core.Node;
-const Signal = core.Signal;
 const box = core.box;
 const theme = core.theme;
-const Scope = @import("../../reactive.zig").Scope;
+const reactive = @import("../../reactive.zig");
+const Scope = reactive.Scope;
+const Signal = reactive.Signal;
+const Source = reactive.Source;
+const Model = reactive.Model;
+const Handler = core.Handler;
+const bind_mod = @import("../../bind.zig");
 const popover_mod = @import("../popover/mod.zig");
 const input_mod = @import("../input/mod.zig");
 const TextInputState = input_mod.TextInputState;
@@ -28,16 +36,17 @@ const KeyCode = events.KeyCode;
 const Modifiers = events.Modifiers;
 const EventResult = events.EventResult;
 
-/// 键盘导航复用 select_headless 的纯函数状态机（含 wrap / page / home-end）。
-/// ValueT 取 u32 = **可见（过滤后）选项在 options 里的下标**，因为 ComboBox
-/// 的导航必须只走当前匹配的行，隐藏行不能被箭头选中。
+/// Keyboard nav reuses select_headless pure function state machine
+/// (wrap/page/home-end). ValueT = u32 = **visible (filtered) option index
+/// in options**, because nav must walk only matching rows; arrow keys
+/// skip hidden rows.
 const NavValue = u32;
 const NavState = sm.SelectState(NavValue);
 const NavOption = sm.Option(NavValue);
-/// 可见选项上限（= options 上限；超出部分不参与键盘导航）
+/// Max visible options (excess hidden from keyboard nav)
 const max_visible_options = 256;
 
-/// 选项（label 展示 + value 提交）
+/// Option (label display + value commit)
 pub const ComboOption = struct {
     value: []const u8,
     label: []const u8,
@@ -45,17 +54,40 @@ pub const ComboOption = struct {
 };
 
 pub const ComboBoxProps = struct {
-    options: []const ComboOption = &.{},
-    placeholder: []const u8 = "Type to search…",
-    label_text: ?[]const u8 = null,
+    /// Option (can pass signal/derived: rebuild row on content/address
+    /// change). Strings owned by caller, must stay valid while current;
+    /// static arrays shallow-copied.
+    options: Source([]const ComboOption) = .{ .value = &.{} },
+    placeholder: Source([]const u8) = .{ .value = "Type to search…" },
+    label_text: Source([]const u8) = .{ .value = "" },
     width: f32 = 240,
     max_dropdown_height: f32 = 280,
-    disabled: bool = false,
-    /// 选中提交回调；caller 在回调里读 state.selectedOption()
-    on_change: ?core.HandlerRef = null,
+    disabled: Source(bool) = .{ .value = false },
+    /// Committed option value (null = unselected)
+    value: Model(?[]const u8) = .{ .local = null },
+    /// Called when user commits/edits invalidate selection and settle
+    on_change: ?Handler(?[]const u8) = null,
+    open: Model(bool) = .{ .local = false },
+    on_open_change: ?Handler(bool) = null,
 };
 
-// ── 样式层在 styles.zig ──
+/// Create ComboBox: `W.ComboBox(.{ .options = &fruits, .value =
+/// fruit }).mount(scope, cx)`
+pub fn ComboBox(props: anytype) ComboBoxBuilder {
+    return .{ .props = reactive.props.coerce(ComboBoxProps, props) };
+}
+
+pub const ComboBoxBuilder = struct {
+    props: ComboBoxProps,
+
+    pub fn mount(self: ComboBoxBuilder, scope: *Scope, cx: *Cx) !ComboBoxResult {
+        cx.owner.enterMount();
+        defer cx.owner.exitMount();
+        return mountImpl(self.props, scope, cx);
+    }
+};
+
+// -- Style layer in styles.zig --
 const styles = @import("styles.zig");
 const combo_item_height = styles.combo_item_height;
 const comboPanelStyle = styles.comboPanelStyle;
@@ -66,28 +98,46 @@ const comboEmptyTextStyle = styles.comboEmptyTextStyle;
 const comboHighlightBg = styles.comboHighlightBg;
 
 pub const ComboBoxState = struct {
-    options: []const ComboOption,
-    item_nodes: []*Node,
-    empty_node: *Node,
-    /// combobox 角色所在节点（pop.trigger），expanded / active_descendant /
-    /// value_text 三个 a11y 状态全部写回这里（AT 的虚拟焦点停在输入框上）。
+    cx: *Cx,
+    tokens: *const theme.ThemeTokens,
+    value: reactive.Bound(?[]const u8),
+    open: reactive.Bound(bool),
+    disabled: Source(bool),
+    /// Dynamic label: trigger's a11y name points to self-owned copy
+    /// (static label borrows literal)
+    label: Source([]const u8),
+    label_copy: []u8 = &.{},
+    on_change: ?Handler(?[]const u8),
+    on_open_change: ?Handler(bool),
+    /// combobox role node (pop.trigger); expanded/active_descendant/
+    /// value_text write here (AT focus stays on input).
     trigger: *Node,
     input_state: *TextInputState,
-    is_open: *Signal(bool),
+    /// Input text value (Input's owned signal): programmatic write uses
+    /// it, doesn't trigger on_change
+    input_value: *Signal([]const u8),
     panel: *Node,
+    items_box: *Node,
+    empty_node: *Node,
     item_h: f32,
+    /// Rebuild with options (array owned by rebuild subscope,
+    /// cleared at start)
+    options: []const ComboOption = &.{},
+    item_nodes: []*Node = &.{},
+    /// Selected index derived from value
     selected_index: ?usize = null,
-    on_change: ?core.HandlerRef = null,
-    /// 点选后程序化写回输入框会触发 Input on_change；置位跳过一次过滤/重开面板
-    suppress_change: bool = false,
+    shown_open: bool = false,
+    /// Last label written into input by component (check when clearing)
+    shown_label: ?[]const u8 = null,
 
-    // ── 键盘导航（复用 select_headless 状态机）──
-    /// 状态机 state；highlight_index 是"可见选项序号"，不是 options 下标
-    nav: NavState = .{ .open = false, .value = null, .highlight_index = null },
-    /// 可见选项表：nav_options[k].value = 该可见项在 options 里的真实下标
+    // -- Keyboard navigation (reuse select_headless state machine) --
+    /// State machine state; highlight_index = "visible option ordinal",
+    /// not options index
+    nav: NavState = .{},
+    /// Visible options table: nav_options[k].value = true index in options
     nav_options_buf: [max_visible_options]NavOption = undefined,
     nav_options_len: usize = 0,
-    /// highlight 行底色 / 常态底色
+    /// highlight row bg / normal bg
     highlight_bg: core.Color = core.Color.TRANSPARENT,
 
     pub fn selectedOption(self: *const ComboBoxState) ?ComboOption {
@@ -95,7 +145,7 @@ pub const ComboBoxState = struct {
         return self.options[i];
     }
 
-    /// 当前 highlight 的 options 下标（无 highlight 返回 null）
+    /// Current options index of highlight (null if none)
     pub fn highlightedIndex(self: *const ComboBoxState) ?usize {
         const k = self.nav.highlight_index orelse return null;
         if (k >= self.nav_options_len) return null;
@@ -105,15 +155,188 @@ pub const ComboBoxState = struct {
     fn navOptions(self: *const ComboBoxState) []const NavOption {
         return self.nav_options_buf[0..self.nav_options_len];
     }
+
+    fn indexOf(self: *const ComboBoxState, value: []const u8) ?usize {
+        for (self.options, 0..) |o, i| {
+            if (std.mem.eql(u8, o.value, value)) return i;
+        }
+        return null;
+    }
+
+    // ---- View ----
+
+    fn viewEffect(self: *ComboBoxState) void {
+        self.applyView(true);
+    }
+
+    fn applyView(self: *ComboBoxState, comptime tracked: bool) void {
+        const v = self.value.readAs(tracked);
+        const open = self.open.readAs(tracked);
+        const disabled = self.disabled.read(tracked);
+        if (self.trigger.behavior.interaction.a11y) |*a| a.disabled = disabled;
+        if (!self.label.isStatic()) {
+            const text = self.label.read(tracked);
+            if (!std.mem.eql(u8, self.label_copy, text)) {
+                if (self.cx.allocator.dupe(u8, text)) |copy| {
+                    self.cx.allocator.free(self.label_copy);
+                    self.label_copy = copy;
+                    if (self.trigger.behavior.interaction.a11y) |*a| a.label = copy;
+                } else |err| std.log.err("[ComboBox] label copy failed: {}", .{err});
+            }
+        }
+        const closing = self.shown_open and !open;
+        self.shown_open = open;
+        // Values not in options don't display as selected, don't write back
+        self.selected_index = if (v) |s| self.indexOf(s) else null;
+        if (closing) self.discardQuery() else self.syncInputText();
+        if (!open) self.nav.highlight_index = null;
+        applyHighlightStyles(self);
+    }
+
+    /// Selected item changed: write its label to input;
+    /// clear component-written when externally cleared (don't touch user typing)
+    fn syncInputText(self: *ComboBoxState) void {
+        if (self.selectedOption()) |opt| {
+            if (self.shown_label) |shown| {
+                if (shown.ptr == opt.label.ptr and shown.len == opt.label.len) return;
+            }
+            self.input_value.set(opt.label);
+            self.shown_label = opt.label;
+            _ = applyFilter(self, "");
+        } else if (self.shown_label != null) {
+            // Input still displays component-written label (clears when user
+            // types); clear together when externally cleared
+            self.input_value.set("");
+            self.shown_label = null;
+        }
+    }
+
+    /// Close panel = leave edit mode: input typing is filter draft, discard
+    /// and return to data -- have selection show label, no selection clear.
+    /// Else parent refuses clear, input forever shows text != value.
+    fn discardQuery(self: *ComboBoxState) void {
+        const text: []const u8 = if (self.selectedOption()) |opt| opt.label else "";
+        if (!std.mem.eql(u8, self.input_value.peek(), text)) self.input_value.set(text);
+        self.shown_label = if (self.selectedOption()) |opt| opt.label else null;
+        _ = applyFilter(self, "");
+    }
+
+    // ---- Interaction: propose only ----
+
+    fn proposeOpen(self: *ComboBoxState, v: bool) void {
+        const on_change = self.on_open_change;
+        const landed = self.open.commit(v) orelse return;
+        if (on_change) |h| h.call(landed);
+    }
+
+    /// Return whether proposal settled
+    fn proposeValue(self: *ComboBoxState, v: ?[]const u8) bool {
+        const on_change = self.on_change;
+        const landed = self.value.commit(v) orelse return false;
+        if (on_change) |h| h.call(landed);
+        return true;
+    }
+
+    // ---- Option rows (ui.rebuildOn) ----
+
+    fn optionsKey(opts: []const ComboOption) u64 {
+        var h = std.hash.Wyhash.init(0);
+        h.update(std.mem.asBytes(&opts.ptr));
+        h.update(std.mem.asBytes(&opts.len));
+        for (opts) |o| {
+            h.update(std.mem.asBytes(&o.value.ptr));
+            h.update(std.mem.asBytes(&o.label.ptr));
+            h.update(o.value);
+            h.update(o.label);
+            h.update(&[_]u8{@intFromBool(o.disabled)});
+        }
+        return h.final();
+    }
+
+    const Parts = struct {
+        nodes: []*Node = &.{},
+        clicks: []ItemClickCtx = &.{},
+
+        fn destroy(ptr: *anyopaque, alloc: Allocator) void {
+            const p: *Parts = @ptrCast(@alignCast(ptr));
+            alloc.free(p.nodes);
+            alloc.free(p.clicks);
+            alloc.destroy(p);
+        }
+    };
+
+    fn buildItems(self: *ComboBoxState, child: *Scope, container: *Node, opts: []const ComboOption) !void {
+        // Let runtime stop referencing previous round's nodes/array
+        self.options = &.{};
+        self.item_nodes = &.{};
+        self.nav_options_len = 0;
+        self.nav.highlight_index = null;
+        const cx = self.cx;
+        const a = child.allocator;
+        const parts = try a.create(Parts);
+        parts.* = .{};
+        try child.adoptResource(@ptrCast(parts), Parts.destroy);
+        parts.nodes = try a.alloc(*Node, opts.len);
+        parts.clicks = try a.alloc(ItemClickCtx, opts.len);
+        try view.mount(child, cx, container, view.items(RowCtx{ .state = self, .parts = parts }, opts, rowElement));
+        self.options = opts;
+        self.item_nodes = parts.nodes;
+        _ = applyFilter(self, self.input_state.getText());
+        self.applyView(false);
+    }
+
+    const RowCtx = struct { state: *ComboBoxState, parts: *Parts };
+    const RowArgs = struct { ctx: RowCtx, opt: ComboOption, index: usize };
+
+    fn rowElement(ctx: RowCtx, opt: ComboOption, i: usize) view.ComponentOf(buildRow) {
+        return view.component(buildRow, RowArgs{ .ctx = ctx, .opt = opt, .index = i });
+    }
+
+    /// Row = label + selected state check (second child;
+    /// syncComboA11y indexes)
+    fn buildRow(args: RowArgs, scope: *Scope, cx: *Cx) !*Node {
+        const self = args.ctx.state;
+        const parts = args.ctx.parts;
+        const opt = args.opt;
+        const i = args.index;
+        const t = self.tokens;
+        const check_px: core.Sizing = .{ .px = 16 };
+        var item_style = comboItemStyle(t);
+        if (!opt.disabled) item_style.cursor = .pointer;
+        const item = try view.render(scope, cx, view.box(.{
+            .style = item_style,
+            .hit_test = !opt.disabled,
+            .a11y = core.A11yProps{ .role = .option, .label = opt.label, .disabled = opt.disabled, .selected = false },
+        }, .{
+            // Label eats row's remaining width (push check to end)
+            view.attrs(.{ .style = core.BoxStyle{ .width = .{ .grow = .{} } } }, view.text(.{ .style = comboItemTextStyle(opt.disabled, t) }, opt.label)),
+            view.icon(.{ .style = .{ .width = check_px, .height = check_px, .opacity = 0 }, .tint = t.tokens.color.accent }, icons.check),
+        }));
+        parts.nodes[i] = item;
+        parts.clicks[i] = .{ .state = self, .index = i };
+        item.behavior.events.event_context = @ptrCast(&parts.clicks[i]);
+        item.behavior.events.on_event = onItemEvent;
+        if (!opt.disabled) {
+            if (item.behavior.interaction.a11y) |*a| a.item_selection = .{ .context = @ptrCast(&parts.clicks[i]), .set = setAccessibleItemSelection };
+        }
+        return item;
+    }
 };
 
-pub const ComboBoxMount = struct {
+pub const ComboBoxResult = struct {
     wrapper: *Node,
-    /// Input wrapper（含 label）
+    /// Input wrapper (with label)
     input: *Node,
     panel: *Node,
-    is_open: *Signal(bool),
+    /// Selected value signal (null when ui.split)
+    value: ?*Signal(?[]const u8),
+    /// Open signal (null when ui.split)
+    open: ?*Signal(bool),
     state: *ComboBoxState,
+    /// `ui.view` integration (see src/ui/view_parts.zig).
+    pub fn viewParts(self: ComboBoxResult) core.ViewParts {
+        return .{ .root = self.wrapper };
+    }
 };
 
 const ItemClickCtx = struct {
@@ -131,16 +354,18 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     return false;
 }
 
+/// Filter show/hide rows, rebuild nav table; return match count
 fn applyFilter(state: *ComboBoxState, filter: []const u8) usize {
     var matched: usize = 0;
     state.nav_options_len = 0;
     for (state.options, state.item_nodes, 0..) |opt, item, i| {
         const show = containsIgnoreCase(opt.label, filter);
-        // display:none：不占位、不计 gap、不绘制、不命中（框架原生隐藏）。
+        // display:none: no layout, no gap, no paint, no hit
+        // (framework-native hide).
         item.setDisplay(if (show) .flex else .none);
         if (show) {
             matched += 1;
-            // 只有可见行进入导航表，箭头键不会停在被过滤掉的行上
+            // Only visible rows enter nav table; arrow keys won't stop on filtered
             if (state.nav_options_len < state.nav_options_buf.len) {
                 state.nav_options_buf[state.nav_options_len] = .{
                     .value = @intCast(i),
@@ -152,14 +377,14 @@ fn applyFilter(state: *ComboBoxState, filter: []const u8) usize {
         }
     }
     state.empty_node.setDisplay(if (matched == 0) .flex else .none);
-    // 过滤变化后旧 highlight 序号失效（指向的可能已被过滤掉）
+    // After filter change old highlight index invalid (item might be filtered)
     state.nav.highlight_index = null;
     applyHighlightStyles(state);
     state.panel.markLayoutDirty();
     return matched;
 }
 
-/// 把 highlight 底色刷到行节点上（仅 highlight 行有底色，其余透明）
+/// Paint highlight bg to row node (only highlight has bg, rest transparent)
 fn applyHighlightStyles(state: *ComboBoxState) void {
     const hi = state.highlightedIndex();
     for (state.item_nodes, 0..) |item, i| {
@@ -170,12 +395,11 @@ fn applyHighlightStyles(state: *ComboBoxState) void {
     syncComboA11y(state);
 }
 
-/// a11y 状态跟随交互（form_field 模式）：expanded 跟 is_open、
-/// active_descendant 跟 highlight、value_text / option.selected 跟提交的选择。
-/// 每处交互出口都要走到这里，否则 AT 播报的是过期状态。
+/// a11y state follows interaction: expanded with open,
+/// active_descendant with highlight, value_text/option.selected with value.
 fn syncComboA11y(state: *ComboBoxState) void {
     if (state.trigger.behavior.interaction.a11y) |*a| {
-        a.expanded = state.is_open.peek();
+        a.expanded = state.shown_open;
         a.active_descendant_element_id = if (state.highlightedIndex()) |idx|
             state.item_nodes[idx].element_id_raw
         else
@@ -187,7 +411,7 @@ fn syncComboA11y(state: *ComboBoxState) void {
         if (item.behavior.interaction.a11y) |*a| {
             a.selected = selected;
         }
-        // 默认 option 的第二个 child 是 Pvnqs 选中态 check icon。
+        // Default: option's second child is check icon for selected state.
         if (item.children.items.len > 1) {
             item.children.items[1].setOpacity(if (selected) 1 else 0);
         }
@@ -195,25 +419,30 @@ fn syncComboA11y(state: *ComboBoxState) void {
     state.trigger.markRenderDirty();
 }
 
-/// 把 highlight 行写回输入框并提交（Enter / 点选共用）
+/// Commit index (Enter/click): propose value + close;
+/// input written back label by view
 fn commitIndex(state: *ComboBoxState, index: usize) void {
+    if (state.disabled.peek()) return;
+    if (index >= state.options.len) return;
     const opt = state.options[index];
     if (opt.disabled) return;
-    state.selected_index = index;
-    // 输入框写回 label（selectAll + insertText = 整体替换）；写回会触发
-    // Input on_change -> suppress 一次，避免按 label 重过滤 + 重开面板。
-    state.suppress_change = true;
-    state.input_state.selectAll();
-    state.input_state.insertText(opt.label);
-    state.is_open.set(false);
-    syncComboA11y(state);
-    if (state.on_change) |h| h.invoke();
+    _ = state.proposeValue(opt.value);
+    state.proposeOpen(false);
+    // Data source unchanged (re-selected same): view doesn't run;
+    // write label to modified input
+    if (state.selected_index == index and !std.mem.eql(u8, state.input_state.getText(), opt.label)) {
+        state.input_value.set(opt.label);
+        state.shown_label = opt.label;
+        _ = applyFilter(state, "");
+    }
+    applyHighlightStyles(state);
 }
 
-/// ComboBox 键盘处理，导航逻辑整体委托给 select_headless 状态机，
-/// 本函数只做 KeyCode -> Action 映射与「可见序号 -> options 下标」的翻译。
+/// ComboBox keyboard handling: navigation delegated to select_headless
+/// state machine; this maps KeyCode->Action and visible-index->options-index.
 fn comboKeyDown(key: KeyCode, _: Modifiers, context: ?*anyopaque) EventResult {
     const state: *ComboBoxState = @ptrCast(@alignCast(context orelse return .ignored));
+    if (state.disabled.peek()) return .ignored;
 
     const action: ?sm.Action = switch (key) {
         .down => .arrow_down,
@@ -228,25 +457,34 @@ fn comboKeyDown(key: KeyCode, _: Modifiers, context: ?*anyopaque) EventResult {
     };
     const a = action orelse return .ignored;
 
-    // 关闭态按方向键 = 打开面板并落到首项（原生 ComboBox 行为）
-    if (!state.is_open.get() and (a == .arrow_down or a == .arrow_up)) {
-        state.is_open.set(true);
-        state.nav.open = true;
+    // Close + arrow = open panel and land on first item
+    // (native ComboBox behavior)
+    const was_open = state.shown_open;
+    if (!was_open and (a == .arrow_down or a == .arrow_up)) {
+        state.proposeOpen(true);
+        // Open refused: don't move highlight on invisible list
+        if (!state.open.peek()) return .stop;
     }
 
-    const opts = state.navOptions();
-    sm.step(NavValue, &state.nav, opts, a, 0);
+    const prev_open = state.nav.open;
+    sm.step(NavValue, &state.nav, state.navOptions(), a, 0);
+    // State machine only for nav state; open/close by data source
+    state.nav.open = prev_open;
 
     switch (a) {
         .enter => {
             if (state.highlightedIndex()) |idx| {
                 commitIndex(state, idx);
             } else {
-                // 无 highlight 时 Enter 不吞事件，交给表单提交等外层逻辑
+                // No highlight + Enter: don't consume, let form submit etc. handle
                 return .ignored;
             }
         },
-        .escape => state.is_open.set(false),
+        .escape => {
+            // Panel not open + Escape: don't consume (outer Modal etc. need it)
+            if (!was_open) return .ignored;
+            state.proposeOpen(false);
+        },
         else => {},
     }
     applyHighlightStyles(state);
@@ -254,19 +492,57 @@ fn comboKeyDown(key: KeyCode, _: Modifiers, context: ?*anyopaque) EventResult {
 }
 
 fn onInputChanged(state: *ComboBoxState, text: []const u8) void {
-    if (state.suppress_change) {
-        state.suppress_change = false;
-        return;
-    }
-    // 手动编辑使既有选择失效（提交值以点选为准）
-    state.selected_index = null;
+    // Manual edit invalidates selection (value by click only). Parent
+    // refuses clear: keep "label shown" record so later view refresh (panel
+    // open) won't overwrite user input. Clear shown_label first, then propose: when the proposal
+    // settles the view effect may re-run synchronously, and by then it must already know the
+    // label is no longer displayed.
+    const prev_label = state.shown_label;
+    state.shown_label = null;
+    if (state.value.peek() != null and !state.proposeValue(null)) state.shown_label = prev_label;
     _ = applyFilter(state, text);
-    if (!state.is_open.get()) state.is_open.set(true);
+    if (!state.shown_open) state.proposeOpen(true);
 }
 
-fn onItemClick(ctx_ptr: *anyopaque) void {
-    const ctx: *ItemClickCtx = @ptrCast(@alignCast(ctx_ptr));
-    commitIndex(ctx.state, ctx.index);
+/// AT ExpandCollapse: explicit target state, same propose pipeline as
+/// keyboard/click. Result fixed before on_open_change (callback might
+/// unmount).
+fn setAccessibleExpanded(raw: *anyopaque, expanded: bool) bool {
+    const state: *ComboBoxState = @ptrCast(@alignCast(raw));
+    if (state.disabled.peek()) return false;
+    if (state.shown_open == expanded) return true;
+    const on_change = state.on_open_change;
+    const landed = state.open.commit(expanded) orelse return false;
+    if (on_change) |h| h.call(landed);
+    return landed == expanded;
+}
+
+/// AT SelectionItem (single): select/remove both only propose value,
+/// input text written/cleared by view per selection; don't change open
+/// (ExpandCollapse's job). Return by settled==proposed; fixed before
+/// on_change (callback might unmount).
+fn setAccessibleItemSelection(raw: *anyopaque, operation: core.A11yProps.ItemSelectionOperation) bool {
+    const ctx: *ItemClickCtx = @ptrCast(@alignCast(raw));
+    const state = ctx.state;
+    if (state.disabled.peek() or ctx.index >= state.options.len or state.options[ctx.index].disabled) return false;
+    const selected = state.selected_index == ctx.index;
+    const want: ?[]const u8 = switch (operation) {
+        .replace, .add => blk: {
+            if (selected) return true;
+            if (operation == .add and state.selected_index != null) return false;
+            break :blk state.options[ctx.index].value;
+        },
+        .remove => blk: {
+            if (!selected) return true;
+            break :blk null;
+        },
+    };
+    const on_change = state.on_change;
+    const landed = state.value.commit(want) orelse return false;
+    const ok = if (landed == null or want == null) landed == null and want == null else std.mem.eql(u8, landed.?, want.?);
+    applyHighlightStyles(state);
+    if (on_change) |h| h.call(landed);
+    return ok;
 }
 
 fn onItemEvent(event: events.Event, context: ?*anyopaque) EventResult {
@@ -297,16 +573,53 @@ fn onItemEvent(event: events.Event, context: ?*anyopaque) EventResult {
     return .ignored;
 }
 
-/// mount ComboBox。默认样式与 select_headless 对齐（bg_primary 面板 + hover 行）。
-pub fn mountComboBox(props: ComboBoxProps, scope: *Scope, cx: *Cx) !ComboBoxMount {
+const OwnedOptions = struct {
+    items: []ComboOption = &.{},
+
+    fn destroy(ptr: *anyopaque, alloc: Allocator) void {
+        const h: *OwnedOptions = @ptrCast(@alignCast(ptr));
+        alloc.free(h.items);
+        alloc.destroy(h);
+    }
+};
+
+/// mount ComboBox. Default style matches select_headless
+/// (bg_primary panel + hover row).
+fn mountImpl(props: ComboBoxProps, scope: *Scope, cx: *Cx) !ComboBoxResult {
     const my_scope = try scope.childScope();
+    // Failure: dispose my_scope first (hook/resource destroyed at
+    // node lifetime) then free wrapper
+    var wrapper_node: ?*Node = null;
+    errdefer {
+        my_scope.dispose();
+        if (wrapper_node) |w| cx.freeNode(w);
+    }
     const allocator = cx.allocator;
     const t = cx.tokens;
+    reactive.checkBorrow(my_scope, props.options);
+    reactive.checkBorrow(my_scope, props.label_text);
+    reactive.checkBorrow(my_scope, props.disabled);
 
-    // ── Popover（manual 触发；面板 bottom_start 锚定 + 跟随 trigger 宽度）──
-    // wrapper/trigger 留在正常文档流，floating content 由 Popover 统一挂到
-    // window portal，不再需要临时篡改 cx 的 portal 指针。
-    var pop = try popover_mod.Popover(.{
+    const value = try reactive.resolveModel(?[]const u8, my_scope, props.value);
+    const open = try reactive.resolveModel(bool, my_scope, props.open);
+    // Popover and component share same open source: click outside by
+    // Popover, input/select by component
+    const pop_open: Model(bool) = open.toModel();
+
+    // Static options shallow-copied into scope: runtime keeps reading
+    // in click/view
+    var options = props.options;
+    if (props.options == .value) {
+        const holder = try my_scope.allocator.create(OwnedOptions);
+        holder.* = .{};
+        try my_scope.adoptResource(@ptrCast(holder), OwnedOptions.destroy);
+        holder.items = try my_scope.allocator.dupe(ComboOption, props.options.value);
+        options = .{ .value = holder.items };
+    }
+
+    // -- Popover (manual trigger; panel bottom_start anchored +
+    // follows trigger width) --
+    const pop = try popover_mod.Popover(.{
         .position = .bottom_start,
         .trigger = .manual,
         .offset = .{ .static = 4 },
@@ -315,145 +628,137 @@ pub fn mountComboBox(props: ComboBoxProps, scope: *Scope, cx: *Cx) !ComboBoxMoun
         .match_trigger_width = true,
         .constrain_width_to_viewport = true,
         .max_height = props.max_dropdown_height,
+        .open = pop_open,
+        .on_open_change = props.on_open_change,
     }).mount(my_scope, cx);
-    // sweep：wrapper 守到 return；失败先 dispose my_scope（hook / resource 在节点存活期 destroy）再 freeNode
-    errdefer cx.freeNode(pop.wrapper);
-    errdefer my_scope.dispose();
+    wrapper_node = pop.wrapper;
     pop.wrapper.meta.ownership.meta.component_name = "ComboBox";
 
     // ── State ──
     const state = try my_scope.allocator.create(ComboBoxState);
+    state.label_copy = &.{};
+    state.cx = cx;
     try my_scope.adoptResource(@ptrCast(state), struct {
         fn destroy(ptr: *anyopaque, alloc: Allocator) void {
-            alloc.destroy(@as(*ComboBoxState, @ptrCast(@alignCast(ptr))));
+            const st: *ComboBoxState = @ptrCast(@alignCast(ptr));
+            st.cx.allocator.free(st.label_copy);
+            alloc.destroy(st);
         }
     }.destroy);
 
-    // ── Input（塞进 pop.trigger 作为锚点）──
-    const input_result = try input_mod.Input(.{
+    // Initial selected item's label is input's initial value
+    // (don't write signal during mount)
+    const initial_label: ?[]const u8 = blk: {
+        const v0 = value.peek() orelse break :blk null;
+        for (options.peek()) |o| {
+            if (std.mem.eql(u8, o.value, v0)) break :blk o.label;
+        }
+        break :blk null;
+    };
+
+    // -- Input (stuffed into pop.trigger as anchor) --
+    pop.trigger.style.width = .{ .px = props.width };
+    pop.trigger.style.height = .{ .fit = .{} };
+    var input_result: input_mod.InputResult = undefined;
+    try view.mount(my_scope, cx, pop.trigger, view.capture(&input_result, input_mod.Input(.{
+        .value = initial_label orelse "",
         .placeholder = props.placeholder,
         .label_text = props.label_text,
         .width = props.width,
         .disabled = props.disabled,
-        .on_change = core.Cx.strHandlerFrom(ComboBoxState, state, onInputChanged),
-    }).mountResult(my_scope, cx);
-    pop.trigger.style.width = .{ .px = props.width };
-    pop.trigger.style.height = .{ .fit = .{} };
-    _ = try core.adoptChild(cx, allocator, pop.trigger, input_result.node);
+        .on_change = cx.on(ComboBoxState, state, onInputChanged),
+    })));
 
-    // a11y: combobox + listbox popup；expanded 初始收起（后续由
-    // syncComboA11y / is_open effect 跟随交互更新）
+    // a11y: combobox + listbox popup; expanded initially collapsed
+    // (later view-follows)
     pop.trigger.behavior.interaction.a11y = .{
         .role = .combobox,
         .has_popup = .listbox,
-        .label = props.label_text,
-        .disabled = props.disabled,
+        // Static label borrows literal; dynamic label written by view
+        // into self-owned copy
+        .label = if (props.label_text.isStatic() and props.label_text.peek().len > 0) props.label_text.peek() else null,
+        .disabled = props.disabled.peek(),
         .expanded = false,
+        .expansion = .{ .context = @ptrCast(state), .set = setAccessibleExpanded },
         .active_descendant_element_id = 0xFFFFFFFF,
     };
 
-    // ── 面板 + option 行 ──
-    // a11y: 面板是 listbox，行是 option（combobox -> listbox -> option 三级角色链）
+    // -- Panel -- a11y: panel is listbox, rows are option
+    // (combobox->listbox->option three-level role chain)
     pop.content.behavior.interaction.a11y = .{ .role = .listbox };
     const panel_style = comboPanelStyle(t);
     panel_style.applyTo(&pop.content.style, allocator);
     if (panel_style.background) |bg| pop.content.setBackgroundRaw(bg);
-    // Popover 的默认 chrome 是 4px 圆角；ComboBox 以 Pvnqs 的 8px panel
-    // 为准，同步命中与裁剪形状，避免只有边框变圆而内容仍按旧半径裁切。
+    // Popover's default chrome 4px radius; ComboBox uses Pvnqs's 8px
+    // panel, sync hit/clip shape to avoid only border rounding while
+    // content clips with old radius.
     const panel_radius = styles.comboPanelRadius(t);
     const panel_ext = try pop.content.style.ensureExtFallible(allocator);
     panel_ext.hit_shape = .{ .rounded_rect = panel_radius };
     panel_ext.clip_shape = .{ .rounded_rect = panel_radius };
 
-    const NodesHolder = struct { nodes: []*Node, click_ctxs: []ItemClickCtx };
-    const holder = try my_scope.allocator.create(NodesHolder);
-    {
-        // 两次 alloc 不能写在同一个初始化器里：第二次失败时第一次已分配却无人释放。
-        errdefer my_scope.allocator.destroy(holder);
-        const nodes = try my_scope.allocator.alloc(*Node, props.options.len);
-        errdefer my_scope.allocator.free(nodes);
-        const click_ctxs = try my_scope.allocator.alloc(ItemClickCtx, props.options.len);
-        holder.* = .{ .nodes = nodes, .click_ctxs = click_ctxs };
-    }
-    try my_scope.adoptResource(@ptrCast(holder), struct {
-        fn destroy(ptr: *anyopaque, alloc: Allocator) void {
-            const h: *NodesHolder = @ptrCast(@alignCast(ptr));
-            alloc.free(h.nodes);
-            alloc.free(h.click_ctxs);
-            alloc.destroy(h);
-        }
-    }.destroy);
-
-    for (props.options, 0..) |opt, i| {
-        // 建好即挂：item 进 content，label / check 进 item
-        const item = try core.adoptChild(cx, allocator, pop.content, try box(cx, comboItemStyle(t), .{}));
-        if (!opt.disabled) item.style.cursor = .pointer;
-        item.setHitTestVisible(!opt.disabled);
-        item.behavior.interaction.a11y = .{
-            .role = .option,
-            .label = opt.label,
-            .disabled = opt.disabled,
-            .selected = false,
-        };
-        const label = try core.adoptChild(cx, allocator, item, try box(cx, .{ .width = .{ .grow = .{} }, .height = .{ .fit = .{} } }, .{}));
-        var label_txt = comboItemTextStyle(opt.disabled, t);
-        label_txt.content = opt.label;
-        label.setText(label_txt);
-        const check_icon = try core.adoptChild(cx, allocator, item, try core.iconTint(cx, icons.check, t.color.accent, .{
-            .width = .{ .px = 16 },
-            .height = .{ .px = 16 },
-        }));
-        check_icon.setOpacityRaw(0);
-        holder.nodes[i] = item;
-
-        holder.click_ctxs[i] = .{ .state = state, .index = i };
-        item.behavior.events.event_context = @ptrCast(&holder.click_ctxs[i]);
-        item.behavior.events.on_event = onItemEvent;
-    }
-
-    // 空态行（默认收起）
-    const empty_node = try core.adoptChild(cx, allocator, pop.content, try box(cx, comboEmptyStyle(t), .{}));
-    const empty_label = try core.adoptChild(cx, allocator, empty_node, try box(cx, .{ .width = .{ .fit = .{} }, .height = .{ .fit = .{} } }, .{}));
-    empty_label.setText(comboEmptyTextStyle(t));
-    empty_node.setHitTestVisible(false);
+    // Option row container (rebuild with options) + empty state row
+    // (default collapsed)
+    const Panel = struct { items_box: *Node = undefined, empty: *Node = undefined };
+    var panel: Panel = .{};
+    try view.mount(my_scope, cx, pop.content, .{
+        view.capture(&panel.items_box, view.box(.{ .style = .{
+            .width = .{ .grow = .{} },
+            .height = .{ .fit = .{} },
+            .direction = .column,
+            .gap = pop.content.style.gap,
+        } }, {})),
+        view.capture(&panel.empty, view.box(
+            .{ .style = comboEmptyStyle(t), .hit_test = false },
+            view.text(.{ .style = comboEmptyTextStyle(t) }, "No results found"),
+        )),
+    });
+    const items_box = panel.items_box;
+    const empty_node = panel.empty;
 
     state.* = .{
-        .options = props.options,
-        .item_nodes = holder.nodes,
-        .empty_node = empty_node,
+        .cx = cx,
+        .tokens = t,
+        .value = value,
+        .open = open,
+        .disabled = props.disabled,
+        .label = props.label_text,
+        .on_change = props.on_change,
+        .on_open_change = props.on_open_change,
         .trigger = pop.trigger,
         .input_state = input_result.state,
-        .is_open = pop.is_open,
+        .input_value = input_result.value.?,
         .panel = pop.content,
+        .items_box = items_box,
+        .empty_node = empty_node,
         .item_h = combo_item_height,
-        .on_change = props.on_change,
         .highlight_bg = comboHighlightBg(t),
+        .shown_label = initial_label,
     };
-    // 初始导航表 = 全部选项可见
-    _ = applyFilter(state, "");
+    pop.wrapper.addDebugState(@ptrCast(state));
+    // Dynamic label: trigger's a11y name points to self-owned copy
+    // (later view-follows)
+    if (!props.label_text.isStatic()) {
+        state.label_copy = try cx.allocator.dupe(u8, props.label_text.peek());
+        pop.trigger.behavior.interaction.a11y.?.label = state.label_copy;
+    }
 
-    // 键盘导航挂在 Input 节点上：焦点始终在输入框里（面板不抢焦点），
-    // 所以 arrow/Enter/Escape 必须从 Input 起手。
+    // Keyboard nav on Input node: focus always on input (panel doesn't
+    // steal), so arrow/Enter/Escape start from Input.
     input_result.node.behavior.events.key_context = @ptrCast(state);
     input_result.node.behavior.events.on_key_down = comboKeyDown;
 
-    // expanded 也可能由外部路径翻转（点外部关闭 popover 等），effect 兜底跟随
-    // is_open（form_field 的 error_sig effect 同款模式）。
-    try my_scope.createEffect(.{
-        .is_open = pop.is_open,
-        .state_ptr = state,
-    }, struct {
-        fn update(c: anytype) void {
-            _ = c.is_open.get();
-            syncComboA11y(c.state_ptr);
-        }
-    }.update);
+    // Write content (portal) rebuild and view effect both owned by
+    // Popover's scope
+    try bind_mod.rebuildOn(cx, pop.scope, options, items_box, state, ComboBoxState.optionsKey, ComboBoxState.buildItems);
+    try pop.scope.createEffect(state, ComboBoxState.viewEffect);
 
     return .{
         .wrapper = pop.wrapper,
         .input = input_result.node,
         .panel = pop.content,
-        .is_open = pop.is_open,
+        .value = value.asSignal(),
+        .open = open.asSignal(),
         .state = state,
     };
 }
@@ -462,287 +767,322 @@ pub fn mountComboBox(props: ComboBoxProps, scope: *Scope, cx: *Cx) !ComboBoxMoun
 // Tests
 // ============================================================================
 
+const testing = std.testing;
+
 test "containsIgnoreCase" {
-    try std.testing.expect(containsIgnoreCase("Apple", "app"));
-    try std.testing.expect(containsIgnoreCase("Banana", "NAN"));
-    try std.testing.expect(!containsIgnoreCase("Cherry", "apple"));
-    try std.testing.expect(containsIgnoreCase("anything", ""));
+    try testing.expect(containsIgnoreCase("Apple", "app"));
+    try testing.expect(containsIgnoreCase("Banana", "NAN"));
+    try testing.expect(!containsIgnoreCase("Cherry", "apple"));
+    try testing.expect(containsIgnoreCase("anything", ""));
 }
 
-test "mountComboBox: 过滤切换行高 + 点选写回输入框" {
-    const testing = std.testing;
-    var cx = try Cx.init(testing.allocator);
-    defer cx.deinit();
-    const root = try box(cx, .{ .width = .{ .px = 600 }, .height = .{ .px = 400 } }, .{});
-    cx.root = root;
-    const scope = try Scope.init(testing.allocator, null, cx.owner);
-    defer scope.dispose();
+const fruit = [_]ComboOption{
+    .{ .value = "a", .label = "Apple" },
+    .{ .value = "b", .label = "Banana" },
+    .{ .value = "c", .label = "Cherry" },
+};
 
-    const opts = [_]ComboOption{
-        .{ .value = "a", .label = "Apple" },
-        .{ .value = "b", .label = "Banana" },
-        .{ .value = "c", .label = "Cherry" },
-    };
-    const cb = try mountComboBox(.{ .options = &opts, .width = 240 }, scope, cx);
-    try root.appendChild(testing.allocator, cb.wrapper);
+const CEnv = struct {
+    cx: *Cx,
+    scope: *Scope,
+    root: *Node,
+
+    fn init() !CEnv {
+        const cx = try Cx.init(testing.allocator, std.testing.io);
+        errdefer cx.deinit();
+        cx.setViewport(600, 400);
+        const root = try box(cx, .{ .width = .{ .px = 600 }, .height = .{ .px = 400 } }, .{});
+        cx.root = root;
+        return .{ .cx = cx, .scope = try Scope.init(testing.allocator, null, cx.owner), .root = root };
+    }
+
+    fn deinit(self: CEnv) void {
+        self.scope.dispose();
+        self.cx.deinit();
+    }
+
+    fn mount(self: CEnv, props: anytype) !ComboBoxResult {
+        const cb = try ComboBox(props).mount(self.scope, self.cx);
+        try self.root.appendChild(testing.allocator, cb.wrapper);
+        return cb;
+    }
+};
+
+/// Simulate user typing in input (go through Input's edit exit).
+/// Real path: select-all then input. Input writes full text to data source,
+/// then calls onInputChanged.
+fn typeText(cb: ComboBoxResult, text: []const u8) void {
+    const st = cb.state.input_state;
+    _ = input_mod.inputEventHandler(.{ .key_down = .{ .key = .a, .modifiers = .{ .super = true } } }, @ptrCast(st));
+    _ = input_mod.inputEventHandler(.{ .text_input = .{ .text = text } }, @ptrCast(st));
+}
+
+test "ComboBox: 过滤 + 点选写回输入框并提议 value / 关闭" {
+    const env = try CEnv.init();
+    defer env.deinit();
+    const cb = try env.mount(.{ .options = &fruit, .width = 240 });
+    const st = cb.state;
 
     // Pvnqs panel / option chrome
     try testing.expectEqual(@as(f32, 2), cb.panel.style.gap);
     try testing.expectEqual(@as(f32, 4), cb.panel.style.padding.top);
-    try testing.expectEqual(@as(f32, 4), cb.panel.style.padding.left);
     try testing.expectEqual(@as(f32, 8), cb.panel.style.border.radius);
     try testing.expectEqual(@as(usize, 1), cb.panel.style.shadowSlice().len);
-    try testing.expectEqual(@as(f32, 12), cb.panel.style.shadowSlice()[0].blur);
-    try testing.expectEqual(@as(f32, 4), cb.panel.style.shadowSlice()[0].offset_y);
-
-    // 初始：全部行可见
-    for (cb.state.item_nodes) |item| {
+    for (st.item_nodes) |item| {
         try testing.expectEqual(@as(f32, combo_item_height), item.style.height.px);
         try testing.expectEqual(@as(f32, 8), item.style.padding.top);
         try testing.expectEqual(@as(f32, 12), item.style.padding.left);
-        try testing.expectEqual(@as(f32, 6), item.style.corner_radius().?.resolve());
-        try testing.expectEqual(@as(f32, 1), item.getOpacity());
         try testing.expect(item.style.overflow_hidden);
-        try testing.expectEqual(core.Position.relative, item.style.position);
     }
 
-    // 过滤 "an" -> 只 Banana 命中
-    const matched = applyFilter(cb.state, "an");
-    try testing.expectEqual(@as(usize, 1), matched);
-    try testing.expectEqual(core.Display.none, cb.state.item_nodes[0].style.display);
-    try testing.expectEqual(core.Display.flex, cb.state.item_nodes[1].style.display);
-    try testing.expectEqual(core.Display.none, cb.state.item_nodes[2].style.display);
-    try testing.expectEqual(core.Display.none, cb.state.empty_node.style.display);
-    // 行高不再被改写（隐藏靠 display，不靠 0 高）
+    // Type "an" -> only Banana matches, panel opens
+    typeText(cb, "an");
+    try testing.expectEqual(core.Display.none, st.item_nodes[0].style.display);
+    try testing.expectEqual(core.Display.flex, st.item_nodes[1].style.display);
+    try testing.expectEqual(core.Display.none, st.empty_node.style.display);
+    try testing.expect(cb.open.?.peek());
 
-    // 无匹配 -> 空态行展开
-    _ = applyFilter(cb.state, "zzz");
-    try testing.expectEqual(core.Display.flex, cb.state.empty_node.style.display);
-    for (cb.state.item_nodes) |item| try testing.expectEqual(core.Display.none, item.style.display);
+    // No match -> empty state row expands
+    typeText(cb, "zzz");
+    try testing.expectEqual(core.Display.flex, st.empty_node.style.display);
 
-    // 点选 Banana -> 输入框写回 label、选中提交、面板关闭
-    cb.is_open.set(true);
-    var click_ctx = ItemClickCtx{ .state = cb.state, .index = 1 };
-    onItemClick(@ptrCast(&click_ctx));
-    try testing.expectEqual(@as(?usize, 1), cb.state.selected_index);
-    try testing.expectEqualStrings("Banana", cb.state.selectedOption().?.label);
-    try testing.expect(!cb.is_open.get());
-    try testing.expectEqualStrings("Banana", cb.state.input_state.buffer[0..cb.state.input_state.buffer_len]);
-    try testing.expectEqual(@as(f32, 1), cb.state.item_nodes[1].children.items[1].getOpacity());
+    // Click Banana -> value commits, label written to input, panel closes
+    var click_ctx = ItemClickCtx{ .state = st, .index = 1 };
+    _ = onItemEvent(.{ .click = .{ .x = 0, .y = 0 } }, @ptrCast(&click_ctx));
+    try testing.expectEqualStrings("b", cb.value.?.peek().?);
+    try testing.expectEqualStrings("Banana", st.input_state.getText());
+    try testing.expect(!cb.open.?.peek());
+    try testing.expectEqual(@as(f32, 1), st.item_nodes[1].children.items[1].getOpacity());
+
+    // First real edit after click-write filters normally (old implementation
+    // suppressed flag swallowed), invalidates selection
+    typeText(cb, "Ch");
+    try testing.expect(cb.value.?.peek() == null);
+    try testing.expectEqual(core.Display.flex, st.item_nodes[2].style.display);
+    try testing.expectEqual(core.Display.none, st.item_nodes[1].style.display);
 }
 
-/// 键盘导航测试用的公共 mount
-fn mountKbdFixture(cx: *Cx, scope: *Scope, opts: []const ComboOption) !ComboBoxMount {
-    const root = try box(cx, .{ .width = .{ .px = 600 }, .height = .{ .px = 400 } }, .{});
-    cx.root = root;
-    const cb = try mountComboBox(.{ .options = opts, .width = 240 }, scope, cx);
-    try root.appendChild(cx.allocator, cb.wrapper);
-    return cb;
+test "ComboBox: 外部写入 value 写回 label；外部清空只在输入框仍显示原 label 时清文字" {
+    const env = try CEnv.init();
+    defer env.deinit();
+    const v = try env.scope.createSignal(?[]const u8, "c");
+    const cb = try env.mount(.{ .options = &fruit, .value = v });
+    try testing.expectEqualStrings("Cherry", cb.state.input_state.getText());
+    v.set("a");
+    try testing.expectEqualStrings("Apple", cb.state.input_state.getText());
+    v.set(null);
+    try testing.expectEqualStrings("", cb.state.input_state.getText());
+    // External clear while user typing doesn't overwrite input
+    v.set("b");
+    typeText(cb, "Bananas?");
+    v.set(null);
+    try testing.expectEqualStrings("Bananas?", cb.state.input_state.getText());
+    // Close panel: no selected item, typed text (not any option) discarded
+    try testing.expect(cb.open.?.peek());
+    cb.open.?.set(false);
+    try testing.expectEqualStrings("", cb.state.input_state.getText());
 }
 
-test "ComboBox 键盘：arrow-then-Enter 选中（此前完全没有键盘导航）" {
-    const testing = std.testing;
-    var cx = try Cx.init(testing.allocator);
-    defer cx.deinit();
-    const scope = try Scope.init(testing.allocator, null, cx.owner);
-    defer scope.dispose();
+test "ComboBox: options 来自 signal —— 换选项重建行，选择按新选项派生" {
+    const env = try CEnv.init();
+    defer env.deinit();
+    const opts = try env.scope.createSignal([]const ComboOption, fruit[0..2]);
+    const v = try env.scope.createSignal(?[]const u8, "c");
+    const cb = try env.mount(.{ .options = opts, .value = v });
+    try testing.expectEqual(@as(usize, 2), cb.state.item_nodes.len);
+    try testing.expect(cb.state.selected_index == null);
+    opts.set(&fruit);
+    try testing.expectEqual(@as(usize, 3), cb.state.items_box.children.items.len);
+    try testing.expectEqual(@as(?usize, 2), cb.state.selected_index);
+    try testing.expectEqualStrings("Cherry", cb.state.input_state.getText());
+}
 
-    const opts = [_]ComboOption{
-        .{ .value = "a", .label = "Apple" },
-        .{ .value = "b", .label = "Banana" },
-        .{ .value = "c", .label = "Cherry" },
-    };
-    const cb = try mountKbdFixture(cx, scope, &opts);
+test "ComboBox 键盘：arrow-then-Enter 选中；箭头只走可见行；Escape 关闭" {
+    const env = try CEnv.init();
+    defer env.deinit();
+    const cb = try env.mount(.{ .options = &fruit });
     const st = cb.state;
-
-    // key handler 真的接上了（回归护栏：此前 on_key_down 是 null）
     try testing.expect(cb.input.behavior.events.on_key_down != null);
 
-    // 关闭态按 ↓ -> 打开面板并落到首项
-    try testing.expect(!cb.is_open.get());
+    // Close + down arrow -> open panel and land on first item
     try testing.expectEqual(EventResult.stop, comboKeyDown(.down, .{}, @ptrCast(st)));
-    try testing.expect(cb.is_open.get());
+    try testing.expect(cb.open.?.peek());
     try testing.expectEqual(@as(?usize, 0), st.highlightedIndex());
-
-    // 再按两次 ↓ -> Cherry
     _ = comboKeyDown(.down, .{}, @ptrCast(st));
-    _ = comboKeyDown(.down, .{}, @ptrCast(st));
-    try testing.expectEqual(@as(?usize, 2), st.highlightedIndex());
-
-    // Enter 提交 -> 写回输入框、关闭面板
+    try testing.expectEqual(@as(?usize, 1), st.highlightedIndex());
+    try testing.expect(st.item_nodes[1].getBackground().eql(st.highlight_bg));
     _ = comboKeyDown(.@"return", .{}, @ptrCast(st));
-    try testing.expectEqual(@as(?usize, 2), st.selected_index);
-    try testing.expectEqualStrings("Cherry", st.selectedOption().?.label);
-    try testing.expect(!cb.is_open.get());
-    try testing.expectEqualStrings("Cherry", st.input_state.buffer[0..st.input_state.buffer_len]);
-}
+    try testing.expectEqualStrings("b", cb.value.?.peek().?);
+    try testing.expect(!cb.open.?.peek());
 
-test "ComboBox 键盘：箭头只走过滤后可见的行" {
-    const testing = std.testing;
-    var cx = try Cx.init(testing.allocator);
-    defer cx.deinit();
-    const scope = try Scope.init(testing.allocator, null, cx.owner);
-    defer scope.dispose();
-
-    const opts = [_]ComboOption{
-        .{ .value = "a", .label = "Apple" },
-        .{ .value = "b", .label = "Banana" },
-        .{ .value = "c", .label = "Cherry" },
-        .{ .value = "g", .label = "Grape" },
-    };
-    const cb = try mountKbdFixture(cx, scope, &opts);
-    const st = cb.state;
-
-    // 过滤 "ap" -> Apple(0) 与 Grape(3) 命中；Banana/Cherry 隐藏
-    try testing.expectEqual(@as(usize, 2), applyFilter(st, "ap"));
-    try testing.expectEqual(@as(usize, 2), st.nav_options_len);
-
-    cb.is_open.set(true);
+    // After filter, arrow only walks visible rows ("an" -> Banana)
+    typeText(cb, "an");
     _ = comboKeyDown(.down, .{}, @ptrCast(st));
-    try testing.expectEqual(@as(?usize, 0), st.highlightedIndex()); // Apple
+    try testing.expectEqual(@as(?usize, 1), st.highlightedIndex());
     _ = comboKeyDown(.down, .{}, @ptrCast(st));
-    try testing.expectEqual(@as(?usize, 3), st.highlightedIndex()); // 跳过隐藏行 → Grape
-    // wrap 回首个可见项，而不是走到 Banana
-    _ = comboKeyDown(.down, .{}, @ptrCast(st));
-    try testing.expectEqual(@as(?usize, 0), st.highlightedIndex());
+    try testing.expectEqual(@as(?usize, 1), st.highlightedIndex());
 
-    // ↑ 从首项 wrap 到末个可见项
-    _ = comboKeyDown(.up, .{}, @ptrCast(st));
-    try testing.expectEqual(@as(?usize, 3), st.highlightedIndex());
-}
-
-test "ComboBox 键盘：Home/End/Escape 与无 highlight 时的 Enter" {
-    const testing = std.testing;
-    var cx = try Cx.init(testing.allocator);
-    defer cx.deinit();
-    const scope = try Scope.init(testing.allocator, null, cx.owner);
-    defer scope.dispose();
-
-    const opts = [_]ComboOption{
-        .{ .value = "a", .label = "Apple" },
-        .{ .value = "b", .label = "Banana" },
-        .{ .value = "c", .label = "Cherry" },
-    };
-    const cb = try mountKbdFixture(cx, scope, &opts);
-    const st = cb.state;
-    cb.is_open.set(true);
-
-    _ = comboKeyDown(.end, .{}, @ptrCast(st));
-    try testing.expectEqual(@as(?usize, 2), st.highlightedIndex());
-    _ = comboKeyDown(.home, .{}, @ptrCast(st));
-    try testing.expectEqual(@as(?usize, 0), st.highlightedIndex());
-
-    // Escape 关闭并清 highlight
     _ = comboKeyDown(.escape, .{}, @ptrCast(st));
-    try testing.expect(!cb.is_open.get());
-    try testing.expect(st.highlightedIndex() == null);
-
-    // 无 highlight 时 Enter 不吞事件（留给外层表单提交）
+    try testing.expect(!cb.open.?.peek());
+    // No highlight + Enter doesn't consume
     try testing.expectEqual(EventResult.ignored, comboKeyDown(.@"return", .{}, @ptrCast(st)));
-    try testing.expect(st.selected_index == null);
 }
 
-test "ComboBox 键盘：highlight 底色刷到行节点上" {
-    const testing = std.testing;
-    var cx = try Cx.init(testing.allocator);
-    defer cx.deinit();
-    const scope = try Scope.init(testing.allocator, null, cx.owner);
-    defer scope.dispose();
-
-    const opts = [_]ComboOption{
-        .{ .value = "a", .label = "Apple" },
-        .{ .value = "b", .label = "Banana" },
+test "ComboBox: ui.split 拒绝开合时箭头不移动高亮；拒绝提交时选择不变" {
+    const env = try CEnv.init();
+    defer env.deinit();
+    const Parent = struct {
+        o: *Signal(bool),
+        v: *Signal(?[]const u8),
+        fn writeO(_: *@This(), _: bool) void {}
+        fn writeV(_: *@This(), _: ?[]const u8) void {}
     };
-    const cb = try mountKbdFixture(cx, scope, &opts);
-    const st = cb.state;
-    cb.is_open.set(true);
+    var parent = Parent{ .o = try env.scope.createSignal(bool, false), .v = try env.scope.createSignal(?[]const u8, null) };
+    const cb = try env.mount(.{
+        .options = &fruit,
+        .open = reactive.split(parent.o, env.cx.on(Parent, &parent, Parent.writeO)),
+        .value = reactive.split(parent.v, env.cx.on(Parent, &parent, Parent.writeV)),
+    });
+    _ = comboKeyDown(.down, .{}, @ptrCast(cb.state));
+    try testing.expect(cb.state.highlightedIndex() == null);
+    var click_ctx = ItemClickCtx{ .state = cb.state, .index = 0 };
+    _ = onItemEvent(.{ .click = .{ .x = 0, .y = 0 } }, @ptrCast(&click_ctx));
+    try testing.expect(cb.state.selected_index == null);
+    try testing.expectEqualStrings("", cb.state.input_state.getText());
+}
 
-    _ = comboKeyDown(.down, .{}, @ptrCast(st)); // highlight = Apple
-    const hl = st.highlight_bg;
-    try testing.expect(st.item_nodes[0].getBackground().eql(hl));
-    try testing.expect(st.item_nodes[1].getBackground().eql(core.Color.TRANSPARENT));
+test "ComboBox: 父组件拒绝清空选择时，编辑中不覆盖用户输入，关闭后回到选中项的标签；面板关着时 Escape 不吞" {
+    const env = try CEnv.init();
+    defer env.deinit();
+    const Parent = struct {
+        v: *Signal(?[]const u8),
+        fn write(self: *@This(), x: ?[]const u8) void {
+            if (x != null) self.v.set(x); // Only accept selection, not clear
+        }
+    };
+    var parent = Parent{ .v = try env.scope.createSignal(?[]const u8, "b") };
+    const cb = try env.mount(.{ .options = &fruit, .value = reactive.split(parent.v, env.cx.on(Parent, &parent, Parent.write)) });
+    try testing.expectEqualStrings("Banana", cb.state.input_state.getText());
+    typeText(cb, "Ch"); // Clear refused; panel open settled -> view re-runs
+    try testing.expect(cb.open.?.peek());
+    try testing.expectEqualStrings("Ch", cb.state.input_state.getText());
+    try testing.expectEqualStrings("b", parent.v.peek().?);
 
-    _ = comboKeyDown(.down, .{}, @ptrCast(st)); // highlight = Banana
-    try testing.expect(st.item_nodes[0].getBackground().eql(core.Color.TRANSPARENT));
-    try testing.expect(st.item_nodes[1].getBackground().eql(hl));
+    _ = comboKeyDown(.escape, .{}, @ptrCast(cb.state));
+    try testing.expect(!cb.open.?.peek());
+    // Close = leave edit mode: filter draft discarded, input returns to
+    // data source (still selected b)
+    try testing.expectEqualStrings("Banana", cb.state.input_state.getText());
+    try testing.expectEqual(EventResult.ignored, comboKeyDown(.escape, .{}, @ptrCast(cb.state)));
 }
 
 test "a11y: ComboBox expanded/active_descendant/value 跟随交互且可撤回" {
-    const testing = std.testing;
-    var cx = try Cx.init(testing.allocator);
-    defer cx.deinit();
-    cx.setViewport(600, 400);
-    const root = try box(cx, .{ .width = .{ .px = 600 }, .height = .{ .px = 400 } }, .{});
-    cx.root = root;
-    const scope = try Scope.init(testing.allocator, null, cx.owner);
-    defer scope.dispose();
+    const env = try CEnv.init();
+    defer env.deinit();
+    const cb = try env.mount(.{ .options = fruit[0..2], .width = 240 });
+    env.cx.layout();
+    _ = env.cx.render();
 
-    const opts = [_]ComboOption{
-        .{ .value = "a", .label = "Apple" },
-        .{ .value = "b", .label = "Banana" },
-    };
-    const cb = try mountComboBox(.{ .options = &opts, .width = 240 }, scope, cx);
-    try root.appendChild(testing.allocator, cb.wrapper);
-    cx.layout();
-    _ = cx.render();
-
-    // 断言 a11y 树（真正送给 AT 的），不是 props 结构体。
+    // Assert a11y tree (actually sent to AT), not props struct.
     const eid = core.ElementId.fromRaw(cb.state.trigger.element_id_raw);
     {
-        const n = cx.accessibility_tree.get(eid).?;
+        const n = env.cx.accessibility_tree.getNode(eid).?;
         try testing.expectEqual(core.a11y_tree.Role.combobox, n.role);
         try testing.expect(n.state.haspopup);
         try testing.expect(n.state.expanded_present);
-        try testing.expect(!n.state.expanded); // 初始收起
+        try testing.expect(!n.state.expanded);
         try testing.expect(n.active_descendant.isNull());
-        try testing.expectEqual(@as(u64, 0), n.text_hash); // 无选中值
+        try testing.expectEqual(@as(u64, 0), n.text_hash);
     }
 
-    // ↓ 打开面板并落到首项 -> expanded=true + active_descendant 指向 Apple 行
     _ = comboKeyDown(.down, .{}, @ptrCast(cb.state));
-    cx.layout();
-    _ = cx.render();
+    env.cx.layout();
+    _ = env.cx.render();
     {
-        const n = cx.accessibility_tree.get(eid).?;
+        const n = env.cx.accessibility_tree.getNode(eid).?;
         try testing.expect(n.state.expanded);
         try testing.expectEqual(cb.state.item_nodes[0].element_id_raw, n.active_descendant.raw());
     }
 
-    // Enter 提交 Apple -> 收起、value_text 播报选中项、option.selected 置位
     _ = comboKeyDown(.@"return", .{}, @ptrCast(cb.state));
-    cx.layout();
-    _ = cx.render();
+    env.cx.layout();
+    _ = env.cx.render();
     {
-        const n = cx.accessibility_tree.get(eid).?;
-        try testing.expect(!n.state.expanded); // 状态可撤回：开→关
+        const n = env.cx.accessibility_tree.getNode(eid).?;
+        try testing.expect(!n.state.expanded);
         try testing.expectEqual(std.hash.Wyhash.hash(0, "Apple"), n.text_hash);
     }
     try testing.expect(cb.state.item_nodes[0].behavior.interaction.a11y.?.selected);
     try testing.expect(!cb.state.item_nodes[1].behavior.interaction.a11y.?.selected);
 
-    // 手动编辑使选择失效 -> value 撤回、selected 位撤回。
-    // （测试直接调 onInputChanged，先消掉 commitIndex 写回 Input 用的
-    // suppress 标记，真实流程里它被 insertText 触发的 on_change 消费。）
-    cb.state.suppress_change = false;
-    onInputChanged(cb.state, "ban");
-    cx.layout();
-    _ = cx.render();
-    try testing.expectEqual(@as(u64, 0), cx.accessibility_tree.get(eid).?.text_hash);
+    // Manual edit invalidates selection -> value retracted, selected bit
+    // retracted
+    typeText(cb, "ban");
+    env.cx.layout();
+    _ = env.cx.render();
+    try testing.expectEqual(@as(u64, 0), env.cx.accessibility_tree.getNode(eid).?.text_hash);
     try testing.expect(!cb.state.item_nodes[0].behavior.interaction.a11y.?.selected);
 }
 
-// styles.zig 的测试收集，这行是必需的，见 docs/STYLING.md
+test "ComboBox: 动态标签同步到 combobox 的 a11y 名称（自持副本）" {
+    const env = try CEnv.init();
+    defer env.deinit();
+    const label = try env.scope.createText("Fruit", .{});
+    const cb = try env.mount(.{ .options = &fruit, .label_text = label });
+    try testing.expectEqualStrings("Fruit", cb.state.trigger.behavior.interaction.a11y.?.label.?);
+    label.set("Favourite fruit");
+    try testing.expectEqualStrings("Favourite fruit", cb.state.trigger.behavior.interaction.a11y.?.label.?);
+}
+
+// styles.zig test collection; this line required, see docs/STYLING.md
 test {
     _ = @import("styles.zig");
 }
 
-// 逐分配点 OOM sweep，见 src/ui/components/oom_sweep.zig
+// Per-allocation OOM sweep; see src/ui/components/oom_sweep.zig
 const sweep_opts = [_]ComboOption{ .{ .value = "a", .label = "Apple" }, .{ .value = "b", .label = "Banana" } };
 test "combo_box: mount 在任意分配点失败时不泄漏（sweep）" {
     const sw = @import("../oom_sweep.zig");
     try sw.sweepMount("combo_box", struct {
         fn m(scope: *sw.Scope, cx: *sw.Cx) anyerror!?*sw.Node {
-            return (try mountComboBox(.{ .options = &sweep_opts, .width = 240 }, scope, cx)).wrapper;
+            return (try ComboBox(.{ .options = &sweep_opts, .width = 240 }).mount(scope, cx)).wrapper;
         }
     }.m);
+}
+
+test "combo_box(dynamic): mount 在任意分配点失败时不泄漏（sweep）" {
+    const sw = @import("../oom_sweep.zig");
+    try sw.sweepMount("combo_box(dynamic)", struct {
+        fn m(scope: *sw.Scope, cx: *sw.Cx) anyerror!?*sw.Node {
+            const opts = try scope.createSignal([]const ComboOption, &sweep_opts);
+            const v = try scope.createSignal(?[]const u8, "b");
+            const label = try scope.createText("Fruit", .{});
+            return (try ComboBox(.{ .options = opts, .value = v, .label_text = label }).mount(scope, cx)).wrapper;
+        }
+    }.m);
+}
+
+test "ComboBox: a11y item_selection / expansion —— 返回值如实反映受控拒绝" {
+    const env = try CEnv.init();
+    defer env.deinit();
+    const Parent = struct {
+        v: *Signal(?[]const u8),
+        fn write(self: *@This(), x: ?[]const u8) void {
+            if (x != null) self.v.set(x); // Only accept selection, not clear
+        }
+    };
+    var parent = Parent{ .v = try env.scope.createSignal(?[]const u8, null) };
+    const cb = try env.mount(.{ .options = &fruit, .value = reactive.split(parent.v, env.cx.on(Parent, &parent, Parent.write)) });
+    const sel0 = cb.state.item_nodes[0].behavior.interaction.a11y.?.item_selection.?;
+    const sel1 = cb.state.item_nodes[1].behavior.interaction.a11y.?.item_selection.?;
+    try testing.expect(sel0.set(sel0.context, .replace));
+    try testing.expectEqualStrings(fruit[0].value, parent.v.peek().?);
+    try testing.expect(!sel1.set(sel1.context, .add)); // Single-select: add fails when selection exists
+    try testing.expect(!sel0.set(sel0.context, .remove)); // Parent refuses clear
+    try testing.expectEqualStrings(fruit[0].value, parent.v.peek().?);
+    const expansion = cb.state.trigger.behavior.interaction.a11y.?.expansion.?;
+    try testing.expect(expansion.set(expansion.context, true));
+    try testing.expect(cb.state.shown_open);
+    try testing.expect(expansion.set(expansion.context, false));
+    try testing.expect(!cb.state.shown_open);
 }

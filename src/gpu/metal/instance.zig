@@ -1,6 +1,6 @@
-/// Metal Instance 实现
+/// Metal Instance implementation
 ///
-/// Metal 不需要显式的 Instance 对象，这里主要用于设备枚举
+/// Metal has no explicit Instance object, mainly for device enumeration
 const std = @import("std");
 const gpu = @import("../gpu.zig");
 const mtl = @import("metal_bindings.zig");
@@ -17,16 +17,16 @@ pub const Instance = struct {
     }
 
     pub fn enumerateAdapters(self: *Instance) ![]Adapter {
-        // 使用 autorelease pool 防止内存峰值
+        // Use autorelease pool to prevent memory spikes
         var pool = mtl.AutoreleasePool.init();
         defer pool.deinit();
 
-        // 首先查询设备数量
+        // First query device count
         var count: usize = 0;
         _ = mtl.metal_copy_all_devices(&count, null, 0);
 
         if (count == 0) {
-            // 如果没有设备，尝试获取系统默认设备
+            // If no devices, try to get system default device
             const default_device = mtl.createSystemDefaultDevice() orelse {
                 return error.NoMetalDevices;
             };
@@ -38,12 +38,12 @@ pub const Instance = struct {
             return adapters;
         }
 
-        // 分配设备指针数组
+        // Allocate device pointer array
         const devices = try self.allocator.alloc(?*anyopaque, count);
         defer self.allocator.free(devices);
 
-        // 获取所有设备。两次调用间设备数可能变化（热插拔 eGPU/唤醒独显）：
-        // 桥按 capacity 钳写入，这里只信"实际写入数"，不信第一次的 count
+        // Get all devices. Count may change between calls (hot-swap eGPU/wake discrete GPU):
+        // bridge clamps writes by capacity, trust actual count not first query's count
         var total: usize = 0;
         const written = mtl.metal_copy_all_devices(&total, devices.ptr, devices.len);
         if (written == 0) return error.NoMetalDevices;
@@ -52,7 +52,7 @@ pub const Instance = struct {
 
         for (0..written) |i| {
             const device: *mtl.MTLDevice = @ptrCast(devices[i].?);
-            // 注意: metal_copy_all_devices 已经 retained，不需要再次 retain
+            // Note: metal_copy_all_devices already retained, no need to retain again
             adapters[i] = Adapter{
                 .device = device,
             };

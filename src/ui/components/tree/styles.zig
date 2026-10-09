@@ -1,6 +1,6 @@
-/// Tree，样式层
+/// Tree, style layer
 ///
-/// 具名样式函数；业务逻辑/State/事件处理在 mod.zig。
+/// Named style functions; business logic / State / event handling in mod.zig.
 const core = @import("../../core.zig");
 const theme = core.theme;
 const Color = core.Color;
@@ -25,9 +25,9 @@ pub fn treeRowStyle(_: *const theme.ThemeTokens) core.BoxStyle {
     };
 }
 
-/// 选中行背景，由 applySelectionStyles 运行时驱动
+/// Selected row background, driven at runtime by applySelectionStyles
 pub fn treeSelectionBg(t: *const theme.ThemeTokens) Color {
-    return t.color.list_selection_bg;
+    return t.tokens.color.list_selection_bg;
 }
 
 pub fn treeIndicatorBoxStyle(_: *const theme.ThemeTokens) core.BoxStyle {
@@ -39,18 +39,16 @@ pub fn treeIndicatorBoxStyle(_: *const theme.ThemeTokens) core.BoxStyle {
     };
 }
 
-// iconTint 的 style 参数是 core.Style（非 BoxStyle），返回类型跟随
-pub fn treeExpandIconStyle(_: *const theme.ThemeTokens) core.Style {
+pub fn treeExpandIconStyle(_: *const theme.ThemeTokens) core.BoxStyle {
     return .{
         .width = .{ .px = 10 },
         .height = .{ .px = 10 },
     };
 }
 
-pub fn treeIndicatorTextStyle(t: *const theme.ThemeTokens) core.TextProps {
+pub fn treeIndicatorTextStyle(t: *const theme.ThemeTokens) core.TextStyle {
     return .{
-        .content = "",
-        .color = t.color.fg_secondary,
+        .color = t.tokens.color.fg_secondary,
         .font_size = 8,
     };
 }
@@ -63,10 +61,9 @@ pub fn treeLabelBoxStyle(_: *const theme.ThemeTokens) core.BoxStyle {
     };
 }
 
-pub fn treeLabelTextStyle(disabled: bool, t: *const theme.ThemeTokens) core.TextProps {
+pub fn treeLabelTextStyle(disabled: bool, t: *const theme.ThemeTokens) core.TextStyle {
     return .{
-        .content = "",
-        .color = if (disabled) t.color.fg_disabled else t.color.fg_primary,
-        .font_size = t.font_size.sm,
+        .color = if (disabled) t.tokens.color.fg_disabled else t.tokens.color.fg_primary,
+        .font_size = t.tokens.font_size.sm,
     };
 }

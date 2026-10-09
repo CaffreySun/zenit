@@ -4,6 +4,7 @@
 //! shared by command encoding and the public render facade.
 
 const std = @import("std");
+const gpu = @import("gpu");
 
 /// sRGB byte (0..255) to linear float, precomputed at comptime.
 ///
@@ -26,17 +27,29 @@ pub inline fn srgbByteToLinear(v: u8) f32 {
     return srgb_to_linear_table[v];
 }
 
-/// Packed sRGB bytes to linear RGBA floats.
+/// Color bytes -> shader value. Blending done in sRGB encoded space (render target is non-_sRGB
+/// format, consistent with AppKit,
+/// see docs/SRGB_BLENDING_PLAN.md), so shader receives encoded values as-is, no linearization.
+/// This is the sole entry point for CPU color into GPU; shaders needing linear light compute must
+/// linearize explicitly.
+pub fn byteToShader(v: u8) f32 {
+    // All backends blend in sRGB encoded space (see gpu.color_format / shader_colors_encoded);
+    // linear path kept only for shader_colors_encoded = false configurations.
+    if (comptime !gpu.shader_colors_encoded) return srgbByteToLinear(v);
+    return @as(f32, @floatFromInt(v)) / 255.0;
+}
+
+/// Packed sRGB bytes to shader RGBA floats (sRGB-encoded, see byteToShader).
 pub fn toFloat4(c: anytype) [4]f32 {
     return .{
-        srgbByteToLinear(c.r),
-        srgbByteToLinear(c.g),
-        srgbByteToLinear(c.b),
+        byteToShader(c.r),
+        byteToShader(c.g),
+        byteToShader(c.b),
         @as(f32, @floatFromInt(c.a)) / 255.0,
     };
 }
 
-/// Packed sRGB bytes to the text renderer's linear color type.
+/// Packed sRGB bytes to the text renderer's color type (sRGB-encoded).
 pub fn toRenderColor(c: anytype) @import("text_renderer.zig").Color {
     const rgba = toFloat4(c);
     return .{ .r = rgba[0], .g = rgba[1], .b = rgba[2], .a = rgba[3] };
@@ -94,11 +107,13 @@ test "srgbToLinear endpoints and out-of-range inputs stay well defined" {
     try testing.expectEqual(srgbToLinearExact(1.5), srgbToLinear(1.5));
 }
 
-test "toFloat4 converts rgb through the table and alpha linearly" {
+test "toFloat4 passes sRGB-encoded channels straight through (blend in encoded space)" {
     const c = .{ .r = @as(u8, 255), .g = @as(u8, 0), .b = @as(u8, 128), .a = @as(u8, 64) };
     const f = toFloat4(c);
-    try testing.expectEqual(srgbToLinearExact(1.0), f[0]);
+    try testing.expectEqual(@as(f32, 1.0), f[0]);
     try testing.expectEqual(@as(f32, 0.0), f[1]);
-    try testing.expectEqual(srgbToLinearExact(128.0 / 255.0), f[2]);
+    // Encoded value into shader as-is: 128 not linearized (linearized = 0.2158, blending
+    // brighter—AppKit reads 128)
+    try testing.expectApproxEqAbs(@as(f32, 128.0 / 255.0), f[2], 1e-6);
     try testing.expectApproxEqAbs(@as(f32, 64.0 / 255.0), f[3], 1e-6);
 }

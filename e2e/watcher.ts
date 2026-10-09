@@ -1,10 +1,10 @@
 /**
- * e2e/watcher.ts, HMR 体验薄壳：监听 .zig 变更 -> 重跑 scenario -> 自动验收报告
+ * e2e/watcher.ts: HMR experience thin shell - watches .zig changes -> reruns scenario -> auto-validates report
  *
- * 这是「保存即自动验收」的最后一环，骑在 scenario_runner 之上，不另造执行逻辑。
+ * This is the final piece of "save = auto-validate" workflow; builds on scenario_runner without separate execution logic.
  *
- * 用法:
- *   bun e2e/watcher.ts                          # 监听 src,examples，跑全部 scenario
+ * Usage:
+ *   bun e2e/watcher.ts                          # watches src,examples; runs all scenarios
  *   ZENIT_SCENARIO=smoke.design-probe.json \
  *   ZENIT_WATCH_DIRS=src,examples \
  *   ZENIT_DEBOUNCE_MS=800 bun e2e/watcher.ts
@@ -15,7 +15,7 @@ import { spawn } from "node:child_process";
 import { join } from "node:path";
 
 const WATCH_DIRS = (process.env.ZENIT_WATCH_DIRS ?? "src,examples").split(",").map((s) => s.trim()).filter(Boolean);
-const SCENARIO = process.env.ZENIT_SCENARIO; // 可选：只跑这一个
+const SCENARIO = process.env.ZENIT_SCENARIO; // Optional: run only this scenario
 const DEBOUNCE_MS = Number(process.env.ZENIT_DEBOUNCE_MS ?? 800);
 const SCENARIOS_DIR = process.env.ZENIT_SCENARIOS_DIR ?? "e2e/scenarios";
 

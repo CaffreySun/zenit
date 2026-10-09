@@ -1,10 +1,10 @@
-/// 效果/裁剪桥接层：将 PropertyTree 中的 effect/clip 节点翻译为 DisplayItem 字面 token
+/// Effect/clip bridge: translate effect/clip nodes in PropertyTree to DisplayItem literal tokens.
 ///
-/// 负责（R3f 后唯一活路径，Display 端）：
-/// - Layer Bridge: begin/end_opacity_layer / begin/end_blur_layer / begin/end_rounded_clip
-///   DisplayItem token emit
-/// - Clip Bridge: push_clip / pop_clip DisplayItem token emit
-/// - Effect Chain: 沿 effect_id 链展开成线性 token 序列 (appendDisplayEffectBridge*)
+/// Responsible for (Display side):
+/// - Layer Bridge: begin/end_opacity_layer / blur_layer / rounded_clip tokens
+/// - Clip Bridge: push_clip / pop_clip tokens
+/// - Effect Chain: expand along the effect_id chain into a linear token sequence
+///   (appendDisplayEffectBridge*)
 const std = @import("std");
 const display_list_mod = @import("../display_list.zig");
 const layer_tree_mod = @import("../layer_tree.zig");
@@ -24,20 +24,16 @@ const EffectBridgeEntry = node_state.EffectBridgeEntry;
 const INVALID_ID = property_tree_mod.INVALID_ID;
 const ItemHeader = display_list_mod.ItemHeader;
 
-/// Effect/clip token 的 header，这些 token 不绑定到具体 paint node，header 占位用
-/// INVALID transform_id (encoder 不用 transform 二次变换 effect/clip，字段已 lower)。
+/// Effect/clip token header: these tokens not bound to concrete paint node, header placeholder.
+/// INVALID transform_id (encoder does not secondary-transform effect/clip; field lowered).
 const CONTROL_HEADER: ItemHeader = .{ .transform_id = INVALID_ID, .node_id = std.math.maxInt(u32) };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 底层：Layer Bridge（begin/end）
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// GPU retained 的身份键。
+/// GPU retained identity key.
 ///
-/// **只有真正被提升为独立 surface 的 layer 才有资格**：`stable_id` 本身对每个
-/// plan layer 都会赋值（含没被提升的），拿它当 retained 身份会让一批只是"路过"
-/// 的层去认领专属纹理，它们的内容依赖外层上下文，跨帧复用不成立。
-/// 不合格时返回 INVALID_SURFACE_ID，encoder 走每帧重画的安全老路。
+/// Only layers truly promoted to independent surface qualify: stable_id assigned to each plan layer
+/// (including unpromoted); using it as retained identity lets pass-through layers claim dedicated
+/// texture, but their content depends on outer context, cross-frame reuse fails. Unqualified
+/// returns INVALID_SURFACE_ID; encoder falls back to safe full-repaint each frame.
 fn retainedSurfaceId(layer: layer_tree_mod.CompositedLayer) u32 {
     if (!layer.promotion_reason.any()) return display_list_mod.INVALID_SURFACE_ID;
     if (layer.stable_id == INVALID_ID) return display_list_mod.INVALID_SURFACE_ID;
@@ -49,17 +45,17 @@ pub fn appendLayerBridgeBeginFromPlanState(cx: *RenderContext, effect_state: lay
     const layer = effect_state.layer orelse return false;
     const bounds = effect_state.begin_bounds orelse return false;
 
-    // surface transform 情形：用 Plan 预计算的 source/draw bounds 替代 world bounds
+    // Surface transform case: use Plan's precomputed source/draw bounds instead of world bounds.
     const src = if (layer.has_surface_transform) layer.surface_source_bounds else bounds;
     const draw = if (layer.has_surface_transform) layer.surface_draw_bounds else bounds;
-    if (std.posix.getenv("ZENIT_DEBUG_LAYER") != null and layer.root_node_id == 440) {
+    if (@import("zenit_environment").has("ZENIT_DEBUG_LAYER") and layer.root_node_id == 440) {
         std.debug.print("[layer_begin] node=440 kind={s} effect_id={d} src=({d:.1},{d:.1},{d:.1},{d:.1}) draw=({d:.1},{d:.1},{d:.1},{d:.1}) cr={d:.1}\n", .{
             @tagName(layer.effect_kind),                                                                                      layer.effect_id, src.x, src.y, src.w, src.h, draw.x, draw.y, draw.w, draw.h,
             @max(@max(layer.corner_radius[0], layer.corner_radius[1]), @max(layer.corner_radius[2], layer.corner_radius[3])),
         });
     }
-    // rounded-clip 折叠（Stage 3）：opacity/composited_group effect 携带的
-    // corner_radius 由 composite blit 施加（同 begin_blur_layer 的单 radius 现状）。
+    // Rounded-clip fold (Stage 3): corner_radius from opacity/composited_group effect applied by
+    // composite blit (same as current begin_blur_layer single radius).
     const fold_radius = @max(
         @max(layer.corner_radius[0], layer.corner_radius[1]),
         @max(layer.corner_radius[2], layer.corner_radius[3]),
@@ -84,6 +80,7 @@ pub fn appendLayerBridgeBeginFromPlanState(cx: *RenderContext, effect_state: lay
                     .draw_w = draw.w,
                     .draw_h = draw.h,
                     .blend_mode = layer.blend_mode,
+                    .warp = .{ layer.warp.cap, layer.warp.edge, layer.warp.fade_start, layer.warp.fade_width },
                     .surface_stable_id = retainedSurfaceId(layer),
                     .surface_content_version = layer.content_version,
                 },
@@ -108,6 +105,7 @@ pub fn appendLayerBridgeBeginFromPlanState(cx: *RenderContext, effect_state: lay
                     .draw_w = draw.w,
                     .draw_h = draw.h,
                     .blend_mode = layer.blend_mode,
+                    .warp = .{ layer.warp.cap, layer.warp.edge, layer.warp.fade_start, layer.warp.fade_width },
                     .surface_stable_id = retainedSurfaceId(layer),
                     .surface_content_version = layer.content_version,
                 },
@@ -122,6 +120,7 @@ pub fn appendLayerBridgeBeginFromPlanState(cx: *RenderContext, effect_state: lay
                 .w = src.w,
                 .h = src.h,
                 .corner_radius = @max(@max(layer.corner_radius[0], layer.corner_radius[1]), @max(layer.corner_radius[2], layer.corner_radius[3])),
+                .corner_radii = layer.corner_radius,
                 .glass = layer.glass,
                 .rotate = layer.surface_rotate,
                 .use_draw_transform = layer.has_surface_transform,
@@ -179,19 +178,19 @@ pub fn appendRectClipBridgeBeginFromPlanState(
     fallback_shape_kind: display_list_mod.ClipShapeKind,
     fallback_polygon: display_list_mod.ClipPolygon,
     use_fallback: bool,
-    /// true = push_clip 落在该 effect 的 surface **内部**（begin layer 之后），
-    /// 需投影到 surface content 帧；false = 落在父上下文（blur 的 clip 在
-    /// begin_blur_layer 之前），投影到父 surface 的内容坐标。
+    /// true = push_clip falls **inside** effect's surface (after begin layer), needs projection to
+    /// surface content frame; false = falls in parent context (blur's clip before
+    /// begin_blur_layer), project to parent surface content coordinates.
     inside_surface: bool,
 ) !bool {
     if (effect_state.apply_clip_bounds) |clip_bounds_raw| {
-        // apply_clip 的 AABB 是 world 坐标，但 surface 内 content 在
-        // owner-unscaled-local 帧（layer_tree CA-pure：owner_world⁻¹ 投影；
-        // effect 无 transform 时 owner_world=identity，local 即 world）。
-        // 必须用属性树的 owner_world⁻¹ 把 clip（draw_transform 已是父 surface 坐标）
-        // 投到 content 帧，否则带 rotate 的 surface 里世界坐标 scissor 会把内容
-        // 整个裁空（例：settle 后 rotate=90° 的 accordion chevron 消失）。
-        // 旋转下取 AABB 是过覆盖近似，越出部分由 composite 时父级同一 clip 兜住。
+        // apply_clip AABB is world coordinates, but surface content lower in owner-unscaled-local
+        // frame (layer_tree CA-pure: owner_world^-1 projection; effect without transform:
+        // owner_world=identity, local is world). Must use property tree's owner_world^-1 to project
+        // clip (draw_transform already parent surface coordinates) to content frame; else rotated
+        // surface gets world scissor pushing content fully offscreen (e.g., settle+90-degree
+        // rotated accordion chevron vanishes). AABB under rotation is covering approximation;
+        // overflow clipped by parent-level same clip during composite.
         const clip_bounds = blk: {
             if (effect_state.layer) |layer| {
                 if (inside_surface and layer.has_surface_transform and layer.transform_id < cx.property_tree.transforms.items.len) {
@@ -247,10 +246,10 @@ pub fn collectEffectBridgeChain(
     var count: usize = 0;
     var current = effect_id;
     while (current != parent_effect_id and current != INVALID_ID and count < entries.len) {
-        // 防御：缓存 splice 的 item header 可能携带**过期**的 effect_id（写缓存帧的
-        // property tree 索引，本帧 effect 列表收缩后越界）。正常路径由
-        // canReusePromotedCommands 的 effect_id 比对拦截 stale 替放；此处兜底
-        // 防 panic，越界即终止链（该 item 按无 effect 处理）。
+        // Defense: cached splice item header may carry stale effect_id (property tree index from
+        // cache write frame; effect list shrinks this frame, overwrites). Normal path blocks stale
+        // via canReusePromotedCommands effect_id check; here bottleneck prevents panic, boundary
+        // terminates chain (item treated as effect-free).
         if (current >= cx.property_tree.effects.items.len) break;
         entries[count] = .{
             .effect_id = current,
@@ -263,17 +262,13 @@ pub fn collectEffectBridgeChain(
     return count;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 高层：Display Effect Bridge（DisplayList 回放时用）
-// ─────────────────────────────────────────────────────────────────────────────
-
 pub const DisplayEffectBridgeScope = struct {
     entry: EffectBridgeEntry,
     clip_active: bool,
-    /// Begin 是否真的发射了 layer token。End 必须按这个位配对，而不是
-    /// 重新推导条件：Begin 有 `draw_opacity == null` 等只在自己一侧成立的
-    /// 早退（bridge 完整但仍无操作），重推导会让 End 对没 begin 过的层发
-    /// end token，靠编码器空栈守卫兜底没崩，但 token 流已不配平。
+    /// Begin actually emitted layer token. End must pair per this, not re-derive condition: Begin
+    /// has draw_opacity==null early exits only on its side (bridge complete but no action);
+    /// re-derive makes End emit for non-begun layer, encoder's empty-stack guard prevents crash but
+    /// token stream unbalanced.
     layer_emitted: bool = false,
 };
 
@@ -290,8 +285,8 @@ pub fn appendDisplayEffectBridgeBeginEntry(
         .clip_active = false,
     };
     const clip_before_layer = entry.effect.kind == .backdrop_blur;
-    // 统一走 CompositorPlan：Plan 已在 buildFromPropertyTree 预计算所有参数，
-    // 包括 surface transform 情形的 source/draw bounds 和 draw_transform。
+    // Unified via CompositorPlan: Plan precomputes all params in buildFromPropertyTree, including
+    // surface transform case source/draw bounds and draw_transform.
     if (clip_before_layer and entry.state.hasPlanClipBridge()) {
         scope.clip_active = try appendRectClipBridgeBeginFromPlanState(
             cx,
@@ -301,7 +296,7 @@ pub fn appendDisplayEffectBridgeBeginEntry(
             .rect,
             display_list_mod.ClipPolygon.empty(),
             false,
-            false, // begin layer 之前 → 父上下文，world 坐标
+            false, // before begin layer -> parent context, world coordinates.
         );
     }
     if (try appendLayerBridgeBeginFromPlanState(cx, entry.state)) {
@@ -315,12 +310,13 @@ pub fn appendDisplayEffectBridgeBeginEntry(
                 .rect,
                 display_list_mod.ClipPolygon.empty(),
                 false,
-                true, // begin layer 之后 → surface content 帧
+                true, // after begin layer -> surface content frame.
             );
         }
         return scope;
     }
-    // Plan 未覆盖此 effect（requires_offscreen=false 或分配失败），退化为无操作。
+    // Plan did not cover this effect (requires_offscreen=false or allocation failed), degrade to
+    // no-op.
     return scope;
 }
 
@@ -352,20 +348,20 @@ pub fn appendDisplayEffectBridgeEnd(cx: *RenderContext, scopes: []const DisplayE
     while (remaining > 0) {
         remaining -= 1;
         const scope = scopes[remaining];
-        // backdrop_blur 的嵌套顺序刻意"颠倒"：begin 是 push_clip ->
-        // begin_blur_layer，end 却先 pop_clip 再 end_blur_layer。这只因为
-        // end_blur_layer 在编码器里是 no-op（blur 合成全部发生在 begin，
-        // 且发生在 clip 作用域内）才是安全的，若哪天给 end_blur_layer
-        // 加真实工作，必须改成按 clip_before_layer 分支还原真嵌套。
+        // backdrop_blur nesting order intentionally 'reversed': begin is push_clip ->
+        // begin_blur_layer, end is pop_clip first then end_blur_layer. Safe only because
+        // end_blur_layer is no-op in encoder (blur composite all happens in begin, within clip
+        // scope); if end_blur_layer gains real work, must restore true nesting per
+        // clip_before_layer branch.
         if (scope.clip_active) {
             try appendRectClipBridgeEnd(cx, true);
         }
-        if (!scope.layer_emitted) continue; // Begin 无操作 ⇒ End 同样无操作
+        if (!scope.layer_emitted) continue; // Begin no-op => End same no-op.
         if (try appendLayerBridgeEndFromPlanState(cx, scope.entry.state)) {
             continue;
         }
-        // bridge 在 begin/end 之间失效（防御性兜底，理论不可达）：
-        // 用裸 token 闭合，宁可多发也不留未闭合层
+        // Bridge failed between begin/end (defensive fallback, theoretically unreachable): emit raw
+        // tokens, prefer double-emitting to leaving layer unclosed.
         switch (scope.entry.effect.kind) {
             .opacity, .composited_group => try display_list_lowering.appendLoweredBoth(cx, .{ .end_opacity_layer = .{ .header = CONTROL_HEADER } }),
             .backdrop_blur => try display_list_lowering.appendLoweredBoth(cx, .{ .end_blur_layer = .{ .header = CONTROL_HEADER } }),
@@ -374,9 +370,9 @@ pub fn appendDisplayEffectBridgeEnd(cx: *RenderContext, scopes: []const DisplayE
     }
 }
 
-/// 收集 clip 链（innermost-first），供调用方做跨组公共前缀比较。
-/// 与 `collectEffectBridgeChain` 对偶，effect 侧早已按前缀保留 scope，
-/// clip 侧此前每组整链 close+reopen（见 display_list_lowering 的循环注释）。
+/// Collect clip chain (innermost-first) for caller's cross-group common prefix comparison. Dual to
+/// collectEffectBridgeChain; effect side already keeps scope per prefix, clip side previously
+/// close+reopen each group (see display_list_lowering loop comment).
 pub fn collectDisplayClipChainPublic(cx: *RenderContext, clip_id: u32, out: *[8]u32) usize {
     return collectDisplayClipChain(cx, clip_id, out);
 }
@@ -397,25 +393,21 @@ pub fn appendDisplayClipBridgeBegin(cx: *RenderContext, clip_id: u32, active_par
     return appendDisplayClipBridgeBeginFiltered(cx, clip_id, active_parent_effect_id, false);
 }
 
-/// only_scroll=true 时仅发射来自 scroll 容器的 clip(effect 内部场景,
-/// 玻璃岛内虚拟列表的行溢出必须裁,而 Input 等小 clip 的 effect-内投影
-/// 尚有坐标问题,先维持旧行为不发)。
+/// only_scroll=true emits only clips from scroll containers (effect-internal scenario: glass island
+/// virtual list row overflow must clip; Input etc small clips' effect-internal projection still has
+/// coordinate issues, maintain old behavior for now).
 pub fn appendDisplayClipBridgeBeginFiltered(cx: *RenderContext, clip_id: u32, active_parent_effect_id: u32, only_scroll: bool) !usize {
     return appendDisplayClipBridgeBeginSuffix(cx, clip_id, active_parent_effect_id, only_scroll, 0);
 }
 
-/// `skip_outer` = 已经由上一组打开、本组要**继续沿用**的最外层 clip 个数。
-///
-/// 为什么需要它：lowering 主循环按 `(effect_id, clip_id)` 分组，而虚拟列表
-/// 里每一行都有自己的 clip_id。旧实现每组把**整条祖先链**重发一遍，于是
-/// 岛的圆角 clip（所有行共享的最外层）被逐行 push/pop，实测 git diff
-/// 滚动一次就有 15 万次 `null -> rounded(1106) -> null` 往返。每次往返
-/// `syncClipStateAfterMutation` 都要 `flushAllPending`（清空全部 pipeline
-/// 并吃掉一个 SDF uniform 槽），256 槽在一帧内耗尽，encode 涨到 10-17ms。
-///
-/// effect 侧 2026-08-02 已经修过同一个形状的 bug（见 lowering 循环里的
-/// scope 前缀注释）；clip 侧当时没跟上。这里补齐：公共前缀跨组保持打开，
-/// 只发射差异部分。
+/// skip_outer = outermost clip count already opened by previous group, this group continues to use.
+/// Why needed: lowering main loop groups by (effect_id, clip_id), each virtual list row has own
+/// clip_id. Old impl re-emitted entire ancestor chain per group; measured: island rounded_clip (all
+/// rows shared outer layer) push/pop per row logged 150k swaps of null->rounded(1106)->null. Each
+/// swap calls syncClipStateAfterMutation flushAllPending (drain pipeline, eat SDF uniform slot),
+/// 256 slots exhausted per frame, encode balloons to 10-17ms. Effect side fixed same shape bug
+/// 2026-08-02 (see lowering loop scope prefix comment); clip side missed the sync. Now closed: hold
+/// common prefix across groups, emit only diff.
 pub fn appendDisplayClipBridgeBeginSuffix(
     cx: *RenderContext,
     clip_id: u32,
@@ -424,12 +416,12 @@ pub fn appendDisplayClipBridgeBeginSuffix(
     skip_outer: usize,
 ) !usize {
     if (clip_id == INVALID_ID or clip_id >= cx.property_tree.clips.items.len) return 0;
-    // CA-pure（P6 后）：surface 内容以 **owner-local（unscaled）** 帧 lower，encoder 的
-    // offscreenOffset = -(surface_source_bounds.origin)（src 亦为 owner-local 帧）。因此
-    // surface 内的 push_clip 同样必须转到 owner-local：active_parent_inverse.transformRect
-    // (world_aabb) + encoder 偏移 = 正确 texture 位置。早先"surface 内直接传 world_aabb"
-    // 是早先的世界坐标模型假设，CA-pure 下会把 clip 推错位置 -> 面板圆角/边界裁剪
-    // 失效（menu item hover 背景溢出 wrapper 边缘）。
+    // CA-pure (P6+): surface content lower in **owner-local (unscaled)** frame; encoder
+    // offscreenOffset = -(surface_source_bounds.origin) (src also owner-local). Thus push_clip
+    // inside surface also convert to owner-local: active_parent_inverse.transformRect(world_aabb) +
+    // encoder offset = correct texture position. Old 'surface directly pass world_aabb' assumed
+    // world-coordinate model; under CA-pure clips positioned wrong -> panel rounded_clip/boundary
+    // clip fails (menu item hover background overflows wrapper edge).
     const active_parent_inverse = blk: {
         if (active_parent_effect_id == INVALID_ID or active_parent_effect_id >= cx.property_tree.effects.items.len) {
             break :blk Transform2D.identity();
@@ -443,8 +435,8 @@ pub fn appendDisplayClipBridgeBeginSuffix(
     if (count == 0) return 0;
 
     var emitted: usize = 0;
-    // chain 是 innermost-first；outermost 在 chain[count-1]。跳过已由上一组
-    // 打开的 `skip_outer` 个最外层，从第一个真正需要新开的那层开始发。
+    // Chain is innermost-first; outermost in chain[count-1]. Skip skip_outer outermost layers
+    // already opened by previous group; start from first layer truly needing new open.
     var i = count - @min(skip_outer, count);
     while (i > 0) {
         i -= 1;
@@ -458,9 +450,10 @@ pub fn appendDisplayClipBridgeBeginSuffix(
             active_parent_inverse.mul(cx.property_tree.transforms.items[clip.transform_id].world).extractApproxScale()
         else
             1.0;
-        // polygon 点集是 clip-rect-origin-relative（clip.zig buildClipPolygonFromPathGeometry
-        // 减掉了 rect 原点），随 rect 投影自然平移；但 rect 被 clip_scale 缩放时点集
-        // 必须同步缩放，否则形状与 rect 比例失配（与上面 radius * clip_scale 同理）。
+        // Polygon point set is clip-rect-origin-relative (clip.zig buildClipPolygonFromPathGeometry
+        // subtracts rect origin), naturally translates per rect projection; but when rect is
+        // clip_scale-scaled, point set must scale likewise, else shape/rect aspect mismatches (same
+        // logic as above radius * clip_scale).
         var polygon = clip.polygon;
         if (@abs(clip_scale - 1.0) > 0.0001) {
             for (polygon.points[0..polygon.point_count]) |*p| {

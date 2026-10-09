@@ -1,18 +1,17 @@
-//! PaintTable + PaintChunk, Phase 3 拆 Node 的渲染产物
+//! PaintTable + PaintChunk: retained rendering artifacts split out of Node.
 //!
-//! 每 element 持一个 PaintChunk：
-//!   - display_items[]：高层语义绘制项（rect / text / image / path / shadow）
-//!   - property_state_ref：(transform_id, clip_id, effect_id, scroll_id) 四元 u32 引用 PropertyTree
-//!   - bounds：world-space AABB（用于 culling / hit broad-phase）
-//!   - content_hash：内容稳定 hash，重新生成时若 hash 命中则跳过录制，复用上帧 display_items
+//! Each element holds one PaintChunk:
+//!   - display_items[]: high-level semantic paint items (rect / text / image / path / shadow)
+//!   - property_state_ref: (transform_id, clip_id, effect_id, scroll_id) u32 refs into PropertyTree
+//!   - bounds: world-space AABB (for culling / hit broad-phase)
+//!   - content_hash: content-stable hash; on hit, skip recording and reuse previous display_items
 //!
-//! 历史债避免（吸取 zenit 现状中 "Node.cached_commands" 是唯一保留态、
-//! 而 display_items 每帧重建 的问题）：
-//! - chunk 自身跨帧保留；只在 content_hash mismatch 时才重生
-//! - 不持有 GPU 资源；那些去 ResourcePool。chunk 只是 CPU 侧 IR
-//! - paint_epoch 与 layout_epoch 解耦：颜色变化 paint_epoch++，layout_epoch 不变
+//! Design:
+//! - chunk is retained across frames; regenerated only on content_hash mismatch
+//! - no GPU resources held (those go to ResourcePool); chunk is CPU-side IR only
+//! - paint_epoch and layout_epoch are decoupled: color change bumps paint_epoch only
 //!
-//! Phase 4 layer tree 接入后，layer 按 chunk 分组并跟踪 damage rect。
+//! Layers group by chunk and track damage rect.
 
 const std = @import("std");
 const testing = std.testing;
@@ -23,8 +22,8 @@ const icon_ir = @import("icon_ir");
 
 pub const ElementId = element_id_mod.ElementId;
 
-/// Property tree 引用：四个 u32 索引 PropertyTree 的 4 棵树。
-/// INVALID_ID = 该轴无引用（继承父）。
+/// Property tree references: four u32 indices into 4 PropertyTree trees.
+/// INVALID_ID = no reference on this axis (inherit from parent).
 pub const PropertyStateRef = packed struct(u128) {
     transform_id: u32 = std.math.maxInt(u32),
     clip_id: u32 = std.math.maxInt(u32),
@@ -34,7 +33,7 @@ pub const PropertyStateRef = packed struct(u128) {
     pub const NONE: PropertyStateRef = .{};
 };
 
-/// World-space bounds（postransformed AABB）
+/// World-space bounds (post-transformed AABB)
 pub const Bounds = struct {
     min_x: f32 = 0,
     min_y: f32 = 0,
@@ -59,28 +58,29 @@ pub const Bounds = struct {
     }
 };
 
-/// 高层 display item 类别。当前先列基本几种；后续 paint pass 切换时按需加。
+/// High-level display item category. Currently lists basic types; add more as needed during paint
+/// pass transitions.
 pub const DisplayItemKind = enum(u8) {
-    /// 占位（用于 chunk 创建时）
+    /// Placeholder (for chunk creation)
     none,
-    /// 实色矩形（含圆角）
+    /// Solid rect (with corner radius)
     rect,
-    /// 文本 run
+    /// Text run
     text,
-    /// 图片 / SVG icon
+    /// Image / SVG icon
     image,
-    /// 路径填充
+    /// Path fill
     path,
-    /// 阴影
+    /// Shadow
     shadow,
-    /// 渐变填充
+    /// Gradient fill
     gradient,
     /// effect/clip control token (begin/end_opacity/blur/rounded_clip + push/pop_clip)
     control,
 };
 
-/// Control sub-kind (B-7-C): 当 DisplayItemKind == .control 时区分 8 种 token。
-/// .none 用于非 control item (paint kind)。
+/// Control sub-kind (B-7-C): distinguishes 8 token types when DisplayItemKind == .control.
+/// .none for non-control items (paint kind).
 pub const ControlKind = enum(u8) {
     none = 0,
     push_clip = 1,
@@ -93,8 +93,8 @@ pub const ControlKind = enum(u8) {
     end_rounded_clip = 8,
 };
 
-/// fill_rect kind 的几何 payload (x,y,w,h packed)。32-bit f16 quantized 节省空间，
-/// 但当前先用 f32 简单清晰；后续真接管 batch 时再 quantize。
+/// fill_rect kind geometric payload (x,y,w,h packed). 32-bit f16 quantized saves space, but
+/// currently use f32 for simplicity; quantize later when truly managing batch.
 pub const RectGeom = struct {
     x: f32 = 0,
     y: f32 = 0,
@@ -109,8 +109,8 @@ pub const CornerRadii = struct {
     br: f32 = 0,
     bl: f32 = 0,
 
-    /// 转 [4]f32 顺序 TL/TR/BR/BL, sdf_renderer.addRoundedRect 直消费的格式。
-    /// 让 encoder 切到 paint_table 时无需转换。
+    /// Convert to [4]f32 order TL/TR/BR/BL, format directly consumed by
+    /// sdf_renderer.addRoundedRect. No conversion needed when encoder switches to paint_table.
     pub fn toArray(self: CornerRadii) [4]f32 {
         return .{ self.tl, self.tr, self.br, self.bl };
     }
@@ -120,15 +120,15 @@ pub const CornerRadii = struct {
     }
 };
 
-/// RGBA8 packed color (与 types.Color 同 layout 但本模块不依赖 types)
+/// RGBA8 packed color (same layout as types.Color but module doesn't depend on types)
 pub const RGBA = packed struct(u32) {
     r: u8 = 0,
     g: u8 = 0,
     b: u8 = 0,
     a: u8 = 0,
 
-    /// 转 GPU shader 用的 normalized [4]f32 (linear RGB convention)。
-    /// 让 encoder 切到 paint_table 时直接喂 sdf_renderer。
+    /// Convert to normalized [4]f32 for GPU shader (linear RGB convention). Direct to sdf_renderer
+    /// when encoder switches to paint_table.
     pub fn toFloat4(self: RGBA) [4]f32 {
         const inv: f32 = 1.0 / 255.0;
         return .{
@@ -139,119 +139,119 @@ pub const RGBA = packed struct(u32) {
         };
     }
 
-    /// 转 types.Color (相同 r/g/b/a u8 字段，字段顺序一致 -> bitcast 等价但显式
-    /// 字段拷贝更清晰，便于 caller 用 Color.eql/Color.rgba 等 API)。tests fixture 用。
+    /// Convert to types.Color (same r/g/b/a u8 fields, consistent order -> bitcast equivalent but
+    /// explicit field copy clearer, lets caller use Color.eql/Color.rgba etc APIs). For tests
+    /// fixture.
     pub fn toColor(self: RGBA) types.Color {
         return .{ .r = self.r, .g = self.g, .b = self.b, .a = self.a };
     }
 };
 
-/// 高层 display item，绘制描述。
+/// High-level display item, draw description.
 ///
-/// v0.5 §5 GpuDraw epic B-4 起步: 旧 payload_a/b u64 placeholder 升级为
-/// 强类型字段 (geom + color + radii)，让 shadow 路径能真验证内容等价；
-/// 后续真接管时 paint_table.DisplayItem 直接喂 backend，不丢数据。
+/// Strongly-typed fields (geom + color + radii) let the shadow path verify content
+/// equivalence; the backend consumes DisplayItem directly with no data loss.
 ///
-/// B-5+ 扩展 kind-specific 字段:
-/// - stroke_rect: stroke_width (line 1)
-/// - shadow_rect: shadow_blur + shadow_offset_x/y (line 4-6)
+/// Kind-specific fields:
+/// - stroke_rect: stroke_width
+/// - shadow_rect: shadow_blur + shadow_offset_x/y
 /// - border_per_side: border_widths [4]f32
 /// - image_quad: image_opacity
 ///
-/// 后续阶段继续补 gradient (to_color/direction/extend_mode) / text (font_size/
-/// weight/italic/spans) / path / icon 等字段。
+/// Later stages add gradient (to_color/direction/extend_mode) / text
+/// (font_size/weight/italic/spans) / path / icon fields.
 pub const DisplayItem = struct {
     kind: DisplayItemKind,
-    /// 该 item 在 element 局部空间的 AABB（用于 chunk 内裁剪 / 部分重画）
+    /// Item's AABB in element local space (for intra-chunk clipping / partial repaint)
     local_bounds: Bounds = .{},
-    /// 资源句柄（texture / glyph atlas / path geometry buffer 等），u64 类型擦除。
-    /// Phase 4 接入 ResourcePool 时替换为强类型 ResourceHandle。
+    /// Resource handle (texture / glyph atlas / path geometry buffer etc), u64 type-erased. Phase 4
+    /// integration with ResourcePool replaces with strongly-typed ResourceHandle.
     resource_handle: u64 = 0,
-    /// 几何（rect kind 用 x/y/w/h；其它 kind 当前 0）
+    /// Geometry (rect kind uses x/y/w/h; other kinds currently 0)
     geom: RectGeom = .{},
-    /// 主色 (rect/stroke/shadow/text 用)
+    /// Primary color (rect/stroke/shadow/text)
     color: RGBA = .{},
-    /// 圆角半径 (rect/stroke 用)
+    /// Corner radius (rect/stroke)
     radii: CornerRadii = .{},
 
     // ── kind-specific extension fields (B-5+) ──
-    /// stroke / outline 线宽 (stroke_rect, outline_rect, border_side 用)
+    /// stroke / outline line width (stroke_rect, outline_rect, border_side)
     stroke_width: f32 = 0,
-    /// border_per_side: top/right/bottom/left 各边 width
+    /// border_per_side: top/right/bottom/left per-side widths
     border_widths: [4]f32 = .{ 0, 0, 0, 0 },
-    /// shadow_rect: 模糊半径
+    /// shadow_rect: blur radius
     shadow_blur: f32 = 0,
-    /// shadow_rect: 阴影偏移 x
+    /// shadow_rect: shadow offset x
     shadow_offset_x: f32 = 0,
-    /// shadow_rect: 阴影偏移 y
+    /// shadow_rect: shadow offset y
     shadow_offset_y: f32 = 0,
     /// shadow_rect: CSS spread
     shadow_spread: f32 = 0,
-    /// image_quad: 透明度 (0..1)
+    /// image_quad: opacity (0..1)
     image_opacity: f32 = 1,
-    // ── gradient_rect 专用 ──
-    /// gradient: 终点颜色 (color 字段是起点 from)
+    // -- gradient_rect only --
+    /// gradient: end color (color field is start from)
     gradient_to_color: RGBA = .{},
-    /// gradient: direction enum 表示 (与 types.GradientDirection 同顺序)。
+    /// gradient: direction enum representation (same order as types.GradientDirection).
     /// 0=horizontal 1=vertical 2=diagonal 3=radial 4=conic
     gradient_direction: u8 = 1,
-    /// gradient: extend mode (与 types.GradientExtendMode 同顺序)。
-    /// 0=pad 1=repeat 2=reflect
+    /// gradient: extend mode (same order as types.GradientExtendMode). 0=pad 1=repeat 2=reflect
     gradient_extend_mode: u8 = 0,
-    /// radial gradient: 中心 x 偏移 (相对几何中心，0..1 normalized)
+    /// radial gradient: center x offset (relative to geometry center, 0..1 normalized)
     gradient_radial_center_x: f32 = 0,
-    /// radial gradient: 中心 y 偏移 (相对几何中心，0..1 normalized)
+    /// radial gradient: center y offset (relative to geometry center, 0..1 normalized)
     gradient_radial_center_y: f32 = 0,
-    /// 径向椭圆半径（UV 单位；0.5 = 内切，旧行为）
+    /// radial ellipse radius (UV units; 0.5 = inscribed, old behavior)
     gradient_radial_radius_x: f32 = 0.5,
     gradient_radial_radius_y: f32 = 0.5,
-    /// conic gradient: 起始角度 (radians)
+    /// conic gradient: start angle (radians)
     gradient_conic_start_angle: f32 = 0,
-    // ── text_run 专用 ──
-    /// text 逻辑字号（不乘 scale）
+    // -- text_run only --
+    /// text logical font size (not multiplied by scale)
     text_font_size: f32 = 0,
-    /// text 字重 (400 = regular, 700 = bold)
+    /// text weight (400 = regular, 700 = bold)
     text_font_weight: u16 = 400,
-    /// text 字体族 id(render.FontRegistry)。0 = 默认族。
+    /// text font family id (render.FontRegistry). 0 = default family.
     text_font_family: u16 = 0,
     /// text font flags packed: bit 0 = italic, bit 1 = monospace, bit 2 = symbols
     text_font_flags: u8 = 0,
-    /// monospace 字符宽度 (0 = 非 monospace 或自动)
+    /// monospace character width (0 = non-monospace or auto)
     text_monospace_char_width: f32 = 0,
-    /// blob byte 范围 start (用于 sub-string render)
+    /// blob byte range start (for sub-string render)
     text_blob_byte_start: u32 = 0,
-    /// blob byte 范围 end (exclusive)
+    /// blob byte range end (exclusive)
     text_blob_byte_end: u32 = 0,
-    /// text_run.content (生命周期由 display_list / TextLayoutBlob 保证)
+    /// text_run.content (lifetime guaranteed by display_list / TextLayoutBlob)
     text_content: []const u8 = "",
-    /// text_run.spans (?[]const TextSpan), null 表示无 span 着色
+    /// text_run.spans (?[]const TextSpan), null means no span coloring
     text_spans: ?[]const types.TextSpan = null,
-    /// text_run.raster_policy 过线值（与 text_blob.TextRasterPolicy 一一对应）：
-    /// 0 = static_crisp (默认), 1 = animated_stable/direct_animated, 2 = surface_cached。
-    /// encoder 侧 exhaustive switch 消化，禁止折叠成布尔。
+    /// text_run.raster_policy wire value (one-to-one with text_blob.TextRasterPolicy): 0 =
+    /// static_crisp (default), 1 = animated_stable/direct_animated, 2 = surface_cached. The encoder
+    /// consumes it with an exhaustive switch; never collapse it into a boolean.
     text_raster_policy: u8 = 0,
-    /// text_run 右端淡出遮罩窗口（相对 geom.x 的偏移；0/0 = 关闭）
+    /// text_run right-edge fade-out mask window (offset relative to geom.x; 0/0 = disabled)
     text_fade_dx0: f32 = 0,
     text_fade_dx1: f32 = 0,
-    // ── noise_rect 专用 (B-7-B 第一刀: 推 paint_table 主路径覆盖 noise) ──
-    /// noise mode (0=cellular 1=fbm 2=value 等，与 types.NoiseMode 同顺序)
+    // -- noise_rect only (B-7-B first cut: push paint_table main path cover noise) --
+    /// noise mode (0=none 1=value 2=film_grain, same order as types.NoiseMode)
     noise_mode: u8 = 0,
-    /// noise scale (单位: pixels per cell)
+    /// noise scale (unit: pixels per cell)
     noise_scale: f32 = 0,
-    /// noise intensity (0..1)。dispatchCommand .rect arm 用 > 0 判别是否走 noise 路径，
-    /// 默认必须 0；非 noise_rect 的 .rect kind item 不能有非零 intensity (B-7 主路径切换 bug)
+    /// noise intensity (0..1). dispatchCommand .rect arm uses > 0 to detect noise path, default
+    /// must be 0; non-noise_rect .rect kind items can't have nonzero intensity (B-7 main-path
+    /// switch bug)
     noise_intensity: f32 = 0,
     /// noise PRNG seed
     noise_seed: u8 = 0,
-    // ── multi_gradient_rect 专用 (B-7-D) ──
-    /// 16 stop 颜色数组（与 display_list union 同 capacity）
-    mg_stop_colors: [16]RGBA = [_]RGBA{.{}} ** 16,
-    /// 16 stop 位置（0..1 normalized）
-    mg_stop_positions: [16]f32 = [_]f32{0} ** 16,
-    /// 实际 stop 数（≤16）
+    // -- multi_gradient_rect only (B-7-D) --
+    /// 16 stop color array (same capacity as display_list union)
+    mg_stop_colors: [16]RGBA = @as([16]RGBA, @splat(.{})),
+    /// 16 stop positions (0..1 normalized)
+    mg_stop_positions: [16]f32 = @as([16]f32, @splat(0)),
+    /// actual stop count (<=16)
     mg_stop_count: u8 = 0,
-    // ── icon_rep / fill_path / stroke_path 专用 (B-7-D) ──
-    /// icon_rep: *const icon_ir.Rep。
+    // -- icon_rep / fill_path / stroke_path only (B-7-D) --
+    /// icon_rep: *const icon_ir.Rep.
     icon_rep_ptr: ?*const icon_ir.Rep = null,
     /// fill_path / stroke_path: *const types.PathGeometry
     path_geometry_ptr: ?*const types.PathGeometry = null,
@@ -259,11 +259,11 @@ pub const DisplayItem = struct {
     clip_polygon_ptr: ?*const display_list_mod.ClipPolygon = null,
     /// begin_blur_layer.glass: *const types.ResolvedGlassParams
     glass_ptr: ?*const types.ResolvedGlassParams = null,
-    /// glass 拥有者 node id（亮度区域槽的稳定 key）
+    /// glass owner node id (stable key for brightness region slot)
     glass_owner_id: u32 = std.math.maxInt(u32),
-    /// rotate 角度 (image_quad/icon_rep 用) - 弧度
+    /// rotate angle (image_quad/icon_rep) - radians
     rotate: f32 = 0,
-    /// stroke_path: line join (与 types.LineJoin 同顺序)。0=miter 1=bevel 2=round
+    /// stroke_path: line join (same order as types.LineJoin). 0=miter 1=bevel 2=round
     path_line_join: u8 = 0,
     /// icon_rep: corner clip radius
     icon_corner_clip_radius: f32 = 0,
@@ -271,67 +271,73 @@ pub const DisplayItem = struct {
     icon_tint: RGBA = .{ .r = 255, .g = 255, .b = 255, .a = 255 },
     /// icon_rep: rep_size (px hint)
     icon_rep_size: u8 = 0,
-    /// image_quad: tint color (与 icon_tint 平行；image_quad 单独存避免歧义)
+    /// icon_rep: snap the quad to device pixels (static icon)
+    icon_snap: bool = true,
+    /// image_quad: tint color (parallel to icon_tint; separate to avoid ambiguity)
     image_tint: RGBA = .{ .r = 255, .g = 255, .b = 255, .a = 255 },
-    /// image_quad: corner_radius (与 radii 区别，image_quad union 字段是单 f32)
+    /// image_quad: corner_radius (differs from radii, image_quad union field is single f32)
     image_corner_radius: f32 = 0,
-    // ── inset_shadow_rect / shadow_dual_rect 专用 (B-7-E) ──
-    /// shadow_dual / inset_shadow 的辅助阴影颜色 (shadow_dual.shadow1_color，
-    /// inset_shadow.shadow_color)。主 color 字段保留 fill 颜色；secondary 是
-    /// 阴影颜色，跟 gradient_to_color 类比但语义独立避免 alias。
+    // -- inset_shadow_rect / shadow_dual_rect only (B-7-E) --
+    /// shadow_dual / inset_shadow secondary shadow color (shadow_dual.shadow1_color,
+    /// inset_shadow.shadow_color). Primary color field reserves fill color; secondary is shadow
+    /// color, analogous to gradient_to_color but semantically independent to avoid aliasing.
     shadow_secondary_color: RGBA = .{},
-    /// shadow_dual 第二阴影颜色
+    /// shadow_dual second shadow color
     shadow2_color: RGBA = .{},
-    /// shadow_dual 第二阴影 blur
+    /// shadow_dual second shadow blur
     shadow2_blur: f32 = 0,
-    /// shadow_dual 第二阴影 offset x
+    /// shadow_dual second shadow offset x
     shadow2_offset_x: f32 = 0,
-    /// shadow_dual 第二阴影 offset y
+    /// shadow_dual second shadow offset y
     shadow2_offset_y: f32 = 0,
-    // ── arc 专用 (B-7-E) ──
-    /// arc 起始角度（弧度）
+    // -- arc only (B-7-E) --
+    /// arc start angle (radians)
     arc_start_angle: f32 = 0,
-    /// arc 结束角度（弧度）
+    /// arc end angle (radians)
     arc_end_angle: f32 = 0,
-    /// arc 外圆半径 (用 geom.x/y 存中心点；w/h 存 0；这里独立存半径避免歧义)
+    /// arc outer radius (geom.x/y store center; w/h store 0; radius stored separately to avoid
+    /// ambiguity)
     arc_outer_radius: f32 = 0,
-    // ── control kind 专用 (B-7-C) ──
-    /// 当 kind == .control 时区分 8 种 token；paint kind 时 .none。
+    // -- control kind only (B-7-C) --
+    /// Distinguishes 8 token types when kind == .control; .none during paint kind.
     control_kind: ControlKind = .none,
-    /// begin_opacity_layer.opacity / begin_*.draw_w/h 等共用此字段。
-    /// 平时 0；begin_opacity_layer 写 opacity (rect kind 也共用)。
+    /// begin_opacity_layer.opacity / begin_*.draw_w/h etc share this field. Usually 0;
+    /// begin_opacity_layer writes opacity (rect kind also shares).
     opacity: f32 = 0,
-    /// 绘制形状 (fill_rect/stroke_rect)：0 = rounded_rect, 1 = ellipse。
-    /// 与 types.ShapeSpec 同序。**不是** clip_shape_kind，那个是裁剪掩码，
-    /// 只裁内容裁不动描边；这个换的是填充与描边的距离场本身。
+    /// Draw shape (fill_rect/stroke_rect): 0 = rounded_rect, 1 = ellipse. Same order as
+    /// types.ShapeSpec. **not** clip_shape_kind, which is clip mask, clips content not stroke; this
+    /// swaps the distance field of fill and stroke themselves.
     shape_kind: u8 = 0,
-    /// push_clip.shape_kind (rect/rounded_rect/ellipse/polygon)。0 = rect。
-    /// 与 display_list.ClipShapeKind 同顺序。
+    /// push_clip.shape_kind (rect/rounded_rect/ellipse/polygon); 0 = rect.
+    /// Same order as display_list.ClipShapeKind.
     clip_shape_kind: u8 = 0,
-    /// begin_opacity_layer.blend_mode (与 types.BlendMode 同顺序，0 = normal)
+    /// begin_opacity_layer.blend_mode (same order as types.BlendMode; 0 = normal)
     blend_mode: u8 = 0,
-    /// begin_opacity / begin_blur / begin_rounded_clip 的 draw_x/y/w/h。
-    /// NaN 默认值与 union 字段对齐（caller 用 isNan 判别）。
+    /// begin_opacity_layer.warp (see types.ContentWarp)
+    warp: [4]f32 = .{ 0, 0, 0, 0 },
+    /// draw_x/y/w/h for begin_opacity / begin_blur / begin_rounded_clip.
+    /// NaN defaults align with union fields (caller uses isNan to distinguish).
     draw_x: f32 = 0,
     draw_y: f32 = 0,
     draw_w: f32 = 0,
     draw_h: f32 = 0,
-    /// begin_opacity_layer 的 GPU retained 缓存键（见 display_list 同名字段）。
-    /// surface_stable_id = 跨帧稳定 layer 身份，INVALID_SURFACE_ID = 不参与
-    /// retained（每帧重画）；surface_content_version = 内容版本。
+    /// GPU retained cache key for begin_opacity_layer (see same-named field in
+    /// display_list). surface_stable_id = stable layer identity across frames;
+    /// INVALID_SURFACE_ID = skip retained (redraw every frame);
+    /// surface_content_version = content version.
     surface_stable_id: u32 = display_list_mod.INVALID_SURFACE_ID,
     surface_content_version: u32 = 0,
-    /// use_draw_transform 标记 + draw_transform[6] 仿射 matrix。
+    /// use_draw_transform flag + draw_transform[6] affine matrix.
     use_draw_transform: bool = false,
     draw_transform: [6]f32 = .{ 1, 0, 0, 1, 0, 0 },
-    // 复杂 control payload (push_clip.polygon / begin_blur_layer.glass) 暂不
-    // inline；走 extra_ptr 透传 source union variant 的指针。lowerDisplayItem
-    // 写 source variant payload &it 进 extra_ptr，dispatch 端 cast 回原类型读
-    // polygon / glass 字段。生命周期由 caller 保证 (display_list 跨帧稳定)。
+    // Complex control payloads (push_clip.polygon / begin_blur_layer.glass) not
+    // inlined; use extra_ptr to pass source union variant pointers. lowerDisplayItem
+    // writes the payload pointer; dispatch casts it back to read polygon/glass fields.
+    // Lifetime guaranteed by caller (display_list stable across frames).
 
-    /// tests fixture 友好 helpers (v0.5 §5 GpuDraw 收尾切 tests 时用)：
-    /// 让 fixture 写起来跟 union .text_run / .fill_rect / .push_clip 等 pattern
-    /// 一样直接，不必每处 spell out kind/control_kind 组合。
+    /// Test fixture-friendly helpers (used during v0.5 sec 5 GpuDraw test refactor):
+    /// allow fixtures to be written as directly as union patterns like .text_run /
+    /// .fill_rect / .push_clip, without spelling out kind/control_kind combinations.
     pub fn isFillRect(self: DisplayItem) bool {
         return self.kind == .rect and self.stroke_width == 0;
     }
@@ -359,19 +365,22 @@ pub const TextFontFlag = struct {
     pub const italic: u8 = 1;
     pub const monospace: u8 = 2;
     pub const symbols: u8 = 4;
+    /// Rasterize without platform font smoothing (TextProps.font_smoothing = false)
+    pub const no_smoothing: u8 = 8;
 };
 
-/// 单 element 的 paint chunk
+/// Paint chunk for a single element.
 pub const PaintChunk = struct {
-    /// chunk 涉及的 display items
+    /// Display items involved in the chunk.
     display_items: std.ArrayListUnmanaged(DisplayItem),
-    /// 引用 PropertyTree 的 4 棵树状态
+    /// References 4 tree states from PropertyTree.
     property_state: PropertyStateRef = .NONE,
-    /// world-space bounds（包络所有 display_items）
+    /// World-space bounds (envelope of all display_items).
     bounds: Bounds = .ZERO,
-    /// 内容 hash，比对此值与上次记录决定是否需要重新录制
+    /// Content hash; comparing with previous value determines if re-recording is needed.
     content_hash: u64 = 0,
-    /// paint_epoch：每次重录 ++。下游 layer cache 据此判失效。
+    /// paint_epoch: incremented on each re-record; layer cache uses it to detect
+    /// invalidation.
     paint_epoch: u64 = 0,
 
     pub fn deinit(self: *PaintChunk, allocator: std.mem.Allocator) void {
@@ -390,7 +399,7 @@ pub const PaintTable = struct {
     chunks: std.ArrayListUnmanaged(PaintChunk),
 
     pub fn init(allocator: std.mem.Allocator) PaintTable {
-        return .{ .allocator = allocator, .chunks = .{} };
+        return .{ .allocator = allocator, .chunks = .empty };
     }
 
     pub fn deinit(self: *PaintTable) void {
@@ -403,7 +412,7 @@ pub const PaintTable = struct {
         if (id.isNull()) return;
         const idx = id.index;
         while (self.chunks.items.len <= idx) {
-            try self.chunks.append(self.allocator, .{ .display_items = .{} });
+            try self.chunks.append(self.allocator, .{ .display_items = .empty });
         }
     }
 
@@ -412,15 +421,13 @@ pub const PaintTable = struct {
         return &self.chunks.items[id.index];
     }
 
-    /// 元素销毁时调用：释放 display_items 内存并把 chunk 复位到"从未录制"。
-    /// slot 本身保留（dense by index），但内容必须清，否则：
-    /// 1) 长生命周期窗口反复 mount/unmount 时 display_items 堆内存只增不减；
-    /// 2) slot 复用后若新 owner 的 content_hash 恰好撞上旧值，beginRecord 的
-    ///    cache-hit（paint_epoch != 0 分支）会原样吐出上一个 owner 的
-    ///    display_items（内容串台）；
-    /// 3) 下游按全表扫描消费 property_state（core.zig syncPaint 循环用 idx
-    ///    反推 id、恒拼出当前世代），已死元素的残留 effect 引用会继续参与
-    ///    图层提升决策。
+    /// Called on element destruction: free display_items memory and reset chunk to
+    /// 'never recorded'. Slot retained (dense by index) but content must be cleared;
+    /// otherwise: 1) long-lived windows with repeated mount/unmount only grow heap; 2)
+    /// slot reuse collision: if new owner's content_hash matches old, cache-hit emits
+    /// previous owner's display_items unchanged (cross-talk); 3) downstream
+    /// property_state scan: stale effect references from dead elements participate in
+    /// layer promotion decisions.
     pub fn release(self: *PaintTable, id: ElementId) void {
         if (id.isNull() or id.index >= self.chunks.items.len) return;
         const chunk = &self.chunks.items[id.index];
@@ -436,8 +443,8 @@ pub const PaintTable = struct {
         return self.chunks.items[id.index].paint_epoch;
     }
 
-    /// 重新录制 chunk，只在 content_hash 不同时真正清空 + 再录制。
-    /// 返回 true 表示真的重录了；false 表示 hash 命中跳过。
+    /// Re-record chunk only if content_hash differs; then clear and re-record.
+    /// Returns true if actually re-recorded; false if hash cache-hit.
     pub fn beginRecord(self: *PaintTable, id: ElementId, new_content_hash: u64) !bool {
         try self.ensureSlot(id);
         const chunk = &self.chunks.items[id.index];
@@ -484,7 +491,7 @@ test "PaintTable: beginRecord on different hash bumps epoch + clears items" {
     defer t.deinit();
     const id: ElementId = .{ .index = 0, .generation = 0 };
 
-    // 首次录制
+    // First recording
     try testing.expect(try t.beginRecord(id, 0xAAAA));
     try t.pushItem(id, .{ .kind = .rect, .local_bounds = .{ .min_x = 0, .min_y = 0, .max_x = 100, .max_y = 50 } });
     t.endRecord(id, .NONE);
@@ -493,12 +500,12 @@ test "PaintTable: beginRecord on different hash bumps epoch + clears items" {
     try testing.expect(epoch1 > 0);
     try testing.expectEqual(@as(usize, 1), t.get(id).?.display_items.items.len);
 
-    // 同 hash -> 不重录
+    // Same hash -> do not re-record
     try testing.expect(!(try t.beginRecord(id, 0xAAAA)));
     try testing.expectEqual(epoch1, t.epoch(id));
     try testing.expectEqual(@as(usize, 1), t.get(id).?.display_items.items.len);
 
-    // 不同 hash -> 重录
+    // Different hash -> re-record
     try testing.expect(try t.beginRecord(id, 0xBBBB));
     try testing.expectEqual(@as(usize, 0), t.get(id).?.display_items.items.len); // cleared
     try t.pushItem(id, .{ .kind = .text, .local_bounds = .{} });
@@ -554,9 +561,9 @@ test "CornerRadii.toArray + fromArray: roundtrip" {
 }
 
 comptime {
-    // GPU retained 哨兵三处一致：display_list（产出端）、paint_table（本文件，
-    // 传输端）、render/opacity_layer + offscreen_texture（消费端，那两处之间
-    // 另有 comptime 断言互钉）。消费端在 render module 里、不便反向 import，
-    // 故用同一个字面量并在此处钉住产出/传输两端。
+    // GPU retained sentinel: three locations must align: display_list (producer),
+    // paint_table (this file, transport), render/opacity_layer + offscreen_texture (consumer;
+    // comptime assertions cross-lock those two). Consumer in render module cannot reverse-import,
+    // so sentinel value pinned here to lock producer/transport sides.
     std.debug.assert(display_list_mod.INVALID_SURFACE_ID == std.math.maxInt(u32));
 }

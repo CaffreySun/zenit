@@ -1,8 +1,9 @@
-/// Phase L3: Text Blob，逻辑布局与渲染缩放分离
+/// Text Blob: logical layout and render scale are separate.
 ///
-/// TextStyleKey 唯一标识布局/塑形参数，TextLayoutBlob 保存逻辑字号空间的稳定布局结果。
-/// TextRasterPolicy 控制光栅化策略（静态锐利 vs 动画稳定）。
-/// BlobStore 是帧级存储，每帧 clear + 重建。
+/// TextStyleKey uniquely identifies layout/shaping parameters; TextLayoutBlob holds stable
+/// layout result in logical font-size space. TextRasterPolicy controls rasterization strategy
+/// (static sharp vs animation stable). BlobStore is frame-local storage, cleared + rebuilt each
+/// frame.
 const std = @import("std");
 const types = @import("types.zig");
 const text_layout_mod = @import("text_layout.zig");
@@ -13,23 +14,23 @@ const LineInfo = text_layout_mod.LineInfo;
 pub const MAX_LINES = text_layout_mod.MAX_LINES;
 const INVALID_BLOB_ID = std.math.maxInt(u32);
 
-/// 光栅化策略
+/// Rasterization strategy
 pub const TextRasterPolicy = enum(u8) {
-    /// 静态文本：允许子像素变体 + nearest 采样 + 精确字号派生
+    /// Static text: allow subpixel variants + nearest sampling + exact font-size derivative
     static_crisp,
-    /// 动画中文本：强制 linear 采样，禁止子像素变体切换
+    /// Text in animation: force linear sampling, forbid subpixel variant switching
     animated_stable,
-    /// 预留：文本先光栅到 layer surface，动画期间只变换 surface
+    /// Reserved: rasterize text to layer surface, animate surface only
     surface_cached,
 };
 
-/// 布局/塑形的唯一标识（缓存键）
+/// Unique identifier for layout/shaping (cache key)
 pub const TextStyleKey = struct {
-    /// 逻辑字号（不乘 scale）
+    /// Logical font size (not scaled)
     font_size: f32,
     font_weight: u16,
-    /// 字体族 id。**必须进这个 key**，同一段文字换族要重新塑形,
-    /// 漏了它会让第二个族命中第一个族的布局缓存(与 shapingKey 同款坑)。
+    /// Font family id. **Must enter this key**: same text, different family needs reshape;
+    /// omit it -> second family hits first family's layout cache (same bug as shapingKey).
     font_family: u16 = 0,
     line_height: f32,
     use_italic: bool = false,
@@ -39,26 +40,26 @@ pub const TextStyleKey = struct {
     max_lines: u16 = 0,
 };
 
-/// 稳定的布局结果（逻辑字号空间）
+/// Stable layout result (logical font-size space)
 pub const TextLayoutBlob = struct {
     style_key: TextStyleKey,
-    /// content 的 hash（用于变更检测）
+    /// content hash (used for change detection)
     content_hash: u64,
-    /// 当前帧内借用的源文本切片；生命周期受帧约束
+    /// Source text slice borrowed this frame; lifetime frame-bound
     content: []const u8 = "",
     spans_hash: u64 = 0,
-    /// 折行结果
+    /// Line-break result
     lines: [MAX_LINES]LineInfo = undefined,
     line_count: u16 = 0,
-    /// 逻辑空间总高度 (line_count * font_size * line_height)
+    /// Total height in logical space (line_count * font_size * line_height)
     total_height: f32 = 0,
-    /// 逻辑空间最大行宽
+    /// Max line width in logical space
     max_line_width: f32 = 0,
-    /// 折行宽度
+    /// Line-break width
     wrap_width: f32 = 0,
-    /// 在 BlobStore 中的索引
+    /// Index in BlobStore
     blob_id: u32 = 0,
-    /// 帧内 dedupe 索引里的同指纹链表
+    /// In-frame dedupe index, same-fingerprint chain link
     dedupe_next_blob_id: u32 = INVALID_BLOB_ID,
 };
 
@@ -97,7 +98,7 @@ fn hashBlobFingerprint(blob: TextLayoutBlob) u64 {
     hasher.update(std.mem.asBytes(&blob.style_key.use_italic));
     hasher.update(std.mem.asBytes(&blob.style_key.use_monospace));
     hasher.update(std.mem.asBytes(&blob.style_key.use_symbols));
-    const wrap_tag: u8 = @intFromEnum(blob.style_key.wrap);
+    const wrap_tag: u8 = @backingInt(blob.style_key.wrap);
     hasher.update(std.mem.asBytes(&wrap_tag));
     hasher.update(std.mem.asBytes(&blob.style_key.max_lines));
     hasher.update(std.mem.asBytes(&blob.content_hash));
@@ -114,7 +115,7 @@ fn hashBlobFingerprint(blob: TextLayoutBlob) u64 {
     return hasher.final();
 }
 
-/// 帧级 blob 存储
+/// Frame-local blob storage
 pub const BlobStore = struct {
     allocator: Allocator,
     blobs: std.ArrayList(TextLayoutBlob),
@@ -123,7 +124,7 @@ pub const BlobStore = struct {
     pub fn init(allocator: Allocator) BlobStore {
         return .{
             .allocator = allocator,
-            .blobs = .{},
+            .blobs = .empty,
             .blob_index = .{},
         };
     }
@@ -138,7 +139,7 @@ pub const BlobStore = struct {
         self.blob_index.clearRetainingCapacity();
     }
 
-    /// 追加 blob，返回其 blob_id
+    /// Append blob, return its blob_id
     pub fn append(self: *BlobStore, blob: TextLayoutBlob) !u32 {
         const id: u32 = @intCast(self.blobs.items.len);
         var b = blob;
@@ -154,12 +155,12 @@ pub const BlobStore = struct {
 
     pub fn appendOrReuseTracked(self: *BlobStore, blob: TextLayoutBlob) !AppendOrReuseResult {
         const fingerprint = hashBlobFingerprint(blob);
-        // 头指针可能悬空：paint pass 的双发射守卫会把 blobs 截断回
-        // subtree_blob_start（render_engine/mod.zig renderNodeTransform），
-        // 但 index 里指向被截断区间的表项还在，直接解引用越界 panic
-        // （线上 crash 实证：appendOrReuseTracked +336 outOfBounds）。
-        // 链上 id 严格递减（新头指向旧头），存活 blob 只会链到更早、
-        // 必然也存活的 blob，所以只需守卫头指针这一处。
+        // Head pointer may dangle: the paint pass dual-emit guard truncates blobs back to
+        // subtree_blob_start (render_engine/mod.zig renderNodeTransform), but index entries
+        // pointing into the truncated range remain; dereferencing directly panics out-of-bounds
+        // (appendOrReuseTracked). On the chain, id strictly decreases (new head -> old head); an
+        // alive
+        // blob only chains to earlier, hence alive, blobs; so guard the head pointer only here.
         const raw_head_id = self.blob_index.get(fingerprint);
         const head_blob_id: ?u32 = if (raw_head_id) |id|
             (if (id < self.blobs.items.len) id else null)
@@ -204,9 +205,9 @@ pub const BlobStore = struct {
 };
 
 test "BlobStore: blobs 被子树回滚截断后，同指纹查询不越界" {
-    // 复现线上 SIGABRT：renderNodeTransform 的双发射守卫
-    // shrinkRetainingCapacity(blobs) 不回滚 blob_index，
-    // 同帧内相同指纹的文本再次查询会拿到 >= blobs.len 的悬空头指针。
+    // Reproduce on-line SIGABRT: renderNodeTransform dual-emit guard
+    // shrinkRetainingCapacity(blobs) doesn't roll back blob_index;
+    // same-fingerprint text later in frame reads >= blobs.len dangling head.
     var store = BlobStore.init(std.testing.allocator);
     defer store.deinit();
 
@@ -229,10 +230,10 @@ test "BlobStore: blobs 被子树回滚截断后，同指纹查询不越界" {
     const first = try store.appendOrReuseTracked(blob);
     try std.testing.expect(!first.reused);
 
-    // 模拟 paint pass 的子树回滚：只截断 blobs，不动 index
+    // Simulate paint-pass subtree rollback: truncate blobs only, don't touch index
     store.blobs.shrinkRetainingCapacity(0);
 
-    // 修复前这里 index-out-of-bounds panic；修复后按未命中处理、重新追加
+    // Pre-fix here index-out-of-bounds panic; post-fix treat as miss, re-append
     const second = try store.appendOrReuseTracked(blob);
     try std.testing.expect(!second.reused);
     try std.testing.expectEqual(@as(u32, 0), second.blob_id);

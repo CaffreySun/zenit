@@ -1,10 +1,9 @@
-/// System SDK - 统一系统通信层
+/// System SDK - unified system communication layer
 ///
-/// Phase 0:
-/// - 收敛跨平台系统 API
-/// - 定义后端 SPI（vtable）
-/// - 定义统一事件模型
-/// - 支持能力探测（capabilities）
+/// - Converges cross-platform system APIs
+/// - Defines backend SPI (vtable)
+/// - Defines unified event model
+/// - Supports capability detection (capabilities)
 const std = @import("std");
 
 pub const api = @import("api.zig");

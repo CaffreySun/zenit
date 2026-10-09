@@ -37,6 +37,13 @@ class BatchContract(unittest.TestCase):
         self.assertEqual(len({p["exe_name"] for p in plan}), 4)
         self.assertTrue(all(p["blocking"] for p in plan))
 
+    def test_accessibility_suites_target_their_actual_application(self):
+        plan = batch.stages(True)
+        accessibility = {p["name"]: p["exe_name"] for p in plan if p["name"].startswith("accessibility")}
+        self.assertEqual(accessibility.pop("accessibility"), batch.queue.E2E_APPS["render-gallery"])
+        self.assertEqual(len(accessibility), 6)
+        self.assertTrue(all(exe == batch.queue.E2E_APPS["storybook"] for exe in accessibility.values()))
+
     def test_conflicting_accessibility_options_fail_before_bundling(self):
         with self.assertRaises(SystemExit) as error:
             self.invoke(["--prepare-only", "--require-a11y", "--no-a11y"])

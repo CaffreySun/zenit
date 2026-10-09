@@ -46,7 +46,10 @@ def stages(include_a11y: bool) -> list[dict]:
     if include_a11y:
         for suite in sorted((REPO / "e2e").glob("windows-accessibility*.test.ts")):
             short = suite.name.removeprefix("windows-").removesuffix(".test.ts")
-            out.append({"name": short, "kind": "e2e", "exe_name": queue.E2E_APPS["storybook"],
+            # The original UIA suite exercises Gallery controls; the widget
+            # suites exercise Storybook. Keep each suite with its fixture app.
+            app = "render-gallery" if suite.name == "windows-accessibility.test.ts" else "storybook"
+            out.append({"name": short, "kind": "e2e", "exe_name": queue.E2E_APPS[app],
                         "suite_source": f"e2e/{suite.name}", "minimum_cases": 1, "blocking": False, "filter": ""})
     return out
 

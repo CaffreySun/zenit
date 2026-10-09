@@ -481,8 +481,15 @@ pub fn build(b: *std.Build) void {
     for ([_][]const u8{ "d3d12", "dcomp", "dwmapi", "gdi32", "dxgi", "dxguid", "uuid", "d3dcompiler_47", "user32", "ole32", "windowscodecs" }) |library| d12_contract.root_module.linkSystemLibrary(library, .{});
     d12_contract.root_module.link_libc = true;
     d12_contract.root_module.link_libcpp = true;
-    b.step("windows-arm64-gpu-resources-contract", "Cross-compile real D3D12 buffer upload/copy/readback contracts")
-        .dependOn(&b.addInstallArtifact(d12_contract, .{}).step);
+    const windows_gpu_fixture_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("tools/windows_gpu_device_fixture.zig"),
+        .target = b.graph.host,
+    }) });
+    const run_windows_gpu_fixtures = b.addRunArtifact(windows_gpu_fixture_tests);
+    b.step("test-windows-gpu-fixtures", "Verify Windows GPU contract upload fixtures").dependOn(&run_windows_gpu_fixtures.step);
+    const windows_gpu_contract_step = b.step("windows-arm64-gpu-resources-contract", "Cross-compile real D3D12 buffer upload/copy/readback contracts");
+    windows_gpu_contract_step.dependOn(&b.addInstallArtifact(d12_contract, .{}).step);
+    windows_gpu_contract_step.dependOn(&run_windows_gpu_fixtures.step);
 
     const system_sdk_module = b.createModule(.{
         .root_source_file = b.path("src/system_sdk/system_sdk.zig"),
@@ -1847,6 +1854,7 @@ pub fn build(b: *std.Build) void {
         const windows_batch_contract = b.addSystemCommand(&.{ "python3", "tools/windows_batch_test.py" });
         b.step("test-windows-batch", "Verify offline Windows batch preparation and strict acceptance").dependOn(&windows_batch_contract.step);
         test_all_step.dependOn(&windows_batch_contract.step);
+        test_all_step.dependOn(&run_windows_gpu_fixtures.step);
         test_all_step.dependOn(test_headless_step);
         test_all_step.dependOn(metal_integration_step);
         test_all_step.dependOn(test_native_step);

@@ -1854,6 +1854,9 @@ pub fn build(b: *std.Build) void {
         const windows_batch_contract = b.addSystemCommand(&.{ "python3", "tools/windows_batch_test.py" });
         b.step("test-windows-batch", "Verify offline Windows batch preparation and strict acceptance").dependOn(&windows_batch_contract.step);
         test_all_step.dependOn(&windows_batch_contract.step);
+        const windows_upload_contract = b.addSystemCommand(&.{ "python3", "tools/windows_upload_parts_test.py" });
+        b.step("test-windows-upload", "Verify authenticated resumable batch evidence transfer").dependOn(&windows_upload_contract.step);
+        test_all_step.dependOn(&windows_upload_contract.step);
         test_all_step.dependOn(&run_windows_gpu_fixtures.step);
         test_all_step.dependOn(test_headless_step);
         test_all_step.dependOn(metal_integration_step);

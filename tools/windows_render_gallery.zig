@@ -2,6 +2,7 @@
 const std = @import("std");
 const ui = @import("ui");
 const App = @import("zenit_app").App;
+const texture_fixture = @import("windows_gpu_device_fixture.zig");
 const init_contract = if (@hasField(@FieldType(App, "painter"), "native")) @import("windows_app_init_contract.zig") else @import("windows_shared_app_init_contract.zig");
 const cursor_contract = @import("windows_cursor_contract.zig");
 const pointer_contract = @import("windows_pointer_contract.zig");
@@ -210,8 +211,7 @@ const Actions = struct {
         app.renderer.image_renderer.unloadTexture(old);
         app.renderer.image_renderer.unloadTexture(old);
         std.debug.assert(app.renderer.image_renderer.getTextureSize(old) == null);
-        const green = [4]u8{ 0, 255, 0, 255 };
-        quadrant_id = app.renderer.image_renderer.loadTexture(2, 2, &green) catch @panic("reload failed");
+        quadrant_id = app.renderer.image_renderer.loadTexture(texture_fixture.width, texture_fixture.height, texture_fixture.greenReplacementBytes()) catch @panic("reload failed");
         std.debug.assert(quadrant_id != old);
         first_image.setImage(.{ .texture_id = quadrant_id });
         status.setText(.{ .content = "texture-replaced; old-handles-invalid", .font_size = 14, .color = ui.Color.WHITE });

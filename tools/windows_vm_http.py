@@ -21,6 +21,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from windows_upload_parts import MAX_SIZE, PART_SIZE, UploadConflict, UploadParts
 
 REPO = Path(__file__).resolve().parent.parent
 FILENAMES = {
@@ -45,12 +46,12 @@ PROBES = {"gpu": ("windows-arm64-gpu-resources-contract", "zenit-windows-gpu-res
 # stage manifest in one archive; the worker runs the stages locally and returns
 # all evidence in one results archive.
 BATCH_BUNDLE = "zenit-batch.zip"
-# One results archive per stage (a tunnel caps a single request body near 100 MB).
+# One archive per stage, reassembled from bounded, hash-verified parts.
 BATCH_RESULT_RE = re.compile(r"^batch-[a-z0-9-]{1,48}\.zip$")
 ARTIFACTS = {BATCH_BUNDLE, "Zenit-UI-Scroll.exe", "windows_ui_acceptance.ps1", LOCAL_SUITE_RUNTIME, LOCAL_SUITE_SCRIPT, *E2E_APPS.values(), *(item[1] for item in PROBES.values())}
 ID_RE = re.compile(r"^[a-f0-9]{32}$")
 MAX_UPLOAD = 32 * 1024 * 1024
-MAX_FRAME_ARCHIVE_UPLOAD = 256 * 1024 * 1024
+MAX_FRAME_ARCHIVE_UPLOAD = MAX_SIZE
 
 
 def data_dir() -> Path:
@@ -98,6 +99,7 @@ class QueueServer(ThreadingHTTPServer):
         self.rpc_inflight: dict[str, dict] = {}
         self.rpc_results: dict[str, dict] = {}
         self.rpc_screenshots: dict[str, Path] = {}
+        self.upload_parts = UploadParts(root / "upload-parts")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -462,6 +464,32 @@ class Handler(BaseHTTPRequestHandler):
         if not self.auth():
             return
         parts = self.path.strip("/").split("/")
+        if len(parts) == 4 and parts[0] == "upload-parts":
+            job = self.job(parts[1])
+            if job is None or job["kind"] != "batch" or not BATCH_RESULT_RE.fullmatch(parts[2]):
+                return self.send_error(404)
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if not 0 < length <= PART_SIZE:
+                    return self.send_error(413)
+                self.connection.settimeout(30)
+                data = self.rfile.read(length)
+                result = self.server.upload_parts.receive(
+                    parts[1], parts[2], int(parts[3]),
+                    int(self.headers.get("X-Upload-Size", "0")),
+                    int(self.headers.get("X-Upload-Count", "0")),
+                    self.headers.get("X-Upload-SHA256", ""),
+                    self.headers.get("X-Part-SHA256", ""), data,
+                    self.server.root / "jobs" / parts[1] / parts[2])
+            except UploadConflict as error:
+                return self.send_error(409, str(error))
+            except ValueError as error:
+                return self.send_error(400, str(error))
+            except TimeoutError:
+                return self.send_error(408)
+            except OSError:
+                return self.send_error(500)
+            return self.json_response(200, result)
         if len(parts) != 3 or parts[0] != "upload" or (parts[2] not in FILENAMES and not BATCH_RESULT_RE.fullmatch(parts[2])):
             if len(parts) == 4 and parts[:2] == ["rpc", "screenshot"]:
                 if self.job(parts[2]) is None or not ID_RE.fullmatch(parts[3]):
@@ -485,11 +513,14 @@ class Handler(BaseHTTPRequestHandler):
         job = self.job(parts[1])
         if job is None:
             return self.send_error(404)
+        if BATCH_RESULT_RE.fullmatch(parts[2]):
+            # A legacy write could race reassembly or replace a verified ZIP
+            # behind its completion record. Batch archives use one protocol.
+            return self.send_error(409, "Batch evidence requires upload-parts")
         with self.server.condition:
             job["worker_acked"] = True
         dest = self.server.root / "jobs" / parts[1] / parts[2]
-        limit = (MAX_FRAME_ARCHIVE_UPLOAD if BATCH_RESULT_RE.fullmatch(parts[2]) else
-                 MAX_FRAME_ARCHIVE_UPLOAD if parts[2] in {"windows-presented-frames.zip", "windows-suite-session.zip"} else MAX_UPLOAD)
+        limit = MAX_FRAME_ARCHIVE_UPLOAD if parts[2] in {"windows-presented-frames.zip", "windows-suite-session.zip"} else MAX_UPLOAD
         try:
             self.upload_file(dest, limit)
         except ValueError:

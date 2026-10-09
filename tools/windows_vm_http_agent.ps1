@@ -76,6 +76,42 @@ function Upload([string]$jobId, [string]$filename, [string]$directory) {
   Invoke-Retrying { Invoke-WebRequest -UseBasicParsing -Uri ($base+'/upload/'+$jobId+'/'+$filename) -Method Put -Headers $headers -ContentType 'application/octet-stream' -InFile $path -TimeoutSec $timeout } | Out-Null
 }
 
+# Evidence transfer begins only after all local stages finish. Small, hashed
+# parts survive gateway write deadlines and a lost acknowledgement safely.
+function Upload-BatchArchive([string]$jobId, [string]$name, [string]$path) {
+  $partSize = 512 * 1024
+  $size = (Get-Item -LiteralPath $path).Length
+  $digest = (Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash.ToLower()
+  $count = [int][Math]::Ceiling($size / [double]$partSize)
+  $stream = [IO.File]::OpenRead($path)
+  $last = $null
+  try {
+    for ($index = 0; $index -lt $count; $index++) {
+      $length = [int][Math]::Min($partSize, $size - [long]$index * $partSize)
+      [byte[]]$bytes = New-Object byte[] $length
+      $offset = 0
+      while ($offset -lt $length) {
+        $read = $stream.Read($bytes, $offset, $length - $offset)
+        if ($read -eq 0) { throw 'Evidence archive truncated during upload' }
+        $offset += $read
+      }
+      $sha = [Security.Cryptography.SHA256]::Create()
+      try { $partDigest = -join ($sha.ComputeHash($bytes) | ForEach-Object { $_.ToString('x2') }) }
+      finally { $sha.Dispose() }
+      $partHeaders = @{}
+      foreach ($key in $headers.Keys) { $partHeaders[$key] = $headers[$key] }
+      $partHeaders['X-Upload-Size'] = [string]$size
+      $partHeaders['X-Upload-Count'] = [string]$count
+      $partHeaders['X-Upload-SHA256'] = $digest
+      $partHeaders['X-Part-SHA256'] = $partDigest
+      $last = Invoke-Retrying { Invoke-RestMethod -Uri ($base+'/upload-parts/'+$jobId+'/'+$name+'/'+$index) -Method Put -Headers $partHeaders -ContentType 'application/octet-stream' -Body $bytes -TimeoutSec 90 }
+    }
+    if (-not $last.complete -or $last.sha256 -ne $digest -or [long]$last.size -ne $size) {
+      throw 'Evidence archive was not fully verified by the host'
+    }
+  } finally { $stream.Dispose() }
+}
+
 function Wait-RpcResult([string]$path, [object]$proc) {
   $deadline = [DateTime]::UtcNow.AddSeconds(15)
   while ([DateTime]::UtcNow -lt $deadline) {
@@ -223,7 +259,9 @@ while ($true) {
       Download ('/artifacts/'+$batchId+'/zenit-batch.zip') $zip
       Add-Type -AssemblyName System.IO.Compression.FileSystem
       [System.IO.Compression.ZipFile]::ExtractToDirectory($zip, $bundleDir)
-      Remove-Item -Force -LiteralPath $zip
+      # Virus scanners may still hold the downloaded ZIP after extraction.
+      # Its removal is housekeeping; the verified bundle is already ready.
+      Remove-Item -Force -LiteralPath $zip -ErrorAction SilentlyContinue
       Ensure-SuiteRuntime $batchId ([string]$job.local_suite.runtime_sha256) | Out-Null
       $manifest = Get-Content -LiteralPath (Join-Path $bundleDir 'manifest.json') -Raw -Encoding UTF8 | ConvertFrom-Json
       foreach ($stage in $manifest.stages) {
@@ -268,7 +306,7 @@ while ($true) {
         $archive = Join-Path $job.dir $name
         if (Test-Path $archive) { Remove-Item -Force $archive }
         [System.IO.Compression.ZipFile]::CreateFromDirectory($stageDir.FullName, $archive, [System.IO.Compression.CompressionLevel]::Fastest, $false)
-        Invoke-Retrying { Invoke-WebRequest -UseBasicParsing -Uri ($base+'/upload/'+$batchId+'/'+$name) -Method Put -Headers $headers -ContentType 'application/octet-stream' -InFile $archive -TimeoutSec 1800 } | Out-Null
+        Upload-BatchArchive $batchId $name $archive
         $uploaded += $name
       }
       $completion = Api-Post ('/complete/'+$batchId) @{ exit_code=$exitCode; error=$errorText; uploaded=$uploaded }

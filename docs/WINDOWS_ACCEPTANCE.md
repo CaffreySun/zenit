@@ -32,7 +32,12 @@ python3 tools/windows_batch.py --base "$ZENIT_VM_BASE" --arch aarch64 \
 The tool prepares all artifacts before its single job submission. The worker
 runs each suite alongside its application, using guest-local file RPC; individual
 harness calls do not cross the host connection. It returns stage evidence after
-executing the full plan. Require every row of `batch-report.json` to pass.
+executing the full plan. Stage archives travel in 512 KiB parts, with each part
+and the assembled archive checked by SHA-256. Retries preserve completed parts;
+no test RPC crosses the host connection during execution. Require the batch
+completion status and every row of `batch-report.json` to pass. Install the worker
+and host queue from the same revision; batch evidence uses the part-upload
+protocol rather than the legacy whole-file upload endpoint.
 
 The 21-stage plan covers 13 shared render/input gates, the complete native GPU
 contract probe, and seven UI Automation suites. Modal, Sheet and Notification

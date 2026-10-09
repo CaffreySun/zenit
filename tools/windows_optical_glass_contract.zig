@@ -18,8 +18,10 @@ fn ramp(ctx: ui.DrawContext, context: ?*anyopaque) anyerror!void {
     const header = ctx.display_header orelse return;
     var colors = @as([16]ui.Color, @splat(ui.Color.TRANSPARENT));
     var positions = @as([16]f32, @splat(0));
+    // The saturation control needs chroma headroom: pure primaries are already
+    // clamped and cannot show a further increase in specular saturation.
     for (0..11) |i| {
-        colors[i] = if (context != null) (if (i % 2 == 0) ui.Color.rgb(255, 0, 0) else ui.Color.rgb(0, 0, 255)) else (if (i % 2 == 0) ui.Color.BLACK else ui.Color.WHITE);
+        colors[i] = if (context != null) (if (i % 2 == 0) ui.Color.rgb(192, 64, 64) else ui.Color.rgb(64, 64, 192)) else (if (i % 2 == 0) ui.Color.BLACK else ui.Color.WHITE);
         positions[i] = @as(f32, @floatFromInt(i)) / 10.0;
     }
     try dl.append(.{ .multi_gradient_rect = .{ .header = header, .x = 0, .y = 0, .w = ctx.local_w, .h = ctx.local_h, .stop_colors = colors, .stop_positions = positions, .stop_count = 11, .direction = .horizontal } });

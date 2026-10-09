@@ -1844,6 +1844,9 @@ pub fn build(b: *std.Build) void {
         }
 
         const test_all_step = b.step("test-all", "Run deterministic, live-device Metal and native bridge tests");
+        const windows_batch_contract = b.addSystemCommand(&.{ "python3", "tools/windows_batch_test.py" });
+        b.step("test-windows-batch", "Verify offline Windows batch preparation and strict acceptance").dependOn(&windows_batch_contract.step);
+        test_all_step.dependOn(&windows_batch_contract.step);
         test_all_step.dependOn(test_headless_step);
         test_all_step.dependOn(metal_integration_step);
         test_all_step.dependOn(test_native_step);

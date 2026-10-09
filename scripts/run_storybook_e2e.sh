@@ -74,9 +74,9 @@ cleanup() {
   # The app quits gracefully on SIGTERM, so GPA's deinit leak report is in the
   # log. A passing suite that leaked is still a failing gate.
   local leak_gate_failed=0
-  if [[ "$GATE_STATUS" == "PASS" && -f "$APP_LOG" ]] && grep -q "error(gpa):.*leaked" "$APP_LOG"; then
+  if [[ "$GATE_STATUS" == "PASS" && -f "$APP_LOG" ]] && grep -Eq 'error\((gpa|DebugAllocator)\):.*leaked' "$APP_LOG"; then
     echo "FAIL: GPA reported leaked allocations at app exit:" >&2
-    grep -A6 "error(gpa):.*leaked" "$APP_LOG" | head -40 >&2
+    grep -EA6 'error\((gpa|DebugAllocator)\):.*leaked' "$APP_LOG" | head -40 >&2
     GATE_STATUS="FAIL"
     GATE_RC=87
     FAILURE_KIND="gpa_leak_at_exit"

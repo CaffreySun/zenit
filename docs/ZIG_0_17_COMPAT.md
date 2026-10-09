@@ -22,6 +22,7 @@ ZENIT_E2E_TEST_FILE=e2e/interaction-lifecycle.test.ts bash scripts/run_storybook
 The public CI also runs the 11 focused window regression files. These gates
 require a macOS desktop session and Metal; cross-compilation is not a substitute
 for Windows runtime acceptance. OS input can influence idle-frame measurements.
+See [Windows batch acceptance](WINDOWS_ACCEPTANCE.md) for guest-local one-job execution.
 
 ## Bundled ZLS
 
@@ -47,3 +48,13 @@ private host automation, caches, credentials and generated build outputs are exc
 The public Git repository additionally includes CI and ignore rules; these are not
 required in a fetched Zig package. Run `bash scripts/check_public_source.sh` before
 publishing a source snapshot.
+
+## Performance gate
+
+```sh
+ZENIT_BENCH_COMMIT="$(git rev-parse HEAD)" \
+ZENIT_BENCH_HOST="$(uname -m)-$(sw_vers -productVersion)" \
+zig build bench -- json=/tmp/zenit-bench.json
+BENCH_RERUN_CMD='zig build bench -- json=%OUT%' \
+bash scripts/check_bench_regression.sh src/bench/baselines/main.json /tmp/zenit-bench.json 15
+```

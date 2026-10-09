@@ -23,6 +23,17 @@
     // allowlist, so the Zig fetch/package payload has only Lucide. The public Git source export
     // must still exclude all of private/; scripts/check_oss_icon_license.sh enforces fail-closed.
     .paths = .{
+        "tools/windows_shared_notification_frame_audit.py",
+        "tools/windows_shared_sheet_frame_audit.py",
+        "tools/windows_shared_modal_frame_audit.py",
+        "tools/windows_modal_frame_audit.py",
+        "tools/windows_uia_query.ps1",
+        "tools/windows_native_input.ps1",
+        "tools/windows_vm_http_agent.ps1",
+        "tools/windows_vm_http.py",
+        "tools/windows_shared_regression.py",
+        "tools/windows_batch.py",
+        "tools/windows_batch_test.py",
         "scripts/record_release_audit.sh",
         "tools/axprobe/axprobe.swift",
         "scripts/cgevent.swift",
@@ -51,6 +62,7 @@
         "docs/UI_OSS_BOUNDARY.md",
         "docs/YIX_EDITOR.md",
         "docs/ZIG_0_17_COMPAT.md",
+        "docs/WINDOWS_ACCEPTANCE.md",
         "docs/SIGNAL_API_DESIGN.md",
         "src",
         "examples",
@@ -267,6 +279,7 @@
         "scripts/switch_icon_set.sh",
         "scripts/test_bench_regression_contract.sh",
         "scripts/test_evidence_contract.sh",
+        "scripts/test_e2e_leak_contract.sh",
         "scripts/test_native_clipboard.sh",
         "scripts/test_native_drag_events.sh",
         "scripts/test_native_global_events.sh",

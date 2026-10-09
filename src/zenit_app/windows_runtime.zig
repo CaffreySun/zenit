@@ -402,7 +402,7 @@ pub const App = struct {
         self.cx.needs_redraw = true;
         if (test_harness.enabled) {
             self.rebindTestHarness();
-            test_harness.init(self.config.io, getTestCx, wakeTestHarness);
+            test_harness.init(self.cx.io, getTestCx, wakeTestHarness);
         }
     }
 

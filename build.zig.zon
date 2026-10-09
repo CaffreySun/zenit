@@ -217,6 +217,8 @@
         "e2e/windows-frame-timing.test.ts",
         "e2e/windows-glass-open-probe.test.ts",
         "e2e/windows-glass-render.test.ts",
+        "e2e/windows-optical-oracle.ts",
+        "e2e/windows-optical-oracle.test.ts",
         "e2e/windows-image-render.test.ts",
         "e2e/windows-input-edge-drag.test.ts",
         "e2e/windows-input-viewport-probe.test.ts",

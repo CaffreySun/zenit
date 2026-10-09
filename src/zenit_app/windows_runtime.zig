@@ -515,13 +515,24 @@ pub const App = struct {
     }
 
     pub fn processEvent(self: *App, event: system_sdk.events.Event) void {
+        self.processEventFrom(.os, event);
+    }
+
+    /// Only for gallery contracts that own and synchronously seed the native
+    /// input queue. Ordinary SDK pumps must always use processEvent.
+    /// Calling this entry point outside a test-mode build fails compilation.
+    pub fn processTestContractEvent(self: *App, event: system_sdk.events.Event) void {
+        self.processEventFrom(.test_contract, event);
+    }
+
+    fn processEventFrom(self: *App, comptime source: pointer_isolation.Source, event: system_sdk.events.Event) void {
         if (event.targetWindowId()) |target| {
             if (target != self.windowId()) return;
         }
         // Harness pointer injection calls Cx directly, so dropping the OS pointer here leaves
         // only the test's own input. Without it, a person using the machine during a background
         // run moves the real cursor over the window and its hover state lands in screenshots.
-        if (test_harness.enabled and isolateOsPointer() and pointer_isolation.isOsPointerEvent(event)) return;
+        if (pointer_isolation.shouldDropEvent(test_harness.enabled, test_harness.enabled and isolateOsPointer(), source, event)) return;
         switch (event) {
             .quit, .window_close_requested => self.should_quit = true,
             .window_resized, .frame_requested, .system_theme_changed => self.cx.needs_redraw = true,

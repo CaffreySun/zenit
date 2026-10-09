@@ -71,3 +71,44 @@ test "only OS pointer events are dropped" {
         try std.testing.expectEqual(expected, isOsPointerEvent(event));
     }
 }
+
+/// The default App path handles OS input. Only a test-mode caller that owns
+/// the seeded queue may explicitly mark input as a contract injection.
+pub const Source = enum { os, test_contract };
+pub fn shouldDropEvent(comptime test_mode: bool, isolated: bool, comptime source: Source, event: system_sdk.events.Event) bool {
+    if (source == .test_contract) {
+        if (!test_mode) @compileError("owned contract input requires a test-mode build");
+        return false;
+    }
+    return isolated and isOsPointerEvent(event);
+}
+
+test "background isolation preserves owned contract input while dropping real OS pointer input" {
+    const cancel: system_sdk.events.Event = .{ .mouse_button = .{
+        .window_id = 1,
+        .x = 10,
+        .y = 10,
+        .button = .left,
+        .pressed = false,
+        .cancelled = true,
+    } };
+    const down: system_sdk.events.Event = .{ .mouse_button = .{
+        .window_id = 1,
+        .x = 10,
+        .y = 10,
+        .button = .left,
+        .pressed = true,
+    } };
+    const move: system_sdk.events.Event = .{ .mouse_move = .{
+        .window_id = 1,
+        .x = 10,
+        .y = 10,
+    } };
+    for ([_]system_sdk.events.Event{ cancel, down, move }) |event| {
+        try std.testing.expect(shouldDropEvent(true, true, .os, event));
+        try std.testing.expect(!shouldDropEvent(true, true, .test_contract, event));
+        try std.testing.expect(!shouldDropEvent(true, false, .os, event));
+        // Production input still follows the OS path; contract source fails to compile.
+        try std.testing.expect(shouldDropEvent(false, true, .os, event));
+    }
+}

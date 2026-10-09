@@ -14,7 +14,7 @@ fn require(ok: bool) !void {
 }
 fn pump(app: *App) !void {
     _ = try app.sdk.pump(0);
-    for (app.sdk.events()) |event| app.processEvent(event);
+    for (app.sdk.events()) |event| app.processTestContractEvent(event);
 }
 fn press(app: *App, x: c_int, y: c_int) !void {
     try require(zenit_windows_contract_press(app.win.getNativeSurfaceHandle(), 0, x, y) != 0);
@@ -81,7 +81,7 @@ fn batchedDrag(app: *App, node: *ui.Node, x: c_int, y: c_int) !void {
     try require(@abs(events[1].mouse_move.dx - 20 / scale) < 0.01);
     try require(@abs(events[3].mouse_move.dx - 20 / scale) < 0.01);
     try require(@abs(events[5].mouse_move.dx - 5 / scale) < 0.01);
-    for (events) |event| app.processEvent(event);
+    for (events) |event| app.processTestContractEvent(event);
     try require(record.starts == 1 and record.moves >= 1 and record.ends == 1 and record.cancels == 0);
     try require(@abs(record.delta - 40 / scale) < 0.01 and clicks == 0);
     try require(!app.cx.dispatcher.hasPointerCapture() and app.cx.drag_manager.session == null);
@@ -153,7 +153,7 @@ pub fn run(app: *App, node: *ui.Node) !void {
     try require(@abs(negative[0].mouse_move.y - (-5 / scale)) < 0.01);
     try require(negative[0].mouse_move.modifiers.shift and negative[0].mouse_move.modifiers.ctrl);
     try require(!negative[1].mouse_move.modifiers.shift and !negative[1].mouse_move.modifiers.ctrl);
-    for (negative) |event| app.processEvent(event);
+    for (negative) |event| app.processTestContractEvent(event);
     try batchedDrag(app, node, x, y);
     try require(GetForegroundWindow() == foreground and GetCapture() == capture);
 }

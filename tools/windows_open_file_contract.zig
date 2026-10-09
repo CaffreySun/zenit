@@ -40,8 +40,7 @@ fn parse(line: []const u8, accepted: bool) !void {
 }
 
 pub fn dispatchChild(init: std.process.Init) !bool {
-    const args = try init.minimal.args.toSlice(std.heap.page_allocator);
-    defer std.heap.page_allocator.free(args);
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
     if (args.len < 3 or !std.mem.eql(u8, args[1], "--zenit-open-file-contract")) return false;
     if (std.mem.eql(u8, args[2], "send")) {
         if (args.len != 5) return error.BadOpenFileChildArgs;

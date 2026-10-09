@@ -481,7 +481,9 @@ pub fn main(init: std.process.Init) !void {
     defer _ = gpa.deinit();
 
     const allocator = gpa.allocator();
-    const args = try init.minimal.args.toSlice(allocator);
+    // Args.toSlice may own several allocations on Windows; the process arena
+    // owns the complete argument view on every platform.
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
     var custom_titlebar = false;
     for (args[1..]) |arg| if (std.mem.eql(u8, arg, "--zenit-custom-titlebar")) {
         custom_titlebar = true;

@@ -349,7 +349,8 @@ pub fn build(b: *std.Build) void {
 
     // Cross-compile a real native Win32 window from any development host.
     // It paints only the bridge's diagnostic GDI frame, not the Zenit renderer.
-    const windows_arch = b.option(std.Target.Cpu.Arch, "windows-arch", "Windows native target: aarch64 (default) or x86_64") orelse .aarch64;
+    const default_windows_arch: std.Target.Cpu.Arch = if (b.graph.host.result.os.tag == .windows and b.graph.host.result.cpu.arch == .x86_64) .x86_64 else .aarch64;
+    const windows_arch = b.option(std.Target.Cpu.Arch, "windows-arch", "Windows target: x86_64 or aarch64 (native on Windows, otherwise aarch64)") orelse default_windows_arch;
     if (windows_arch != .aarch64 and windows_arch != .x86_64) @panic("windows-arch must be aarch64 or x86_64");
     // Keep the historical build-step names for existing VM automation.
     const windows_arm64 = b.resolveTargetQuery(.{
@@ -706,8 +707,8 @@ pub fn build(b: *std.Build) void {
     // isCJK); kept in sync with text_layout.findLineBreak.
     text_core_module.addImport("i18n", i18n_module);
 
-    // Bring the actual Zenit UI graph into Windows executables. Keeping its
-    // modules on the ARM64 target catches platform assumptions.
+    // Bring the actual Zenit UI graph into Windows executables. All modules
+    // share the selected Windows target (x86_64 or aarch64).
     const windows_i18n = b.createModule(.{ .root_source_file = b.path("src/i18n/mod.zig"), .target = windows_arm64, .optimize = optimize });
     const windows_text_core = b.createModule(.{ .root_source_file = b.path("src/text_core/text_core.zig"), .target = windows_arm64, .optimize = optimize });
     windows_text_core.addImport("i18n", windows_i18n);
@@ -893,6 +894,11 @@ pub fn build(b: *std.Build) void {
     windows_storybook_root.addImport("ui", windows_ui);
     windows_storybook_root.addImport("zenit_app", windows_app);
     const windows_storybook = b.addExecutable(.{ .name = "zenit-windows-storybook", .root_module = windows_storybook_root });
+    // Debug renderer initialization uses large value temporaries. Windows' default
+    // executable stack is too small; reserve address space (not committed RAM).
+    for ([_]*std.Build.Step.Compile{ windows_storybook, windows_input_example, windows_render_gallery }) |exe| {
+        exe.stack_size = 32 * 1024 * 1024;
+    }
     windows_storybook.root_module.addCSourceFile(.{ .file = b.path("native/windows/window_bridge.c"), .flags = &.{} });
     windows_storybook.root_module.addCSourceFile(.{ .file = b.path("native/windows/recording_bridge.cpp"), .flags = &.{ "-std=c++17", "-fno-exceptions", "-fno-rtti" } });
     windows_storybook.root_module.linkSystemLibrary("mfuuid", .{});
@@ -2065,6 +2071,21 @@ pub fn build(b: *std.Build) void {
         const bench_step = b.step("bench", "Run perf baselines (zig build bench [-- filter] [-- json=path])");
         bench_step.dependOn(&bench_run.step);
     }
+    // Architecture-neutral names are the preferred entry points. Preserve the
+    // old names as aliases for existing VM automation; both install one artifact.
+    const historical_steps = b.allocator.dupe(*std.Build.Step.TopLevel, b.top_level_steps.values()) catch @panic("OOM");
+    for (historical_steps) |top| {
+        const prefix = "windows-arm64-";
+        if (std.mem.startsWith(u8, top.step.name, prefix)) {
+            const name = b.fmt("windows-{s}", .{top.step.name[prefix.len..]});
+            b.step(name, "Build the Windows target selected by -Dwindows-arch").dependOn(&top.step);
+        }
+    }
+    const build_config_tests = b.addTest(.{
+        .root_module = b.createModule(.{ .root_source_file = b.path("build.zig"), .target = b.graph.host, .optimize = .debug }),
+        .filters = &.{"build paths match"},
+    });
+    b.step("test-build-config", "Verify host-independent build path matching").dependOn(&b.addRunArtifact(build_config_tests).step);
     wireReflection(b);
     twins.attachDependencies();
 }
@@ -2188,7 +2209,7 @@ const YixTwins = struct {
                 else => continue,
             };
             for (t.paths.items) |path_| {
-                if (std.mem.eql(u8, source, path_)) {
+                if (buildPathEqual(source, path_)) {
                     step.dependOn(generation);
                     return;
                 }
@@ -2255,6 +2276,27 @@ fn wireReflectionStep(b: *std.Build, step: *std.Build.Step, reflection: *std.Bui
     if (step.cast(std.Build.Step.Compile)) |compile| wireReflectionModule(b, compile.root_module, reflection, clock, environment, headers, seen);
 }
 
+// Build.Module duplicates LazyPath with host-native separators. Match registered
+// repository paths independently of the build host, including mixed separators.
+fn buildPathEqual(actual: []const u8, registered: []const u8) bool {
+    if (actual.len != registered.len) return false;
+    for (actual, registered) |a, r| {
+        if (a == r) continue;
+        if ((a == '/' or a == '\\') and (r == '/' or r == '\\')) continue;
+        return false;
+    }
+    return true;
+}
+
+test "build paths match Windows and POSIX module roots" {
+    try std.testing.expect(buildPathEqual("src/ui/ui.zig", "src/ui/ui.zig"));
+    try std.testing.expect(buildPathEqual("src\\ui\\ui.zig", "src/ui/ui.zig"));
+    try std.testing.expect(buildPathEqual("src/ui\\components\\calendar/mod.zig", "src/ui/components/calendar/mod.zig"));
+    try std.testing.expect(buildPathEqual("src/text/text.zig", "src\\text\\text.zig"));
+    try std.testing.expect(!buildPathEqual("src/ui/tests_root.zig", "src/ui/ui.zig"));
+    try std.testing.expect(!buildPathEqual("src/ui/ui.zig.bak", "src/ui/ui.zig"));
+}
+
 fn wireCHeaders(b: *std.Build, mod: *std.Build.Module, cache: *std.StringHashMap(*std.Build.Module)) void {
     const root = mod.root_source_file orelse return;
     const source = switch (root) {
@@ -2263,10 +2305,10 @@ fn wireCHeaders(b: *std.Build, mod: *std.Build.Module, cache: *std.StringHashMap
     };
     const target = mod.resolved_target orelse b.graph.host;
     const triple = target.query.zigTriple(b.allocator) catch @panic("OOM");
-    if (std.mem.eql(u8, source, "src/ui/ui.zig") or
-        std.mem.eql(u8, source, "src/ui/tests_root.zig") or
-        std.mem.eql(u8, source, "src/ui/bench_facade.zig") or
-        std.mem.eql(u8, source, "src/ui/components/calendar/mod.zig"))
+    if (buildPathEqual(source, "src/ui/ui.zig") or
+        buildPathEqual(source, "src/ui/tests_root.zig") or
+        buildPathEqual(source, "src/ui/bench_facade.zig") or
+        buildPathEqual(source, "src/ui/components/calendar/mod.zig"))
     {
         const key = b.fmt("calendar-{s}", .{triple});
         if (cache.get(key)) |cached| {
@@ -2282,7 +2324,7 @@ fn wireCHeaders(b: *std.Build, mod: *std.Build.Module, cache: *std.StringHashMap
         cache.put(key, c_module) catch @panic("OOM");
         mod.addImport("calendar_time", c_module);
     }
-    if (std.mem.eql(u8, source, "src/text/text.zig") and target.result.os.tag != .macos and target.result.os.tag != .windows) {
+    if (buildPathEqual(source, "src/text/text.zig") and target.result.os.tag != .macos and target.result.os.tag != .windows) {
         const key = b.fmt("freetype-{s}", .{triple});
         if (cache.get(key)) |cached| {
             mod.addImport("text_freetype_c", cached);

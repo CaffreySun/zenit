@@ -8,30 +8,32 @@
 - 构建 GUI 不需要 Node 或 Bun；Yix/Yss 生成器由 Zig 构建并在构建主机运行。
 - 批量验收准备需要 Python 3 和 Bun；编辑器扩展打包需要 Node/npm。
 - macOS 可以交叉编译 Windows `.exe`；Windows PowerShell 也可运行相同构建目标。
-- `windows-arm64-*` 是保留的构建目标名。**实际架构由 `-Dwindows-arch` 决定**，默认 `aarch64`，与名称无关。
+- 推荐使用架构中立的 `windows-*` 构建目标；`windows-arm64-*` 保留为兼容别名。**实际架构由 `-Dwindows-arch` 决定**，Windows x64 主机默认 `x86_64`，Windows ARM64 主机与其他交叉编译主机默认 `aarch64`，与步骤名无关。
 - GUI 必须显式传 `-Dgpu-backend=d3d12`。这些专用 Windows App 目标未选 D3D12 时使用 Null 后端，不能证明实际 GPU 渲染。
 
 ## Windows PC 本机构建
 
-在仓库根目录执行 PowerShell，生产构建先不打开测试模式：
+在仓库根目录执行 PowerShell，普通交互示例先不打开测试模式：
 
 ```powershell
 zig version
-zig build windows-arm64-storybook windows-arm64-text-input windows-arm64-render-gallery -Dwindows-arch=x86_64 -Dgpu-backend=d3d12 -Doptimize=fast --prefix .\out\windows-x64
+zig build windows-storybook windows-text-input windows-render-gallery -Dwindows-arch=x86_64 -Dgpu-backend=d3d12 -Doptimize=fast --prefix .\out\windows-x64
 if ($LASTEXITCODE -ne 0) { throw 'Windows build failed' }
 .\out\windows-x64\bin\zenit-windows-storybook.exe
 ```
+
+普通 gallery 构建不执行创建临时窗口、字体截图等启动合同，也不注册测试专用的指针输入注入回调，其余渲染展示保持可用。需要执行指针合同与 Harness 自动验收时，另加 `-Dtest-mode=true`，并使用独立 prefix，避免覆盖普通程序。不要把 gallery 这个含原生合同探针的回归工具当成生产发布应用。
 
 输出均在所选 prefix 的 `bin` 目录：
 
 | 构建目标 | 输出程序 | 用途 |
 | --- | --- | --- |
-| `windows-arm64-storybook` | `zenit-windows-storybook.exe` | 共享 Storybook、组件交互、DevTools |
-| `windows-arm64-text-input` | `zenit-windows-text-input.exe` | 文本编辑、IME 示例 |
-| `windows-arm64-render-gallery` | `zenit-windows-render-gallery.exe` | 图像、纹理和渲染回归 |
-| `windows-arm64-app-gate` | `zenit-windows-app-gate.exe` | 公开 App 运行时探针 |
-| `windows-arm64-ui-probe` | `zenit-windows-ui-smoke.exe` | UI 交互探针 |
-| `windows-arm64-gpu-resources-contract` | `zenit-windows-gpu-resources-contract.exe` | D3D12 原生资源与 GPU 合同 |
+| `windows-storybook` | `zenit-windows-storybook.exe` | 共享 Storybook、组件交互、DevTools |
+| `windows-text-input` | `zenit-windows-text-input.exe` | 文本编辑、IME 示例 |
+| `windows-render-gallery` | `zenit-windows-render-gallery.exe` | 图像、纹理和渲染回归 |
+| `windows-app-gate` | `zenit-windows-app-gate.exe` | 公开 App 运行时探针 |
+| `windows-ui-probe` | `zenit-windows-ui-smoke.exe` | UI 交互探针 |
+| `windows-gpu-resources-contract` | `zenit-windows-gpu-resources-contract.exe` | D3D12 原生资源与 GPU 合同 |
 
 Windows on Arm 将架构改成 `aarch64`，使用独立 prefix。GPU 合同是独立目标，应带 `-Dwindows-gpu-contract-scope=all`。
 
@@ -40,10 +42,10 @@ Windows on Arm 将架构改成 `aarch64`，使用独立 prefix。GPU 合同是�
 在仓库根目录一次准备四个程序。测试模式打开 Harness，日常发布不要带 `-Dtest-mode=true`。
 
 ```sh
-zig build windows-arm64-storybook windows-arm64-text-input windows-arm64-render-gallery \
+zig build windows-storybook windows-text-input windows-render-gallery \
   -Dwindows-arch=x86_64 -Dgpu-backend=d3d12 -Doptimize=fast -Dtest-mode=true \
   --prefix /tmp/zenit-windows-x64
-zig build windows-arm64-gpu-resources-contract \
+zig build windows-gpu-resources-contract \
   -Dwindows-arch=x86_64 -Dwindows-gpu-contract-scope=all -Doptimize=fast \
   --prefix /tmp/zenit-windows-x64
 ```
@@ -95,7 +97,7 @@ zenit.attach(dep, exe);
 zig build -Dtarget=x86_64-windows-gnu -Doptimize=fast
 ```
 
-这里是消费项目的普通 install 步骤；仓库的 `windows-arm64-*` 专用目标则使用上一节命令。ARM 消费项目使用 `aarch64-windows-gnu`。`.app` 打包只适用于 macOS，Windows 直接运行 `.exe`。
+这里是消费项目的普通 install 步骤；仓库的 `windows-*` 专用目标则使用上一节命令。ARM 消费项目使用 `aarch64-windows-gnu`。`.app` 打包只适用于 macOS，Windows 直接运行 `.exe`。
 
 ## 常见问题与检查
 

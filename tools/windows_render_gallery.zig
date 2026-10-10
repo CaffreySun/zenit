@@ -207,6 +207,7 @@ const Actions = struct {
         clipboard_status.setText(.{ .content = "clipboard-contract=PASS", .font_size = 14, .color = ui.Color.WHITE });
     }
     pub fn replace(_: *@This()) void {
+        const before = app.renderer.image_renderer.getTextureMemoryStats();
         const old = quadrant_id;
         app.renderer.image_renderer.unloadTexture(old);
         app.renderer.image_renderer.unloadTexture(old);
@@ -216,7 +217,14 @@ const Actions = struct {
         first_image.setImage(.{ .texture_id = quadrant_id });
         status.setText(.{ .content = "texture-replaced; old-handles-invalid", .font_size = 14, .color = ui.Color.WHITE });
         const stats = app.renderer.image_renderer.getTextureMemoryStats();
-        std.debug.assert(stats.texture_count == 2 and stats.estimated_bytes == 20);
+        // Shared rendering stores small images in atlas pages; resident GPU
+        // bytes are not the 20 bytes of source pixels. Replacement must retain
+        // the live handle count, irrespective of atlas allocation strategy.
+        if (comptime @hasField(@FieldType(App, "painter"), "state")) {
+            std.debug.assert(stats.slots_used == before.slots_used);
+        } else {
+            std.debug.assert(stats.texture_count == before.texture_count and stats.estimated_bytes == before.estimated_bytes);
+        }
     }
 };
 
@@ -310,8 +318,12 @@ fn mount(cx: *ui.Cx, scope: *ui.Scope) anyerror!*ui.Node {
             self.app_.cx.needs_redraw = true;
         }
     };
-    const pointer_check = try cx.bindState(PointerCheck, .{ .app_ = app, .node = window_status });
-    window_status.behavior.events.on_click = ui.Cx.simpleHandler(PointerCheck.clicked, pointer_check);
+    // Ordinary gallery builds remain interactive without compiling the owned
+    // test-input route. Keep the contract and its runtime guard in test builds.
+    if (@import("zenit_app").test_harness.enabled) {
+        const pointer_check = try cx.bindState(PointerCheck, .{ .app_ = app, .node = window_status });
+        window_status.behavior.events.on_click = ui.Cx.simpleHandler(PointerCheck.clicked, pointer_check);
+    }
     try status_row.appendChild(cx.allocator, window_status);
     const row = try ui.box(cx, .{ .width = .{ .grow = .{} }, .height = .{ .px = 100 }, .direction = .row, .gap = 12 }, .{});
     try root.appendChild(cx.allocator, row);
@@ -441,10 +453,12 @@ fn mount(cx: *ui.Cx, scope: *ui.Scope) anyerror!*ui.Node {
 pub fn main(init: std.process.Init) !void {
     if (try @import("windows_open_file_contract.zig").dispatchChild(init)) return;
     var reused = init_contract.ReusedAllocator{};
-    try reused.beforeReuse(init.io);
+    // Startup contracts create temporary windows and require harness capture.
+    // Run them only in test builds; an ordinary launch should open the gallery.
+    if (@import("zenit_app").test_harness.enabled) try reused.beforeReuse(init.io);
     app = try App.init(reused.allocator(), .{ .io = init.io, .window = .{ .width = 800, .height = 600, .title = "Zenit Windows Render Gallery" }, .clear_color = .{ .r = 20.0 / 255.0, .g = 40.0 / 255.0, .b = 60.0 / 255.0, .a = 1 } });
     defer app.deinit();
-    try reused.afterReuse(app);
+    if (@import("zenit_app").test_harness.enabled) try reused.afterReuse(app);
     // Reject malformed uploads through the public facade before native access.
     if (app.renderer.image_renderer.loadTexture(0, 2, &quadrant)) |_| return error.AcceptedZeroWidth else |_| {}
     if (app.renderer.image_renderer.loadTexture(2, 2, quadrant[0..4])) |_| return error.AcceptedShortPixels else |_| {}

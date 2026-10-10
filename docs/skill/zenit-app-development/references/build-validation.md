@@ -9,12 +9,12 @@ macOS 框架示例：`zig build run-storybook`、`zig build run-hello-button`；
 Windows 框架 Storybook（PowerShell）：
 
 ```powershell
-zig build windows-arm64-storybook -Dwindows-arch=x86_64 -Dgpu-backend=d3d12 -Doptimize=fast
+zig build windows-storybook -Dwindows-arch=x86_64 -Dgpu-backend=d3d12 -Doptimize=fast
 if ($LASTEXITCODE -ne 0) { throw 'Storybook build failed' }
 .\zig-out\bin\zenit-windows-storybook.exe
 ```
 
-历史 `windows-arm64-*` 名称不代表固定 ARM64，架构由 `-Dwindows-arch` 决定，默认 aarch64。专用 UI 步骤必须显式选 D3D12 才有真实 GPU GUI，不能把 Null 后端当渲染验收。
+推荐用 `windows-*`；历史 `windows-arm64-*` 是兼容别名，不代表固定 ARM64。架构由 `-Dwindows-arch` 决定，Windows x64 主机默认 x86_64，其余主机默认 aarch64。专用 UI 步骤必须显式选 D3D12 才有真实 GPU GUI，不能把 Null 后端当渲染验收。gallery 的指针合同仅在 `-Dtest-mode=true` 时注册，普通构建不开放测试输入注入。
 
 消费 app 从 minimal template 改 build 时向 Zenit 依赖显式转发：
 

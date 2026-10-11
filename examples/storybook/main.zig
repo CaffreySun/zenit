@@ -13,6 +13,7 @@ const std = @import("std");
 const ui = @import("ui");
 const zenit_app = @import("zenit_app");
 const MultiWindowApp = zenit_app.MultiWindowApp;
+const Chrome = zenit_app.window_chrome;
 
 const Padding = ui.Padding;
 const light = ui.theme.modes.light;
@@ -25,7 +26,6 @@ const W = ui.widgets;
 
 var g_storybook_cx: ?*ui.Cx = null;
 var g_devtools_close_requested = false;
-var g_windows_custom_titlebar = false;
 /// SIGTERM/SIGINT request a graceful quit so `gpa.deinit()` runs and reports
 /// leaks. The e2e runner stops the app with SIGTERM; without this the process
 /// died before the leak check and every run was leak-blind.
@@ -73,7 +73,7 @@ const WidgetSpec = struct {
     /// panel, outside `story.<key>` (the website frames that panel's root: notes stay out of its
     /// screenshots and videos).
     note: []const u8 = "",
-    /// The story root spans the panel's width; otherwise it hugs its content, centred.
+    /// The story root spans the panel's width; otherwise it hugs its content, left-aligned.
     wide: bool = false,
 };
 
@@ -185,17 +185,17 @@ const NavSection = struct {
 /// inserting a component inside a group cannot silently misclassify every
 /// section after it.
 const NAV_SECTIONS = [_]NavSection{
-    .{ .start_key = "button", .label = "ACTIONS" },
-    .{ .start_key = "input", .label = "INPUTS" },
-    .{ .start_key = "badge", .label = "DATA DISPLAY" },
-    .{ .start_key = "tabs", .label = "NAVIGATION" },
-    .{ .start_key = "notification", .label = "OVERLAYS" },
-    .{ .start_key = "divider", .label = "LAYOUT" },
-    .{ .start_key = "glassbox", .label = "LIQUID GLASS" },
-    .{ .start_key = "canvasevents", .label = "LABS" },
-    .{ .start_key = "glassgroup", .label = "GLASS REGRESSIONS" },
-    .{ .start_key = "popoverregress", .label = "REGRESSIONS" },
-    .{ .start_key = "secsvg", .label = "SECURITY REGRESSIONS" },
+    .{ .start_key = "button", .label = "Actions" },
+    .{ .start_key = "input", .label = "Inputs" },
+    .{ .start_key = "badge", .label = "Data display" },
+    .{ .start_key = "tabs", .label = "Navigation" },
+    .{ .start_key = "notification", .label = "Overlays" },
+    .{ .start_key = "divider", .label = "Layout" },
+    .{ .start_key = "glassbox", .label = "Liquid glass" },
+    .{ .start_key = "canvasevents", .label = "Labs" },
+    .{ .start_key = "glassgroup", .label = "Glass regressions" },
+    .{ .start_key = "popoverregress", .label = "Regressions" },
+    .{ .start_key = "secsvg", .label = "Security regressions" },
 };
 
 const COMPONENT_COUNT_LABEL = std.fmt.comptimePrint("{d} components", .{WIDGETS.len});
@@ -372,66 +372,208 @@ fn mountUI(cx: *ui.Cx, scope: *ui.Scope) anyerror!*ui.Node {
         }
     }
 
-    return v.render(scope, cx, v.row(.{ .style = S.root }, .{
-        // left sidebar - landmark: VoiceOver landmark rotor can jump directly between sidebar nav
-        // and main content; sidebar becomes one nav unit, no longer interleaved with main area by
-        // screen position (verified on real VoiceOver).
-        v.col(.{ .style = S.sidebar, .test_id = "sidebar", .a11y = ui.A11yProps{ .role = .navigation, .label = "Component library" } }, .{
-            v.row(.{ .style = S.brand }, .{
-                v.box(.{ .style = S.logoMark }, .{v.text(.{ .style = S.logoLetter }, "Z")}),
-                v.text(.{ .style = S.brandName }, "Zenit Storybook"),
-            }),
-            v.box(.{ .style = S.searchWrap }, .{
-                v.row(.{ .style = S.searchField }, .{
-                    v.icon(.{ .style = S.searchIcon, .tint = S.searchIconTint }, ui.system_icons.search),
-                    // search box self-draws shell (border / background / icon), embedded Input only
-                    // keeps editable text surface.
-                    v.attrs(.{ .test_id = "storybook.search", .style = S.searchInput }, W.Input(.{
-                        .placeholder = "Search components",
-                        .placeholder_color = light.tokens.color.fg_tertiary,
-                        .size = .sm,
-                        .embedded = true,
-                        .on_change = ui.on.assign(nav.query),
-                    })),
-                }),
-            }),
-            // nav list in ScrollArea: scrollable when component count exceeds window height (mouse
-            // wheel / trackpad). width/height empty -> container grow default, consume remaining
-            // height below header. e2e clickTestId uses test harness scroll-into-view (scroll
-            // target into view before command), so off-screen rows still clickable, see
-            // src/test_harness/command_executor.zig.
-            v.with(W.ScrollArea(.{
-                .direction = .vertical,
-                .padding = .{ .top = 0, .right = 10, .bottom = 12, .left = 10 },
-            }), .{
-                v.listWith(nav, &NAV_ENTRIES, navItem),
-                v.text(.{ .style = S.navEmptyHint, .visible = ui.map(nav.query, noneMatch) }, "No matching components"),
-            }),
-            v.box(.{ .style = S.sidebarFooter }, .{
-                v.text(.{ .style = S.sidebarFooterText }, COMPONENT_COUNT_LABEL),
+    const pager = try scope.createState(Pager, .{ .active = nav.active });
+    // Search, story list and count: the same library in every desktop's sidebar.
+    const library = try v.render(scope, cx, v.col(.{ .style = S.sidebarBody }, .{
+        v.box(.{ .style = S.searchWrap }, .{
+            v.row(.{ .style = S.searchField }, .{
+                v.icon(.{ .style = S.searchIcon, .tint = S.searchIconTint }, ui.system_icons.search),
+                // search box self-draws shell (border / background / icon), embedded Input only
+                // keeps editable text surface.
+                v.attrs(.{ .test_id = "storybook.search", .style = S.searchInput }, W.Input(.{
+                    .placeholder = "Search components",
+                    .placeholder_color = light.tokens.color.fg_tertiary,
+                    .size = .sm,
+                    .embedded = true,
+                    .on_change = ui.on.assign(nav.query),
+                })),
             }),
         }),
+        // nav list in ScrollArea: scrollable when component count exceeds window height (mouse
+        // wheel / trackpad). e2e clickTestId uses test harness scroll-into-view (scroll target
+        // into view before command), so off-screen rows still clickable, see
+        // src/test_harness/command_executor.zig.
+        v.with(W.ScrollArea(.{
+            .direction = .vertical,
+            .padding = .{ .top = 0, .right = 10, .bottom = 12, .left = 10 },
+        }), .{
+            v.listWith(nav, &NAV_ENTRIES, navItem),
+            v.text(.{ .style = S.navEmptyHint, .visible = ui.map(nav.query, noneMatch) }, "No matching components"),
+        }),
+        v.box(.{ .style = S.sidebarFooter }, .{
+            v.text(.{ .style = S.sidebarFooterText }, COMPONENT_COUNT_LABEL),
+        }),
+    }));
+    // Each window backend compiles its own native window design. With a system title bar
+    // (fallback or --native-titlebar) the header stays an ordinary toolbar.
+    const root = try switch (S.backend) {
+        .appkit => macWindow(scope, cx, nav, pager, library),
+        .win32 => windowsWindow(scope, cx, nav, pager, library),
+        else => gnomeWindow(scope, cx, nav, pager, library),
+    };
+    // F11 toggles fullscreen on every desktop (macOS also keeps its native ⌃⌘F).
+    root.behavior.events.on_event_capture = windowKeys;
+    root.behavior.events.capture_context = cx;
+    return root;
+}
 
-        // right workspace
-        v.col(.{ .style = S.workspace, .a11y = ui.A11yProps{ .role = .main } }, .{
-            // Windows custom title bar: reserve right side for window buttons.
-            v.row(.{ .style = .{ S.toolbar, if (g_windows_custom_titlebar) ui.BoxStyle{ .padding = .{ .right = 160 } } else ui.BoxStyle{} } }, .{
-                v.row(.{ .style = S.heading }, .{
-                    v.text(.{ .style = S.category }, ui.map(nav.active, sectionForIndex)),
-                    v.text(decorative, "/"),
-                    v.text(.{ .style = S.title, .test_id = "storybook.title" }, ui.map(nav.active, titleForIndex)),
-                }),
-                v.row(.{
-                    .style = S.devtoolsButton,
-                    .test_id = "storybook.devtools",
-                    .a11y = ui.A11yProps{ .role = .button, .label = "Open DevTools" },
-                    .on_click = ui.on.call(cx, toggleDevtools),
-                }, .{v.text(.{ .style = S.devtoolsLabel }, "DevTools  ⌥⌘I")}),
+/// Sidebar landmark: the VoiceOver rotor jumps between the sidebar nav and the main content
+/// as units (verified on real VoiceOver).
+const sidebar_a11y = ui.A11yProps{ .role = .navigation, .label = "Component library" };
+const main_a11y = ui.A11yProps{ .role = .main };
+
+/// macOS 26 Finder: floating Regular glass sidebar holding the traffic lights, a toolbar of
+/// glass capsules floating over the content, and the title-bar scroll edge.
+fn macWindow(scope: *ui.Scope, cx: *ui.Cx, nav: Nav, pager: *Pager, library: *ui.Node) !*ui.Node {
+    const chrome = try cx.windowChrome();
+    const lead_width = try scope.createMemo(f32, chrome, struct {
+        fn read(state: *ui.Signal(Chrome.State)) f32 {
+            return @max(0, S.content_left - leftControlsReserve(state.get()));
+        }
+    }.read);
+    const TB = W.glass_toolbar;
+    const nav_bar = try W.GlassToolbar(.{ .groups = &[_]TB.ToolbarGroup{.{ .buttons = &[_]TB.ToolbarButton{
+        .{ .icon = ui.system_icons.chevron_left, .label = "Previous story", .on_click = ui.on.call(pager, Pager.previous), .test_id = "storybook.previous" },
+        .{ .icon = ui.system_icons.chevron_right, .label = "Next story", .on_click = ui.on.call(pager, Pager.next), .test_id = "storybook.next" },
+    } }} }).mount(scope, cx);
+    nav_bar.root.style.width = .{ .fit = .{} };
+    const action_bar = try W.GlassToolbar(.{ .groups = &[_]TB.ToolbarGroup{.{ .buttons = &[_]TB.ToolbarButton{
+        .{ .icon = ui.icons.code, .label = "Open DevTools", .on_click = ui.on.call(cx, toggleDevtools), .test_id = "storybook.devtools" },
+    } }} }).mount(scope, cx);
+    action_bar.root.style.width = .{ .fit = .{} };
+    const sidebar = try W.GlassBox(.{ .height = 1, .corner_radius = S.sidebar_radius, .padding = Padding.all(0), .body_gap = 0 }).mountWithState(scope, cx);
+    sidebar.box.style.width = .{ .px = S.sidebar_width };
+    sidebar.box.style.height = .{ .grow = .{} };
+    sidebar.box.meta.ownership.meta.test_id = "sidebar";
+    sidebar.box.behavior.interaction.a11y = sidebar_a11y;
+    // Top row: the traffic lights (title-bar height, part of the drag region).
+    try sidebar.body.appendChild(cx.allocator, try v.render(scope, cx, v.box(.{ .style = S.sidebarTop }, .{})));
+    try sidebar.body.appendChild(cx.allocator, library);
+    return v.render(scope, cx, v.box(.{ .style = S.root }, .{
+        // Content right of the sidebar; stories start below the title bar and scroll under it.
+        v.row(.{ .style = S.content_layer }, .{
+            v.box(.{ .style = S.contentGutter }, .{}),
+            v.col(.{ .style = S.workspace, .a11y = main_a11y }, .{
+                v.dynamic(nav.active, renderContent),
+                // Title-bar edge: content scrolling under the toolbar washes toward the window
+                // background (the measured macOS 26 scroll edge).
+                try W.glass_toolbar.titlebarEdge(cx, .{ .dark = false }),
             }),
-            // right content panel (unload old, mount new on story change, see renderContent).
+        }),
+        v.col(.{ .style = S.sidebar_layer }, .{sidebar.box}),
+        // The header reserves the traffic lights' measured space; the toolbar starts at the
+        // content edge.
+        W.WindowHeader(.{ .test_id = "storybook.header", .style = S.header }, .{
+            v.box(.{ .style = v.styleBy(lead_width, S.headerLeadSized) }, .{}),
+            v.row(.{ .style = S.toolbar }, .{
+                nav_bar.root,
+                v.text(.{ .style = S.title, .test_id = "storybook.title" }, ui.map(nav.active, titleForIndex)),
+                v.box(.{ .style = S.headerSpacer }, .{}),
+                action_bar.root,
+            }),
+        }),
+    }));
+}
+
+fn chromeButton(icon: ui.SvgAsset, label: []const u8, handler: ui.Handler(void), style: ui.BoxStyle) @TypeOf(W.Button(.{})) {
+    return W.Button(.{ .variant = .ghost, .icon_only = true, .icon_asset = icon, .icon_size = @as(f32, 16), .a11y_label = label, .on_click = handler, .base_style = style });
+}
+
+/// Windows 11: Mica window, 48 px title bar (back / forward, app icon and name, caption
+/// buttons flush top-right), navigation pane on the Mica, page on a content card.
+fn windowsWindow(scope: *ui.Scope, cx: *ui.Cx, nav: Nav, pager: *Pager, library: *ui.Node) !*ui.Node {
+    const X = S.win;
+    return v.render(scope, cx, v.col(.{ .style = X.root }, .{
+        W.WindowHeader(.{ .test_id = "storybook.header", .style = X.titlebar }, .{
+            W.WindowControls(.{ .side = .left, .fullscreen_controls = true, .height = S.header_height }),
+            v.attrs(.{ .test_id = "storybook.previous" }, chromeButton(ui.system_icons.chevron_left, "Previous story", ui.on.call(pager, Pager.previous), X.titleButton)),
+            v.attrs(.{ .test_id = "storybook.next" }, chromeButton(ui.system_icons.chevron_right, "Next story", ui.on.call(pager, Pager.next), X.titleButton)),
+            v.box(.{ .style = X.appIcon }, .{v.text(.{ .style = X.appIconLetter }, "Z")}),
+            v.text(.{ .style = X.appTitle }, "Zenit Storybook"),
+            v.box(.{ .style = S.headerSpacer }, .{}),
+            v.attrs(.{ .test_id = "storybook.devtools" }, chromeButton(ui.icons.code, "Open DevTools (Ctrl+Shift+I)", ui.on.call(cx, toggleDevtools), X.titleButton)),
+            W.WindowControls(.{ .side = .right, .fullscreen_controls = true, .height = S.header_height }),
+        }),
+        v.row(.{ .style = X.body }, .{
+            v.col(.{ .style = X.navPane, .test_id = "sidebar", .a11y = sidebar_a11y }, .{library}),
+            v.col(.{ .style = X.card, .a11y = main_a11y }, .{
+                // Settings-style page title: parent section, then the page.
+                v.row(.{ .style = X.pageHeader, .test_id = "storybook.page" }, .{
+                    v.text(.{ .style = X.pageParent }, ui.map(nav.active, sectionForIndex)),
+                    v.text(.{ .style = X.pageParent, .a11y = ui.A11yProps{ .hidden = true } }, "›"),
+                    v.text(.{ .style = X.pageTitle, .test_id = "storybook.title" }, ui.map(nav.active, titleForIndex)),
+                }),
+                v.dynamic(nav.active, renderContent),
+            }),
+        }),
+    }));
+}
+
+/// GNOME / libadwaita split view: the sidebar pane and the content pane each have a header
+/// bar; caption buttons follow the desktop's layout (left ones over the sidebar, right ones
+/// over the content).
+fn gnomeWindow(scope: *ui.Scope, cx: *ui.Cx, nav: Nav, pager: *Pager, library: *ui.Node) !*ui.Node {
+    const G = S.gnome;
+    return v.render(scope, cx, v.row(.{ .style = G.root }, .{
+        v.col(.{ .style = G.sidebar, .test_id = "sidebar", .a11y = sidebar_a11y }, .{
+            W.DragRegion(.{ .style = G.header }, .{
+                W.WindowControls(.{ .side = .left, .fullscreen_controls = true }),
+                v.box(.{ .style = S.headerSpacer }, .{}),
+                v.text(.{ .style = G.title }, "Zenit Storybook"),
+                v.box(.{ .style = S.headerSpacer }, .{}),
+            }),
+            library,
+        }),
+        v.col(.{ .style = G.content, .a11y = main_a11y }, .{
+            W.WindowHeader(.{ .test_id = "storybook.header", .style = G.contentHeader }, .{
+                v.attrs(.{ .test_id = "storybook.previous" }, chromeButton(ui.system_icons.chevron_left, "Previous story", ui.on.call(pager, Pager.previous), G.flatButton)),
+                v.attrs(.{ .test_id = "storybook.next" }, chromeButton(ui.system_icons.chevron_right, "Next story", ui.on.call(pager, Pager.next), G.flatButton)),
+                v.box(.{ .style = S.headerSpacer }, .{}),
+                v.text(.{ .style = G.title, .test_id = "storybook.title" }, ui.map(nav.active, titleForIndex)),
+                v.box(.{ .style = S.headerSpacer }, .{}),
+                v.attrs(.{ .test_id = "storybook.devtools" }, chromeButton(ui.icons.code, "Open DevTools (Ctrl+Shift+I)", ui.on.call(cx, toggleDevtools), G.flatButton)),
+                W.WindowControls(.{ .side = .right, .fullscreen_controls = true }),
+            }),
             v.dynamic(nav.active, renderContent),
         }),
     }));
+}
+
+/// Toolbar back / forward: step through the stories in sidebar order.
+const Pager = struct {
+    active: *ui.Signal(usize),
+    fn previous(p: *Pager) void {
+        const i = p.active.peek();
+        p.active.set(if (i == 0) WIDGETS.len - 1 else i - 1);
+    }
+    fn next(p: *Pager) void {
+        p.active.set((p.active.peek() + 1) % WIDGETS.len);
+    }
+};
+
+/// Space the header reserves for native controls on its left (macOS traffic lights), so
+/// the leading segment still ends at the sidebar edge. Mirrors WindowHeader's inset.
+fn leftControlsReserve(state: Chrome.State) f32 {
+    if (state.effective_mode != .custom or state.controls_owner != .native) return 0;
+    if (!state.controls_geometry_known) return S.content_left;
+    var reserve: f32 = 0;
+    for (state.native_controls[0..state.native_controls_count]) |r| {
+        if (r.x + r.w / 2 < state.width / 2) reserve = @max(reserve, r.x + r.w + 8);
+    }
+    return reserve;
+}
+
+fn windowKeys(ev: ui.events.Event, raw: ?*anyopaque) ui.events.EventResult {
+    const cx: *ui.Cx = @ptrCast(@alignCast(raw orelse return .ignored));
+    switch (ev) {
+        .key_down => |key| if (key.key == .f11) {
+            const fullscreen = if (cx.windowChrome()) |c| c.peek().fullscreen else |_| false;
+            cx.performWindowAction(.{ .fullscreen = !fullscreen }) catch {};
+            return .stop;
+        },
+        else => {},
+    }
+    return .ignored;
 }
 
 fn renderContent(index: usize, scope: *ui.Scope, cx: *ui.Cx) !*ui.Node {
@@ -453,8 +595,8 @@ fn renderStoryContent(comptime spec: WidgetSpec, scope: *ui.Scope, cx: *ui.Cx) !
     } else .{v.component(StoryPanel(spec).build, {})};
     if (spec.scrolls) return v.render(scope, cx, v.with(W.ScrollArea(.{
         .direction = .vertical,
-        .padding = Padding.all(light.tokens.space.space800),
-        .background = light.tokens.color.bg_primary,
+        .padding = .{ .top = S.content_top, .right = light.tokens.space.space800, .bottom = light.tokens.space.space800, .left = light.tokens.space.space800 },
+        .background = S.content_bg,
     }), .{
         v.col(.{ .style = S.contentColumn, .test_id = "content" }, body),
     }));
@@ -471,7 +613,7 @@ fn StoryPanel(comptime spec: WidgetSpec) type {
 
 /// story displayed on content canvas, retains separate mount boundary and test marker.
 fn renderStoryPanel(comptime spec: WidgetSpec, scope: *ui.Scope, cx: *ui.Cx) !*ui.Node {
-    return v.render(scope, cx, v.col(.{ .style = if (spec.wide) S.panel else S.panelCentred, .test_id = "story." ++ spec.key }, .{
+    return v.render(scope, cx, v.col(.{ .style = if (spec.wide) S.panel else S.panelHug, .test_id = "story." ++ spec.key }, .{
         v.component(spec.build, {}),
     }));
 }
@@ -484,20 +626,36 @@ pub fn main(init: std.process.Init) !void {
     // Args.toSlice may own several allocations on Windows; the process arena
     // owns the complete argument view on every platform.
     const args = try init.minimal.args.toSlice(init.arena.allocator());
-    var custom_titlebar = false;
-    for (args[1..]) |arg| if (std.mem.eql(u8, arg, "--zenit-custom-titlebar")) {
-        custom_titlebar = true;
-    };
-    g_windows_custom_titlebar = custom_titlebar and @import("builtin").os.tag == .windows;
+    // --native-titlebar: system title bar, the header becomes an ordinary toolbar.
+    // --zenit-custom-titlebar: platform-drawn caption controls over the header (the
+    // attended Windows DWM caption fixture).
+    var native_titlebar = false;
+    var native_controls = @import("builtin").os.tag == .macos;
+    var require_gpu_validation = false;
+    for (args[1..]) |arg| {
+        if (std.mem.eql(u8, arg, "--native-titlebar")) native_titlebar = true;
+        if (std.mem.eql(u8, arg, "--zenit-custom-titlebar")) native_controls = true;
+        if (@import("builtin").os.tag == .linux and std.mem.eql(u8, arg, "--validation")) require_gpu_validation = true;
+    }
     var application = MultiWindowApp.init(allocator, .{ .pump_timeout_ms = 16 });
     defer application.deinit();
 
-    const storybook = try application.createWindowWith(.{
+    var storybook_config: @typeInfo(@TypeOf(MultiWindowApp.createWindowWith)).@"fn".param_types[1].? = .{
         .io = init.io,
         .font = .{ .locale = "zh-CN" },
-        .window = .{ .width = 1100, .height = 1000, .title = "zenit Storybook", .titlebar = if (custom_titlebar) .custom_inset else .default, .titlebar_drag_right_inset = if (custom_titlebar) 160 else 0 },
+        .window = .{
+            .width = 1100,
+            .height = 1000,
+            .min_width = 640,
+            .min_height = 420,
+            .title = "zenit Storybook",
+            .titlebar_height = S.header_height,
+            .chrome = if (native_titlebar) .native else .{ .custom = .{ .controls = if (native_controls) .automatic else .application, .unsupported = .use_native } },
+        },
         .idle_skip_frames = true,
-    }, mountUI);
+    };
+    if (comptime @import("builtin").os.tag == .linux) storybook_config.require_gpu_validation = require_gpu_validation;
+    const storybook = try application.createWindowWith(storybook_config, mountUI);
     const storybook_window_id = storybook.windowId();
     if (zenit_app.test_harness.enabled and @import("builtin").os.tag == .macos)
         @import("atlas_eviction_fixture.zig").install(storybook);
@@ -554,11 +712,13 @@ pub fn main(init: std.process.Init) !void {
 
         if (target.cx.inspector.enabled) {
             if (devtools_window_id == null) {
-                const devtools = try application.createWindowWith(.{
+                var devtools_config: @TypeOf(storybook_config) = .{
                     .io = init.io,
                     .window = .{ .width = 980, .height = 720, .title = "Zenit Storybook DevTools" },
                     .idle_skip_frames = true,
-                }, mountDevtools);
+                };
+                if (comptime @import("builtin").os.tag == .linux) devtools_config.require_gpu_validation = require_gpu_validation;
+                const devtools = try application.createWindowWith(devtools_config, mountDevtools);
                 devtools_window_id = devtools.windowId();
             }
         } else if (devtools_window_id) |id| {

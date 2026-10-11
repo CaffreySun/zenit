@@ -200,7 +200,7 @@ pub const Painter = struct {
         defer self.allocator.free(tree_name);
         try dir.writeFile(self.state.renderer.io, .{ .sub_path = tree_name, .data = tree });
         const metadata = try std.json.Stringify.valueAlloc(self.allocator, .{
-            .backend = "d3d12",
+            .backend = @tagName(gpu.backend_kind),
             .index = self.capture_count,
             .window_id = window.getWindowId(),
             .frame_serial = self.state.renderer.frame_count,
@@ -233,12 +233,14 @@ pub const Painter = struct {
     pub fn resetTiming(self: *Painter) void {
         self.state.renderer.timing_ring.reset();
         self.state.renderer.gpu_timing_ring.reset();
+        self.state.renderer.gpu_timing_disjoint_samples = 0;
+        self.state.renderer.gpu_timing_failed_samples = 0;
         self.state.renderer.frame_count = 0;
     }
     pub fn timingStats(self: *Painter) legacy.TimingStats {
         const r = &self.state.renderer;
         const last = r.last_frame_stats;
-        return .{ .frame_count = r.frame_count, .last = .{ .gpu_execute_us = last.gpu_execute_us, .cpu_frame_us = last.cpu_frame_us, .total_frame_us = last.total_frame_us, .layout_us = last.layout_us, .render_gen_us = last.render_gen_us, .gpu_encode_us = last.gpu_encode_us }, .cpu_p95_us = r.timing_ring.cpuPercentile(95), .total_p95_us = r.timing_ring.totalPercentile(95), .cpu_timing_samples = r.timing_ring.len, .gpu_p95_us = r.gpu_timing_ring.gpuPercentile(95), .timing_samples = r.gpu_timing_ring.len, .query_supported = if (r.gpu_timing_ring.len > 0) 1 else 0 };
+        return .{ .frame_count = r.frame_count, .last = .{ .gpu_execute_us = last.gpu_execute_us, .cpu_frame_us = last.cpu_frame_us, .total_frame_us = last.total_frame_us, .layout_us = last.layout_us, .render_gen_us = last.render_gen_us, .gpu_encode_us = last.gpu_encode_us }, .cpu_p95_us = r.timing_ring.cpuPercentile(95), .total_p95_us = r.timing_ring.totalPercentile(95), .cpu_timing_samples = r.timing_ring.len, .gpu_p95_us = r.gpu_timing_ring.gpuPercentile(95), .timing_samples = r.gpu_timing_ring.len, .disjoint_samples = r.gpu_timing_disjoint_samples, .failed_samples = r.gpu_timing_failed_samples, .query_supported = if (r.gpu_timing_ring.len > 0 or r.gpu_timing_disjoint_samples > 0) 1 else 0 };
         // Report support only after a native query actually resolves. Missing
         // results remain unknown; CPU frame timing is never used as a substitute.
     }

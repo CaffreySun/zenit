@@ -37,7 +37,7 @@ test("frame cost per scene", async () => {
     const f0 = (await stats()).frame_count;
     const t0 = Date.now();
     const parts: Record<string, number[]> = {};
-    const keys = ["encode_us", "wait_for_frame_us", "total_frame_us", "gpu_execute_us", "glass_count", "glass_us", "texture_creates", "render_passes", "blit_passes", "pass_native_us"];
+    const keys = ["layout_us", "render_gen_us", "gpu_encode_us", "acquire_texture_us", "flush_us", "cpu_frame_us", "encode_us", "wait_for_frame_us", "total_frame_us", "gpu_execute_us", "glass_count", "glass_us", "texture_creates", "render_passes", "blit_passes", "pass_native_us"];
     while (Date.now() - t0 < 4000) {
       const p = await stats() as any;
       for (const k of keys) if (typeof p[k] === "number") (parts[k] ??= []).push(p[k]);

@@ -19,17 +19,27 @@ test("Windows native dialogs return Unicode open/save/folder paths, cancellation
       const s=await native({action:"status"});
       return s.foreground_owned && s.foreground_class==="#32770" && s.foreground_owner===s.hwnd ? s : null;
     },10000,100);
-    // Foreground precedes the common dialog's initial Shell paint.
-    await sleep(500);
     const path=`${getSessionDir()}/windows-native-dialog-${stage}.png`;
-    assert((await request("POST","/windows/native-desktop",{path})).ok,`${stage}: desktop capture failed`);
-    const png=decodePng(path);
-    let neutral=0;
-    for(let i=0;i<png.pixels.length;i+=png.channels) {
-      const rgb=[png.pixels[i],png.pixels[i+1],png.pixels[i+2]];
-      if(Math.max(...rgb)-Math.min(...rgb)<12 && Math.max(...rgb)>10)neutral++;
-    }
-    const fraction=neutral/(png.width*png.height);
+    // Foreground ownership precedes Shell's first paint, particularly under
+    // x86 emulation. Wait for the same strict pixel criterion, rather than
+    // assuming a fixed delay is enough for an independently painted window.
+    const started=Date.now();
+    const fraction=await waitFor(async()=>{
+      const owned=await native({action:"status"});
+      assert(owned.foreground_owned && owned.foreground_hwnd===status.foreground_hwnd &&
+        owned.foreground_class==="#32770" && owned.foreground_owner===owned.hwnd,
+        `${stage}: native dialog lost foreground ownership before painting`);
+      assert((await request("POST","/windows/native-desktop",{path})).ok,`${stage}: desktop capture failed`);
+      const png=decodePng(path);
+      let neutral=0;
+      for(let i=0;i<png.pixels.length;i+=png.channels) {
+        const rgb=[png.pixels[i],png.pixels[i+1],png.pixels[i+2]];
+        if(Math.max(...rgb)-Math.min(...rgb)<12 && Math.max(...rgb)>10)neutral++;
+      }
+      const value=neutral/(png.width*png.height);
+      console.log(`  ${stage}: native paint after ${Date.now()-started}ms, neutral coverage=${value}`);
+      return value>.4 ? value : null;
+    },10000,100);
     assert(fraction>.4,`${stage}: native dialog pixels absent; neutral coverage=${fraction}`);
     console.log(`  ${stage}: ${status.foreground_title}, native neutral coverage=${fraction}, ${path}`);
   };

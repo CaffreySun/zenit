@@ -115,7 +115,40 @@ pub const ColorAttachment = gpu.RenderPassColorAttachment;
 pub const DepthStencilAttachment = gpu.RenderPassDepthStencilAttachment;
 pub const RenderPassDescriptor = gpu.RenderPassDescriptor;
 const StoredUniform = struct { buffer: d12.Buffer, offset: u64 = 0, size: u64 };
-const StoredVertex = struct { buffer: d12.Buffer, offset: u64 };
+const StoredVertex = struct { buffer: d12.Buffer, offset: u64, size: ?u64 = null };
+fn bufferRangeSize(capacity: u64, offset: u64, size: ?u64) !u64 {
+    if (offset > capacity) return error.InvalidBufferRange;
+    const available = capacity - offset;
+    const bound = size orelse available;
+    if (bound == 0 or bound > available) return error.InvalidBufferRange;
+    return bound;
+}
+
+fn reflectedUniformSize(available: u64, reflected: u64) !u64 {
+    if (reflected > 65536) return error.InvalidUniformData;
+    const capped = @min(available, @as(u64, 65536));
+    return if (reflected == 0) capped else @min(capped, std.mem.alignForward(u64, reflected, 16));
+}
+
+test "uniform bindings exclude allocation tails and preserve register padding" {
+    try std.testing.expectEqual(@as(u64, 352), try reflectedUniformSize(4 * 1024 * 1024, 340));
+    try std.testing.expectEqual(@as(u64, 352), try reflectedUniformSize(352, 340));
+    // A short source stays short: the caller must reject it or explicitly
+    // snapshot/zero-pad it, rather than exposing bytes past the source range.
+    try std.testing.expectEqual(@as(u64, 340), try reflectedUniformSize(340, 352));
+    try std.testing.expectEqual(@as(u64, 65536), try reflectedUniformSize(131072, 0));
+    try std.testing.expectEqual(@as(u64, 65536), try reflectedUniformSize(65536, 65536));
+    try std.testing.expectError(error.InvalidUniformData, reflectedUniformSize(131072, 65537));
+}
+
+test "explicit buffer ranges retain payload bounds within large allocations" {
+    try std.testing.expectEqual(@as(u64, 512), try bufferRangeSize(10 * 1024 * 1024, 256, 512));
+    try std.testing.expectEqual(@as(u64, 768), try bufferRangeSize(1024, 256, null));
+    try std.testing.expectError(error.InvalidBufferRange, bufferRangeSize(1024, 1025, 1));
+    try std.testing.expectError(error.InvalidBufferRange, bufferRangeSize(1024, 1024, null));
+    try std.testing.expectError(error.InvalidBufferRange, bufferRangeSize(1024, 256, 769));
+    try std.testing.expectError(error.InvalidBufferRange, bufferRangeSize(1024, 0, 0));
+}
 const RenderState = struct {
     inner: d12.RenderPass,
     target_size: [2]f32,
@@ -179,6 +212,14 @@ pub const RenderPass = struct {
         current.fragment_buffers[slot] = .{ .buffer = owned, .offset = offset };
         if (current.fragment_bytes[slot]) |*old| old.buffer.destroy();
         current.fragment_bytes[slot] = null;
+    }
+    pub fn setVertexBufferRange(self: *RenderPass, slot: u32, buffer: *const d12.Buffer, offset: u64, size: u64) void {
+        self.setVertexBuffer(slot, buffer, offset);
+        self.state().vertices[slot].?.size = size;
+    }
+    pub fn setFragmentBufferRange(self: *RenderPass, slot: u32, buffer: *const d12.Buffer, offset: u64, size: u64) void {
+        self.setFragmentBuffer(slot, buffer, offset);
+        self.state().fragment_buffers[slot].?.size = size;
     }
     pub fn setFragmentTextureBindingChecked(self: *RenderPass, slot: u32, texture: resources.TextureBinding) !void {
         if (!self.isActive()) return error.InvalidEncoderState;
@@ -253,15 +294,19 @@ pub const RenderPass = struct {
             _ = CommandBuffer.error_count.fetchAdd(1, .monotonic);
         };
     }
-    fn uniformEntry(current: *RenderState, vertex: bool, slot: u32) !d12.BindGroupEntry {
+    fn bufferEntry(current: *RenderState, vertex: bool, slot: u32) !d12.BindGroupEntry {
         const uniforms = if (vertex) &current.vertex_bytes else &current.fragment_bytes;
         const buffers = if (vertex) &current.vertices else &current.fragment_buffers;
         if (uniforms[slot]) |*u| return .{ .binding = slot, .buffer = &u.buffer, .offset = u.offset, .size = u.size };
         if (buffers[slot]) |*b| {
-            if (b.offset > b.buffer.size) return error.InvalidUniformData;
-            return .{ .binding = slot, .buffer = &b.buffer, .offset = b.offset, .size = @min(@as(u64, 65536), b.buffer.size - b.offset) };
+            return .{ .binding = slot, .buffer = &b.buffer, .offset = b.offset, .size = try bufferRangeSize(b.buffer.size, b.offset, b.size) };
         }
         return error.UniformNotSet;
+    }
+    fn uniformEntry(current: *RenderState, vertex: bool, slot: u32) !d12.BindGroupEntry {
+        var entry = try bufferEntry(current, vertex, slot);
+        entry.size = @min(@as(u64, 65536), entry.size.?);
+        return entry;
     }
     pub fn drawChecked(self: *RenderPass, vertex_count: u32, instance_count: u32, first_vertex: u32, first_instance: u32) !void {
         if (!self.isActive()) return error.InvalidEncoderState;
@@ -275,7 +320,7 @@ pub const RenderPass = struct {
                 bindings[count] = .{ .buffer = &u.buffer, .slot = @intCast(slot), .offset = u.offset, .size = u.size };
             } else {
                 const value = if (vertex.*) |*v| v else return error.VertexBufferNotSet;
-                bindings[count] = .{ .buffer = &value.buffer, .slot = @intCast(slot), .offset = value.offset };
+                bindings[count] = .{ .buffer = &value.buffer, .slot = @intCast(slot), .offset = value.offset, .size = value.size };
             }
             count += 1;
         }
@@ -324,6 +369,10 @@ pub const RenderPass = struct {
                         // Inline snapshots already own zeroed native padding.
                         const inline_bytes = if (binding.visibility & 1 != 0) &current.vertex_bytes else &current.fragment_bytes;
                         if (inline_bytes[binding.binding] != null) entry.size = std.mem.alignForward(u64, entry.size.?, 16);
+                        // Bind only the shader's declared registers. Using the
+                        // remainder of a large upload allocation copies up to
+                        // 64 KiB per tiny uniform and includes unrelated slots.
+                        entry.size = try reflectedUniformSize(entry.size.?, binding.min_size);
                         // Shared renderers append CPU-sized uniforms (e.g.340
                         // bytes), whereas native CBV addresses align to256.
                         // Snapshot an unaligned host-visible range per draw;
@@ -348,11 +397,9 @@ pub const RenderPass = struct {
                         entry.binding = binding.binding;
                     },
                     2 => {
-                        entry = try uniformEntry(current, binding.visibility & 1 != 0, binding.binding);
-                        // Storage SRVs expose the whole remaining range, not the CBV cap.
-                        const bytes = if (binding.visibility & 1 != 0) &current.vertex_bytes else &current.fragment_bytes;
-                        const buffers = if (binding.visibility & 1 != 0) &current.vertices else &current.fragment_buffers;
-                        entry.size = if (bytes[binding.binding]) |u| u.size else if (buffers[binding.binding]) |b| b.buffer.size - b.offset else return error.UniformNotSet;
+                        // Explicit renderer spans expose only the uploaded
+                        // batch; ordinary bindings retain their full range.
+                        entry = try bufferEntry(current, binding.visibility & 1 != 0, binding.binding);
                         entry.stride = try pipeline.bufferStride(binding.group, binding.binding);
                         // Capacity allocations may end in a partial element
                         // (Path's byte-sized growth with28-byte vertices).
@@ -363,8 +410,9 @@ pub const RenderPass = struct {
                             if (entry.size.? == 0) return error.InvalidStorageData;
                         }
                         if (binding.visibility == 3) {
-                            const other = try uniformEntry(current, false, binding.binding);
-                            if (entry.buffer.?.raw != other.buffer.?.raw or entry.offset != other.offset) return error.SharedStorageMismatch;
+                            var other = try bufferEntry(current, false, binding.binding);
+                            if (entry.stride != 0) other.size = other.size.? - other.size.? % entry.stride;
+                            if (entry.buffer.?.raw != other.buffer.?.raw or entry.offset != other.offset or entry.size != other.size) return error.SharedStorageMismatch;
                         }
                     },
                     1 => {
@@ -526,10 +574,14 @@ const SharedCommand = struct {
 };
 pub const CommandBuffer = struct {
     shared: *SharedCommand,
-    pub var error_count: std.atomic.Value(u64) = .init(0);
+    pub var error_count: std.atomic.Value(usize) = .init(0);
     pub fn submitChecked(self: *CommandBuffer) !void {
         if (self.shared.serial != null) return error.CommandAlreadySubmitted;
-        const queue = &self.shared.context.queue;
+        const context = self.shared.context;
+        // Texture writes recorded during this frame execute before its draws.
+        // A failed flush leaves the frame unsubmitted.
+        try context.flushUploads();
+        const queue = &context.queue;
         const before = queue.last_serial;
         const serial = queue.submit(&.{self.shared.inner}) catch |err| {
             // Signal failure can follow real execution. Keep its serial and
@@ -564,6 +616,9 @@ pub const CommandBuffer = struct {
     pub fn isCompleted(self: *const CommandBuffer) bool {
         self.waitChecked(0) catch return false;
         return true;
+    }
+    pub fn gpuTimingResult(self: *const CommandBuffer) d12.GpuTimingResult {
+        return self.shared.inner.gpuTimingResult();
     }
     pub fn gpuElapsedMicros(self: *const CommandBuffer) ?u64 {
         return self.shared.inner.gpuElapsedMicros();

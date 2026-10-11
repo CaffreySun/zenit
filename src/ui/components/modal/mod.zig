@@ -48,6 +48,9 @@ pub const ModalProps = struct {
     close_on_overlay: bool = true,
     /// Close button SVG asset (optional, null fallback text X)
     close_icon_asset: ?svg_assets.Asset = null,
+    /// Opening and closing motion. Set to .none for a fixed presentation.
+    enter_transition: overlay_stack.Transition = .scale_fade,
+    exit_transition: overlay_stack.Transition = .scale_fade,
     /// User-initiated toggle (X/Esc/mask-click) fires after settling, param is settled toggle
     /// state.
     on_open_change: ?Handler(bool) = null,
@@ -126,8 +129,8 @@ pub const ModalBuilder = struct {
                 .outside_click = if (p.close_on_overlay) .close else .none,
                 .escape = true,
             },
-            .enter_transition = .scale_fade,
-            .exit_transition = .scale_fade,
+            .enter_transition = p.enter_transition,
+            .exit_transition = p.exit_transition,
             .focus = .{ .trap = true, .auto_focus = true, .restore = true },
             .on_dismiss_request = core.Cx.simpleHandler(ModalRuntime.requestClose, rt),
         });

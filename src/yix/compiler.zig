@@ -244,6 +244,7 @@ const attr_visible: HostAttr = .{ .name = "visible", .doc = "bool 或 bool 源�
 const attr_hit_test: HostAttr = .{ .name = "hitTest", .doc = "false：不参与命中（点击穿透）" };
 
 pub const box_attrs = [_]HostAttr{
+    .{ .name = "windowRegion", .doc = "自绘窗口外框时该区域的系统含义（.drag 拖动窗口、.resize_* 缩放、.minimize / .maximize / .close 标题栏按钮）" },
     attr_style,
     attr_test_id,
     attr_a11y,

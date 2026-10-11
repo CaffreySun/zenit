@@ -4,6 +4,7 @@ const text = @import("text");
 const App = @import("zenit_app").App;
 const Window = @FieldType(App, "win");
 extern "user32" fn GetForegroundWindow() callconv(.winapi) ?*anyopaque;
+extern fn zenit_windows_contract_background(c_int) c_int;
 extern fn zenit_d3d11_contract_text_stats(*anyopaque, *[2]u64) void;
 const sample = "AV ffi Windows";
 var label: *ui.Node = undefined;
@@ -38,6 +39,8 @@ fn pixelHash(app: *App, path: [:0]const u8) !u64 {
     return std.hash.Wyhash.hash(0, bytes[start..]);
 }
 pub fn run(io: std.Io) !void {
+    const background = zenit_windows_contract_background(1);
+    defer _ = zenit_windows_contract_background(background);
     var stage: []const u8 = "init";
     errdefer std.log.err("Windows font range paint stage={s}", .{stage});
     const before = Window.liveWindowCount();
@@ -178,13 +181,18 @@ pub fn run(io: std.Io) !void {
         label.setText(.{ .content = "中文", .font_size = 24, .use_italic_font = true, .color = ui.Color.rgb(0, 0, 0) });
         try app.frame();
         const italic_reference = try pixelHash(app, path);
+        std.log.info("CJK italic pixel hashes regular={x} italic={x}", .{ cjk_regular_hash, italic_reference });
         try require(italic_reference != cjk_regular_hash);
+        stage = "stack-italic-fallback";
         app.setFontSelector(&app.font_selector);
         app.setFallbackStack(&stack);
         try app.frame();
-        try require(try pixelHash(app, path) == italic_reference);
+        const italic_fallback = try pixelHash(app, path);
+        std.log.info("CJK italic fallback pixel hashes reference={x} fallback={x}", .{ italic_reference, italic_fallback });
+        try require(italic_fallback == italic_reference);
         app.setFallbackStack(null);
         app.setFontSelector(&app.font_selector);
+        stage = "stack-italic-foreground";
         try require(GetForegroundWindow() == foreground);
     }
     try require(Window.liveWindowCount() == before and GetForegroundWindow() == foreground);

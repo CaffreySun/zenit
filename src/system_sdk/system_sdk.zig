@@ -6,6 +6,7 @@
 /// - Supports capability detection (capabilities)
 const std = @import("std");
 
+pub const window_chrome = @import("window_chrome.zig");
 pub const api = @import("api.zig");
 pub const vtable = @import("vtable.zig");
 pub const backends = @import("backends/mod.zig");

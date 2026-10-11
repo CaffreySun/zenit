@@ -241,7 +241,7 @@ export async function query(testId: string): Promise<QueryNode[]> {
 }
 
 export interface FrameStats {
-  renderer_backend?: "d3d12" | "legacy" | null;
+  renderer_backend?: "d3d12" | "d3d11" | "legacy" | null;
   window_scale?: number | null;
   retained_hits: number;
   retained_misses: number;

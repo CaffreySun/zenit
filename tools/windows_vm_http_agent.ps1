@@ -18,6 +18,16 @@ $PID | Set-Content (Join-Path $PSScriptRoot 'agent.pid')
 # 502/503/504, and Cloudflare's 520-530 while its edge reconnects to the origin —
 # or drops the connection. Retry those for about 90 s instead of aborting the
 # job and its app; any other HTTP status is a real error.
+# Diagnostic tracing must not abort a job when a concurrent evidence reader
+# briefly locks the file (for example VMware CopyFileFromGuestToHost).
+function Write-AgentTrace {
+  param([Parameter(Mandatory=$true)][string]$Path,
+        [Parameter(ValueFromPipeline=$true)][string]$Message)
+  process {
+    try { Add-Content -LiteralPath $Path -Value $Message -ErrorAction Stop }
+    catch { Write-Warning ("Diagnostic trace append failed: " + $_.Exception.Message) }
+  }
+}
 function Invoke-Retrying([scriptblock]$call) {
   $deadline = [DateTime]::UtcNow.AddSeconds(90)
   for ($attempt = 1; ; $attempt++) {
@@ -113,7 +123,9 @@ function Upload-BatchArchive([string]$jobId, [string]$name, [string]$path) {
 }
 
 function Wait-RpcResult([string]$path, [object]$proc) {
-  $deadline = [DateTime]::UtcNow.AddSeconds(15)
+  # Match the suite's 40-second command deadline. A native contract may render
+  # several resized frames inside one RPC, especially under x64 emulation.
+  $deadline = [DateTime]::UtcNow.AddSeconds(40)
   while ([DateTime]::UtcNow -lt $deadline) {
     if (Test-Path $path) {
       # The shared harness may still hold the newly created response open.
@@ -196,7 +208,7 @@ function Next-SuiteRpc([System.Diagnostics.Process]$suite) {
     # The suite's own timeout cannot fire if its event loop is stuck; never
     # let a hung suite hold this worker (and its app) forever.
     if ([DateTime]::UtcNow -gt $script:suiteDeadline) {
-      'local suite exceeded its deadline; terminating' | Add-Content (Join-Path $script:suiteJobDir 'agent-trace.log')
+      'local suite exceeded its deadline; terminating' | Write-AgentTrace -Path (Join-Path $script:suiteJobDir 'agent-trace.log')
       Stop-Process -Id $suite.Id -Force -ErrorAction SilentlyContinue
       $suite.WaitForExit()
       return [pscustomobject]@{kind='stop'}
@@ -277,7 +289,7 @@ while ($true) {
           kind=[string]$stage.kind; id=[guid]::NewGuid().ToString('N'); exe_name=[string]$stage.exe_name
           custom_titlebar=[bool]$stage.custom_titlebar; capture_frames=[bool]$stage.capture_frames
           trace_frames=[bool]$stage.trace_frames; capture_desktop=$false; allow_foreground=$false
-          local_suite=$stageSuite
+          local_suite=$stageSuite; startup_timeout_ms=$stage.startup_timeout_ms
           batch=[pscustomobject]@{parent=$batchId; stage=[string]$stage.name; bundle=$bundleDir; results=$resultsDir; files=[pscustomobject]$files}
         })
       }
@@ -330,7 +342,7 @@ while ($true) {
   try {
     if ($job.kind -eq 'probe') {
       $exeName = [string]$job.exe_name
-      if ($exeName -notin @('zenit-windows-font-smoke.exe', 'zenit-windows-drop-contract.exe', 'zenit-windows-gpu-resources-contract.exe')) { throw 'Unknown native probe' }
+      if ($exeName -notin @('zenit-windows-font-smoke.exe', 'zenit-windows-drop-contract.exe', 'zenit-windows-gpu-resources-contract.exe', 'zenit-windows-d3d11-contract.exe')) { throw 'Unknown native probe' }
       $exe = Join-Path $dir $exeName
       Get-JobArtifact $job $exeName $exe
       $proc = New-Object System.Diagnostics.Process
@@ -361,7 +373,7 @@ while ($true) {
       }
     } elseif ($job.kind -eq 'e2e') {
       $exeName = [string]$job.exe_name
-      if ($exeName -notin @('zenit-windows-text-input.exe', 'zenit-windows-storybook.exe', 'zenit-windows-render-gallery.exe')) { throw 'Unknown E2E executable' }
+      if ($exeName -notin @('zenit-windows-text-input.exe', 'zenit-windows-storybook.exe', 'zenit-windows-render-gallery.exe', 'zenit-windows-adaptive-window.exe')) { throw 'Unknown E2E executable' }
       $exe = Join-Path $dir $exeName
       $rpcDir = Join-Path $dir 'rpc'
       New-Item -ItemType Directory -Force -Path $rpcDir | Out-Null
@@ -413,7 +425,12 @@ while ($true) {
       Remove-Item Env:ZENIT_WINDOWS_DESKTOP_WAKE_INPUT -ErrorAction SilentlyContinue
       Remove-Item Env:ZENIT_WINDOWS_DESKTOP_CAPTURE -ErrorAction SilentlyContinue
       Remove-Item Env:ZENIT_WINDOWS_FRAME_TIMING -ErrorAction SilentlyContinue
-      for ($ready=0; $ready -lt 100 -and -not (Test-Path (Join-Path $rpcDir 'owner.json')); $ready++) {
+      # First-run shader compilation and fixture startup contracts can exceed
+      # ten seconds. Use the host's requested startup deadline for both sides.
+      $startupTimeoutMs = if ($job.startup_timeout_ms) { [int]$job.startup_timeout_ms } else { 90000 }
+      if ($startupTimeoutMs -lt 1 -or $startupTimeoutMs -gt 300000) { throw 'Invalid startup timeout' }
+      $startupDeadline = [DateTime]::UtcNow.AddMilliseconds($startupTimeoutMs)
+      while ([DateTime]::UtcNow -lt $startupDeadline -and -not (Test-Path (Join-Path $rpcDir 'owner.json'))) {
         $proc.Refresh()
         if ($proc.HasExited) { throw "E2E app exited before harness startup: $($proc.ExitCode)" }
         Start-Sleep -Milliseconds 100
@@ -421,7 +438,7 @@ while ($true) {
       if (-not (Test-Path (Join-Path $rpcDir 'owner.json'))) { throw 'E2E harness did not start' }
       $foregroundAfterLaunch=[ZenitNativeInput]::GetForegroundWindow()
       @{foreground_before=$foregroundBeforeLaunch.ToInt64(); foreground_after=$foregroundAfterLaunch.ToInt64(); allow_foreground=[bool]$job.allow_foreground} | ConvertTo-Json | Set-Content (Join-Path $dir 'native-startup.json')
-      'harness ready' | Add-Content (Join-Path $dir 'agent-trace.log')
+      'harness ready' | Write-AgentTrace -Path (Join-Path $dir 'agent-trace.log')
       if ($job.local_suite) {
         $script:suiteRpcDir = Join-Path $dir 'suite-rpc'
         New-Item -ItemType Directory -Force -Path $script:suiteRpcDir | Out-Null
@@ -445,15 +462,15 @@ while ($true) {
         if (-not $suiteProc.Start()) { throw 'E2E suite did not start' }
         $suiteStdout = $suiteProc.StandardOutput.ReadToEndAsync()
         $suiteStderr = $suiteProc.StandardError.ReadToEndAsync()
-        'local suite started' | Add-Content (Join-Path $dir 'agent-trace.log')
+        'local suite started' | Write-AgentTrace -Path (Join-Path $dir 'agent-trace.log')
       }
       $nativeCloseAccepted=$false
         while ($true) {
           $proc.Refresh()
           if ($proc.HasExited -and -not $nativeCloseAccepted) { throw "E2E app exited: $($proc.ExitCode)" }
-          'poll' | Add-Content (Join-Path $dir 'agent-trace.log')
+          'poll' | Write-AgentTrace -Path (Join-Path $dir 'agent-trace.log')
           $rpc = if ($suiteProc) { Next-SuiteRpc $suiteProc } else { Api-Get ('/rpc/next/'+$jobId) }
-          ('received '+($rpc | ConvertTo-Json -Compress -Depth 5)) | Add-Content (Join-Path $dir 'agent-trace.log')
+          ('received '+($rpc | ConvertTo-Json -Compress -Depth 5)) | Write-AgentTrace -Path (Join-Path $dir 'agent-trace.log')
           if ($rpc.kind -eq 'stop') { $exitCode = if ($suiteProc) { $suiteProc.ExitCode } else { 0 }; break }
           if ($rpc.kind -ne 'rpc') { continue }
           $requestId = [string]$rpc.id
@@ -543,12 +560,12 @@ while ($true) {
           $resPath = Join-Path $rpcDir ('res-'+$requestId+'.json')
           $requestText = @{method=$rpc.method;path=$rpc.path;body_json=$rpc.body_json} | ConvertTo-Json -Depth 100 -Compress
           Write-RpcRequest $reqPath $requestText
-          ('wrote '+$requestId) | Add-Content (Join-Path $dir 'agent-trace.log')
+          ('wrote '+$requestId) | Write-AgentTrace -Path (Join-Path $dir 'agent-trace.log')
           $resultText = Wait-RpcResult $resPath $proc
-          ('read '+$requestId+' bytes='+$resultText.Length) | Add-Content (Join-Path $dir 'agent-trace.log')
-          ('posting '+$requestId) | Add-Content (Join-Path $dir 'agent-trace.log')
+          ('read '+$requestId+' bytes='+$resultText.Length) | Write-AgentTrace -Path (Join-Path $dir 'agent-trace.log')
+          ('posting '+$requestId) | Write-AgentTrace -Path (Join-Path $dir 'agent-trace.log')
           Complete-Rpc $jobId $requestId $resultText
-          ('completed '+$requestId) | Add-Content (Join-Path $dir 'agent-trace.log')
+          ('completed '+$requestId) | Write-AgentTrace -Path (Join-Path $dir 'agent-trace.log')
         }
         # A local suite has no host to close the frame archive: serialize with
         # the app's frame writers and stop further archive writes before the
@@ -559,11 +576,11 @@ while ($true) {
           $finished = Wait-RpcResult (Join-Path $rpcDir ('res-'+$finishId+'.json')) $proc
           [System.IO.File]::WriteAllText((Join-Path $dir 'frame-capture-finish.json'), $finished, (New-Object System.Text.UTF8Encoding($false)))
           $finishedValue = $finished | ConvertFrom-Json
-          if (-not $finishedValue.ok -or -not $finishedValue.finished) { $exitCode = 1; 'frame capture finish failed' | Add-Content (Join-Path $dir 'agent-trace.log') }
+          if (-not $finishedValue.ok -or -not $finishedValue.finished) { $exitCode = 1; 'frame capture finish failed' | Write-AgentTrace -Path (Join-Path $dir 'agent-trace.log') }
         }
       } finally {
-        if ('ZenitNativeInput' -as [type]) { try { [ZenitNativeInput]::DragCancel() } catch { 'owned drag cleanup failed' | Add-Content (Join-Path $dir 'agent-trace.log') } }
-        if ('ZenitNativeInput' -as [type]) { try { [ZenitNativeInput]::ReceiverStop() } catch { 'owned receiver cleanup failed' | Add-Content (Join-Path $dir 'agent-trace.log') } }
+        if ('ZenitNativeInput' -as [type]) { try { [ZenitNativeInput]::DragCancel() } catch { 'owned drag cleanup failed' | Write-AgentTrace -Path (Join-Path $dir 'agent-trace.log') } }
+        if ('ZenitNativeInput' -as [type]) { try { [ZenitNativeInput]::ReceiverStop() } catch { 'owned receiver cleanup failed' | Write-AgentTrace -Path (Join-Path $dir 'agent-trace.log') } }
         foreach ($vk in $heldKeys) { [ZenitNativeInput]::Key($vk,$true) | Out-Null }
         $restoreForeground = -not $proc.HasExited -and [ZenitNativeInput]::Owned([ZenitNativeInput]::GetForegroundWindow(),$proc.Id)
         if (-not $proc.HasExited) { Stop-Process -Id $proc.Id }

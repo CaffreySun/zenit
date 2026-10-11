@@ -5,7 +5,7 @@ import { assert, getSessionDir, run, test } from './runner';
 test('Windows renderer resize preserves pixels, input state and background focus', async () => {
   await waitForServerReady(15000);
   const backend = (await stats()).renderer_backend;
-  assert(backend === 'd3d12' || backend === 'legacy', 'requires a Windows renderer');
+  assert(backend === 'd3d12' || backend === 'd3d11' || backend === 'legacy', 'requires a Windows renderer');
   const foreground = await request('POST', '/windows/native-input', {action:'status'});
   await clickTestId('input.name');
   await key('a', {ctrl:true});

@@ -21,6 +21,7 @@ pub const TestCommand = union(enum) {
     mouse_move: MousePayload,
     mouse_up: MousePayload,
     key_down: KeyPayload,
+    key_up: KeyPayload,
     text_input: TextPayload,
     ime_preedit: ImePayload,
     ime_commit: TextPayload,
@@ -76,7 +77,12 @@ pub const TestCommand = union(enum) {
     /// reconfiguration; in test-mode reconfiguration must preserve CPU readback ability, else
     /// subsequent /screenshot artifacts.
     resize_window: struct { width: u32, height: u32 },
+    window: WindowCommand,
+    quit_app: void,
 };
+
+pub const WindowCommand = enum { status, maximize, restore, minimize, close };
+pub const WindowSnapshot = struct { decoration_height: i32, decorated: bool, maximized: bool, active: bool, suspended: bool, width: u32, height: u32 };
 
 pub const RecordingStartPayload = struct {
     pub const PATH_CAP = 768;

@@ -482,13 +482,24 @@ pub fn handleKeyDown(self: *Cx, key: KeyCode, modifiers: Modifiers) void {
             .key = key,
             .modifiers = modifiers,
         });
-    } else if (self.root) |root| {
-        // No focused node, fallback to root to let app/island-level shortcuts work
+    } else if (unfocusedKeyTarget(self)) |root| {
+        // No focused node, fallback to the application root so app/island-level shortcuts work
         _ = self.dispatcher.dispatchKeyDown(root, .{
             .key = key,
             .modifiers = modifiers,
         });
     }
+}
+
+/// Target for keys while nothing has focus: the application's mounted tree, else the root.
+/// App's root wraps that tree and the overlay portal; capture runs root -> target, so a
+/// target of the wrapper would never reach handlers on the application root.
+fn unfocusedKeyTarget(self: *Cx) ?*Node {
+    const root = self.root orelse return null;
+    if (self.content_root) |content| {
+        for (root.children.items) |child| if (child == content) return content;
+    }
+    return root;
 }
 
 fn resolveKeyboardTarget(self: *Cx, identity: ?NodeHandle) ?*Node {
@@ -502,6 +513,11 @@ pub fn handleKeyUp(self: *Cx, key: KeyCode, modifiers: Modifiers) void {
         self.focused_node = focused;
         self.focused_handle = self.node_registry.handleFor(focused);
         _ = self.dispatcher.dispatchKeyUp(focused, .{
+            .key = key,
+            .modifiers = modifiers,
+        });
+    } else if (unfocusedKeyTarget(self)) |root| {
+        _ = self.dispatcher.dispatchKeyUp(root, .{
             .key = key,
             .modifiers = modifiers,
         });
@@ -531,11 +547,15 @@ pub fn handleImePreedit(self: *Cx, preedit_text: []const u8, cursor_utf8_offset:
 }
 
 pub fn handleImePreeditReplace(self: *Cx, preedit_text: []const u8, cursor_utf8_offset: u32, replace_start_utf8: u32, replace_end_utf8: u32) void {
+    return handleImePreeditEvent(self, .{ .text = preedit_text, .cursor_utf8_offset = cursor_utf8_offset, .replace_start_utf8 = replace_start_utf8, .replace_end_utf8 = replace_end_utf8 });
+}
+
+pub fn handleImePreeditEvent(self: *Cx, event: events_mod.ImePreeditEvent) void {
     const focused = focusedTextInput(self) orelse return;
     self.needs_redraw = true;
     const owner = self.node_registry.handleFor(focused);
     const client_context = focused.behavior.interaction.text_input_client.?.context;
-    _ = self.dispatcher.dispatchImePreeditReplace(focused, preedit_text, cursor_utf8_offset, replace_start_utf8, replace_end_utf8);
+    _ = self.dispatcher.dispatch(.{ .ime_preedit = event }, focused);
     const current = focusedTextInput(self) orelse return;
     if (!std.meta.eql(owner, self.node_registry.handleFor(current)) or
         current.behavior.interaction.text_input_client.?.context != client_context) return;
@@ -552,6 +572,12 @@ pub fn handleImeCommitReplace(self: *Cx, commit_text: []const u8, replace_start_
     if (!deferred) self.needs_redraw = true;
     const result = self.dispatcher.dispatchImeCommitReplace(focused, commit_text, replace_start_utf8, replace_end_utf8);
     if (deferred and result != .stop) self.needs_redraw = true;
+}
+
+pub fn handleImeDeleteSurrounding(self: *Cx, before: u32, after: u32) void {
+    const focused = focusedTextInput(self) orelse return;
+    self.needs_redraw = true;
+    _ = self.dispatcher.dispatch(.{ .ime_delete_surrounding = .{ .before_bytes = before, .after_bytes = after } }, focused);
 }
 
 pub fn scrollEventFromSdk(wheel: system_sdk_mod.events.MouseWheel) events_mod.ScrollEvent {

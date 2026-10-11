@@ -99,7 +99,7 @@ pub const DialogVTable = struct {
 };
 
 pub const ImeVTable = struct {
-    /// Enable AppKit text interpretation for the focused editable control.
+    /// Enable platform text interpretation for the focused editable control.
     /// Raw key events are independent and must remain available when false.
     set_enabled: *const fn (ctx: *anyopaque, window_id: events.WindowId, enabled: bool) SdkError!void,
     set_cursor_rect: *const fn (ctx: *anyopaque, window_id: events.WindowId, x: f32, y: f32, width: f32, height: f32) SdkError!void,
@@ -109,6 +109,10 @@ pub const ImeVTable = struct {
     /// directly between two text clients discards A but keeps the one
     /// window-level input context enabled for B.
     discard: *const fn (ctx: *anyopaque, window_id: events.WindowId) SdkError!void,
+    /// Optional UTF-8 editor state for protocols such as Wayland text-input-v3.
+    set_surrounding: ?*const fn (ctx: *anyopaque, window_id: events.WindowId, text: []const u8, cursor: u32, anchor: u32, secure: bool) SdkError!void = null,
+    /// Epoch tagging protects copied IME events from a later focus/session switch.
+    generation: ?*const fn (ctx: *anyopaque) u64 = null,
 };
 
 pub const CursorVTable = struct {

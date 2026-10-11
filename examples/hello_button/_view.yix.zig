@@ -27,11 +27,11 @@ fn __yix_HelloButton(__yix_props: HelloButtonProps, scope: *ui.Scope, cx: *ui.Cx
     };
     const __yix_root = try ui.view.render(scope, cx, ui.view.col(.{ .style = S.root, }, .{
             ui.view.text(.{ .style = S.title, }, ui.view.fmt("Hello, zenit!", .{ })),
-            ui.view.textChild(Button, .{ .variant = .primary, .size = .md, .on_click = ui.view.eventProp(Button, "on_click", try ui.on.bindAny(scope, .{ .count = count, .__yix_owner = scope.owner, }, struct { fn __yix_run(__yix_ctx: anytype) void { __yix_ctx.__yix_owner.beginBatch(); defer __yix_ctx.__yix_owner.endBatch(); __yix_ctx.count.set(__yix_ctx.count.peek() + (1));  } }.__yix_run)), }, "Click me", .{
+            ui.view.templateAttrs(.{ .test_id = "hello.increment", }, ui.view.textChild(Button, .{ .variant = .primary, .size = .md, .on_click = ui.view.eventProp(Button, "on_click", try ui.on.bindAny(scope, .{ .count = count, .__yix_owner = scope.owner, }, struct { fn __yix_run(__yix_ctx: anytype) void { __yix_ctx.__yix_owner.beginBatch(); defer __yix_ctx.__yix_owner.endBatch(); __yix_ctx.count.set(__yix_ctx.count.peek() + (1));  } }.__yix_run)), }, "Click me", .{
                 ui.view.text(.{}, ui.view.fmt("Click me", .{ })),
-            }),
+            })),
             ui.view.box(.{ .style = S.Panel.of(.{ .emphasis = emphasis }), }, .{
-                ui.view.text(.{ .style = S.counter_label, }, ui.view.fmt("Clicked " ++ ui.view.yixFormat(@TypeOf(count), "") ++ " times", .{ count, })),
+                ui.view.text(.{ .test_id = "hello.counter", .style = S.counter_label, }, ui.view.fmt("Clicked " ++ ui.view.yixFormat(@TypeOf(count), "") ++ " times", .{ count, })),
             }),
         }));
     __yix_root.meta.ownership.meta.component_name = "HelloButton";

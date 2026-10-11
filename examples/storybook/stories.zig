@@ -701,12 +701,12 @@ pub fn buildSpinner(scope: *ui.Scope, cx: *ui.Cx) anyerror!*ui.Node {
     // e2e uses dedicated shape node for locate, avoids other content pixel masking
     // spinner draw issue.
     return v.render(scope, cx, v.row(.{ .style = S.line(20), .test_id = "story.spinner.row" }, .{
-        W.Spinner(.{ .size = 16 }),
-        W.Spinner(.{ .size = 24 }),
-        W.Spinner(.{ .size = 36 }),
+        v.attrs(.{ .test_id = "story.spinner.0" }, W.Spinner(.{ .size = 16 })),
+        v.attrs(.{ .test_id = "story.spinner.1" }, W.Spinner(.{ .size = 24 })),
+        v.attrs(.{ .test_id = "story.spinner.2" }, W.Spinner(.{ .size = 36 })),
         // custom colour and stroke
-        W.Spinner(.{ .size = 36, .stroke_width = 2, .color = ui.Color.rgba(52, 199, 89, 255) }),
-        W.Spinner(.{ .size = 36, .stroke_width = 5, .color = ui.Color.rgba(255, 59, 48, 255) }),
+        v.attrs(.{ .test_id = "story.spinner.3" }, W.Spinner(.{ .size = 36, .stroke_width = 2, .color = ui.Color.rgba(52, 199, 89, 255) })),
+        v.attrs(.{ .test_id = "story.spinner.4" }, W.Spinner(.{ .size = 36, .stroke_width = 5, .color = ui.Color.rgba(255, 59, 48, 255) })),
     }));
 }
 
@@ -1250,10 +1250,10 @@ pub fn buildGlassLab(scope: *ui.Scope, cx: *ui.Cx) anyerror!*ui.Node {
 // so a correct edge reads like the glass a little further in, and a fringe shows as a dark rim
 // on colour. Everything sits in the popover portal (whole window), hit-test transparent (no
 // handlers), and is detached with the story scope.
-const edge_sidebar_w: f32 = 217; // Storybook sidebar 216 + its border
-const edge_wallpaper_top: f32 = 176; // below the story header and its note
+const edge_sidebar_w: f32 = 216; // Storybook floating sidebar 8 + 200 + 8 gutter
+const edge_wallpaper_top: f32 = 164; // below the title bar and the story note
 const edge_inspector_w: f32 = 260;
-const edge_header_h: f32 = 64; // Storybook's story header
+const edge_header_h: f32 = 52; // Storybook's title bar
 
 fn edgeCard(cx: *ui.Cx, left: f32, top: f32, w: f32, h: f32, c0: ui.Color, c1: ui.Color) !*ui.Node {
     const n = try ui.box(cx, .{ .position = .absolute, .width = .{ .px = w }, .height = .{ .px = h } }, .{});
@@ -3783,7 +3783,7 @@ pub fn buildInput(scope: *ui.Scope, cx: *ui.Cx) anyerror!*ui.Node {
         // -- Types --
         label("Types"),
         v.attrs(.{ .test_id = "story.input.name" }, W.Input(.{ .label_text = "Name", .placeholder = "Your name", .width = 320 })),
-        W.Input(.{ .label_text = "Email", .input_type = .email, .placeholder = "you@example.com", .width = 320 }),
+        v.attrs(.{ .test_id = "story.input.email" }, W.Input(.{ .label_text = "Email", .input_type = .email, .placeholder = "you@example.com", .width = 320 })),
         W.Input(.{ .label_text = "Password", .input_type = .password, .placeholder = "••••••••", .width = 320 }),
 
         // -- Sizes --
@@ -3972,8 +3972,8 @@ pub fn buildEditableText(scope: *ui.Scope, cx: *ui.Cx) anyerror!*ui.Node {
     const title = try scope.createText("Quarterly roadmap", .{});
     const note = try scope.createText("Click any line to edit it in place; the text reflows as you type.", .{});
     return v.render(scope, cx, v.col(.{ .style = demoWidth(420) }, .{
-        v.attrs(.{ .test_id = "story.editabletext.title" }, W.EditableText(.{ .value = title, .font_size = 22, .width = 420 })),
-        v.attrs(.{ .test_id = "story.editabletext.note" }, W.EditableText(.{ .value = note, .font_size = 14, .wrap_width = 420 })),
+        v.attrs(.{ .test_id = "story.editabletext.title" }, W.EditableText(.{ .value = title, .font_size = 22, .width = 420, .activation = .click })),
+        v.attrs(.{ .test_id = "story.editabletext.note" }, W.EditableText(.{ .value = note, .font_size = 14, .wrap_width = 420, .activation = .click })),
         v.text(.{ .style = S.storyLabel, .test_id = "story.editabletext.status" }, v.fmt("title → {s}", .{title})),
     }));
 }
@@ -4826,6 +4826,11 @@ const CanvasEventsStory = struct {
             self.setLabel(self.clip_label, "clip: set failed", .{});
             return;
         }
+        self.clipboardRead();
+    }
+
+    fn clipboardRead(self: *CanvasEventsStory) void {
+        const cx = self.cx;
         const kinds = ui.platform_services.clipboardProbe(cx.system_sdk);
         const count = ui.platform_services.clipboardImageCount(cx.system_sdk);
         if (ui.platform_services.clipboardGetImageAlloc(cx.system_sdk, cx.allocator, 0)) |img_const| {
@@ -4833,8 +4838,8 @@ const CanvasEventsStory = struct {
             defer img.deinit(cx.allocator);
             // 2x2 pure red premultiplied RGBA: first pixel R=255 A=255
             const px_ok = img.rgba.len == 16 and img.rgba[0] == 255 and img.rgba[3] == 255;
-            self.setLabel(self.clip_label, "clip: image={any} count={d} {d}x{d} px_ok={any} uti={s}", .{
-                kinds.image, count, img.width, img.height, px_ok, img.uti orelse "(none)",
+            self.setLabel(self.clip_label, "clip: image={any} count={d} {d}x{d} px_ok={any} uti={s} rgba_crc32={x}", .{
+                kinds.image, count, img.width, img.height, px_ok, img.uti orelse "(none)", std.hash.Crc32.hash(img.rgba),
             });
         } else {
             self.setLabel(self.clip_label, "clip: image={any} count={d} read failed", .{ kinds.image, count });
@@ -4863,6 +4868,7 @@ pub fn buildCanvasEvents(scope: *ui.Scope, cx: *ui.Cx) anyerror!*ui.Node {
         v.capture(&st.drag_label, v.text(.{ .style = regBody, .test_id = "story.canvasevents.drag" }, "drag (none)")),
         v.capture(&st.clip_label, v.text(.{ .style = regBody, .test_id = "story.canvasevents.clip" }, "clip (none)")),
         v.attrs(.{ .test_id = "story.canvasevents.clipbtn" }, W.Button(.{ .label = "Clipboard PNG roundtrip", .on_click = ui.on.call(st, CanvasEventsStory.clipboardRoundtrip) })),
+        v.attrs(.{ .test_id = "story.canvasevents.clipread" }, W.Button(.{ .label = "Read clipboard PNG", .on_click = ui.on.call(st, CanvasEventsStory.clipboardRead) })),
     }));
 }
 

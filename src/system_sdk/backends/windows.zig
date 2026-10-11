@@ -283,6 +283,12 @@ pub const WindowsBackend = struct {
                     }
                 }
 
+                if (comptime @hasDecl(@typeInfo(WindowType).pointer.child, "checkShouldClose")) {
+                    if (should_continue and self.window.checkShouldClose()) {
+                        try pushEvent(queue, .{ .window_close_requested = .{ .window_id = self.window_id } });
+                        self.window.resetShouldClose();
+                    }
+                }
                 if (!should_continue) {
                     try pushEvent(queue, .{ .quit = {} });
                 }

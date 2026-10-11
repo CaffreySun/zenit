@@ -675,7 +675,8 @@ void metal_layer_set_wants_edr(void* layer, _Bool wants) {
 
 void metal_layer_set_drawable_size(void* layer, unsigned int width, unsigned int height) {
     CAMetalLayer* l = (__bridge CAMetalLayer*)layer;
-    l.drawableSize = CGSizeMake(width, height);
+    CGSize size=CGSizeMake(width,height);
+    if (!CGSizeEqualToSize(l.drawableSize,size)) l.drawableSize=size;
 }
 
 /// Get nextDrawable — [owned] return +1, caller takes ownership, do not retain again.

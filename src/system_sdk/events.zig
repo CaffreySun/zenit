@@ -136,6 +136,9 @@ pub const Event = union(enum) {
     },
     ime_preedit: struct {
         window_id: WindowId,
+        generation: u64 = 0,
+        cursor_visible: bool = true,
+        selection_end_utf8: ?u32 = null,
         text: []const u8,
         cursor_utf8_offset: u32,
         /// IME replacementRange converted to UTF-8 byte range (relative to focused input document).
@@ -145,9 +148,16 @@ pub const Event = union(enum) {
     },
     ime_commit: struct {
         window_id: WindowId,
+        generation: u64 = 0,
         text: []const u8,
         replace_start_utf8: u32 = ime_no_replacement,
         replace_end_utf8: u32 = ime_no_replacement,
+    },
+    ime_delete_surrounding: struct {
+        window_id: WindowId,
+        generation: u64 = 0,
+        before_bytes: u32,
+        after_bytes: u32,
     },
     /// System theme change event (macOS Dark/Light mode)
     system_theme_changed: struct {
@@ -172,6 +182,7 @@ pub const Event = union(enum) {
             .text_input => |e| e.window_id,
             .ime_preedit => |e| e.window_id,
             .ime_commit => |e| e.window_id,
+            .ime_delete_surrounding => |e| e.window_id,
             .menu_command => |e| if (e.window_id == 0) null else e.window_id,
             .quit, .frame_requested, .system_theme_changed => null,
         };

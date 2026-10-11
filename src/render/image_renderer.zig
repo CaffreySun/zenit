@@ -87,7 +87,7 @@ const MAX_UNIFORM_UPDATES = 256;
 // D3D12 CBV addresses require 256-byte alignment. Append aligned slots so
 // normal shared draws can bind the retained frame buffer without snapshots.
 // D3D12 CBV addresses need 256-byte alignment; Metal buffer offsets need 16.
-const UNIFORM_STRIDE = std.mem.alignForward(usize, @sizeOf(Uniforms), if (gpu.backend_kind == .d3d12) 256 else 16);
+const UNIFORM_STRIDE = std.mem.alignForward(usize, @sizeOf(Uniforms), if (gpu.is_direct3d) 256 else 16);
 
 /// Triple buffering constant
 const BUFFER_COUNT = 3;
@@ -576,7 +576,7 @@ pub const ImageRenderer = struct {
         errdefer pipeline.deinit();
         var unmasked_pipeline: ?gpu.Backend.RenderPipeline = null;
         errdefer if (unmasked_pipeline) |*value| value.deinit();
-        if (gpu.backend_kind == .d3d12) {
+        if (gpu.is_direct3d) {
             var unmasked_fragment = try shader.getFunction("image_unmasked_fragment_main");
             defer unmasked_fragment.deinit();
             unmasked_pipeline = try gpu.Backend.createRenderPipeline(device, .{
@@ -941,8 +941,10 @@ pub const ImageRenderer = struct {
 
         // Set pipeline
         render_pass.setPipeline(if (self.clip_shape_kind == 0 and self.unmasked_pipeline != null) &self.unmasked_pipeline.? else &self.pipeline);
-        render_pass.setVertexBuffer(0, uniform_buffer, @intCast(uniform_byte_offset));
-        render_pass.setFragmentBuffer(0, uniform_buffer, @intCast(uniform_byte_offset));
+        // One uniform slot, not the rest of the ring: Direct3D snapshots the bound
+        // range per draw (constant buffers over 4 KiB are copied into a new buffer).
+        gpu.setVertexBufferRange(render_pass, 0, uniform_buffer, @intCast(uniform_byte_offset), UNIFORM_STRIDE);
+        gpu.setFragmentBufferRange(render_pass, 0, uniform_buffer, @intCast(uniform_byte_offset), UNIFORM_STRIDE);
 
         // Bind sampler
         if (self.sampler) |smp| {
@@ -982,15 +984,15 @@ pub const ImageRenderer = struct {
                 const overflow_buffer = &self.overflow_buffers[self.current_buffer].?;
                 const overflow_data = try overflow_buffer.getMappedRange(self.overflow_write_offset, chunk_size);
                 @memcpy(overflow_data, std.mem.sliceAsBytes(self.instances.items[global_offset .. global_offset + chunk_count]));
-                render_pass.setVertexBuffer(1, overflow_buffer, @intCast(self.overflow_write_offset));
-                render_pass.setFragmentBuffer(1, overflow_buffer, @intCast(self.overflow_write_offset));
+                gpu.setVertexBufferRange(render_pass, 1, overflow_buffer, @intCast(self.overflow_write_offset), @intCast(chunk_size));
+                gpu.setFragmentBufferRange(render_pass, 1, overflow_buffer, @intCast(self.overflow_write_offset), @intCast(chunk_size));
                 self.overflow_write_offset += chunk_size;
             } else {
                 const byte_offset = self.buffer_write_offset * @sizeOf(ImageInstance);
                 const chunk_data = try self.instance_buffers[self.current_buffer].getMappedRange(byte_offset, chunk_size);
                 @memcpy(chunk_data, std.mem.sliceAsBytes(self.instances.items[global_offset .. global_offset + chunk_count]));
-                render_pass.setVertexBuffer(1, &self.instance_buffers[self.current_buffer], @intCast(byte_offset));
-                render_pass.setFragmentBuffer(1, &self.instance_buffers[self.current_buffer], @intCast(byte_offset));
+                gpu.setVertexBufferRange(render_pass, 1, &self.instance_buffers[self.current_buffer], @intCast(byte_offset), @intCast(chunk_size));
+                gpu.setFragmentBufferRange(render_pass, 1, &self.instance_buffers[self.current_buffer], @intCast(byte_offset), @intCast(chunk_size));
                 self.buffer_write_offset += chunk_count;
             }
 

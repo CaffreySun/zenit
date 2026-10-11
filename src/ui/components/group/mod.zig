@@ -69,6 +69,7 @@ pub const GroupBuilder = struct {
             .height = .{ .fit = .{} },
             .direction = dir,
             .align_items = p.align_items,
+            .no_cross_stretch = p.orientation == .vertical and p.width == .fit,
             .gap = 0,
         } }, {}));
         container.meta.ownership.meta.component_name = "Group";
@@ -92,6 +93,15 @@ pub fn addGroupItem(
 ) !void {
     const ext = try child.style.ensureExtFallible(allocator);
     const horizontal = container.style.direction == .row;
+    // Attached vertical controls share the container's cross-axis width.
+    // Buttons normally opt out of inherited stretch when used independently.
+    if (!horizontal and container.style.align_items == .stretch and child.style.width == .fit) {
+        const bounds = child.style.width.fit;
+        child.setStyleInline(allocator, .{
+            .width = .{ .grow = .{ .min = bounds.min, .max = bounds.max } },
+            .no_cross_stretch = false,
+        });
+    }
     const overlap = @max(@as(f32, 1), child.style.border.width);
     var side_colors = ext.border_side_colors orelse BorderSideColors{};
 
@@ -139,6 +149,31 @@ pub fn addGroupItem(
 }
 
 // ========== Tests ==========
+
+test "Group: vertical buttons share intrinsic group width" {
+    const alloc = std.testing.allocator;
+    var ctx = try Cx.init(alloc, std.testing.io);
+    defer ctx.deinit();
+    ctx.setViewport(400, 300);
+    const root = try box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 }, .direction = .column }, .{});
+    ctx.root = root;
+    const scope = try Scope.init(alloc, null, ctx.owner);
+    defer scope.dispose();
+    const group = try Group(.{ .orientation = .vertical }).mount(scope, ctx);
+    try root.appendChild(alloc, group.container);
+    const Button = @import("../button/mod.zig").Button;
+    const top = try Button(.{ .label = "Top" }).mount(scope, ctx);
+    const middle = try Button(.{ .label = "Middle" }).mount(scope, ctx);
+    const bottom = try Button(.{ .label = "Bottom" }).mount(scope, ctx);
+    try addGroupItem(group.container, alloc, top, .first, 8);
+    try addGroupItem(group.container, alloc, middle, .between, 8);
+    try addGroupItem(group.container, alloc, bottom, .last, 8);
+    ctx.layout();
+    try std.testing.expect(top.rectFromWorldOrFallback().w > 0 and top.rectFromWorldOrFallback().w < root.rectFromWorldOrFallback().w);
+    try std.testing.expectApproxEqAbs(group.container.rectFromWorldOrFallback().w, top.rectFromWorldOrFallback().w, 0.01);
+    try std.testing.expectApproxEqAbs(top.rectFromWorldOrFallback().w, middle.rectFromWorldOrFallback().w, 0.01);
+    try std.testing.expectApproxEqAbs(top.rectFromWorldOrFallback().w, bottom.rectFromWorldOrFallback().w, 0.01);
+}
 
 test "Group: structure" {
     const alloc = std.testing.allocator;

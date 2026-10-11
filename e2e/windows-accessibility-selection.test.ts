@@ -147,7 +147,8 @@ test("Windows Tabs Selection commits page changes, rejects disabled and conflict
   await waitFor(async()=> (await query("story.tabs.status"))[0]?.text?.includes("t1")?true:null,3000,50);
   assert(JSON.stringify(await selectedNames(container))===JSON.stringify(["Overview"]),"Tabs selection round trip failed");
   const after=await request("POST","/windows/native-input",{action:"status"});
-  assert(!after.foreground && after.foreground_hwnd===before.foreground_hwnd,"Tabs selection took foreground");
+  assert(!after.foreground && after.foreground_hwnd===before.foreground_hwnd,
+    `Tabs selection took foreground: before=${JSON.stringify(before)}, after=${JSON.stringify(after)}`);
 });
 
 test("Windows ComboBox Selection writes the editable value, clears optional selection and invokes the public callback",async()=>{
@@ -252,7 +253,13 @@ test("Windows Select and Accordion ExpandCollapse preserve selection and exclusi
   await expand(two,true); await expand(two,true);
   assert((await controls()).find((n:any)=>n.automation_id===one.automation_id)?.expand_state===1,"nonexclusive Accordion collapsed sibling");
   await expand(two,false); await expand(two,false);
-  await clickTestId("story.accordion.exclusive");
+  // The mode is a prerequisite for the exclusivity assertion. A pointer
+  // request alone does not prove its callback ran when layout is moving.
+  // Invoke the actual accessible button and require its committed event.
+  const mode=(await controls()).find((n:any)=>n.role===50000 && n.name==="Use exclusive mode");
+  assert(mode?.enabled,"exclusive Accordion mode button unavailable");
+  const switched=await request("POST","/windows/native-input",{action:"uia-invoke",name:mode.name});
+  assert(switched.invoked_event,"exclusive Accordion mode did not commit its Invoke event");
   const exclusiveOne=one, exclusiveTwo=two;
   assert(exclusiveOne?.expand_available && exclusiveTwo?.expand_available,"exclusive Accordion missing");
   await expand(exclusiveOne,true); await expand(exclusiveTwo,true); await expand(exclusiveTwo,true);

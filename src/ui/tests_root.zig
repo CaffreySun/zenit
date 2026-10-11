@@ -11,3 +11,8 @@ test {
     _ = @import("core/text_shaper_adapter.zig"); // v0.5 §5 GlyphRun pipeline
     _ = @import("core/a11y_projection.zig"); // a11y projection rules unit test (no longer driven via cx.render)
 }
+
+// Named entry keeps the chrome suite discoverable with -Dtest-filter='window chrome'.
+test "window chrome imports" {
+    _ = @import("core/window_chrome_tests.zig");
+}

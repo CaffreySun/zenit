@@ -66,7 +66,7 @@ pub const GlyphAtlas = struct {
     current_frame: u64,
     /// This frame's count of "cache miss AND actual rasterization".
     frame_insert_count: u32,
-    cache: std.AutoHashMap(GlyphKey, AtlasRegion),
+    cache: GlyphCache,
     /// Incremented after GC drains pages, signals render cache invalidation
     /// (prevent cached commands from referencing released texture pages).
     gc_generation: u32 = 0,
@@ -130,7 +130,7 @@ pub const GlyphAtlas = struct {
             .page_count = 0,
             .current_frame = 0,
             .frame_insert_count = 0,
-            .cache = std.AutoHashMap(GlyphKey, AtlasRegion).init(allocator),
+            .cache = GlyphCache.init(allocator),
         };
         errdefer self.deinit();
 
@@ -750,6 +750,19 @@ const GlyphKey = struct {
     scale_q: u32 = quantizeScale(1.0),
 };
 
+// Hash the integer fields together rather than invoking generic field hashing
+// for every glyph. Padding never participates in either hash or equality.
+const GlyphKeyContext = struct {
+    pub fn hash(_: @This(), key: GlyphKey) u64 {
+        const words = [_]u64{ key.font_ptr, @as(u64, key.glyph_index) | (@as(u64, key.subpixel_bin) << 32), key.scale_q };
+        return std.hash.Wyhash.hash(0, std.mem.asBytes(&words));
+    }
+    pub fn eql(_: @This(), a: GlyphKey, b: GlyphKey) bool {
+        return a.font_ptr == b.font_ptr and a.glyph_index == b.glyph_index and a.subpixel_bin == b.subpixel_bin and a.scale_q == b.scale_q;
+    }
+};
+const GlyphCache = std.HashMap(GlyphKey, AtlasRegion, GlyphKeyContext, 80);
+
 /// Quantize f32 scale to integer safe for AutoHashMap key (1/100 precision).
 ///
 /// Why quantize vs raw f32: HashMap does bitwise hash and equality. Float -0.0/+0.0, NaN,
@@ -779,15 +792,23 @@ pub fn rasterKey(font: anytype) u32 {
 /// R6: Number of subpixel bins (4 per axis = 16 variants).
 pub const SUBPIXEL_BINS: u32 = 4;
 
-/// R6: Calculate subpixel bin.
-pub fn subpixelBin(fractional: f32) u4 {
-    const clamped = @max(0.0, @min(fractional, 0.999));
-    return @intFromFloat(clamped * @as(f32, @floatFromInt(SUBPIXEL_BINS)));
+/// R6: Pen position rounded to the nearest 1/SUBPIXEL_BINS pixel: the integer pixel the
+/// bitmap is placed from and the bin it is rasterized in. Bin 0 is an unshifted raster, so a
+/// pen on the pixel grid gets the hinted glyph exactly (a bin-center offset would move every
+/// hinted stem off the grid by 1/8 px and smear it across two pixels).
+pub const SubpixelPen = struct { pixel: f32, bin: u4 };
+
+pub fn subpixelPen(pen_px: f32) SubpixelPen {
+    const bins: f32 = @floatFromInt(SUBPIXEL_BINS);
+    const quantized = @round(pen_px * bins) / bins;
+    const pixel = @floor(quantized);
+    const bin: u4 = @intFromFloat(@min(@max(@round((quantized - pixel) * bins), 0), bins - 1));
+    return .{ .pixel = pixel, .bin = bin };
 }
 
-/// R6: Reverse-calculate subpixel offset from bin (bin center value).
+/// R6: Raster offset of a bin. Bin 0 is the unshifted glyph.
 pub fn subpixelOffset(bin: u4) f32 {
-    return (@as(f32, @floatFromInt(bin)) + 0.5) / @as(f32, @floatFromInt(SUBPIXEL_BINS));
+    return @as(f32, @floatFromInt(bin)) / @as(f32, @floatFromInt(SUBPIXEL_BINS));
 }
 
 /// R6: Pack x/y bin to u8.
@@ -1079,7 +1100,7 @@ test "page eviction removes every victim glyph without allocating and remaps sur
     var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
     var atlas: GlyphAtlas = undefined;
     atlas.allocator = failing.allocator();
-    atlas.cache = std.AutoHashMap(GlyphKey, AtlasRegion).init(testing.allocator);
+    atlas.cache = GlyphCache.init(testing.allocator);
     defer atlas.cache.deinit();
     atlas.pages = @as([GlyphAtlas.MAX_PAGES]?AtlasPage, @splat(null));
     atlas.retired = @as([GlyphAtlas.MAX_RETIRED]?RetiredTexture, @splat(null));
@@ -1128,7 +1149,7 @@ test "forgetFont 只摘除该 font_ptr 的全部条目（含各 scale / subpixel
     const testing = std.testing;
     // forgetFont only touches cache, no Metal device needed.
     var atlas: GlyphAtlas = undefined;
-    atlas.cache = std.AutoHashMap(GlyphKey, AtlasRegion).init(testing.allocator);
+    atlas.cache = GlyphCache.init(testing.allocator);
     defer atlas.cache.deinit();
     const region = AtlasRegion{
         .uv_min = .{ 0, 0 },

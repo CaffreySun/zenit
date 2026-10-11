@@ -66,7 +66,7 @@ const MAX_UNIFORM_UPDATES = 512;
 // D3D12 CBV addresses require 256-byte alignment. Append aligned slots so
 // normal shared draws can bind the retained frame buffer without snapshots.
 // D3D12 CBV addresses need 256-byte alignment; Metal buffer offsets need 16.
-const UNIFORM_STRIDE = std.mem.alignForward(usize, @sizeOf(Uniforms), if (gpu.backend_kind == .d3d12) 256 else 16);
+const UNIFORM_STRIDE = std.mem.alignForward(usize, @sizeOf(Uniforms), if (gpu.is_direct3d) 256 else 16);
 
 /// Triple-buffering constant.
 const BUFFER_COUNT = 3;
@@ -179,6 +179,56 @@ const LongSegmentCache = struct {
         while (it.next()) |entry| release(allocator, entry.*);
         self.entries.deinit(allocator);
         self.* = .{};
+    }
+};
+
+// Layout measures overlapping prefixes and identical layers before drawing. Cache
+// exact results only within one frame; owned text verifies hash collisions and
+// avoids retaining caller buffers. Both entry count and text bytes are bounded.
+const WidthCache = struct {
+    const Key = struct {
+        hash: u64,
+        font: usize,
+        size: u32,
+        physical_size: u32,
+        scale: u32,
+        advance: u32,
+        italic: bool,
+    };
+    const Entry = struct { text: []u8, width: f32 };
+    entries: std.AutoHashMapUnmanaged(Key, Entry) = .{},
+    bytes: usize = 0,
+
+    fn get(self: *const WidthCache, key: Key, text: []const u8) ?f32 {
+        const entry = self.entries.get(key) orelse return null;
+        return if (std.mem.eql(u8, entry.text, text)) entry.width else null;
+    }
+
+    fn put(self: *WidthCache, allocator: std.mem.Allocator, key: Key, text: []const u8, width: f32) void {
+        if (self.entries.count() >= 4096 or text.len > 2 * 1024 * 1024 - self.bytes) return;
+        const owned = allocator.dupe(u8, text) catch return;
+        const slot = self.entries.getOrPut(allocator, key) catch {
+            allocator.free(owned);
+            return;
+        };
+        if (slot.found_existing) {
+            self.bytes -= slot.value_ptr.text.len;
+            allocator.free(slot.value_ptr.text);
+        }
+        slot.value_ptr.* = .{ .text = owned, .width = width };
+        self.bytes += text.len;
+    }
+
+    fn clear(self: *WidthCache, allocator: std.mem.Allocator) void {
+        var it = self.entries.valueIterator();
+        while (it.next()) |entry| allocator.free(entry.text);
+        self.entries.clearRetainingCapacity();
+        self.bytes = 0;
+    }
+
+    fn deinit(self: *WidthCache, allocator: std.mem.Allocator) void {
+        self.clear(allocator);
+        self.entries.deinit(allocator);
     }
 };
 
@@ -582,6 +632,7 @@ pub const TextRenderer = struct {
 
     // Segment-level shaping cache, word/CJK-single-char granularity, inline-stored no-alloc
     segment_cache: std.AutoHashMap(SegmentCacheKey, SegmentCacheEntry),
+    width_cache: WidthCache = .{},
     cache_long_segments: bool = false,
     long_segment_cache: LongSegmentCache = .{},
     // Full-line fallback cache, used when segment overflows.
@@ -722,6 +773,7 @@ pub const TextRenderer = struct {
         }
         self.segment_cache.deinit();
         self.long_segment_cache.deinit(self.allocator);
+        self.width_cache.deinit(self.allocator);
         var fallback_font_iter = self.fallback_font_cache.iterator();
         while (fallback_font_iter.next()) |entry| {
             entry.value_ptr.font.deinit();
@@ -756,6 +808,7 @@ pub const TextRenderer = struct {
         self.overflow_write_offset = 0;
         self.uniform_overflow_used = 0;
         self.uniform_peak_slots = 0;
+        self.width_cache.clear(self.allocator);
         self.current_frame += 1;
         // DPI changed (drag window across screens) -> glyph raster size and subpixel
         // bin key change; prewarm skip baseline invalidated.
@@ -885,7 +938,7 @@ pub const TextRenderer = struct {
 
     fn evictStaleFallbackFonts(self: *TextRenderer) void {
         const evict_threshold = 1800;
-        var keys_buf: [64]usize = undefined;
+        var keys_buf: [64]u64 = undefined;
         var remove_count: usize = 0;
 
         var iter = self.fallback_font_cache.iterator();
@@ -1011,7 +1064,7 @@ pub const TextRenderer = struct {
 
     /// Draw text
     fn getOrCreateGlyphFallbackFont(self: *TextRenderer, fallback_font_ref: *anyopaque, prototype: *Font) !*Font {
-        if (comptime builtin.target.os.tag != .macos and builtin.target.os.tag != .windows) {
+        if (comptime builtin.target.os.tag != .macos and builtin.target.os.tag != .windows and builtin.target.os.tag != .linux) {
             return error.UnsupportedNativeFallbackFontRef;
         } else {
             // Key must be the font **identity** (PS name + size + traits), not the CTFontRef
@@ -1029,7 +1082,7 @@ pub const TextRenderer = struct {
             const key = text_module.fallbackFontRefIdentityHash(fallback_font_ref);
             if (self.fallback_font_cache.getPtr(key)) |cached| {
                 cached.frame_last_used = self.current_frame;
-                cached.font.scale_factor = prototype.scale_factor;
+                if (comptime builtin.target.os.tag == .linux) cached.font.setScaleFactor(prototype.scale_factor) else cached.font.scale_factor = prototype.scale_factor;
                 return cached.font;
             }
 
@@ -1041,7 +1094,7 @@ pub const TextRenderer = struct {
             const ct_size = text_module.fallbackFontRefSize(fallback_font_ref);
             const requested_size = if (std.math.isFinite(ct_size) and ct_size > 0) ct_size else prototype.pixelSize();
             const size_px: f32 = if (std.math.isFinite(requested_size)) std.math.clamp(requested_size, 1, 4096) else 1;
-            const fallback_font = if (comptime builtin.target.os.tag == .windows)
+            const fallback_font = if (comptime builtin.target.os.tag == .windows or builtin.target.os.tag == .linux)
                 try Font.fromFallbackRef(self.allocator, fallback_font_ref, prototype)
             else blk: {
                 const owned = try self.allocator.create(Font);
@@ -1137,6 +1190,7 @@ pub const TextRenderer = struct {
     }
 
     fn selectRenderFontForGlyph(self: *TextRenderer, glyph: text_module.ShapedGlyph, p: EmitParams) !*Font {
+        if (p.resolved_font) |font| return font;
         if (glyph.is_fallback_font) {
             if (glyph.fallback_font_ref) |fallback_font_ref| {
                 return self.getOrCreateGlyphFallbackFont(fallback_font_ref, p.font);
@@ -1229,6 +1283,7 @@ pub const TextRenderer = struct {
         instance_list: *std.ArrayList(GlyphInstance),
         fixed_advance: f32 = 0,
         explicit_range_raster: bool = false,
+        resolved_font: ?*Font = null,
     };
 
     /// Take glyphs[i] cluster_span = next_cluster - cur_cluster, last glyph uses
@@ -1249,8 +1304,8 @@ pub const TextRenderer = struct {
     /// pixel may move it. Rounding pen + bearing adds the fraction a second time:
     /// every glyph whose pen fraction >= 0.5 lands one device pixel right,
     /// which reads as random letter gaps at 100% scale.
-    fn subpixelGlyphLeftPx(pen_px: f32, bearing_px: f32) f32 {
-        return @floor(pen_px) + bearing_px;
+    fn subpixelGlyphLeftPx(pen: atlas_mod.SubpixelPen, bearing_px: f32) f32 {
+        return pen.pixel + bearing_px;
     }
 
     fn glyphAdvance(glyph: text_module.ShapedGlyph, cluster_span: u32, p: EmitParams) f32 {
@@ -1319,11 +1374,11 @@ pub const TextRenderer = struct {
         else
             p.instance_list;
 
-        if (p.use_subpixel and !glyph.is_synthetic_italic and (!glyph.is_fallback_font or p.explicit_range_raster)) {
+        const layout_selects_faces = comptime @hasDecl(Font, "layout_selects_faces") and Font.layout_selects_faces;
+        if (p.use_subpixel and !glyph.is_synthetic_italic and (!glyph.is_fallback_font or p.explicit_range_raster or layout_selects_faces)) {
             const phys_x = (cursor_x + glyph.x_offset * layout_scale) * p.scale;
-            const fract_x = phys_x - @floor(phys_x);
-            const x_bin = atlas_mod.subpixelBin(fract_x);
-            const bin_packed = atlas_mod.packSubpixelBin(x_bin, 0);
+            const pen = atlas_mod.subpixelPen(phys_x);
+            const bin_packed = atlas_mod.packSubpixelBin(pen.bin, 0);
 
             const region = self.atlas.getOrInsertSubpixel(render_font, glyph.glyph_index, bin_packed) catch {
                 return glyphAdvance(glyph, cluster_span, p);
@@ -1338,7 +1393,7 @@ pub const TextRenderer = struct {
             // The bitmap already carries the pen's fractional bin; place it from
             // the pen's integer pixel only (see subpixelGlyphLeftPx).
             const bearing_px = @as(f32, @floatFromInt(region.bearing_x)) * (p.scale / render_font.scale_factor) * bitmap_scale;
-            const raw_final_x = subpixelGlyphLeftPx(phys_x, bearing_px) / p.scale;
+            const raw_final_x = subpixelGlyphLeftPx(pen, bearing_px) / p.scale;
             const final_x = clampFixedAdvanceGlyphX(raw_final_x, cursor_x, glyph, p);
             const final_y = cursor_y + glyph.y_offset * layout_scale - sp_bearing_y * bitmap_scale;
             const snap_x = if (p.snap_to_device_pixels) @round(final_x * p.scale) / p.scale else final_x;
@@ -1503,6 +1558,16 @@ pub const TextRenderer = struct {
     ) !f32 {
         if (text.len == 0) return 0;
         const font_physical_size = font.pixelSize();
+        const width_key: WidthCache.Key = .{
+            .hash = std.hash.Wyhash.hash(0, text),
+            .font = @intFromPtr(font),
+            .size = @bitCast(requested_size),
+            .physical_size = @bitCast(font_physical_size),
+            .scale = @bitCast(self.scale_factor),
+            .advance = @bitCast(fixed_advance),
+            .italic = use_italic,
+        };
+        if (self.width_cache.get(width_key, text)) |width| return width;
         const text_scale: f32 = if (requested_size > 0 and font_physical_size > 0)
             requested_size / font_physical_size
         else
@@ -1557,6 +1622,7 @@ pub const TextRenderer = struct {
             } else break;
             if (seg_count <= MAX_SEGMENTS) break;
         }
+        self.width_cache.put(self.allocator, width_key, text, total);
         return total;
     }
 
@@ -1719,9 +1785,22 @@ pub const TextRenderer = struct {
             for (glyphs, 0..) |g, i| adv += glyphAdvance(g, clusterSpanAt(glyphs, i, seg_end_byte), seg_p);
             if (cursor_x + adv < clip_left) return cursor_x + adv;
         }
+        var previous_ref: ?*anyopaque = null;
+        var previous_font: ?*Font = null;
         for (glyphs, 0..) |g, i| {
             const span = clusterSpanAt(glyphs, i, seg_end_byte);
-            cursor_x += try self.emitGlyphInstance(g, span, cursor_x, y, color, seg_p);
+            var glyph_params = seg_p;
+            // Consecutive glyphs in one shaped run share an owned native ref.
+            // Resolve its font once within this call; never cache borrowed ref
+            // pointers across calls, where allocator reuse could alias fonts.
+            if (g.is_fallback_font and g.fallback_font_ref != null) {
+                if (previous_ref != g.fallback_font_ref) {
+                    previous_font = try self.selectRenderFontForGlyph(g, seg_p);
+                    previous_ref = g.fallback_font_ref;
+                }
+                glyph_params.resolved_font = previous_font;
+            }
+            cursor_x += try self.emitGlyphInstance(g, span, cursor_x, y, color, glyph_params);
         }
         return cursor_x;
     }
@@ -1924,8 +2003,10 @@ pub const TextRenderer = struct {
         // Text fragment shader also reads buffer(0) clip/uniform. Binding only vertex buffer
         // leaves fragment stage with stale or undefined state; offscreen/clip switch scenes
         // show first-frame text clipped wrong.
-        render_pass.setVertexBuffer(0, uniform_buffer, @intCast(uniform_byte_offset));
-        render_pass.setFragmentBuffer(0, uniform_buffer, @intCast(uniform_byte_offset));
+        // One uniform slot, not the rest of the ring: Direct3D snapshots the bound
+        // range per draw (constant buffers over 4 KiB are copied into a new buffer).
+        gpu.setVertexBufferRange(render_pass, 0, uniform_buffer, @intCast(uniform_byte_offset), UNIFORM_STRIDE);
+        gpu.setFragmentBufferRange(render_pass, 0, uniform_buffer, @intCast(uniform_byte_offset), UNIFORM_STRIDE);
 
         // Nearest pass (1:1 scale), per page_index bucket
         if (nearest_count > 0) {
@@ -2052,15 +2133,15 @@ pub const TextRenderer = struct {
                     const overflow_buffer = &self.overflow_buffers[self.current_buffer].?;
                     const overflow_data = try overflow_buffer.getMappedRange(self.overflow_write_offset, instance_size);
                     @memcpy(overflow_data, std.mem.sliceAsBytes(items[seg_offset .. seg_offset + batch]));
-                    render_pass.setVertexBuffer(1, overflow_buffer, @intCast(self.overflow_write_offset));
-                    render_pass.setFragmentBuffer(1, overflow_buffer, @intCast(self.overflow_write_offset));
+                    gpu.setVertexBufferRange(render_pass, 1, overflow_buffer, @intCast(self.overflow_write_offset), @intCast(instance_size));
+                    gpu.setFragmentBufferRange(render_pass, 1, overflow_buffer, @intCast(self.overflow_write_offset), @intCast(instance_size));
                     self.overflow_write_offset += instance_size;
                 } else {
                     const byte_offset = self.buffer_write_offset * @sizeOf(GlyphInstance);
                     const instance_data = try self.instance_buffers[self.current_buffer].getMappedRange(byte_offset, instance_size);
                     @memcpy(instance_data, std.mem.sliceAsBytes(items[seg_offset .. seg_offset + batch]));
-                    render_pass.setVertexBuffer(1, &self.instance_buffers[self.current_buffer], @intCast(byte_offset));
-                    render_pass.setFragmentBuffer(1, &self.instance_buffers[self.current_buffer], @intCast(byte_offset));
+                    gpu.setVertexBufferRange(render_pass, 1, &self.instance_buffers[self.current_buffer], @intCast(byte_offset), @intCast(instance_size));
+                    gpu.setFragmentBufferRange(render_pass, 1, &self.instance_buffers[self.current_buffer], @intCast(byte_offset), @intCast(instance_size));
                     self.buffer_write_offset += batch;
                 }
                 render_pass.draw(6, @intCast(batch), 0, 0);
@@ -2435,15 +2516,43 @@ test "CoreText 桥：开头 UTF-8 BOM 不打乱 cluster 映射与 caret stops" {
 
 test "subpixel glyph placement counts the pen fraction once" {
     // A glyph rasterized into bin b has its origin at subpixelOffset(b) inside the
-    // bitmap, whose left edge sits at bearing from the integer origin.
+    // bitmap, whose left edge sits at bearing from the integer origin. A pen on the pixel
+    // grid uses the unshifted (hinted) raster.
     const bearing_px: f32 = -1;
     var i: u32 = 0;
     while (i < 64) : (i += 1) {
         const pen_px = 100.0 + @as(f32, @floatFromInt(i)) / 64.0;
-        const bin = atlas_mod.subpixelBin(pen_px - @floor(pen_px));
-        const left = TextRenderer.subpixelGlyphLeftPx(pen_px, bearing_px);
+        const pen = atlas_mod.subpixelPen(pen_px);
+        const left = TextRenderer.subpixelGlyphLeftPx(pen, bearing_px);
         try std.testing.expectEqual(@floor(left), left);
-        const drawn_origin = left - bearing_px + atlas_mod.subpixelOffset(bin);
+        const drawn_origin = left - bearing_px + atlas_mod.subpixelOffset(pen.bin);
         try std.testing.expect(@abs(drawn_origin - pen_px) <= 0.5 / @as(f32, @floatFromInt(atlas_mod.SUBPIXEL_BINS)) + 1e-4);
     }
+    // On the grid (and within 1/8 px of it, either side) the raster is unshifted.
+    for ([_]f32{ 100.0, 100.1, 99.9 }) |pen_px| {
+        const pen = atlas_mod.subpixelPen(pen_px);
+        try std.testing.expectEqual(@as(u4, 0), pen.bin);
+        try std.testing.expectEqual(@as(f32, 100), pen.pixel);
+    }
+    try std.testing.expectEqual(@as(f32, 0), atlas_mod.subpixelOffset(0));
+}
+
+test "frame width cache owns text, rejects collisions and clears results" {
+    var cache: WidthCache = .{};
+    defer cache.deinit(std.testing.allocator);
+    const key: WidthCache.Key = .{ .hash = 1, .font = 2, .size = 3, .physical_size = 4, .scale = 5, .advance = 6, .italic = false };
+    var text = [_]u8{ 'a', 'b' };
+    cache.put(std.testing.allocator, key, &text, 12.5);
+    text[0] = 'x';
+    try std.testing.expectEqual(@as(?f32, 12.5), cache.get(key, "ab"));
+    try std.testing.expectEqual(@as(?f32, null), cache.get(key, &text));
+    cache.put(std.testing.allocator, key, &text, 13);
+    try std.testing.expectEqual(@as(?f32, null), cache.get(key, "ab"));
+    try std.testing.expectEqual(@as(usize, 2), cache.bytes);
+    cache.clear(std.testing.allocator);
+    try std.testing.expectEqual(@as(?f32, null), cache.get(key, &text));
+    const oversized = try std.testing.allocator.alloc(u8, 2 * 1024 * 1024 + 1);
+    defer std.testing.allocator.free(oversized);
+    cache.put(std.testing.allocator, key, oversized, 99);
+    try std.testing.expectEqual(@as(usize, 0), cache.entries.count());
 }

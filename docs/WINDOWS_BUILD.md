@@ -99,6 +99,8 @@ zig build -Dtarget=x86_64-windows-gnu -Doptimize=fast
 
 这里是消费项目的普通 install 步骤；仓库的 `windows-*` 专用目标则使用上一节命令。ARM 消费项目使用 `aarch64-windows-gnu`。`.app` 打包只适用于 macOS，Windows 直接运行 `.exe`。
 
+`zenit.attach()` / `addNativeLibs()` 为 Windows 程序设置至少 32 MiB 的栈地址空间预留，以容纳 Debug 渲染器初始化的临时值；调用方已经设置的更大预留会保留。这是地址空间预留，并非启动时提交 32 MiB 内存。
+
 ## 常见问题与检查
 
 - **程序无法启动 / 架构错误**：程序、`--arch` 和目标机器架构应一致；ARM 机器的 Bun 使用准备工具选择的 x64 runtime，依赖系统仿真。

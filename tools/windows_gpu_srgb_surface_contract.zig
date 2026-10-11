@@ -131,7 +131,7 @@ pub fn run() !void {
         try copy.copyTextureToBuffer(&frame.texture.inner, region, &readback, 0, layout.row_pitch);
         var copy_command = try copy.finish();
         defer copy_command.deinit();
-        const copy_serial = try dq.device.context.queue.submit(&.{copy_command});
+        const copy_serial = try dq.device.context.submitCommands(&.{copy_command});
         try dq.device.context.queue.wait(copy_serial, 5000);
         const mapped = try readback.getMappedRange(0, readback.size);
         for (0..4) |row| try check(mapped[row * layout.row_pitch ..][0..32], color, case.bgra, true);

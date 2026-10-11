@@ -278,6 +278,7 @@ pub const NodeRegistry = struct {
 };
 
 pub const HitQueryKind = enum {
+    window_chrome,
     pointer,
     scroll,
     inspect,
@@ -772,7 +773,7 @@ pub const HitRuntime = struct {
             // (e.g. Textarea/VirtualList) scroll still cannot take over.
             // session stability maintained by EventDispatcher's scroll_session_owner.
             .scroll => @as(?HitResult, null),
-            .inspect => null,
+            .inspect, .window_chrome => null,
         };
         const result = cached orelse return null;
         return self.validateProxy(result.proxy_id, query, registry);
@@ -858,11 +859,16 @@ pub const HitRuntime = struct {
         if (!proxy.flags.alive) return null;
 
         if (!roleAllowsQuery(proxy.roles, query.kind)) return null;
-        if (query.kind != .inspect and !behaviorAllowsQuery(proxy.behavior)) return null;
+        if (query.kind != .inspect and query.kind != .window_chrome and !behaviorAllowsQuery(proxy.behavior)) return null;
         if (!proxy.true_aabb.contains(query.world_x, query.world_y)) return null;
         if (!self.clipChainContains(proxy.clip_chain_id, query.world_x, query.world_y, registry)) return null;
 
         const node = registry.resolve(proxy.handle, null) orelse return null;
+        if (query.kind == .window_chrome and node.behavior.interaction.window_region == .inherit) {
+            if (node.style.hit_behavior()) |explicit| {
+                if (!behaviorAllowsQuery(explicit)) return null;
+            }
+        }
         const local = node.frame_state.frame_local.spatial.world.inverse.applyPoint(query.world_x, query.world_y);
         if (!self.shapeContains(proxy.shape_id, node, proxy.local_rect, local.x, local.y)) return null;
 
@@ -1164,6 +1170,7 @@ fn roleAllowsQuery(roles: HitRoles, kind: HitQueryKind) bool {
         .pointer => roles.pointer,
         .scroll => roles.scroll,
         .inspect => roles.inspect,
+        .window_chrome => roles.window_chrome,
     };
 }
 

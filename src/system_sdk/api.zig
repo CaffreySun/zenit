@@ -283,6 +283,27 @@ pub const SystemSdk = struct {
         try api.discard(self.backend_ctx, window_id);
     }
 
+    pub fn setImeSurrounding(self: *SystemSdk, window_id: events_mod.WindowId, text: []const u8, cursor: u32, anchor: u32, secure: bool) SdkError!void {
+        try self.ensureOwnerThread();
+        if (!self.capabilities.has(.ime)) return error.NotSupported;
+        const api = self.vtable.ime orelse return error.NotSupported;
+        const set = api.set_surrounding orelse return error.NotSupported;
+        try set(self.backend_ctx, window_id, text, cursor, anchor, secure);
+    }
+
+    /// Called during dispatch, without mutating the borrowed event queue.
+    pub fn imeEventCurrent(self: *const SystemSdk, event: events_mod.Event) bool {
+        const generation = switch (event) {
+            .ime_preedit => |e| e.generation,
+            .ime_commit => |e| e.generation,
+            .ime_delete_surrounding => |e| e.generation,
+            else => return true,
+        };
+        const api = self.vtable.ime orelse return generation == 0;
+        const current = api.generation orelse return generation == 0;
+        return generation == current(self.backend_ctx);
+    }
+
     pub fn setCursorShape(self: *SystemSdk, window_id: events_mod.WindowId, shape: u8) SdkError!void {
         try self.ensureOwnerThread();
         if (!self.capabilities.has(.cursor)) return SdkError.NotSupported;

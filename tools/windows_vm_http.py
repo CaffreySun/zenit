@@ -40,8 +40,8 @@ LOCAL_SUITE_SCRIPT = "zenit-e2e-suite.js"
 LOCAL_SUITE_ENV = {"ZENIT_E2E_TIMEOUT_MS", "ZENIT_E2E_EXPECT_RENDERER", "ZENIT_E2E_STARTUP_TIMEOUT_MS",
                    "ZENIT_E2E_VISUAL_QUALITY", "ZENIT_E2E_FILTER", "ZENIT_E2E_SUITE_TIMEOUT_MS",
                    "ZENIT_E2E_FORCE_LOCKED_CLOCK"}
-E2E_APPS = {"render-gallery": "zenit-windows-render-gallery.exe", "text-input": "zenit-windows-text-input.exe", "storybook": "zenit-windows-storybook.exe"}
-PROBES = {"gpu": ("windows-arm64-gpu-resources-contract", "zenit-windows-gpu-resources-contract.exe"), "font": ("windows-arm64-font-smoke", "zenit-windows-font-smoke.exe"), "drop": ("windows-arm64-drop-contract", "zenit-windows-drop-contract.exe")}
+E2E_APPS = {"render-gallery": "zenit-windows-render-gallery.exe", "text-input": "zenit-windows-text-input.exe", "storybook": "zenit-windows-storybook.exe", "adaptive-window": "zenit-windows-adaptive-window.exe"}
+PROBES = {"gpu-d3d11": ("windows-d3d11-contract", "zenit-windows-d3d11-contract.exe"), "gpu": ("windows-arm64-gpu-resources-contract", "zenit-windows-gpu-resources-contract.exe"), "font": ("windows-arm64-font-smoke", "zenit-windows-font-smoke.exe"), "drop": ("windows-arm64-drop-contract", "zenit-windows-drop-contract.exe")}
 # A batch job (tools/windows_batch.py): every executable, bundled suite and the
 # stage manifest in one archive; the worker runs the stages locally and returns
 # all evidence in one results archive.
@@ -307,6 +307,9 @@ class Handler(BaseHTTPRequestHandler):
                 exe_name = probe[1]
             modal_audit = payload.get("modal_audit")
             custom_titlebar = payload.get("custom_titlebar") is True
+            startup_timeout_ms = payload.get("startup_timeout_ms", 90000)
+            if type(startup_timeout_ms) is not int or not 1 <= startup_timeout_ms <= 300000:
+                return self.send_error(400, "invalid startup timeout")
             if custom_titlebar and (kind != "e2e" or payload.get("app") != "storybook"):
                 return self.send_error(400, "custom titlebar requires Storybook")
             if modal_audit not in (None, "target", "desktop") or modal_audit and (kind != "e2e" or payload.get("app") != "storybook"):
@@ -335,6 +338,7 @@ class Handler(BaseHTTPRequestHandler):
                 if kind == "batch":
                     self.server.jobs[job_id]["local_suite"] = local_suite
                 if kind == "e2e":
+                    self.server.jobs[job_id]["startup_timeout_ms"] = startup_timeout_ms
                     self.server.jobs[job_id]["custom_titlebar"] = custom_titlebar
                     self.server.jobs[job_id]["local_suite"] = local_suite
                     self.server.rpc_pending[job_id] = deque()
@@ -369,7 +373,9 @@ class Handler(BaseHTTPRequestHandler):
                     self.server.rpc_screenshots[request_id] = requested_path
                 self.server.rpc_pending[parts[1]].append({"kind": "rpc", "id": request_id, "method": payload.get("method"), "path": payload.get("path"), "body_json": json.dumps(payload.get("body"), ensure_ascii=False) if payload.get("body") is not None else ""})
                 self.server.condition.notify_all()
-                deadline = time.monotonic() + 30
+                # Let the worker's 40-second command deadline finish before
+                # the host transport gives up, including a small network margin.
+                deadline = time.monotonic() + 45
                 while request_id not in self.server.rpc_results and job["status"] == "running" and time.monotonic() < deadline:
                     self.server.condition.wait(timeout=1)
                 response = self.server.rpc_results.pop(request_id, None)
@@ -746,7 +752,7 @@ def run_owned_suite(argv, *, cwd, env, output, timeout, worker_state):
 
 
 def require_pe_arch(path: Path, arch: str) -> None:
-    expected = {"aarch64": 0xaa64, "x86_64": 0x8664}[arch]
+    expected = {"aarch64": 0xaa64, "x86_64": 0x8664, "x86": 0x14c}[arch]
     with path.open("rb") as file:
         header = file.read(64)
         if len(header) < 64 or header[:2] != b"MZ":
@@ -758,11 +764,11 @@ def require_pe_arch(path: Path, arch: str) -> None:
 
 
 def e2e_build_command(app: str, renderer: str, arch: str = "aarch64") -> list[str]:
-    if app not in E2E_APPS or renderer not in {"legacy", "d3d12"} or arch not in {"aarch64", "x86_64"}:
+    if app not in E2E_APPS or renderer not in {"legacy", "d3d12", "d3d11"} or arch not in {"aarch64", "x86_64", "x86"}:
         raise ValueError("invalid Windows app/renderer")
-    backend = "d3d12" if renderer == "d3d12" else "metal"
+    backend = renderer if renderer in {"d3d12", "d3d11"} else "metal"
     return ["zig", "build", f"windows-arm64-{app}", "-Dtest-mode=true",
-            f"-Dgpu-backend={backend}", "-Doptimize=fast"] + (["-Dwindows-arch=x86_64"] if arch == "x86_64" else [])
+            f"-Dgpu-backend={backend}", "-Doptimize=fast"] + ([f"-Dwindows-arch={arch}"] if arch != "aarch64" else [])
 
 
 def build_local_suite(args: argparse.Namespace, folder: Path) -> dict:
@@ -838,8 +844,8 @@ def run_e2e(args: argparse.Namespace) -> int:
         raise ValueError("--startup-timeout must be greater than 0 and at most 300 seconds")
     if not args.skip_build and args.artifact_dir != REPO / "zig-out/bin":
         raise ValueError("--artifact-dir requires --skip-build; build isolated artifacts with zig --prefix first")
-    if args.visual_quality and args.renderer != "d3d12":
-        raise ValueError("--visual-quality requires --renderer d3d12")
+    if args.visual_quality and args.renderer not in ("d3d12", "d3d11"):
+        raise ValueError("--visual-quality requires --renderer d3d12 or d3d11")
     if args.custom_titlebar and args.app != "storybook":
         raise SystemExit("--custom-titlebar requires --app storybook")
     if args.audit_modal_frames and args.app != "storybook":
@@ -876,7 +882,7 @@ def run_e2e(args: argparse.Namespace) -> int:
     local_suite = None
     if args.suite_on_worker:
         local_suite = build_local_suite(args, folder)
-    request(base, token, "POST", "/jobs", {"id": job_id, "kind": "e2e", "app": args.app, "local_suite": local_suite, "custom_titlebar": args.custom_titlebar, "capture_frames": args.capture_frames or args.capture_desktop or bool(args.audit_modal_frames), "trace_frames": args.trace_frames or bool(args.audit_modal_frames), "capture_desktop": args.capture_desktop or args.audit_modal_frames == "desktop", "modal_audit": args.audit_modal_frames, "allow_foreground": args.allow_foreground})
+    request(base, token, "POST", "/jobs", {"id": job_id, "kind": "e2e", "app": args.app, "local_suite": local_suite, "startup_timeout_ms": round(args.startup_timeout * 1000), "custom_titlebar": args.custom_titlebar, "capture_frames": args.capture_frames or args.capture_desktop or bool(args.audit_modal_frames), "trace_frames": args.trace_frames or bool(args.audit_modal_frames), "capture_desktop": args.capture_desktop or args.audit_modal_frames == "desktop", "modal_audit": args.audit_modal_frames, "allow_foreground": args.allow_foreground})
     print(f"Windows E2E job: {job_id}; evidence: {folder}", flush=True)
     deadline = time.monotonic() + args.timeout
     while time.monotonic() < deadline:
@@ -910,7 +916,7 @@ def run_e2e(args: argparse.Namespace) -> int:
     except subprocess.TimeoutExpired:
         (folder / "host-suite.log").open("a").write("\nHost suite timed out\n")
     finally:
-        if args.renderer == "d3d12" and (args.capture_frames or args.capture_desktop or args.audit_modal_frames):
+        if args.renderer in ("d3d12", "d3d11") and (args.capture_frames or args.capture_desktop or args.audit_modal_frames):
             # The worker terminates only its owned app after /rpc/stop. First
             # serialize with frame writers on the app thread, then prevent any
             # further archive writes. Never prune an incomplete final frame.
@@ -959,8 +965,8 @@ def main() -> int:
     e2e_cmd.add_argument("--base", default="http://127.0.0.1:19817")
     e2e_cmd.add_argument("--skip-build", action="store_true")
     e2e_cmd.add_argument("--artifact-dir", type=Path, default=REPO / "zig-out/bin")
-    e2e_cmd.add_argument("--arch", choices=["aarch64", "x86_64"], default="aarch64")
-    e2e_cmd.add_argument("--renderer", choices=["legacy", "d3d12"], default="legacy",
+    e2e_cmd.add_argument("--arch", choices=["aarch64", "x86_64", "x86"], default="aarch64")
+    e2e_cmd.add_argument("--renderer", choices=["legacy", "d3d12", "d3d11"], default="legacy",
                          help="Build this Windows renderer and verify it in the running app, including with --skip-build")
     e2e_cmd.add_argument("--app", choices=sorted(E2E_APPS), default="text-input")
     e2e_cmd.add_argument("--suite", default="e2e/text-input-demo-audit.test.ts")
@@ -979,7 +985,7 @@ def main() -> int:
     probe_cmd.add_argument("--base", default="http://127.0.0.1:19817")
     probe_cmd.add_argument("--skip-build", action="store_true")
     probe_cmd.add_argument("--artifact-dir", type=Path, default=REPO / "zig-out/bin")
-    probe_cmd.add_argument("--arch", choices=["aarch64", "x86_64"], default="aarch64")
+    probe_cmd.add_argument("--arch", choices=["aarch64", "x86_64", "x86"], default="aarch64")
     probe_cmd.add_argument("--probe", choices=sorted(PROBES), default="font")
     probe_cmd.add_argument("--timeout", type=float, default=60)
     probe_cmd.add_argument("--gpu-scope", choices=["all", "sdf", "other", "app", "resources", "resources_core", "resources_shared", "bindings"], default="all", help="Native contract scope; sdf + other or sdf + resources + app cover all; resources_core + resources_shared = resources. Validated even with --skip-build.")

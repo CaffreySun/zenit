@@ -47,6 +47,8 @@ pub const MenuItemKind = enum {
 
 /// Menu item
 pub const MenuItem = struct {
+    /// Nested menu. Static trees are copied at mount; leaf selection closes ancestors.
+    children: []const MenuItem = &.{},
     /// Item identifier (received by `on_select`)
     id: []const u8 = "",
     /// Display text
@@ -67,6 +69,9 @@ pub const MenuItem = struct {
 
 /// Menu properties
 pub const MenuProps = struct {
+    trigger: popover_mod.PopoverTrigger = .click,
+    /// Used by nested menus to return focus to their parent on Left/Escape.
+    on_back: ?Handler(void) = null,
     /// Menu items. Static array copied at mount with strings (caller can pass function-local
     /// array);
     /// signal / derived borrow current value: new array rebuilds, old array and strings must stay
@@ -104,6 +109,8 @@ pub const MenuResult = struct {
 
 /// Menu internal state (owned by Popover scope, lifetime with menu)
 pub const MenuState = struct {
+    was_open: bool = false,
+    previous_focus: ?core.NodeHandle = null,
     cx: *Cx,
     /// Current highlight index (keyboard navigation and select use it)
     highlighted_index: usize = 0,
@@ -123,6 +130,8 @@ pub const MenuState = struct {
     close: Handler(void),
     /// Container holding keyboard focus (aria-activedescendant attached to it)
     menu_node: ?*Node = null,
+    on_back: ?Handler(void) = null,
+    submenu_open: [MAX_ITEMS]?*Signal(bool) = @splat(null),
 
     pub const MAX_ITEMS = 64;
     /// highlight's "no highlight" value
@@ -145,6 +154,10 @@ pub const MenuState = struct {
         if (self.highlighted_index >= self.items.len) return;
         const item = self.items[self.highlighted_index];
         if (item.kind == .separator or item.disabled) return;
+        if (item.children.len > 0) {
+            if (self.submenu_open[self.highlighted_index]) |open| open.set(true);
+            return;
+        }
         const on_select = self.on_select;
         const close = self.close;
         const cx = self.cx;
@@ -174,6 +187,7 @@ pub const MenuState = struct {
     pub fn highlightIndex(self: *MenuState, index: usize) void {
         if (index >= self.item_count) return;
         if (self.items[index].kind == .separator) return;
+        for (self.submenu_open, 0..) |open, i| if (open) |s| if (i != index) s.set(false);
 
         self.highlighted_index = index;
         // Row view lights up by highlighted (data-driven, no direct node background change)
@@ -191,9 +205,18 @@ pub const MenuState = struct {
         }
     }
 
+    fn enterIndex(self: *MenuState, index: usize) void {
+        self.highlightIndex(index);
+        if (index < self.item_count and !self.items[index].disabled) if (self.submenu_open[index]) |open| open.set(true);
+    }
+
     /// Rebuild key: content + string address + callback (strings borrowed, address change stales
     /// a11y label on old nodes)
     fn itemsKey(items: []const MenuItem) u64 {
+        return itemsKeyDepth(items, 0);
+    }
+    fn itemsKeyDepth(items: []const MenuItem, depth: usize) u64 {
+        if (depth > 8) return 0;
         var h = std.hash.Wyhash.init(0);
         h.update(std.mem.asBytes(&items.len));
         for (items) |it| {
@@ -202,6 +225,8 @@ pub const MenuState = struct {
             if (it.shortcut) |sc| hashStr(&h, sc) else h.update("\x00");
             h.update(&.{ @backingInt(it.kind), @intFromBool(it.disabled), @intFromBool(it.danger) });
             const icon: usize = if (it.icon_asset) |a| @intFromPtr(a.svg_data.ptr) else 0;
+            const child_key = if (it.children.len > 0) itemsKeyDepth(it.children, depth + 1) else 0;
+            h.update(std.mem.asBytes(&child_key));
             h.update(std.mem.asBytes(&icon));
             if (it.on_click) |c| {
                 h.update(std.mem.asBytes(&@intFromPtr(c.callback)));
@@ -227,6 +252,7 @@ pub const MenuState = struct {
         self.items = &.{};
         self.item_nodes = @as([MAX_ITEMS]?*Node, @splat(null));
         self.item_count = 0;
+        self.submenu_open = @splat(null);
         self.highlighted_index = 0;
         self.highlighted.set(no_highlight);
         if (self.menu_node) |menu_node| {
@@ -237,15 +263,17 @@ pub const MenuState = struct {
         // invisible items
         const items = all_items[0..@min(all_items.len, MAX_ITEMS)];
         var nodes = @as([MAX_ITEMS]?*Node, @splat(null));
+        var submenus: [MAX_ITEMS]?*Signal(bool) = @splat(null);
 
-        try view.mount(items_scope, cx, item_list, view.items(RowCtx{ .state = self, .nodes = &nodes }, items, rowElement));
+        try view.mount(items_scope, cx, item_list, view.items(RowCtx{ .state = self, .nodes = &nodes, .submenus = &submenus }, items, rowElement));
 
         self.item_nodes = nodes;
+        self.submenu_open = submenus;
         self.item_count = items.len;
         self.items = items;
     }
 
-    const RowCtx = struct { state: *MenuState, nodes: *[MAX_ITEMS]?*Node };
+    const RowCtx = struct { state: *MenuState, nodes: *[MAX_ITEMS]?*Node, submenus: *[MAX_ITEMS]?*Signal(bool) };
     const RowArgs = struct { ctx: RowCtx, item: MenuItem, index: usize };
 
     fn rowElement(ctx: RowCtx, item: MenuItem, i: usize) view.ComponentOf(buildRow) {
@@ -269,9 +297,47 @@ pub const MenuState = struct {
                 .shortcut = item.shortcut,
                 .icon_asset = item.icon_asset,
                 .on_pick = Handler(usize).from(MenuState, state, MenuState.pickIndex),
-                .on_enter = Handler(usize).from(MenuState, state, MenuState.highlightIndex),
+                .on_enter = Handler(usize).from(MenuState, state, MenuState.enterIndex),
             }));
+        var orphan = true;
+        errdefer if (orphan) cx.destroyDetached(node);
         args.ctx.nodes[args.index] = node;
+        if (item.children.len > 0 and !item.disabled) {
+            const open = try scope.createSignal(bool, false);
+            args.ctx.submenus[args.index] = open;
+            const Parent = struct {
+                state: *MenuState,
+                open: *Signal(bool),
+                fn selected(p: *@This(), id: []const u8) void {
+                    const close = p.state.close;
+                    const notify = p.state.on_select;
+                    close.invoke();
+                    if (notify) |h| h.call(id);
+                }
+                fn changed(p: *@This(), value: bool) void {
+                    if (!value) {
+                        if (p.state.menu_node) |root| p.state.cx.setFocus(root);
+                    }
+                }
+                fn back(p: *@This()) void {
+                    p.open.set(false);
+                    if (p.state.menu_node) |root| p.state.cx.setFocus(root);
+                }
+            };
+            const parent = try scope.createState(Parent, .{ .state = state, .open = open });
+            const arrow = try view.render(scope, cx, view.icon(.{ .style = .{ .width = 12, .height = 12 } }, @import("zenit_system_icons").chevron_right));
+            _ = try core.adoptChild(cx, cx.allocator, node, arrow);
+            if (node.behavior.interaction.a11y) |*a| a.has_popup = .menu;
+            const nested = try Menu(.{ .trigger = .manual, .items = item.children, .open = open, .on_open_change = Handler(bool).from(Parent, parent, Parent.changed), .position = .right_start, .on_select = Handler([]const u8).from(Parent, parent, Parent.selected), .on_back = cx.on(Parent, parent, Parent.back) }).mount(scope, cx);
+            errdefer cx.destroyDetached(nested.wrapper);
+            // Nested rows fill the panel, unlike a fit-content toolbar trigger.
+            nested.wrapper.setStyleInline(cx.allocator, .{ .width = core.Sizing.fill() });
+            nested.trigger.setStyleInline(cx.allocator, .{ .width = core.Sizing.fill() });
+            orphan = false; // adoptChild owns the row even when append fails
+            _ = try core.adoptChild(cx, cx.allocator, nested.trigger, node);
+            return nested.wrapper;
+        }
+        orphan = false;
         return node;
     }
 
@@ -298,7 +364,7 @@ pub const MenuBuilder = struct {
 
         var pop_result = try popover_mod.Popover(.{
             .position = p.position,
-            .trigger = .click,
+            .trigger = p.trigger,
             .width = p.width,
             .max_width = if (p.max_height != null) p.width else null,
             .max_height = p.max_height,
@@ -324,6 +390,7 @@ pub const MenuBuilder = struct {
         state.* = .{
             .cx = cx,
             .on_select = p.on_select,
+            .on_back = p.on_back,
             .close = pop_result.close,
             .highlighted = highlighted,
         };
@@ -364,10 +431,22 @@ pub const MenuBuilder = struct {
         try menu_scope.createEffect(.{
             .open = pop_result.open_read,
             .content = pop_result.content,
+            .state = state,
             .cx = cx,
         }, struct {
             fn update(c: anytype) void {
-                if (c.open.get()) c.cx.setFocus(c.content);
+                const open = c.open.get();
+                if (open and !c.state.was_open) {
+                    c.state.previous_focus = if (c.cx.focused_node) |node| c.cx.node_registry.handleFor(node) else null;
+                    c.cx.setFocus(c.content);
+                } else if (!open and c.state.was_open) {
+                    for (c.state.submenu_open) |submenu| if (submenu) |child| child.set(false);
+                    if (c.state.on_back == null or c.cx.focus_manager.getFocused() == c.content) {
+                        if (c.state.previous_focus) |handle| if (c.cx.node_registry.resolve(handle, null)) |node| c.cx.setFocus(node);
+                    }
+                    c.state.previous_focus = null;
+                }
+                c.state.was_open = open;
             }
         }.update);
 
@@ -380,6 +459,10 @@ pub const MenuBuilder = struct {
 };
 
 fn cloneItems(allocator: Allocator, source: []const MenuItem) ![]MenuItem {
+    return cloneItemsDepth(allocator, source, 0);
+}
+fn cloneItemsDepth(allocator: Allocator, source: []const MenuItem, depth: usize) ![]MenuItem {
+    if (depth > 8) return error.MenuNestingTooDeep;
     const cloned = try allocator.alloc(MenuItem, source.len);
     errdefer allocator.free(cloned);
     var initialized: usize = 0;
@@ -387,6 +470,7 @@ fn cloneItems(allocator: Allocator, source: []const MenuItem) ![]MenuItem {
         allocator.free(item.id);
         allocator.free(item.label);
         if (item.shortcut) |shortcut| allocator.free(shortcut);
+        if (item.children.len > 0) freeItems(allocator, @constCast(item.children));
     };
 
     for (source, 0..) |item, index| {
@@ -395,10 +479,13 @@ fn cloneItems(allocator: Allocator, source: []const MenuItem) ![]MenuItem {
         const label = try allocator.dupe(u8, item.label);
         errdefer allocator.free(label);
         const shortcut = if (item.shortcut) |value| try allocator.dupe(u8, value) else null;
+        errdefer if (shortcut) |text| allocator.free(text);
+        const children: []const MenuItem = if (item.children.len > 0) try cloneItemsDepth(allocator, item.children, depth + 1) else &.{};
         cloned[index] = item;
         cloned[index].id = id;
         cloned[index].label = label;
         cloned[index].shortcut = shortcut;
+        cloned[index].children = children;
         initialized += 1;
     }
     return cloned;
@@ -409,6 +496,7 @@ fn freeItems(allocator: Allocator, items: []MenuItem) void {
         allocator.free(item.id);
         allocator.free(item.label);
         if (item.shortcut) |shortcut| allocator.free(shortcut);
+        if (item.children.len > 0) freeItems(allocator, @constCast(item.children));
     }
     allocator.free(items);
 }
@@ -440,6 +528,14 @@ fn menuKeyHandler(key: KeyCode, _: Modifiers, context: ?*anyopaque) EventResult 
     const state: *MenuState = @ptrCast(@alignCast(context.?));
 
     switch (key) {
+        .right => {
+            if (state.highlighted_index < state.items.len and state.items[state.highlighted_index].children.len > 0) state.selectHighlighted();
+            return .stop;
+        },
+        .left => {
+            if (state.on_back) |h| h.invoke();
+            return .stop;
+        },
         .down => {
             if (nextEnabledIndex(state.items, state.highlighted_index, true)) |idx| {
                 state.highlightIndex(idx);
@@ -457,7 +553,7 @@ fn menuKeyHandler(key: KeyCode, _: Modifiers, context: ?*anyopaque) EventResult 
             return .stop;
         },
         .escape => {
-            state.close.invoke();
+            if (state.on_back) |h| h.invoke() else state.close.invoke();
             return .stop;
         },
         else => return .ignored,
@@ -845,6 +941,35 @@ test "Menu: mount 在任意分配点失败时不泄漏（sweep）" {
         fn m(scope: *sw.Scope, cx: *sw.Cx) anyerror!?*sw.Node {
             const items = try scope.createSignal([]const MenuItem, &test_items);
             return (try Menu(.{ .items = items, .max_height = 120 }).mount(scope, cx)).wrapper;
+        }
+    }.m);
+}
+
+test "Menu: nested navigation, ancestor close and focus restoration" {
+    const env = try TestEnv.init();
+    defer env.deinit();
+    const open = try env.scope.createSignal(bool, false);
+    const result = try env.mount(.{ .items = &[_]MenuItem{.{ .id = "file", .label = "File", .children = &.{.{ .id = "new", .label = "New" }} }}, .open = open });
+    try env.ctx.node_registry.rebuild(env.root);
+    result.trigger.setFocusable(true);
+    env.ctx.setFocus(result.trigger);
+    open.set(true);
+    const parent = stateOf(result);
+    const child_open = parent.submenu_open[0].?;
+    parent.highlightIndex(0);
+    try std.testing.expect(!child_open.peek());
+    _ = menuKeyHandler(.right, .{}, parent);
+    try std.testing.expect(child_open.peek());
+    open.set(false);
+    try std.testing.expect(!child_open.peek());
+    try std.testing.expectEqual(result.trigger, env.ctx.focused_node.?);
+}
+
+test "Menu: nested mount failures release rows, portal scopes and copied children" {
+    const sw = @import("../oom_sweep.zig");
+    try sw.sweepMount("nested_menu", struct {
+        fn m(scope: *sw.Scope, cx: *sw.Cx) anyerror!?*sw.Node {
+            return (try Menu(.{ .items = &[_]MenuItem{.{ .id = "file", .label = "File", .children = &.{.{ .id = "new", .label = "New", .children = &.{.{ .id = "leaf", .label = "Leaf" }} }} }} }).mount(scope, cx)).wrapper;
         }
     }.m);
 }

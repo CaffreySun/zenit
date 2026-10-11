@@ -3,12 +3,14 @@ const builtin = @import("builtin");
 pub const Backend = switch (builtin.target.os.tag) {
     .macos => @import("macos/window.zig"),
     .windows => @import("windows/window.zig"),
+    .linux => @import("linux/window.zig"),
     else => @import("unsupported/window.zig"),
 };
 
 pub const Window = switch (builtin.target.os.tag) {
     .macos => Backend.MacOSWindow,
     .windows => Backend.WindowsWindow,
+    .linux => Backend.LinuxWindow,
     else => Backend.UnsupportedWindow,
 };
 

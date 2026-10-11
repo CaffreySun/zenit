@@ -72,6 +72,13 @@ const Class = struct {
 };
 
 fn classOf(cp: u21) Class {
+    // ASCII has no pictographic or Indic properties. Keep CR/LF and controls
+    // distinct so this fast path preserves the Unicode boundary rules.
+    if (cp < 0x80) return .{
+        .gcb = if (cp == '\r') .cr else if (cp == '\n') .lf else if (cp < 0x20 or cp == 0x7f) .control else .other,
+        .extended_pictographic = false,
+        .incb = .none,
+    };
     return .{
         .gcb = gcbProp(cp),
         .extended_pictographic = unicode_data.isExtendedPictographic(cp),

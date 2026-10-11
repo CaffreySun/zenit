@@ -16,9 +16,9 @@ pub fn HelloButton() View {
     return (
         <col style={S.root}>
             <text style={S.title}>Hello, zenit!</text>
-            <Button variant={.primary} size={.md} onClick={count += 1}>Click me</Button>
+            <Button testId="hello.increment" variant={.primary} size={.md} onClick={count += 1}>Click me</Button>
             <box style={S.Panel.of(.{ .emphasis = emphasis })}>
-                <text style={S.counter_label}>Clicked {count} times</text>
+                <text testId="hello.counter" style={S.counter_label}>Clicked {count} times</text>
             </box>
         </col>
     );

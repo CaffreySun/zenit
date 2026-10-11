@@ -383,7 +383,7 @@ pub fn inputBeforeRender(node: *Node) void {
     // setBorderColor).
 
     const now = @import("zenit_time").Instant.now(state.io) catch null;
-    const blink_visible = if (state.focused and now != null) state.blinkVisible(now.?) else state.focused;
+    const blink_visible = (!state.hasImePreedit() or state.ime_cursor_visible) and (if (state.focused and now != null) state.blinkVisible(now.?) else state.focused);
     if (state.focused and now != null) {
         if (state.cx_ref) |cx| {
             cx.scheduleRedrawAfterNs(state.nextBlinkDelayNs(now.?));
@@ -684,8 +684,8 @@ fn rebuildSingleLineSpans(state: *TextInputState) void {
             // IME marked highlight (entire preedit blue semi-transparent).
             if (state.shouldShowImeSelectionHighlight()) {
                 state.text_spans_buf[len] = .{
-                    .start = preedit_start,
-                    .end = preedit_end,
+                    .start = preedit_start + @as(u32, @intCast(if (state.ime_selection_end) |end| if (is_password) text_utils.utf8GraphemeLen(state.preeditText()[0..@min(end, state.ime_cursor_utf8_offset)]) else @min(end, state.ime_cursor_utf8_offset) else 0)),
+                    .end = if (state.ime_selection_end) |end| preedit_start + @as(u32, @intCast(if (is_password) text_utils.utf8GraphemeLen(state.preeditText()[0..@max(end, state.ime_cursor_utf8_offset)]) else @max(end, state.ime_cursor_utf8_offset))) else preedit_end,
                     .bg_color = styles.imeHighlightColor(state.tokens),
                 };
                 len += 1;

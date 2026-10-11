@@ -89,6 +89,7 @@ fn defaultRoles(node: *const Node) HitRoles {
             node.tag == .input,
         .scroll = is_scroll_owner,
         .inspect = node.frame_state.state_bits.flags.inspectable,
+        .window_chrome = true,
     };
 }
 

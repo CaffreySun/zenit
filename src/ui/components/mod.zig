@@ -12,6 +12,12 @@
 const std = @import("std");
 const core = @import("../core.zig");
 
+pub const window_chrome = @import("window_chrome/mod.zig");
+pub const WindowHeader = window_chrome.WindowHeader;
+pub const WindowControls = window_chrome.WindowControls;
+pub const DragRegion = window_chrome.DragRegion;
+pub const ClientRegion = window_chrome.ClientRegion;
+
 // Unified base.
 pub const control_shell = @import("control_shell/mod.zig");
 /// Test support: per-allocation OOM sweep during component mount. Export for consumers

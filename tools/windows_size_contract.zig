@@ -6,8 +6,17 @@ const Rect = extern struct { left: i32, top: i32, right: i32, bottom: i32 };
 extern "user32" fn GetWindowRect(*anyopaque, *Rect) callconv(.winapi) c_int;
 extern "user32" fn GetForegroundWindow() callconv(.winapi) ?*anyopaque;
 extern "user32" fn GetDpiForWindow(*anyopaque) callconv(.winapi) u32;
-extern "user32" fn GetWindowLongPtrW(*anyopaque, c_int) callconv(.winapi) isize;
-extern "user32" fn SetWindowLongPtrW(*anyopaque, c_int, isize) callconv(.winapi) isize;
+const WindowLong = if (@import("builtin").cpu.arch == .x86) struct {
+    extern "user32" fn GetWindowLongW(*anyopaque, c_int) callconv(.winapi) i32;
+    extern "user32" fn SetWindowLongW(*anyopaque, c_int, i32) callconv(.winapi) i32;
+    const get = GetWindowLongW;
+    const set = SetWindowLongW;
+} else struct {
+    extern "user32" fn GetWindowLongPtrW(*anyopaque, c_int) callconv(.winapi) isize;
+    extern "user32" fn SetWindowLongPtrW(*anyopaque, c_int, isize) callconv(.winapi) isize;
+    const get = GetWindowLongPtrW;
+    const set = SetWindowLongPtrW;
+};
 extern "user32" fn SetWindowPos(*anyopaque, ?*anyopaque, c_int, c_int, c_int, c_int, u32) callconv(.winapi) c_int;
 extern "user32" fn SendMessageW(*anyopaque, u32, usize, isize) callconv(.winapi) isize;
 extern "user32" fn CreateMenu() callconv(.winapi) ?*anyopaque;
@@ -34,16 +43,16 @@ fn sized(app: *App, width: u32, height: u32) !void {
 pub fn run(app: *App) !void {
     const hwnd = app.win.getNativeSurfaceHandle();
     const foreground = GetForegroundWindow();
-    const old_style = GetWindowLongPtrW(hwnd, -16);
-    const old_ex_style = GetWindowLongPtrW(hwnd, -20);
+    const old_style = WindowLong.get(hwnd, -16);
+    const old_ex_style = WindowLong.get(hwnd, -20);
     const old_menu = GetMenu(hwnd);
     var before: Rect = undefined;
     try require(GetWindowRect(hwnd, &before) != 0);
     const menu = CreateMenu() orelse return error.WindowSizeContractFailed;
     defer {
         _ = SetMenu(hwnd, old_menu);
-        _ = SetWindowLongPtrW(hwnd, -16, old_style);
-        _ = SetWindowLongPtrW(hwnd, -20, old_ex_style);
+        _ = WindowLong.set(hwnd, -16, old_style);
+        _ = WindowLong.set(hwnd, -20, old_ex_style);
         _ = SetWindowPos(hwnd, null, 0, 0, before.right - before.left, before.bottom - before.top, 0x36);
         _ = DrawMenuBar(hwnd);
         _ = DestroyMenu(menu);
@@ -66,13 +75,13 @@ pub fn run(app: *App) !void {
     try require(GetWindowRect(hwnd, &wrapped) != 0);
     try require(wrapped.bottom - wrapped.top > single_row.bottom - single_row.top);
     std.log.info("Windows wrapped menu outer height {d}->{d}, client height stays 603", .{ single_row.bottom - single_row.top, wrapped.bottom - wrapped.top });
-    _ = SetWindowLongPtrW(hwnd, -16, old_style & ~@as(isize, 0x40000)); // No WS_THICKFRAME.
-    _ = SetWindowLongPtrW(hwnd, -20, old_ex_style | 0x200); // WS_EX_CLIENTEDGE.
+    _ = WindowLong.set(hwnd, -16, old_style & ~@as(isize, 0x40000)); // No WS_THICKFRAME.
+    _ = WindowLong.set(hwnd, -20, old_ex_style | 0x200); // WS_EX_CLIENTEDGE.
     _ = SetWindowPos(hwnd, null, 0, 0, 0, 0, 0x37);
-    try require(GetWindowLongPtrW(hwnd, -16) == old_style & ~@as(isize, 0x40000));
-    try require(GetWindowLongPtrW(hwnd, -20) == old_ex_style | 0x200);
+    try require(WindowLong.get(hwnd, -16) == old_style & ~@as(isize, 0x40000));
+    try require(WindowLong.get(hwnd, -20) == old_ex_style | 0x200);
     try sized(app, 805, 605);
-    _ = SetWindowLongPtrW(hwnd, -16, (old_style & ~@as(isize, 0x40000)) | 0x300000); // Native scrollbars.
+    _ = WindowLong.set(hwnd, -16, (old_style & ~@as(isize, 0x40000)) | 0x300000); // Native scrollbars.
     _ = SetWindowPos(hwnd, null, 0, 0, 0, 0, 0x37);
     try sized(app, 807, 607);
     var stable: Rect = undefined;

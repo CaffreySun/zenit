@@ -787,7 +787,7 @@ pub const PathRenderer = struct {
             if (self.vertex_buffer) |*vertex_buffer| {
                 const mapped = try vertex_buffer.getMappedRange(byte_offset, vertex_bytes.len);
                 @memcpy(mapped, vertex_bytes);
-                render_pass.setVertexBuffer(0, vertex_buffer, @intCast(byte_offset));
+                gpu.setVertexBufferRange(render_pass, 0, vertex_buffer, @intCast(byte_offset), @intCast(vertex_bytes.len));
             } else unreachable;
             self.buffer_write_offset = byte_offset + vertex_bytes.len;
         }
@@ -957,7 +957,7 @@ pub const PathRenderer = struct {
     /// created on-demand at first flush). GPU is guaranteed to have consumed the next slot last
     /// written BUFFER_MAX_FRAMES_IN_FLIGHT frames ago (frame_sync ensures this).
     fn rotateVertexBufferSlot(self: *PathRenderer) void {
-        self.restoreFrameBufferSlot((self.buffer_slot + 1) % BUFFER_MAX_FRAMES_IN_FLIGHT);
+        self.restoreFrameBufferSlot(@intCast((self.buffer_slot + 1) % BUFFER_MAX_FRAMES_IN_FLIGHT));
     }
 
     /// Undo an unsubmitted frame's rotation without losing ownership of either

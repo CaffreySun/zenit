@@ -1,10 +1,11 @@
-//! D3D12 public App initialization and font contracts. D3D11-native layout
+//! Shared Direct3D App initialization and font contracts. Legacy D3D11 layout
 //! counters belong to the legacy fixture; shared rendering is checked in pixels.
 const std = @import("std");
 const App = @import("zenit_app").App;
 const Window = @FieldType(App, "win");
 const Storage = @import("windows_app_init_contract.zig").ReusedAllocator;
 extern "user32" fn GetForegroundWindow() callconv(.winapi) ?*anyopaque;
+extern fn zenit_windows_contract_background(c_int) c_int;
 
 fn require(ok: bool) !void {
     if (!ok) return error.SharedAppInitContractFailed;
@@ -24,6 +25,8 @@ pub const ReusedAllocator = struct {
         return self.storage.allocator();
     }
     pub fn beforeReuse(self: *@This(), io: std.Io) !void {
+        const background = zenit_windows_contract_background(1);
+        defer _ = zenit_windows_contract_background(background);
         const before = Window.liveWindowCount();
         const foreground = GetForegroundWindow();
         if (App.init(self.allocator(), .{ .io = io, .font = .{ .small_size = 0 } })) |unexpected| {
@@ -63,7 +66,7 @@ pub const ReusedAllocator = struct {
         }
         _ = try width(app);
         try @import("windows_font_paint_contract.zig").run(app.cx.io);
-        std.log.info("Shared D3D12 App init contract: nonzero allocation, quit/reuse, owned family, missing fallback, window isolation, shaping and actual font-range paint PASS", .{});
-        std.log.info("D3D11 private layout/device contracts are legacy-only; this shared fixture does not claim them", .{});
+        std.log.info("Shared Direct3D App init contract: nonzero allocation, quit/reuse, owned family, missing fallback, window isolation, shaping and actual font-range paint PASS", .{});
+        std.log.info("Private layout/device counters are legacy-only; this shared fixture verifies rendered pixels", .{});
     }
 };

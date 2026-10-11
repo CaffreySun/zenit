@@ -778,12 +778,14 @@ pub const PopoverPositionCtx = struct {
                 const g = self.trigger_node.globalRect();
                 // Global hook read rect (fallback to node.rect when epoch==0).
                 const r = self.trigger_node.rectFromWorldOrFallback();
-                break :blk .{ .x = g.x, .y = g.y, .w = r.w, .h = r.h };
+                const offset = if (self.cx.windowHeaderOwns(self.trigger_node)) self.cx.window_header_offset else [2]f32{ 0, 0 };
+                break :blk .{ .x = g.x + offset[0], .y = g.y + offset[1], .w = r.w, .h = r.h };
             },
             .external_node => |n| blk: {
                 const g = n.globalRect();
                 const r = n.rectFromWorldOrFallback();
-                break :blk .{ .x = g.x, .y = g.y, .w = r.w, .h = r.h };
+                const offset = if (self.cx.windowHeaderOwns(n)) self.cx.window_header_offset else [2]f32{ 0, 0 };
+                break :blk .{ .x = g.x + offset[0], .y = g.y + offset[1], .w = r.w, .h = r.h };
             },
             .virtual => |va| va.getRect(va.ctx),
         };

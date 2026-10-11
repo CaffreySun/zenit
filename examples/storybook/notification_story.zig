@@ -34,6 +34,9 @@ const Story = struct {
     /// Simulated progress card (id + start frame time + duration).
     progress_id: ?Id = null,
     progress_start_ms: f64 = 0,
+    /// Wall-clock start of the current hover pause. The hook can run several times per frame
+    /// (hit-test refreshes), so the pause is settled once on resume instead of accumulating dt.
+    progress_paused_at: ?f64 = null,
     progress_duration_ms: f64 = 5200,
     progress_title_done: []const u8 = "上传完成",
     progress_body_done: []const u8 = "assets/hero-shot.png · 5 / 5",
@@ -285,6 +288,7 @@ const Story = struct {
     fn startProgress(self: *Story, id: Id, duration_ms: f64) void {
         self.progress_id = id;
         self.progress_start_ms = self.cx.frame_time_ms;
+        self.progress_paused_at = null;
         self.progress_duration_ms = duration_ms;
     }
 
@@ -295,11 +299,16 @@ const Story = struct {
             return;
         }
         // Hover pauses all timers, progress simulation also pauses (demo: advance by remaining).
+        const now = self.cx.frame_time_ms;
         if (self.n.isPaused()) {
-            self.progress_start_ms += self.cx.frame_dt_seconds * 1000;
+            if (self.progress_paused_at == null) self.progress_paused_at = now;
             return;
         }
-        const p: f32 = @floatCast(@min(1, (self.cx.frame_time_ms - self.progress_start_ms) / self.progress_duration_ms));
+        if (self.progress_paused_at) |paused_at| {
+            self.progress_start_ms += @max(0, now - paused_at);
+            self.progress_paused_at = null;
+        }
+        const p: f32 = @floatCast(std.math.clamp((now - self.progress_start_ms) / self.progress_duration_ms, 0, 1));
         var label_buf: [64]u8 = undefined;
         var count_buf: [16]u8 = undefined;
         const done: u32 = @intFromFloat(@floor(p * 5));

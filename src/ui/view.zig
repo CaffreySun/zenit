@@ -206,7 +206,7 @@ fn emitSingle(scope: *Scope, cx: *Cx, sink: Sink, child: anytype) !?*Node {
 
 // Elements: containers and text
 
-const box_props = [_][]const u8{ "style", "test_id", "a11y", "on_click", "visible", "focusable", "focus_ring", "hit_test", "on_focus", "on_blur", "on_hover", "on_leave", "tag", "on_event", "event_context", "state", "on_key_down", "on_key_up", "on_pointer_down", "on_pointer_move", "on_pointer_up", "on_scroll" };
+const box_props = [_][]const u8{ "window_region", "style", "test_id", "a11y", "on_click", "visible", "focusable", "focus_ring", "hit_test", "on_focus", "on_blur", "on_hover", "on_leave", "tag", "on_event", "event_context", "state", "on_key_down", "on_key_up", "on_pointer_down", "on_pointer_move", "on_pointer_up", "on_scroll" };
 const text_props = [_][]const u8{ "style", "box", "test_id", "a11y", "on_click", "visible", "hit_test" };
 
 /// container (direction from style, default column).
@@ -1153,7 +1153,7 @@ fn storeRef(scope: *Scope, dest: anytype, value: anytype) !void {
 
 /// .parts value: string = test_id; or attrs properties (.style uses mount snapshot, can't override
 /// part's own effect/animation fields).
-const part_props = [_][]const u8{ "style", "test_id", "a11y", "on_click", "visible", "focusable", "hit_test", "on_focus", "on_blur", "on_hover", "on_leave" };
+const part_props = [_][]const u8{ "window_region", "style", "test_id", "a11y", "on_click", "visible", "focusable", "hit_test", "on_focus", "on_blur", "on_hover", "on_leave" };
 
 /// Part attributes: each field in parts must be *Node / ?*Node field in component Result (or
 /// ViewParts), compile-time checked;
@@ -1204,7 +1204,7 @@ fn mountComponent(scope: *Scope, cx: *Cx, sink: Sink, builder: anytype, parts: a
 
 // Elements: decorators and static lists
 
-const attrs_props = [_][]const u8{ "style", "test_id", "a11y", "on_click", "visible", "parts", "focusable", "hit_test", "on_focus", "on_blur", "on_hover", "on_leave", "tag", "on_key_down", "on_key_up", "on_pointer_down", "on_pointer_move", "on_pointer_up", "on_scroll" };
+const attrs_props = [_][]const u8{ "window_region", "style", "test_id", "a11y", "on_click", "visible", "parts", "focusable", "hit_test", "on_focus", "on_blur", "on_hover", "on_leave", "tag", "on_key_down", "on_key_up", "on_pointer_down", "on_pointer_move", "on_pointer_up", "on_scroll" };
 
 /// Yix: <X>text</X>. Component declares param as Text (generated props has pub const text_child =
 /// "name"), text is that param
@@ -4144,6 +4144,7 @@ fn applyAttrs(node: *Node, props: anytype) void {
     if (@hasField(P, "tag")) node.tag = props.tag;
     // Focusable (Tab order / click focus); can be bool source (exit Tab order when disabled), see
     // bindFocus.
+    if (@hasField(P, "window_region")) node.behavior.interaction.window_region = coerceLiteral(@import("system_sdk").window_chrome.Region, props.window_region);
     if (@hasField(P, "focusable")) node.setFocusable(sourceOf(bool, "ui.view .focusable", props.focusable).peek());
     if (@hasField(P, "hit_test")) node.setHitTestVisible(props.hit_test);
     // Low-level generic event callback (GenericEventCallback) & context; can be source (mount take

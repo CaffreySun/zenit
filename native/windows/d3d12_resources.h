@@ -189,7 +189,9 @@ void *zenit_d12_sampler_heap(ZenitD12Sampler *);
 /* Queue/command status additionally: 3 timeout, 4 device removed.
    Queue/encoder mutation is confined to one thread. Buffers can be destroyed
    after recording; command references and the submission retain their storage.
-   On failed wait/deinit, ownership remains with the caller for retry. */
+   On failed wait/deinit, ownership remains with the caller for retry.
+   D3D11 destroy succeeds on a permanently removed device, releasing pending
+   references without completing work. Timeout still preserves ownership. */
 int zenit_d12_queue_create(ZenitD12Device *, ZenitD12Queue **out);
 int zenit_d12_queue_submit(ZenitD12Queue *, ZenitD12Commands *, uint64_t *serial);
 int zenit_d12_queue_wait(ZenitD12Queue *, uint64_t serial, uint32_t timeout_ms);
@@ -201,6 +203,7 @@ int zenit_d12_commands_copy(ZenitD12Commands *, ZenitD12Buffer *source, uint64_t
 int zenit_d12_commands_finish(ZenitD12Commands *);
 /* Enable before recording work. Results are unavailable until fence completion. */
 int zenit_d12_commands_enable_timestamps(ZenitD12Commands *);
+/* Elapsed status: 0 valid, 3 pending/unavailable, 5 completed disjoint. */
 int zenit_d12_commands_elapsed_micros(ZenitD12Commands *, uint64_t *micros);
 /* Immutable diagnostic labels, borrowed from their owning shader/pipeline. */
 const char *zenit_d12_shader_entry(ZenitD12Shader *);

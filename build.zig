@@ -1,5 +1,37 @@
 const std = @import("std");
+// Zig's build graph must invalidate native objects when included bridge files
+// change, including incremental acceptance bundles that reuse the guest cache.
+const linux_native_revision_flag = blk: {
+    @setEvalBranchQuota(1000000);
+    break :blk std.fmt.comptimePrint("-DZENIT_LINUX_NATIVE_REV=0x{x}ULL", .{std.hash.Wyhash.hash(0, @embedFile("native/linux/wayland/cursor.inc") ++ @embedFile("native/linux/wayland/keyboard.inc") ++ @embedFile("native/linux/wayland/pointer.inc") ++
+        @embedFile("native/linux/wayland/clipboard.inc") ++ @embedFile("native/linux/wayland/text_input.inc") ++ @embedFile("native/linux/wayland/scaling.inc") ++ @embedFile("native/linux/wayland/window.h") ++ @embedFile("vendor/libdecor/libdecor.h") ++
+        @embedFile("native/linux/vulkan_pipeline.inc") ++ @embedFile("native/linux/vulkan_resources.inc") ++
+        @embedFile("native/linux/vulkan_device.h") ++ @embedFile("native/linux/png.inc") ++
+        @embedFile("native/linux/text_layout.h") ++ @embedFile("native/linux/opengl_device.h") ++ @embedFile("native/linux/opengl_resources.inc") ++ @embedFile("native/linux/opengl_pipeline.inc"))});
+};
 const macos_bundle = @import("src/system_sdk/bundle/macos_app.zig");
+
+// Zig's x86 PE linker defaults to a 2 GiB process address space. Produce a
+// separate installation image with LAA; never modify the compilation cache.
+fn installWindowsExecutable(b: *std.Build, exe: *std.Build.Step.Compile) *std.Build.Step {
+    if (exe.root_module.resolved_target.?.result.cpu.arch != .x86)
+        return &b.addInstallArtifact(exe, .{}).step;
+    const symbols = b.addInstallArtifact(exe, .{
+        .dest_dir = .disabled,
+        .pdb_dir = if (exe.producesPdbFile()) .{ .override = .bin } else .disabled,
+    });
+    const tool = b.addExecutable(.{ .name = "zenit-windows-large-address", .root_module = b.createModule(.{
+        .root_source_file = b.path("tools/windows_large_address.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+    }) });
+    const run = b.addRunArtifact(tool);
+    run.addFileArg(exe.getEmittedBin());
+    const output = run.addOutputFileArg(exe.out_filename);
+    const install = b.addInstallFileWithDir(output, .bin, exe.out_filename);
+    install.step.dependOn(&symbols.step);
+    return &install.step;
+}
 
 // ============================================================================
 // Public build API for consumers
@@ -131,6 +163,9 @@ pub fn attachWithOptions(
 /// wire module imports themselves. Safe to call on any target.
 pub fn addNativeLibs(zenit_dep: *std.Build.Dependency, exe: *std.Build.Step.Compile) void {
     if (exe.rootModuleTarget().os.tag == .windows) {
+        // Consumer apps use the same renderer initialization as the examples.
+        // Preserve a larger caller reserve while ensuring enough stack in Debug.
+        exe.stack_size = windowsStackReserve(exe.stack_size);
         exe.root_module.addCSourceFile(.{ .file = zenit_dep.path("native/windows/window_bridge.c"), .flags = &.{} });
         exe.root_module.addCSourceFile(.{ .file = zenit_dep.path("native/windows/recording_bridge.cpp"), .flags = &.{ "-std=c++17", "-fno-exceptions", "-fno-rtti" } });
         exe.root_module.linkSystemLibrary("mfuuid", .{});
@@ -159,6 +194,16 @@ pub fn addNativeLibs(zenit_dep: *std.Build.Dependency, exe: *std.Build.Step.Comp
         exe.root_module.linkSystemLibrary("windowscodecs", .{});
         exe.root_module.link_libc = true;
         exe.root_module.link_libcpp = true;
+        return;
+    }
+    if (exe.rootModuleTarget().os.tag == .linux) {
+        const mod = exe.root_module;
+        for ([_][]const u8{ "vendor/vulkan-headers/include", "vendor/wayland/include", "vendor/xkbcommon-headers/include", "vendor/wayland/protocols" }) |path| mod.addIncludePath(zenit_dep.path(path));
+        for ([_][]const u8{ "native/linux/vulkan_device.c", "native/linux/opengl_device.c", "native/linux/wayland/window.c", "native/linux/font_discovery.c", "native/linux/text_layout.c", "vendor/wayland/protocols/wayland-protocol.c", "vendor/wayland/protocols/xdg-shell-protocol.c", "vendor/wayland/protocols/fractional-scale-v1-protocol.c", "vendor/wayland/protocols/viewporter-protocol.c", "vendor/wayland/protocols/cursor-shape-v1-protocol.c", "vendor/wayland/protocols/tablet-v2-protocol.c", "vendor/wayland/protocols/text-input-unstable-v3-protocol.c" }) |path| mod.addCSourceFile(.{ .file = zenit_dep.path(path), .flags = &.{ linux_native_revision_flag, "-std=c11", "-D_POSIX_C_SOURCE=200809L" } });
+        mod.linkSystemLibrary("dl", .{});
+        mod.linkSystemLibrary("fontconfig", .{});
+        addFreeTypeLibs(mod);
+        mod.link_libc = true;
         return;
     }
     if (exe.rootModuleTarget().os.tag != .macos) return;
@@ -254,6 +299,170 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Linux bootstrap is an independent graph: it must not pull in Cocoa,
+    // Metal shaders, Windows SDK, FreeType or the UI until those are ported.
+    const linux_arch = b.option(std.Target.Cpu.Arch, "linux-arch", "Linux Vulkan probe target: aarch64 (default) or x86_64") orelse .aarch64;
+    if (linux_arch != .aarch64 and linux_arch != .x86_64) @panic("linux-arch must be aarch64 or x86_64");
+    const linux_target = b.resolveTargetQuery(.{ .cpu_arch = linux_arch, .os_tag = .linux, .abi = .gnu });
+    const glslc = b.option([]const u8, "glslc", "Host GLSL-to-SPIR-V compiler") orelse "glslc";
+    const probe_vertex_compile = b.addSystemCommand(&.{ glslc, "--target-env=vulkan1.0", "-Werror" });
+    probe_vertex_compile.addFileArg(b.path("src/gpu/vulkan/shaders/probe.vert"));
+    probe_vertex_compile.addArg("-o");
+    const probe_vertex = probe_vertex_compile.addOutputFileArg("probe.vert.spv");
+    const probe_fragment_compile = b.addSystemCommand(&.{ glslc, "--target-env=vulkan1.0", "-Werror" });
+    probe_fragment_compile.addFileArg(b.path("src/gpu/vulkan/shaders/probe.frag"));
+    probe_fragment_compile.addArg("-o");
+    const probe_fragment = probe_fragment_compile.addOutputFileArg("probe.frag.spv");
+    const resource_fragment_compile = b.addSystemCommand(&.{ glslc, "--target-env=vulkan1.1", "-Werror" });
+    resource_fragment_compile.addFileArg(b.path("src/gpu/vulkan/shaders/resource.frag"));
+    resource_fragment_compile.addArg("-o");
+    const resource_fragment = resource_fragment_compile.addOutputFileArg("resource.frag.spv");
+    const resource_indices_compile = b.addSystemCommand(&.{ glslc, "--target-env=vulkan1.1", "-Werror", "-O" });
+    resource_indices_compile.addFileArg(b.path("src/gpu/vulkan/shaders/resource_indices.vert"));
+    resource_indices_compile.addArg("-o");
+    const resource_indices = resource_indices_compile.addOutputFileArg("resource_indices.vert.spv");
+    const resource_values_compile = b.addSystemCommand(&.{ glslc, "--target-env=vulkan1.1", "-Werror" });
+    resource_values_compile.addFileArg(b.path("src/gpu/vulkan/shaders/resource_values.frag"));
+    resource_values_compile.addArg("-o");
+    const resource_values = resource_values_compile.addOutputFileArg("resource_values.frag.spv");
+    const blend_fragment_compile = b.addSystemCommand(&.{ glslc, "--target-env=vulkan1.1", "-Werror" });
+    blend_fragment_compile.addFileArg(b.path("src/gpu/vulkan/shaders/blend_probe.frag"));
+    blend_fragment_compile.addArg("-o");
+    const blend_fragment = blend_fragment_compile.addOutputFileArg("blend_probe.frag.spv");
+    const ui_shader_compile = b.addSystemCommand(&.{"python3"});
+    ui_shader_compile.addFileArg(b.path("scripts/compile_vulkan_ui_shaders.py"));
+    ui_shader_compile.addArgs(&.{ "--glslc", glslc, "--spirv-val", b.option([]const u8, "spirv-val", "Host SPIR-V validator") orelse "spirv-val", "--out" });
+    const ui_shader_dir = ui_shader_compile.addOutputDirectoryArg("vulkan-ui-shaders");
+    for ([_][]const u8{ "blur", "composite", "path", "image", "damage_clear", "icon", "text", "sdf_primitives", "glass" }) |program| {
+        ui_shader_compile.addFileArg(b.path(b.fmt("src/gpu/d3d12/shaders/{s}.hlsl", .{program})));
+    }
+    b.step("linux-vulkan-shaders", "Compile and validate all UI shader entries for Vulkan")
+        .dependOn(&b.addInstallDirectory(.{ .source_dir = ui_shader_dir, .install_dir = .prefix, .install_subdir = "share/zenit/vulkan-shaders" }).step);
+    const ui_shaders_module = b.createModule(.{ .root_source_file = ui_shader_dir.path(b, "shaders.zig"), .target = linux_target, .optimize = optimize });
+    const vulkan_device = b.createModule(.{ .root_source_file = b.path("src/gpu/gpu.zig"), .target = linux_target, .optimize = optimize });
+    vulkan_device.addImport("vulkan_ui_shaders", ui_shaders_module);
+    // Compile the probes with the selected renderer backend too: shared GPU
+    // descriptors and backend contract must resolve to the actual Vulkan types.
+    const native_descriptor_opts = b.addOptions();
+    native_descriptor_opts.addOption([]const u8, "gpu_backend", "vulkan");
+    vulkan_device.addOptions("build_options", native_descriptor_opts);
+    const vulkan_probe_root = b.createModule(.{ .root_source_file = b.path("tools/linux_vulkan_probe.zig"), .target = linux_target, .optimize = optimize, .link_libc = true });
+    vulkan_probe_root.addImport("vulkan_device", vulkan_device);
+    vulkan_probe_root.addAnonymousImport("probe_vertex", .{ .root_source_file = probe_vertex });
+    vulkan_probe_root.addAnonymousImport("probe_fragment", .{ .root_source_file = probe_fragment });
+    vulkan_probe_root.addIncludePath(b.path("vendor/vulkan-headers/include"));
+    vulkan_probe_root.addCSourceFile(.{ .file = b.path("native/linux/vulkan_device.c"), .flags = &.{ linux_native_revision_flag, "-std=c11", "-Wall", "-Wextra", "-Werror" } });
+    vulkan_probe_root.linkSystemLibrary("dl", .{});
+    const vulkan_probe = b.addExecutable(.{ .name = "zenit-linux-vulkan-probe", .root_module = vulkan_probe_root });
+    b.step("linux-vulkan-probe", "Build Linux Vulkan graphics/readback probe (run on target)")
+        .dependOn(&b.addInstallArtifact(vulkan_probe, .{}).step);
+    const pipeline_probe_root = b.createModule(.{ .root_source_file = b.path("tools/linux_vulkan_pipeline_probe.zig"), .target = linux_target, .optimize = optimize, .link_libc = true });
+    pipeline_probe_root.addImport("vulkan_device", vulkan_device);
+    pipeline_probe_root.addAnonymousImport("resource_indices", .{ .root_source_file = resource_indices });
+    pipeline_probe_root.addAnonymousImport("resource_values", .{ .root_source_file = resource_values });
+    pipeline_probe_root.addAnonymousImport("resource_fragment", .{ .root_source_file = resource_fragment });
+    pipeline_probe_root.addAnonymousImport("probe_vertex", .{ .root_source_file = probe_vertex });
+    pipeline_probe_root.addAnonymousImport("probe_fragment", .{ .root_source_file = probe_fragment });
+    pipeline_probe_root.addImport("vulkan_ui_shaders", ui_shaders_module);
+    pipeline_probe_root.addAnonymousImport("blend_fragment", .{ .root_source_file = blend_fragment });
+    pipeline_probe_root.addIncludePath(b.path("vendor/vulkan-headers/include"));
+    pipeline_probe_root.addCSourceFile(.{ .file = b.path("native/linux/vulkan_device.c"), .flags = &.{ linux_native_revision_flag, "-std=c11", "-Wall", "-Wextra", "-Werror" } });
+    pipeline_probe_root.linkSystemLibrary("dl", .{});
+    const pipeline_probe = b.addExecutable(.{ .name = "zenit-linux-vulkan-pipeline-probe", .root_module = pipeline_probe_root });
+    b.step("linux-vulkan-pipeline-probe", "Build live Vulkan UI pipeline validation")
+        .dependOn(&b.addInstallArtifact(pipeline_probe, .{}).step);
+    const renderer_resource_probe_root = b.createModule(.{ .root_source_file = b.path("tools/linux_vulkan_renderer_resources_probe.zig"), .target = linux_target, .optimize = optimize, .link_libc = true });
+    renderer_resource_probe_root.addImport("vulkan_device", vulkan_device);
+    renderer_resource_probe_root.addIncludePath(b.path("vendor/vulkan-headers/include"));
+    renderer_resource_probe_root.addCSourceFile(.{ .file = b.path("native/linux/vulkan_device.c"), .flags = &.{ linux_native_revision_flag, "-std=c11", "-Wall", "-Wextra", "-Werror" } });
+    renderer_resource_probe_root.linkSystemLibrary("dl", .{});
+    const linux_image_renderer = b.createModule(.{ .root_source_file = b.path("src/render/image_renderer.zig"), .target = linux_target, .optimize = optimize });
+    linux_image_renderer.addImport("gpu", vulkan_device);
+    renderer_resource_probe_root.addImport("image_renderer", linux_image_renderer);
+    const renderer_resource_probe = b.addExecutable(.{ .name = "zenit-linux-vulkan-renderer-resources-probe", .root_module = renderer_resource_probe_root });
+    b.step("linux-vulkan-renderer-resources-probe", "Validate renderer-owned Vulkan resource adapters on target")
+        .dependOn(&b.addInstallArtifact(renderer_resource_probe, .{}).step);
+    const opengl_probe_gpu = b.createModule(.{ .root_source_file = b.path("src/gpu/gpu.zig"), .target = linux_target, .optimize = optimize });
+    const opengl_probe_options = b.addOptions();
+    opengl_probe_options.addOption([]const u8, "gpu_backend", "opengl");
+    opengl_probe_gpu.addOptions("build_options", opengl_probe_options);
+    const opengl_resources_root = b.createModule(.{ .root_source_file = b.path("tools/linux_vulkan_renderer_resources_probe.zig"), .target = linux_target, .optimize = optimize, .link_libc = true });
+    opengl_resources_root.addImport("vulkan_device", opengl_probe_gpu);
+    // The alias keeps one contract suite for both production drivers.
+    const opengl_image_renderer = b.createModule(.{ .root_source_file = b.path("src/render/image_renderer.zig"), .target = linux_target, .optimize = optimize });
+    opengl_image_renderer.addImport("gpu", opengl_probe_gpu);
+    opengl_resources_root.addImport("image_renderer", opengl_image_renderer);
+    opengl_resources_root.addImport("linux_wayland", b.createModule(.{ .root_source_file = b.path("src/platform/linux/wayland/window.zig"), .target = linux_target, .optimize = optimize }));
+    opengl_resources_root.addIncludePath(b.path("vendor/vulkan-headers/include"));
+    opengl_resources_root.addIncludePath(b.path("vendor/wayland/include"));
+    opengl_resources_root.addIncludePath(b.path("vendor/wayland/protocols"));
+    opengl_resources_root.addIncludePath(b.path("vendor/xkbcommon-headers/include"));
+    opengl_resources_root.addCSourceFiles(.{ .files = &.{ "native/linux/vulkan_device.c", "native/linux/opengl_device.c", "native/linux/wayland/window.c", "vendor/wayland/protocols/wayland-protocol.c", "vendor/wayland/protocols/xdg-shell-protocol.c", "vendor/wayland/protocols/fractional-scale-v1-protocol.c", "vendor/wayland/protocols/viewporter-protocol.c", "vendor/wayland/protocols/cursor-shape-v1-protocol.c", "vendor/wayland/protocols/tablet-v2-protocol.c", "vendor/wayland/protocols/text-input-unstable-v3-protocol.c" }, .flags = &.{ linux_native_revision_flag, "-std=c11", "-D_POSIX_C_SOURCE=200809L", "-Wall", "-Wextra", "-Werror" } });
+    opengl_resources_root.linkSystemLibrary("dl", .{});
+    const opengl_resources_probe = b.addExecutable(.{ .name = "zenit-linux-opengl-renderer-resources-probe", .root_module = opengl_resources_root });
+    b.step("linux-opengl-renderer-resources-probe", "Validate renderer-owned OpenGL resources and commands on hardware")
+        .dependOn(&b.addInstallArtifact(opengl_resources_probe, .{}).step);
+    const linux_probe_platform = b.createModule(.{ .root_source_file = b.path("src/platform.zig"), .target = linux_target, .optimize = optimize });
+    const wayland_probe_root = b.createModule(.{ .root_source_file = b.path("tools/linux_wayland_vulkan_probe.zig"), .target = linux_target, .optimize = optimize, .link_libc = true });
+    wayland_probe_root.addImport("vulkan_device", vulkan_device);
+    wayland_probe_root.addImport("linux_platform", linux_probe_platform);
+    wayland_probe_root.addAnonymousImport("probe_vertex", .{ .root_source_file = probe_vertex });
+    wayland_probe_root.addAnonymousImport("probe_fragment", .{ .root_source_file = probe_fragment });
+    wayland_probe_root.addIncludePath(b.path("vendor/vulkan-headers/include"));
+    wayland_probe_root.addIncludePath(b.path("vendor/wayland/include"));
+    wayland_probe_root.addIncludePath(b.path("vendor/xkbcommon-headers/include"));
+    wayland_probe_root.addIncludePath(b.path("vendor/wayland/protocols"));
+    wayland_probe_root.addCSourceFiles(.{ .files = &.{ "native/linux/vulkan_device.c", "native/linux/wayland/window.c" }, .flags = &.{ linux_native_revision_flag, "-std=c11", "-D_POSIX_C_SOURCE=200809L", "-Wall", "-Wextra", "-Werror" } });
+    // Generated protocol metadata is compiled as generated; no handwritten edits.
+    wayland_probe_root.addCSourceFiles(.{ .files = &.{ "vendor/wayland/protocols/wayland-protocol.c", "vendor/wayland/protocols/xdg-shell-protocol.c", "vendor/wayland/protocols/fractional-scale-v1-protocol.c", "vendor/wayland/protocols/viewporter-protocol.c", "vendor/wayland/protocols/cursor-shape-v1-protocol.c", "vendor/wayland/protocols/tablet-v2-protocol.c", "vendor/wayland/protocols/text-input-unstable-v3-protocol.c" }, .flags = &.{"-std=c11"} });
+    wayland_probe_root.linkSystemLibrary("dl", .{});
+    const wayland_probe = b.addExecutable(.{ .name = "zenit-linux-wayland-vulkan-probe", .root_module = wayland_probe_root });
+    b.step("linux-wayland-vulkan-probe", "Build Linux Wayland/Vulkan presentation probe (run in desktop session)")
+        .dependOn(&b.addInstallArtifact(wayland_probe, .{}).step);
+
+    const clipboard_transport_root = b.createModule(.{ .root_source_file = b.path("tools/linux_wayland_clipboard_transport_probe.zig"), .target = linux_target, .optimize = optimize, .link_libc = true });
+    clipboard_transport_root.addIncludePath(b.path("vendor/wayland/include"));
+    clipboard_transport_root.addIncludePath(b.path("vendor/wayland/protocols"));
+    clipboard_transport_root.addIncludePath(b.path("vendor/xkbcommon-headers/include"));
+    clipboard_transport_root.addCSourceFiles(.{ .files = &.{"tools/linux_wayland_clipboard_transport_probe.c"}, .flags = &.{ linux_native_revision_flag, "-std=c11", "-D_POSIX_C_SOURCE=200809L", "-UNDEBUG", "-Wall", "-Wextra", "-Werror" } });
+    clipboard_transport_root.addCSourceFiles(.{ .files = &.{ "vendor/wayland/protocols/wayland-protocol.c", "vendor/wayland/protocols/xdg-shell-protocol.c", "vendor/wayland/protocols/fractional-scale-v1-protocol.c", "vendor/wayland/protocols/viewporter-protocol.c", "vendor/wayland/protocols/cursor-shape-v1-protocol.c", "vendor/wayland/protocols/tablet-v2-protocol.c", "vendor/wayland/protocols/text-input-unstable-v3-protocol.c" }, .flags = &.{"-std=c11"} });
+    clipboard_transport_root.linkSystemLibrary("dl", .{});
+    const clipboard_transport = b.addExecutable(.{ .name = "zenit-linux-wayland-clipboard-transport-probe", .root_module = clipboard_transport_root });
+    b.step("linux-wayland-clipboard-transport-probe", "Build native clipboard pipe, ownership and failure contracts")
+        .dependOn(&b.addInstallArtifact(clipboard_transport, .{}).step);
+    const ime_protocol_root = b.createModule(.{ .root_source_file = b.path("tools/linux_wayland_ime_protocol_probe.zig"), .target = linux_target, .optimize = optimize, .link_libc = true });
+    ime_protocol_root.addImport("wayland_window", b.createModule(.{ .root_source_file = b.path("src/platform/linux/wayland/window.zig"), .target = linux_target, .optimize = optimize }));
+    ime_protocol_root.addIncludePath(b.path("vendor/wayland/include"));
+    ime_protocol_root.addIncludePath(b.path("vendor/wayland/protocols"));
+    ime_protocol_root.addIncludePath(b.path("vendor/xkbcommon-headers/include"));
+    ime_protocol_root.addCSourceFiles(.{ .files = &.{"tools/linux_wayland_ime_protocol_probe.c"}, .flags = &.{ linux_native_revision_flag, "-std=c11", "-D_POSIX_C_SOURCE=200809L", "-UNDEBUG", "-Wall", "-Wextra", "-Werror" } });
+    ime_protocol_root.addCSourceFiles(.{ .files = &.{ "vendor/wayland/protocols/wayland-protocol.c", "vendor/wayland/protocols/xdg-shell-protocol.c", "vendor/wayland/protocols/fractional-scale-v1-protocol.c", "vendor/wayland/protocols/viewporter-protocol.c", "vendor/wayland/protocols/cursor-shape-v1-protocol.c", "vendor/wayland/protocols/tablet-v2-protocol.c", "vendor/wayland/protocols/text-input-unstable-v3-protocol.c" }, .flags = &.{"-std=c11"} });
+    ime_protocol_root.linkSystemLibrary("dl", .{});
+    const ime_protocol = b.addExecutable(.{ .name = "zenit-linux-wayland-ime-protocol-probe", .root_module = ime_protocol_root });
+    b.step("linux-wayland-ime-protocol-probe", "Build native text-input-v3 batching and lifecycle contracts")
+        .dependOn(&b.addInstallArtifact(ime_protocol, .{}).step);
+    const scroll_protocol_root = b.createModule(.{ .root_source_file = b.path("tools/linux_wayland_scroll_probe.zig"), .target = linux_target, .optimize = optimize, .link_libc = true });
+    scroll_protocol_root.addImport("wayland_window", b.createModule(.{ .root_source_file = b.path("src/platform/linux/wayland/window.zig"), .target = linux_target, .optimize = optimize }));
+    scroll_protocol_root.addIncludePath(b.path("vendor/wayland/include"));
+    scroll_protocol_root.addIncludePath(b.path("vendor/wayland/protocols"));
+    scroll_protocol_root.addIncludePath(b.path("vendor/xkbcommon-headers/include"));
+    scroll_protocol_root.addCSourceFiles(.{ .files = &.{"tools/linux_wayland_scroll_probe.c"}, .flags = &.{ linux_native_revision_flag, "-std=c11", "-D_POSIX_C_SOURCE=200809L", "-UNDEBUG", "-Wall", "-Wextra", "-Werror" } });
+    scroll_protocol_root.addCSourceFiles(.{ .files = &.{ "vendor/wayland/protocols/wayland-protocol.c", "vendor/wayland/protocols/xdg-shell-protocol.c", "vendor/wayland/protocols/fractional-scale-v1-protocol.c", "vendor/wayland/protocols/viewporter-protocol.c", "vendor/wayland/protocols/cursor-shape-v1-protocol.c", "vendor/wayland/protocols/tablet-v2-protocol.c", "vendor/wayland/protocols/text-input-unstable-v3-protocol.c" }, .flags = &.{"-std=c11"} });
+    scroll_protocol_root.linkSystemLibrary("dl", .{});
+    const scroll_protocol = b.addExecutable(.{ .name = "zenit-linux-wayland-scroll-probe", .root_module = scroll_protocol_root });
+    b.step("linux-wayland-scroll-probe", "Build Wayland scroll direction, frame and device contracts")
+        .dependOn(&b.addInstallArtifact(scroll_protocol, .{}).step);
+    if (b.graph.host.result.os.tag == .linux and b.graph.host.result.cpu.arch == linux_arch) {
+        const run_vulkan_probe = b.addRunArtifact(vulkan_probe);
+        run_vulkan_probe.addPassthruArgs();
+        b.step("run-linux-vulkan-probe", "Run live Vulkan probe; software devices require --allow-software")
+            .dependOn(&run_vulkan_probe.step);
+        const run_wayland_probe = b.addRunArtifact(wayland_probe);
+        run_wayland_probe.addPassthruArgs();
+        b.step("run-linux-wayland-vulkan-probe", "Run Wayland/Vulkan probe in a desktop session")
+            .dependOn(&run_wayland_probe.step);
+    }
+
     const yix_compiler_module = b.createModule(.{ .root_source_file = b.path("src/yix/compiler.zig"), .target = b.graph.host });
 
     const yix_exe = b.addExecutable(.{ .name = "yix", .root_module = b.createModule(.{ .root_source_file = b.path("tools/yix.zig"), .target = b.graph.host }) });
@@ -317,10 +526,10 @@ pub fn build(b: *std.Build) void {
     const gpu_backend = b.option(
         []const u8,
         "gpu-backend",
-        "GPU backend: metal (default), null (reference), d3d12 (Windows renderer)",
-    ) orelse "metal";
-    if (!std.mem.eql(u8, gpu_backend, "metal") and !std.mem.eql(u8, gpu_backend, "null") and !std.mem.eql(u8, gpu_backend, "d3d12")) {
-        std.debug.print("invalid -Dgpu-backend={s} (expected 'metal', 'null' or 'd3d12')\n", .{gpu_backend});
+        "GPU backend: metal, null (reference), d3d12 or d3d11 (Windows), vulkan (Linux), opengl (Linux compatibility)",
+    ) orelse if (target.result.os.tag == .linux) "vulkan" else "metal";
+    if (!std.mem.eql(u8, gpu_backend, "metal") and !std.mem.eql(u8, gpu_backend, "null") and !std.mem.eql(u8, gpu_backend, "d3d12") and !std.mem.eql(u8, gpu_backend, "d3d11") and !std.mem.eql(u8, gpu_backend, "vulkan") and !std.mem.eql(u8, gpu_backend, "opengl")) {
+        std.debug.print("invalid -Dgpu-backend={s} (expected 'metal', 'null', 'd3d12', 'd3d11', 'vulkan' or 'opengl')\n", .{gpu_backend});
         std.process.exit(1);
     }
 
@@ -341,6 +550,14 @@ pub fn build(b: *std.Build) void {
         addFreeTypeLibs(text_module);
     }
 
+    if (target.result.os.tag == .linux) {
+        const font_root = b.createModule(.{ .root_source_file = b.path("tools/linux_font_smoke.zig"), .target = target, .optimize = optimize, .link_libc = true });
+        font_root.addImport("text", text_module);
+        const font_smoke = b.addExecutable(.{ .name = "zenit-linux-font-smoke", .root_module = font_root });
+        addCoreTextBridge(b, font_smoke);
+        b.step("linux-font-smoke", "Build Linux system-font discovery and scaling gate").dependOn(&b.addInstallArtifact(font_smoke, .{}).step);
+    }
+
     const platform_module = b.createModule(.{
         .root_source_file = b.path("src/platform.zig"),
         .target = target,
@@ -350,8 +567,8 @@ pub fn build(b: *std.Build) void {
     // Cross-compile a real native Win32 window from any development host.
     // It paints only the bridge's diagnostic GDI frame, not the Zenit renderer.
     const default_windows_arch: std.Target.Cpu.Arch = if (b.graph.host.result.os.tag == .windows and b.graph.host.result.cpu.arch == .x86_64) .x86_64 else .aarch64;
-    const windows_arch = b.option(std.Target.Cpu.Arch, "windows-arch", "Windows target: x86_64 or aarch64 (native on Windows, otherwise aarch64)") orelse default_windows_arch;
-    if (windows_arch != .aarch64 and windows_arch != .x86_64) @panic("windows-arch must be aarch64 or x86_64");
+    const windows_arch = b.option(std.Target.Cpu.Arch, "windows-arch", "Windows target: x86, x86_64 or aarch64 (native on Windows, otherwise aarch64)") orelse default_windows_arch;
+    if (windows_arch != .aarch64 and windows_arch != .x86_64 and windows_arch != .x86) @panic("windows-arch must be aarch64, x86_64 or x86");
     // Keep the historical build-step names for existing VM automation.
     const windows_arm64 = b.resolveTargetQuery(.{
         .cpu_arch = windows_arch,
@@ -475,6 +692,8 @@ pub fn build(b: *std.Build) void {
     d12_contract_root.addImport("text", d12_text);
     d12_contract_root.addImport("icon_ir", d12_icon_ir);
     const d12_contract = b.addExecutable(.{ .name = "zenit-windows-gpu-resources-contract", .root_module = d12_contract_root });
+    // Its AppRenderer contracts construct whole renderers on the stack, like the apps.
+    d12_contract.stack_size = windowsStackReserve(d12_contract.stack_size);
     d12_contract.root_module.addCSourceFile(.{ .file = b.path("native/windows/dwrite_bridge.cpp"), .flags = &.{ "-std=c++17", "-fno-exceptions", "-fno-rtti" } });
     d12_contract.root_module.linkSystemLibrary("dwrite", .{});
     for ([_][]const u8{ "native/windows/d3d12_resources.cpp", "native/windows/d3d12_shader.cpp", "native/windows/d3d12_pipeline.cpp", "native/windows/d3d12_png.cpp", "native/windows/d3d12_resources_tests.cpp", "native/windows/d3d12_views_tests.cpp" }) |source|
@@ -788,12 +1007,18 @@ pub fn build(b: *std.Build) void {
     b.step("windows-arm64-ui-probe", "Cross-compile the interactive Zenit UI probe on Windows ARM64")
         .dependOn(&b.addInstallArtifact(windows_ui_smoke, .{}).step);
 
+    const d11_contract = b.addExecutable(.{ .name = "zenit-windows-d3d11-contract", .root_module = b.createModule(.{ .root_source_file = b.path("tools/windows_d3d11_contract.zig"), .target = windows_arm64, .optimize = optimize, .link_libc = true, .link_libcpp = true }) });
+    for ([_][]const u8{ "native/windows/d3d11_backend.cpp", "native/windows/d3d11_renderer_tests.cpp" }) |source|
+        d11_contract.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c++17", "-fno-exceptions", "-fno-rtti" } });
+    for ([_][]const u8{ "d3d11", "dcomp", "dwmapi", "gdi32", "dxgi", "dxguid", "uuid", "d3dcompiler_47" }) |lib| d11_contract.root_module.linkSystemLibrary(lib, .{});
+    b.step("windows-d3d11-contract", "Build native D3D11 hardware resource acceptance").dependOn(installWindowsExecutable(b, d11_contract));
+
     // The public Windows App uses the Direct2D paint-table subset. Other
     // legacy AppRenderer exports still compile against the Null GPU.
     const windows_app_opts = b.addOptions();
     windows_app_opts.addOption(bool, "test_mode", test_mode);
     windows_app_opts.addOption(u16, "e2e_port", e2e_port);
-    windows_app_opts.addOption([]const u8, "gpu_backend", if (std.mem.eql(u8, gpu_backend, "d3d12")) "d3d12" else "null");
+    windows_app_opts.addOption([]const u8, "gpu_backend", if (std.mem.eql(u8, gpu_backend, "d3d12") or std.mem.eql(u8, gpu_backend, "d3d11")) gpu_backend else "null");
     const windows_app_opts_module = windows_app_opts.createModule();
     const windows_gpu = b.createModule(.{ .root_source_file = b.path("src/gpu/gpu.zig"), .target = windows_arm64, .optimize = optimize });
     windows_gpu.addImport("build_options", windows_app_opts_module);
@@ -826,6 +1051,11 @@ pub fn build(b: *std.Build) void {
     }
 
     windows_ui_smoke_root.addImport("zenit_app", windows_app);
+    if (std.mem.eql(u8, gpu_backend, "d3d11")) {
+        for ([_][]const u8{ "native/windows/d3d11_backend.cpp", "native/windows/d3d12_png.cpp" }) |source|
+            windows_app.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c++17", "-fno-exceptions", "-fno-rtti" } });
+        for ([_][]const u8{ "d3d11", "dcomp", "dxgi", "d3dcompiler_47", "windowscodecs" }) |lib| windows_app.linkSystemLibrary(lib, .{});
+    }
     const windows_app_gate_root = b.createModule(.{ .root_source_file = b.path("tools/windows_app_gate.zig"), .target = windows_arm64, .optimize = optimize });
     windows_app_gate_root.addImport("zenit_app", windows_app);
     const windows_app_gate = b.addExecutable(.{ .name = "zenit-windows-app-gate", .root_module = windows_app_gate_root });
@@ -865,7 +1095,7 @@ pub fn build(b: *std.Build) void {
     windows_input_example.root_module.link_libc = true;
     windows_input_example.root_module.link_libcpp = true;
     b.step("windows-arm64-text-input", "Cross-compile the Zenit text_input example as a Win32 ARM64 app")
-        .dependOn(&b.addInstallArtifact(windows_input_example, .{}).step);
+        .dependOn(installWindowsExecutable(b, windows_input_example));
 
     const windows_render_gallery_root = b.createModule(.{ .root_source_file = b.path("tools/windows_render_gallery.zig"), .target = windows_arm64, .optimize = optimize });
     windows_render_gallery_root.addImport("ui", windows_ui);
@@ -888,7 +1118,7 @@ pub fn build(b: *std.Build) void {
     windows_render_gallery.root_module.link_libc = true;
     windows_render_gallery.root_module.link_libcpp = true;
     b.step("windows-arm64-render-gallery", "Cross-compile the Windows image rendering regression fixture")
-        .dependOn(&b.addInstallArtifact(windows_render_gallery, .{}).step);
+        .dependOn(installWindowsExecutable(b, windows_render_gallery));
 
     const windows_storybook_root = b.createModule(.{ .root_source_file = b.path("examples/storybook/main.zig"), .target = windows_arm64, .optimize = optimize });
     windows_storybook_root.addImport("ui", windows_ui);
@@ -897,7 +1127,7 @@ pub fn build(b: *std.Build) void {
     // Debug renderer initialization uses large value temporaries. Windows' default
     // executable stack is too small; reserve address space (not committed RAM).
     for ([_]*std.Build.Step.Compile{ windows_storybook, windows_input_example, windows_render_gallery }) |exe| {
-        exe.stack_size = 32 * 1024 * 1024;
+        exe.stack_size = windowsStackReserve(exe.stack_size);
     }
     windows_storybook.root_module.addCSourceFile(.{ .file = b.path("native/windows/window_bridge.c"), .flags = &.{} });
     windows_storybook.root_module.addCSourceFile(.{ .file = b.path("native/windows/recording_bridge.cpp"), .flags = &.{ "-std=c++17", "-fno-exceptions", "-fno-rtti" } });
@@ -914,7 +1144,50 @@ pub fn build(b: *std.Build) void {
     windows_storybook.root_module.link_libc = true;
     windows_storybook.root_module.link_libcpp = true;
     b.step("windows-arm64-storybook", "Cross-compile the shared Storybook and DevTools on Windows ARM64")
-        .dependOn(&b.addInstallArtifact(windows_storybook, .{}).step);
+        .dependOn(installWindowsExecutable(b, windows_storybook));
+
+    const windows_chrome_root = b.createModule(.{ .root_source_file = b.path("examples/window_chrome/main.zig"), .target = windows_arm64, .optimize = optimize });
+    windows_chrome_root.addImport("ui", windows_ui);
+    windows_chrome_root.addImport("zenit_app", windows_app);
+    const windows_chrome = b.addExecutable(.{ .name = "zenit-windows-window-chrome", .root_module = windows_chrome_root });
+    windows_chrome.stack_size = windowsStackReserve(windows_chrome.stack_size);
+    windows_chrome.root_module.addCSourceFile(.{ .file = b.path("native/windows/window_bridge.c"), .flags = &.{} });
+    windows_chrome.root_module.addCSourceFile(.{ .file = b.path("native/windows/recording_bridge.cpp"), .flags = &.{ "-std=c++17", "-fno-exceptions", "-fno-rtti" } });
+    windows_chrome.root_module.linkSystemLibrary("mfuuid", .{});
+    windows_chrome.root_module.addCSourceFile(.{ .file = b.path("native/windows/file_dialog.cpp"), .flags = &.{ "-std=c++17", "-fno-exceptions", "-fno-rtti" } });
+    windows_chrome.root_module.addCSourceFile(.{ .file = b.path("native/windows/drop_bridge.cpp"), .flags = &.{ "-std=c++17", "-fno-exceptions", "-fno-rtti" } });
+    windows_chrome.root_module.addCSourceFile(.{ .file = b.path("native/windows/drag_data.cpp"), .flags = &.{ "-std=c++17", "-fno-exceptions", "-fno-rtti" } });
+    windows_chrome.root_module.addCSourceFile(.{ .file = b.path("native/windows/drag_source.cpp"), .flags = &.{ "-std=c++17", "-fno-exceptions", "-fno-rtti" } });
+    windows_chrome.root_module.addCSourceFile(.{ .file = b.path("native/windows/accessibility_bridge.cpp"), .flags = &.{ "-std=c++17", "-fno-exceptions", "-fno-rtti" } });
+    windows_chrome.root_module.addCSourceFile(.{ .file = b.path("native/windows/d3d11_probe.c"), .flags = &.{"-O2"} });
+    windows_chrome.root_module.addCSourceFile(.{ .file = b.path("native/windows/d2d_composite.cpp"), .flags = windowsD2DFlags(b, b) });
+    windows_chrome.root_module.addCSourceFile(.{ .file = b.path("native/windows/dwrite_bridge.cpp"), .flags = &.{ "-std=c++17", "-fno-exceptions", "-fno-rtti" } });
+    for ([_][]const u8{ "user32", "dwmapi", "gdi32", "imm32", "d3d11", "d2d1", "dxgi", "dwrite", "dxguid", "ole32", "shell32", "uuid", "windowscodecs", "uiautomationcore", "oleaut32" }) |lib| windows_chrome.root_module.linkSystemLibrary(lib, .{});
+    windows_chrome.root_module.link_libc = true;
+    windows_chrome.root_module.link_libcpp = true;
+    b.step("windows-window-chrome", "Cross-compile the shared Storybook and DevTools on Windows ARM64")
+        .dependOn(&b.addInstallArtifact(windows_chrome, .{}).step);
+    const windows_window_root = b.createModule(.{ .root_source_file = b.path("examples/adaptive_window/main.zig"), .target = windows_arm64, .optimize = optimize });
+    windows_window_root.addImport("ui", windows_ui);
+    windows_window_root.addImport("zenit_app", windows_app);
+    const windows_window = b.addExecutable(.{ .name = "zenit-windows-adaptive-window", .root_module = windows_window_root });
+    windows_window.stack_size = windowsStackReserve(windows_window.stack_size);
+    windows_window.root_module.addCSourceFile(.{ .file = b.path("native/windows/window_bridge.c"), .flags = &.{} });
+    windows_window.root_module.addCSourceFile(.{ .file = b.path("native/windows/recording_bridge.cpp"), .flags = &.{ "-std=c++17", "-fno-exceptions", "-fno-rtti" } });
+    windows_window.root_module.linkSystemLibrary("mfuuid", .{});
+    windows_window.root_module.addCSourceFile(.{ .file = b.path("native/windows/file_dialog.cpp"), .flags = &.{ "-std=c++17", "-fno-exceptions", "-fno-rtti" } });
+    windows_window.root_module.addCSourceFile(.{ .file = b.path("native/windows/drop_bridge.cpp"), .flags = &.{ "-std=c++17", "-fno-exceptions", "-fno-rtti" } });
+    windows_window.root_module.addCSourceFile(.{ .file = b.path("native/windows/drag_data.cpp"), .flags = &.{ "-std=c++17", "-fno-exceptions", "-fno-rtti" } });
+    windows_window.root_module.addCSourceFile(.{ .file = b.path("native/windows/drag_source.cpp"), .flags = &.{ "-std=c++17", "-fno-exceptions", "-fno-rtti" } });
+    windows_window.root_module.addCSourceFile(.{ .file = b.path("native/windows/accessibility_bridge.cpp"), .flags = &.{ "-std=c++17", "-fno-exceptions", "-fno-rtti" } });
+    windows_window.root_module.addCSourceFile(.{ .file = b.path("native/windows/d3d11_probe.c"), .flags = &.{"-O2"} });
+    windows_window.root_module.addCSourceFile(.{ .file = b.path("native/windows/d2d_composite.cpp"), .flags = windowsD2DFlags(b, b) });
+    windows_window.root_module.addCSourceFile(.{ .file = b.path("native/windows/dwrite_bridge.cpp"), .flags = &.{ "-std=c++17", "-fno-exceptions", "-fno-rtti" } });
+    for ([_][]const u8{ "user32", "dwmapi", "gdi32", "imm32", "d3d11", "d2d1", "dxgi", "dwrite", "dxguid", "ole32", "shell32", "uuid", "windowscodecs", "uiautomationcore", "oleaut32" }) |lib| windows_window.root_module.linkSystemLibrary(lib, .{});
+    windows_window.root_module.link_libc = true;
+    windows_window.root_module.link_libcpp = true;
+    b.step("windows-adaptive-window", "Build the platform-adaptive window example")
+        .dependOn(&b.addInstallArtifact(windows_window, .{}).step);
 
     // i18n unit tests
     const i18n_test_module = b.createModule(.{
@@ -1292,14 +1565,15 @@ pub fn build(b: *std.Build) void {
     );
     release_candidate_validator_step.dependOn(&run_release_candidate_validator.step);
 
-    // macOS-only targets (Metal pipeline + native bridges)
-    if (target.result.os.tag == .macos) {
+    // Application graph shared by macOS Metal and Linux Vulkan.
+    if (target.result.os.tag == .macos or target.result.os.tag == .linux) {
         const gpu_module = b.createModule(.{
             .root_source_file = b.path("src/gpu/gpu.zig"),
             .target = target,
             .optimize = optimize,
         });
         gpu_module.addImport("build_options", build_options_module);
+        if (target.result.os.tag == .linux) gpu_module.addImport("vulkan_ui_shaders", ui_shaders_module);
 
         const render_module = b.createModule(.{
             .root_source_file = b.path("src/render/render.zig"),
@@ -1802,6 +2076,12 @@ pub fn build(b: *std.Build) void {
         app_test_step.dependOn(&app_tests.step);
 
         const test_headless_step = b.step("test-headless", "Run deterministic tests (no live Metal device required)");
+        const pe_tests = b.addTest(.{ .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/windows_large_address_test.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }) });
+        test_headless_step.dependOn(&b.addRunArtifact(pe_tests).step);
         test_headless_step.dependOn(app_test_step);
         test_headless_step.dependOn(test_tokens);
         test_headless_step.dependOn(&run_harness_tests.step);
@@ -1907,6 +2187,8 @@ pub fn build(b: *std.Build) void {
             step_desc: []const u8,
         };
         const examples = [_]ExampleSpec{
+            .{ .name = "adaptive_window", .display_name = "Adaptive Window", .step_name = "adaptive-window", .step_desc = "Build the platform-adaptive window example: custom/native chrome, shared Header, fullscreen Header host, one real window per desktop preset" },
+            .{ .name = "window_chrome", .display_name = "Window Chrome", .step_name = "window-chrome", .step_desc = "Build the cross-platform custom Header example" },
             .{
                 .name = "hello_button",
                 .display_name = "Hello Button",
@@ -1995,17 +2277,20 @@ pub fn build(b: *std.Build) void {
             });
             addMacOSNativeLibs(b, example_exe);
 
-            const example_bundle = macos_bundle.bundleApp(b, .{
-                .exe = example_exe,
-                .display_name = spec.display_name,
-                .bundle_id = b.fmt("com.zenit.{s}", .{spec.step_name}),
-                .version = "0.1.0",
-                .signing = .ad_hoc,
-                .clear_quarantine = true,
-            });
-
             const build_step = b.step(spec.step_name, spec.step_desc);
-            build_step.dependOn(example_bundle.final_step);
+            if (target.result.os.tag == .macos) {
+                const example_bundle = macos_bundle.bundleApp(b, .{
+                    .exe = example_exe,
+                    .display_name = spec.display_name,
+                    .bundle_id = b.fmt("com.zenit.{s}", .{spec.step_name}),
+                    .version = "0.1.0",
+                    .signing = .ad_hoc,
+                    .clear_quarantine = true,
+                });
+                build_step.dependOn(example_bundle.final_step);
+            } else {
+                build_step.dependOn(&b.addInstallArtifact(example_exe, .{}).step);
+            }
 
             const run = b.addRunArtifact(example_exe);
             run.step.dependOn(&example_exe.step);
@@ -2083,9 +2368,9 @@ pub fn build(b: *std.Build) void {
     }
     const build_config_tests = b.addTest(.{
         .root_module = b.createModule(.{ .root_source_file = b.path("build.zig"), .target = b.graph.host, .optimize = .debug }),
-        .filters = &.{"build paths match"},
+        .filters = &.{ "build paths match", "Windows stack reserve" },
     });
-    b.step("test-build-config", "Verify host-independent build path matching").dependOn(&b.addRunArtifact(build_config_tests).step);
+    b.step("test-build-config", "Verify build path matching and Windows stack reserve").dependOn(&b.addRunArtifact(build_config_tests).step);
     wireReflection(b);
     twins.attachDependencies();
 }
@@ -2096,7 +2381,22 @@ pub fn build(b: *std.Build) void {
 
 /// zenit required macOS native bridges: window + harness recording +
 /// metal + coretext + image.
+fn addLinuxNativeLibs(b: *std.Build, exe: *std.Build.Step.Compile) void {
+    const mod = exe.root_module;
+    for ([_][]const u8{ "vendor/vulkan-headers/include", "vendor/wayland/include", "vendor/xkbcommon-headers/include", "vendor/wayland/protocols" }) |path| mod.addIncludePath(b.path(path));
+    mod.addCSourceFiles(.{ .files = &.{ "native/linux/vulkan_device.c", "native/linux/opengl_device.c", "native/linux/wayland/window.c", "native/linux/font_discovery.c", "native/linux/text_layout.c" }, .flags = &.{ linux_native_revision_flag, "-std=c11", "-D_POSIX_C_SOURCE=200809L", "-Wall", "-Wextra", "-Werror" } });
+    mod.addCSourceFiles(.{ .files = &.{ "vendor/wayland/protocols/wayland-protocol.c", "vendor/wayland/protocols/xdg-shell-protocol.c", "vendor/wayland/protocols/fractional-scale-v1-protocol.c", "vendor/wayland/protocols/viewporter-protocol.c", "vendor/wayland/protocols/cursor-shape-v1-protocol.c", "vendor/wayland/protocols/tablet-v2-protocol.c", "vendor/wayland/protocols/text-input-unstable-v3-protocol.c" }, .flags = &.{"-std=c11"} });
+    mod.linkSystemLibrary("dl", .{});
+    mod.linkSystemLibrary("fontconfig", .{});
+    addFreeTypeLibs(mod);
+    mod.link_libc = true;
+}
+
 fn addMacOSNativeLibs(b: *std.Build, exe: *std.Build.Step.Compile) void {
+    if (exe.rootModuleTarget().os.tag == .linux) {
+        addLinuxNativeLibs(b, exe);
+        return;
+    }
     addMacOSWindowBridge(b, exe);
     addMacOSScreenRecordingBridge(b, exe);
     addMacOSMetalBridge(b, exe);
@@ -2143,6 +2443,14 @@ fn addMacOSMetalBridge(b: *std.Build, exe: *std.Build.Step.Compile) void {
 }
 
 fn addCoreTextBridge(b: *std.Build, exe: *std.Build.Step.Compile) void {
+    if (exe.rootModuleTarget().os.tag == .linux) {
+        exe.root_module.addCSourceFile(.{ .file = b.path("native/linux/font_discovery.c"), .flags = &.{"-std=c11"} });
+        exe.root_module.addCSourceFile(.{ .file = b.path("native/linux/text_layout.c"), .flags = &.{"-std=c11"} });
+        exe.root_module.linkSystemLibrary("fontconfig", .{});
+        addFreeTypeLibs(exe.root_module);
+        exe.root_module.link_libc = true;
+        return;
+    }
     exe.root_module.addCSourceFile(.{
         .file = b.path("native/macos/coretext_bridge.m"),
         .flags = &.{"-fobjc-arc"},
@@ -2170,6 +2478,11 @@ fn addImageBridge(b: *std.Build, exe: *std.Build.Step.Compile) void {
 fn addFreeTypeLibs(mod: *std.Build.Module) void {
     mod.linkSystemLibrary("freetype2", .{});
     mod.linkSystemLibrary("harfbuzz", .{});
+    if (mod.resolved_target.?.result.os.tag == .linux) {
+        mod.linkSystemLibrary("pangoft2", .{});
+        mod.linkSystemLibrary("pangocairo", .{});
+        mod.linkSystemLibrary("cairo", .{});
+    }
 }
 
 /// Host translator output participates in Zig's cache and dependency graph.
@@ -2274,6 +2587,16 @@ fn wireReflectionStep(b: *std.Build, step: *std.Build.Step, reflection: *std.Bui
     if (entry.found_existing) return;
     for (step.dependencies.items) |dep| wireReflectionStep(b, dep, reflection, clock, environment, headers, seen, steps);
     if (step.cast(std.Build.Step.Compile)) |compile| wireReflectionModule(b, compile.root_module, reflection, clock, environment, headers, seen);
+}
+
+fn windowsStackReserve(existing: ?u64) u64 {
+    return @max(existing orelse 0, 32 * 1024 * 1024);
+}
+
+test "Windows stack reserve preserves larger consumer settings" {
+    try std.testing.expectEqual(@as(u64, 32 * 1024 * 1024), windowsStackReserve(null));
+    try std.testing.expectEqual(@as(u64, 32 * 1024 * 1024), windowsStackReserve(16 * 1024 * 1024));
+    try std.testing.expectEqual(@as(u64, 64 * 1024 * 1024), windowsStackReserve(64 * 1024 * 1024));
 }
 
 // Build.Module duplicates LazyPath with host-native separators. Match registered

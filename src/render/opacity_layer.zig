@@ -150,6 +150,14 @@ pub fn alignTranslationSurface(it: anytype, scale: f32, offset: [2]f32) @TypeOf(
     return out;
 }
 
+/// The mask rect a rounded layer composites from its aligned texture: the source rect in
+/// aligned-layer-local units, or the whole layer (w = 0) when alignment moved nothing.
+pub fn maskQuad(src: anytype, aligned: anytype) [4]f32 {
+    if (aligned.geom.x == src.geom.x and aligned.geom.y == src.geom.y and aligned.geom.w == src.geom.w and aligned.geom.h == src.geom.h)
+        return .{ 0, 0, 0, 0 };
+    return .{ src.geom.x - aligned.geom.x, src.geom.y - aligned.geom.y, src.geom.w, src.geom.h };
+}
+
 pub fn beginOpacityLayer(
     encoder: anytype,
     x: f32,
@@ -1406,4 +1414,34 @@ test "raster content key preserves the non-cacheable sentinel" {
     const bounds = [4]f32{ -2, -2, 228, 100 };
     try std.testing.expectEqual(@as(u64, 0), rasterContentHash(0, bounds, 1.75));
     try std.testing.expect(rasterContentHash(42, bounds, 1.75) != rasterContentHash(42, bounds, 2));
+}
+
+test "rounded clip at a fractional origin: texture on the pixel grid, mask on the original rect" {
+    // Settled notification card at 1x: GlassBox content clip (radius 18) at a fractional
+    // surface origin. Composited unaligned, every glyph inside went through a half-pixel
+    // bilinear resample.
+    const Item = struct {
+        geom: struct { x: f32, y: f32, w: f32, h: f32 },
+        rotate: f32 = 0,
+        use_draw_transform: bool = true,
+        draw_transform: [6]f32 = .{ 1, 0, 0, 1, 354.3, 861.6 },
+        draw_x: f32 = std.math.nan(f32),
+        draw_y: f32 = std.math.nan(f32),
+        draw_w: f32 = std.math.nan(f32),
+        draw_h: f32 = std.math.nan(f32),
+    };
+    const src = Item{ .geom = .{ .x = 0, .y = 0, .w = 392, .h = 117 } };
+    const al = alignTranslationSurface(src, 1, .{ 0, 0 });
+    try std.testing.expectEqual(@as(f32, 354), al.draw_transform[4]);
+    try std.testing.expectEqual(@as(f32, 861), al.draw_transform[5]);
+    const q = maskQuad(src, al);
+    // mask origin in the world is unchanged: aligned origin + quad offset = source origin
+    try std.testing.expectApproxEqAbs(src.draw_transform[4], al.draw_transform[4] + q[0], 1e-4);
+    try std.testing.expectApproxEqAbs(src.draw_transform[5], al.draw_transform[5] + q[1], 1e-4);
+    try std.testing.expectEqual(src.geom.w, q[2]);
+    try std.testing.expectEqual(src.geom.h, q[3]);
+    // already on the grid: nothing moves, whole-layer mask
+    const grid = Item{ .geom = .{ .x = 0, .y = 0, .w = 392, .h = 117 }, .draw_transform = .{ 1, 0, 0, 1, 354, 861 } };
+    const same = alignTranslationSurface(grid, 1, .{ 0, 0 });
+    try std.testing.expectEqual([4]f32{ 0, 0, 0, 0 }, maskQuad(grid, same));
 }

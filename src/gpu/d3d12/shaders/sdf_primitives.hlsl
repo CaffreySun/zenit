@@ -378,34 +378,48 @@ float sdf_line(float2 p, float2 a, float2 b, float thickness) {
 /// stroke_width: line width.
 /// start_angle: start (radians, any value, need not normalize).
 /// end_angle: end (radians, end >= start, sweep = end - start).
+float sdf_arc_cap(float2 p, float angle, float inner_radius, float outer_radius) {
+    float2 dir = float2(cos(angle), sin(angle));
+    float2 a = dir * inner_radius;
+    float2 ba = dir * (outer_radius - inner_radius);
+    float2 pa = p - a;
+    return length(pa - ba * clamp(dot(pa, ba) / max(dot(ba, ba), 1e-6), 0.0, 1.0));
+}
+
 float sdf_arc(float2 p, float outer_radius, float stroke_width, float start_angle, float end_angle) {
     float mid_radius = outer_radius - stroke_width * 0.5;
     float half_stroke = stroke_width * 0.5;
 
-    // Annulus SDF (no angle clipping).
+    // Ring SDF (no angle clipping)
     float ring_sdf = abs(length(p) - mid_radius) - half_stroke;
 
-    // sweep = arc length in radians, clamped to [0, 2pi].
+    // sweep = arc angle, clamp to [0, 2pi]
     float sweep = clamp(end_angle - start_angle, 0.0, 2.0 * 3.14159265358979323846);
 
-    // sweep >= 2pi: full annulus, return directly.
+    // sweep >= 2pi: full ring, return directly
     if (sweep >= 2.0 * 3.14159265358979323846 - 0.0001) {
         return ring_sdf;
     }
-
-    // Normalize p's polar angle relative to start_angle to [0, 2pi).
-    float raw_angle = atan2(p.y, p.x);
-    float rel = raw_angle - start_angle;
-    // Normalize to [0, 2pi).
-    rel = rel - floor(rel / (2.0 * 3.14159265358979323846)) * (2.0 * 3.14159265358979323846);
-
-    // rel in [0, sweep] -> inside arc.
-    if (rel <= sweep) {
-        return ring_sdf;
+    // Empty arc: positive everywhere and continuous (no line along the start ray).
+    if (sweep <= 0.0) {
+        return max(ring_sdf, 0.0) + 1.0;
     }
 
-    // Outside arc: return positive (no end caps, flat truncation).
-    return half_stroke + 1.0;
+    // Flat-capped arc: the ring band clipped by the two radial end caps. The distance to the
+    // nearer cap segment closes the field on both sides of each boundary ray: inside the sweep
+    // it bounds the ring distance from below (approaching 0 at the cap), outside it is the
+    // distance itself. A constant outside the sweep jumped by the ring distance along those
+    // rays, and the derivative-based AA drew a line along each of them.
+    float inner_radius = max(outer_radius - stroke_width, 0.0);
+    float cap = min(sdf_arc_cap(p, start_angle, inner_radius, outer_radius),
+                    sdf_arc_cap(p, start_angle + sweep, inner_radius, outer_radius));
+
+    // Normalize p's polar angle relative to start_angle to [0, 2pi)
+    float raw_angle = atan2(p.y, p.x);
+    float rel = raw_angle - start_angle;
+    rel = rel - floor(rel / (2.0 * 3.14159265358979323846)) * (2.0 * 3.14159265358979323846);
+
+    return rel <= sweep ? max(ring_sdf, -cap) : cap;
 }
 
 // Anti-aliasing functions
@@ -511,7 +525,9 @@ VertexOutput sdf_vertex_impl(uint vertex_id, uint instance_id, bool shadow_ring)
     // Instance coords are logical pixels; multiply by scale_factor to physical.
     float s = uniforms.scale_factor;
 
-    float expand = inst.shadow_blur * 2.0 + abs(inst.shadow_offset_x) + abs(inst.shadow_offset_y);
+    // Arcs carry their start / end angles in the shadow offset slots and draw no shadow:
+    // their quad is the ring's bounds (growing angles must not stretch it).
+    float expand = inst.shape_type == 3u ? 0.0 : inst.shadow_blur * 2.0 + abs(inst.shadow_offset_x) + abs(inst.shadow_offset_y);
     // bit 28: outer shadow spread (noise_scale reused); positive spread syncs quad expansion.
     if ((inst.packed_flags & (1u << 28u)) != 0u) expand += max(inst.noise_scale, 0.0);
     // Two-layer shadow: quad must cover both layers' max expansion, else large
@@ -521,6 +537,16 @@ VertexOutput sdf_vertex_impl(uint vertex_id, uint instance_id, bool shadow_ring)
         float expand2 = s2v.blur * 2.0 + abs(s2v.offset_x) + abs(s2v.offset_y);
         expand = max(expand, expand2);
     }
+
+#if defined(ZENIT_LINUX_GPU)
+    // A half-pixel-aligned thin fill needs fragments on both sides of its
+    // distance-AA boundary. Its unexpanded triangle otherwise drops one of
+    // the two half-covered texels and loses half the divider's opacity.
+    if (inst.shape_type == 0u && inst.packed_flags == 0u && expand == 0.0 &&
+        all(inst.rect.zw > float2(0.0, 0.0)) && min(inst.rect.z * s, inst.rect.w * s) <= 2.0) {
+        expand = 0.5 / s;
+    }
+#endif
 
     float2 pos = (inst.rect.xy - expand) * s;
     float2 size = (inst.rect.zw + expand * 2.0) * s;
@@ -900,8 +926,8 @@ float4 sdf_fragment_impl_ex(VertexOutput input, InstanceData inst, bool solid_on
                 float angle = atan2(input.uv.y - 0.5, input.uv.x - 0.5) - start_angle;
                 t = frac(angle / (2.0 * 3.14159265358979323846) + 0.5);
             } else {
-                // Linear (vert/horiz/diag): preserve shadow expand logic.
-                float expand = inst.shadow_blur * 2.0 + abs(inst.shadow_offset_x) + abs(inst.shadow_offset_y);
+                // Linear (vert/horiz/diag): same quad expansion as the vertex stage.
+                float expand = inst.shape_type == 3u ? 0.0 : inst.shadow_blur * 2.0 + abs(inst.shadow_offset_x) + abs(inst.shadow_offset_y);
                 float2 orig_size = inst.rect.zw;
                 float2 expanded_size = orig_size + expand * 2.0;
                 float2 remap_uv = (input.uv * expanded_size - float2(expand,expand)) / max(orig_size, float2(0.001,0.001));

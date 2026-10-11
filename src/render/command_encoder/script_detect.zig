@@ -48,6 +48,11 @@ pub fn preferCjkFallback(text: []const u8) bool {
 fn anyCodepoint(text: []const u8, comptime pred: fn (u21) bool) bool {
     var i: usize = 0;
     while (i < text.len) {
+        if (text[i] < 0x80) {
+            if (pred(text[i])) return true;
+            i += 1;
+            continue;
+        }
         const seq_len = std.unicode.utf8ByteSequenceLength(text[i]) catch {
             i += 1;
             continue;

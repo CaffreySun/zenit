@@ -22,7 +22,7 @@ fn hit(app: *App, x: f32, y: f32) !isize {
     const hwnd = app.win.getNativeSurfaceHandle();
     try require(ClientToScreen(hwnd, &point) != 0);
     const packed_point = @as(u32, @as(u16, @truncate(@as(u32, @bitCast(point.x))))) | (@as(u32, @as(u16, @truncate(@as(u32, @bitCast(point.y))))) << 16);
-    return SendMessageW(hwnd, 0x84, 0, @intCast(packed_point));
+    return SendMessageW(hwnd, 0x84, 0, @as(isize, @as(i32, @bitCast(packed_point))));
 }
 const HitContext = struct {
     blocked: bool = true,

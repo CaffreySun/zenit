@@ -65,6 +65,8 @@ pub fn run(io: std.Io) !void {
         context.queue.waitIdle(5000) catch @panic("blit gate cleanup");
         zenit_d12_test_gate_release(gate);
     }
+    // Send the setup writes first, so the injected failure hits the blit command.
+    try context.flushUploads();
     zenit_d12_test_fail_next_signal(context.queue.raw);
     try expectError(error.NativeGpuFailure, command.submitChecked());
     try expectError(error.CommandAlreadySubmitted, retained.submitChecked());

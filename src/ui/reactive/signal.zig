@@ -240,7 +240,7 @@ pub fn Signal(comptime T: type) type {
         }
 
         fn destroyImpl(base: *SignalBase, allocator: Allocator) void {
-            const self: *Self = @fieldParentPtr("base", base);
+            const self: *Self = @alignCast(@fieldParentPtr("base", base));
             // subscribers field deleted; graph.destroyNode handles edges
             if (has_store) {
                 if (self.slice_store) |ts| {

@@ -22,7 +22,7 @@ fn press(app: *App, x: c_int, y: c_int) !void {
 }
 fn release(app: *App, x: c_int, y: c_int) !void {
     const point = @as(u32, @as(u16, @intCast(x))) | (@as(u32, @as(u16, @intCast(y))) << 16);
-    _ = SendMessageW(app.win.getNativeSurfaceHandle(), 0x202, 0, @intCast(point));
+    _ = SendMessageW(app.win.getNativeSurfaceHandle(), 0x202, 0, @as(isize, @as(i32, @bitCast(point))));
     try pump(app);
 }
 fn sendPoint(app: *App, message: u32, x: c_int, y: c_int) void {
@@ -31,7 +31,7 @@ fn sendPoint(app: *App, message: u32, x: c_int, y: c_int) void {
 fn sendPointFlags(app: *App, message: u32, x: c_int, y: c_int, flags: usize) void {
     const point = @as(u32, @as(u16, @truncate(@as(u32, @bitCast(x))))) |
         (@as(u32, @as(u16, @truncate(@as(u32, @bitCast(y))))) << 16);
-    _ = SendMessageW(app.win.getNativeSurfaceHandle(), message, flags, @intCast(point));
+    _ = SendMessageW(app.win.getNativeSurfaceHandle(), message, flags, @as(isize, @as(i32, @bitCast(point))));
 }
 fn batchedDrag(app: *App, node: *ui.Node, x: c_int, y: c_int) !void {
     const drag = ui.interaction.drag;

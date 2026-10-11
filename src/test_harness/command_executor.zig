@@ -28,6 +28,7 @@ var frame_escape_on_enter: bool = false;
 var frame_action_index: ?usize = null;
 var frame_capture_path: ?command_queue.TestIdPayload = null;
 var frame_capture_after_ms: f64 = 0;
+var frame_capture_started_ms: f64 = 0;
 var frame_capture_index: ?usize = null;
 var frame_capture_failed: bool = false;
 
@@ -44,7 +45,15 @@ pub fn observeSubmittedFrame(ctx: *Cx) void {
         return;
     }
     const r = node.globalRect();
-    frame_samples[frame_count] = .{ .ms = @as(f64, @floatFromInt(@import("zenit_time").monotonicTimestamp(ctx.io) - frame_started)) / 1e6, .x = r.x, .y = r.y, .w = r.w, .h = r.h, .opacity = node.getOpacity(), .effective_opacity = tree_serializer.effectiveOpacity(node, &ctx.overlay_stack) };
+    // Timed pixels represent the animation evaluated at frame start, not the
+    // later GPU completion instant. Cold/slow submits must not label an
+    // initial hidden frame as an intermediate animation frame. Ordinary frame
+    // audits retain real submission timestamps.
+    const sample_ms = if (frame_capture_after_ms > 0)
+        @max(0, ctx.frame_time_ms - frame_capture_started_ms)
+    else
+        @as(f64, @floatFromInt(@import("zenit_time").monotonicTimestamp(ctx.io) - frame_started)) / 1e6;
+    frame_samples[frame_count] = .{ .ms = sample_ms, .x = r.x, .y = r.y, .w = r.w, .h = r.h, .opacity = node.getOpacity(), .effective_opacity = tree_serializer.effectiveOpacity(node, &ctx.overlay_stack) };
     frame_count += 1;
     if (frame_capture_path) |path| {
         if (frame_samples[frame_count - 1].ms >= frame_capture_after_ms) {
@@ -114,6 +123,13 @@ pub const RecordingStateFn = *const fn () RecordingState;
 /// cycles).
 pub const FrameStatsSnapshot = struct {
     renderer_backend: ?[]const u8 = null,
+    gpu_validation_errors: ?u32 = null,
+    gpu_software: ?bool = null,
+    window_logical_width: ?u32 = null,
+    window_logical_height: ?u32 = null,
+    window_pixel_width: ?u32 = null,
+    window_pixel_height: ?u32 = null,
+    clipboard_write_ready: ?bool = null,
     retained_hits: u32 = 0,
     retained_misses: u32 = 0,
     retained_partial_repaints: u32 = 0,
@@ -198,6 +214,15 @@ var g_stop_recording_fn: ?RecordingStateFn = null;
 var g_get_frame_stats_fn: ?GetFrameStatsFn = null;
 var g_reset_timing_fn: ?ResetTimingFn = null;
 var g_resize_window_fn: ?ResizeWindowFn = null;
+pub const WindowCommandFn = *const fn (command_queue.WindowCommand) ?command_queue.WindowSnapshot;
+var g_window_command_fn: ?WindowCommandFn = null;
+pub fn setWindowCommandFn(f: WindowCommandFn) void {
+    g_window_command_fn = f;
+}
+var g_quit_app_fn: ?*const fn () bool = null;
+pub fn setQuitAppFn(f: *const fn () bool) void {
+    g_quit_app_fn = f;
+}
 
 pub fn setGetCtxFn(f: GetCtxFn) void {
     g_get_ctx_fn = f;
@@ -379,6 +404,7 @@ pub fn drainCommandsRequestFrame(queue: *CommandQueue) bool {
 
 fn commandRequestsFrame(cmd: TestCommand) bool {
     return switch (cmd) {
+        .window => |command| command != .status and command != .close and command != .minimize,
         // These commands observe state; reset_timing changes measurements only.
         .health,
         .query_tree,
@@ -390,6 +416,7 @@ fn commandRequestsFrame(cmd: TestCommand) bool {
         .frame_stats,
         .reset_timing,
         .console_query,
+        .quit_app,
         => false,
         // Input, resize, screenshots and recording/control mutations request
         // one immediate frame. Custom routes have no readonly declaration, so
@@ -543,7 +570,7 @@ fn executeCommand(queue: *CommandQueue, cmd_in: TestCommand) bool {
             }
             return true;
         },
-        .key_down => |payload| {
+        .key_down, .key_up => |payload| {
             if (getCtx()) |ctx| {
                 const name = payload.getKeyName();
                 const key_code = parseKeyName(name);
@@ -553,7 +580,7 @@ fn executeCommand(queue: *CommandQueue, cmd_in: TestCommand) bool {
                     .alt = payload.alt,
                     .super = payload.super,
                 };
-                ctx.handleKeyDown(key_code, mods);
+                if (cmd == .key_up) ctx.handleKeyUp(key_code, mods) else ctx.handleKeyDown(key_code, mods);
                 queue.result.setJson("{\"ok\":true}");
             } else {
                 queue.result.setError("no context");
@@ -678,7 +705,7 @@ fn executeCommand(queue: *CommandQueue, cmd_in: TestCommand) bool {
                 const st = f();
                 // 16 numeric fields, 512B insufficient (JsonWriter silent truncate produces invalid
                 // JSON, client sees parse error not clear failure).
-                var buf: [1536]u8 = undefined;
+                var buf: [2048]u8 = undefined;
                 var jw = JsonWriter.init(&buf);
                 jw.beginObject();
                 jw.key("retained_hits");
@@ -701,6 +728,16 @@ fn executeCommand(queue: *CommandQueue, cmd_in: TestCommand) bool {
                 if (getCtx()) |ctx| jw.floatValue(@floatCast(ctx.frame_time_ms)) else jw.nullValue();
                 jw.key("renderer_backend");
                 if (st.renderer_backend) |backend| jw.stringValue(backend) else jw.nullValue();
+                jw.key("gpu_validation_errors");
+                if (st.gpu_validation_errors) |count| jw.numberValue(count) else jw.nullValue();
+                jw.key("gpu_software");
+                if (st.gpu_software) |software| jw.booleanValue(software) else jw.nullValue();
+                inline for (.{ "window_logical_width", "window_logical_height", "window_pixel_width", "window_pixel_height" }) |field| {
+                    jw.key(field);
+                    if (@field(st, field)) |value| jw.numberValue(value) else jw.nullValue();
+                }
+                jw.key("clipboard_write_ready");
+                if (st.clipboard_write_ready) |ready| jw.booleanValue(ready) else jw.nullValue();
                 jw.key("window_scale");
                 if (getCtx()) |ctx| jw.floatValue(ctx.window_scale) else jw.nullValue();
                 // new-glass first-frame family probes (Cx.glass_probe_stats, cumulative)
@@ -825,10 +862,10 @@ fn executeCommand(queue: *CommandQueue, cmd_in: TestCommand) bool {
         },
         .frames_start => |payload| {
             // Per-frame observation backend-independent (read layout/opacity after each submit);
-            // macOS runtime and Windows paint both call post-submit. Timed screenshot reads
-            // 'already-submitted' frame only; Windows callback satisfies this, other platforms
-            // drive another frame, can't use here.
-            if (payload.capture_path != null and @import("builtin").os.tag != .windows) {
+            // Timed capture must read the already-submitted surface. Windows
+            // paint and Linux retained GPU readback both satisfy this contract.
+            const os = @import("builtin").os.tag;
+            if (payload.capture_path != null and os != .windows and os != .linux) {
                 queue.result.setJson("{\"supported\":false}");
                 return true;
             }
@@ -850,6 +887,7 @@ fn executeCommand(queue: *CommandQueue, cmd_in: TestCommand) bool {
             }
             frame_capture_path = payload.capture_path;
             frame_capture_after_ms = payload.capture_after_ms;
+            frame_capture_started_ms = ctx.eventTimeMs();
             frame_capture_index = null;
             frame_capture_failed = false;
             frame_context = @intFromPtr(ctx);
@@ -1133,7 +1171,7 @@ fn executeCommand(queue: *CommandQueue, cmd_in: TestCommand) bool {
                         var buf: [4096]u8 = undefined;
                         var jw = JsonWriter.init(&buf);
                         const on_event = ic.behavior.events.on_event;
-                        if (on_event == inputEventHandler) {
+                        if (on_event == inputEventHandler or ui.widgets.input.isEditableTextClickHandler(on_event)) {
                             const state: *TextInputState = @ptrCast(@alignCast(ctx_ptr));
                             // EditableText deliberately reuses inputEventHandler for both
                             // storage modes.  Its multiline variant keeps the canonical
@@ -1305,6 +1343,22 @@ fn executeCommand(queue: *CommandQueue, cmd_in: TestCommand) bool {
             }
             return true;
         },
+        .window => |command| {
+            if (g_window_command_fn) |f| {
+                if (f(command)) |state| {
+                    var buf: [256]u8 = undefined;
+                    const json = std.fmt.bufPrint(&buf, "{{\"ok\":true,\"decoration_height\":{d},\"decorated\":{},\"maximized\":{},\"active\":{},\"suspended\":{},\"width\":{d},\"height\":{d}}}", .{ state.decoration_height, state.decorated, state.maximized, state.active, state.suspended, state.width, state.height }) catch unreachable;
+                    queue.result.setJson(json);
+                } else queue.result.setError("native window operation failed");
+            } else queue.result.setError("native window operations unsupported");
+            return true;
+        },
+        .quit_app => {
+            if (g_quit_app_fn) |f| {
+                queue.result.setJson(if (f()) "{\"ok\":true}" else "{\"ok\":false}");
+            } else queue.result.setError("quit callback unavailable");
+            return true;
+        },
         .resize_window => |payload| {
             if (g_resize_window_fn) |f| {
                 if (f(payload.width, payload.height)) {
@@ -1452,6 +1506,10 @@ fn scrollNodeIntoView(ctx: *Cx, node: *Node, align_top: bool) void {
 }
 
 fn parseKeyName(name: []const u8) KeyCode {
+    if (std.ascii.eqlIgnoreCase(name, "f10")) return .f10;
+    if (std.ascii.eqlIgnoreCase(name, "f11")) return .f11;
+    if (std.ascii.eqlIgnoreCase(name, "Alt") or std.ascii.eqlIgnoreCase(name, "AltLeft")) return .left_alt;
+    if (std.ascii.eqlIgnoreCase(name, "AltRight")) return .right_alt;
     if (std.mem.eql(u8, name, "tab")) return .tab;
     if (std.mem.eql(u8, name, "enter") or std.mem.eql(u8, name, "return")) return .@"return";
     if (std.mem.eql(u8, name, "escape") or std.mem.eql(u8, name, "esc")) return .escape;
@@ -1838,15 +1896,18 @@ test "timed capture reads one submitted frame after deadline and disarms on read
     frame_context = @intFromPtr(cx);
     frame_count = 0;
     frame_capture_after_ms = 120;
+    defer frame_capture_after_ms = 0;
     frame_capture_index = null;
     frame_capture_failed = false;
     frame_escape_on_enter = false;
     Capture.calls = 0;
-    // Future start avoids wall-clock flakiness without sleeping in this unit test.
-    frame_started = @import("zenit_time").monotonicTimestamp(cx.io) + std.time.ns_per_s;
+    frame_capture_started_ms = cx.frame_time_ms;
+    // GPU completion can be late while the submitted animation is still at
+    // its initial state. Capture follows the frame's evaluated animation time.
+    frame_started = @import("zenit_time").monotonicTimestamp(cx.io) - 200 * std.time.ns_per_ms;
     observeSubmittedFrame(cx);
     try std.testing.expectEqual(@as(usize, 0), Capture.calls);
-    frame_started = @import("zenit_time").monotonicTimestamp(cx.io) - 130 * std.time.ns_per_ms;
+    cx.frame_time_ms += 130;
     observeSubmittedFrame(cx);
     try std.testing.expectEqual(@as(usize, 1), Capture.calls);
     try std.testing.expectEqual(@as(?usize, 1), frame_capture_index);
@@ -1882,6 +1943,28 @@ test "harness pacing: readonly queries do not force an animation submission" {
         .{ .console_query = .{} },
     };
     for (commands) |cmd| try std.testing.expect(!commandRequestsFrame(cmd));
+}
+
+test "harness quit invokes the app on the dispatch thread without requesting a frame" {
+    const Quit = struct {
+        var calls: u32 = 0;
+        fn run() bool {
+            calls += 1;
+            return true;
+        }
+    };
+    const previous = g_quit_app_fn;
+    defer g_quit_app_fn = previous;
+    var queue = CommandQueue{ .io = std.testing.io, .allocator = std.testing.allocator };
+    g_quit_app_fn = null;
+    try std.testing.expect(executeCommand(&queue, .{ .quit_app = {} }));
+    try std.testing.expect(!queue.result.success);
+    Quit.calls = 0;
+    setQuitAppFn(Quit.run);
+    try std.testing.expect(!commandRequestsFrame(.{ .quit_app = {} }));
+    try std.testing.expect(executeCommand(&queue, .{ .quit_app = {} }));
+    try std.testing.expectEqual(@as(u32, 1), Quit.calls);
+    try std.testing.expectEqualStrings("{\"ok\":true}", queue.result.getData());
 }
 
 test "harness pacing: input screenshots and opaque routes require an immediate frame" {

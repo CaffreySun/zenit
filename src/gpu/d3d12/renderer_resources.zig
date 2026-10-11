@@ -7,6 +7,8 @@ const d12 = @import("resources.zig");
 pub const Context = struct {
     allocator: std.mem.Allocator,
     device: d12.Device,
+    /// Submit through `submitCommands`: a direct submission would run ahead of
+    /// texture writes still waiting in `pending_uploads`.
     queue: d12.Queue,
     resources: usize = 0,
     timeout_ms: u32 = 5000,
@@ -16,6 +18,17 @@ pub const Context = struct {
     /// once if the command never executed). Creating a committed buffer for every
     /// inline-bytes call cost ~100 us of CPU each and dominated D3D12 encoding.
     upload_pages: std.ArrayListUnmanaged(UploadPage) = .empty,
+    /// Texture writes recorded since the last submission on this queue. Each glyph/icon
+    /// write used to submit and wait for its own copy (a full GPU round trip per region:
+    /// a story with a few hundred new glyphs opened seconds late on a VM). Writes now
+    /// share one copy command that every submission on this queue sends first; in-order
+    /// queue execution keeps the copies ahead of the draws and readbacks submitted after
+    /// them, and native commands retain the staging buffers until their fence.
+    pending_uploads: ?d12.CommandEncoder = null,
+    /// Finished upload command whose submission failed. Kept and resent first:
+    /// the atlas already counts its glyphs as uploaded, and a buffer-to-texture
+    /// copy is idempotent, so resending one that did execute is harmless.
+    unsent_uploads: ?d12.CommandBuffer = null,
 
     pub fn init(allocator: std.mem.Allocator, device: *const d12.Device) !*Context {
         const self = try allocator.create(Context);
@@ -57,6 +70,8 @@ pub const Context = struct {
     }
     pub fn deinit(self: *Context) !void {
         if (self.resources != 0) return error.ResourcesStillAlive;
+        // No texture is alive, so nothing can observe these writes any more.
+        self.discardUploads();
         try self.queue.deinit(self.timeout_ms);
         for (self.upload_pages.items) |*page| page.buffer.destroy();
         self.upload_pages.deinit(self.allocator);
@@ -64,10 +79,54 @@ pub const Context = struct {
         const allocator = self.allocator;
         allocator.destroy(self);
     }
+    /// The one submission path: recorded texture writes go first.
+    pub fn submitCommands(self: *Context, commands: []const d12.CommandBuffer) !u64 {
+        try self.flushUploads();
+        return self.queue.submit(commands);
+    }
+    /// Sends the recorded texture writes. `submitCommands` calls this first.
+    /// A failure loses nothing: an unfinished encoder stays pending and a
+    /// command the queue never took is resent, so the next submission retries
+    /// in order. A command the queue did take (a Signal failure after
+    /// execution) is in flight and is never resent.
+    pub fn flushUploads(self: *Context) !void {
+        if (self.unsent_uploads != null) try self.sendUnsentUploads();
+        if (self.pending_uploads) |*encoder| {
+            const command = try encoder.finish();
+            encoder.deinit();
+            self.pending_uploads = null;
+            self.unsent_uploads = command;
+            try self.sendUnsentUploads();
+        }
+    }
+    fn sendUnsentUploads(self: *Context) !void {
+        const command = &self.unsent_uploads.?;
+        const before = self.queue.last_serial;
+        _ = self.queue.submit(&.{command.*}) catch |err| {
+            if (self.queue.last_serial != before) {
+                command.deinit();
+                self.unsent_uploads = null;
+            }
+            return err;
+        };
+        command.deinit();
+        self.unsent_uploads = null;
+    }
+    /// Drops writes that can no longer be observed (no texture is alive).
+    fn discardUploads(self: *Context) void {
+        if (self.unsent_uploads) |*command| command.deinit();
+        if (self.pending_uploads) |*encoder| encoder.deinit();
+        self.unsent_uploads = null;
+        self.pending_uploads = null;
+    }
+    fn uploadEncoder(self: *Context) !*d12.CommandEncoder {
+        if (self.pending_uploads == null) self.pending_uploads = try self.device.createCommandEncoder();
+        return &self.pending_uploads.?;
+    }
     fn submit(self: *Context, encoder: *d12.CommandEncoder) !void {
         var command = try encoder.finish();
         defer command.deinit();
-        const serial = try self.queue.submit(&.{command});
+        const serial = try self.submitCommands(&.{command});
         try self.queue.wait(serial, self.timeout_ms);
     }
     pub fn createBuffer(self: *Context, allocator: std.mem.Allocator, desc: gpu.BufferDescriptor) !d12.Buffer {
@@ -102,6 +161,38 @@ pub const Texture = struct {
     mip_level_count: u32,
     dimension: gpu.TextureDimension,
     memory: gpu.TextureMemory,
+
+    prepared_readback: ?d12.Buffer = null,
+    prepared_layout: ?d12.TextureCopyLayout = null,
+
+    /// Encode the CPU copy in the frame that produces the luminance texture.
+    /// The caller must wait for that frame's completion before consuming bytes.
+    pub fn prepareBgra8Readback(self: *Texture, encoder: anytype, width: u32, height: u32) !void {
+        if (encoder.context != self.context) return error.InvalidTextureData;
+        if (self.format != .bgra8_unorm and self.format != .bgra8_unorm_srgb) return error.UnsupportedTextureFormat;
+        if (self.dimension != .@"2d" or self.size.depth != 1) return error.InvalidTextureRegion;
+        const region = d12.TextureRegion{ .width = width, .height = height };
+        const layout = try self.inner.copyLayout(region, 0);
+        self.prepared_layout = null;
+        if (self.prepared_readback) |*buffer| {
+            if (buffer.size < layout.required_bytes) {
+                buffer.destroy();
+                self.prepared_readback = null;
+            }
+        }
+        if (self.prepared_readback == null) self.prepared_readback = try self.context.device.createBuffer(self.context.allocator, .{ .size = layout.required_bytes, .usage = .{ .map_read = true, .copy_dst = true } });
+        try encoder.inner.copyTextureToBuffer(&self.inner, region, &self.prepared_readback.?, 0, layout.row_pitch);
+        self.prepared_layout = layout;
+    }
+
+    /// CPU-only access after the producing command buffer has completed.
+    pub fn readPreparedBgra8(self: *Texture, width: u32, height: u32, bytes: []u8, bytes_per_row: u32) !void {
+        const layout = self.prepared_layout orelse return error.InvalidTextureData;
+        if (width != layout.width or height != layout.height or bytes_per_row < layout.row_bytes or @as(u64, bytes_per_row) * height > bytes.len) return error.InvalidTextureData;
+        const buffer = &(self.prepared_readback orelse return error.InvalidTextureData);
+        const mapped = try buffer.getMappedRange(0, buffer.size);
+        for (0..height) |row| @memcpy(bytes[row * bytes_per_row ..][0..@intCast(layout.row_bytes)], mapped[row * layout.row_pitch ..][0..@intCast(layout.row_bytes)]);
+    }
 
     /// One queued, owned staging buffer. The copy is ordered on the renderer's
     /// queue before Present; the source drawable may be reused after submission.
@@ -141,7 +232,7 @@ pub const Texture = struct {
         try encoder.copyTextureToBuffer(&source, region, &buffer, 0, layout.row_pitch);
         var command = try encoder.finish();
         defer command.deinit();
-        const serial = try self.context.queue.submit(&.{command});
+        const serial = try self.context.submitCommands(&.{command});
         return .{ .buffer = buffer, .context = self.context, .serial = serial, .width = self.size.width, .height = self.size.height, .stride = layout.row_pitch };
     }
 
@@ -155,10 +246,9 @@ pub const Texture = struct {
         const mapped = try buffer.getMappedRange(0, buffer.size);
         @memset(mapped, 0);
         for (0..height) |row| @memcpy(mapped[row * layout.row_pitch ..][0..@intCast(layout.row_bytes)], bytes[row * bytes_per_row ..][0..@intCast(layout.row_bytes)]);
-        var encoder = try self.context.device.createCommandEncoder();
-        defer encoder.deinit();
+        // Recorded, not submitted: the next submission on this queue sends it first.
+        const encoder = try self.context.uploadEncoder();
         try encoder.copyBufferToTexture(&buffer, 0, layout.row_pitch, &self.inner, region);
-        try self.context.submit(&encoder);
     }
     pub fn readBgra8(self: *const Texture, width: u32, height: u32, bytes: []u8, bytes_per_row: u32) !void {
         if (self.format != .bgra8_unorm and self.format != .bgra8_unorm_srgb) return error.UnsupportedTextureFormat;
@@ -184,6 +274,7 @@ pub const Texture = struct {
         return null; // Windows records through beginRecordingReadback, not a native texture handle.
     }
     pub fn destroy(self: *Texture) void {
+        if (self.prepared_readback) |*buffer| buffer.destroy();
         self.inner.destroy();
         self.context.resources -= 1;
         self.* = undefined;

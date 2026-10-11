@@ -1,11 +1,13 @@
 //! Pixel-producing Windows App runtime built on the current Direct2D paint
 //! subset. It uses the same Cx and SystemSdk event path as the macOS App.
+const chrome_backend = @import("chrome_backend.zig");
+const chrome_controller = @import("chrome_controller.zig");
 const std = @import("std");
 const ui = @import("ui");
 const platform = @import("platform");
 const system_sdk = @import("system_sdk");
 const text = @import("text");
-const shared_renderer = @import("gpu").backend_kind == .d3d12;
+const shared_renderer = @import("gpu").is_direct3d;
 const windows_paint = if (shared_renderer) @import("windows_shared_paint.zig") else @import("windows_paint.zig");
 const test_harness = @import("test_harness");
 const ClearColor = @import("renderer.zig").ClearColor;
@@ -27,6 +29,8 @@ pub const Config = struct {
     /// Application-owned I/O implementation, valid until all windows are destroyed.
     io: std.Io,
     window: WindowConfig = .{},
+    /// Return false to cancel. Called for native and application close requests.
+    on_close_request: ?*const fn (*App) bool = null,
     font: FontConfig = .{},
     clear_color: ClearColor = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
     visual_quality: ?@import("render").visual_quality.Quality = null,
@@ -49,13 +53,14 @@ fn prewarmShaderCache(device: *@import("gpu").Backend.Device) void {
 
 fn warmShaderSource(device: *@import("gpu").Backend.Device, name: []const u8, source: []const u8) void {
     var module = @import("gpu").Backend.ShaderModule.initFromSource(device, source) catch |err| {
-        std.log.warn("[d3d12] shader cache warm-up of {s} failed: {}", .{ name, err });
+        std.log.warn("[{s}] shader warm-up of {s} failed: {}", .{ @tagName(@import("gpu").backend_kind), name, err });
         return;
     };
     module.deinit();
 }
 
 pub const App = struct {
+    config: Config,
     allocator: std.mem.Allocator,
     win: platform.Window,
     /// D3D12 shader-cache warm-up; joined before the painter goes away.
@@ -70,6 +75,7 @@ pub const App = struct {
     cx: *ui.Cx,
     painter: windows_paint.Painter,
     renderer: *windows_paint.Painter,
+    chrome: chrome_controller.Controller,
     should_quit: bool = false,
     width: u32,
     height: u32,
@@ -82,21 +88,43 @@ pub const App = struct {
 
     pub const MountFn = *const fn (*ui.Cx, *ui.Scope) anyerror!*ui.Node;
 
+    pub const chromeState = chrome_controller.chromeState;
+    pub const windowCapabilities = chrome_controller.windowCapabilities;
+    pub const requestClose = chrome_controller.requestClose;
+    pub const minimize = chrome_controller.minimize;
+    pub const setMaximized = chrome_controller.setMaximized;
+    pub const toggleMaximize = chrome_controller.toggleMaximize;
+    pub const setFullscreen = chrome_controller.setFullscreen;
+    pub const performWindowAction = chrome_controller.performWindowAction;
+
+    fn chromeAction(context: *anyopaque, action: chrome_backend.chrome.Action) anyerror!void {
+        const self: *App = @ptrCast(@alignCast(context));
+        try self.performWindowAction(action);
+    }
+    fn chromeHit(context: ?*anyopaque, x: f32, y: f32) callconv(.c) c_int {
+        const self: *App = @ptrCast(@alignCast(context orelse return 1));
+        return @intCast(@backingInt(self.cx.windowRegionAt(x, y)));
+    }
+
     pub fn init(allocator: std.mem.Allocator, config: Config) !*App {
         const sizes = [_]u32{ config.font.small_size, config.font.medium_size, config.font.large_size };
         for (sizes) |size| if (size == 0) return error.InvalidFontSize;
         const self = try allocator.create(App);
         errdefer allocator.destroy(self);
+        self.config = config;
         self.allocator = allocator;
         self.should_quit = false;
         self.font_registry = null;
         self.fallback_stack = null;
         self.win = try platform.Window.init(config.window.width, config.window.height, config.window.title);
         errdefer self.win.deinit();
-        if (config.window.titlebar == .custom_inset) {
+        self.chrome = .{ .initial = try chrome_backend.configure(&self.win, @import("window_config.zig").requestedChrome(config.window), config.window.titlebar_height) };
+        try chrome_backend.configureHeader(&self.win, self.chrome.initial, config.window.fullscreen_header, config.window.titlebar_height);
+        try chrome_backend.setMinimumSize(&self.win, config.window.min_width, config.window.min_height);
+        if (config.window.chrome == null and config.window.titlebar == .custom_inset) {
             try self.win.setCustomTitlebar(config.window.titlebar_height, config.window.titlebar_drag_right_inset);
-            if (!self.win.setSizeChecked(config.window.width, config.window.height)) return error.WindowResizeFailed;
         }
+        if (self.chrome.initial.effective_mode != .native and !self.win.setSizeChecked(config.window.width, config.window.height)) return error.WindowResizeFailed;
         self.sdk = try system_sdk.backends.initSystemSdk(allocator, &self.win, self.win.getWindowId());
         errdefer self.sdk.deinit();
         self.font_system = try text.FontSystem.init(allocator, config.io);
@@ -168,7 +196,12 @@ pub const App = struct {
         // Native sizing/moving runs a nested Win32 loop. Rebuild Cx geometry
         // there instead of replaying commands prepared for the old viewport.
         self.win.setRenderCallback(renderNative, self);
-        if (config.window.titlebar == .custom_inset) self.win.setTitlebarHitCallback(titlebarHitTest, self);
+        const chrome_signal = try self.cx.windowChrome();
+        chrome_signal.set(self.chromeState());
+        self.cx.window_service = .{ .context = self, .perform = chromeAction };
+        if (config.window.chrome != null and self.chrome.initial.effective_mode != .native)
+            chrome_backend.setHitCallback(&self.win, chromeHit, self)
+        else if (config.window.titlebar == .custom_inset) self.win.setTitlebarHitCallback(titlebarHitTest, self);
         @import("windows_accessibility.zig").install(self.cx, &self.win) catch |err| {
             std.log.err("Windows accessibility handler: {s}", .{@errorName(err)});
         };
@@ -177,12 +210,14 @@ pub const App = struct {
 
     fn titlebarHitTest(context: ?*anyopaque, x: f32, y: f32) callconv(.c) c_int {
         const self: *App = @ptrCast(@alignCast(context orelse return 0));
-        return if (self.cx.hitTest(x, y) != null) 1 else 0;
+        return if (self.cx.legacyWindowControlAt(x, y)) 1 else 0;
     }
 
     pub fn deinit(self: *App) void {
         if (self.prewarm_thread) |thread| thread.join();
         self.prewarm_thread = null;
+        chrome_backend.setHitCallback(&self.win, null, null);
+        self.cx.window_service = null;
         self.win.setTitlebarHitCallback(null, null);
         self.win.setRenderCallback(null, null);
         @import("windows_accessibility.zig").detach(&self.win);
@@ -363,7 +398,9 @@ pub const App = struct {
         var portal_orphan = true;
         errdefer if (portal_orphan) portal.destroy(allocator);
         portal.meta.ownership.meta.component_name = "WindowOverlayPortal";
-        (try portal.style.ensureExtFallible(allocator)).z_index = ui.Cx.window_portal_z_index;
+        const portal_ext = try portal.style.ensureExtFallible(allocator);
+        portal_ext.z_index = ui.Cx.window_portal_z_index;
+        portal_ext.hit_behavior = .children_only;
 
         const scope = try ui.Scope.init(allocator, null, self.cx.owner);
         var scope_owned = true;
@@ -399,6 +436,7 @@ pub const App = struct {
         scope_owned = false;
         app_root_orphan = false;
         self.cx.is_mounted = true;
+        self.cx.content_root = user_root;
         self.cx.needs_redraw = true;
         if (test_harness.enabled) {
             self.rebindTestHarness();
@@ -474,6 +512,8 @@ pub const App = struct {
                 self.cx.needs_redraw = true;
             }
         }
+        chrome_controller.syncChrome(self);
+        defer self.cx.publishWindowRegions();
         const size = self.win.getSize();
         const scale = self.win.getScaleFactor();
         self.cx.display_refresh_hz = self.win.getDisplayRefreshRate();
@@ -502,7 +542,7 @@ pub const App = struct {
     pub fn run(self: *App) !void {
         self.cx.needs_redraw = true;
         try self.frame();
-        while (!self.should_quit and !self.win.shouldClose()) {
+        while (!self.should_quit) {
             const timeout = if (self.cx.wantsFrame()) 0 else if (test_harness.enabled) @min(self.pump_timeout_ms, 16) else self.pump_timeout_ms;
             platform.Window.pumpAppEventsTimeout(timeout);
             self.cx.bindFrameClock();
@@ -534,7 +574,8 @@ pub const App = struct {
         // run moves the real cursor over the window and its hover state lands in screenshots.
         if (pointer_isolation.shouldDropEvent(test_harness.enabled, test_harness.enabled and isolateOsPointer(), source, event)) return;
         switch (event) {
-            .quit, .window_close_requested => self.should_quit = true,
+            .quit => self.should_quit = true,
+            .window_close_requested => self.requestClose() catch {},
             .window_resized, .frame_requested, .system_theme_changed => self.cx.needs_redraw = true,
             .window_focused => |e| {
                 self.cx.needs_redraw = true;
@@ -563,6 +604,7 @@ pub const App = struct {
             .text_input => |e| self.cx.handleTextInput(e.text),
             .ime_preedit => |e| self.cx.handleImePreeditReplace(e.text, e.cursor_utf8_offset, e.replace_start_utf8, e.replace_end_utf8),
             .ime_commit => |e| self.cx.handleImeCommitReplace(e.text, e.replace_start_utf8, e.replace_end_utf8),
+            .ime_delete_surrounding => |e| self.cx.handleImeDeleteSurrounding(e.before_bytes, e.after_bytes),
             .magnify => |e| self.cx.handleMagnify(e.magnification, e.x, e.y, @fromBackingInt(@intCast(e.phase))),
             .drag => |e| {
                 if (e.kind == 4) self.cx.cancelPointerInteractions(.native_handoff);
@@ -658,6 +700,12 @@ pub const MultiWindowApp = struct {
     }
     pub fn pump(self: *MultiWindowApp, timeout_ms: u32) !bool {
         if (!self.shouldContinue()) return false;
+        // Retire already accepted closes before any potentially blocking native wait.
+        for (self.windows.items) |app| {
+            if (app.should_quit) _ = self.lifecycle.requestClose(app.windowId());
+        }
+        self.applyPendingCloses();
+        if (!self.shouldContinue()) return false;
         platform.Window.pumpAppEventsTimeout(timeout_ms);
         self.iterating = true;
         {
@@ -665,7 +713,7 @@ pub const MultiWindowApp = struct {
             for (self.windows.items) |app| {
                 app.cx.bindFrameClock();
                 const result = try app.sdk.pump(0);
-                if (!result.should_continue or app.win.shouldClose()) {
+                if (!result.should_continue) {
                     _ = self.lifecycle.requestClose(app.windowId());
                     continue;
                 }
@@ -745,7 +793,7 @@ fn frameStatsForHarness() test_harness.FrameStatsSnapshot {
     const st = app.painter.timingStats();
     const retained = app.painter.retainedStats();
     return .{
-        .renderer_backend = if (shared_renderer) "d3d12" else "legacy",
+        .renderer_backend = if (shared_renderer) @tagName(@import("gpu").backend_kind) else "legacy",
         .frame_count = st.frame_count,
         .path_draw_calls = app.painter.path_draw_calls,
         .backdrop_luminance = app.painter.backdrop_luminance orelse -1,

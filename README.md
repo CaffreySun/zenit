@@ -14,7 +14,7 @@ validation commands and protocol limits.
 | | |
 |---|---|
 | **Maturity** | Alpha (`0.1.0-alpha`). The API will break before v1, so pin a revision. |
-| **Platforms** | macOS (Metal); experimental Windows x64/ARM64 (D3D12), see [Windows build](docs/WINDOWS_BUILD.md). |
+| **Platforms** | macOS (Metal); experimental Windows x64/ARM64 (D3D12 or D3D11), see [Windows build](docs/WINDOWS_BUILD.md); experimental Linux Wayland (Vulkan, or OpenGL with `-Dgpu-backend=opengl`). |
 | **Accessibility** | Not supported. See [Accessibility](#accessibility). |
 | **Zig** | `0.17.0` |
 

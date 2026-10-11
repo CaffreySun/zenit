@@ -34,7 +34,7 @@ def audit(folder):
                 continue
             meta = json.loads(archive.read(name))
             key = (meta['window_id'], meta['index'], meta['frame_serial'])
-            if key in seen or meta['backend'] != 'd3d12':
+            if key in seen or meta['backend'] not in ('d3d11', 'd3d12'):
                 raise ValueError('duplicate or non-D3D12 frame')
             seen.add(key)
             if name != f"shared-{meta['window_id']}-frame-{meta['index']:04d}.json":
@@ -122,7 +122,7 @@ def audit(folder):
             results.append({'index':meta['index'],'alpha':alpha,'max_channel_error':error,'closed_max_channel_error':residual})
             prior = alpha
         report = {'passed':starts==3 and closes==3 and entering>=3 and exiting>=3 and prior==0 and all(r['max_channel_error']<=4 and r['closed_max_channel_error']<=3 for r in results),
-                  'capture_source':'D3D12 retained submitted surface','animation_clock_step_ms':33,'archive_frames':len(seen),'starts':starts,'closes':closes,
+                  'capture_source':'Direct3D retained submitted surface','animation_clock_step_ms':33,'archive_frames':len(seen),'starts':starts,'closes':closes,
                   'entry_intermediates':entering,'exit_intermediates':exiting,'max_channel_error':max(r['max_channel_error'] for r in results),
                   'closed_max_channel_error':max(r['closed_max_channel_error'] for r in results),'frames':results}
         return report

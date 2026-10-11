@@ -13,7 +13,7 @@ const Padding = core.Padding;
 /// is per-item kind; disabled overrides danger and highlight.
 recipe MenuRow slots(root, label, icon) {
   base {
-    root { width: grow; height: 32; direction: row; align-items: center; justify: space-between; padding: 0 10; background: transparent; }
+    root { width: grow; height: 32; direction: row; align-items: center; justify: space-between; padding: 0 10; corner-radius: 3; background: transparent; }
     label { font-size: 13; color: fg-primary; }
     icon { width: 16; height: 16; icon-color: fg-primary; }
   }
@@ -24,7 +24,7 @@ recipe MenuRow slots(root, label, icon) {
 }
 
 /// Item list in panel
-style list { width: grow; height: fit; direction: column; padding: 4 0; }
+style list { width: grow; height: fit; direction: column; padding: 4; }
 
 /// Divider outer: vertical padding, line itself 1px
 style separator { width: grow; height: fit; padding: 4 0; }

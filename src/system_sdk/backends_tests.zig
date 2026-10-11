@@ -1,7 +1,11 @@
-const macos = @import("backends/macos.zig");
+const builtin = @import("builtin");
+const linux = @import("backends/linux.zig");
 
 test {
-    _ = macos;
+    // macOS helpers use native Cocoa text and drag event types. Linux's
+    // mock-backed adapter contracts can also run on the macOS development host.
+    if (builtin.os.tag == .macos) _ = @import("backends/macos.zig");
+    _ = linux;
 }
 
 // ── cursor vtable optional set_custom contract ────────────────────────────────

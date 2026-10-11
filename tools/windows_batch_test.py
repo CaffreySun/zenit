@@ -16,7 +16,7 @@ class BatchContract(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="zenit-batch-contract-") as directory:
             folder = Path(directory) / "payload"
             captured = []
-            def bundle(plan, bin_dir, arch, out, startup):
+            def bundle(plan, bin_dir, arch, out, startup, renderer="d3d12", suite_timeout=900):
                 captured.extend(plan)
                 (out / batch.queue.BATCH_BUNDLE).write_bytes(b"fixture")
                 return "fixture-digest"
@@ -32,10 +32,42 @@ class BatchContract(unittest.TestCase):
     def test_offline_strict_prepares_every_stage_without_credentials_or_network(self):
         code, plan = self.invoke(["--prepare-only", "--require-a11y"])
         self.assertEqual(code, 0)
-        self.assertEqual(len(plan), 31)
-        self.assertEqual(sum(p["kind"] == "e2e" for p in plan), 30)
-        self.assertEqual(len({p["exe_name"] for p in plan}), 4)
+        self.assertEqual(len(plan), 33)
+        self.assertEqual(sum(p["kind"] == "e2e" for p in plan), 32)
+        self.assertEqual(len({p["exe_name"] for p in plan}), 5)
         self.assertTrue(all(p["blocking"] for p in plan))
+
+    def test_d3d11_x86_strict_plan_keeps_all_gates_and_native_backend(self):
+        code, plan = self.invoke(["--prepare-only", "--require-a11y", "--renderer", "d3d11", "--arch", "x86"])
+        self.assertEqual(code, 0)
+        self.assertEqual(len(plan), 33)
+        self.assertTrue(all(stage["blocking"] for stage in plan))
+        native = next(stage for stage in plan if stage["kind"] == "probe")
+        self.assertEqual(native["exe_name"], "zenit-windows-d3d11-contract.exe")
+        self.assertEqual(native["renderer"], "d3d11")
+
+    def test_full_application_suites_are_unfiltered_and_blocking(self):
+        code, plan = self.invoke(["--prepare-only", "--require-a11y", "--renderer", "d3d11", "--full-app-suites"])
+        self.assertEqual(code, 0)
+        self.assertEqual(len(plan), 35)
+        for name in ["storybook-full", "text-input-full"]:
+            stage = next(stage for stage in plan if stage["name"] == name)
+            self.assertTrue(stage["blocking"])
+            self.assertEqual(stage["filter"], "")
+
+    def test_d3d11_probe_requires_hardware_and_successful_contract(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "stage-result.json").write_text(json.dumps({"exit_code": 0, "error": ""}))
+            (root / "windows-probe-stdout.log").write_text("D3D11 hardware contract: upload snapshot, nonzero-offset update, partial clear, padded readback, submit/wait PASS\nD3D11 timestamp contract: pending, GPU duration, queue-independent lifetime PASS")
+            stderr = root / "windows-probe-stderr.log"
+            stage = {"kind": "probe", "renderer": "d3d11"}
+            stderr.write_text("[d3d11-adapter] name=VMware SVGA 3D feature=0xb000 software=1 result=0x00000000")
+            self.assertFalse(batch.judge(stage, root)[0])
+            stderr.write_text("[d3d11-adapter] name=VMware SVGA 3D feature=0xb000 software=0 result=0x00000000")
+            self.assertTrue(batch.judge(stage, root)[0])
+            (root / "windows-probe-stdout.log").write_text("")
+            self.assertFalse(batch.judge(stage, root)[0])
 
     def test_complete_gallery_suite_covers_texture_replacement_without_filter(self):
         full = [s for s in batch.stages(True) if s.get("suite_source") == "e2e/windows-image-render.test.ts" and not s.get("filter")]
@@ -97,7 +129,7 @@ class BatchContract(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="zenit-batch-result-") as directory:
             root = Path(directory)
             output = io.StringIO()
-            def bundle(plan, bin_dir, arch, out, startup):
+            def bundle(plan, bin_dir, arch, out, startup, renderer="d3d12", suite_timeout=900):
                 (out / batch.queue.BATCH_BUNDLE).write_bytes(b"fixture")
                 return "fixture-digest"
             def request(base, token, method, route, *args):

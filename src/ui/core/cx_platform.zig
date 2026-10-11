@@ -118,6 +118,14 @@ pub fn refreshTextInputSession(self: *Cx) void {
         .{ .node = next_node, .context = next_context },
         textInputHost(self),
     );
+    const sdk = self.system_sdk orelse return;
+    const api = sdk.vtable.ime orelse return;
+    if (api.set_surrounding == null) return;
+    const client = resolveFocusedTextInputClient(self) orelse return;
+    var buffer: [4000]u8 = undefined;
+    const state = @import("text_input_protocol.zig").surrounding(client, &buffer) orelse
+        @import("text_input_protocol.zig").Snapshot{ .text = "", .cursor = 0, .anchor = 0 };
+    sdk.setImeSurrounding(self.window_id, state.text, state.cursor, state.anchor, client.secure) catch {};
 }
 
 pub fn deactivateTextInputSession(self: *Cx) void {

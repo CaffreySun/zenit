@@ -6373,6 +6373,44 @@ test "render: sticky with positive z is clipped by scroll viewport and orders ab
     try std.testing.expectEqual(topbar, cx.hitTest(100, 30).?);
 }
 
+test "render: descendant shadows are inside the opacity-layer surface bounds" {
+    // Notification stack regression: the scaled/faded positioner is the layer owner, the shadow
+    // is painted by a grandchild (card body). A fixed 8px child margin cut that shadow at the
+    // texture edge into a hard rectangle; the surface must cover every shadow layer.
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    cx.setViewport(600, 600);
+
+    const root = try box(cx, .{ .width = .{ .px = 600 }, .height = .{ .px = 600 } }, .{});
+    const owner = try box(cx, .{ .width = .{ .px = 200 }, .height = .{ .px = 80 }, .opacity = 0.8 }, .{});
+    const wrapper = try box(cx, .{ .width = .{ .px = 200 }, .height = .{ .px = 80 } }, .{});
+    const body = try box(cx, .{ .width = .{ .px = 200 }, .height = .{ .px = 80 }, .background = Color.rgba(250, 250, 250, 255) }, .{});
+    (try body.style.ensureExtFallible(cx.allocator)).setShadows(
+        .{ .color = Color.rgba(0, 0, 0, 30), .blur = 4, .offset_y = 2 },
+        .{ .color = Color.rgba(0, 0, 0, 40), .blur = 24, .offset_y = 12, .spread = 2 },
+    );
+    try wrapper.appendChild(cx.allocator, body);
+    try owner.appendChild(cx.allocator, wrapper);
+    try root.appendChild(cx.allocator, owner);
+    cx.root = root;
+    cx.layout();
+    _ = cx.render();
+
+    // Second layer: blur 24 on both sides (48) + spread 2, shifted down 12.
+    const reach = 24 * 2 + 2;
+    const bbox = owner.getLayoutOutput().artifacts.children_bbox orelse return error.MissingChildrenBBox;
+    try std.testing.expect(bbox.x <= -reach);
+    try std.testing.expect(bbox.x + bbox.w >= 200 + reach);
+    try std.testing.expect(bbox.y + bbox.h >= 80 + 12 + reach);
+
+    const runtime = cx.scene_runtime.get(owner.id).?;
+    const node_plan = cx.layer_tree.planQueryNode(owner.id, runtime.effect_id, true, false, runtime.clip_bounds_fallback);
+    const bounds = node_plan.effect.begin_bounds orelse return error.MissingSurfaceBounds;
+    try std.testing.expect(bounds.x <= -reach);
+    try std.testing.expect(bounds.x + bounds.w >= 200 + reach);
+    try std.testing.expect(bounds.y + bounds.h >= 80 + 12 + reach);
+}
+
 test "render: z>0 child of opacity-layer parent is included in surface bounds" {
     // S9.1 item 5. Non-clip opacity 0.8 parent, z>0 child overflow parent frame: post-decouple
     // renders in parent surface like z=0, children_bbox / surface begin_bounds must cover it,
@@ -13389,6 +13427,37 @@ test "capture phase walks root → target; the target's own capture handler runs
     try std.testing.expectEqual(@as(u8, 'R'), trace.seq.items[0]);
     try std.testing.expectEqual(@as(u8, 'M'), trace.seq.items[1]);
     try std.testing.expectEqual(@as(u8, 'T'), trace.seq.items[2]);
+}
+
+test "unfocused keys reach the application root under the App wrapper" {
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    cx.setViewport(400, 300);
+
+    var trace = CaptureTrace{ .seq = .empty };
+    defer trace.seq.deinit(std.testing.allocator);
+
+    // App shape: a wrapper root holding the application tree and the overlay portal.
+    const wrapper = try box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
+    const content = try box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
+    content.behavior.events.on_event_capture = captureHandlerFor('A');
+    content.behavior.events.event_context = &trace;
+    const portal = try box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
+    try wrapper.appendChild(std.testing.allocator, content);
+    try wrapper.appendChild(std.testing.allocator, portal);
+    cx.root = wrapper;
+    cx.content_root = content;
+    cx.layout();
+
+    cx.handleKeyDown(.f11, .{});
+    cx.handleKeyUp(.f11, .{});
+    try std.testing.expectEqualSlices(u8, "AA", trace.seq.items);
+
+    // A content root no longer under the wrapper is ignored; the wrapper receives keys.
+    wrapper.removeChild(content);
+    defer content.destroy(std.testing.allocator);
+    cx.handleKeyDown(.f11, .{});
+    try std.testing.expectEqualSlices(u8, "AA", trace.seq.items);
 }
 
 test "capture stop halts propagation (no bubble)" {

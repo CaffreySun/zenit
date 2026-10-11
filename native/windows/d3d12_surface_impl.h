@@ -32,7 +32,10 @@ static HRESULT surface_update_composition(ZenitD12Surface *s) {
     DXGI_SWAP_CHAIN_DESC1 desc={};
     HRESULT hr=s->raw->GetDesc1(&desc); if (FAILED(hr)) return hr;
     RECT buttons={0,0,0,0},outer; POINT origin={0,0};
-    if (GetPropW(s->hwnd,L"Zenit.CustomFrame")) {
+    // Only while DWM actually paints caption buttons over this client (the
+    // bridge maintains the property); application-painted controls keep the
+    // whole surface, otherwise their slots are cut out and left black.
+    if (GetPropW(s->hwnd,L"Zenit.DwmCaption")) {
         hr=DwmGetWindowAttribute(s->hwnd,DWMWA_CAPTION_BUTTON_BOUNDS,&buttons,sizeof(buttons));
         if (FAILED(hr) || !GetWindowRect(s->hwnd,&outer) || !ClientToScreen(s->hwnd,&origin)) return E_FAIL;
         OffsetRect(&buttons,outer.left-origin.x,outer.top-origin.y);
@@ -134,9 +137,12 @@ extern "C" int zenit_d12_surface_create(ZenitD12Queue *q,void *hwnd,uint32_t w,u
     desc.SampleDesc.Count=1; desc.BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT|DXGI_USAGE_SHADER_INPUT;
     desc.BufferCount=count; desc.SwapEffect=DXGI_SWAP_EFFECT_FLIP_DISCARD;
     desc.AlphaMode=DXGI_ALPHA_MODE_IGNORE;
+    // Never stretch an older buffer over a resized client (composition: stretch only).
+    desc.Scaling=DXGI_SCALING_NONE;
     HRESULT hr=CreateDXGIFactory1(IID_IDXGIFactory4,(void **)&factory);
     const bool custom=GetPropW((HWND)hwnd,L"Zenit.CustomFrame")!=nullptr;
     if (custom) {
+        desc.Scaling=DXGI_SCALING_STRETCH;
         desc.SwapEffect=DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
         desc.AlphaMode=DXGI_ALPHA_MODE_PREMULTIPLIED;
         if (SUCCEEDED(hr)) hr=factory->CreateSwapChainForComposition(q->raw,&desc,nullptr,&chain);

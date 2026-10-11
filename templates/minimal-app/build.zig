@@ -16,10 +16,14 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const test_mode = b.option(bool, "test-mode", "Enable the Zenit automation harness") orelse false;
     const e2e_port = b.option(u16, "e2e-port", "Zenit Harness RPC directory suffix") orelse 19816;
+    const gpu_backend = b.option([]const u8, "gpu-backend", "GPU backend: metal, null, d3d12 or d3d11") orelse
+        (if (target.result.os.tag == .windows) "d3d12" else "metal");
 
     const zenit_dep = b.dependency("zenit", .{
         .target = target,
         .optimize = optimize,
+        .@"windows-arch" = if (target.result.os.tag == .windows) target.result.cpu.arch else @as(std.Target.Cpu.Arch, .aarch64),
+        .@"gpu-backend" = gpu_backend,
         // Dependency build options are isolated in Zig. Forward these
         // explicitly so `zig build -Dtest-mode=true` reaches Zenit.
         .@"test-mode" = test_mode,

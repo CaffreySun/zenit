@@ -46,6 +46,9 @@ pub const MultiWindowApp = if (builtin.target.os.tag == .windows) @import("windo
 pub const Application = MultiWindowApp;
 pub const AppWindow = App;
 pub const MultiWindowConfig = if (builtin.target.os.tag == .windows) @import("windows_runtime.zig").MultiWindowConfig else runtime.MultiWindowConfig;
+pub const window_chrome = @import("system_sdk").window_chrome;
+pub const WindowChrome = window_chrome.Config;
+pub const build_environment = window_chrome.build_environment;
 pub const TitlebarStyle = @import("window_config.zig").TitlebarStyle;
 pub const WindowConfig = if (builtin.target.os.tag == .windows) @import("windows_runtime.zig").WindowConfig else runtime.WindowConfig;
 pub const FontConfig = runtime.FontConfig;

@@ -180,7 +180,7 @@ const MAX_UNIFORM_UPDATES = 256;
 // D3D12 CBV addresses require 256-byte alignment (append aligned slots so
 // normal shared draws can bind the retained frame buffer without snapshots);
 // Metal buffer offsets must be multiples of 16 (the struct is not).
-const UNIFORM_STRIDE = std.mem.alignForward(usize, @sizeOf(Uniforms), if (gpu.backend_kind == .d3d12) 256 else 16);
+const UNIFORM_STRIDE = std.mem.alignForward(usize, @sizeOf(Uniforms), if (gpu.is_direct3d) 256 else 16);
 
 /// TRANSPARENT color
 const TRANSPARENT: [4]f32 = .{ 0, 0, 0, 0 };
@@ -305,7 +305,7 @@ pub const SdfRenderer = struct {
         defer vertex_func.deinit();
         // D3D12 splits the material program into layer passes (see
         // splitLayers), so the mandatory pipeline is the body entry.
-        var fragment_func = try shader.getFunction(if (gpu.backend_kind == .d3d12) "sdf_body_fragment_main" else "sdf_fragment_main");
+        var fragment_func = try shader.getFunction(if (gpu.is_direct3d) "sdf_body_fragment_main" else "sdf_fragment_main");
         defer fragment_func.deinit();
 
         // Create pipeline (with alpha blend). After this, every failure must release built
@@ -327,7 +327,7 @@ pub const SdfRenderer = struct {
         errdefer pipeline.deinit();
         var layer_pipelines: [3]?gpu.Backend.RenderPipeline = @splat(null);
         errdefer for (&layer_pipelines) |*slot| if (slot.*) |*value| value.deinit();
-        if (gpu.backend_kind == .d3d12) for (&layer_pipelines, [_][]const u8{ "sdf_outer_shadow_fragment_main", "sdf_inset_layer_fragment_main", "sdf_border_layer_fragment_main" }) |*slot, entry| {
+        if (gpu.is_direct3d) for (&layer_pipelines, [_][]const u8{ "sdf_outer_shadow_fragment_main", "sdf_inset_layer_fragment_main", "sdf_border_layer_fragment_main" }) |*slot, entry| {
             var layer_fragment = try shader.getFunction(entry);
             defer layer_fragment.deinit();
             slot.* = try gpu.Backend.createRenderPipeline(device, .{
@@ -406,8 +406,8 @@ pub const SdfRenderer = struct {
         // core UI initialization; the general SDF pipeline implements all cases.
         var optimized_ready = false;
         optimized: {
-            if (gpu.backend_kind == .d3d12 and @import("zenit_environment").has("ZENIT_D3D12_SDF_GENERAL_ONLY")) break :optimized;
-            if (gpu.backend_kind == .d3d12) {
+            if (gpu.is_direct3d and @import("zenit_environment").has("ZENIT_D3D12_SDF_GENERAL_ONLY")) break :optimized;
+            if (gpu.is_direct3d) {
                 if (device.supportsVertexViewportIndex()) {
                     var region_vertex = shader.getFunction("sdf_region_vertex_main") catch break :optimized;
                     defer region_vertex.deinit();
@@ -424,7 +424,7 @@ pub const SdfRenderer = struct {
                     }
                 }
             }
-            if (gpu.backend_kind == .d3d12) {
+            if (gpu.is_direct3d) {
                 var tiled_vertex = shader.getFunction("sdf_tiled_rect_vertex_main") catch break :optimized;
                 defer tiled_vertex.deinit();
                 const names = [_][]const u8{ "sdf_solid_fragment_main", "sdf_plain_rect_fragment_main", "sdf_rect_fragment_main", "sdf_plain_rect_fragment_main", "sdf_rect_fragment_main", "sdf_rounded_clip_rect_fragment_main", "sdf_linear_x_fragment_main", "sdf_linear_y_fragment_main", "sdf_inset_rect_fragment_main" };
@@ -448,7 +448,7 @@ pub const SdfRenderer = struct {
                 }
             }
 
-            if (gpu.backend_kind == .d3d12) {
+            if (gpu.is_direct3d) {
                 var dual_fragment = shader.getFunction("sdf_dual_shadow_fragment_main") catch break :optimized;
                 defer dual_fragment.deinit();
                 var dual_vertex = shader.getFunction("sdf_dual_shadow_vertex_main") catch break :optimized;
@@ -577,7 +577,7 @@ pub const SdfRenderer = struct {
             .shadow_ring_pipeline = shadow_ring_pipeline,
             .layer_pipelines = layer_pipelines,
             .dual_shadow_pipeline = dual_shadow_pipeline,
-            .trace_materials = gpu.backend_kind == .d3d12 and @import("zenit_environment").has("ZENIT_WINDOWS_FRAME_TIMING"),
+            .trace_materials = gpu.is_direct3d and @import("zenit_environment").has("ZENIT_WINDOWS_SDF_MATERIAL_TRACE"),
             .uniform_buffers = uniform_buffers,
             .instance_buffers = instance_buffers,
             .stop_buffers = stop_buffers,
@@ -652,7 +652,7 @@ pub const SdfRenderer = struct {
         return copy;
     }
     fn splitLayers(self: *SdfRenderer) !void {
-        if (comptime gpu.backend_kind != .d3d12) return;
+        if (comptime !gpu.is_direct3d) return;
         var extra: usize = 0;
         for (self.instances.items) |item| {
             // Already split by an earlier render() of the same list (render
@@ -688,7 +688,7 @@ pub const SdfRenderer = struct {
         std.debug.assert(write == 0);
     }
     fn pipelineKind(self: *const SdfRenderer, item: SDFInstance) PipelineKind {
-        if (comptime gpu.backend_kind == .d3d12) if (layerPass(item) != null) return .layer;
+        if (comptime gpu.is_direct3d) if (layerPass(item) != null) return .layer;
         if (item.shape_type == 0 and item.rect[2] > 0 and item.rect[3] > 0 and item.fill_color[3] == 0 and item.shadow_color[3] > 0 and
             item.shadow_blur > 0 and item.border_width == 0 and item.packed_flags & ~shadow_spread_flag == 0)
         {
@@ -1371,6 +1371,15 @@ pub const SdfRenderer = struct {
             const buf = try self.ensureUniformOverflowCapacity(slot + 1);
             break :blk .{ buf, slot * UNIFORM_STRIDE };
         };
+        // Only film-grain batches consume the frame seed in the shader.
+        // Keep other constants stable so Direct3D can reuse their immutable
+        // GPU storage across frames without changing any pixels.
+        const batch_seed = blk: {
+            for (self.instances.items) |inst| {
+                if (((inst.packed_flags >> 8) & 0xff) == @backingInt(NoiseMode.film_grain) and inst.noise_scale > 0) break :blk self.frame_seed;
+            }
+            break :blk @as(u32, 0);
+        };
         const uniforms = Uniforms{
             .viewport_size = .{ self.viewport_width, self.viewport_height },
             .scale_factor = self.scale_factor,
@@ -1382,15 +1391,17 @@ pub const SdfRenderer = struct {
             .clip_contour_count = self.clip_contour_count,
             .clip_polygon_end_points = self.clip_polygon_end_points,
             .clip_polygon_points = self.clip_polygon_points,
-            .frame_seed = self.frame_seed,
+            .frame_seed = batch_seed,
         };
         const uniform_data = try uniform_buffer.getMappedRange(uniform_byte_offset, @sizeOf(Uniforms));
         @memcpy(uniform_data, std.mem.asBytes(&uniforms));
 
         // Set pipeline (once).
         render_pass.setPipeline(&self.pipeline);
-        render_pass.setVertexBuffer(0, uniform_buffer, @intCast(uniform_byte_offset));
-        render_pass.setFragmentBuffer(0, uniform_buffer, @intCast(uniform_byte_offset));
+        // One uniform slot, not the rest of the ring: Direct3D snapshots the bound
+        // range per draw (constant buffers over 4 KiB are copied into a new buffer).
+        gpu.setVertexBufferRange(render_pass, 0, uniform_buffer, @intCast(uniform_byte_offset), UNIFORM_STRIDE);
+        gpu.setFragmentBufferRange(render_pass, 0, uniform_buffer, @intCast(uniform_byte_offset), UNIFORM_STRIDE);
 
         // Upload GradientStop data to slot 2 (append: tail only).
         {
@@ -1404,7 +1415,8 @@ pub const SdfRenderer = struct {
                     self.grad_stops_uploaded = stop_count;
                 } else |_| {}
             }
-            render_pass.setFragmentBuffer(2, stop_buf, 0);
+            // Only the uploaded stops (shaders index from 0); at least one element.
+            gpu.setFragmentBufferRange(render_pass, 2, stop_buf, 0, @sizeOf(GradientStop) * @max(@as(usize, 1), self.grad_stops_uploaded));
         }
 
         // Upload ShadowParam data to slot 3 (append: tail only).
@@ -1419,9 +1431,10 @@ pub const SdfRenderer = struct {
                     self.shadow2_uploaded = s2_count;
                 } else |_| {}
             }
-            render_pass.setFragmentBuffer(3, s2_buf, 0);
+            const s2_bytes = @sizeOf(ShadowParam) * @max(@as(usize, 1), self.shadow2_uploaded);
+            gpu.setFragmentBufferRange(render_pass, 3, s2_buf, 0, s2_bytes);
             // Vertex also reads shadow_params (dual-shadow quad expansion takes max of both).
-            render_pass.setVertexBuffer(3, s2_buf, 0);
+            gpu.setVertexBufferRange(render_pass, 3, s2_buf, 0, s2_bytes);
         }
 
         // Batch render: each batch within remaining buffer capacity.
@@ -1457,7 +1470,7 @@ pub const SdfRenderer = struct {
                 if (kind == .shadow_ring) vertex_count = 24;
                 // Split only at material boundaries; never reorder blended items.
                 var run: usize = 1;
-                if (comptime gpu.backend_kind == .d3d12) {
+                if (comptime gpu.is_direct3d) {
                     const exact_viewport = render_pass.matchesViewport(.{ self.viewport_width, self.viewport_height });
                     if (!(exact_viewport and self.constantInterior(original_item) != null)) {
                         // Layer copies share .layer; each pass is its own pipeline.
@@ -1482,7 +1495,7 @@ pub const SdfRenderer = struct {
                     .dual_shadow => &(self.dual_shadow_pipeline.?),
                     .layer => &(self.layer_pipelines[@backingInt(layerPass(original_item).?) - 1].?),
                 });
-                if (comptime gpu.backend_kind == .d3d12) {
+                if (comptime gpu.is_direct3d) {
                     var can_tile = (kind == .plain_rect or (kind == .solid_rect and self.clip_shape_kind == 0)) and render_pass.matchesViewport(.{ self.viewport_width, self.viewport_height });
                     // Even a transparent shadow can expand the original quad.
                     // Retain that interpolation/AA path byte-for-byte.
@@ -1514,7 +1527,7 @@ pub const SdfRenderer = struct {
                         }
                     }
                 }
-            } else if (comptime gpu.backend_kind == .d3d12) {
+            } else if (comptime gpu.is_direct3d) {
                 // Without the optional pipelines everything is the body program,
                 // except the layer-pass copies of split instances.
                 const layer = layerPass(self.instances.items[offset]);
@@ -1543,15 +1556,15 @@ pub const SdfRenderer = struct {
                 const overflow_buffer = &self.overflow_buffers[self.current_buffer].?;
                 const overflow_data = try overflow_buffer.getMappedRange(self.overflow_write_offset, instance_size);
                 @memcpy(overflow_data, std.mem.sliceAsBytes(self.instances.items[offset .. offset + batch_count]));
-                render_pass.setVertexBuffer(1, overflow_buffer, @intCast(self.overflow_write_offset));
-                render_pass.setFragmentBuffer(1, overflow_buffer, @intCast(self.overflow_write_offset));
+                gpu.setVertexBufferRange(render_pass, 1, overflow_buffer, @intCast(self.overflow_write_offset), @intCast(instance_size));
+                gpu.setFragmentBufferRange(render_pass, 1, overflow_buffer, @intCast(self.overflow_write_offset), @intCast(instance_size));
                 self.overflow_write_offset += instance_size;
             } else {
                 const byte_offset = self.buffer_write_offset * @sizeOf(SDFInstance);
                 const instance_data = try self.instance_buffers[self.current_buffer].getMappedRange(byte_offset, instance_size);
                 @memcpy(instance_data, std.mem.sliceAsBytes(self.instances.items[offset .. offset + batch_count]));
-                render_pass.setVertexBuffer(1, &self.instance_buffers[self.current_buffer], @intCast(byte_offset));
-                render_pass.setFragmentBuffer(1, &self.instance_buffers[self.current_buffer], @intCast(byte_offset));
+                gpu.setVertexBufferRange(render_pass, 1, &self.instance_buffers[self.current_buffer], @intCast(byte_offset), @intCast(instance_size));
+                gpu.setFragmentBufferRange(render_pass, 1, &self.instance_buffers[self.current_buffer], @intCast(byte_offset), @intCast(instance_size));
                 self.buffer_write_offset += batch_count;
             }
 
@@ -1559,7 +1572,7 @@ pub const SdfRenderer = struct {
                 const item = self.instances.items[offset];
                 std.log.info("[sdf-material] kind={s} vertices={d} target={any} count={d} shape={d} flags={x} rect={any} fill={d} shadow={d} blur={d} offset={any} mask={d} mask_rect={any} mask_radius={d} clip={any}", .{ @tagName(self.pipelineKind(item)), vertex_count, [2]f32{ self.viewport_width, self.viewport_height }, batch_count, item.shape_type, item.packed_flags, item.rect, item.fill_color[3], item.shadow_color[3], item.shadow_blur, [2]f32{ item.shadow_offset_x, item.shadow_offset_y }, self.clip_shape_kind, self.clip_rect, self.clip_radius, item.rect_clip });
             }
-            if (comptime gpu.backend_kind == .d3d12) {
+            if (comptime gpu.is_direct3d) {
                 if (edge_hole) |hole| {
                     // Original six vertices/interpolation, clipped into four
                     // disjoint edge bands. Mask-AA derivatives stay unchanged.
@@ -1773,4 +1786,38 @@ test "uniform 槽位用尽后继续画（溢出 buffer），不再返回 Uniform
         gpu.Backend.stats.buffers_created - created_base,
         gpu.Backend.stats.buffers_destroyed - destroyed_base,
     );
+}
+
+test "static SDF uniforms stay identical across clocks while film grain preserves its seed" {
+    if (gpu.backend_kind != .null_backend) return error.SkipZigTest;
+    var device = gpu.Backend.Device{};
+    var queue = gpu.Backend.Queue{};
+    var renderer = try SdfRenderer.init(std.testing.allocator, &device);
+    defer renderer.deinit();
+    var encoder = try gpu.Backend.CommandEncoder.init(&queue);
+    defer encoder.deinit();
+    var pass = try encoder.beginRenderPass(.{ .color_attachments = &.{} });
+    defer pass.end();
+    var previous: [@sizeOf(Uniforms)]u8 = undefined;
+    for ([_]u32{ 7, 113 }, 0..) |seed, index| {
+        renderer.beginFrame(800, 600, 2, seed);
+        try renderer.addRoundedRect(0, 0, 10, 10, .{ 1, 0, 0, 1 }, .{ 2, 2, 2, 2 });
+        try renderer.flush(&pass);
+        const bytes = try renderer.uniform_buffers[renderer.current_buffer].getMappedRange(0, @sizeOf(Uniforms));
+        var observed: Uniforms = undefined;
+        @memcpy(std.mem.asBytes(&observed), bytes);
+        try std.testing.expectEqual(@as(u32, 0), observed.frame_seed);
+        if (index == 0) @memcpy(&previous, bytes) else try std.testing.expectEqualSlices(u8, &previous, bytes);
+    }
+    for ([_]NoiseMode{ .value, .film_grain }) |mode| {
+        for ([_]u32{ 7, 113 }) |seed| {
+            renderer.beginFrame(800, 600, 2, seed);
+            try renderer.addNoiseRect(0, 0, 10, 10, .{ 1, 0, 0, 1 }, mode, 1, 0.2, 23, .{ 2, 2, 2, 2 });
+            try renderer.flush(&pass);
+            const bytes = try renderer.uniform_buffers[renderer.current_buffer].getMappedRange(0, @sizeOf(Uniforms));
+            var observed: Uniforms = undefined;
+            @memcpy(std.mem.asBytes(&observed), bytes);
+            try std.testing.expectEqual(if (mode == .film_grain) seed else @as(u32, 0), observed.frame_seed);
+        }
+    }
 }

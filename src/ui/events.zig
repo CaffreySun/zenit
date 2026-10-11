@@ -11,7 +11,7 @@ const std = @import("std");
 
 /// Platform's standard application shortcut modifier.
 pub fn primaryModifier(modifiers: Modifiers) bool {
-    return if (@import("builtin").target.os.tag == .windows) modifiers.ctrl else modifiers.super;
+    return if (@import("builtin").target.os.tag == .macos) modifiers.super else modifiers.ctrl;
 }
 
 /// Multi-click detection window and pixel tolerance. 300ms / 5px is tight in desktop editors,
@@ -164,6 +164,95 @@ pub const KeyCode = enum(u16) {
     /// Translate Win32 virtual-key codes into Zenit's logical key enum.
     /// Letter and digit VKs are layout-independent physical shortcuts here;
     /// committed characters continue to arrive through text_input.
+    /// Linux/Wayland uses evdev key codes, without the XKB-only +8 offset.
+    pub fn fromLinuxEvdev(raw: u16) KeyCode {
+        return switch (raw) {
+            1 => .escape,
+            2 => .@"1",
+            3 => .@"2",
+            4 => .@"3",
+            5 => .@"4",
+            6 => .@"5",
+            7 => .@"6",
+            8 => .@"7",
+            9 => .@"8",
+            10 => .@"9",
+            11 => .@"0",
+            12 => .minus,
+            13 => .equal,
+            14 => .delete,
+            15 => .tab,
+            16 => .q,
+            17 => .w,
+            18 => .e,
+            19 => .r,
+            20 => .t,
+            21 => .y,
+            22 => .u,
+            23 => .i,
+            24 => .o,
+            25 => .p,
+            26 => .left_bracket,
+            27 => .right_bracket,
+            28 => .@"return",
+            29 => .left_ctrl,
+            30 => .a,
+            31 => .s,
+            32 => .d,
+            33 => .f,
+            34 => .g,
+            35 => .h,
+            36 => .j,
+            37 => .k,
+            38 => .l,
+            39 => .semicolon,
+            40 => .quote,
+            41 => .grave,
+            42 => .left_shift,
+            43 => .backslash,
+            44 => .z,
+            45 => .x,
+            46 => .c,
+            47 => .v,
+            48 => .b,
+            49 => .n,
+            50 => .m,
+            51 => .comma,
+            52 => .period,
+            53 => .slash,
+            54 => .right_shift,
+            56 => .left_alt,
+            57 => .space,
+            59 => .f1,
+            60 => .f2,
+            61 => .f3,
+            62 => .f4,
+            63 => .f5,
+            64 => .f6,
+            65 => .f7,
+            66 => .f8,
+            67 => .f9,
+            68 => .f10,
+            87 => .f11,
+            88 => .f12,
+            96 => .@"return",
+            97 => .right_ctrl,
+            100 => .right_alt,
+            102 => .home,
+            103 => .up,
+            104 => .page_up,
+            105 => .left,
+            106 => .right,
+            107 => .end,
+            108 => .down,
+            109 => .page_down,
+            111 => .forward_delete,
+            125 => .left_super,
+            126 => .right_super,
+            else => .unknown,
+        };
+    }
+
     pub fn fromWindowsVirtualKey(vk: u16) KeyCode {
         return switch (vk) {
             0x41 => .a,
@@ -270,6 +359,8 @@ pub const ime_no_replacement: u32 = 0xFFFF_FFFF;
 
 /// IME preedit event
 pub const ImePreeditEvent = struct {
+    cursor_visible: bool = true,
+    selection_end_utf8: ?u32 = null,
     text: []const u8,
     cursor_utf8_offset: u32 = 0,
     /// replacementRange converted to UTF-8 byte range (relative to document); re-convert and
@@ -422,6 +513,7 @@ pub const Event = union(enum) {
     text_input: TextInputEvent,
     ime_preedit: ImePreeditEvent,
     ime_commit: ImeCommitEvent,
+    ime_delete_surrounding: struct { before_bytes: u32, after_bytes: u32 },
 
     // Focus event
     focus: FocusEvent,
@@ -518,4 +610,13 @@ test "EventResult helpers" {
     try std.testing.expect(preventsDefault(.stop));
     try std.testing.expect(!stopsPropagation(.handled));
     try std.testing.expect(stopsPropagation(.stop));
+}
+
+test "Linux evdev keycodes remain separate from Mac and XKB keycodes" {
+    try std.testing.expectEqual(KeyCode.a, KeyCode.fromLinuxEvdev(30));
+    try std.testing.expectEqual(KeyCode.c, KeyCode.fromLinuxEvdev(46));
+    try std.testing.expectEqual(KeyCode.@"return", KeyCode.fromLinuxEvdev(28));
+    try std.testing.expectEqual(KeyCode.left, KeyCode.fromLinuxEvdev(105));
+    try std.testing.expectEqual(KeyCode.right_alt, KeyCode.fromLinuxEvdev(100));
+    try std.testing.expectEqual(KeyCode.unknown, KeyCode.fromLinuxEvdev(768));
 }

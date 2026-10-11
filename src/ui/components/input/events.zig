@@ -29,7 +29,7 @@ pub fn inputEventHandler(event: Event, context: ?*anyopaque) EventResult {
 fn handleEvent(state: *TextInputState, event: Event) EventResult {
     if (state.readonly) {
         switch (event) {
-            .text_input, .ime_preedit, .ime_commit => return .handled,
+            .text_input, .ime_preedit, .ime_commit, .ime_delete_surrounding => return .handled,
             .key_down => |e| {
                 if (e.key == .tab) return .ignored; // Focus traversal, never insert indentation.
                 const allowed = switch (e.key) {
@@ -88,7 +88,14 @@ fn handleEvent(state: *TextInputState, event: Event) EventResult {
             input.len = state_mod.sanitizeInputText(state, input.text(), input.mutableText()).len;
             const filtered = input.text();
             state.handleImePreeditReplaceEventChecked(filtered, e.cursor_utf8_offset, e.replace_start_utf8, e.replace_end_utf8) catch return .handled;
+            state.setImeAttributes(e.cursor_visible, e.selection_end_utf8);
             state.updateScrollX();
+            return .handled;
+        },
+        .ime_delete_surrounding => |e| {
+            state.handleImeDeleteSurrounding(e.before_bytes, e.after_bytes) catch return .handled;
+            state.updateScrollX();
+            fireOnChange(state);
             return .handled;
         },
         .ime_commit => |e| {

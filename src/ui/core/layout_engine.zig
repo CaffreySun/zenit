@@ -617,7 +617,7 @@ fn calcIntrinsicSizeUncached(node: *Node, comptime is_main_row: bool) f32 {
     // Absolute children don't participate in intrinsic (avoid overlay impact layout)
     var flow_count: usize = 0;
     for (node.children.items) |child| {
-        if (child.style.position != .absolute) flow_count += 1;
+        if (!isOutOfFlow(child)) flow_count += 1;
     }
     if (flow_count == 0) return pad;
 
@@ -1127,49 +1127,58 @@ pub fn layoutNode(node: *Node, available: Size, ctx: LayoutContext) void {
     node_mod.fireMountIfNeeded(node);
 }
 
-/// compute children's bounding box union (relative to parent coordinate system, includes translate
-/// offset)
-/// hitTest checks bbox first, skip entire subtree if mouse not in bbox
+/// compute children's painted bounding box union (relative to this node, includes translate
+/// offset). A child counts with everything it paints outside its own rect: every shadow layer,
+/// its outline, and (unless it clips them) its own descendants' painted box. Used by hitTest
+/// culling and as the offscreen surface extent of opacity/composited layers: a descendant's
+/// shadow outside this box is cut by the texture edge into a hard rectangle.
 fn computeChildrenBBox(node: *Node) void {
     const lo = node.layoutOutputPtr() orelse return;
-    if (node.children.items.len == 0) {
-        lo.artifacts.children_bbox = null;
-        return;
-    }
-
-    var min_x: f32 = std.math.inf(f32);
-    var min_y: f32 = std.math.inf(f32);
-    var max_x: f32 = -std.math.inf(f32);
-    var max_y: f32 = -std.math.inf(f32);
-    var has_flow = false;
-
+    var bbox: ?types.ComputedRect = null;
     for (node.children.items) |child| {
         if (child.getOpacity() == 0) continue;
         // z>0 children also count: z_index affects sibling order only, doesn't escape clipping,
         // drawn in parent's opacity surface like z=0, must expand surface bbox (geometry uses it
         // for surface bounds), else z>0 children overflow parent frame get clipped by texture edge.
-        const cx = child.rectFromWorldOrFallback().x + child.style.translate_x + child.frame_state.frame_local.runtime.sticky.x;
-        const cy = child.rectFromWorldOrFallback().y + child.style.translate_y + child.frame_state.frame_local.runtime.sticky.y;
-        if (child.rectFromWorldOrFallback().w <= 0 or child.rectFromWorldOrFallback().h <= 0) continue;
-        min_x = @min(min_x, cx);
-        min_y = @min(min_y, cy);
-        max_x = @max(max_x, cx + child.rectFromWorldOrFallback().w);
-        max_y = @max(max_y, cy + child.rectFromWorldOrFallback().h);
-        has_flow = true;
+        const r = child.rectFromWorldOrFallback();
+        if (r.w <= 0 or r.h <= 0) continue;
+        const cx = r.x + child.style.translate_x + child.frame_state.frame_local.runtime.sticky.x;
+        const cy = r.y + child.style.translate_y + child.frame_state.frame_local.runtime.sticky.y;
+        const rect = types.ComputedRect.init(cx, cy, r.w, r.h);
+        // A minimum margin for ink that styles do not describe (glyph overhang, AA).
+        var ink = types.ComputedRect.init(cx - children_ink_margin, cy - children_ink_margin, r.w + children_ink_margin * 2, r.h + children_ink_margin * 2);
+        ink = unionComputed(ink, paintedRect(&child.style, rect));
+        if (!child.style.overflow_hidden) {
+            if (child.layoutOutputPtr()) |child_lo| if (child_lo.artifacts.children_bbox) |nested| {
+                ink = unionComputed(ink, types.ComputedRect.init(cx + nested.x, cy + nested.y, nested.w, nested.h));
+            };
+        }
+        bbox = if (bbox) |b| unionComputed(b, ink) else ink;
     }
+    lo.artifacts.children_bbox = bbox;
+}
 
-    if (has_flow) {
-        // bbox adds margin to accommodate shadow/outline overflow
-        const margin: f32 = 8;
-        lo.artifacts.children_bbox = types.ComputedRect.init(
-            min_x - margin,
-            min_y - margin,
-            (max_x - min_x) + margin * 2,
-            (max_y - min_y) + margin * 2,
-        );
-    } else {
-        lo.artifacts.children_bbox = null;
+const children_ink_margin: f32 = 8;
+
+/// `rect` plus what `style` paints beyond it: each shadow layer (blur on both sides, positive
+/// spread, offset) and the outline. Same extent rule as the opacity-layer bounds.
+fn paintedRect(style: anytype, rect: types.ComputedRect) types.ComputedRect {
+    var out = rect;
+    for (style.shadowSlice()) |shadow| {
+        const grow = shadow.blur * 2 + @max(@as(f32, 0), shadow.spread);
+        out = unionComputed(out, types.ComputedRect.init(rect.x + shadow.offset_x - grow, rect.y + shadow.offset_y - grow, rect.w + grow * 2, rect.h + grow * 2));
     }
+    if (style.outline()) |o| {
+        const m = @max(@as(f32, 0), o.offset + o.width);
+        out = unionComputed(out, types.ComputedRect.init(rect.x - m, rect.y - m, rect.w + m * 2, rect.h + m * 2));
+    }
+    return out;
+}
+
+fn unionComputed(a: types.ComputedRect, b: types.ComputedRect) types.ComputedRect {
+    const x0 = @min(a.x, b.x);
+    const y0 = @min(a.y, b.y);
+    return types.ComputedRect.init(x0, y0, @max(a.x + a.w, b.x + b.w) - x0, @max(a.y + a.h, b.y + b.h) - y0);
 }
 
 /// batch reverse: mirror-flip direct children's position on main axis,
@@ -1789,9 +1798,9 @@ fn layoutChildren(parent: *Node, available: Size, ctx: LayoutContext) void {
             const main_sizing = if (is_row) child.style.width else child.style.height;
             if (main_sizing == .fit) {
                 const intrinsic = if (is_row)
-                    calcIntrinsicSize(child, true)
+                    calcChildIntrinsicSize(child, true)
                 else
-                    calcIntrinsicSize(child, false);
+                    calcChildIntrinsicSize(child, false);
                 used_space += intrinsic;
             }
         }
@@ -2949,4 +2958,16 @@ test "managed font hooks clear only the active Cx owner" {
     setDrawnTextMeasure(Bridge.measure, &shared_selector); // External owner takes over.
     clearContextFontHooks(&first);
     try std.testing.expectEqual(@as(?f32, 42), shapeViaPipeline(null, null, "sample", 16, 400, false, false, 0, false, 0));
+}
+
+test "intrinsic fit gaps exclude hidden anchors and display-none captions" {
+    var parent = Node{ .id = 1, .tag = .box, .style = .{ .direction = .row, .gap = 8 }, .children = .empty };
+    defer parent.children.deinit(std.testing.allocator);
+    var first = Node{ .id = 2, .tag = .box, .style = .{ .width = .{ .px = 28 } }, .children = .empty };
+    var hidden = Node{ .id = 3, .tag = .anchor, .style = .{ .display = .none }, .children = .empty };
+    var last = Node{ .id = 4, .tag = .box, .style = .{ .width = .{ .px = 146 } }, .children = .empty };
+    try parent.children.append(std.testing.allocator, &first);
+    try parent.children.append(std.testing.allocator, &hidden);
+    try parent.children.append(std.testing.allocator, &last);
+    try std.testing.expectEqual(@as(f32, 182), calcIntrinsicSizeUncached(&parent, true));
 }

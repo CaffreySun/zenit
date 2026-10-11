@@ -89,6 +89,15 @@ redistributing zenit means redistributing them under their own terms:
                           Copyright 2011 The Lora Project Authors.
                           Full text: tools/fixtures/fonts/Lora-OFL.txt
 
+  vendor/vulkan-headers/  Khronos Vulkan headers, Apache-2.0 / MIT.
+                          Full text: vendor/vulkan-headers/LICENSE.md
+  vendor/wayland/         Wayland and wayland-protocols headers, XML and
+                          generated protocol code, MIT (notices in each file).
+                          Sources: vendor/wayland/README.md
+  vendor/libdecor/        libdecor ABI header, MIT (notice in the header).
+                          Source: vendor/libdecor/README.md
+  vendor/xkbcommon-headers/  libxkbcommon headers, MIT.
+                          Full text: vendor/xkbcommon-headers/LICENSE
   vendor/unicode/         Unicode Character Database, Unicode License V3.
                           Copyright (c) Unicode, Inc.
                           Full text: vendor/unicode/LICENSE.txt

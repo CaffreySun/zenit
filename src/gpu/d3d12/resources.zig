@@ -386,9 +386,19 @@ pub const CommandEncoder = struct {
         self.raw = null;
     }
 };
+pub const GpuTimingResult = union(enum) { pending, disjoint, failed, elapsed: u64 };
 pub const CommandBuffer = struct {
     raw: *NativeCommands,
     /// Completion-only mapped read; never waits or submits additional work.
+    pub fn gpuTimingResult(self: *const CommandBuffer) GpuTimingResult {
+        var micros: u64 = 0;
+        return switch (zenit_d12_commands_elapsed_micros(self.raw, &micros)) {
+            0 => .{ .elapsed = micros },
+            3 => .pending,
+            5 => .disjoint,
+            else => .failed,
+        };
+    }
     pub fn gpuElapsedMicros(self: *const CommandBuffer) ?u64 {
         var micros: u64 = 0;
         if (zenit_d12_commands_elapsed_micros(self.raw, &micros) != 0) return null;

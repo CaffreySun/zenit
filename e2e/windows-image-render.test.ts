@@ -730,7 +730,9 @@ test("Windows procedural noise preserves local value fields, seed, scale, alpha,
   // next frame itself (the renderer's paint-table scan), so a static scene
   // keeps rendering and the presented grain changes without any input.
   const grainBefore=(await stats()).frame_count;
-  await sleep(300);
+  // Check autonomous progress rather than a minimum frame rate: Debug builds
+  // under x64 emulation can take longer than 300 ms to encode one frame.
+  await waitFor(async()=>(await stats()).frame_count>=grainBefore+3?true:null,10000,50);
   const grainAfter=(await stats()).frame_count;
   assert(grainAfter-grainBefore>=3,`film grain did not drive frames by itself: ${grainBefore} -> ${grainAfter}`);
   await capture("noise-next-frame");

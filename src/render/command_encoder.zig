@@ -1609,10 +1609,7 @@ pub const RenderCommandEncoder = struct {
             .begin_opacity_layer => {
                 const aligned = opacity_layer.alignTranslationSurface(it, self.scale, self.offscreenOffset());
                 // A rounded layer composites its own rect (the mask) from the aligned texture.
-                const quad: [4]f32 = if (it.radii.tl >= 0.5 and aligned.geom.w != it.geom.w)
-                    .{ it.geom.x - aligned.geom.x, it.geom.y - aligned.geom.y, it.geom.w, it.geom.h }
-                else
-                    .{ 0, 0, 0, 0 };
+                const quad: [4]f32 = if (it.radii.tl >= 0.5) opacity_layer.maskQuad(it, aligned) else .{ 0, 0, 0, 0 };
                 const content_seq = self.retained_begin_seq;
                 var content_hash: u64 = blk: {
                     const seq = self.retained_begin_seq;
@@ -1640,7 +1637,7 @@ pub const RenderCommandEncoder = struct {
                 // A surface matrix maps local coordinates back to its envelope. Identity linear
                 // terms plus the envelope origin cancel the localization; opaque normal groups need
                 // no intermediate RT.
-                const identity_surface = gpu.backend_kind == .d3d12 and aligned.use_draw_transform and
+                const identity_surface = gpu.is_direct3d and aligned.use_draw_transform and
                     aligned.draw_transform[0] == 1 and aligned.draw_transform[1] == 0 and
                     aligned.draw_transform[2] == 0 and aligned.draw_transform[3] == 1 and
                     aligned.draw_transform[4] == aligned.geom.x and aligned.draw_transform[5] == aligned.geom.y;
@@ -1756,28 +1753,34 @@ pub const RenderCommandEncoder = struct {
                     self.rounded_clip_mode_stack[self.rounded_clip_mode_depth] = .shader;
                     self.rounded_clip_mode_depth += 1;
                 } else {
-                    const draw_x = if (std.math.isNan(it.draw_x)) it.geom.x else it.draw_x;
-                    const draw_y = if (std.math.isNan(it.draw_y)) it.geom.y else it.draw_y;
-                    const draw_w = if (std.math.isNan(it.draw_w)) it.geom.w else it.draw_w;
-                    const draw_h = if (std.math.isNan(it.draw_h)) it.geom.h else it.draw_h;
+                    // Same pixel-grid alignment as an opacity layer: a fractional surface origin
+                    // would composite the whole clipped subtree (text, borders, icons) through a
+                    // bilinear half-pixel resample. The mask keeps the original rect (quad).
+                    const aligned = opacity_layer.alignTranslationSurface(it, self.scale, self.offscreenOffset());
+                    const quad = opacity_layer.maskQuad(it, aligned);
+                    const draw_x = if (std.math.isNan(aligned.draw_x)) aligned.geom.x else aligned.draw_x;
+                    const draw_y = if (std.math.isNan(aligned.draw_y)) aligned.geom.y else aligned.draw_y;
+                    const draw_w = if (std.math.isNan(aligned.draw_w)) aligned.geom.w else aligned.draw_w;
+                    const draw_h = if (std.math.isNan(aligned.draw_h)) aligned.geom.h else aligned.draw_h;
                     const opened = try opacity_layer.beginOpacityLayer(
                         self,
-                        it.geom.x,
-                        it.geom.y,
-                        it.geom.w,
-                        it.geom.h,
+                        aligned.geom.x,
+                        aligned.geom.y,
+                        aligned.geom.w,
+                        aligned.geom.h,
                         1.0,
-                        it.rotate,
+                        aligned.rotate,
                         draw_x,
                         draw_y,
                         draw_w,
                         draw_h,
-                        it.use_draw_transform,
-                        it.draw_transform,
+                        aligned.use_draw_transform,
+                        aligned.draw_transform,
                         .normal,
                     );
                     if (opened and self.offscreen_depth > 0) {
                         self.offscreen_stack[self.offscreen_depth - 1].corner_radius = it.radii.tl;
+                        self.offscreen_stack[self.offscreen_depth - 1].quad = quad;
                     }
                     if (self.rounded_clip_mode_depth < self.rounded_clip_mode_stack.len) {
                         self.rounded_clip_mode_stack[self.rounded_clip_mode_depth] = if (opened) .layer else .noop;

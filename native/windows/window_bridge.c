@@ -1,3 +1,4 @@
+#include "../window_chrome.h"
 #define WIN32_LEAN_AND_MEAN
 #ifndef WINVER
 #define WINVER 0x0A00
@@ -32,6 +33,12 @@
    messages here. A busy reader/sync agent must not make ordinary copy/paste
    fail immediately, and a persistent lock must not stall the UI indefinitely. */
 #ifdef ZENIT_WINDOW_CONTRACT
+static int contract_background_windows;
+int zenit_windows_contract_background(int enabled) {
+    int previous = contract_background_windows;
+    contract_background_windows = enabled;
+    return previous;
+}
 static unsigned clipboard_busy_attempts;
 unsigned zenit_win_contract_clipboard_busy_attempts(void) { return clipboard_busy_attempts; }
 #endif
@@ -181,6 +188,14 @@ typedef struct ZenitWindow {
     ZenitDragPacket source_result;
     float titlebar_drag_height, titlebar_drag_right_inset;
     int custom_frame;
+    int chrome_hide_controls, chrome_fullscreen;
+    unsigned chrome_hover, chrome_pressed;
+    uint32_t chrome_min_width, chrome_min_height;
+    uint32_t chrome_state_generation;
+    LONG_PTR chrome_saved_style;
+    RECT chrome_saved_rect;
+    int (*chrome_hit)(void *, float, float);
+    void *chrome_context;
     float custom_titlebar_height;
     int (*titlebar_hit_callback)(void *, float, float);
     void *titlebar_hit_context;
@@ -668,8 +683,16 @@ static HRESULT custom_frame_margins(ZenitWindow *win) {
     UINT dpi=GetDpiForWindow(win->hwnd); if (!dpi) dpi=96;
     double top=ceil((double)win->custom_titlebar_height*dpi/96.0);
     if (top>INT_MAX) return E_INVALIDARG;
-    MARGINS margins={0,0,win->custom_frame?(int)top:0,0};
+    MARGINS margins={0,0,win->custom_frame&&!win->chrome_hide_controls?(int)top:0,0};
     return DwmExtendFrameIntoClientArea(win->hwnd,&margins);
+}
+/* "Zenit.DwmCaption": DWM paints its caption buttons over this client (custom
+   frame with automatic controls, not fullscreen). The GPU surface reads only
+   this property to carve out and blacken that region; application-painted
+   controls (chrome_hide_controls) never get a DWM cut-out. */
+static void sync_dwm_caption_prop(ZenitWindow *win) {
+    if (win->custom_frame && !win->chrome_hide_controls && !win->chrome_fullscreen) SetPropW(win->hwnd,L"Zenit.DwmCaption",(HANDLE)1);
+    else RemovePropW(win->hwnd,L"Zenit.DwmCaption");
 }
 int zenit_win_custom_frame(void *owner, int enabled, float height, float right_inset) {
     ZenitWindow *win=window_owner((HWND)owner);
@@ -684,10 +707,12 @@ int zenit_win_custom_frame(void *owner, int enabled, float height, float right_i
     win->custom_titlebar_height=enabled?height:0;
     win->titlebar_drag_height=enabled?height:0;
     win->titlebar_drag_right_inset=enabled?right_inset:0;
+    sync_dwm_caption_prop(win);
     if (FAILED(custom_frame_margins(win)) || !SetWindowPos(win->hwnd,NULL,0,0,0,0,
         SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE|SWP_FRAMECHANGED)) {
         if (!old_frame) RemovePropW(win->hwnd,L"Zenit.CustomFrame");
         win->custom_frame=old_frame; win->custom_titlebar_height=old_custom_height; win->titlebar_drag_height=old_height; win->titlebar_drag_right_inset=old_inset;
+        sync_dwm_caption_prop(win);
         custom_frame_margins(win);
         SetWindowPos(win->hwnd,NULL,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE|SWP_FRAMECHANGED);
         return 0;
@@ -702,7 +727,7 @@ float zenit_win_titlebar_height(void *owner) {
 /* Physical client pixels reserved for the DWM-owned caption buttons. */
 int zenit_win_caption_button_rect(HWND hwnd, RECT *out) {
     ZenitWindow *win=window_owner(hwnd);
-    if (!win || !win->custom_frame || IsIconic(hwnd)) return 0;
+    if (!win || !win->custom_frame || win->chrome_hide_controls || win->chrome_fullscreen || IsIconic(hwnd)) return 0;
     RECT buttons,outer; POINT origin={0,0};
     if (!out || FAILED(DwmGetWindowAttribute(hwnd,DWMWA_CAPTION_BUTTON_BOUNDS,&buttons,sizeof(buttons))) ||
         !GetWindowRect(hwnd,&outer) || !ClientToScreen(hwnd,&origin)) return -1;
@@ -877,13 +902,65 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPAR
         return TRUE;
     }
     if (!win) return DefWindowProcW(hwnd, message, wparam, lparam);
-    if (win->custom_frame && (message==WM_NCHITTEST || message==WM_NCMOUSELEAVE)) {
+    if (win->chrome_fullscreen && message==WM_NCHITTEST) return HTCLIENT;
+    if (win->custom_frame && !win->chrome_hide_controls && (message==WM_NCHITTEST || message==WM_NCMOUSELEAVE)) {
         LRESULT result=0;
         if (DwmDefWindowProc(hwnd,message,wparam,lparam,&result)) return result;
     }
     switch (message) {
+        case WM_GETMINMAXINFO:
+            if(win->chrome_min_width||win->chrome_min_height) {
+                MINMAXINFO *limits=(MINMAXINFO *)lparam;UINT dpi=GetDpiForWindow(hwnd);if(!dpi)dpi=96;
+                RECT frame={0,0,MulDiv((int)win->chrome_min_width,dpi,96),MulDiv((int)win->chrome_min_height,dpi,96)};
+                AdjustWindowRectExForDpi(&frame,(DWORD)GetWindowLongPtrW(hwnd,GWL_STYLE),FALSE,(DWORD)GetWindowLongPtrW(hwnd,GWL_EXSTYLE),dpi);
+                if(win->chrome_min_width)limits->ptMinTrackSize.x=frame.right-frame.left;
+                if(win->chrome_min_height)limits->ptMinTrackSize.y=frame.bottom-frame.top;
+                return 0;
+            }
+            break;
+        case WM_NCMOUSEMOVE:
+            if(win->chrome_hide_controls&&win->custom_frame) {
+                win->chrome_hover=wparam==HTMINBUTTON?1:wparam==HTMAXBUTTON?2:wparam==HTCLOSE?3:0;
+                /* A press released outside the window never reports WM_NCLBUTTONUP;
+                   drop it once the button is up so a later release cannot act on it. */
+                if(!(GetKeyState(VK_LBUTTON)&0x8000)) win->chrome_pressed=0;
+                TRACKMOUSEEVENT track={sizeof(track),TME_LEAVE|TME_NONCLIENT,hwnd,0};TrackMouseEvent(&track);
+                win->redraw_requested=1;
+            }
+            break;
+        case WM_NCMOUSELEAVE:
+            win->chrome_hover=0;win->chrome_pressed=0;win->redraw_requested=1;
+            break;
+        case WM_NCLBUTTONDOWN:
+            if(win->chrome_hide_controls&&win->custom_frame) {
+                win->chrome_pressed=wparam==HTMINBUTTON?1:wparam==HTMAXBUTTON?2:wparam==HTCLOSE?3:0;
+                win->redraw_requested=1;
+                if(win->render_callback)win->render_callback(win->render_context);
+                /* Application-drawn caption buttons report HTMIN/HTMAX/HTCLOSE so
+                   Windows 11 offers Snap Layouts. DefWindowProc's button tracking
+                   uses the native caption, which this frame removed, and never
+                   issues the command: press here, act on the matching release. */
+                if(win->chrome_pressed) return 0;
+                LRESULT result=DefWindowProcW(hwnd,message,wparam,lparam);
+                win->chrome_pressed=0;win->redraw_requested=1;
+                return result;
+            }
+            break;
+        case WM_NCLBUTTONUP: {
+            const int released=wparam==HTMINBUTTON?1:wparam==HTMAXBUTTON?2:wparam==HTCLOSE?3:0;
+            const int pressed=win->chrome_pressed;
+            win->chrome_pressed=0;win->redraw_requested=1;
+            if(win->chrome_hide_controls&&win->custom_frame&&pressed) {
+                if(pressed==released) {
+                    const WPARAM command=pressed==1?SC_MINIMIZE:pressed==3?SC_CLOSE:IsZoomed(hwnd)?SC_RESTORE:SC_MAXIMIZE;
+                    PostMessageW(hwnd,WM_SYSCOMMAND,command,lparam);
+                }
+                return 0;
+            }
+            break;
+        }
         case WM_NCCALCSIZE:
-            if (win->custom_frame && wparam) {
+            if (win->custom_frame && wparam && !win->chrome_fullscreen) {
                 DefWindowProcW(hwnd,message,wparam,lparam);
                 NCCALCSIZE_PARAMS *params=(NCCALCSIZE_PARAMS *)lparam;
                 UINT dpi=GetDpiForWindow(hwnd); if (!dpi) dpi=96;
@@ -948,6 +1025,21 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPAR
                     return HTTOP;
                 }
             }
+            if (win->chrome_hit) {
+                if (standard != HTCLIENT) return standard;
+                POINT p={GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+                if (!ScreenToClient(hwnd,&p)) return HTCLIENT;
+                float scale=(float)GetDpiForWindow(hwnd)/96.0f;
+                int region=win->chrome_hit(win->chrome_context,p.x/scale,p.y/scale);
+                if (win->chrome_fullscreen) return HTCLIENT;
+                if (region==2) return HTCAPTION;
+                if (region==11) return HTMINBUTTON;
+                if (region==12) return HTMAXBUTTON;
+                if (region==13) return HTCLOSE;
+                static const int edges[]={HTTOP,HTBOTTOM,HTLEFT,HTTOPLEFT,HTBOTTOMLEFT,HTRIGHT,HTTOPRIGHT,HTBOTTOMRIGHT};
+                if (region>=3 && region<=10 && !IsZoomed(hwnd)) return edges[region-3];
+                return HTCLIENT;
+            }
             if (standard != HTCLIENT || win->titlebar_drag_height <= 0) return standard;
             POINT point = {GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)}; RECT client;
             if (!ScreenToClient(hwnd, &point) || !GetClientRect(hwnd, &client)) return standard;
@@ -982,6 +1074,7 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPAR
         case WM_DESTROY:
             KillTimer(hwnd, ZENIT_RESIZE_TIMER);
             win->live_resize = 0;
+            win->chrome_hit = NULL; win->chrome_context = NULL;
             win->titlebar_hit_callback = NULL;
             win->titlebar_hit_context = NULL;
             clear_menu(win);
@@ -1008,6 +1101,7 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPAR
         case WM_CAPTURECHANGED:
         case WM_CANCELMODE:
             if (message == WM_KILLFOCUS && win->render_callback) InvalidateRect(hwnd, NULL, FALSE);
+            win->chrome_pressed=0;win->chrome_hover=0;win->redraw_requested=1;
             cancel_pointer(win);
             if (message == WM_KILLFOCUS && win->ime_active) {
                 push_ime(win, 1, L"", 0, 0);
@@ -1017,6 +1111,13 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPAR
         case WM_MOUSEMOVE:
             push_move(win, GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam), wparam);
             return 0;
+        case WM_SIZE:
+            // Present the new extent before DWM composes it. Otherwise resize,
+            // maximize and restore show the previous frame until the next
+            // timer tick or WM_PAINT. The App defers a nested frame.
+            if (wparam != SIZE_MINIMIZED && LOWORD(lparam) && HIWORD(lparam) && win->render_callback)
+                win->render_callback(win->render_context);
+            break;
         case WM_DPICHANGED: {
             RECT *suggested = (RECT *)lparam;
             SetWindowPos(hwnd, NULL, suggested->left, suggested->top,
@@ -1188,7 +1289,11 @@ ZenitWindow *zenit_windows_create(uint32_t width, uint32_t height, const char *t
     win->drop_target = zenit_drop_create(hwnd, next_drag_serial, win);
     ++live_windows;
     const char *background = getenv("ZENIT_E2E_BACKGROUND");
-    ShowWindow(hwnd, background && !strcmp(background, "1") ? SW_SHOWNOACTIVATE : SW_SHOW);
+    int no_activate = background && !strcmp(background, "1");
+#ifdef ZENIT_WINDOW_CONTRACT
+    no_activate |= contract_background_windows;
+#endif
+    ShowWindow(hwnd, no_activate ? SW_SHOWNOACTIVATE : SW_SHOW);
     UpdateWindow(hwnd);
     return win;
 }
@@ -1219,7 +1324,7 @@ int zenit_windows_poll(ZenitWindow *win) {
     while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
         dispatch_native_message(&msg);
     }
-    return win && win->alive && !win->close_requested && !app_quit_requested;
+    return win && win->alive && !app_quit_requested;
 }
 void zenit_windows_pump_timeout(uint32_t timeout_ms) {
     MsgWaitForMultipleObjectsEx(0, NULL, timeout_ms, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
@@ -1769,3 +1874,87 @@ int zenit_win_alert_contract_end(void) {
     return ok;
 }
 #endif
+
+int zenit_win_chrome_configure(void *owner, int mode, int automatic, float height) {
+    ZenitWindow *w=window_owner((HWND)owner); if (!w) return 0;
+    if (!mode) return 1;
+    HIGHCONTRASTW contrast={sizeof(contrast),0,NULL};
+    if(SystemParametersInfoW(SPI_GETHIGHCONTRAST,sizeof(contrast),&contrast,0)&&(contrast.dwFlags&HCF_HIGHCONTRASTON))return 2;
+    int previous_hide=w->chrome_hide_controls;w->chrome_hide_controls=mode==2 || !automatic;
+    if (!zenit_win_custom_frame(owner,1,mode==2?1:height,0)){w->chrome_hide_controls=previous_hide;sync_dwm_caption_prop(w);return 0;}
+    int corner=2;DwmSetWindowAttribute(w->hwnd,33,&corner,sizeof(corner));
+    if (w->chrome_hide_controls) {
+        LONG_PTR style=GetWindowLongPtrW(w->hwnd,GWL_STYLE);
+        SetLastError(0);
+        /* Preserve native commands and HTMAXBUTTON/Snap; DWM's caption paint
+           has no glass caption margin; the application paints its client slots. */
+        if (!SetWindowLongPtrW(w->hwnd,GWL_STYLE,mode==2?style & ~(WS_SYSMENU|WS_MINIMIZEBOX|WS_MAXIMIZEBOX):style) && GetLastError()) return 0;
+        if (!SetWindowPos(w->hwnd,NULL,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE|SWP_FRAMECHANGED)) return 0;
+    }
+    return 1;
+}
+void zenit_win_chrome_hit(void *owner, int (*hit)(void *,float,float), void *context) {
+    ZenitWindow *w=window_owner((HWND)owner);
+    if (w) { w->chrome_hit=hit; w->chrome_context=hit?context:NULL; }
+}
+int zenit_win_chrome_minimum(void *owner,uint32_t width,uint32_t height) {
+    ZenitWindow *w=window_owner((HWND)owner);if(!w)return 0;
+    w->chrome_min_width=width;w->chrome_min_height=height;return 1;
+}
+void zenit_win_chrome_state(void *owner, ZenitChromeState *out) {
+    memset(out,0,sizeof(*out));
+    ZenitWindow *w=window_owner((HWND)owner); if (!w) return;
+    out->state_generation=w->chrome_state_generation;
+    out->flags=(IsZoomed(w->hwnd)?1:0)|(w->chrome_fullscreen?2:0)|(GetForegroundWindow()==w->hwnd?4:0);
+    out->flags |= 16;
+    out->appearance=2;out->button_layout[3]=1;out->button_layout[4]=2;out->button_layout[5]=3;
+    out->caption_hover=w->chrome_hover;out->caption_pressed=w->chrome_pressed;
+    HIGHCONTRASTW contrast={sizeof(contrast),0,NULL};if(SystemParametersInfoW(SPI_GETHIGHCONTRAST,sizeof(contrast),&contrast,0)&&(contrast.dwFlags&HCF_HIGHCONTRASTON))out->flags|=64;
+    out->capabilities=127;
+    if (w->custom_frame && !w->chrome_hide_controls && !w->chrome_fullscreen) {
+        RECT r; int got=zenit_win_caption_button_rect(w->hwnd,&r);
+        if (got<0) out->controls_count=-1;
+        else if (got>0) {
+            float scale=(float)GetDpiForWindow(w->hwnd)/96.0f;
+            out->controls_count=1;
+            out->controls[0]=(ZenitChromeRect){r.left/scale,r.top/scale,(r.right-r.left)/scale,(r.bottom-r.top)/scale};
+        }
+    }
+}
+int zenit_win_chrome_action(void *owner, int action, int value) {
+    ZenitWindow *w=window_owner((HWND)owner); if (!w) return 0;
+    w->chrome_state_generation++;
+    switch(action) {
+    case 0: w->close_requested=1; return 1;
+    case 1: ShowWindow(w->hwnd,SW_MINIMIZE); return 1;
+    case 2: if (w->chrome_fullscreen) return 0; ShowWindow(w->hwnd,value?SW_MAXIMIZE:SW_RESTORE); return 1;
+    case 3: {
+        if (!!value==w->chrome_fullscreen) return 1;
+        RECT previous; if (!GetWindowRect(w->hwnd,&previous)) return 0;
+        LONG_PTR style=GetWindowLongPtrW(w->hwnd,GWL_STYLE);
+        RECT next=w->chrome_saved_rect;
+        LONG_PTR next_style=w->chrome_saved_style;
+        if (value) {
+            MONITORINFO info={.cbSize=sizeof(info)};
+            if (!GetMonitorInfoW(MonitorFromWindow(w->hwnd,MONITOR_DEFAULTTONEAREST),&info)) return 0;
+            next=info.rcMonitor;
+            next_style=style & ~(WS_CAPTION|WS_THICKFRAME);
+        }
+        SetLastError(0);
+        if (!SetWindowLongPtrW(w->hwnd,GWL_STYLE,next_style) && GetLastError()) return 0;
+        int previous_fullscreen=w->chrome_fullscreen;
+        w->chrome_fullscreen=!!value; /* NCCALCSIZE must see the pending frame policy. */
+        sync_dwm_caption_prop(w);
+        if (!SetWindowPos(w->hwnd,value?HWND_TOP:NULL,next.left,next.top,next.right-next.left,next.bottom-next.top,SWP_FRAMECHANGED|(value?0:SWP_NOZORDER))) {
+            w->chrome_fullscreen=previous_fullscreen;
+            sync_dwm_caption_prop(w);
+            SetWindowLongPtrW(w->hwnd,GWL_STYLE,style);
+            SetWindowPos(w->hwnd,NULL,previous.left,previous.top,previous.right-previous.left,previous.bottom-previous.top,SWP_NOZORDER|SWP_FRAMECHANGED);
+            return 0;
+        }
+        if (value) { w->chrome_saved_style=style; w->chrome_saved_rect=previous; }
+        return 1;
+    }
+    default: return 0;
+    }
+}

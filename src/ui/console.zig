@@ -149,7 +149,7 @@ pub const Console = struct {
     live_bytes: usize = 0,
     next_seq: u64 = 1,
     started_ns: i128,
-    revision_value: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    revision_value: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     evicted_total: u64 = 0,
     dropped_oom: u64 = 0,
     dropped_oversize: u64 = 0,

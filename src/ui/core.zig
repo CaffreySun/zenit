@@ -505,6 +505,11 @@ pub const Cx = struct {
 
     // UI tree
     root: ?*Node = null,
+    /// The application's own tree under `root` (App mounts it beside the overlay portal).
+    /// Keys with no focused node are delivered here, so capture/bubble handlers on the
+    /// application root (window-level shortcuts) see them. Only used while it is still a
+    /// child of `root`; otherwise `root` receives them.
+    content_root: ?*Node = null,
     /// Window-root portal, sole host of all overlays detached from normal document flow.
     /// Popover/Tooltip only attach floating content here, trigger wrapper stays in caller tree.
     /// Modal/Sheet barrier also direct child of same portal, lets OverlayStack's z-index tier
@@ -774,6 +779,12 @@ pub const Cx = struct {
     theme_version: u32 = 0,
     /// theme Signal-ified: lazy-created (themeSignal()), set on setTheme, lets Effect/Memo
     /// reactively subscribe to theme switch instead of polling theme_version.
+    window_service: ?system_sdk_mod.window_chrome.Service = null,
+    window_chrome_signal: ?*Signal(system_sdk_mod.window_chrome.State) = null,
+    /// Registered presentation slot. Scope cleanup clears it before freeing nodes.
+    window_header_node: ?*Node = null,
+    window_header_offset: [2]f32 = .{ 0, 0 },
+    window_header_reveal_leases: u32 = 0,
     theme_signal: ?*Signal(*const theme.ThemeTokens) = null,
     /// System a11y display preferences (a11y/preferences.zig): this Cx's synced process-level
     /// version, and lazy-created Signal (a11yPreferencesSignal, lifetime = theme_signal).
@@ -878,6 +889,35 @@ pub const Cx = struct {
         return &self.console_store;
     }
 
+    pub fn windowHeaderOwns(self: *const Cx, node: ?*Node) bool {
+        const header = self.window_header_node orelse return false;
+        var ancestor = node;
+        while (ancestor) |n| {
+            if (n == header) return true;
+            ancestor = n.parent;
+        }
+        return false;
+    }
+    pub const HeaderRevealLease = struct {
+        cx: *Cx,
+        released: bool = false,
+        pub fn release(lease: *@This()) void {
+            if (lease.released) return;
+            lease.released = true;
+            std.debug.assert(lease.cx.window_header_reveal_leases > 0);
+            lease.cx.window_header_reveal_leases -= 1;
+            lease.cx.needs_redraw = true;
+        }
+    };
+    pub fn acquireWindowHeaderReveal(self: *Cx, scope: *Scope) !*HeaderRevealLease {
+        if (self.window_header_node == null) return error.MissingWindowHeader;
+        if (self.window_header_reveal_leases == std.math.maxInt(u32)) return error.TooManyHeaderRevealLeases;
+        const lease = try scope.createState(HeaderRevealLease, .{ .cx = self });
+        try scope.onCleanup(HeaderRevealLease, lease, HeaderRevealLease.release);
+        self.window_header_reveal_leases += 1;
+        self.needs_redraw = true;
+        return lease;
+    }
     pub fn init(allocator: Allocator, io: std.Io) !*Cx {
         // -- Multi-Cx / multi-window: no MultipleContextsUnsupported guard --
         //
@@ -1070,6 +1110,7 @@ pub const Cx = struct {
             self.freeNode(r);
             self.root = null;
         }
+        self.content_root = null;
         self.popover_portal_root = null;
 
         // ScrollArea cells outlive both scopes and nodes: scope cleanup clears cell.ctx, node
@@ -1152,6 +1193,7 @@ pub const Cx = struct {
             self.freeNode(r);
             self.root = null;
         }
+        self.content_root = null;
         self.popover_portal_root = null;
         self.current_scope = null;
         self.is_mounted = false;
@@ -2253,6 +2295,16 @@ pub const Cx = struct {
         return cx_input.handleTextInput(self, t);
     }
 
+    pub fn handleImePreeditEvent(self: *Cx, event: @import("events.zig").ImePreeditEvent) void {
+        const host = self.enterHost();
+        defer self.exitHost(host);
+        return cx_input.handleImePreeditEvent(self, event);
+    }
+    pub fn handleImeDeleteSurrounding(self: *Cx, before: u32, after: u32) void {
+        const host = self.enterHost();
+        defer self.exitHost(host);
+        return cx_input.handleImeDeleteSurrounding(self, before, after);
+    }
     pub fn handleImePreedit(self: *Cx, preedit_text: []const u8, cursor_utf8_offset: u32) void {
         const host = self.enterHost();
         defer self.exitHost(host);
@@ -2361,6 +2413,49 @@ pub const Cx = struct {
             .world_y = y,
         }) orelse return null;
         return resolveInteractionTarget(self.node_registry.resolve(hit.handle, &self.perf));
+    }
+
+    /// Publish on the application frame boundary, outside any native callback.
+    pub fn publishWindowRegions(self: *Cx) void {
+        if (self.window_chrome_signal) |signal| {
+            if (signal.peek().effective_mode != .native) cx_render.ensureHitTestSceneFresh(self);
+        }
+    }
+    pub fn legacyWindowControlAt(self: *Cx, x: f32, y: f32) bool {
+        if (self.tick_depth > 0 or self.draining_deferred_frees) return true;
+        inline for (.{ HitQueryKind.pointer, HitQueryKind.scroll }) |kind| {
+            if (self.interaction_index.hitTestQuery(.{ .kind = kind, .world_x = x, .world_y = y }, &self.node_registry, null) != null) return true;
+        }
+        return false;
+    }
+
+    /// State belongs to this Cx, subscriptions belong to the consumer Scope.
+    pub fn windowChrome(self: *Cx) !*Signal(system_sdk_mod.window_chrome.State) {
+        if (self.window_chrome_signal) |signal| return signal;
+        const signal = try Signal(system_sdk_mod.window_chrome.State).create(self.owner, .{});
+        self.window_chrome_signal = signal;
+        return signal;
+    }
+
+    pub fn performWindowAction(self: *Cx, action: system_sdk_mod.window_chrome.Action) !void {
+        const service = self.window_service orelse return error.WindowServiceUnavailable;
+        try service.perform(service.context, action);
+    }
+
+    /// Native event-pump entry: no layout, allocation, effects or UI mutation.
+    /// Uses the last published transformed/clipped/ordered hit scene. During a
+    /// tree mutation it fails closed; stale handles are checked by the registry.
+    pub fn windowRegionAt(self: *Cx, x: f32, y: f32) system_sdk_mod.window_chrome.Region {
+        if (self.tick_depth > 0 or self.draining_deferred_frees) return .client;
+        const hit = self.interaction_index.hitTestQuery(.{ .kind = .window_chrome, .world_x = x, .world_y = y }, &self.node_registry, null) orelse return .client;
+        var current = self.node_registry.resolve(hit.handle, null);
+        while (current) |node| : (current = node.parent) {
+            const region = node.behavior.interaction.window_region;
+            if (region != .inherit) return region;
+            const roles = @import("core/interaction_semantics.zig").nodeHitRoles(node);
+            if (roles.pointer or roles.scroll or node.behavior.interaction.text_input_client != null) return .client;
+        }
+        return .client;
     }
 
     pub fn hitTestInspect(self: *Cx, x: f32, y: f32) ?*Node {
@@ -2773,5 +2868,6 @@ pub const DisplayItem = display_list_mod.DisplayItem;
 
 test {
     _ = @import("core/cx_tests.zig");
+    _ = @import("core/window_chrome_tests.zig");
     _ = @import("core/presentation_clock.zig");
 }

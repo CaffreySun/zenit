@@ -55,6 +55,7 @@ pub const EventKindTag = enum(u8) {
     ime_commit,
     focus,
     blur,
+    ime_delete_surrounding,
 };
 
 pub const EventResultTag = enum(u8) { ignored, handled, stop };

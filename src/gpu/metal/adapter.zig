@@ -22,7 +22,7 @@ pub const Adapter = struct {
             .device = Device{
                 .raw_device = mtl.retain(self.device),
                 .features = desc.required_features,
-                .limits = desc.required_limits,
+                .limits = desc.required_limits orelse .{},
             },
             .queue = Queue{
                 .raw = command_queue,

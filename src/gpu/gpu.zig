@@ -2,7 +2,7 @@
 ///
 /// Based on wgpu API design; Zig implementation.
 ///
-/// Backends: macOS Metal, Windows D3D12 renderer entry points, Null reference.
+/// Backends: macOS Metal, Windows D3D11/D3D12, Linux Vulkan/OpenGL, Null reference.
 /// Windows integration tracked in docs/WINDOWS_ARM64_PORT.md.
 ///
 /// Reference: https://docs.rs/wgpu/latest/wgpu/
@@ -10,6 +10,9 @@ const builtin = @import("builtin");
 const std = @import("std");
 
 pub const rhi = @import("rhi.zig");
+/// Native Vulkan diagnostics and explicit acceptance options.
+pub const opengl_native = @import("opengl/device.zig");
+pub const vulkan_native = @import("vulkan_bootstrap.zig");
 pub const backend_contract = @import("backend_contract.zig");
 
 // ============================================================================
@@ -20,7 +23,7 @@ pub const backend_contract = @import("backend_contract.zig");
 /// deterministic reference, **falsify abstraction**: only second implementation
 /// truly compiling confirms `Backend.*` backend-neutral, Metal semantics not
 /// baked in.
-pub const BackendKind = enum { metal, null_backend, d3d12 };
+pub const BackendKind = enum { metal, null_backend, d3d12, d3d11, vulkan, opengl };
 
 /// Selected backend kind.
 ///
@@ -35,6 +38,18 @@ pub const backend_kind: BackendKind = blk: {
         if (std.mem.eql(u8, opts.gpu_backend, "d3d12")) {
             if (builtin.target.os.tag != .windows) @compileError("D3D12 backend requires Windows");
             break :blk .d3d12;
+        }
+        if (std.mem.eql(u8, opts.gpu_backend, "d3d11")) {
+            if (builtin.target.os.tag != .windows) @compileError("D3D11 backend requires Windows");
+            break :blk .d3d11;
+        }
+        if (std.mem.eql(u8, opts.gpu_backend, "vulkan")) {
+            if (builtin.target.os.tag != .linux) @compileError("Vulkan backend requires Linux");
+            break :blk .vulkan;
+        }
+        if (std.mem.eql(u8, opts.gpu_backend, "opengl")) {
+            if (builtin.target.os.tag != .linux) @compileError("OpenGL backend requires Linux");
+            break :blk .opengl;
         }
         @compileError("unknown -Dgpu-backend value: " ++ opts.gpu_backend);
     }
@@ -55,10 +70,15 @@ pub const color_format: TextureFormat = .bgra8_unorm;
 /// Shaders receive sRGB-encoded colors (else linear). See `color_format`.
 pub const shader_colors_encoded: bool = true;
 
+/// Both Direct3D versions share the renderer facade and HLSL, with distinct native implementations.
+pub const is_direct3d = backend_kind == .d3d12 or backend_kind == .d3d11;
+
 pub const Backend = switch (backend_kind) {
     .metal => @import("metal/backend.zig"),
     .null_backend => @import("null/backend.zig"),
-    .d3d12 => @import("d3d12/renderer_device.zig"),
+    .d3d12, .d3d11 => @import("d3d12/renderer_device.zig"),
+    .vulkan => @import("vulkan/renderer_device.zig"),
+    .opengl => @import("opengl/renderer_device.zig"),
 };
 
 // Abstraction gatekeeper: backend missing contract symbol fails compile,
@@ -134,6 +154,23 @@ pub const CommandBuffer = Backend.CommandBuffer;
 
 /// RenderPass - render pass encoder.
 pub const RenderPass = Backend.RenderPass;
+
+/// Declare the uploaded byte span. Native storage-buffer backends use this
+/// bound when creating a draw's view; other backends keep their buffer binding.
+pub fn setVertexBufferRange(pass: *RenderPass, slot: u32, buffer: *const Buffer, offset: u64, size: u64) void {
+    if (comptime @hasDecl(RenderPass, "setVertexBufferRange")) {
+        pass.setVertexBufferRange(slot, buffer, offset, size);
+    } else {
+        pass.setVertexBuffer(slot, buffer, offset);
+    }
+}
+pub fn setFragmentBufferRange(pass: *RenderPass, slot: u32, buffer: *const Buffer, offset: u64, size: u64) void {
+    if (comptime @hasDecl(RenderPass, "setFragmentBufferRange")) {
+        pass.setFragmentBufferRange(slot, buffer, offset, size);
+    } else {
+        pass.setFragmentBuffer(slot, buffer, offset);
+    }
+}
 
 /// ComputePass - compute pass encoder.
 pub const ComputePass = Backend.ComputePass;
@@ -468,18 +505,16 @@ pub const ShaderStages = packed struct(u32) {
 
 /// Instance descriptor.
 pub const InstanceDescriptor = struct {
-    /// **Currently ignored by all backends.** Backend selection is compile-time
-    /// (`-Dgpu-backend=metal|null`; see build.zig); Metal and Null both discard the descriptor
-    /// in `Instance.init`. Kept for wgpu descriptor shape alignment; setting has no effect.
-    /// `Backends` entries vulkan / dx12 / dx11 / gl / browser_webgpu are **unimplemented**,
-    /// not a backend-select switch.
+    /// Backend selection is compile-time (`-Dgpu-backend=metal|null|d3d12|d3d11|vulkan|opengl`).
+    /// Direct3D and Vulkan initialization reject a disabled selected backend; Metal and Null
+    /// ignore this descriptor. These flags do not switch backends at runtime; GL and browser
+    /// WebGPU entries remain descriptor placeholders.
     backends: Backends = .all,
 };
 
 /// Backend selection bitfield.
 ///
-/// Note: wgpu shape placeholder; **doesn't mean zenit implements these backends**.
-/// Currently Metal and Null only; both via `-Dgpu-backend=` compile-time select.
+/// Available implementations are Metal, Null, D3D12, D3D11, Vulkan and OpenGL, selected at build time.
 /// See `InstanceDescriptor.backends`.
 pub const Backends = packed struct(u32) {
     vulkan: bool = false,
@@ -504,7 +539,9 @@ pub const Backends = packed struct(u32) {
 pub const DeviceDescriptor = struct {
     label: ?[]const u8 = null,
     required_features: Features = .{},
-    required_limits: Limits = .{},
+    /// Null requests no additional minimums. Vulkan and D3D12 negotiate
+    /// explicit limits; Metal retains its existing descriptor policy.
+    required_limits: ?Limits = null,
 };
 
 /// Feature flags.
@@ -921,6 +958,8 @@ test {
     _ = rhi;
     _ = backend_contract;
     _ = resource_pool;
+    // Direct3D range validation is CPU-only and belongs in the portable gate.
+    _ = @import("d3d12/renderer_commands.zig");
     // metal/* tests meaningful only under Metal backend (bind_group depends on
     // Backend.BindGroupLayout, Null backend lacks it).
     if (backend_kind == .metal) {
@@ -946,6 +985,8 @@ test "backend selection is compile-time and matches the built backend" {
     switch (backend_kind) {
         .metal => try std.testing.expect(Backend == @import("metal/backend.zig")),
         .null_backend => try std.testing.expect(Backend == @import("null/backend.zig")),
-        .d3d12 => try std.testing.expect(Backend == @import("d3d12/renderer_device.zig")),
+        .d3d12, .d3d11 => try std.testing.expect(Backend == @import("d3d12/renderer_device.zig")),
+        .vulkan => try std.testing.expect(Backend == @import("vulkan/renderer_device.zig")),
+        .opengl => try std.testing.expect(Backend == @import("opengl/renderer_device.zig")),
     }
 }

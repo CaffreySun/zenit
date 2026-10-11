@@ -389,7 +389,10 @@ fn buildBlurPipeline(encoder: anytype) bool {
                 .fragment_function = &function,
                 .color_attachment_formats = &.{.rgba16_float},
                 .blend_state = null,
-            }) catch return false;
+            }) catch |e| {
+                std.log.err("[blur] {s} RGBA16 float PSO failed: {}", .{ spec[0], e });
+                return false;
+            };
         }
     }
     return true;
@@ -1529,7 +1532,7 @@ fn applyBackdropBlurImpl(encoder: anytype, p: BackdropBlurParams) !void {
     if (p.w <= 0 or p.h <= 0 or p.blur_radius < 0.5) return;
     // Any reduced tier can always present the material layer; full quality
     // falls back to it only on D3D12 (where blur pipeline failure latches basic).
-    const fallback_allowed = encoder.visual_quality != .full or comptime gpu.backend_kind == .d3d12;
+    const fallback_allowed = encoder.visual_quality != .full or comptime gpu.is_direct3d;
     if (encoder.visual_quality != .basic and try tryBackdropBlur(encoder, p)) return;
     if (!fallback_allowed) return;
     if (encoder.render_pass == null) return error.MissingRenderPass;

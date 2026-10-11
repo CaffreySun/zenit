@@ -10,6 +10,7 @@ pub const enabled = build_options.test_mode;
 
 pub const CommandQueue = @import("command_queue.zig").CommandQueue;
 pub const TestCommand = @import("command_queue.zig").TestCommand;
+const command_queue = @import("command_queue.zig");
 const command_executor = @import("command_executor.zig");
 const http_server = @import("http_server.zig");
 
@@ -64,6 +65,10 @@ pub fn setResetTimingCallback(f: command_executor.ResetTimingFn) void {
 }
 
 /// Register window resize callback (/resize route)
+pub fn setQuitCallback(f: *const fn () bool) void {
+    if (!enabled) return;
+    command_executor.setQuitAppFn(f);
+}
 pub fn setResizeWindowCallback(f: command_executor.ResizeWindowFn) void {
     if (!enabled) return;
     command_executor.setResizeWindowFn(f);
@@ -141,4 +146,12 @@ pub const VisualQualityCommand = command_executor.VisualQualityCommand;
 pub fn setVisualQualityCallback(f: command_executor.VisualQualityFn) void {
     if (!enabled) return;
     command_executor.setVisualQualityFn(f);
+}
+
+/// Native window controls, executed on the UI thread through the Harness.
+pub const WindowCommand = command_queue.WindowCommand;
+pub const WindowSnapshot = command_queue.WindowSnapshot;
+pub fn setWindowCommandCallback(f: command_executor.WindowCommandFn) void {
+    if (!enabled) return;
+    command_executor.setWindowCommandFn(f);
 }

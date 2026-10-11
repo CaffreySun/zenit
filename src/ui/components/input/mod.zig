@@ -53,6 +53,7 @@ pub const inputEventHandler = events_mod.inputEventHandler;
 pub const EditableText = editable_text_mod.EditableText;
 pub const EditableTextResult = editable_text_mod.EditableTextResult;
 pub const EditableTextProps = editable_text_mod.EditableTextProps;
+pub const isEditableTextClickHandler = editable_text_mod.isClickActivationHandler;
 pub const textareaEventHandler = textarea_mod.textareaEventHandler;
 
 // Re-export text_utils for external consumers

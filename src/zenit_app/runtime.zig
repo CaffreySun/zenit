@@ -1,3 +1,5 @@
+const chrome_backend = @import("chrome_backend.zig");
+const chrome_controller = @import("chrome_controller.zig");
 /// runtime, zenit app runtime (app helper)
 ///
 /// Replaces ~110 lines of startup + main loop boilerplate with one line:
@@ -113,7 +115,10 @@ fn getTestCx() ?*ui.Cx {
 var g_screenshot_app: ?*App = null;
 fn getFrameStats() test_harness.FrameStatsSnapshot {
     const app = g_screenshot_app orelse return .{};
-    return .{
+    var stats: test_harness.FrameStatsSnapshot = .{
+        .renderer_backend = @tagName(gpu.backend_kind),
+        .gpu_validation_errors = if (comptime (gpu.backend_kind == .vulkan or gpu.backend_kind == .opengl)) (if (app.device.context) |context| context.device.validationErrors() else null) else null,
+        .gpu_software = if (comptime (gpu.backend_kind == .vulkan or gpu.backend_kind == .opengl)) app.device.isSoftware() else null,
         .retained_hits = @intCast(app.renderer.total_retained_hits),
         .retained_misses = @intCast(app.renderer.total_retained_misses),
         .retained_partial_repaints = @intCast(app.renderer.total_retained_partial_repaints),
@@ -149,6 +154,16 @@ fn getFrameStats() test_harness.FrameStatsSnapshot {
         .total_p95_us = app.renderer.timing_ring.totalPercentile(95),
         .timing_samples = @intCast(app.renderer.timing_ring.len),
     };
+    if (comptime builtin.os.tag == .linux) {
+        stats.clipboard_write_ready = app.win.clipboardWriteReady();
+        if (app.win.nativeSurface()) |surface| {
+            stats.window_logical_width = surface.logical_width;
+            stats.window_logical_height = surface.logical_height;
+            stats.window_pixel_width = surface.pixel_width;
+            stats.window_pixel_height = surface.pixel_height;
+        } else |_| {}
+    }
+    return stats;
 }
 
 /// Clear cross-frame timing ring. E2E perf gates switch to heavy scene, wait settle, then call
@@ -165,6 +180,25 @@ fn wakeTestHarness() void {
     if (builtin.target.os.tag == .macos) platform.Window.postEmptyEvent();
 }
 
+fn quitForHarness() bool {
+    const app = g_screenshot_app orelse return false;
+    app.quit();
+    return true;
+}
+fn windowCommandForHarness(command: test_harness.WindowCommand) ?test_harness.WindowSnapshot {
+    if (comptime builtin.os.tag != .linux) return null;
+    const app = g_screenshot_app orelse return null;
+    switch (command) {
+        .status => {},
+        .maximize => app.win.setMaximized(true) catch return null,
+        .restore => app.win.setMaximized(false) catch return null,
+        .minimize => app.win.minimize() catch return null,
+        .close => app.win.closeNative() catch return null,
+    }
+    const flags = app.win.native.windowState();
+    const size = app.win.getSize();
+    return .{ .decoration_height = app.win.native.decorationHeight(), .decorated = app.win.native.hasDecorations(), .maximized = flags & 2 != 0, .active = flags & 1 != 0, .suspended = flags & 128 != 0, .width = size[0], .height = size[1] };
+}
 fn resizeWindowForHarness(width: u32, height: u32) bool {
     const app = g_screenshot_app orelse return false;
     app.win.setSize(width, height);
@@ -276,8 +310,13 @@ pub const FramePacing = enum { poll, display_link };
 pub const Config = struct {
     /// Application-owned I/O implementation, valid until all windows are destroyed.
     io: std.Io,
+    /// Linux Vulkan acceptance/debug options. Hardware is required by default.
+    allow_software_gpu: bool = false,
+    require_gpu_validation: bool = false,
     visual_quality: ?@import("render").visual_quality.Quality = null,
     window: WindowConfig = .{},
+    /// Return false to cancel. Called for native and application close requests.
+    on_close_request: ?*const fn (*App) bool = null,
     font: FontConfig = .{},
     /// Per-window diagnostic console sinks and bounded capture capacity.
     console: ui.console.Config = ui.console.defaultConfig(),
@@ -339,6 +378,7 @@ pub const App = struct {
     viewport_w: f32,
     viewport_h: f32,
     scale: f32,
+    chrome: chrome_controller.Controller,
     should_quit: bool = false,
     /// display-link pacing state (when frame_pacing == .display_link).
     display_link_running: bool = false,
@@ -354,7 +394,25 @@ pub const App = struct {
 
     fn titlebarHitTestCb(ctx: ?*anyopaque, x: f32, y: f32) callconv(.c) c_int {
         const app: *App = @ptrCast(@alignCast(ctx orelse return 0));
-        return if (app.cx.hitTest(x, y) != null) 1 else 0;
+        return if (app.cx.legacyWindowControlAt(x, y)) 1 else 0;
+    }
+
+    pub const chromeState = chrome_controller.chromeState;
+    pub const windowCapabilities = chrome_controller.windowCapabilities;
+    pub const requestClose = chrome_controller.requestClose;
+    pub const minimize = chrome_controller.minimize;
+    pub const setMaximized = chrome_controller.setMaximized;
+    pub const toggleMaximize = chrome_controller.toggleMaximize;
+    pub const setFullscreen = chrome_controller.setFullscreen;
+    pub const performWindowAction = chrome_controller.performWindowAction;
+
+    fn chromeAction(context: *anyopaque, action: chrome_backend.chrome.Action) anyerror!void {
+        const self: *App = @ptrCast(@alignCast(context));
+        try self.performWindowAction(action);
+    }
+    fn chromeHit(context: ?*anyopaque, x: f32, y: f32) callconv(.c) c_int {
+        const self: *App = @ptrCast(@alignCast(context orelse return 1));
+        return @intCast(@backingInt(self.cx.windowRegionAt(x, y)));
     }
 
     pub fn init(allocator: Allocator, config: Config) !*App {
@@ -367,6 +425,9 @@ pub const App = struct {
 
         app.allocator = allocator;
         app.config = config;
+        // allocator.create does not apply field defaults. A scale transition
+        // may consult this borrowed registry before a host installs one.
+        app.font_registry = null;
         // Win32 has no display-link callback yet; use the timed message pump.
         if (builtin.os.tag == .windows) app.config.frame_pacing = .poll;
         app.should_quit = false;
@@ -408,16 +469,22 @@ pub const App = struct {
         }
 
         // System accessibility preference: inject reader fn, read once, listen for changes.
-        ui.a11y.preferences.system_reader = zenit_a11y_display_options;
-        _ = ui.a11y.preferences.refresh();
-        zenit_a11y_observe_display_options();
+        if (comptime builtin.os.tag == .macos) {
+            ui.a11y.preferences.system_reader = zenit_a11y_display_options;
+            _ = ui.a11y.preferences.refresh();
+            zenit_a11y_observe_display_options();
+        }
 
         // Platform init.
         Window.initAppWithDelegate();
         app.win = try Window.init(config.window.width, config.window.height, config.window.title);
         errdefer app.win.deinit();
 
-        if (config.window.titlebar == .custom_inset) {
+        app.chrome = .{ .initial = try chrome_backend.configure(&app.win, @import("window_config.zig").requestedChrome(config.window), config.window.titlebar_height) };
+        if (config.window.chrome) |requested| if (requested == .native) try chrome_backend.useSystemTitlebar(&app.win);
+        try chrome_backend.configureHeader(&app.win, app.chrome.initial, config.window.fullscreen_header, config.window.titlebar_height);
+        try chrome_backend.setMinimumSize(&app.win, config.window.min_width, config.window.min_height);
+        if (config.window.chrome == null and app.chrome.initial.effective_mode == .custom and config.window.titlebar == .custom_inset) {
             // Traffic light centered vertically on custom title bar; x default system origin 7.
             app.win.setTrafficLightsInset(7, config.window.titlebar_height / 2.0);
             app.win.setTitlebarDragHeight(config.window.titlebar_height);
@@ -427,7 +494,15 @@ pub const App = struct {
         }
 
         // GPU
-        app.instance = try gpu.Backend.Instance.init(allocator, .{});
+        app.instance = if (comptime (gpu.backend_kind == .vulkan or gpu.backend_kind == .opengl)) blk: {
+            const native_surface = try app.win.nativeSurface();
+            break :blk try gpu.Backend.Instance.initWithOptions(allocator, .{}, .{
+                .allow_software = config.allow_software_gpu,
+                .require_validation = config.require_gpu_validation,
+                .wayland_display = native_surface.display,
+                .wayland_surface = native_surface.surface,
+            });
+        } else try gpu.Backend.Instance.init(allocator, .{});
         errdefer app.instance.deinit();
         const adapters = try app.instance.enumerateAdapters();
         defer {
@@ -532,8 +607,18 @@ pub const App = struct {
         // Drag-region hit (downstream app): custom_inset title bar mouseDown true hit-test first;
         // if on interactive control, dispatch normal event, else empty space drags window.
         // Rect model (drag_right_inset) still applies as coarse pre-filter.
-        if ((builtin.os.tag == .macos or builtin.os.tag == .windows) and config.window.titlebar == .custom_inset) {
+        const chrome_signal = try app.cx.windowChrome();
+        chrome_signal.set(app.chromeState());
+        app.cx.window_service = .{ .context = app, .perform = chromeAction };
+        if (config.window.chrome != null and app.chrome.initial.effective_mode != .native) {
+            chrome_backend.setHitCallback(&app.win, chromeHit, app);
+        } else if ((builtin.os.tag == .macos or builtin.os.tag == .windows) and config.window.titlebar == .custom_inset) {
             app.win.setTitlebarHitCallback(titlebarHitTestCb, app);
+        }
+
+        errdefer {
+            chrome_backend.setHitCallback(&app.win, null, null);
+            if (comptime builtin.os.tag == .macos or builtin.os.tag == .windows) app.win.setTitlebarHitCallback(null, null);
         }
 
         // Connect to measure_fn. Prefer version with context: it passes this App's own FontSelector
@@ -640,6 +725,8 @@ pub const App = struct {
         // Invalidate every native->Zig edge before releasing Cx/render state.
         // A closing window can still be inside live resize, IME composition, or
         // a drag session, so teardown order is part of the public contract.
+        chrome_backend.setHitCallback(&self.win, null, null);
+        self.cx.window_service = null;
         self.win.setRenderCallback(null, null);
         if (builtin.os.tag == .macos or builtin.os.tag == .windows) self.win.setTitlebarHitCallback(null, null);
         if (self.display_link_running) {
@@ -683,10 +770,12 @@ pub const App = struct {
             self.renderer.setFonts(&self.font_selector);
         }
         self.renderer.deinitFontDerivedCache();
-        for (self.fonts) |f| f.deinit();
-        self.font_manager.deinit();
+        // Renderer fallback faces borrow the FontSystem library/context. Release
+        // them while the manager and primary fonts still exist.
         self.renderer.deinit();
         self.allocator.destroy(self.renderer);
+        for (self.fonts) |f| f.deinit();
+        self.font_manager.deinit();
         self.surface.deinit();
         self.queue.deinit();
         self.device.deinit();
@@ -751,14 +840,15 @@ pub const App = struct {
         var portal_orphan = true;
         errdefer if (portal_orphan) portal.destroy(allocator);
         portal.meta.ownership.meta.component_name = "WindowOverlayPortal";
-        (try portal.style.ensureExtFallible(allocator)).z_index = ui.Cx.window_portal_z_index;
+        const portal_ext = try portal.style.ensureExtFallible(allocator);
+        portal_ext.z_index = ui.Cx.window_portal_z_index;
+        portal_ext.hit_behavior = .children_only;
         // WARNING: do not use setHitTestVisible(false); hit-test recurses and cuts the entire
         // subtree
         // at invisible nodes (hit_runtime.buildRecursive: !participates -> return), making every
         // Modal/Sheet in the portal unclickable (x cannot close, mask does not dismiss).
-        // An empty box has no pointer hit role by default (defaultRoles: no handler/not
-        // focusable/not
-        // button -> pointer=false), so the portal itself does not intercept hits while children
+        // The portal is explicitly children-only for pointer and window-chrome
+        // queries: its transparent viewport must not block Header drag while children
         // (barrier/dialog) participate normally. Scope is created after both nodes; errdefer
         // disposes
         // the scope first so portaled content cleanup can safely access the portal, then destroys
@@ -813,6 +903,7 @@ pub const App = struct {
         root_scope_owned = false;
         app_root_orphan = false;
         self.cx.is_mounted = true;
+        self.cx.content_root = user_root;
 
         // E2E test harness: register cx reference + screenshot callback + start file RPC
         // server (when test-mode=true).
@@ -829,7 +920,9 @@ pub const App = struct {
             test_harness.setRecordingCallbacks(startWindowRecording, windowRecordingStatus, stopWindowRecording);
             test_harness.setFrameStatsCallback(getFrameStats);
             test_harness.setResetTimingCallback(resetTiming);
+            test_harness.setWindowCommandCallback(windowCommandForHarness);
             test_harness.setResizeWindowCallback(resizeWindowForHarness);
+            test_harness.setQuitCallback(quitForHarness);
             test_harness.setVisualQualityCallback(visualQualityForHarness);
             test_harness.init(self.config.io, getTestCx, wakeTestHarness);
         }
@@ -850,6 +943,19 @@ pub const App = struct {
 
     pub fn bindMenuCommand(self: *App, command_id: u64, action: ui.actions.Action) void {
         self.cx.bindCommandAction(command_id, action);
+    }
+
+    pub fn postHeaderPointerForTesting(self: *App, x: f32, y: f32, right: bool) !void {
+        if (!@import("build_options").test_mode) return error.TestModeRequired;
+        try chrome_backend.postHeaderPointer(&self.win, x, y, right);
+    }
+    pub fn postHeaderSystemHoverForTesting(self: *App, edge: bool) !void {
+        if (!@import("build_options").test_mode) return error.TestModeRequired;
+        try chrome_backend.postHeaderSystemHover(&self.win, edge);
+    }
+    pub fn headerReadyForTesting(self: *App) bool {
+        if (!@import("build_options").test_mode) return false;
+        return chrome_backend.headerReadyForTesting(&self.win);
     }
 
     pub fn windowId(self: *const App) system_sdk.events.WindowId {
@@ -881,7 +987,7 @@ pub const App = struct {
         var pace_prev: ?@import("zenit_time").Instant = null;
         var pace_dts: [120]f64 = undefined;
         var pace_n: usize = 0;
-        while (!self.win.shouldClose() and !self.should_quit) {
+        while (!self.should_quit) {
             const pool = AutoreleasePool.push();
             defer pool.pop();
             // .poll: timed polling.
@@ -1037,6 +1143,7 @@ pub const App = struct {
     }
 
     fn shouldRenderAutomaticFrame(self: *App, forced: bool) bool {
+        chrome_controller.syncChrome(self);
         // Read before wantsFrame consumes an expired scheduled-redraw deadline.
         const deadline_due = if (self.cx.nextWakeDelayNs()) |delay| delay == 0 else false;
         const force_frame = forced or self.resize_frame_pending or !self.config.idle_skip_frames;
@@ -1063,6 +1170,8 @@ pub const App = struct {
     /// makes `App` safe with a shared/multi-window backend while preserving the
     /// existing single-window `processEvents()` API.
     pub fn processEvent(self: *App, evt: system_sdk.events.Event) bool {
+        if (!self.sdk.imeEventCurrent(evt)) return false;
+        defer self.cx.refreshTextInputSession();
         if (evt.targetWindowId()) |target| {
             if (target != self.windowId()) return false;
         }
@@ -1077,7 +1186,8 @@ pub const App = struct {
         // operation of a test-mode app is unaffected.
         if (test_harness.enabled and isolateOsPointer() and pointer_isolation.isOsPointerEvent(evt)) return true;
         switch (evt) {
-            .quit, .window_close_requested => self.should_quit = true,
+            .quit => self.should_quit = true,
+            .window_close_requested => self.requestClose() catch {},
             .frame_requested, .window_resized, .system_theme_changed => self.cx.needs_redraw = true,
             .window_focused => |e| {
                 self.cx.needs_redraw = true;
@@ -1132,14 +1242,17 @@ pub const App = struct {
             .key => |e| {
                 const key = if (builtin.target.os.tag == .windows)
                     ui.events.KeyCode.fromWindowsVirtualKey(e.keycode)
+                else if (builtin.target.os.tag == .linux)
+                    ui.events.KeyCode.fromLinuxEvdev(e.keycode)
                 else
                     ui.events.KeyCode.fromRawKeycode(e.keycode);
                 const ui_mods = sdkModifiersToUi(e.modifiers);
                 if (e.pressed) self.cx.handleKeyDown(key, ui_mods) else self.cx.handleKeyUp(key, ui_mods);
             },
             .text_input => |e| self.cx.handleTextInput(e.text),
-            .ime_preedit => |e| self.cx.handleImePreeditReplace(e.text, e.cursor_utf8_offset, e.replace_start_utf8, e.replace_end_utf8),
+            .ime_preedit => |e| self.cx.handleImePreeditEvent(.{ .text = e.text, .cursor_utf8_offset = e.cursor_utf8_offset, .cursor_visible = e.cursor_visible, .selection_end_utf8 = e.selection_end_utf8, .replace_start_utf8 = e.replace_start_utf8, .replace_end_utf8 = e.replace_end_utf8 }),
             .ime_commit => |e| self.cx.handleImeCommitReplace(e.text, e.replace_start_utf8, e.replace_end_utf8),
+            .ime_delete_surrounding => |e| self.cx.handleImeDeleteSurrounding(e.before_bytes, e.after_bytes),
         }
         return true;
     }
@@ -1242,6 +1355,8 @@ pub const App = struct {
 
     /// Render one frame.
     pub fn frame(self: *App) !void {
+        chrome_controller.syncChrome(self);
+        defer self.cx.publishWindowRegions();
         // Host writing custom main loop (pump + frame, control cadence) also needs pool;
         // outside run()/tick() is already one, nesting another harmless.
         const pool = AutoreleasePool.push();
@@ -1399,6 +1514,12 @@ pub const MultiWindowApp = struct {
     /// Cmd+Q, explicit `quit`, or teardown of the last window.
     pub fn pump(self: *MultiWindowApp, timeout_ms: u32) !bool {
         if (!self.shouldContinue()) return false;
+        // Retire already accepted closes before any potentially blocking native wait.
+        for (self.windows.items) |managed| {
+            if (managed.app.should_quit) _ = self.lifecycle.requestClose(managed.app.windowId());
+        }
+        self.applyPendingCloses();
+        if (!self.shouldContinue()) return false;
         {
             std.debug.assert(!self.iterating);
             self.iterating = true;
@@ -1415,6 +1536,7 @@ pub const MultiWindowApp = struct {
                 managed.app.sdk.dispatching = true;
                 defer managed.app.sdk.dispatching = false;
                 for (managed.app.sdk.events()) |evt| self.dispatchEvent(managed.app.windowId(), evt);
+                if (managed.app.should_quit) _ = self.lifecycle.requestClose(managed.app.windowId());
                 if (self.lifecycle.quit_requested) break;
             }
         }
@@ -1458,6 +1580,13 @@ pub const MultiWindowApp = struct {
                 if (managed.app.cx == g_test_cx) managed.force_frame = true;
             }
         }
+        // App.quit() may come from a harness command or application callback,
+        // without a native event to pass through dispatchToWindow. Retire such
+        // windows before rendering instead of waiting for another input event.
+        for (self.windows.items) |managed| {
+            if (managed.app.should_quit) _ = self.lifecycle.requestClose(managed.app.windowId());
+        }
+        self.applyPendingCloses();
         if (!self.shouldContinue()) return false;
         try self.frame();
         if (test_harness.enabled) test_harness.afterFrame();
@@ -1507,7 +1636,7 @@ pub const MultiWindowApp = struct {
                 return;
             },
             .window_close_requested => |e| {
-                _ = self.lifecycle.requestClose(e.window_id);
+                self.dispatchToWindow(e.window_id, evt);
                 return;
             },
             .window_focused => |e| {
@@ -1579,14 +1708,17 @@ pub const MultiWindowApp = struct {
 
 /// Synced from MetalView.setFrameSize during live resize: reconfigure surface/viewport
 /// and render so content reflows frame-by-frame (native behavior), not CoreAnimation
-/// stretch of old frame. Programmatic setFrameSize goes back to main loop, avoid frame()
-/// reentrancy.
+/// stretch of old frame. Native code also calls this at the final resize boundary,
+/// after live resize ends. Other programmatic setFrameSize calls use the main loop.
 fn liveResizeRender(ctx: ?*anyopaque) callconv(.c) void {
     const app: *App = @ptrCast(@alignCast(ctx orelse return));
-    if (!app.win.isInLiveResize()) return;
     if (app.in_live_resize_render) return;
     app.in_live_resize_render = true;
     defer app.in_live_resize_render = false;
+    // Native Header policy may change layout without changing the outer window.
+    // Publish that state/layout before reading the drawable and testing dirtiness;
+    // otherwise the final resize can be skipped or use the previous projection.
+    chrome_controller.syncChrome(app);
     app.maybeReconfigureSurface() catch |err| {
         std.log.scoped(.zenit_runtime).warn("live-resize surface reconfigure failed: {s}", .{@errorName(err)});
         return;

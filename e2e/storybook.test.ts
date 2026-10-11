@@ -39,7 +39,7 @@ import {
 } from "./client";
 import { test, run, assert, getSessionDir, appendLog } from "./runner";
 import { statSync } from "node:fs";
-import { decodePng, countDarkPixels, countNonBackgroundPixels } from "./png";
+import { decodePng as decodePngFile, countDarkPixels, countNonBackgroundPixels } from "./png";
 
 /// Pixel-level verification: rect region must have enough dark pixels (text/graphics really drawn).
 /// Prevent 'layout OK but GPU blank' bugs (Modal empty panel missed 49/49 on settle). Light
@@ -72,6 +72,18 @@ function assertRegionHasInk(pngPath: string, rect: { x: number; y: number; w: nu
 }
 
 const DIR = getSessionDir();
+const decodedCapturePaths = new WeakMap<ReturnType<typeof decodePngFile>, string>();
+function decodePng(path: string): ReturnType<typeof decodePngFile> {
+  const image = decodePngFile(path);
+  decodedCapturePaths.set(image, path);
+  return image;
+}
+function decodedCaptureScale(image: ReturnType<typeof decodePngFile>): number {
+  const path = decodedCapturePaths.get(image);
+  assert(path != null, "missing decoded capture path");
+  return captureScale(path!, image.width);
+}
+
 const captureWidths = new Map<string, number>();
 async function screenshot(path: string) {
   const width = (await tree()).rect.w;
@@ -359,6 +371,43 @@ async function assertAnimates(key: string, targetId: string): Promise<void> {
   assert(diff >= 50, `${targetId} 两帧之间没有变化（diff=${diff}）— 动画没在跑或图形没画出来`);
 }
 
+/// Spinner ink stays inside each spinner's own bounds. The arc keeps its rotation angles in the
+/// instance's shadow-offset slots; the quad once grew with them, and the arc field's jump at the
+/// sweep ends drew thin rays out of every spinner (worse the longer it ran).
+test("spinner arcs draw nothing outside their ring", async () => {
+  await switchTo("spinner");
+  await sleep(1500); // let the angles grow, as they do in a long-running app
+  const rects: { x: number; y: number; w: number; h: number }[] = [];
+  for (let i = 0; i < 5; i++) {
+    const node = (await query(`story.spinner.${i}`))[0];
+    assert(node != null, `story.spinner.${i} 不存在`);
+    rects.push(node.rect);
+  }
+  // Window chrome and the page title (Windows draws it above the story) are not spinner ink.
+  const chrome: { x: number; y: number; w: number; h: number }[] = [];
+  for (const id of ["storybook.header", "storybook.page", "sidebar"]) for (const n of await query(id).catch(() => [])) chrome.push(n.rect);
+  const inside = (x: number, y: number) => [...rects, ...chrome].some((r) => x >= r.x - 1 && x <= r.x + r.w + 1 && y >= r.y - 1 && y <= r.y + r.h + 1);
+  for (let frame = 0; frame < 3; frame++) {
+    const path = `${DIR}/story-spinner-bounds-${frame}.png`;
+    await screenshot(path);
+    const img = decodePng(path);
+    const scale = captureScale(path, img.width);
+    let stray = 0;
+    for (const r of rects) {
+      for (let y = Math.floor((r.y - 40) * scale); y < Math.ceil((r.y + r.h + 40) * scale); y++) {
+        for (let x = Math.floor((r.x - 40) * scale); x < Math.ceil((r.x + r.w + 40) * scale); x++) {
+          if (x < 0 || y < 0 || x >= img.width || y >= img.height || inside(x / scale, y / scale)) continue;
+          const i = (y * img.width + x) * img.channels;
+          if (0.299 * img.pixels[i] + 0.587 * img.pixels[i + 1] + 0.114 * img.pixels[i + 2] < 200) stray++;
+        }
+      }
+    }
+    appendLog(`  spinner frame ${frame}: ink outside spinner bounds = ${stray}`);
+    assert(stray === 0, `spinner 外框之外出现墨迹（射线）：${stray} 像素，frame ${frame}`);
+    await sleep(120);
+  }
+});
+
 async function storyTexts(key: string): Promise<string> {
   const q = await query(`story.${key}`);
   const out: string[] = [];
@@ -412,13 +461,13 @@ async function harnessLatencyMs(): Promise<number> {
 }
 /// high-latency harness locked clock: time advances only by animSleep's grants, mid-animation
 /// sample at precise moment, RPC unaffected. Only for cases using animSleep throughout.
-async function useAnimationClock(): Promise<void> {
+async function useAnimationClock(lockForSampling = false): Promise<void> {
   const s = await stats();
   const slowRenderer = Math.max(s.total_frame_us || 0, s.total_p95_us || 0) > 50_000;
-  const latency = slowRenderer ? 0 : process.env.ZENIT_E2E_FORCE_LOCKED_CLOCK === "1" ? Infinity : await harnessLatencyMs();
+  const latency = lockForSampling ? Infinity : slowRenderer ? 0 : process.env.ZENIT_E2E_FORCE_LOCKED_CLOCK === "1" ? Infinity : await harnessLatencyMs();
   if (!slowRenderer && latency <= 150) return;
-  animClockStep = slowRenderer ? 33 : 16;
-  animClockLocked = !slowRenderer;
+  animClockStep = slowRenderer && !lockForSampling ? 33 : 16;
+  animClockLocked = lockForSampling || !slowRenderer;
   const r = await request("POST", "/clock", { step_ms: animClockStep, locked: animClockLocked });
   assert(!r.error, `animation clock: ${JSON.stringify(r)}`);
   appendLog(`  ${animClockLocked ? "locked" : "fixed"} animation clock ${animClockStep} ms/frame (${slowRenderer ? "slow renderer" : `harness latency ${latency} ms`})`);
@@ -731,7 +780,10 @@ test("Steps: 连接线连贯（横向贯穿圆心 / 纵向末段贴圆圈）+ �
         const i = (y * png.width + x) * png.channels;
         const lum = 0.299 * png.pixels[i] + 0.587 * png.pixels[i + 1] + 0.114 * png.pixels[i + 2];
         const w = Math.max(0, lum - 128);
-        sx += w * x; sy += w * y; m += w;
+        // Texture pixels occupy [x,x+1) × [y,y+1). Compare their centers
+        // with logical circle geometry; index coordinates bias ink by half a
+        // physical pixel, most visibly at 1x on Linux.
+        sx += w * (x + 0.5); sy += w * (y + 0.5); m += w;
       }
     }
     assert(m > 0, "圆圈内没有白色序号墨迹");
@@ -1400,9 +1452,12 @@ function sheetPanelEdgeX(pngPath: string, logicalY: number): number | null {
 test("Sheet: 交互 — 打开后 panel 贴边可见 + content 文本", async () => {
   await switchTo("sheet");
   const backend = (await stats()).renderer_backend;
-  const nativeSample = backend === "legacy" || backend === "d3d12";
+  const nativeSample = backend === "legacy" || backend === "d3d12" || backend === "d3d11" || backend === "opengl";
+  const viewportWidth = (await tree()).rect.w;
+  assert(viewportWidth > 0, "missing native client width");
   let nativeSampleX: number | undefined;
   if (nativeSample) {
+    await useAnimationClock();
     const samplePath = `${DIR}/story-sheet-mid-anim.png`;
     const sampleWidth = (await tree()).rect.w;
     assert(sampleWidth > 0, "missing native client width");
@@ -1434,16 +1489,19 @@ test("Sheet: 交互 — 打开后 panel 贴边可见 + content 文本", async ()
   // The layout tree advances normally, so rect assertions pass; only mid-animation pixels catch it.
   // Settlement at x~780; assert at t~120ms that the panel left edge is "entered but not settled".
   const midEdge = sheetPanelEdgeX(`${DIR}/story-sheet-mid-anim.png`, 500);
+  const sampledPanel = (await query("story.sheet.panel"))[0];
+  assert(sampledPanel != null && sampledPanel.rect.w > 0, "missing Sheet panel geometry");
+  const settledEdge = viewportWidth - sampledPanel.rect.w;
   if (nativeSampleX !== undefined) assert(midEdge != null && Math.abs(midEdge - nativeSampleX) <= 2,
     `captured Sheet pixels do not match sampled geometry: ${midEdge} vs ${nativeSampleX}`);
   appendLog(`  sheet mid-anim panel edge x=${midEdge == null ? "none" : Math.round(midEdge)}`);
   assert(
-    midEdge != null && midEdge > 788 && midEdge < 1098,
+    midEdge != null && midEdge > settledEdge + 8 && midEdge < viewportWidth - 2,
     `sheet 滑入动画中段面板位置异常 (edge=${midEdge == null ? "不可见" : Math.round(midEdge)}) — ` +
-      `应在 (788,1098) 之间；=780 表示画面直接跳到终点（动画冻结），不可见表示还没入场`,
+      `应在 (${settledEdge + 8},${viewportWidth - 2}) 之间；=${settledEdge} 表示画面直接跳到终点（动画冻结），不可见表示还没入场`,
   );
 
-  await sleep(780);
+  await animSleep(780);
   await shot("sheet-open");
 
   const panel = (await query("story.sheet.panel"))[0];
@@ -1466,11 +1524,11 @@ test("Sheet: 交互 — 打开后 panel 贴边可见 + content 文本", async ()
   // blank close. Also must close sheet; sheet barrier now truly blocks clicks (modal
   // semantics), not closing blocks subsequent nav switch.
   await clickAt(r.x + r.w / 2, r.y + r.h / 2); // panel interior
-  await sleep(400);
+  await animSleep(400);
   const afterInside = (await query("story.sheet.panel"))[0];
   assert(afterInside?.visible !== false, `点 sheet panel 内部竟关闭了（hit-test 穿透）`);
   await clickAt(80, 500); // left backdrop (panel on right)
-  await sleep(600);
+  await animSleep(600);
   const closed = (await query("story.sheet.panel"))[0];
   appendLog(`  after backdrop click, sheet panel visible=${closed?.visible}`);
   assert(closed?.visible === false, `sheet backdrop 点击未关闭`);
@@ -2723,7 +2781,7 @@ test("zindex: 三级嵌套 modal → popover → modal2（tier 链）", async ()
 });
 
 function glassRegionRmse(pathA: string, pathB: string, r: {x:number;y:number;w:number;h:number}, exclude?: {x:number;y:number;radius:number}): number {
-  const a=decodePng(pathA),b=decodePng(pathB),scale=a.width/1100;
+  const a=decodePng(pathA),b=decodePng(pathB),scale=decodedCaptureScale(a);
   assert(a.width===b.width&&a.height===b.height,"glass screenshots dimensions changed");
   let sum=0,n=0;
   for(let y=Math.ceil((r.y+6)*scale);y<Math.floor((r.y+r.h-6)*scale);y++) {
@@ -2753,7 +2811,7 @@ test("GlassBox: .glass 按钮按下当帧主体平移（原生 −19.8 色阶）
   await mouseMove(x,y);await sleep(300);const hover=await shotAt("hover");
   await mouseDown(x,y);await sleep(120);const pressed=await shotAt("pressed");
   await mouseUp(x,y);await mouseMove(-10,-10);await sleep(300);const released=await shotAt("released");
-  const L=(png:ReturnType<typeof decodePng>)=>{const c=meanRgbOf(png,patch,png.width/1100);return (c[0]+c[1]+c[2])/3;};
+  const L=(png:ReturnType<typeof decodePng>)=>{const c=meanRgbOf(png,patch,decodedCaptureScale(png));return (c[0]+c[1]+c[2])/3;};
   appendLog(`  glass button body: rest ${L(rest).toFixed(1)} hover ${L(hover).toFixed(1)} pressed ${L(pressed).toFixed(1)} released ${L(released).toFixed(1)}`);
   assert(Math.abs(L(hover)-L(rest))<1.5,"hover must not change the glass button body");
   const d=L(rest)-L(pressed);
@@ -2772,7 +2830,7 @@ test("GlassLab: real pointer drag moves glass and preserves rendered content", a
   const after=(await query("story.glasslab.drag"))[0]?.rect;
   assert(after&&Math.abs(after.x-r.x-80)<1&&Math.abs(after.y-r.y-24)<1,`drag lost geometry: ${JSON.stringify(r)} -> ${JSON.stringify(after)}`);
   const path=`${DIR}/glasslab-dragged.png`;assert((await screenshot(path)).ok===true,"drag screenshot failed");
-  const png=decodePng(path),s=png.width/1100;
+  const png=decodePng(path),s=decodedCaptureScale(png);
   const inner={x:after.x+20,y:after.y+20,w:after.w-40,h:after.h-40};
   assert(countNonBackgroundPixels(png,inner,s,8)>100,"dragged glass lost its content/material");
   // drag outside container layout box also glass (container surface by union exterior): both ends
@@ -2945,7 +3003,7 @@ test("GlassChrome: Scroll ±90 按钮真的滚动画布（经 setScrollY，边�
   const edgePath = `${DIR}/glasschrome-scrolled.png`;
   assert((await screenshot(edgePath)).ok === true, "glasschrome screenshot failed");
   const png = decodePng(edgePath);
-  const chroma = (yy: number) => { const c = meanRgbOf(png, { x: st.x + 250, y: st.y + yy - 2, w: 20, h: 4 }, png.width / 1100); return Math.max(...c) - Math.min(...c); };
+  const chroma = (yy: number) => { const c = meanRgbOf(png, { x: st.x + 250, y: st.y + yy - 2, w: 20, h: 4 }, decodedCaptureScale(png)); return Math.max(...c) - Math.min(...c); };
   const cTop = chroma(12), cLow = chroma(66);
   appendLog(`  titlebar edge chroma: y12 ${cTop.toFixed(1)} y66 ${cLow.toFixed(1)}`);
   assert(cLow > 60, `边缘带底部应基本露出便签原色 (chroma ${cLow.toFixed(1)})`);
@@ -3098,7 +3156,7 @@ test("GlassIslands: 同帧两个 blur+rounded_clip 岛都必须显示内容", as
 /// per-pixel diff of two same-size regions (mean/p99/max of RGB absolute diff).
 function regionDiff(pngPath: string, a: { x: number; y: number; w: number; h: number }, b: { x: number; y: number; w: number; h: number }): { mean: number; p99: number; max: number; n: number } {
   const png = decodePng(pngPath);
-  const scale = png.width / 1100;
+  const scale = decodedCaptureScale(png);
   const w = Math.round(a.w * scale), h = Math.round(a.h * scale);
   const ax = Math.round(a.x * scale), ay = Math.round(a.y * scale);
   const bx = Math.round(b.x * scale), by = Math.round(b.y * scale);
@@ -3145,7 +3203,7 @@ test("GlassGroup: 容器一次采样合成与单体 GlassBox 逐像素等价（M
 /// by area): count pixels in band brighter than gray+40, min between inner edges.
 function neckHeight(pngPath: string, rect: { x: number; y: number; w: number; h: number }, capsuleW: number, gap: number): number {
   const png = decodePng(pngPath);
-  const scale = png.width / 1100;
+  const scale = decodedCaptureScale(png);
   const y0 = Math.max(0, Math.round((rect.y - 8) * scale)), y1 = Math.min(png.height, Math.round((rect.y + rect.h + 8) * scale));
   const x0 = Math.round((rect.x + capsuleW - 2) * scale), x1 = Math.round((rect.x + capsuleW + gap + 2) * scale);
   let neck = Infinity;
@@ -3185,8 +3243,13 @@ test("GlassMerge: GlassGroup 融合颈部与原生 GlassEffectContainer 实测�
 
 function regionMeanDiff(pngA: string, pngB: string, rect: { x: number; y: number; w: number; h: number }): number {
   const a = decodePng(pngA), b = decodePng(pngB);
-  const scale = a.width / 1100;
+  const scale = decodedCaptureScale(a);
   const x0 = Math.round(rect.x * scale), y0 = Math.round(rect.y * scale), x1 = Math.round((rect.x + rect.w) * scale), y1 = Math.round((rect.y + rect.h) * scale);
+  assert(a.width === b.width && a.height === b.height && a.channels === b.channels,
+    `pixel comparison requires matching captures: ${a.width}×${a.height} vs ${b.width}×${b.height}`);
+  assert(Math.abs(scale - decodedCaptureScale(b)) < 1e-6, "pixel comparison logical scale changed between captures");
+  assert(x0 >= 0 && y0 >= 0 && x1 <= a.width && y1 <= a.height && x1 > x0 && y1 > y0,
+    `pixel comparison region outside capture: [${x0},${y0},${x1},${y1}] in ${a.width}×${a.height}`);
   let sum = 0, n = 0;
   for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) {
     const i = (y * a.width + x) * a.channels;
@@ -3199,7 +3262,9 @@ function regionMeanDiff(pngA: string, pngB: string, rect: { x: number; y: number
 test("GlassMaterialize: glassSetEnabled 按 materialize 曲线消散/成形（M4）", async () => {
   await switchTo("glassmotion");
   await settle(500);
-  await useAnimationClock();
+  // Freeze the sampled phase while readback runs. Free stepping can spend
+  // most of the transition in click/stats/screenshot RPCs on Windows.
+  await useAnimationClock(true);
   const box = (await query("story.glassmotion.materialize"))[0]?.rect;
   assert(box, "materialize 玻璃节点应存在");
   const inner = { x: box!.x + 24, y: box!.y + 6, w: box!.w - 48, h: box!.h - 12 };
@@ -3210,10 +3275,15 @@ test("GlassMaterialize: glassSetEnabled 按 materialize 曲线消散/成形（M4
   const full = regionMeanDiff(`${DIR}/story-glassmaterialize-on.png`, `${DIR}/story-glassmaterialize-off.png`, inner);
   appendLog(`  materialize: on-vs-off mean diff=${full.toFixed(1)}`);
   assert(full > 20, `玻璃消散后区域应回到背景（on/off 差 ${full.toFixed(1)} 过小）`);
-  // appear 420ms: click then screenshot ASAP, material mid-forming (neither background nor final)
+  // Sample the middle of the 420ms appearance, rather than an RPC-dependent
+  // "ASAP" image. Keep the original pixel thresholds against both endpoints.
   await clickTestId("story.glassmotion.toggle");
-  await animSleep(40);
+  await animSleep(210);
+  const beforeCapture = (await stats() as any).frame_time_ms;
   await shot("glassmaterialize-mid");
+  const afterCapture = (await stats() as any).frame_time_ms;
+  appendLog(`  materialize frozen midpoint: time=${beforeCapture} capture-advance=${afterCapture-beforeCapture}ms`);
+  assert(Math.abs(afterCapture-beforeCapture)<0.1, "materialize screenshot advanced the locked animation clock");
   await animSleep(800);
   await shot("glassmaterialize-back");
   const mid_from_off = regionMeanDiff(`${DIR}/story-glassmaterialize-mid.png`, `${DIR}/story-glassmaterialize-off.png`, inner);
@@ -3227,7 +3297,7 @@ test("GlassMaterialize: glassSetEnabled 按 materialize 曲线消散/成形（M4
 
 /// center line luminance (0..255), determines glass (frosted ~230) vs background (~130).
 function lumaAt(pngPath: string, x: number, y: number): number {
-  const png = decodePng(pngPath); const s = png.width / 1100;
+  const png = decodePng(pngPath); const s = decodedCaptureScale(png);
   const px = Math.round(x * s), py = Math.round(y * s); let sum = 0, n = 0;
   for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) { const i = ((py + dy) * png.width + (px + dx)) * png.channels; sum += 0.2126 * png.pixels[i] + 0.7152 * png.pixels[i + 1] + 0.0722 * png.pixels[i + 2]; n++; }
   return sum / n;
@@ -3236,7 +3306,7 @@ function lumaAt(pngPath: string, x: number, y: number): number {
 test("GlassSplit: 官方 glassEffectID 展开/收起——合并态单一形状无凸起、过渡期液态桥接、静止不吸附、收起汇集复原（视觉验收）", async () => {
   await switchTo("glasssplit");
   await settle(600);
-  await useAnimationClock();
+  await useAnimationClock(true);
   const rects = async () => Promise.all([0, 1, 2].map(async (i) => (await query(`story.glasssplit.bar${i}`))[0]?.rect));
   let [b0, b1, b2] = await rects();
   assert(b0 && b1 && b2, "三个 bar 应存在");
@@ -3257,12 +3327,10 @@ test("GlassSplit: 官方 glassEffectID 展开/收起——合并态单一形状�
   };
   await shot("glasssplit-merged");
   flatAt(`${DIR}/story-glasssplit-merged.png`, "merged");
-  // sub bar extends from first element endcap (matched geometry), bridge between during transition
-  // (none at rest 24). Bridge existence only geometry state, independent speed: slow 16x (transact
-  // 8000ms) gap 2-22 window ~250ms -> ~4s, gap 0-9 -> ~800ms; 200-400ms shots land multi-frame (×8
-  // occasional single miss). Poll rate depends on load (measured 200-900ms): miss 'nearly stuck'
-  // frame, try original speed + stagger start + slow ×16 again (max 4 rounds). Criterion is
-  // geometry, replay unchanged.
+  // Slow the product transition to 8000ms, then sample every 200ms of
+  // animation time. Lock each phase across geometry queries and screenshot
+  // readback; retries stagger the sampling phase if the narrow near-gap
+  // interval lands between samples. Keep all original pixel/coverage rules.
   let bridgeSeen = false, inWindow = 0, noBridge = 0, near = 0, nearBroken = 0;
   for (let attempt = 0; attempt < 4 && near === 0; attempt++) {
     if (attempt > 0) {
@@ -3274,6 +3342,9 @@ test("GlassSplit: 官方 glassEffectID 展开/收起——合并态单一形状�
     if (attempt > 0) await animSleep(150 * attempt); // stagger screenshot phase
     const tSplit = await animNow();
     for (let i = 1; i <= 80 && (await animNow()) - tSplit < 11000; i++) {
+      // Advance between samples; geometry queries and readback must observe
+      // the same frozen phase, rather than skipping the bridge window.
+      await animSleep(200);
       // query layout before+after screenshot; gap in bridge window both times counts
       const [p0, p1] = await rects();
       const gapBefore = p1!.x - (p0!.x + p0!.w);
@@ -3332,7 +3403,9 @@ test("GlassSplit: 官方 glassEffectID 展开/收起——合并态单一形状�
 test("GlassSplit: card 展开中途再点即折返（不再忽略动画中的点击），收起淡出途中再展开原地反向", async () => {
   await switchTo("glasssplit");
   await settle(600);
-  await useAnimationClock();
+  // The 120ms reversal must arrive before fade-out completes even when
+  // screenshot/readback or RPC latency varies under the full suite's load.
+  await useAnimationClock(true);
   const card = async (i: number) => (await query(`story.glasssplit.card${i}`))[0]?.rect;
   const c0 = (await card(0))!;
   assert(Math.abs(c0.w - 300) < 2, `card 初始应收起为 300 宽（${c0.w}）`);
@@ -3375,7 +3448,7 @@ test("GlassSplit: 连点多次后慢放展开，子 bar 从当前几何长出、
   // 'unlayouted' 220x140.
   await switchTo("glasssplit");
   await settle(600);
-  await useAnimationClock();
+  await useAnimationClock(true);
   for (let i = 0; i < 5; i++) { await clickTestId("story.glasssplit.splitbtn"); await animSleep(70 + 25 * (i % 3)); }
   // 6th retract: wait sub bar resorbed (size<1, resorb unfinished) then slow expand -> window only
   // frames
@@ -3386,7 +3459,7 @@ test("GlassSplit: 连点多次后慢放展开，子 bar 从当前几何长出、
   while (!tiny && (await animNow()) < tEnd) {
     const r = (await query("story.glasssplit.bar1"))[0]?.rect;
     tiny = !!r && r.h < 1;
-    if (!tiny) await animSleep(10);
+    if (!tiny) await animSleep(20);
   }
   appendLog(`  reached end-cap absorption: ${tiny}`);
   assert(tiny, "慢放收起应把子 bar 吸到端帽（h<1）");
@@ -3420,7 +3493,7 @@ test("GlassTintMerge: 容器融合桥无 tint、tint 只铺成员内部、不同
   // white stage fully in viewport, then screenshot
   await shot("glasstint");
   const img = decodePng(`${DIR}/story-glasstint.png`);
-  const scale = img.width / 1100;
+  const scale = decodedCaptureScale(img);
   const at = (x: number, y: number) => meanRgbOf(img, { x: white!.x + x - 1, y: white!.y + y - 1, w: 2, h: 2 }, scale).map((v) => Math.round(v));
   // case 3 (blue|orange, gap 12) bridge: native 249 white, colorless
   const bridge = at(475 + 1, 144);
@@ -3443,7 +3516,7 @@ test("GlassUnion: glassEffectUnion 同 id 成员合成整体包围盒形状（�
   assert(st, "union stage missing");
   await shot("glassunion");
   const img = decodePng(`${DIR}/story-glassunion.png`);
-  const scale = img.width / 1100;
+  const scale = decodedCaptureScale(img);
   const runsAt = (cy: number) => {
     const y = Math.round((st!.y + cy) * scale); const runs: number[] = []; let start = -1;
     for (let x = Math.round(st!.x * scale); x < Math.round((st!.x + 640) * scale); x++) {
@@ -3470,7 +3543,7 @@ test("GlassPopover: 玻璃按钮弹出带箭头的玻璃弹出层——原生 .p
   await sleep(800);
   await shot("glasspopover-open");
   const img = decodePng(`${DIR}/story-glasspopover-open.png`);
-  const scale = img.width / 1100;
+  const scale = decodedCaptureScale(img);
   const px = (x: number, y: number) => img.pixels[(Math.round((st!.y + y) * scale) * img.width + Math.round((st!.x + x) * scale)) * img.channels];
   // each line glass coverage width (logical pt; cumulative coverage % from 128->230, antialiasing)
   const coverage = (img2: typeof img, y: number) => {
@@ -3513,7 +3586,7 @@ test("GlassMenu: 菜单当帧出现、玻璃面板无投影、打开期间触发
   }
   await sleep(400);
   const sample = (img: ReturnType<typeof decodePng>, x: number, y: number) => {
-    const scale = img.width / 1100;
+    const scale = decodedCaptureScale(img);
     return img.pixels[(Math.round((st!.y + y) * scale) * img.width + Math.round((st!.x + x) * scale)) * img.channels];
   };
   await shot("glassmenu-closed");
@@ -3596,13 +3669,19 @@ test("GlassToolbar: NSToolbar 玻璃胶囊——悬停/按下/选中底板叠加
   const plateAt = (png: string, id: string) => lumaAt(png, R[id].x + 5, R[id].y + R[id].h / 2);
   const corner = (id: string): [number, number] => [R[id].x + R[id].w - 3, R[id].y + R[id].h - 3];
   const sepAt = (png: string, right: string) => {
-    const img = decodePng(png); const sc = img.width / 1100; let m = 255;
+    const img = decodePng(png); const sc = decodedCaptureScale(img);
     const yy = Math.round((R[right].y + R[right].h / 2) * sc);
-    for (let x = Math.round((R[right].x - 1) * sc); x <= Math.round((R[right].x + 3) * sc); x++) m = Math.min(m, img.pixels[(yy * img.width + x) * img.channels]);
-    return m;
+    const samples: number[] = [];
+    for (let x = Math.floor((R[right].x - 1) * sc); x < Math.ceil((R[right].x + 3) * sc); x++) samples.push(img.pixels[(yy * img.width + x) * img.channels]);
+    // A 1pt divider on a half-pixel boundary at 1x covers two pixels by half.
+    // Integrate contrast across its full physical width, preserving the native
+    // 234 +/- 3 opacity assertion instead of depending on the peak texel. This
+    // also rejects missing, half-opacity and double-width separators.
+    const background = Math.max(...samples);
+    return background - samples.reduce((sum, value) => sum + background - value, 0) / sc;
   };
   const inkIn = (png: string, id: string) => {
-    const img = decodePng(png); const sc = img.width / 1100; let m = 255;
+    const img = decodePng(png); const sc = decodedCaptureScale(img); let m = 255;
     for (let y = Math.round((R[id].y + 9) * sc); y < Math.round((R[id].y + 27) * sc); y++)
       for (let x = Math.round((R[id].x + 9) * sc); x < Math.round((R[id].x + 27) * sc); x++) m = Math.min(m, img.pixels[(y * img.width + x) * img.channels]);
     return m;
@@ -3656,7 +3735,7 @@ test("GlassToolbar: NSToolbar 玻璃胶囊——悬停/按下/选中底板叠加
   // inactive glass flattens: capsule left no highlight, bottom no shadow (active left 254, bottom
   // 227). Highlight 1px wide: per-column max in capsule left ±1.5pt (5x5 mean dilutes it).
   const rimMax = (png: string) => {
-    const img = decodePng(png); const sc = img.width / 1100; let m = 0;
+    const img = decodePng(png); const sc = decodedCaptureScale(img); let m = 0;
     const yy = Math.round((R.share.y + R.share.h / 2) * sc);
     for (let x = Math.round((cap1 - 1.5) * sc); x <= Math.round((cap1 + 1.5) * sc); x++) m = Math.max(m, img.pixels[(yy * img.width + x) * img.channels]);
     return m;
@@ -3674,7 +3753,7 @@ test("GlassToolbar: NSToolbar 玻璃胶囊——悬停/按下/选中底板叠加
   const dPlate = (png: string, id: string) => lumaAt(png, D[id].x + 5, D[id].y + D[id].h / 2);
   const dCorner = (id: string): [number, number] => [D[id].x + D[id].w - 3, D[id].y + D[id].h - 3];
   const inkMax = (png: string, id: string) => {
-    const img = decodePng(png); const sc = img.width / 1100; let m = 0;
+    const img = decodePng(png); const sc = decodedCaptureScale(img); let m = 0;
     for (let y = Math.round((D[id].y + 9) * sc); y < Math.round((D[id].y + 27) * sc); y++)
       for (let x = Math.round((D[id].x + 9) * sc); x < Math.round((D[id].x + 27) * sc); x++) m = Math.max(m, img.pixels[(y * img.width + x) * img.channels]);
     return m;
@@ -3756,13 +3835,13 @@ test("GlassControls: 按住旋钮变成 clear 玻璃透镜并放大、松开恢�
   const st = (await query("story.glasscontrols.stage"))[0]?.rect;
   assert(st, "controls stage missing");
   const at = (img: ReturnType<typeof decodePng>, x: number, y: number) => {
-    const scale = img.width / 1100;
+    const scale = decodedCaptureScale(img);
     const i = (Math.round((st!.y + y) * scale) * img.width + Math.round((st!.x + x) * scale)) * img.channels;
     return [img.pixels[i], img.pixels[i + 1], img.pixels[i + 2]];
   };
   // knob above one line (y=73, track 77..83 top) non-background width
   const knobWidth = (img: ReturnType<typeof decodePng>) => {
-    const scale = img.width / 1100; const row = Math.round((st!.y + 73) * scale); let lo = -1, hi = -1;
+    const scale = decodedCaptureScale(img); const row = Math.round((st!.y + 73) * scale); let lo = -1, hi = -1;
     for (let x = Math.round((st!.x + 290) * scale); x < Math.round((st!.x + 320) * scale); x++) {
       const v = img.pixels[(row * img.width + x) * img.channels];
       if (Math.abs(v - 128) > 5) { if (lo < 0) lo = x; hi = x; }
@@ -3789,7 +3868,7 @@ test("GlassControls: 按住旋钮变成 clear 玻璃透镜并放大、松开恢�
   // Widths come from one pixel row and double the left-edge distance, so their
   // resolution is two device pixels; the tolerance is three device pixels at
   // every DPI (±1.5 logical at 2×, as calibrated; ±3 at 100%).
-  const widthTol = 3 / (held.width / 1100);
+  const widthTol = 3 / (decodedCaptureScale(held));
   assert(Math.abs(wHeld - 20) <= widthTol && Math.abs(wRest - 13) <= widthTol, `按住时旋钮应放大成玻璃（y=73 行宽 ${wRest.toFixed(1)} -> ${wHeld.toFixed(1)}，原生 13 -> 20，容差 ${widthTol.toFixed(1)}）`);
   assert(Math.abs(inner - 136) <= 5, `玻璃透镜内部在灰 128 上应约 136（原生 178 灰 16% 涂层、无模糊），实测 ${inner}`);
   assert(white >= 245, `松开后旋钮应恢复白色实心，实测 ${white}`);
@@ -3817,7 +3896,7 @@ test("GlassAppKit: NSGlassEffectView 参数——tintColor alpha 是 tint 量、
   await settle(600);
   await shot("glassappkit");
   const img = decodePng(`${DIR}/story-glassappkit.png`);
-  const sc = img.width / 1100;
+  const sc = decodedCaptureScale(img);
   const rgb = (x: number, y: number) => { const i = (Math.round(y * sc) * img.width + Math.round(x * sc)) * img.channels; return [img.pixels[i], img.pixels[i + 1], img.pixels[i + 2]]; };
   const magenta = (c: number[]) => c[0] > 200 && c[1] < 80 && c[2] > 200;
   // contentView clip: the overflowing magenta square is cut at the glass edge, rounded corner
@@ -3856,7 +3935,7 @@ test("GlassIdiom: 同一玻璃按 macOS / iOS 实测 profile 渲染——iOS reg
   await settle(600);
   await shot("glassidiom");
   const img = decodePng(`${DIR}/story-glassidiom.png`);
-  const sc = img.width / 1100;
+  const sc = decodedCaptureScale(img);
   const rgb = (x: number, y: number) => { const i = (Math.round(y * sc) * img.width + Math.round(x * sc)) * img.channels; return [img.pixels[i], img.pixels[i + 1], img.pixels[i + 2]]; };
   const mean = (r: any, dx: number, dy: number, f: (c: number[]) => number) => {
     let s = 0, n = 0;
@@ -3887,7 +3966,7 @@ test("GlassIosBars: iOS 导航栏 / 工具栏 / 标签栏 / 玻璃按钮——�
   await settle(600);
   await shot("glassiosbars");
   const img = decodePng(`${DIR}/story-glassiosbars.png`);
-  const sc = img.width / 1100;
+  const sc = decodedCaptureScale(img);
   const rgb = (x: number, y: number) => { let s = [0, 0, 0], n = 0; for (let dx = -2; dx <= 2; dx++) for (let dy = -2; dy <= 2; dy++) { const i = (Math.round((y + dy * 0.5) * sc) * img.width + Math.round((x + dx * 0.5) * sc)) * img.channels; s = s.map((v, k) => v + img.pixels[i + k]); n++; } return s.map((v) => v / n); };
   const rect = async (id: string) => { const r = (await query(id))[0]?.rect; assert(r, `${id} missing`); return r!; };
   const near = (c: number[], want: number[], tol: number) => c.every((v, k) => Math.abs(v - want[k]) <= tol);
@@ -3943,13 +4022,13 @@ test("GlassIosBars tab lens: 按下即抬起透镜、platter 放大、拖动跟�
     const sample = async (name: string) => {
       await shot(name);
       img = decodePng(`${DIR}/story-${name}.png`);
-      const sc = img.width / 1100;
+      const sc = decodedCaptureScale(img);
       return (x: number, y: number) => { const i = (Math.round(y * sc) * img.width + Math.round(x * sc)) * img.channels; return [img.pixels[i], img.pixels[i + 1], img.pixels[i + 2]]; };
     };
     const fmt = (c: number[]) => c.map((v) => v.toFixed(0)).join(",");
     // Accent-blue pixels in a tab's icon box (24 pt icon, 5 pt from the button top)
     const blueIn = (r: { x: number; y: number; w: number }) => {
-      const sc = img.width / 1100;
+      const sc = decodedCaptureScale(img);
       let n = 0;
       for (let y = Math.round((r.y + 5) * sc); y < Math.round((r.y + 29) * sc); y++)
         for (let x = Math.round((r.x + r.w / 2 - 14) * sc); x < Math.round((r.x + r.w / 2 + 14) * sc); x++) {
@@ -3960,7 +4039,7 @@ test("GlassIosBars tab lens: 按下即抬起透镜、platter 放大、拖动跟�
     };
     // Plain-ink (near black) pixels in the same box
     const darkIn = (r: { x: number; y: number; w: number }) => {
-      const sc = img.width / 1100;
+      const sc = decodedCaptureScale(img);
       let n = 0;
       for (let y = Math.round((r.y + 5) * sc); y < Math.round((r.y + 29) * sc); y++)
         for (let x = Math.round((r.x + r.w / 2 - 14) * sc); x < Math.round((r.x + r.w / 2 + 14) * sc); x++) {
@@ -4023,7 +4102,7 @@ test("GlassConcentric: ConcentricRectangle 每角 = max(R − max(dx,dy), minimu
   assert(st, "concentric stage missing");
   await shot("glassconcentric");
   const img = decodePng(`${DIR}/story-glassconcentric.png`);
-  const scale = img.width / 1100;
+  const scale = decodedCaptureScale(img);
   // point within grid (row,col) relative to grid top-left
   const px = (row: number, col: number, x: number, y: number) =>
     img.pixels[(Math.round((st!.y + 20 + 140 * row + y) * scale) * img.width + Math.round((st!.x + 20 + 140 * col + x) * scale)) * img.channels];
@@ -4058,7 +4137,7 @@ test("GlassExtension: backgroundExtensionEffect 镜像铺满延伸区、只模�
   assert(st, "extension stage missing");
   await shot("glassextension");
   const img = decodePng(`${DIR}/story-glassextension.png`);
-  const scale = img.width / 1100;
+  const scale = decodedCaptureScale(img);
   const at = (x: number, y: number) => {
     const i = (Math.round((st!.y + y) * scale) * img.width + Math.round((st!.x + x) * scale)) * img.channels;
     return [img.pixels[i], img.pixels[i + 1], img.pixels[i + 2]];
@@ -4684,6 +4763,58 @@ test("IME: Textarea 取消 —— 失焦不把 marked text 写进 doc", async ()
   await shot("ime-textarea-cancel");
 });
 
+// Harness injection verifies editor/render behavior independently of desktop IME engines.
+for (const fixture of [
+  { language: "Japanese", text: "こんにちは", cancelled: "日本語", shot: "japanese" },
+  { language: "Korean", text: "안녕", cancelled: "한국어", shot: "korean" },
+]) {
+  test(`IME multilingual: ${fixture.language} replacement, commit and cancellation`, async () => {
+    await switchTo("input");
+    await clearInput("story.input.name");
+    const bytes = new TextEncoder().encode(fixture.text).length;
+    await imePreedit(fixture.text, 3);
+    await sleep(120);
+    const composing = await inputState("story.input.name");
+    assert(composing.buffer === "" && composing.ime_preedit_len === bytes,
+      `preedit changed document or byte length: ${JSON.stringify(composing)}`);
+    assert((await visibleText("story.input.name")).includes(fixture.text), "preedit missing from rendered text");
+    await shot(`ime-${fixture.shot}-preedit`);
+    await imeCommit(fixture.text);
+    await sleep(120);
+    const committed = await inputState("story.input.name");
+    assert(committed.buffer === fixture.text && committed.cursor_pos === bytes && committed.ime_preedit_len === 0,
+      `incorrect multilingual commit: ${JSON.stringify(committed)}`);
+    await imePreedit(fixture.cancelled, 3);
+    const blurClick = await clickTestId("story.input.email");
+    assert(blurClick.ok, `Email focus click failed: ${JSON.stringify(blurClick)}`);
+    await sleep(120);
+    const cancelled = await inputState("story.input.name");
+    assert(cancelled.buffer === fixture.text && cancelled.ime_preedit_len === 0,
+      `blur leaked composition: ${JSON.stringify(cancelled)}`);
+    assert(!(await visibleText("story.input.name")).includes(fixture.cancelled), "cancelled preedit still rendered");
+    await shot(`ime-${fixture.shot}-commit-cancel`);
+  });
+}
+
+test("IME multilingual: rapid replacement and mixed UTF-8 commit order", async () => {
+  await switchTo("input");
+  await clearInput("story.input.name");
+  // No artificial delays between acknowledged commands: exercise successive owned events.
+  for (let i = 0; i < 48; i++) await imePreedit(i % 2 ? "안녕" : "こんにちは", 3);
+  await sleep(120);
+  const replacement = await inputState("story.input.name");
+  assert(replacement.buffer === "" && replacement.ime_preedit_len === 6,
+    `rapid replacement accumulated or committed: ${JSON.stringify(replacement)}`);
+  for (const text of ["日本語", "한국어", "中文", "café"]) await imeCommit(text);
+  await sleep(120);
+  const committed = await inputState("story.input.name");
+  const expected = "日本語한국어中文café";
+  assert(committed.buffer === expected && committed.cursor_pos === new TextEncoder().encode(expected).length && committed.ime_preedit_len === 0,
+    `rapid mixed commit lost order/bytes: ${JSON.stringify(committed)}`);
+  assert((await visibleText("story.input.name")).includes(expected), "mixed commit missing from rendered text");
+  await shot("ime-multilingual-rapid");
+});
+
 // 2026-08-16 core review fix batch regression anchors (story + e2e dual verification)
 
 /// read test_id node's own text (no subtree).
@@ -5115,8 +5246,10 @@ test("popover: tall content shrinks to viewport and never covers its trigger", a
   assert(settled != null, "tall popover content 消失");
   appendLog(`  trigger=${JSON.stringify(trigger.rect)} content(first)=${JSON.stringify(content.rect)} content(settled)=${JSON.stringify(settled.rect)}`);
   await shot("popover-tall-autosize");
-  // storybook window fixed 1100x1000 (examples/storybook/main.zig), rect is window logical coords
-  const vpH = 1000;
+  // Native compositors may choose a different client extent. Check against
+  // the same logical viewport used by popover layout, including after resize.
+  const vpH = (await tree()).rect.h;
+  assert(vpH > 0, "missing native client height");
   // Precondition: content actually exceeds window (else assertion on air)
   assert(settled.rect.h < 1400, `面板高度 ${settled.rect.h} 未被收紧（内容 1400+px）`);
   assert(settled.rect.h <= vpH, `面板高度 ${settled.rect.h} 超出 viewport ${vpH}`);
@@ -5179,8 +5312,8 @@ test("Storybook 搜索: 输入过滤导航、分组标题随行隐藏、无匹�
   let out = await sidebarText();
   appendLog(`  search "glass": ${out.join(" │ ")}`);
   assert(out.includes("Liquid Glass") && out.includes("Glass Lab"), `应保留 Glass* 行 — ${out.join(" │ ")}`);
-  assert(out.includes("LIQUID GLASS"), `匹配行的分组标题应保留 — ${out.join(" │ ")}`);
-  assert(!out.includes("Button") && !out.includes("ACTIONS"), `不匹配的行与空分组应隐藏 — ${out.join(" │ ")}`);
+  assert(out.includes("Liquid glass"), `匹配行的分组标题应保留 — ${out.join(" │ ")}`);
+  assert(!out.includes("Button") && !out.includes("Actions"), `不匹配的行与空分组应隐藏 — ${out.join(" │ ")}`);
   await shot("search-glass");
 
   // Filtered rows remain clickable
@@ -5198,7 +5331,7 @@ test("Storybook 搜索: 输入过滤导航、分组标题随行隐藏、无匹�
 
   await clearSearch();
   out = await sidebarText();
-  assert(out.includes("Button") && out.includes("ACTIONS") && out.includes("Liquid Glass"), `清空后应恢复完整列表 — ${out.join(" │ ")}`);
+  assert(out.includes("Button") && out.includes("Actions") && out.includes("Liquid Glass"), `清空后应恢复完整列表 — ${out.join(" │ ")}`);
   assert(!out.includes("No matching components"), "清空后不应残留无匹配提示");
   await switchTo("button");
 });

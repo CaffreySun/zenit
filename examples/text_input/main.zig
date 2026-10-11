@@ -12,6 +12,7 @@
 ///
 /// UI (with controlled uppercase input) is in view.yix; this file just starts it.
 const std = @import("std");
+const builtin = @import("builtin");
 const ui = @import("ui");
 const App = @import("zenit_app").App;
 const TextInputDemo = @import("_view.yix.zig").TextInputDemo;
@@ -26,7 +27,20 @@ pub fn main(init: std.process.Init) !void {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
 
-    const app = try App.init(gpa.allocator(), .{
+    const app = if (comptime builtin.os.tag == .linux) blk: {
+        var allow_software = false;
+        var validation = false;
+        const args = try init.minimal.args.toSlice(init.arena.allocator());
+        for (args[1..]) |arg| {
+            if (std.mem.eql(u8, arg, "--allow-software")) allow_software = true else if (std.mem.eql(u8, arg, "--validation")) validation = true else return error.InvalidArgument;
+        }
+        break :blk try App.init(gpa.allocator(), .{
+            .io = init.io,
+            .window = .{ .width = 600, .height = 620, .title = "Text Input Demo" },
+            .allow_software_gpu = allow_software,
+            .require_gpu_validation = validation,
+        });
+    } else try App.init(gpa.allocator(), .{
         .io = init.io,
         .window = .{ .width = 600, .height = 620, .title = "Text Input Demo" },
     });

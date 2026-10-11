@@ -680,13 +680,14 @@ pub const HitBehavior = enum {
 };
 
 /// Resolved hit role (all three roles finalized). Consumer sees only this type.
-pub const HitRoles = packed struct(u3) {
+pub const HitRoles = packed struct(u4) {
     pointer: bool = false,
     scroll: bool = false,
     inspect: bool = true,
+    window_chrome: bool = false,
 
     pub fn any(self: HitRoles) bool {
-        return self.pointer or self.scroll or self.inspect;
+        return self.pointer or self.scroll or self.inspect or self.window_chrome;
     }
 };
 
@@ -707,6 +708,7 @@ pub const HitRolesOverride = struct {
             .pointer = self.pointer orelse base.pointer,
             .scroll = self.scroll orelse base.scroll,
             .inspect = self.inspect orelse base.inspect,
+            .window_chrome = base.window_chrome,
         };
     }
 };

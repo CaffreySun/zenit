@@ -988,6 +988,7 @@ fn eventToKindTag(event: Event) debug_trace.EventKindTag {
         .text_input => .text_input,
         .ime_preedit => .ime_preedit,
         .ime_commit => .ime_commit,
+        .ime_delete_surrounding => .ime_delete_surrounding,
         .focus => .focus,
         .blur => .blur,
     };

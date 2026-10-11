@@ -261,6 +261,8 @@ pub const TextInputState = struct {
     ime_preedit: ImeText = .{},
     ime_preedit_len: usize = 0,
     ime_cursor_utf8_offset: usize = 0,
+    ime_cursor_visible: bool = true,
+    ime_selection_end: ?usize = null,
     ime_phase: ImeComposePhase = .idle,
     ime_pending_commit: ImeText = .{},
     ime_replacement: ?ImeReplacement = null,
@@ -320,6 +322,11 @@ pub const TextInputState = struct {
     on_submit: ?core.HandlerRef = null,
     /// Called after composition cancel: binding applies deferred external writes from composition.
     on_ime_cancelled: ?core.HandlerRef = null,
+    /// EditableText only: the component enters editing itself when pressed and leaves it on
+    /// Enter (single line), Escape or blur (`EditableTextProps.activation = .click`).
+    editable_click_activation: bool = false,
+    /// EditableText only: editing mode is on (input handler attached, focusable).
+    editable_editing: bool = false,
 
     // ========== Doc sync ==========
 
@@ -541,7 +548,7 @@ pub const TextInputState = struct {
     }
 
     pub fn shouldShowImeSelectionHighlight(self: *const TextInputState) bool {
-        return self.hasImePreedit() and self.ime_selection_highlight;
+        return self.hasImePreedit() and (if (self.ime_selection_end) |end| end != self.ime_cursor_utf8_offset else self.ime_selection_highlight);
     }
 
     fn clearImePendingCommit(self: *TextInputState) void {
@@ -557,7 +564,24 @@ pub const TextInputState = struct {
         return text.len > 0 and std.mem.eql(u8, self.ime_pending_commit.text(), text);
     }
 
+    pub fn setImeAttributes(self: *TextInputState, visible: bool, end: ?u32) void {
+        self.ime_cursor_visible = visible;
+        self.ime_selection_end = if (end) |value| text_coordinates.clampByteOffset(self.preeditText(), .{ .value = value }, .forward).value else null;
+    }
+    pub fn handleImeDeleteSurrounding(self: *TextInputState, before: u32, after: u32) !void {
+        const caret = self.cursor_pos;
+        const anchor = self.selection_anchor;
+        const range = @import("../../core/text_input_protocol.zig").deletion(self.getText(), caret, anchor orelse caret, before, after) orelse return;
+        var selected = try ImeText.init(self.allocator, self.getText()[range.selection_start..range.selection_end]);
+        defer selected.deinit();
+        try self.handleImeCommitReplaceEventChecked(selected.text(), @intCast(range.start), @intCast(range.end));
+        self.cursor_pos = caret - before;
+        self.selection_anchor = if (anchor) |value| value - before else null;
+        self.syncDocFromCursor();
+    }
+
     pub fn effectiveImeCursorOffset(self: *const TextInputState) usize {
+        if (self.ime_selection_end != null) return self.ime_cursor_utf8_offset;
         const raw = editable_block.effectiveImeCursorOffset(
             self.ime_preedit_len,
             self.ime_cursor_utf8_offset,
@@ -750,6 +774,8 @@ pub const TextInputState = struct {
         }
         self.ime_preedit = candidate;
         self.ime_preedit_len = candidate.len;
+        self.ime_cursor_visible = true;
+        self.ime_selection_end = null;
         self.ime_cursor_utf8_offset = text_coordinates.clampByteOffset(
             self.preeditText(),
             .{ .value = cursor_utf8_offset },
@@ -774,6 +800,8 @@ pub const TextInputState = struct {
     }
 
     pub fn clearImePreedit(self: *TextInputState) void {
+        self.ime_cursor_visible = true;
+        self.ime_selection_end = null;
         self.ime_preedit.deinit();
         self.ime_replacement = null;
         self.ime_visual_valid = false;
@@ -2522,7 +2550,7 @@ pub const TextInputState = struct {
                     } else 0;
                     self.dirty = true;
                     self.resetBlink();
-                } else if (modifiers.alt or (@import("builtin").target.os.tag == .windows and modifiers.ctrl)) {
+                } else if (modifiers.alt or ((@import("builtin").target.os.tag == .windows or @import("builtin").target.os.tag == .linux) and modifiers.ctrl)) {
                     // Alt+Left: move word-left
                     if (modifiers.shift and self.selection_anchor == null) {
                         self.selection_anchor = self.cursor_pos;
@@ -2562,7 +2590,7 @@ pub const TextInputState = struct {
                     } else self.buffer_len;
                     self.dirty = true;
                     self.resetBlink();
-                } else if (modifiers.alt or (@import("builtin").target.os.tag == .windows and modifiers.ctrl)) {
+                } else if (modifiers.alt or ((@import("builtin").target.os.tag == .windows or @import("builtin").target.os.tag == .linux) and modifiers.ctrl)) {
                     // Alt+Right: move word-right
                     if (modifiers.shift and self.selection_anchor == null) {
                         self.selection_anchor = self.cursor_pos;
@@ -2583,7 +2611,7 @@ pub const TextInputState = struct {
                 return true;
             },
             .delete => {
-                if (modifiers.super or modifiers.alt or (@import("builtin").target.os.tag == .windows and modifiers.ctrl)) {
+                if (modifiers.super or modifiers.alt or ((@import("builtin").target.os.tag == .windows or @import("builtin").target.os.tag == .linux) and modifiers.ctrl)) {
                     const cursor = @min(self.cursor_pos, self.getText().len);
                     const anchor = @min(self.selection_anchor orelse cursor, self.getText().len);
                     const start = if (anchor != cursor)
@@ -2621,7 +2649,7 @@ pub const TextInputState = struct {
                 return false;
             },
             .y => {
-                if (@import("builtin").target.os.tag == .windows and modifiers.ctrl) {
+                if ((@import("builtin").target.os.tag == .windows or @import("builtin").target.os.tag == .linux) and modifiers.ctrl) {
                     self.redo();
                     return true;
                 }
@@ -3802,4 +3830,24 @@ test "Input stationary edge drag preserves anchor and stops at bounds" {
     try t.expectEqual(@as(f32, 0), state.scroll_x);
     try t.expectEqual(@as(usize, 0), state.cursor_pos);
     try t.expect(!state.advanceEdgeDrag(2500));
+}
+
+test "IME relative deletion excludes selected bytes and preserves backwards selection" {
+    var state = gcMakeState("A你SEL好Z");
+    defer state.deinit();
+    state.cursor_pos = 4;
+    state.selection_anchor = 7;
+    try state.handleImeDeleteSurrounding(3, 3);
+    try testing.expectEqualStrings("ASELZ", state.getText());
+    try testing.expectEqual(@as(usize, 1), state.cursor_pos);
+    try testing.expectEqual(@as(?usize, 4), state.selection_anchor);
+    try state.handleImeDeleteSurrounding(2, 0);
+    try testing.expectEqualStrings("ASELZ", state.getText());
+    state.setImePreedit("你好吗", 3);
+    state.setImeAttributes(false, 6);
+    try testing.expect(!state.ime_cursor_visible);
+    try testing.expectEqual(@as(usize, 3), state.effectiveImeCursorOffset());
+    try testing.expect(state.shouldShowImeSelectionHighlight());
+    state.clearImePreedit();
+    try testing.expect(state.ime_cursor_visible);
 }

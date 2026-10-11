@@ -37,7 +37,9 @@ pub fn open() void {
 pub fn mount(owner: *App, cx: *ui.Cx, scope: *ui.Scope) !void {
     app = owner;
     visible = try scope.createSignal(bool, false);
-    const modal = try ui.widgets.Modal(.{ .title = "Retained pixel contract", .width = 520, .open = visible }).mount(scope, cx);
+    // Compare retained and full pixels at the same fixed transform. Opening
+    // animation timing is covered separately from this cache correctness fixture.
+    const modal = try ui.widgets.Modal(.{ .title = "Retained pixel contract", .width = 520, .open = visible, .enter_transition = .none, .exit_transition = .none }).mount(scope, cx);
     if (!modal.portaled) try cx.root.?.appendChild(cx.allocator, modal.overlay);
     modal.dialog.meta.ownership.meta.test_id = "retained.dialog";
     const actions = try cx.bindState(Actions, .{});

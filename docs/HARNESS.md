@@ -144,3 +144,14 @@ Do not pass `-Dtest-mode=true` to release builds. A normal build compiles out
 Harness initialization and exposes no file-RPC automation endpoint. The native
 recording bridge may still be linked as framework infrastructure, but it is not
 registered or reachable without Harness mode.
+
+### Linux native window controls
+
+`POST /window` runs native window operations on the application's UI thread.
+The body is `{ "action": "status" }` (default), `maximize`, `restore`, `minimize`,
+or `close`. The response reports `decorated`, external `decoration_height`,
+compositor `maximized`, `active`, `suspended`, and logical content dimensions.
+Requests acknowledge dispatch, not compositor completion: poll status after
+maximize/restore. Minimize has no portable Wayland acknowledgement; verify the
+compositor image. Close uses the native decoration callback and normal teardown.
+Unsupported platforms return an error.

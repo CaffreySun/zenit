@@ -253,6 +253,13 @@ fn dispatchRequest(queue: *CommandQueue, method: []const u8, path: []const u8, b
             }
             return .{ .status = 400, .body = "{\"error\":\"invalid payload\"}" };
         }
+        if (std.mem.eql(u8, path, "/key_up")) {
+            if (parseKeyDown(body)) |cmd| {
+                const result = queue.submitAndWait(.{ .key_up = cmd.key_down });
+                return .{ .status = 200, .body = result.getData() };
+            }
+            return .{ .status = 400, .body = "{\"error\":\"invalid key_up payload\"}" };
+        }
         if (std.mem.eql(u8, path, "/key_down")) {
             if (parseKeyDown(body)) |cmd| {
                 const result = queue.submitAndWait(cmd);
@@ -338,6 +345,17 @@ fn dispatchRequest(queue: *CommandQueue, method: []const u8, path: []const u8, b
             }
             return .{ .status = 400, .body = "{\"error\":\"invalid resize payload\"}" };
         }
+        if (std.mem.eql(u8, path, "/window")) {
+            const action = findJsonString(body, "action") orelse "status";
+            const command = std.meta.stringToEnum(command_queue.WindowCommand, action) orelse
+                return .{ .status = 400, .body = "{\"error\":\"invalid window action\"}" };
+            const result = queue.submitAndWait(.{ .window = command });
+            return .{ .status = 200, .body = result.getData() };
+        }
+        if (std.mem.eql(u8, path, "/quit")) {
+            const result = queue.submitAndWait(.{ .quit_app = {} });
+            return .{ .status = 200, .body = result.getData() };
+        }
         if (std.mem.eql(u8, path, "/magnify")) {
             if (parseMagnify(body)) |cmd| {
                 const result = queue.submitAndWait(cmd);
@@ -383,7 +401,7 @@ fn dispatchRequest(queue: *CommandQueue, method: []const u8, path: []const u8, b
             copyTestId(v.test_id, &target);
             copyTestId(v.click_test_id, &click);
             copyTestId(v.path, &output);
-            if (builtin.os.tag != .windows) return .{ .status = 400, .body = "{\"error\":\"timed capture requires Windows\"}" };
+            if (builtin.os.tag != .windows and builtin.os.tag != .linux) return .{ .status = 400, .body = "{\"error\":\"timed capture requires Windows or Linux\"}" };
             const started = queue.submitAndWait(.{ .frames_start = .{ .target = target, .click_target = click, .capture_path = output, .capture_after_ms = after_ms } });
             if (!started.success) return .{ .status = 400, .body = started.getData() };
             // File-RPC thread waits; the UI/render thread keeps animating. No

@@ -292,6 +292,7 @@ pub const PointerDownFocus = enum {
 
 /// Node interaction metadata (v0.5: focus + semantics 5 fields collapsed -> 1 NodeInteraction).
 pub const NodeInteraction = struct {
+    window_region: @import("system_sdk").window_chrome.Region = .inherit,
     /// Focus management
     focusable: bool = false,
     tab_index: ?i32 = null,

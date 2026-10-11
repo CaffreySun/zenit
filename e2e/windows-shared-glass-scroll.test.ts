@@ -5,7 +5,8 @@ import { assert, getSessionDir, run, test } from './runner';
 
 test('Shared GlassChrome refreshes scrolling backdrop and restores clipped surfaces', async () => {
   await waitForServerReady(15000);
-  assert((await stats()).renderer_backend === 'd3d12', 'requires shared D3D12');
+  const backend = (await stats()).renderer_backend;
+  assert(backend === 'd3d12' || backend === 'd3d11', 'requires a shared Windows renderer');
   assert((await clickTestId('nav.glasschrome')).ok, 'navigation failed');
   await waitFor(async () => (await query('story.glasschrome.edge'))[0] || null, 15000, 50);
   await mouseMove(20, 20);

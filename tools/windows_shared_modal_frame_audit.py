@@ -63,7 +63,7 @@ def audit(folder, desktop=False):
             if not re.fullmatch(r'shared-\d+-frame-\d+\.json', name):
                 continue
             meta = json.loads(archive.read(name))
-            if meta['backend'] != 'd3d12':
+            if meta['backend'] not in ('d3d11', 'd3d12'):
                 raise ValueError('unexpected frame backend')
             key = (meta['window_id'], meta['index'], meta['frame_serial'])
             if key in seen:
@@ -175,7 +175,7 @@ def audit(folder, desktop=False):
                             'max_interior_error': interior_error})
         passed = (starts >= 3 and closes >= 3 and entering >= 3 and exiting >= 3 and prior == 0
                   and all(r['stale_pixels'] <= 10 and r['max_interior_error'] <= 3 and r['desktop_target_mismatch_pixels'] <= 10 for r in results))
-        report = {'passed': passed, 'capture_source': 'DXGI desktop duplication of D3D12 after DwmFlush with verified frame serial' if desktop else 'D3D12 retained submitted surface',
+        report = {'passed': passed, 'capture_source': 'DXGI desktop duplication of Direct3D after DwmFlush with verified frame serial' if desktop else 'Direct3D retained submitted surface',
                   'archive_frames': len(seen), 'modal_frames': len(records), 'starts': starts, 'closes': closes,
                   'entry_intermediates': entering, 'exit_intermediates': exiting, 'complete_frame_archive': True,
                   'max_desktop_target_mismatch_pixels': max(r['desktop_target_mismatch_pixels'] for r in results),

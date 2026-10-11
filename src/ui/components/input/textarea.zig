@@ -104,6 +104,8 @@ pub const TextareaState = struct {
     ime_preedit: ImeText = .{},
     ime_preedit_len: usize = 0,
     ime_cursor_utf8_offset: usize = 0,
+    ime_cursor_visible: bool = true,
+    ime_selection_end: ?usize = null,
     /// Persistent composed display text. Dynamic storage avoids truncating a
     /// long wrapped segment before/after the preedit insertion point.
     ime_render_buffer: std.ArrayListUnmanaged(u8) = .empty,
@@ -908,11 +910,11 @@ pub const TextareaState = struct {
                 return true;
             },
             .left => {
-                if (modifiers.super) self.moveToLineStart(modifiers.shift) else if (modifiers.alt or (@import("builtin").target.os.tag == .windows and modifiers.ctrl)) self.moveWordLeft(modifiers.shift) else self.moveCursorLeft(modifiers.shift);
+                if (modifiers.super) self.moveToLineStart(modifiers.shift) else if (modifiers.alt or ((@import("builtin").target.os.tag == .windows or @import("builtin").target.os.tag == .linux) and modifiers.ctrl)) self.moveWordLeft(modifiers.shift) else self.moveCursorLeft(modifiers.shift);
                 return true;
             },
             .right => {
-                if (modifiers.super) self.moveToLineEnd(modifiers.shift) else if (modifiers.alt or (@import("builtin").target.os.tag == .windows and modifiers.ctrl)) self.moveWordRight(modifiers.shift) else self.moveCursorRight(modifiers.shift);
+                if (modifiers.super) self.moveToLineEnd(modifiers.shift) else if (modifiers.alt or ((@import("builtin").target.os.tag == .windows or @import("builtin").target.os.tag == .linux) and modifiers.ctrl)) self.moveWordRight(modifiers.shift) else self.moveCursorRight(modifiers.shift);
                 return true;
             },
             .up => {
@@ -924,11 +926,11 @@ pub const TextareaState = struct {
                 return true;
             },
             .delete => {
-                if (modifiers.super) self.deleteToLineStart() else if (modifiers.alt or (@import("builtin").target.os.tag == .windows and modifiers.ctrl)) self.deleteWordBackward() else self.deleteBackward();
+                if (modifiers.super) self.deleteToLineStart() else if (modifiers.alt or ((@import("builtin").target.os.tag == .windows or @import("builtin").target.os.tag == .linux) and modifiers.ctrl)) self.deleteWordBackward() else self.deleteBackward();
                 return true;
             },
             .forward_delete => {
-                if (modifiers.alt or (@import("builtin").target.os.tag == .windows and modifiers.ctrl)) self.deleteWordForward() else self.deleteForward();
+                if (modifiers.alt or ((@import("builtin").target.os.tag == .windows or @import("builtin").target.os.tag == .linux) and modifiers.ctrl)) self.deleteWordForward() else self.deleteForward();
                 return true;
             },
             .z => {
@@ -939,7 +941,7 @@ pub const TextareaState = struct {
                 return false;
             },
             .y => {
-                if (@import("builtin").target.os.tag == .windows and modifiers.ctrl) {
+                if ((@import("builtin").target.os.tag == .windows or @import("builtin").target.os.tag == .linux) and modifiers.ctrl) {
                     self.redo();
                     return true;
                 }
@@ -1092,6 +1094,8 @@ pub const TextareaState = struct {
         self.ime_preedit.deinit();
         self.ime_preedit = candidate;
         self.ime_preedit_len = candidate.len;
+        self.ime_cursor_visible = true;
+        self.ime_selection_end = null;
         self.ime_cursor_utf8_offset = text_coordinates.clampByteOffset(self.preeditText(), .{ .value = cursor_offset }, .forward).value;
         if (self.cursor.anchor == self.cursor.offset) self.cursor.anchor = null;
         self.cursor_affinity = .downstream;
@@ -1211,11 +1215,29 @@ pub const TextareaState = struct {
         }
     }
 
+    pub fn setImeAttributes(self: *TextareaState, visible: bool, end: ?u32) void {
+        self.ime_cursor_visible = visible;
+        self.ime_selection_end = if (end) |value| text_coordinates.clampByteOffset(self.preeditText(), .{ .value = value }, .forward).value else null;
+    }
+    pub fn handleImeDeleteSurrounding(self: *TextareaState, before: u32, after: u32) !void {
+        const caret = self.cursor.offset;
+        const anchor = self.cursor.anchor;
+        const range = @import("../../core/text_input_protocol.zig").deletion(self.getText(), caret, anchor orelse caret, before, after) orelse return;
+        var selected = try ImeText.init(self.allocator, self.getText()[range.selection_start..range.selection_end]);
+        defer selected.deinit();
+        try self.handleImeCommitReplaceChecked(selected.text(), @intCast(range.start), @intCast(range.end));
+        self.cursor.offset = caret - before;
+        self.cursor.anchor = if (anchor) |value| value - before else null;
+    }
+
     fn effectiveImeCursorOffset(self: *const TextareaState) usize {
+        if (self.ime_selection_end != null) return self.ime_cursor_utf8_offset;
         return editable_block.effectiveImeCursorOffset(self.ime_preedit_len, self.ime_cursor_utf8_offset, self.ime_selection_highlight);
     }
 
     fn clearImePreedit(self: *TextareaState) void {
+        self.ime_cursor_visible = true;
+        self.ime_selection_end = null;
         self.ime_preedit.deinit();
         self.ime_replacement = null;
         if (self.ime_preedit_len > 0) {
@@ -1483,6 +1505,12 @@ fn handleTextareaEvent(state: *TextareaState, event: Event) EventResult {
             input.len = sanitizeText(input.text(), input.mutableText()).len;
             const filtered = input.text();
             state.handleImePreeditReplaceChecked(filtered, e.cursor_utf8_offset, e.replace_start_utf8, e.replace_end_utf8) catch return .handled;
+            state.setImeAttributes(e.cursor_visible, e.selection_end_utf8);
+            return .handled;
+        },
+        .ime_delete_surrounding => |e| {
+            state.handleImeDeleteSurrounding(e.before_bytes, e.after_bytes) catch return .handled;
+            fireOnChange(state);
             return .handled;
         },
         .ime_commit => |e| {
@@ -1848,7 +1876,7 @@ fn textareaBeforeRender(node: *Node) void {
 
     // Caret blink
     const now = @import("zenit_time").Instant.now(state.io) catch null;
-    const blink_visible = if (state.focused and now != null) state.blinkVisible(now.?) else state.focused;
+    const blink_visible = (!state.hasImePreedit() or state.ime_cursor_visible) and (if (state.focused and now != null) state.blinkVisible(now.?) else state.focused);
     if (state.focused and now != null) {
         if (state.cx_ref) |cx| cx.scheduleRedrawAfterNs(state.nextBlinkDelayNs(now.?));
         if (blink_visible != state.last_blink_visible) node.markRenderDirty();
@@ -1956,7 +1984,20 @@ fn textareaBeforeRender(node: *Node) void {
     if (state.selection_node) |sel| {
         var placements: std.ArrayListUnmanaged(TextareaState.SelectionPlacement) = .empty;
         defer placements.deinit(state.allocator);
-        state.collectSelectionPlacements(state.allocator, &placements) catch placements.clearRetainingCapacity();
+        if (state.hasImePreedit() and state.ime_selection_end != null) {
+            if (state.visualLineAtOffset(state.cursor.offset)) |geometry| {
+                if (state.imeVisualGeometry(geometry)) |ime| {
+                    const begin = @min(state.ime_cursor_utf8_offset, state.ime_selection_end.?);
+                    const end = @max(state.ime_cursor_utf8_offset, state.ime_selection_end.?);
+                    const storage = state.allocator.alloc(text_coordinates.SelectionRect, @max(ime.line.caret_stops.len, 1)) catch null;
+                    if (storage) |rects| {
+                        defer state.allocator.free(rects);
+                        const resolved = ime.line.selectionRects(.{ .value = ime.insert_offset + begin }, .{ .value = ime.insert_offset + end }, rects) catch rects[0..0];
+                        for (resolved) |rect| placements.append(state.allocator, .{ .display_line = geometry.display_line, .rect = rect }) catch {};
+                    }
+                }
+            }
+        } else state.collectSelectionPlacements(state.allocator, &placements) catch placements.clearRetainingCapacity();
         if (placements.items.len > 0) {
             const sel_bg = state.tokens.tokens.color.selection_bg;
             const first = placements.items[0];
@@ -4250,4 +4291,29 @@ test "Textarea Home End navigation retains shift anchor and UTF8 offsets" {
     try t.expect(state.handleKeyDown(.end, .{ .ctrl = true }));
     try t.expectEqual(doc.totalLength(), state.cursor.offset);
     try t.expectEqual(@as(?usize, null), state.cursor.anchor);
+}
+
+test "IME textarea surrounding deletion preserves selected bytes and cursor direction" {
+    const t = std.testing;
+    var doc = TextareaDocument.init(t.allocator);
+    defer doc.deinit();
+    try doc.insertAt(0, "A你SEL好Z");
+    var wrap = TextareaWrapMap.init(t.allocator, t.io);
+    defer wrap.deinit();
+    var state: TextareaState = .{ .io = t.io, .allocator = t.allocator, .doc = &doc, .wrap_map = &wrap };
+    defer state.deinit();
+    state.cursor.offset = 4;
+    state.cursor.anchor = 7;
+    try state.handleImeDeleteSurrounding(3, 3);
+    try t.expectEqualStrings("ASELZ", state.getText());
+    try t.expectEqual(@as(usize, 1), state.cursor.offset);
+    try t.expectEqual(@as(?usize, 4), state.cursor.anchor);
+    try state.handleImeDeleteSurrounding(2, 0);
+    try t.expectEqualStrings("ASELZ", state.getText());
+    state.handleImePreedit("你好吗", 3);
+    state.setImeAttributes(false, 6);
+    try t.expect(!state.ime_cursor_visible);
+    try t.expectEqual(@as(usize, 3), state.effectiveImeCursorOffset());
+    state.clearImePreedit();
+    try t.expect(state.ime_cursor_visible);
 }

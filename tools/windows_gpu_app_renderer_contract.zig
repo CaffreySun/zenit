@@ -162,7 +162,7 @@ fn checkAliasCopies(device: *gpu.Backend.Device) !void {
         try encoder.copyTextureToBuffer(&dst, region, &readback, 0, 256);
         var command = try encoder.finish();
         defer command.deinit();
-        const serial = try device.context.queue.submit(&.{command});
+        const serial = try device.context.submitCommands(&.{command});
         try device.context.queue.wait(serial, 5000);
         if (!std.mem.eql(u8, try readback.getMappedRange(0, 16), &bytes)) return error.AliasCopyConvertedPixels;
     }

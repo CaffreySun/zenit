@@ -49,7 +49,7 @@ pub const ShaderModule = struct {
             // of the larger sources takes hundreds of ms to seconds. Report the
             // slow ones so a slow first frame can be attributed.
             const compile_ms = GetTickCount64() -% compile_start;
-            if (compile_ms >= 100) std.log.info("[d3d12] HLSL compile {s} took {d} ms (DXBC now cached for later launches)", .{ entry.name, compile_ms });
+            if (compile_ms >= 100) std.log.info("[{s}] HLSL compile {s} took {d} ms", .{ @tagName(gpu.backend_kind), entry.name, compile_ms });
             defer if (message) |bytes| zenit_d12_shader_diagnostic_free(bytes);
             errdefer if (raw) |shader| zenit_d12_shader_release(shader);
             if (message) |bytes| {

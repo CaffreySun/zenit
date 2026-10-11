@@ -56,7 +56,7 @@ def audit(folder):
                 continue
             meta = json.loads(archive.read(name))
             key = (meta['window_id'], meta['index'], meta['frame_serial'])
-            if key in seen or meta['backend'] != 'd3d12' or meta['animation_clock_step_ms'] is not None:
+            if key in seen or meta['backend'] not in ('d3d11', 'd3d12') or meta['animation_clock_step_ms'] is not None:
                 raise ValueError('duplicate frame, wrong backend or controlled clock')
             seen.add(key)
             stem = name[:-5]
@@ -116,7 +116,7 @@ def audit(folder):
             cycles[-1]['exits'] += exiting
         prior_alpha, prior_x = alpha, x if alpha > 0 else 1100
     return dict(passed=starts == closes == 3 and all(c['entries'] and c['exits'] and c['settled'] and c['closed'] for c in cycles) and all(r['passed'] for r in records),
-                capture_source='D3D12 retained submitted surface', animation_clock='real time',
+                capture_source='Direct3D retained submitted surface', animation_clock='real time',
                 archive_frames=len(seen), checked_frames=len(records), starts=starts, closes=closes,
                 entry_intermediates=entries, exit_intermediates=exits, settled_frames=settled, cycles=cycles, frames=records)
 

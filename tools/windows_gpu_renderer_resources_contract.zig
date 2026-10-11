@@ -29,7 +29,9 @@ fn timeoutRetry() !void {
     defer if (texture_live) texture.destroy();
     const bytes = [_]u8{ 1, 2, 3, 255, 4, 5, 6, 255, 7, 8, 9, 255, 10, 11, 12, 255 };
     context.timeout_ms = 0;
-    try expectError(error.GpuTimeout, texture.writeRegion(0, 0, 0, 2, 2, &bytes, 8));
+    // Writes are recorded, not waited on: a blocked GPU must not stall them.
+    try texture.writeRegion(0, 0, 0, 2, 2, &bytes, 8);
+    if (context.pending_uploads == null) return error.UploadNotRecorded;
     var readback = try context.device.createBuffer(a, .{ .size = 264, .usage = .{ .map_read = true, .copy_dst = true } });
     defer readback.destroy();
     var encoder = try context.device.createCommandEncoder();
@@ -37,7 +39,9 @@ fn timeoutRetry() !void {
     try encoder.copyTextureToBuffer(&texture.inner, .{ .width = 2, .height = 2 }, &readback, 0, 256);
     var command = try encoder.finish();
     defer command.deinit();
-    _ = try context.queue.submit(&.{command});
+    // The recorded write is submitted first, so this readback observes it.
+    _ = try context.submitCommands(&.{command});
+    if (context.pending_uploads != null) return error.UploadNotFlushed;
     texture.destroy();
     texture_live = false;
     try expectError(error.GpuTimeout, context.deinit());
@@ -48,7 +52,7 @@ fn timeoutRetry() !void {
     context_live = false;
     const mapped = try readback.getMappedRange(0, 264);
     if (!std.mem.eql(u8, mapped[0..8], bytes[0..8]) or !std.mem.eql(u8, mapped[256..264], bytes[8..16])) return error.TimeoutLostStagingData;
-    std.debug.print("PASS: renderer staging survives upload timeout, texture destruction and context deinit retry; 16 BGRA bytes verified\n", .{});
+    std.debug.print("PASS: renderer uploads record without waiting on a blocked GPU, precede later submissions, and survive texture destruction and context deinit retry; 16 BGRA bytes verified\n", .{});
 }
 pub fn run() !void {
     try timeoutRetry();
@@ -103,7 +107,7 @@ pub fn run() !void {
     try encoder.copyTextureToBuffer(&view.inner, mip, &readback, 0, layout.row_pitch);
     var command = try encoder.finish();
     defer command.deinit();
-    _ = try context.queue.submit(&.{command});
+    _ = try context.submitCommands(&.{command});
     try context.queue.waitIdle(5000);
     const mapped = try readback.getMappedRange(0, readback.size);
     for (0..2) |row| if (!std.mem.eql(u8, mapped[row * layout.row_pitch ..][0..8], patch[row * 12 ..][0..8])) return error.IncorrectOwnedViewMip;
@@ -118,7 +122,7 @@ pub fn run() !void {
     try glyph_encoder.copyTextureToBuffer(&atlas.inner, .{ .x = 1, .y = 1, .width = 3, .height = 2 }, &glyph_read, 0, 256);
     var glyph_command = try glyph_encoder.finish();
     defer glyph_command.deinit();
-    _ = try context.queue.submit(&.{glyph_command});
+    _ = try context.submitCommands(&.{glyph_command});
     try context.queue.waitIdle(5000);
     const glyph_bytes = try glyph_read.getMappedRange(0, 259);
     if (!std.mem.eql(u8, glyph_bytes[0..3], glyph[0..3]) or !std.mem.eql(u8, glyph_bytes[256..259], glyph[3..6])) return error.IncorrectGlyphAtlasUpload;

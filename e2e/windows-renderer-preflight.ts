@@ -2,7 +2,7 @@
 import { request, stats, waitForServerReady } from "./client";
 
 const expected = process.env.ZENIT_E2E_EXPECT_RENDERER;
-if (expected !== "legacy" && expected !== "d3d12") {
+if (expected !== "legacy" && expected !== "d3d12" && expected !== "d3d11") {
   throw new Error("Windows renderer preflight requires an explicit expected renderer");
 }
 // Artifact transfer and first shader initialization happen before the worker

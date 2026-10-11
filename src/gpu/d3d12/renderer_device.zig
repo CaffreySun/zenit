@@ -34,7 +34,7 @@ pub fn writePngRgba(path: [:0]const u8, rgba: []const u8, width: u32, height: u3
 pub const Instance = struct {
     allocator: std.mem.Allocator,
     pub fn init(allocator: std.mem.Allocator, desc: gpu.InstanceDescriptor) !Instance {
-        if (!desc.backends.dx12) return error.BackendDisabled;
+        if (if (gpu.backend_kind == .d3d11) !desc.backends.dx11 else !desc.backends.dx12) return error.BackendDisabled;
         return .{ .allocator = allocator };
     }
     /// One selected D3D12-capable hardware adapter in DXGI order, with WARP fallback.
@@ -59,9 +59,9 @@ pub const Adapter = struct {
         // Optional renderer feature negotiation is not yet exposed by this facade.
         if (@as(u64, @bitCast(desc.required_features)) != 0) return error.UnsupportedFeatures;
         const supported = gpu.Limits{};
-        inline for (@import("zenit_reflection").fields(gpu.Limits)) |field| {
-            if (@field(desc.required_limits, field.name) > @field(supported, field.name)) return error.UnsupportedLimits;
-        }
+        if (desc.required_limits) |required| inline for (@import("zenit_reflection").fields(gpu.Limits)) |field| {
+            if (@field(required, field.name) > @field(supported, field.name)) return error.UnsupportedLimits;
+        };
         const context = try resources.Context.init(allocator, &self.native_device);
         return .{ .device = .{ .context = context, .features = .{}, .limits = supported }, .queue = Queue.init(context) };
     }

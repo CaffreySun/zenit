@@ -342,6 +342,14 @@ float sdf_line(float2 p, float2 a, float2 b, float thickness) {
 /// stroke_width: line width.
 /// start_angle: start angle (radians, arbitrary, no normalization needed).
 /// end_angle: end angle (radians, end >= start, sweep = end - start).
+float sdf_arc_cap(float2 p, float angle, float inner_radius, float outer_radius) {
+    float2 dir = float2(cos(angle), sin(angle));
+    float2 a = dir * inner_radius;
+    float2 ba = dir * (outer_radius - inner_radius);
+    float2 pa = p - a;
+    return length(pa - ba * clamp(dot(pa, ba) / max(dot(ba, ba), 1e-6), 0.0, 1.0));
+}
+
 float sdf_arc(float2 p, float outer_radius, float stroke_width, float start_angle, float end_angle) {
     float mid_radius = outer_radius - stroke_width * 0.5;
     float half_stroke = stroke_width * 0.5;
@@ -356,20 +364,26 @@ float sdf_arc(float2 p, float outer_radius, float stroke_width, float start_angl
     if (sweep >= 2.0 * M_PI_F - 0.0001) {
         return ring_sdf;
     }
+    // Empty arc: positive everywhere and continuous (no line along the start ray).
+    if (sweep <= 0.0) {
+        return max(ring_sdf, 0.0) + 1.0;
+    }
+
+    // Flat-capped arc: the ring band clipped by the two radial end caps. The distance to the
+    // nearer cap segment closes the field on both sides of each boundary ray: inside the sweep
+    // it bounds the ring distance from below (approaching 0 at the cap), outside it is the
+    // distance itself. A constant outside the sweep jumped by the ring distance along those
+    // rays, and the derivative-based AA drew a line along each of them.
+    float inner_radius = max(outer_radius - stroke_width, 0.0);
+    float cap = min(sdf_arc_cap(p, start_angle, inner_radius, outer_radius),
+                    sdf_arc_cap(p, start_angle + sweep, inner_radius, outer_radius));
 
     // Normalize p's polar angle relative to start_angle to [0, 2pi)
     float raw_angle = atan2(p.y, p.x);
     float rel = raw_angle - start_angle;
-    // Normalize to [0, 2pi)
     rel = rel - floor(rel / (2.0 * M_PI_F)) * (2.0 * M_PI_F);
 
-    // rel in [0, sweep] -> within arc segment
-    if (rel <= sweep) {
-        return ring_sdf;
-    }
-
-    // Outside arc: positive (no end caps, flat cutoff)
-    return half_stroke + 1.0;
+    return rel <= sweep ? max(ring_sdf, -cap) : cap;
 }
 
 // ============================================================================
@@ -492,7 +506,9 @@ inline VertexOutput sdf_vertex_impl(
     // Instance coords logical pixels, multiply by scale_factor to physical pixels.
     float s = uniforms.scale_factor;
 
-    float expand = inst.shadow_blur * 2.0 + abs(inst.shadow_offset_x) + abs(inst.shadow_offset_y);
+    // Arcs carry their start / end angles in the shadow offset slots and draw no shadow:
+    // their quad is the ring's bounds (growing angles must not stretch it).
+    float expand = inst.shape_type == 3u ? 0.0 : inst.shadow_blur * 2.0 + abs(inst.shadow_offset_x) + abs(inst.shadow_offset_y);
     // bit 28: outer shadow has spread (noise_scale reused), positive spread expands quad.
     if ((inst.packed_flags & (1u << 28u)) != 0u) expand += max(inst.noise_scale, 0.0);
     // Dual shadow: quad must cover whichever layer has larger expansion, else second shadow's
@@ -788,8 +804,8 @@ inline float4 sdf_fragment_impl(
                 float angle = atan2(in.uv.y - 0.5, in.uv.x - 0.5) - start_angle;
                 t = fract(angle / (2.0 * M_PI_F) + 0.5);
             } else {
-                // Linear gradient (vert/horiz/diag): retain original shadow expand logic.
-                float expand = inst.shadow_blur * 2.0 + abs(inst.shadow_offset_x) + abs(inst.shadow_offset_y);
+                // Linear gradient (vert/horiz/diag): same quad expansion as the vertex stage.
+                float expand = inst.shape_type == 3u ? 0.0 : inst.shadow_blur * 2.0 + abs(inst.shadow_offset_x) + abs(inst.shadow_offset_y);
                 float2 orig_size = inst.rect.zw;
                 float2 expanded_size = orig_size + expand * 2.0;
                 float2 remap_uv = (in.uv * expanded_size - float2(expand)) / max(orig_size, float2(0.001));

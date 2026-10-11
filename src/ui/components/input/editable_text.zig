@@ -43,6 +43,18 @@ pub const EditableTextProps = struct {
     wrap_width: ?f32 = null,
     /// Called with the landed value after a user edit; retainers must copy it.
     on_change: ?Handler([]const u8) = null,
+    /// Who switches editing mode on. `.manual` keeps the pointer free for the host (canvas
+    /// cells, app-driven renames) until it calls `setEditing`.
+    activation: Activation = .manual,
+};
+
+pub const Activation = enum {
+    /// The host calls `EditableTextResult.setEditing`.
+    manual,
+    /// The text is focusable at rest: a press enters editing with the caret at the pressed
+    /// position, keyboard focus (Tab) enters it with the caret where it was. Enter (single
+    /// line), Escape and losing focus leave it. Edits are already committed as they land.
+    click,
 };
 
 pub const EditableTextResult = struct {
@@ -55,27 +67,7 @@ pub const EditableTextResult = struct {
     /// Enter or leave editing mode. Leaving editing mode also ends IME and
     /// removes selection state. Repeated calls with the same value are cheap.
     pub fn setEditing(self: EditableTextResult, cx: *Cx, editing: bool) void {
-        const currently_editing = self.node.behavior.events.on_event != null;
-        if (editing == currently_editing) return;
-
-        if (editing) {
-            self.node.behavior.events.on_event = events_mod.inputEventHandler;
-            self.node.behavior.interaction.text_input_client = render_mod.textInputClient(self.state);
-            self.node.setFocusable(true);
-            cx.setFocus(self.node);
-        } else {
-            if (cx.isFocused(self.node)) cx.clearFocus();
-            self.state.focused = false;
-            self.state.cancelImeComposition();
-            self.state.selection_anchor = null;
-            self.state.is_dragging = false;
-            self.state.suspend_drag_until_mouse_up = false;
-            self.node.behavior.events.on_event = null;
-            self.node.behavior.interaction.text_input_client = null;
-            self.node.setFocusable(false);
-        }
-        cx.refreshTextInputSession();
-        self.node.markRenderDirty();
+        applyEditing(cx, self.node, self.state, editing);
     }
 
     /// Update runtime font metrics. This is idempotent and safe to call from a
@@ -367,6 +359,9 @@ pub const EditableTextBuilder = struct {
         node.behavior.events.on_focus = Cx.simpleHandler(struct {
             fn handler(context: *anyopaque) void {
                 const typed: *TextInputState = @ptrCast(@alignCast(context));
+                if (typed.editable_click_activation and !typed.editable_editing) {
+                    if (typed.cx_ref) |cx_ref| if (typed.input_container_node) |n| applyEditing(cx_ref, n, typed, true);
+                }
                 typed.focused = true;
                 typed.resetBlink();
             }
@@ -379,11 +374,17 @@ pub const EditableTextBuilder = struct {
                 typed.is_dragging = false;
                 typed.suspend_drag_until_mouse_up = false;
                 typed.cancelImeComposition();
+                // `.click` editing ends with focus; `.manual` hosts decide for themselves.
+                if (typed.editable_click_activation and typed.editable_editing) {
+                    if (typed.cx_ref) |cx_ref| if (typed.input_container_node) |n| applyEditing(cx_ref, n, typed, false);
+                }
             }
         }.handler, @ptrCast(state));
         node.meta.per_frame.hooks.before_render.main = render_mod.inputBeforeRender;
 
-        node.behavior.events.on_event = null;
+        state.editable_click_activation = props.activation == .click;
+        node.behavior.events.on_event = if (state.editable_click_activation) clickDisplayEventHandler else null;
+        node.setFocusable(state.editable_click_activation);
         state.updateScrollX();
         // value is Model: external write via effect into buffer (first run same as initial value,
         // short-circuit)
@@ -394,6 +395,72 @@ pub const EditableTextBuilder = struct {
 
 fn setDisplayText(props: core.TextProps, node: *core.Node) void {
     node.setText(props);
+}
+
+fn applyEditing(cx: *Cx, node: *Node, state: *TextInputState, editing: bool) void {
+    if (editing == state.editable_editing) return;
+    state.editable_editing = editing;
+    if (editing) {
+        node.behavior.events.on_event = if (state.editable_click_activation) clickEditingEventHandler else events_mod.inputEventHandler;
+        node.behavior.interaction.text_input_client = render_mod.textInputClient(state);
+        node.setFocusable(true);
+        // Under `.click` this also runs from on_focus, where the node already holds focus.
+        if (!cx.isFocused(node)) cx.setFocus(node);
+    } else {
+        if (cx.isFocused(node)) cx.clearFocus();
+        state.focused = false;
+        state.cancelImeComposition();
+        state.selection_anchor = null;
+        state.is_dragging = false;
+        state.suspend_drag_until_mouse_up = false;
+        node.behavior.events.on_event = if (state.editable_click_activation) clickDisplayEventHandler else null;
+        node.behavior.interaction.text_input_client = null;
+        // `.click` stays reachable by pointer and Tab at rest: pointer-down focus is decided
+        // before dispatch, so a non-focusable target would have its new focus cleared again.
+        node.setFocusable(state.editable_click_activation);
+    }
+    cx.refreshTextInputSession();
+    node.markRenderDirty();
+}
+
+/// True for every handler whose event context is a `TextInputState` owned by EditableText
+/// under `.click` (introspection tools discriminate state types by handler).
+pub fn isClickActivationHandler(handler: anytype) bool {
+    return handler == clickDisplayEventHandler or handler == clickEditingEventHandler;
+}
+
+/// Display mode under `.click`: the press enters editing, then reaches the editing engine so
+/// the caret (and any drag selection) starts where the pointer went down.
+fn clickDisplayEventHandler(event: core.Event, context: ?*anyopaque) core.EventResult {
+    const state: *TextInputState = @ptrCast(@alignCast(context orelse return .ignored));
+    switch (event) {
+        .mouse_down => |m| if (m.button == .left) {
+            const cx = state.cx_ref orelse return .ignored;
+            const node = state.input_container_node orelse return .ignored;
+            applyEditing(cx, node, state, true);
+            return events_mod.inputEventHandler(event, context);
+        },
+        else => {},
+    }
+    return .ignored;
+}
+
+/// Editing mode under `.click`: Escape and single-line Enter leave editing (outside IME
+/// composition, where both belong to the composition); everything else is plain editing.
+fn clickEditingEventHandler(event: core.Event, context: ?*anyopaque) core.EventResult {
+    const state: *TextInputState = @ptrCast(@alignCast(context orelse return .ignored));
+    switch (event) {
+        .key_down => |e| if (!state.imeIsComposing() and !e.modifiers.super and !e.modifiers.ctrl and
+            (e.key == .escape or (e.key == .@"return" and !state.accept_newline)))
+        {
+            const cx = state.cx_ref orelse return .ignored;
+            const node = state.input_container_node orelse return .ignored;
+            applyEditing(cx, node, state, false);
+            return .handled;
+        },
+        else => {},
+    }
+    return events_mod.inputEventHandler(event, context);
 }
 
 test "EditableText starts passive and updates runtime metrics" {
@@ -441,6 +508,56 @@ test "EditableText editing mode owns focus and detaches the input handler" {
     try std.testing.expect(!result.state.focused);
     try std.testing.expect(!result.state.imeIsComposing());
     try std.testing.expect(result.state.selection_anchor == null);
+}
+
+test "EditableText click activation: press enters editing, Enter / Escape / blur leave it" {
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    const scope = try Scope.init(std.testing.allocator, null, cx.owner);
+    defer scope.dispose();
+
+    const result = try EditableText(.{ .value = "title", .activation = .click }).mountResult(scope, cx);
+    cx.root = result.node;
+    const events = &result.node.behavior.events;
+    // Display mode receives the press and is focusable (pointer-down focus is decided before
+    // dispatch), but does not edit.
+    try std.testing.expect(events.on_event != null);
+    try std.testing.expect(result.node.behavior.interaction.focusable);
+    try std.testing.expectEqual(core.EventResult.ignored, events.on_event.?(.{ .text_input = .{ .text = "x" } }, events.event_context));
+    try std.testing.expectEqualStrings("title", result.getText());
+
+    _ = events.on_event.?(.{ .mouse_down = .{ .x = 0, .y = 0 } }, events.event_context);
+    _ = events.on_event.?(.{ .mouse_up = .{ .x = 0, .y = 0 } }, events.event_context);
+    try std.testing.expect(result.state.editable_editing);
+    try std.testing.expect(cx.isFocused(result.node));
+    _ = events.on_event.?(.{ .key_down = .{ .key = .end, .modifiers = .{} } }, events.event_context);
+    _ = events.on_event.?(.{ .text_input = .{ .text = " 2" } }, events.event_context);
+    try std.testing.expectEqualStrings("title 2", result.getText());
+
+    try std.testing.expectEqual(core.EventResult.handled, events.on_event.?(.{ .key_down = .{ .key = .@"return", .modifiers = .{} } }, events.event_context));
+    try std.testing.expect(!result.state.editable_editing);
+    try std.testing.expect(!cx.isFocused(result.node));
+    try std.testing.expectEqualStrings("title 2", result.getText());
+
+    _ = events.on_event.?(.{ .mouse_down = .{ .x = 0, .y = 0 } }, events.event_context);
+    _ = events.on_event.?(.{ .mouse_up = .{ .x = 0, .y = 0 } }, events.event_context);
+    try std.testing.expect(result.state.editable_editing);
+    _ = events.on_event.?(.{ .key_down = .{ .key = .escape, .modifiers = .{} } }, events.event_context);
+    try std.testing.expect(!result.state.editable_editing);
+
+    _ = events.on_event.?(.{ .mouse_down = .{ .x = 0, .y = 0 } }, events.event_context);
+    _ = events.on_event.?(.{ .mouse_up = .{ .x = 0, .y = 0 } }, events.event_context);
+    try std.testing.expect(result.state.editable_editing);
+    cx.clearFocus();
+    try std.testing.expect(!result.state.editable_editing);
+    try std.testing.expect(result.node.behavior.interaction.focusable);
+
+    // Keyboard focus enters editing too.
+    cx.setFocus(result.node);
+    try std.testing.expect(result.state.editable_editing);
+    try std.testing.expect(cx.isFocused(result.node));
+    _ = events.on_event.?(.{ .text_input = .{ .text = "!" } }, events.event_context);
+    try std.testing.expect(std.mem.endsWith(u8, result.getText(), "!"));
 }
 
 test "EditableText programmatic text switch clears IME and prior undo history" {

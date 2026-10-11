@@ -68,7 +68,7 @@ const MAX_UNIFORM_UPDATES = 256;
 // D3D12 CBV addresses require 256-byte alignment. Append aligned slots so
 // normal shared draws can bind the retained frame buffer without snapshots.
 // D3D12 CBV addresses need 256-byte alignment; Metal buffer offsets need 16.
-const UNIFORM_STRIDE = std.mem.alignForward(usize, @sizeOf(Uniforms), if (gpu.backend_kind == .d3d12) 256 else 16);
+const UNIFORM_STRIDE = std.mem.alignForward(usize, @sizeOf(Uniforms), if (gpu.is_direct3d) 256 else 16);
 const BUFFER_COUNT = 3;
 const MAX_CACHE_BYTES = 32 * 1024 * 1024;
 
@@ -494,8 +494,10 @@ pub const IconRenderer = struct {
         @memcpy(uniform_data, std.mem.asBytes(&uniforms));
 
         render_pass.setPipeline(&self.pipeline);
-        render_pass.setVertexBuffer(0, uniform_buffer, @intCast(uniform_byte_offset));
-        render_pass.setFragmentBuffer(0, uniform_buffer, @intCast(uniform_byte_offset));
+        // One uniform slot, not the rest of the ring: Direct3D snapshots the bound
+        // range per draw (constant buffers over 4 KiB are copied into a new buffer).
+        gpu.setVertexBufferRange(render_pass, 0, uniform_buffer, @intCast(uniform_byte_offset), UNIFORM_STRIDE);
+        gpu.setFragmentBufferRange(render_pass, 0, uniform_buffer, @intCast(uniform_byte_offset), UNIFORM_STRIDE);
         if (self.sampler) |sampler| {
             render_pass.setFragmentSampler(0, &sampler);
         }

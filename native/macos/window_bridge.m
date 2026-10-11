@@ -1,6 +1,8 @@
+#include "../window_chrome.h"
 #import <Cocoa/Cocoa.h>
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
+#import <QuartzCore/CATransaction.h>
 #import <CoreVideo/CVDisplayLink.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #include <limits.h>
@@ -26,7 +28,34 @@ static void zenitPresentWindow(NSWindow *window) {
 }
 
 @class WindowWrapper;
+@interface ZenitFullscreenHeaderHost : NSObject
+// Main-thread publication epoch, independent of drawable acquisition.
+@property (nonatomic) NSUInteger presentationEpoch;
+@property (nonatomic, weak) WindowWrapper *owner;
+@property (nonatomic, strong) NSView *header;
+@property (nonatomic) CGFloat height;
+@property (nonatomic) NSInteger policy;
+@property (nonatomic) BOOL active;
+@property (nonatomic) BOOL exiting;
+@property (nonatomic) BOOL locked;
+@property (nonatomic) CGFloat bodyReserve;
+@property (nonatomic) BOOL bodyReserveCommitted;
+@property (nonatomic) BOOL pendingFullscreen;
+- (void)start;
+- (void)prepare;
+- (void)stop;
+- (void)update;
+- (void)commitBodyLayout;
+- (void)finishExit;
+- (void)beginExit;
+- (void)encodeTexture:(id<MTLTexture>)source commandBuffer:(id<MTLCommandBuffer>)buffer;
+@end
 static WindowWrapper* wrapperForWindow(NSWindow *window);
+static BOOL zenitPrepareFullscreen(NSWindow *window);
+static void zenitPrepareFullscreenExit(NSWindow *window);
+static NSRect zenitLogicalScreenRect(WindowWrapper *owner,CGFloat x,CGFloat y,CGFloat width,CGFloat height);
+static NSPoint zenitLogicalScreenPoint(WindowWrapper *owner,NSPoint screen);
+static BOOL zenitLogicalHeaderHidden(WindowWrapper *owner,CGFloat y,CGFloat height);
 static BOOL windowCanAcceptPointerInput(WindowWrapper *wrapper);
 static BOOL viewCanPresentCursor(NSView *view);
 static id<MTLDevice> createBestMetalDevice(void);
@@ -366,6 +395,7 @@ static NSString * const ZenitInternalDragType = @"dev.zenit.internal-drag";
 // NSRunLoopCommonModes (includes tracking) to drive render; Zig gates
 // on wantsFrame, static content doesn't redraw.
 @property (nonatomic, strong) NSTimer *liveResizeTicker;
+- (void)renderFinalResize;
 @property (nonatomic, strong) NSMutableAttributedString *markedTextStorage;
 @property (nonatomic, assign) BOOL discardingMarkedText;
 - (void)discardMarkedTextFromInputContext;
@@ -471,6 +501,7 @@ static NSString * const ZenitInternalDragType = @"dev.zenit.internal-drag";
 
         CGSize drawableSize = frameRect.size;
         CGFloat scale = currentScreenScale(nil);
+        layer.contentsScale=scale;
         drawableSize.width *= scale;
         drawableSize.height *= scale;
         layer.drawableSize = drawableSize;
@@ -505,13 +536,25 @@ static NSString * const ZenitInternalDragType = @"dev.zenit.internal-drag";
     CGFloat scale = currentScreenScale(self.window);
     drawableSize.width *= scale;
     drawableSize.height *= scale;
-    self.metalLayer.drawableSize = drawableSize;
+    self.metalLayer.contentsScale=scale;
+    if (!CGSizeEqualToSize(self.metalLayer.drawableSize,drawableSize))
+        self.metalLayer.drawableSize = drawableSize;
 
     // Direct render callback invocation, not drawRect-dependent
     // (layer-backed view doesn't trigger drawRect)
-    if (self.renderCallback != NULL) {
+    if (self.inLiveResize && self.renderCallback != NULL) {
         self.renderCallback(self.renderContext);
     }
+}
+
+- (void)renderFinalResize {
+    [CATransaction begin];[CATransaction setDisableActions:YES];
+    BOOL transactional=self.metalLayer.presentsWithTransaction;
+    self.metalLayer.presentsWithTransaction=YES;
+    [self setFrameSize:self.frame.size];
+    if(!self.inLiveResize && self.renderCallback) self.renderCallback(self.renderContext);
+    self.metalLayer.presentsWithTransaction=transactional;
+    [CATransaction commit];
 }
 
 - (void)viewWillStartLiveResize {
@@ -560,9 +603,7 @@ static NSString * const ZenitInternalDragType = @"dev.zenit.internal-drag";
             // until hover/click. Back to main queue, bounds committed, directly
             // flush final frame (post-empty-event won't mark WindowContext
             // needs_redraw, insufficient).
-            if (strongSelf.renderCallback != NULL) {
-                strongSelf.renderCallback(strongSelf.renderContext);
-            }
+            [strongSelf renderFinalResize];
         }
     });
 }
@@ -901,13 +942,12 @@ static NSString * const ZenitInternalDragType = @"dev.zenit.internal-drag";
     // convert back UTF-16 to return.
     if (!self.window) return NSNotFound;
     const uint32_t wid = zenitA11yWindowIdForView(self);
-    NSPoint window_point = [self.window convertPointFromScreen:point];
-    NSPoint local = [self convertPoint:window_point fromView:nil];
+    NSPoint local = zenitLogicalScreenPoint(wrapperForWindow(self.window),point);
     uint32_t start_utf8 = 0;
     uint32_t end_utf8 = 0;
     if (!zenit_text_input_range_at_point(wid,
                                          (float)local.x,
-                                         (float)(self.bounds.size.height - local.y),
+                                         (float)local.y,
                                          &start_utf8, &end_utf8)) {
         return NSNotFound;
     }
@@ -952,8 +992,7 @@ static NSString * const ZenitInternalDragType = @"dev.zenit.internal-drag";
                                         contentView.bounds.size.height - live_y - h,
                                         live_w > 0 ? live_w : 1,
                                         h);
-        NSRect windowRect = [contentView convertRect:contentRect toView:nil];
-        return [self.window convertRectToScreen:windowRect];
+        return zenitLogicalScreenRect(wrapperForWindow(self.window),live_x,live_y,live_w>0?live_w:1,h);
     }
     if (actualRange) *actualRange = range;
     id wrapper = wrapperForWindow(self.window);
@@ -978,7 +1017,7 @@ static NSString * const ZenitInternalDragType = @"dev.zenit.internal-drag";
             caret_h
         );
         NSRect window_rect = [window.contentView convertRect:content_rect toView:nil];
-        NSRect screen_rect = [window convertRectToScreen:window_rect];
+        NSRect screen_rect = zenitLogicalScreenRect(wrapper,caret_x,caret_y,caret_w,caret_h);
         if (input_debug_enabled()) {
             NSLog(@"[bridge-input] firstRect caret=(%.1f,%.1f %.1fx%.1f) content_h=%.1f screen=(%.1f,%.1f %.1fx%.1f)",
                   caret_x, caret_y, caret_w, caret_h,
@@ -1680,6 +1719,8 @@ static void zenitDrainDeferredA11yMutations(void) {
 
 - (BOOL)isAccessibilityElement {
     uint32_t wid = [self zenitWindowId];
+    float x=0,y=0,width=0,height=0;
+    if(zenit_a11y_frame(wid,self.handle,&x,&y,&width,&height) && zenitLogicalHeaderHidden(wrapperForWindow(self.parentView.window),y,height)) return NO;
     return zenit_a11y_exists(wid, self.handle) &&
         (zenit_a11y_state(wid, self.handle) & ZenitA11yStateHidden) == 0;
 }
@@ -2111,8 +2152,7 @@ static BOOL zenitA11yIsRowListAttribute(NSAccessibilityAttributeName attribute) 
     if (!zenit_a11y_frame([self zenitWindowId], self.handle, &x, &y, &width, &height)) return NSZeroRect;
     // Zenit layout is top-left/y-down; AppKit views are bottom-left/y-up.
     NSRect local = NSMakeRect(x, v.bounds.size.height - y - height, width, height);
-    NSRect window_rect = [v convertRect:local toView:nil];
-    return [v.window convertRectToScreen:window_rect];
+    return zenitLogicalScreenRect(wrapperForWindow(v.window),x,y,width,height);
 }
 
 - (NSPoint)accessibilityActivationPoint {
@@ -2613,12 +2653,11 @@ static NSString *const kZenitAXScrollToVisible = @"AXScrollToVisible";
 
 - (id)accessibilityHitTest:(NSPoint)point {
     if (!self.window) return [self zenitA11yRootParent];
-    NSPoint windowPoint = [self.window convertPointFromScreen:point];
-    NSPoint local = [self convertPoint:windowPoint fromView:nil];
+    NSPoint local = zenitLogicalScreenPoint(wrapperForWindow(self.window),point);
     ZenitAXHandle handle = zenit_a11y_hit_test(
         zenitA11yWindowIdForView(self),
         (float)local.x,
-        (float)(self.bounds.size.height - local.y)
+        (float)local.y
     );
     return handle == ZENIT_A11Y_INVALID_HANDLE ? [self zenitA11yRootParent] : [self zenitA11yElementForHandle:handle];
 }
@@ -2721,6 +2760,19 @@ typedef struct {
 } KeyEventPacket;
 
 // window wrapper (also NSWindowDelegate for close event)
+// Borderless application windows remain keyboard/focus-capable.
+@interface ZenitWindow : NSWindow
+@end
+@implementation ZenitWindow
+- (BOOL)canBecomeKeyWindow { return YES; }
+- (BOOL)canBecomeMainWindow { return YES; }
+- (void)toggleFullScreen:(id)sender {
+    if (!(self.styleMask & NSWindowStyleMaskFullScreen) && !zenitPrepareFullscreen(self)) return;
+    if(self.styleMask & NSWindowStyleMaskFullScreen) zenitPrepareFullscreenExit(self);
+    [super toggleFullScreen:sender];
+}
+@end
+
 @interface WindowWrapper : NSObject <NSWindowDelegate> {
 @public
     // One CVDisplayLink writer, main-thread cadence/timing snapshots.
@@ -2730,6 +2782,7 @@ typedef struct {
 }
 @property (nonatomic, strong) NSWindow *window;
 @property (nonatomic, strong) MetalView *metalView;
+@property (nonatomic, strong) ZenitFullscreenHeaderHost *fullscreenHeader;
 @property (nonatomic) BOOL shouldClose;
 // Closing is a two-phase operation. The first user attempt is surfaced to Zig
 // through shouldClose so it can resolve dirty documents. Once Zig commits, the
@@ -2804,6 +2857,11 @@ typedef struct {
 // NULL = fall back to rect model.
 @property (nonatomic, assign) int (*titlebarHitCallback)(void* ctx, float x, float y);
 @property (nonatomic, assign) void* titlebarHitContext;
+@property (nonatomic, assign) int (*chromeHitCallback)(void*, float, float);
+@property (nonatomic, assign) void* chromeHitContext;
+@property (nonatomic) BOOL chromeHideControls;
+@property (nonatomic) BOOL chromeFullscreenTransition;
+@property (nonatomic) uint32_t chromeStateGeneration;
 // Resign-key callback: fires when the window goes from key to non-key, and
 // reports whether the new key window belongs to this process. Floating (find/palette) closes when host
 // focused, keeps when other app focused.
@@ -2823,6 +2881,15 @@ typedef struct {
 @property (nonatomic) float trafficLightsInsetY;
 - (void)applyTrafficLightsInset;
 @end
+// System buttons must win over application drag regions.
+static BOOL chromePointInNativeButton(WindowWrapper *w, NSPoint p) {
+    for (NSWindowButton kind=NSWindowCloseButton; kind<=NSWindowZoomButton; kind++) {
+        NSButton *b=[w.window standardWindowButton:kind];
+        if (b && !b.hidden && NSPointInRect(p,[w.window.contentView convertRect:b.bounds fromView:b])) return YES;
+    }
+    return NO;
+}
+
 
 @implementation WindowWrapper
 
@@ -2862,7 +2929,10 @@ typedef struct {
 }
 
 - (void)applyTrafficLightsInset {
-    if (!self.hasTrafficLightsInset) return;
+    // UnifiedCompact's native accessory host owns the buttons in both modes.
+    // The legacy client-titlebar inset must not reset their positions during
+    // the fullscreen resize animation (20-point vs native 23-point spacing).
+    if (!self.hasTrafficLightsInset || self.fullscreenHeader.header) return;
     NSWindow *window = self.window;
     NSButton *closeButton = [window standardWindowButton:NSWindowCloseButton];
     NSButton *miniButton = [window standardWindowButton:NSWindowMiniaturizeButton];
@@ -2920,12 +2990,47 @@ typedef struct {
 }
 
 - (void)windowDidResize:(NSNotification *)notification {
+    self.chromeStateGeneration++;
     [self applyTrafficLightsInset];
 }
 
 - (void)windowDidExitFullScreen:(NSNotification *)notification {
-    [self applyTrafficLightsInset];
+    // AppKit still owns the transition hierarchy during delegate delivery.
+    // Commit the final body layout and its matching frame together once that
+    // bookkeeping has returned, instead of publishing a windowed projection
+    // while the fullscreen accessory is still being reparented.
+    __weak WindowWrapper *owner=self;
+    ZenitFullscreenHeaderHost *host=self.fullscreenHeader;
+    NSUInteger epoch=host.presentationEpoch;
+    dispatch_async(dispatch_get_main_queue(),^{
+        WindowWrapper *w=owner;
+        if(!w || w.fullscreenHeader!=host || host.presentationEpoch!=epoch ||
+           (w.window.styleMask&NSWindowStyleMaskFullScreen)) return;
+        [CATransaction begin];[CATransaction setDisableActions:YES];
+        [w.window.contentView.superview layoutSubtreeIfNeeded];
+        [host finishExit];
+        w.chromeFullscreenTransition=NO;
+        [w applyTrafficLightsInset];
+        w.chromeStateGeneration++;
+        [w.metalView renderFinalResize];
+        [CATransaction commit];
+    });
 }
+
+- (void)windowWillEnterFullScreen:(NSNotification *)notification { self.chromeFullscreenTransition=YES; [self.fullscreenHeader start]; }
+- (void)windowWillExitFullScreen:(NSNotification *)notification { self.chromeFullscreenTransition=YES; [self.fullscreenHeader beginExit]; }
+- (void)windowDidEnterFullScreen:(NSNotification *)notification {
+    [self.fullscreenHeader commitBodyLayout];self.chromeFullscreenTransition=NO;
+    if(self.fullscreenHeader.active) {
+        [CATransaction begin];[CATransaction setDisableActions:YES];
+        for(NSNumber *kind in @[@(NSWindowCloseButton),@(NSWindowMiniaturizeButton),@(NSWindowZoomButton)])
+            [self.window standardWindowButton:kind.integerValue].alphaValue=1;
+        [CATransaction commit];
+    }
+    self.chromeStateGeneration++;
+}
+- (void)windowDidFailToEnterFullScreen:(NSWindow *)window { self.chromeFullscreenTransition=NO; [self.fullscreenHeader finishExit]; self.chromeStateGeneration++; }
+- (void)windowDidFailToExitFullScreen:(NSWindow *)window { self.chromeFullscreenTransition=NO; self.fullscreenHeader.exiting=NO; [self.fullscreenHeader update]; self.chromeStateGeneration++; }
 
 - (void)windowDidBecomeKey:(NSNotification *)notification {
     // makeFirstResponder is the supported activation boundary. AppKit owns the
@@ -3140,8 +3245,42 @@ static void unregisterWindowWrapper(NSWindow *window) {
 
 static WindowWrapper* wrapperForWindow(NSWindow *window) {
     if (!g_window_registry || !window) return nil;
-    return [g_window_registry objectForKey:window];
+    WindowWrapper *direct=[g_window_registry objectForKey:window];
+    if(direct) return direct;
+    for(WindowWrapper *owner in g_window_registry.objectEnumerator)
+        if(owner.fullscreenHeader.active && owner.fullscreenHeader.header.window==window) return owner;
+    return nil;
 }
+
+// Fullscreen presentation host shares stable identity, input, scale, layout, persistent native hosts and atomic resize clipping and generation-safe acquisition.
+#include "fullscreen_header_host.inc"
+
+// Prepare before AppKit captures the fullscreen toolbar configuration, including
+// entry through the native green button and the system keyboard command.
+static BOOL zenitPrepareFullscreen(NSWindow *window) {
+    WindowWrapper *w=wrapperForWindow(window);
+    ZenitFullscreenHeaderHost *host=w.fullscreenHeader;
+    if(!host || !host.policy) return YES;
+    [host prepare];
+    if(!host.windowedPaintReady) {
+        if(!host.pendingFullscreen) {
+            host.pendingFullscreen=YES;w.chromeFullscreenTransition=YES;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,3*NSEC_PER_SEC),dispatch_get_main_queue(),^{
+                if(host.pendingFullscreen) {
+                    host.pendingFullscreen=NO;w.chromeFullscreenTransition=NO;w.chromeStateGeneration++;
+                    macos_post_empty_event();
+                }
+            });
+        }
+        return NO;
+    }
+    [host start];return YES;
+}
+
+static void zenitPrepareFullscreenExit(NSWindow *window) {
+    [wrapperForWindow(window).fullscreenHeader beginExit];
+}
+
 
 // C API export
 
@@ -3151,7 +3290,7 @@ static void* macos_create_window_internal(int width, int height, const char* tit
     @autoreleasepool {
         NSRect frame = NSMakeRect(0, 0, width, height);
 
-        NSWindow *window = [[NSWindow alloc] initWithContentRect:frame
+        NSWindow *window = [[ZenitWindow alloc] initWithContentRect:frame
                                                       styleMask:styleMask
                                                         backing:NSBackingStoreBuffered
                                                           defer:NO];
@@ -3988,12 +4127,12 @@ static void enqueueMouseMove(WindowWrapper *target, NSEvent *event) {
                                (target.window.occlusionState & NSWindowOcclusionStateVisible) != 0;
     if (!windowCanAcceptPointerInput(target) && !dragging && !inactiveHover) return;
     NSRect contentFrame = [target.window.contentView frame];
-    NSPoint loc = [event locationInWindow];
+    NSPoint loc = zenitLogicalEventPoint(target,event);
 
     MouseMovePacket packet;
     packet.sequence = nextInputEventSequence();
     packet.x = (float)loc.x;
-    packet.y = (float)(contentFrame.size.height - loc.y);
+    packet.y = (float)loc.y;
     // Match the SDK's established top-left coordinate semantics exactly;
     // NSEvent deltaY uses AppKit's coordinate convention and is not used.
     packet.dx = packet.x - (float)target.mouseLocation.x;
@@ -4024,12 +4163,12 @@ static void enqueueMouseMove(WindowWrapper *target, NSEvent *event) {
 // Push button event into target window queue (avoid polling miss
 // same-frame press+release)
 static void enqueueMouseButton(WindowWrapper *target, int button, BOOL pressed, NSEvent *event) {
-    NSPoint locInWindow = [event locationInWindow];
+    NSPoint locInWindow = zenitLogicalEventPoint(target,event);
     NSRect contentFrame = [target.window.contentView frame];
     MouseButtonPacket packet;
     packet.sequence = nextInputEventSequence();
     packet.x = (float)locInWindow.x;
-    packet.y = (float)(contentFrame.size.height - locInWindow.y);
+    packet.y = (float)locInWindow.y;
     packet.button = button;
     packet.pressed = pressed;
     packet.modifiers = (uint32_t)event.modifierFlags;
@@ -4052,7 +4191,7 @@ static void enqueueMouseButton(WindowWrapper *target, int button, BOOL pressed, 
 static BOOL windowCanAcceptPointerInput(WindowWrapper *wrapper) {
     if (!wrapper || !wrapper.window) return NO;
     if (![NSApp isActive]) return NO;
-    if (![wrapper.window isKeyWindow]) return NO;
+    if (![wrapper.window isKeyWindow] && !(wrapper.fullscreenHeader.active && wrapper.fullscreenHeader.header.window.isKeyWindow)) return NO;
     if ((wrapper.window.occlusionState & NSWindowOcclusionStateVisible) == 0) return NO;
     return YES;
 }
@@ -4309,9 +4448,17 @@ int macos_poll_events(void* window_ptr) {
             // track mouse button state (route to target) + push queue
             switch (event.type) {
                 case NSEventTypeLeftMouseDown: {
+                    if (target.chromeHitCallback) {
+                        NSPoint p=[target.window.contentView convertPoint:event.locationInWindow fromView:nil];
+                        float y=(float)(target.window.contentView.bounds.size.height-p.y);
+                        if (!chromePointInNativeButton(target,p) && target.chromeHitCallback(target.chromeHitContext,(float)p.x,y)==2 && !(target.window.styleMask & NSWindowStyleMaskFullScreen)) {
+                            [target.window performWindowDragWithEvent:event];
+                            break;
+                        }
+                    }
                     // custom TitleBar drag: if click in drag area, trigger window drag
                     // not pass to Zig
-                    if (target.titlebarDragHeight > 0) {
+                    if (!target.chromeHitCallback && target.titlebarDragHeight > 0) {
                         NSRect contentFrame = [target.window.contentView frame];
                         NSPoint loc = [event locationInWindow];
                         float y_from_top = (float)(contentFrame.size.height - loc.y);
@@ -4383,12 +4530,12 @@ int macos_poll_events(void* window_ptr) {
                     break;
                 case NSEventTypeScrollWheel:
                     {
-                        NSPoint scrollInWindow = [event locationInWindow];
+                        NSPoint scrollInWindow = zenitLogicalEventPoint(target,event);
                         NSRect contentFrame = [target.window.contentView frame];
                         ScrollEventPacket packet;
                         packet.sequence = nextInputEventSequence();
                         packet.x = (float)scrollInWindow.x;
-                        packet.y = (float)(contentFrame.size.height - scrollInWindow.y);
+                        packet.y = (float)scrollInWindow.y;
                         packet.dx = (float)event.scrollingDeltaX;
                         packet.dy = (float)event.scrollingDeltaY;
                         packet.phase = zenitScrollPhaseCode(event);
@@ -4402,12 +4549,12 @@ int macos_poll_events(void* window_ptr) {
                     break;
                 case NSEventTypeMagnify:
                     {
-                        NSPoint magInWindow = [event locationInWindow];
+                        NSPoint magInWindow = zenitLogicalEventPoint(target,event);
                         NSRect magContentFrame = [target.window.contentView frame];
                         MagnifyEventPacket mpacket;
                         mpacket.sequence = nextInputEventSequence();
                         mpacket.x = (float)magInWindow.x;
-                        mpacket.y = (float)(magContentFrame.size.height - magInWindow.y);
+                        mpacket.y = (float)magInWindow.y;
                         mpacket.magnification = (float)event.magnification;
                         if (event.phase == NSEventPhaseBegan) mpacket.phase = 0;
                         else if (event.phase == NSEventPhaseEnded) mpacket.phase = 2;
@@ -4456,6 +4603,7 @@ int macos_poll_events(void* window_ptr) {
                 NSRect contentFrame = [wrapper.window.contentView frame];
                 wrapper.mouseLocation = NSMakePoint(mouseInWindow.x,
                                                     contentFrame.size.height - mouseInWindow.y);
+                if(wrapper.fullscreenHeader.active) wrapper.mouseLocation=zenitLogicalScreenPoint(wrapper,NSEvent.mouseLocation);
             }
             // drag mouseLocation already by LeftMouseDragged, unchanged
             if (inactiveHover) {
@@ -4490,7 +4638,11 @@ void macos_get_window_size(void* window_ptr, int* width, int* height) {
     @autoreleasepool {
         WindowWrapper *wrapper = (__bridge WindowWrapper*)window_ptr;
         if (!wrapper.window) { *width = 0; *height = 0; return; }
-        NSRect frame = [wrapper.window.contentView frame];
+        // The logical viewport belongs to the render view in both windowed
+        // and fullscreen mode. A persistent clipped body host can have a
+        // different height; switching to its frame on exit changes the
+        // projection independently of the drawable and shifts the whole UI.
+        NSRect frame = wrapper.metalView.bounds;
         *width = (int)frame.size.width;
         *height = (int)frame.size.height;
     }
@@ -5158,6 +5310,7 @@ void macos_update_mouse_position(void* window_ptr) {
         NSRect contentFrame = [wrapper.window.contentView frame];
         wrapper.mouseLocation = NSMakePoint(mouseInWindow.x,
                                             contentFrame.size.height - mouseInWindow.y);
+                if(wrapper.fullscreenHeader.active) wrapper.mouseLocation=zenitLogicalScreenPoint(wrapper,NSEvent.mouseLocation);
     }
 }
 
@@ -5341,6 +5494,7 @@ void macos_destroy_window(void* window_ptr) {
     @autoreleasepool {
         if (!window_ptr) return;
         WindowWrapper *wrapper = (__bridge_transfer WindowWrapper*)window_ptr;
+        [wrapper.fullscreenHeader stop];
         // stop and release display link: CVDisplayLinkStop sync-waits
         // callback thread exit, prevent destroy-after callback via dangling
         if (wrapper.displayLink) {
@@ -5359,6 +5513,7 @@ void macos_destroy_window(void* window_ptr) {
         wrapper.metalView.liveResizeTicker = nil;
         wrapper.metalView.renderCallback = NULL;
         wrapper.metalView.renderContext = NULL;
+        wrapper.chromeHitCallback = NULL; wrapper.chromeHitContext = NULL;
         wrapper.titlebarHitCallback = NULL;
         wrapper.titlebarHitContext = NULL;
         wrapper.resignKeyCallback = NULL;
@@ -5587,7 +5742,15 @@ static void pumpAppEventsWithTimeout(uint32_t timeout_ms) {
             // mouse/scroll event handling (route to target)
             switch (event.type) {
                 case NSEventTypeLeftMouseDown: {
-                    if (target.titlebarDragHeight > 0) {
+                    if (target.chromeHitCallback) {
+                        NSPoint p=[target.window.contentView convertPoint:event.locationInWindow fromView:nil];
+                        float y=(float)(target.window.contentView.bounds.size.height-p.y);
+                        if (!chromePointInNativeButton(target,p) && target.chromeHitCallback(target.chromeHitContext,(float)p.x,y)==2 && !(target.window.styleMask & NSWindowStyleMaskFullScreen)) {
+                            [target.window performWindowDragWithEvent:event];
+                            break;
+                        }
+                    }
+                    if (!target.chromeHitCallback && target.titlebarDragHeight > 0) {
                         NSRect contentFrame = [target.window.contentView frame];
                         NSPoint loc = [event locationInWindow];
                         float y_from_top = (float)(contentFrame.size.height - loc.y);
@@ -5654,12 +5817,12 @@ static void pumpAppEventsWithTimeout(uint32_t timeout_ms) {
                     break;
                 case NSEventTypeScrollWheel:
                     {
-                        NSPoint scrollInWindow = [event locationInWindow];
+                        NSPoint scrollInWindow = zenitLogicalEventPoint(target,event);
                         NSRect contentFrame = [target.window.contentView frame];
                         ScrollEventPacket packet;
                         packet.sequence = nextInputEventSequence();
                         packet.x = (float)scrollInWindow.x;
-                        packet.y = (float)(contentFrame.size.height - scrollInWindow.y);
+                        packet.y = (float)scrollInWindow.y;
                         packet.dx = (float)event.scrollingDeltaX;
                         packet.dy = (float)event.scrollingDeltaY;
                         packet.phase = zenitScrollPhaseCode(event);
@@ -5673,12 +5836,12 @@ static void pumpAppEventsWithTimeout(uint32_t timeout_ms) {
                     break;
                 case NSEventTypeMagnify:
                     {
-                        NSPoint magInWindow = [event locationInWindow];
+                        NSPoint magInWindow = zenitLogicalEventPoint(target,event);
                         NSRect magContentFrame = [target.window.contentView frame];
                         MagnifyEventPacket mpacket;
                         mpacket.sequence = nextInputEventSequence();
                         mpacket.x = (float)magInWindow.x;
-                        mpacket.y = (float)(magContentFrame.size.height - magInWindow.y);
+                        mpacket.y = (float)magInWindow.y;
                         mpacket.magnification = (float)event.magnification;
                         if (event.phase == NSEventPhaseBegan) mpacket.phase = 0;
                         else if (event.phase == NSEventPhaseEnded) mpacket.phase = 2;
@@ -5799,6 +5962,7 @@ void macos_update_window_mouse(void *window_ptr) {
                 NSRect contentFrame = [wrapper.window.contentView frame];
                 wrapper.mouseLocation = NSMakePoint(mouseInWindow.x,
                                                     contentFrame.size.height - mouseInWindow.y);
+                if(wrapper.fullscreenHeader.active) wrapper.mouseLocation=zenitLogicalScreenPoint(wrapper,NSEvent.mouseLocation);
             }
             if (inactiveHover) {
                 wrapper.leftButtonPressed = NO;
@@ -6414,7 +6578,8 @@ static NSMutableArray<NSDictionary *> *zenitPendingMenuCommands;
     // when any command is pending; never evict an earlier user action.
     const BOOL needsWake = zenitPendingMenuCommands.count == 0;
     NSWindow *keyWindow = NSApp.keyWindow;
-    uint64_t windowId = keyWindow ? (uint64_t)(NSInteger)keyWindow.windowNumber : 0;
+    WindowWrapper *logicalOwner=wrapperForWindow(keyWindow);
+    uint64_t windowId = logicalOwner ? (uint64_t)logicalOwner.window.windowNumber : (keyWindow ? (uint64_t)keyWindow.windowNumber : 0);
     [zenitPendingMenuCommands addObject:@{
         @"windowId": @(windowId),
         @"commandId": command,
@@ -6966,5 +7131,91 @@ float macos_get_display_refresh_rate(void* window_ptr) {
             return (float)period.timeScale / (float)period.timeValue;
         }
         return 60.0;
+    }
+}
+
+int macos_chrome_configure(void *owner, int mode, int automatic, float height) {
+    WindowWrapper *w=(__bridge WindowWrapper*)owner;
+    if (!w.window || (mode==1 && (!isfinite(height) || height<=0))) return 0;
+    if (!mode) return 1;
+    w.chromeHideControls=mode==2 || !automatic;
+    if (mode==2) {
+        w.window.styleMask=NSWindowStyleMaskBorderless|NSWindowStyleMaskResizable;
+        w.window.collectionBehavior |= NSWindowCollectionBehaviorFullScreenPrimary;
+    }
+    w.window.titlebarAppearsTransparent=YES;
+    w.window.titleVisibility=NSWindowTitleHidden;
+    if (mode==1) w.window.styleMask |= NSWindowStyleMaskFullSizeContentView;
+    for (NSNumber *kind in @[@(NSWindowCloseButton),@(NSWindowMiniaturizeButton),@(NSWindowZoomButton)]) {
+        NSButton *b=[w.window standardWindowButton:kind.integerValue];
+        b.hidden=mode==2 || !automatic;
+    }
+    if (mode==1 && automatic) macos_set_traffic_lights_inset(owner,7,height/2);
+    w.window.movableByWindowBackground=NO;
+    w.titlebarDragHeight=0;
+    return 1;
+}
+// Explicit `.native` chrome: a real system titlebar (title, standard buttons,
+// system drag), with the client below it. Windows are created with a transparent
+// full-size titlebar because legacy apps paint their own; only the new chrome API
+// asks for this, so the legacy default appearance is unchanged.
+int macos_chrome_system_titlebar(void *owner) {
+    WindowWrapper *w=(__bridge WindowWrapper*)owner;
+    if (!w.window) return 0;
+    NSSize content=w.window.contentView.frame.size;
+    w.window.styleMask=(w.window.styleMask & ~(NSWindowStyleMaskFullSizeContentView|NSWindowStyleMaskBorderless))|NSWindowStyleMaskTitled|NSWindowStyleMaskClosable|NSWindowStyleMaskMiniaturizable|NSWindowStyleMaskResizable;
+    w.window.titlebarAppearsTransparent=NO;
+    w.window.titleVisibility=NSWindowTitleVisible;
+    for (NSNumber *kind in @[@(NSWindowCloseButton),@(NSWindowMiniaturizeButton),@(NSWindowZoomButton)])
+        [w.window standardWindowButton:kind.integerValue].hidden=NO;
+    w.chromeHideControls=NO;
+    w.hasTrafficLightsInset=NO;
+    w.titlebarDragHeight=0;
+    w.window.movableByWindowBackground=NO;
+    // Keep the requested client size; the titlebar is added above it.
+    [w.window setContentSize:content];
+    return 1;
+}
+void macos_chrome_hit(void *owner, int (*hit)(void*,float,float), void *context) {
+    WindowWrapper *w=(__bridge WindowWrapper*)owner;
+    w.chromeHitCallback=hit; w.chromeHitContext=hit?context:NULL;
+}
+void macos_chrome_state(void *owner, ZenitChromeState *out) {
+    memset(out,0,sizeof(*out)); WindowWrapper *w=(__bridge WindowWrapper*)owner;
+    out->appearance=1;out->button_layout[3]=1;out->button_layout[4]=2;out->button_layout[5]=3;
+    if (!w.window) return;
+    [w.fullscreenHeader update];
+    out->state_generation=w.chromeStateGeneration;
+    out->flags=(w.window.isZoomed?1:0)|((w.window.styleMask & NSWindowStyleMaskFullScreen)?2:0)|(w.window.isKeyWindow?4:0)|(w.chromeFullscreenTransition?8:0);
+    out->flags |= 16;
+    out->capabilities=63; /* Native resizable edges; no explicit manual resize API. */
+    if (w.fullscreenHeader.active) out->flags |= 128;
+    if (w.fullscreenHeader.active && zenitHeaderVisible(w.fullscreenHeader.header)) out->flags |= 256;
+    if (w.fullscreenHeader.active && w.fullscreenHeader.hasPresented) out->flags |= 512;
+    if ((out->flags & 2) && !w.fullscreenHeader.active) return;
+    for (NSNumber *kind in @[@(NSWindowCloseButton),@(NSWindowMiniaturizeButton),@(NSWindowZoomButton)]) {
+        NSButton *b=[w.window standardWindowButton:kind.integerValue];
+        if (w.chromeHideControls) b.hidden=YES;
+        if (!b || b.hidden) continue;
+        NSView *host=w.fullscreenHeader.header ?: w.window.contentView;
+        NSRect r=[host convertRect:b.bounds fromView:b];
+        float y=(float)(host.bounds.size.height-NSMaxY(r));
+        /* The system titlebar can sit outside a native-mode client. */
+        if (y<0) continue;
+        out->controls[out->controls_count++]=(ZenitChromeRect){(float)r.origin.x,y,(float)r.size.width,(float)r.size.height};
+    }
+}
+int macos_chrome_minimum(void *owner,uint32_t width,uint32_t height) {
+    WindowWrapper *w=(__bridge WindowWrapper*)owner;if(!w.window)return 0;
+    w.window.contentMinSize=NSMakeSize(width,height);return 1;
+}
+int macos_chrome_action(void *owner, int action, int value) {
+    WindowWrapper *w=(__bridge WindowWrapper*)owner; if (!w.window) return 0;
+    switch(action) {
+    case 0: w.shouldClose=YES; return 1;
+    case 1: [w.window miniaturize:nil]; return 1;
+    case 2: if (w.window.isZoomed != !!value) [w.window zoom:nil]; return 1;
+    case 3: if (w.chromeFullscreenTransition) return 0; if (!!(w.window.styleMask & NSWindowStyleMaskFullScreen)!=!!value) { w.chromeFullscreenTransition=YES; [w.window toggleFullScreen:nil]; } return 1;
+    default: return 0;
     }
 }

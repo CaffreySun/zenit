@@ -25,6 +25,7 @@ const gpu = @import("gpu");
 const render = @import("render");
 const render_pacing = @import("render_pacing.zig");
 const frame_testing_enabled = @import("builtin").is_test or @import("build_options").test_mode;
+extern fn macos_fullscreen_header_encode(*anyopaque, *anyopaque, *anyopaque) void;
 const SdfRenderer = render.SdfRenderer;
 const ImageRenderer = render.ImageRenderer;
 const IconRenderer = render.IconRenderer;
@@ -205,6 +206,8 @@ pub const AppRenderer = struct {
     timing_ring: TimingRing = .{},
     /// Only resolved command-buffer timestamp intervals; no missing-sample zeros.
     gpu_timing_ring: TimingRing = .{},
+    gpu_timing_disjoint_samples: u64 = 0,
+    gpu_timing_failed_samples: u64 = 0,
     /// Last **render** frame start time (idle skip doesn't update), DevTools FPS frame-interval
     /// baseline.
     /// Use renderer's own wall-clock not cx.frame_dt_seconds: latter 1s capped and idle wake first
@@ -319,13 +322,13 @@ pub const AppRenderer = struct {
         errdefer text_renderer.deinit();
 
         var requested = config.visual_quality;
-        if (comptime gpu.backend_kind == .d3d12) {
+        if (comptime gpu.is_direct3d) {
             if (@import("zenit_environment").getOwned(allocator, "ZENIT_VISUAL_QUALITY") catch null) |value| {
                 defer allocator.free(value);
                 requested = try render.visual_quality.parse(value);
             }
         }
-        if (comptime gpu.backend_kind == .d3d12) {
+        if (comptime gpu.is_direct3d) {
             const args: std.process.Args = .{ .vector = std.os.windows.peb().ProcessParameters.CommandLine.slice() };
             var argv = try args.iterateAllocator(allocator);
             defer argv.deinit();
@@ -334,8 +337,8 @@ pub const AppRenderer = struct {
                 if (std.mem.startsWith(u8, arg, prefix)) requested = try render.visual_quality.parse(arg[prefix.len..]);
             }
         }
-        const quality = render.visual_quality.resolve(requested, if (comptime gpu.backend_kind == .d3d12) device.isSoftware() else false);
-        if (comptime gpu.backend_kind == .d3d12) std.log.info("[visual-quality] requested={s} effective={s}", .{ @tagName(requested), @tagName(quality) });
+        const quality = render.visual_quality.resolve(requested, if (comptime gpu.is_direct3d) device.isSoftware() else false);
+        if (comptime gpu.is_direct3d) std.log.info("[visual-quality] requested={s} effective={s}", .{ @tagName(requested), @tagName(quality) });
         return AppRenderer{
             .allocator = allocator,
             .io = io,
@@ -350,7 +353,7 @@ pub const AppRenderer = struct {
             .visual_quality = quality,
             // WARP cannot benefit from a deep queue of expensive stale UI
             // frames. Keep triple-buffered storage but admit one GPU frame.
-            .frame_sync = if (comptime gpu.backend_kind == .d3d12)
+            .frame_sync = if (comptime gpu.is_direct3d)
                 gpu.Backend.FrameSync.initWithLimit(FRAME_BUFFER_COUNT, if (device.isSoftware()) 1 else FRAME_BUFFER_COUNT)
             else if (comptime gpu.backend_kind == .null_backend)
                 gpu.Backend.FrameSync.init(FRAME_BUFFER_COUNT, io)
@@ -399,7 +402,7 @@ pub const AppRenderer = struct {
     pub fn setVisualQuality(self: *AppRenderer, requested: render.visual_quality.Quality) void {
         // Blur pipeline failure auto-downgrades to basic (D3D12 only; WARP etc); Metal keeps
         // semantics: glass just non-blurred.
-        const quality = if ((comptime gpu.backend_kind == .d3d12) and self.persistent_gpu.blur_pipeline_failed) .basic else render.visual_quality.resolve(requested, if (comptime gpu.backend_kind == .d3d12) self.device.isSoftware() else false);
+        const quality = if ((comptime gpu.is_direct3d) and self.persistent_gpu.blur_pipeline_failed) .basic else render.visual_quality.resolve(requested, if (comptime gpu.is_direct3d) self.device.isSoftware() else false);
         if (self.visual_quality == quality) return;
         self.visual_quality = quality;
         self.frame_damage.invalidate();
@@ -615,13 +618,16 @@ pub const AppRenderer = struct {
         // propagate; basic is not device recovery. Only D3D12 upgrades blur pipeline failure to
         // overall basic
         // quality (includes disabling animations).
-        if ((comptime gpu.backend_kind == .d3d12) and self.visual_quality != .basic and self.persistent_gpu.blur_pipeline_failed) {
+        if ((comptime gpu.is_direct3d) and self.visual_quality != .basic and self.persistent_gpu.blur_pipeline_failed) {
             self.visual_quality = .basic;
             self.frame_damage.invalidate();
             self.background_damage.invalidate();
             self.background_valid = false;
             self.retained_valid = false;
             self.offscreen_pool.invalidateRetainedContents();
+            if (self.lum_batch_cmd_buffer == null) {
+                for (&self.persistent_gpu.luminance_slots) |*slot| slot.cur_pending = false;
+            }
             cx.needs_redraw = true;
             if (cx.root) |root| root.markRenderDirty();
             std.log.warn("[visual-quality] basic: backdrop pipeline unavailable", .{});
@@ -635,6 +641,21 @@ pub const AppRenderer = struct {
             cx.backdrop_luminance_readback = self.visual_quality != .basic;
         }
         const frame_start = @import("zenit_time").Instant.now(cx.io) catch null;
+        var measured_frame = false;
+        // Registered before frame resources: their deferred teardown must be
+        // included in CPU/total timing, especially COM releases on Direct3D.
+        defer if (measured_frame) {
+            const complete = @import("zenit_time").Instant.now(cx.io) catch null;
+            const elapsed = timerDelta(frame_start, complete);
+            self.last_frame_stats.total_frame_us = elapsed;
+            self.last_frame_stats.cpu_frame_us = elapsed -| self.last_frame_stats.wait_for_frame_us -| self.last_frame_stats.acquire_texture_us;
+            self.timing_ring.push(.{
+                .gpu_execute_us = self.last_frame_stats.gpu_execute_us,
+                .cpu_frame_us = self.last_frame_stats.cpu_frame_us,
+                .total_frame_us = elapsed,
+            });
+            cx.frame_perf.pushFrameTotalUs(elapsed);
+        };
         errdefer {
             self.frame_damage.invalidate();
             self.background_damage.invalidate();
@@ -645,14 +666,14 @@ pub const AppRenderer = struct {
             // pixels and damage baselines; the retry must repaint every layer.
             self.offscreen_pool.invalidateRetainedContents();
         }
-        const frame_error_start = if (comptime gpu.backend_kind == .d3d12) gpu.Backend.CommandBuffer.error_count.load(.monotonic) else 0;
+        const frame_error_start = if (comptime gpu.is_direct3d) gpu.Backend.CommandBuffer.error_count.load(.monotonic) else 0;
         var wait_start: ?@import("zenit_time").Instant = null;
         var wait_end: ?@import("zenit_time").Instant = null;
 
         // D3D12 (especially WARP) can wait hundreds of milliseconds for a
         // frame slot. Sample animation time after that wait, so submitted UI
         // state does not describe the instant before the GPU stall.
-        const early_frame_wait = gpu.backend_kind == .d3d12;
+        const early_frame_wait = gpu.is_direct3d;
         var acquired_slot = false;
         errdefer if (acquired_slot) self.frame_sync.signal();
         if (early_frame_wait) {
@@ -660,7 +681,7 @@ pub const AppRenderer = struct {
             try self.frame_sync.waitForNextFrame();
             wait_end = @import("zenit_time").Instant.now(cx.io) catch null;
             acquired_slot = true;
-            if (comptime gpu.backend_kind == .d3d12) {
+            if (comptime gpu.is_direct3d) {
                 // No submitted frame remains after the checked fence wait.
                 // This is common with WARP's single-frame admission limit.
                 // Release only the pool's time quarantine, never its owners or
@@ -755,7 +776,7 @@ pub const AppRenderer = struct {
         // A provider may change its output while retaining the same context
         // address. It has no revision contract, so custom providers repaint.
         // The preserved texture uses BGRA; other surface formats also repaint.
-        const frame_cache_enabled = if (comptime gpu.backend_kind == .d3d12)
+        const frame_cache_enabled = if (comptime gpu.is_direct3d)
             self.device.isSoftware() and self.retained_enabled and !self.has_external_encoder and self.config.clear_color.a == 1 and self.text_renderer.font_ranges_provider == null and
                 (surface_texture.texture.format == .bgra8_unorm or surface_texture.texture.format == .bgra8_unorm_srgb)
         else
@@ -830,7 +851,7 @@ pub const AppRenderer = struct {
         if (prefix_len > 0) {
             if (!reuse_background) {
                 if (background_update) |rect| {
-                    if (comptime gpu.backend_kind == .d3d12) {
+                    if (comptime gpu.is_direct3d) {
                         if (!render_pass.clearOpaque(.{ cc.r, cc.g, cc.b, cc.a }, rect)) return error.FrameDamageClearFailed;
                     }
                     enc.frame_damage_scissor = rect;
@@ -852,7 +873,7 @@ pub const AppRenderer = struct {
             }
             try enc.encodeDisplayFrom(cx, prefix_len);
         } else if (damage) |rect| {
-            if (comptime gpu.backend_kind == .d3d12) {
+            if (comptime gpu.is_direct3d) {
                 if (rect[2] > 0 and rect[3] > 0 and !render_pass.clearOpaque(.{ cc.r, cc.g, cc.b, cc.a }, rect)) return error.FrameDamageClearFailed;
             }
             enc.frame_damage_scissor = rect;
@@ -873,7 +894,7 @@ pub const AppRenderer = struct {
         const flush_start = @import("zenit_time").Instant.now(cx.io) catch null;
         if (enc.render_pass) |rp| {
             try enc.flush(rp);
-            if (comptime gpu.backend_kind == .d3d12) {
+            if (comptime gpu.is_direct3d) {
                 if (self.desktop_capture_stamp) {
                     const serial = self.frame_count + 1;
                     if (serial > 0xffffff) return error.DesktopCaptureSerialOverflow;
@@ -980,6 +1001,21 @@ pub const AppRenderer = struct {
                 return error.InjectedFrameFailure;
             }
         }
+        if (comptime gpu.backend_kind == .metal) {
+            macos_fullscreen_header_encode(@ptrCast(self.surface.layer), @ptrCast(surface_texture.texture.raw), @ptrCast(gpu_encoder.raw));
+        }
+        if (comptime gpu.is_direct3d) {
+            if (self.lum_batch_cmd_buffer == null) {
+                for (&self.persistent_gpu.luminance_slots) |*slot| {
+                    if (!slot.cur_pending) continue;
+                    if (slot.staging) |*staging| {
+                        staging.prepareBgra8Readback(&gpu_encoder, slot.cur_w, slot.cur_h) catch {
+                            slot.cur_pending = false;
+                        };
+                    }
+                }
+            }
+        }
         var cmd_buffer = try gpu_encoder.finish();
         defer cmd_buffer.deinit();
 
@@ -1050,7 +1086,7 @@ pub const AppRenderer = struct {
             );
         }
         surface_texture.preparePresent(&cmd_buffer);
-        if (comptime gpu.backend_kind == .d3d12) {
+        if (comptime gpu.is_direct3d) {
             try cmd_buffer.submitChecked();
             if (prefix_len > 0 and gpu.Backend.CommandBuffer.error_count.load(.monotonic) == frame_error_start) {
                 self.background_damage.commit();
@@ -1168,19 +1204,10 @@ pub const AppRenderer = struct {
         render.offscreen_texture.perf_texture_creates = 0;
         if (comptime @hasDecl(gpu.Backend.CommandEncoder, "perf_counters")) gpu.Backend.CommandEncoder.perf_counters = .{};
 
-        // Only frames reaching here rendered; idle skip doesn't, so near-zero samples
-        // won't dilute P95.
-        self.timing_ring.push(.{
-            .gpu_execute_us = self.last_frame_stats.gpu_execute_us,
-            .cpu_frame_us = self.last_frame_stats.cpu_frame_us,
-            .total_frame_us = self.last_frame_stats.total_frame_us,
-        });
-
         // DevTools (Cx side) frame perf backfill. Performance panel reads frame_*_history /
         // perf.layout_us / perf.render_us from target Cx; chain broke when extracted from
         // downstream editor. Write after cx.render(): perf.resetFrame() clears at render start, so
         // values here survive to next frame for DevTools to read across Cx.
-        cx.frame_perf.pushFrameTotalUs(total_us);
         cx.frame_perf.acquire.push(acquire_us);
         cx.perf.layout_us = layout_us;
         cx.perf.render_us = render_gen_us;
@@ -1210,6 +1237,8 @@ pub const AppRenderer = struct {
         self.total_retained_misses += enc.retained_misses;
         self.total_retained_partial_repaints += enc.retained_partial_repaints;
         self.frame_count += 1;
+        // Idle skips and failed frames do not dilute the timing history.
+        measured_frame = true;
     }
 
     /// Release completed command references before DXGI recreates back buffers.
@@ -1261,7 +1290,7 @@ pub const AppRenderer = struct {
                 if (!slot.cur_pending) continue;
                 if (slot.staging) |*staging| {
                     var buf: [64 * 64 * 4]u8 = undefined;
-                    if (readLuminanceBytes(staging, slot.cur_w, slot.cur_h, &buf)) {
+                    if (readCompletedLuminanceBytes(staging, slot.cur_w, slot.cur_h, &buf)) {
                         const wf: f32 = @floatFromInt(slot.cur_w);
                         const hf: f32 = @floatFromInt(slot.cur_h);
                         // The staging holds the whole padded capture: measure
@@ -1393,7 +1422,17 @@ pub const AppRenderer = struct {
         var latest: u64 = 0;
         while (self.gpu_timing_pending[0]) |*oldest| {
             if (!oldest.isCompleted()) break;
-            if (oldest.gpuElapsedMicros()) |elapsed| {
+            if (comptime @hasDecl(gpu.Backend.CommandBuffer, "gpuTimingResult")) {
+                switch (oldest.gpuTimingResult()) {
+                    .pending => break,
+                    .disjoint => self.gpu_timing_disjoint_samples += 1,
+                    .failed => self.gpu_timing_failed_samples += 1,
+                    .elapsed => |elapsed| {
+                        latest = elapsed;
+                        self.gpu_timing_ring.push(.{ .gpu_execute_us = elapsed });
+                    },
+                }
+            } else if (oldest.gpuElapsedMicros()) |elapsed| {
                 latest = elapsed;
                 self.gpu_timing_ring.push(.{ .gpu_execute_us = elapsed });
             }
@@ -1436,6 +1475,14 @@ pub const AppRenderer = struct {
     }
 
     const AverageLuminance = struct { linear: f32, srgb: f32 };
+    fn readCompletedLuminanceBytes(staging: *gpu.Backend.Texture, w: u32, h: u32, buf: *[64 * 64 * 4]u8) bool {
+        if (comptime gpu.is_direct3d) {
+            if (w == 0 or h == 0 or w > 64 or h > 64) return false;
+            staging.readPreparedBgra8(w, h, buf, w * 4) catch return false;
+            return true;
+        } else return readLuminanceBytes(staging, w, h, buf);
+    }
+
     fn readLuminanceBytes(staging: *const gpu.Backend.Texture, w: u32, h: u32, buf: *[64 * 64 * 4]u8) bool {
         if (w == 0 or h == 0 or w > 64 or h > 64) return false;
         const bpr = w * 4;

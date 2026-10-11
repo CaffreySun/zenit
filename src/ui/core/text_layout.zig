@@ -177,7 +177,7 @@ inline fn measureKeyEq(a: MeasureKey, b: MeasureKey) bool {
 // (repeated CoreText remeasure), two slots/group + group LRU eviction
 // significantly lowers thrash, same capacity.
 fn measureCacheLookup(key: MeasureKey) ?f32 {
-    const base = (key.text_hash % MEASURE_CACHE_CAP) & ~@as(u64, 1);
+    const base: usize = @intCast((key.text_hash % MEASURE_CACHE_CAP) & ~@as(u64, 1));
     inline for (0..2) |way| {
         const e = &g_measure_cache[base + way];
         if (e.valid and measureKeyEq(e.key, key)) {
@@ -192,7 +192,7 @@ fn measureCacheLookup(key: MeasureKey) ?f32 {
 }
 
 fn measureCacheStore(key: MeasureKey, width: f32) void {
-    const base = (key.text_hash % MEASURE_CACHE_CAP) & ~@as(u64, 1);
+    const base: usize = @intCast((key.text_hash % MEASURE_CACHE_CAP) & ~@as(u64, 1));
     const e0 = &g_measure_cache[base];
     const e1 = &g_measure_cache[base + 1];
     const target = if (!e0.valid) e0 else if (!e1.valid) e1 else if (e0.last_used <= e1.last_used) e0 else e1;

@@ -21,6 +21,27 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  windows-build:
+    name: Windows x64 host build
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: mlugg/setup-zig@v1
+        with:
+          version: 0.17.0
+      - name: Verify build configuration
+        run: zig build test-build-config
+      - name: Build interactive examples with the native architecture default
+        run: zig build windows-storybook windows-text-input windows-render-gallery -Dgpu-backend=d3d12 -Doptimize=debug
+      - name: Build gallery acceptance contracts
+        run: zig build windows-render-gallery -Dtest-mode=true -Dgpu-backend=d3d12 -Doptimize=debug --prefix out/test-mode
+      - name: Build a Windows consumer using the public attach helper
+        working-directory: templates/minimal-app
+        run: zig build -Dtarget=x86_64-windows-gnu -Doptimize=debug
+
   oss-boundary:
     name: zenit OSS boundary
     runs-on: macos-latest
@@ -367,7 +388,7 @@ jobs:
   required:
     name: required / all gates
     if: always()
-    needs: [oss-boundary, storybook-e2e]
+    needs: [oss-boundary, storybook-e2e, windows-build]
     runs-on: macos-latest
     timeout-minutes: 5
     steps:
@@ -375,6 +396,8 @@ jobs:
         env:
           CORE_RESULT: ${{ needs.oss-boundary.result }}
           E2E_RESULT: ${{ needs.storybook-e2e.result }}
+          WINDOWS_RESULT: ${{ needs.windows-build.result }}
         run: |
           test "$CORE_RESULT" = success
           test "$E2E_RESULT" = success
+          test "$WINDOWS_RESULT" = success

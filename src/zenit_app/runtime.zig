@@ -1185,6 +1185,9 @@ pub const App = struct {
         // manual
         // operation of a test-mode app is unaffected.
         if (test_harness.enabled and isolateOsPointer() and pointer_isolation.isOsPointerEvent(evt)) return true;
+        // Optional keyboard isolation (ZENIT_E2E_ISOLATE_KEYBOARD=1): same rationale as pointer
+        // isolation for machines shared between an e2e run and a live user.
+        if (test_harness.enabled and pointer_isolation.keyboardEnabled() and pointer_isolation.isOsKeyboardEvent(evt)) return true;
         switch (evt) {
             .quit => self.should_quit = true,
             .window_close_requested => self.requestClose() catch {},

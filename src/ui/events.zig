@@ -397,7 +397,9 @@ pub const MomentumPhase = enum(u8) { none, began, changed, ended };
 
 /// Scroll wheel event
 pub const ScrollEvent = struct {
+    /// Scroll delta in logical points (normalized at the event bridge).
     dx: f32,
+    /// Scroll delta in logical points (normalized at the event bridge).
     dy: f32,
     x: f32,
     y: f32,

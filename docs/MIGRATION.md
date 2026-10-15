@@ -20,6 +20,29 @@ alters a public symbol.
 
 ---
 
+## 2026-10-15: macOS non-precise wheel deltas are pixels (BREAKING)
+
+**What changed.** `ScrollEvent.dx/dy` from a non-precise wheel (ratchet mouse)
+were raw AppKit line units (typically ~0.1 per detent, up to ~15 on fast flicks).
+They are now logical points, converted at the event bridge (`40 px/line`).
+Precise devices (trackpads, Magic Mouse) already reported points and are
+unchanged.
+
+**Why.** Line units reached `scroll_area`, which applies `dx/dy` as pixels
+(`scroll_speed` multiplies them): one detent scrolled ~0.1 px and fast flicks
+drifted unpredictably. 40 px/line is the shared constant of Chromium
+`kScrollbarPixelsPerCocoaTick`, WebKit `Scrollbar::pixelsPerLineStep` and
+Flutter `pixelsPerLine`.
+
+**Migration.** Drop any line-unit compensation you added for `ScrollEvent.dx/dy`:
+
+```zig
+// before
+const px = ev.dy * 40; // or scroll_speed = 40, * line_height, ...
+// after
+const px = ev.dy; // already logical px
+```
+
 ## 2026-10-03: `ui.view` is the way to build UI; control flow is anchored (BREAKING for child-index code)
 
 **What changed**

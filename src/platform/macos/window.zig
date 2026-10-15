@@ -613,11 +613,13 @@ pub const MacOSWindow = struct {
         sequence: u64,
         x: f32,
         y: f32,
+        /// Scroll delta in logical points (normalized at the event bridge).
         dx: f32,
+        /// Scroll delta in logical points (normalized at the event bridge).
         dy: f32,
         /// NSEvent.phase encoding: 0=none, 1=may_begin, 2=began, 3=changed, 4=ended, 5=cancelled
         phase: u8,
-        /// NSEvent.momentumPhase encoding: 0=none, 1=began, 2=changed, 3=ended
+        /// NSEvent.momentumPhase encoding: 0=none, 1=began, 2=changed, 3=ended (cancelled folds into ended)
         momentum: u8,
         /// Modifier state at event time (needed for Cmd+scroll zoom etc.)
         modifiers: Modifiers = .{},

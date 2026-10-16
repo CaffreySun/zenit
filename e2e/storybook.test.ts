@@ -247,6 +247,7 @@ const EXPECT: Record<string, string[]> = {
   layoutbox: ["Coverage matrix", "Padding-box anatomy", "content 624 × 132", "Percentage inset", "Flex vs Grid", "Sizing modes", "Overflow clipping"],
   virtuallist: ["Row 0", "Row 1"],
   virtuallistdynamic: ["#0", "#1"],
+  scrolling: ["Vertical · wheel / trackpad", "Horizontal · sideways scroll", "Inner list"],
   scrollarea: ["Scrollable line 0", "Scrollable line 1"],
   grid: ["0,0", "0,1", "1,0"],
   glassbox: ["Toolbar", "Tab bar", "Continue", "Regular", "Interactive", "hover / press me", "Clear", "Backdrop shows through.", "Identity", "Drag me"],
@@ -558,6 +559,69 @@ test("server reachable", async () => {
   await waitForServerReady(15000);
   assert((await health()).status === "ok");
 }, { fatal: true });
+
+async function scrollingState(part: string) {
+  const nodes = await query(`story.scrolling.${part}.status`);
+  const text: string[] = [];
+  for (const node of nodes) collectText(node, text);
+  const value = text.join(" ");
+  const match = /x=(-?\d+) y=(-?\d+)/.exec(value);
+  assert(match != null, `missing scroll readout: ${value}`);
+  return { x: Number(match![1]), y: Number(match![2]), text: value };
+}
+
+async function scrollPanel(part: string, dx: number, dy: number, mods = {}) {
+  const r = await screenPos(`story.scrolling.${part}`);
+  await scrollAt(r.x + 40, r.y + Math.min(40, r.h / 2), dx, dy, mods);
+  await sleep(80);
+}
+
+test("scrolling: logical points, axes and reset", async () => {
+  await switchTo("button");
+  await switchTo("scrolling");
+  await scrollPanel("vertical", 0, -60);
+  assert((await scrollingState("vertical")).y === 60, "vertical wheel must move 60 logical points");
+  assert((await scrollingState("horizontal")).x === 0, "vertical wheel changed sibling");
+  await scrollPanel("horizontal", -80, 0);
+  assert((await scrollingState("horizontal")).x === 80, `horizontal wheel must move 80 logical points: ${JSON.stringify(await scrollingState("horizontal"))}`);
+  await shot("scrolling-axes");
+  await clickTestId("story.scrolling.vertical.reset");
+  await clickTestId("story.scrolling.horizontal.reset");
+  assert((await scrollingState("vertical")).y === 0, "vertical reset failed");
+  assert((await scrollingState("horizontal")).x === 0, "horizontal reset failed");
+});
+
+test("scrolling: nested ownership and boundary handoff", async () => {
+  await switchTo("button");
+  await switchTo("scrolling");
+  await scrollPanel("inner", 0, -40);
+  assert((await scrollingState("inner")).y === 40, "inner did not consume wheel");
+  assert((await scrollingState("outer")).y === 0, "parent moved before inner boundary");
+  await scrollPanel("inner", 0, -460);
+  const edge = (await scrollingState("inner")).y;
+  assert(edge > 40, `inner did not reach bottom: ${JSON.stringify(await scrollingState("inner"))}`);
+  await scrollPanel("inner", 0, -40);
+  assert((await scrollingState("inner")).y === edge, "inner crossed its boundary");
+  assert((await scrollingState("outer")).y > 0, "wheel did not hand off to parent");
+  await shot("scrolling-nested-handoff");
+});
+
+test("scrolling: zero-delta trackpad and momentum lifecycle", async () => {
+  await switchTo("button");
+  await switchTo("scrolling");
+  await scrollPanel("vertical", 0, 0, { phase: "began" });
+  await scrollPanel("vertical", 0, -24, { phase: "changed" });
+  await scrollPanel("vertical", 0, 0, { phase: "ended" });
+  let state = await scrollingState("vertical");
+  assert(state.y === 24 && state.text.includes("ended/none"), `lost trackpad ending: ${state.text}`);
+  await scrollPanel("vertical", 0, -12, { momentum: "began" });
+  await scrollPanel("vertical", 0, -8, { momentum: "changed" });
+  await scrollPanel("vertical", 0, 0, { momentum: "ended" });
+  state = await scrollingState("vertical");
+  assert(state.y === 44 && state.text.includes("none/ended"), `lost momentum ending: ${state.text}`);
+  await shot("scrolling-trackpad-ended");
+});
+
 
 // ── all components: switch + data verification + screenshot (visual + log data dual) ──
 for (const key of KEYS) {

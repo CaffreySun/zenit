@@ -17,6 +17,7 @@ pub const CheckboxProps = struct {
     indeterminate: ui.Source(bool) = .{ .value = false },
     label: ui.Source([]const u8) = .{ .value = "" },
     disabled: ui.Source(bool) = .{ .value = false },
+    focus_ring: ui.Source(ui.FocusRingConfig) = .{ .value = .{} },
     on_change: ?ui.Handler(bool) = null,
     check_icon_asset: ui.Source(?ui.SvgAsset) = .{ .value = null },
     /// Text children of the tag go into this parameter (ui.view.textChild)
@@ -26,6 +27,7 @@ fn __yix_Checkbox(__yix_props: CheckboxProps, scope: *ui.Scope, cx: *ui.Cx) anye
     const indeterminate = __yix_props.indeterminate;
     const label = __yix_props.label;
     const disabled = __yix_props.disabled;
+    const focusRing = __yix_props.focus_ring;
     const onChange = __yix_props.on_change;
     const checkIconAsset = __yix_props.check_icon_asset;
     const __yix_model_checked = try ui.reactive.resolveModelFor(bool, scope, __yix_props.checked);
@@ -47,7 +49,7 @@ fn __yix_Checkbox(__yix_props: CheckboxProps, scope: *ui.Scope, cx: *ui.Cx) anye
         break :__yix_d3 try scope.derive(__yix_T, .{ .disabled = disabled, }, struct { fn __yix_compute(__yix_ctx: anytype) __yix_T {
             return !__yix_ctx.disabled.get();
         } }.__yix_compute);
-    }, .focus_ring = true, .a11y = .{ .role = .checkbox, .checked = checked, .indeterminate = mixed, .disabled = disabled, .label = label }, .on_click = try ui.on.bind(scope, .{ .disabled = disabled, .checked = checked, .__yix_model_checked = __yix_model_checked, .onChange = onChange, .__yix_owner = scope.owner, }, struct { fn __yix_run(__yix_ctx: anytype) void { __yix_ctx.__yix_owner.beginBatch(); defer __yix_ctx.__yix_owner.endBatch(); if (!__yix_ctx.disabled.peek()) { __yix_ctx.__yix_model_checked.propose(!__yix_ctx.checked.peek(), __yix_ctx.onChange); }  } }.__yix_run), }, .{
+    }, .focus_ring = focusRing, .a11y = .{ .role = .checkbox, .checked = checked, .indeterminate = mixed, .disabled = disabled, .label = label }, .on_click = try ui.on.bind(scope, .{ .disabled = disabled, .checked = checked, .__yix_model_checked = __yix_model_checked, .onChange = onChange, .__yix_owner = scope.owner, }, struct { fn __yix_run(__yix_ctx: anytype) void { __yix_ctx.__yix_owner.beginBatch(); defer __yix_ctx.__yix_owner.endBatch(); if (!__yix_ctx.disabled.peek()) { __yix_ctx.__yix_model_checked.propose(!__yix_ctx.checked.peek(), __yix_ctx.onChange); }  } }.__yix_run), }, .{
             ui.view.box(.{ .style = S.CheckboxParts.slot(.box, .{ .on = on, .disabled = disabled }), }, .{
                 ui.view.icon(.{ .style = S.CheckboxParts.slot(.check, .{ .shown = checked }), }, __yix_d4: {
         const __yix_T = @TypeOf(checkIconAsset.peek() orelse ui.icons.check);

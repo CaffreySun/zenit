@@ -2,8 +2,8 @@
 // timing sleeps. The real bridge/pump runs against a deterministic input
 // context; the client document is advanced only at the SDK dispatch boundary.
 #import "../window_bridge.m"
-#include "no_render_copy.inc"
 #include "empty_a11y.inc"
+#include "no_render_copy.inc"
 #include <assert.h>
 
 static NSMutableString *document;
@@ -444,6 +444,151 @@ static void testScrollDeltaUnits(void) {
     fprintf(stderr, "PASS: line wheels normalize to logical points; precise deltas pass through\n");
 }
 
+// Queue real NSEvents inside this process: unlike harness Cx injection, these
+// exercise both pump entry points (which share one dispatcher) without global input.
+static void verifyScrollNormalization(WindowWrapper *w) {
+    for (int pump = 0; pump < 2; pump++) {
+        for (int precise = 0; precise < 2; precise++) {
+            for (int variant = 0; variant < 4; variant++) {
+                const BOOL zero = (variant & 2) != 0;
+                const BOOL shifted = (variant & 1) != 0;
+                CGEventRef raw = CGEventCreateScrollWheelEvent(NULL,
+                    precise ? kCGScrollEventUnitPixel : kCGScrollEventUnitLine,
+                    2, zero ? 0 : -3, zero ? 0 : 2);
+                assert(raw);
+                CGEventSetFlags(raw, shifted ? kCGEventFlagMaskShift : 0);
+                NSEvent *event = [NSEvent eventWithCGEvent:raw];
+                CFRelease(raw);
+                assert(event.hasPreciseScrollingDeltas == (BOOL)precise);
+                const float dx = (float)(event.scrollingDeltaX * (precise ? 1 : 40));
+                const float dy = (float)(event.scrollingDeltaY * (precise ? 1 : 40));
+                if (!zero) {
+                    assert(dx != 0 || dy != 0);
+                    if (!shifted) assert(dx != 0 && dy != 0);
+                }
+                [w.scrollEventQueue removeAllObjects];
+                enqueue(@[event]);
+                for (int attempt = 0; attempt < 16 && w.scrollEventQueue.count == 0; attempt++) {
+                    if (pump) pumpAppEventsWithTimeout(0);
+                    else macos_poll_events((__bridge void *)w);
+                }
+                assert(w.scrollEventQueue.count == 1);
+                ScrollEventPacket packet;
+                [w.scrollEventQueue.firstObject getValue:&packet];
+                assert(packet.dx == dx && packet.dy == dy);
+                assert(packet.modifiers == (uint32_t)event.modifierFlags);
+                assert(packet.phase == 0);
+                assert(packet.momentum == 0);
+                [w.scrollEventQueue removeAllObjects];
+            }
+        }
+    }
+    fprintf(stderr, "PASS: both native scroll entry points normalize line units and preserve precise deltas, axes, zero and modifiers\n");
+}
+
+// Explicit SDK phase expectations, independent of the bridge mapping helpers.
+// Zero-delta lifecycle packets must survive queueing and native ABI dequeue:
+// scroll ownership/bounce completion depends on them even without movement.
+static void verifyScrollLifecycle(WindowWrapper *w) {
+    const struct {
+        CGScrollPhase phase;
+        CGMomentumScrollPhase momentum;
+        uint8_t expectedPhase, expectedMomentum;
+        int dy;
+    } cases[] = {
+        { kCGScrollPhaseMayBegin, kCGMomentumScrollPhaseNone, 1, 0, 0 },
+        { kCGScrollPhaseBegan, kCGMomentumScrollPhaseNone, 2, 0, 0 },
+        { kCGScrollPhaseChanged, kCGMomentumScrollPhaseNone, 3, 0, -3 },
+        { kCGScrollPhaseEnded, kCGMomentumScrollPhaseNone, 4, 0, 0 },
+        { 0, kCGMomentumScrollPhaseBegin, 0, 1, -2 },
+        { 0, kCGMomentumScrollPhaseContinue, 0, 2, -1 },
+        { 0, kCGMomentumScrollPhaseEnd, 0, 3, 0 },
+        { kCGScrollPhaseBegan, kCGMomentumScrollPhaseNone, 2, 0, 0 },
+        { kCGScrollPhaseCancelled, kCGMomentumScrollPhaseNone, 5, 0, 0 },
+    };
+    for (int pump = 0; pump < 2; pump++) {
+        unsigned long long previousSequence = 0;
+        for (NSUInteger i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+            CGEventRef raw = CGEventCreateScrollWheelEvent(NULL,
+                kCGScrollEventUnitPixel, 2, cases[i].dy, 0);
+            assert(raw);
+            CGEventSetIntegerValueField(raw, kCGScrollWheelEventScrollPhase, cases[i].phase);
+            CGEventSetIntegerValueField(raw, kCGScrollWheelEventMomentumPhase, cases[i].momentum);
+            NSEvent *event = [NSEvent eventWithCGEvent:raw];
+            CFRelease(raw);
+            assert(event.hasPreciseScrollingDeltas);
+            enqueue(@[event]);
+            for (int attempt = 0; attempt < 16 && w.scrollEventQueue.count == 0; attempt++) {
+                if (pump) pumpAppEventsWithTimeout(0);
+                else macos_poll_events((__bridge void *)w);
+            }
+            float x, y, dx, dy;
+            uint8_t phase, momentum;
+            uint32_t modifiers;
+            unsigned long long sequence;
+            assert(macos_get_scroll_event((__bridge void *)w, &x, &y, &dx, &dy,
+                &phase, &momentum, &modifiers, &sequence));
+            assert(dx == 0 && dy == cases[i].dy);
+            assert(phase == cases[i].expectedPhase && momentum == cases[i].expectedMomentum);
+            assert(sequence > previousSequence);
+            previousSequence = sequence;
+            assert(!macos_get_scroll_event((__bridge void *)w, &x, &y, &dx, &dy,
+                &phase, &momentum, &modifiers, &sequence));
+        }
+    }
+    fprintf(stderr, "PASS: native scroll lifecycle preserves zero-delta boundaries, momentum and dequeue order\n");
+}
+
+static void verifyKeyboardIsolation(WindowWrapper *w, PumpInputContext *probe) {
+    void *ptr = (__bridge void *)w;
+    dispatchToClient(w);
+    assert(!w.keyboardIsolated);
+    macos_set_text_input_enabled(ptr, 1);
+    macos_set_keyboard_isolated(ptr, 1);
+    NSUInteger calls = probe.calls;
+    NSEvent *quit = [NSEvent keyEventWithType:NSEventTypeKeyDown location:NSZeroPoint
+        modifierFlags:NSEventModifierFlagCommand timestamp:0
+        windowNumber:w.window.windowNumber context:nil characters:@"q"
+        charactersIgnoringModifiers:@"q" isARepeat:NO keyCode:12];
+    NSEvent *close = [NSEvent keyEventWithType:NSEventTypeKeyDown location:NSZeroPoint
+        modifierFlags:NSEventModifierFlagCommand | NSEventModifierFlagShift timestamp:0
+        windowNumber:w.window.windowNumber context:nil characters:@"W"
+        charactersIgnoringModifiers:@"W" isARepeat:NO keyCode:13];
+    enqueue(@[quit, close, key(w, @"x", 7)]);
+    for (int i = 0; i < 4; ++i) pumpAppEventsWithTimeout(0);
+    assert(!w.shouldClose && !g_app_should_quit);
+    assert(probe.calls == calls);
+    assert(w.keyEventQueue.count == 0 && w.inputTextQueue.count == 0);
+    // Asynchronous candidate callbacks must not mutate native marked state.
+    [w.metalView setMarkedText:@"candidate" selectedRange:NSMakeRange(1, 0)
+        replacementRange:NSMakeRange(NSNotFound, 0)];
+    [w.metalView insertText:@"candidate" replacementRange:NSMakeRange(NSNotFound, 0)];
+    assert(w.imePreeditQueue.count == 0 && w.imeCommitQueue.count == 0);
+    assert(w.inputTextQueue.count == 0 && !w.metalView.hasMarkedText);
+    // Isolation belongs to the target window, not the process or key window.
+    void *otherPtr = macos_create_window(200, 100, "input isolation other window");
+    assert(otherPtr);
+    WindowWrapper *other = (__bridge WindowWrapper *)otherPtr;
+    assert(!other.keyboardIsolated);
+    PumpInputContext *otherProbe = [[PumpInputContext alloc] initWithClient:other.metalView];
+    otherProbe.selections = [NSMutableArray array];
+    other.metalView.zenitInputContext = otherProbe;
+    other.lastKeyboardInputSource = otherProbe.selectedKeyboardInputSource;
+    macos_set_text_input_enabled(otherPtr, 1);
+    enqueue(@[key(other, @"b", 11)]);
+    pumpAppEventsWithTimeout(0);
+    assert(otherProbe.calls == 1 && other.keyEventQueue.count == 1);
+    assert(probe.calls == calls && w.keyEventQueue.count == 0);
+    dispatchToClient(other);
+    macos_destroy_window(otherPtr);
+    macos_set_keyboard_isolated(ptr, 0);
+    enqueue(@[key(w, @"x", 7)]);
+    pumpAppEventsWithTimeout(0);
+    assert(probe.calls == calls + 1 && w.keyEventQueue.count == 1);
+    dispatchToClient(w);
+    fprintf(stderr, "PASS: per-window keyboard isolation blocks quit/close/IME, preserves other windows and restores normal input\n");
+}
+
 int main(int argc, const char **argv) {
     @autoreleasepool {
         testScrollDeltaUnits();
@@ -453,6 +598,8 @@ int main(int argc, const char **argv) {
         WindowWrapper *w = (__bridge WindowWrapper *)ptr;
         document = [NSMutableString string];
         verifyCandidateAnchor(w);
+        verifyScrollNormalization(w);
+        verifyScrollLifecycle(w);
         if (argc == 2 && strcmp(argv[1], "--system-ime") == 0) {
             // Real keyboard delivery requires an active application. Wait on
             // that OS condition only, never on IME readiness or a fixed delay.
@@ -515,6 +662,7 @@ int main(int argc, const char **argv) {
         probe.selections = [NSMutableArray array];
         w.metalView.zenitInputContext = probe;
         w.lastKeyboardInputSource = probe.selectedKeyboardInputSource;
+        verifyKeyboardIsolation(w, probe);
         verifyQueuedTextBeforeFocusClick(w, probe);
 
         // First click and first key queued together: the old pump consumed

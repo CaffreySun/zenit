@@ -32,6 +32,7 @@ pub const ButtonProps = struct {
     icon_only: ui.Source(bool) = .{ .value = false },
     loading: ui.Source(bool) = .{ .value = false },
     disabled: ui.Source(bool) = .{ .value = false },
+    focus_ring: ui.Source(ui.FocusRingConfig) = .{ .value = .{} },
     block: ui.Source(bool) = .{ .value = false },
     on_click: ?ui.Handler(void) = null,
     icon: ui.Source(?u32) = .{ .value = null },
@@ -54,6 +55,7 @@ fn __yix_Button(__yix_props: ButtonProps, scope: *ui.Scope, cx: *ui.Cx) anyerror
     const iconOnly = __yix_props.icon_only;
     const loading = __yix_props.loading;
     const disabled = __yix_props.disabled;
+    const focusRing = __yix_props.focus_ring;
     const block = __yix_props.block;
     const onClick = __yix_props.on_click;
     const icon = __yix_props.icon;
@@ -132,7 +134,7 @@ fn __yix_Button(__yix_props: ButtonProps, scope: *ui.Scope, cx: *ui.Cx) anyerror
             return if (__yix_ctx.disabled.get()) null else __yix_ctx.onEvent.get();
         } }.__yix_compute);
     };
-    const __yix_root = try ui.view.render(scope, cx, ui.view.row(.{ .style = .{ ui.view.statesBy(shape, S.root), S.fade }, .focusable = enabled, .focus_ring = true, .a11y = semantics, .on_click = try ui.on.bind(scope, .{ .disabled = disabled, .loading = loading, .onClick = onClick, .__yix_owner = scope.owner, }, struct { fn __yix_run(__yix_ctx: anytype) void { __yix_ctx.__yix_owner.beginBatch(); defer __yix_ctx.__yix_owner.endBatch(); if (!__yix_ctx.disabled.peek() and !__yix_ctx.loading.peek()) { ui.on.fire(__yix_ctx.onClick, .{}); }  } }.__yix_run), .on_event = events, .event_context = eventContext, }, .{
+    const __yix_root = try ui.view.render(scope, cx, ui.view.row(.{ .style = .{ ui.view.statesBy(shape, S.root), S.fade }, .focusable = enabled, .focus_ring = focusRing, .a11y = semantics, .on_click = try ui.on.bind(scope, .{ .disabled = disabled, .loading = loading, .onClick = onClick, .__yix_owner = scope.owner, }, struct { fn __yix_run(__yix_ctx: anytype) void { __yix_ctx.__yix_owner.beginBatch(); defer __yix_ctx.__yix_owner.endBatch(); if (!__yix_ctx.disabled.peek() and !__yix_ctx.loading.peek()) { ui.on.fire(__yix_ctx.onClick, .{}); }  } }.__yix_run), .on_event = events, .event_context = eventContext, }, .{
             ui.view.lazyIf(icon_slot, .{ .size = size, .loading = loading, .icon = icon, .iconAsset = iconAsset, .has_svg = has_svg, .has_texture = has_texture, .look = look, .slot = slot, .idle = idle, }, struct { fn __yix_b(__yix_b1_0: anytype, __yix_bs1_0: *ui.Scope, __yix_bc1_0: *ui.Cx, __yix_bk1_0: ui.view.Sink) anyerror!void { return ui.view.emit(__yix_bs1_0, __yix_bc1_0, __yix_bk1_0, .{ ui.view.box(.{ .style = ui.view.styleBy(__yix_b1_0.slot, S.iconSlot), }, .{
                     ui.view.lazyIf(__yix_b1_0.has_svg, .{ .iconAsset = __yix_b1_0.iconAsset, .look = __yix_b1_0.look, .idle = __yix_b1_0.idle, }, struct { fn __yix_b(__yix_b2_0: anytype, __yix_bs2_0: *ui.Scope, __yix_bc2_0: *ui.Cx, __yix_bk2_0: ui.view.Sink) anyerror!void { return ui.view.emit(__yix_bs2_0, __yix_bc2_0, __yix_bk2_0, .{ ui.view.icon(.{ .style = ui.view.styleBy(__yix_b2_0.look, S.icon), .tint = ui.view.tintBy(__yix_b2_0.look, S.iconTint), .visible = __yix_b2_0.idle, }, __yix_b2_0.iconAsset) }); } }.__yix_b, null),
                     ui.view.lazyIf(__yix_b1_0.has_texture, .{ .icon = __yix_b1_0.icon, .look = __yix_b1_0.look, .idle = __yix_b1_0.idle, }, struct { fn __yix_b(__yix_b3_0: anytype, __yix_bs3_0: *ui.Scope, __yix_bc3_0: *ui.Cx, __yix_bk3_0: ui.view.Sink) anyerror!void { return ui.view.emit(__yix_bs3_0, __yix_bc3_0, __yix_bk3_0, .{ ui.view.image(.{ .style = ui.view.styleBy(__yix_b3_0.look, S.icon), .tint = ui.view.tintBy(__yix_b3_0.look, S.iconTint), .visible = __yix_b3_0.idle, }, __yix_b3_0.icon) }); } }.__yix_b, null),

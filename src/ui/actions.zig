@@ -37,6 +37,7 @@ pub const ActionHandler = *const fn (action: Action, context: ?*anyopaque) Event
 
 /// Action dispatcher
 pub const ActionDispatcher = struct {
+    active_use_depth: ?*usize = null,
     registry: ?*const core.NodeRegistry = null,
 
     bindings: [64]?KeyBinding = @as([64]?KeyBinding, @splat(null)),
@@ -114,6 +115,10 @@ pub const ActionDispatcher = struct {
     };
 
     pub fn dispatchActionWithDelivery(self: *const ActionDispatcher, action: Action, focus_node: *Node) DispatchReport {
+        if (self.active_use_depth) |depth| depth.* += 1;
+        defer if (self.active_use_depth) |depth| {
+            depth.* -= 1;
+        };
         const Entry = struct { raw: *Node, handle: ?core.NodeHandle };
         const registry = self.registry;
         // Small paths use the stack; deeper trees preserve the API's unlimited

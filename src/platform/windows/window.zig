@@ -552,6 +552,12 @@ pub const WindowsWindow = struct {
         return zenit_windows_ime_next_kind(self.native);
     }
 
+    extern fn zenit_windows_set_keyboard_isolated(window: *anyopaque, isolated: c_int) void;
+    /// Test-runtime ingress gate; defaults off for every native window.
+    pub fn setKeyboardIsolated(self: *WindowsWindow, isolated: bool) void {
+        zenit_windows_set_keyboard_isolated(self.native, @intFromBool(isolated));
+    }
+
     pub fn setTextInputEnabled(self: *WindowsWindow, enabled: bool) void {
         zenit_windows_ime_enable(self.native, if (enabled) 1 else 0);
     }

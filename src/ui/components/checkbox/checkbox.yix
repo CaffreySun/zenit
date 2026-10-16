@@ -13,6 +13,7 @@ pub fn Checkbox(
     indeterminate: bool = false,
     label: Text = "",
     disabled: bool = false,
+    focusRing: ui.FocusRingConfig = .{},
     onChange: ?Handler(bool) = null,
     checkIconAsset: ?ui.SvgAsset = null,
 ) View {
@@ -23,7 +24,7 @@ pub fn Checkbox(
             style={S.CheckboxParts.slot(.root, .{ .disabled = disabled })}
             tag={.button}
             focusable={!disabled}
-            focusRing
+            focusRing={focusRing}
             a11y={.{ .role = .checkbox, .checked = checked, .indeterminate = mixed, .disabled = disabled, .label = label }}
             onClick={if (!disabled) checked = !checked}
         >

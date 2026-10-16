@@ -32,24 +32,24 @@ class BatchContract(unittest.TestCase):
     def test_offline_strict_prepares_every_stage_without_credentials_or_network(self):
         code, plan = self.invoke(["--prepare-only", "--require-a11y"])
         self.assertEqual(code, 0)
-        self.assertEqual(len(plan), 33)
-        self.assertEqual(sum(p["kind"] == "e2e" for p in plan), 32)
-        self.assertEqual(len({p["exe_name"] for p in plan}), 5)
+        self.assertEqual(len(plan), 36)
+        self.assertEqual(sum(p["kind"] == "e2e" for p in plan), 34)
+        self.assertEqual(len({p["exe_name"] for p in plan}), 6)
         self.assertTrue(all(p["blocking"] for p in plan))
 
     def test_d3d11_x86_strict_plan_keeps_all_gates_and_native_backend(self):
         code, plan = self.invoke(["--prepare-only", "--require-a11y", "--renderer", "d3d11", "--arch", "x86"])
         self.assertEqual(code, 0)
-        self.assertEqual(len(plan), 33)
+        self.assertEqual(len(plan), 36)
         self.assertTrue(all(stage["blocking"] for stage in plan))
-        native = next(stage for stage in plan if stage["kind"] == "probe")
+        native = next(stage for stage in plan if stage["name"] == "gpu-contracts")
         self.assertEqual(native["exe_name"], "zenit-windows-d3d11-contract.exe")
         self.assertEqual(native["renderer"], "d3d11")
 
     def test_full_application_suites_are_unfiltered_and_blocking(self):
         code, plan = self.invoke(["--prepare-only", "--require-a11y", "--renderer", "d3d11", "--full-app-suites"])
         self.assertEqual(code, 0)
-        self.assertEqual(len(plan), 35)
+        self.assertEqual(len(plan), 38)
         for name in ["storybook-full", "text-input-full"]:
             stage = next(stage for stage in plan if stage["name"] == name)
             self.assertTrue(stage["blocking"])
@@ -67,6 +67,21 @@ class BatchContract(unittest.TestCase):
             stderr.write_text("[d3d11-adapter] name=VMware SVGA 3D feature=0xb000 software=0 result=0x00000000")
             self.assertTrue(batch.judge(stage, root)[0])
             (root / "windows-probe-stdout.log").write_text("")
+            self.assertFalse(batch.judge(stage, root)[0])
+
+    def test_lifetime_probe_requires_all_cases_completion_and_no_allocator_leaks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "stage-result.json").write_text(json.dumps({"exit_code": 0, "error": ""}))
+            stderr = root / "windows-probe-stderr.log"
+            stage = {"name": "window-lifetime", "kind": "probe"}
+            cases = "\n".join(f"lifetime callback passed: trigger={trigger} close_owner={owner}"
+                              for trigger in ("click", "focus", "key", "cleanup") for owner in ("false", "true"))
+            stderr.write_text(cases)
+            self.assertFalse(batch.judge(stage, root)[0])
+            stderr.write_text(cases + "\nlifetime smoke complete:\n")
+            self.assertTrue(batch.judge(stage, root)[0])
+            stderr.write_text(cases + "\nlifetime smoke complete:\nerror(gpa): memory address 0x123 leaked:\n")
             self.assertFalse(batch.judge(stage, root)[0])
 
     def test_complete_gallery_suite_covers_texture_replacement_without_filter(self):

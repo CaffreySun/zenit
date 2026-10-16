@@ -128,6 +128,7 @@ const WIDGETS = [_]WidgetSpec{
     .{ .key = "layoutbox", .title = "Layout / Box Model", .build = stories.buildLayoutBoxModel },
     .{ .key = "virtuallist", .title = "VirtualList", .build = stories.buildVirtualList },
     .{ .key = "virtuallistdynamic", .title = "VirtualList (Dynamic)", .build = stories.buildVirtualListDynamic },
+    .{ .key = "scrolling", .title = "Scrolling", .build = @import("scrolling_story.zig").build, .note = "Wheel and trackpad input in logical points. Try sideways scrolling and nested boundaries; live phase readouts show what the platform delivers." },
     .{ .key = "scrollarea", .title = "ScrollArea", .build = stories.buildScrollArea },
     .{ .key = "grid", .title = "Grid", .build = stories.buildGrid },
     .{ .key = "glassbox", .title = "Liquid Glass", .build = stories.buildGlassBox },

@@ -72,6 +72,9 @@ pub const events = events_mod;
 /// Built-in `useX` hooks (`useHover`, `useFocusRing`, ...).
 pub const hooks = hooks_mod;
 
+/// Configuration for focus outlines (logical pixels, not a blurred halo).
+pub const FocusRingConfig = hooks_mod.FocusRingConfig;
+
 /// Reactive system: `Signal`, `Memo`, `Scope`, `createEffect`, `Context`, `Store`.
 /// (The most common four are also re-exported at the top level for convenience.)
 pub const reactive = reactive_mod;

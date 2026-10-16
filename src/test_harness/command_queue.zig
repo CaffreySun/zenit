@@ -34,7 +34,8 @@ pub const TestCommand = union(enum) {
     track_start: TestIdPayload,
     /// End per-frame tracking, return all samples.
     track_stop: void,
-    screenshot: TestIdPayload,
+    screenshot: ScreenshotPayload,
+    windows: void,
     visual_quality: VisualQualityCommand,
     recording_start: RecordingStartPayload,
     recording_status: void,
@@ -118,6 +119,14 @@ pub const ImePayload = struct {
 
     pub fn deinit(self: *ImePayload, allocator: std.mem.Allocator) void {
         self.text.deinit(allocator);
+    }
+};
+
+pub const ScreenshotPayload = struct {
+    path: TestIdPayload = .{},
+    window_id: ?TestIdPayload = null,
+    pub fn getText(self: *const ScreenshotPayload) []const u8 {
+        return self.path.getText();
     }
 };
 

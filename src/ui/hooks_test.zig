@@ -686,8 +686,7 @@ test "useFocusRing: tab focus shows outline with animation, blur fades out" {
     try std.testing.expect(node.style.outline() == null);
 
     // Tab focus -> after enough frames outline appears (opacity -> 1.0)
-    ctx.focus_manager.last_focus_reason = .tab;
-    node.behavior.events.on_focus.?.invoke();
+    ctx.focus_manager.setFocusWithReason(node, .tab);
     for (0..30) |_| {
         for (node.meta.per_frame.hooks.before_render.hooks[0..node.meta.per_frame.hooks.before_render.count]) |cb_opt| {
             if (cb_opt) |cb| cb(node);
@@ -728,8 +727,7 @@ test "useFocusRing: click focus does NOT show outline" {
     try useFocusRing(scope, ctx, node, .{});
 
     // mouse click focus -> outline still not shown after tick
-    ctx.focus_manager.last_focus_reason = .click;
-    node.behavior.events.on_focus.?.invoke();
+    ctx.focus_manager.setFocusWithReason(node, .click);
     for (0..30) |_| {
         for (node.meta.per_frame.hooks.before_render.hooks[0..node.meta.per_frame.hooks.before_render.count]) |cb_opt| {
             if (cb_opt) |cb| cb(node);
@@ -776,8 +774,7 @@ test "useFocusRing: focused input scrolled out of ScrollArea does not steal clic
     _ = ctx.render();
 
     // Tab focus -> focus-visible -> z_index raised to 1.
-    ctx.focus_manager.last_focus_reason = .tab;
-    field.behavior.events.on_focus.?.invoke();
+    ctx.focus_manager.setFocusWithReason(field, .tab);
     try std.testing.expectEqual(@as(i16, 1), field.style.z_index());
     ctx.frame_time_ms += 16;
     ctx.layout();
@@ -819,8 +816,7 @@ test "useFocusRing: custom config with tab" {
         .offset = 3,
     });
 
-    ctx.focus_manager.last_focus_reason = .tab;
-    node.behavior.events.on_focus.?.invoke();
+    ctx.focus_manager.setFocusWithReason(node, .tab);
     // tick enough frames for animation convergence
     for (0..30) |_| {
         for (node.meta.per_frame.hooks.before_render.hooks[0..node.meta.per_frame.hooks.before_render.count]) |cb_opt| {
@@ -931,4 +927,210 @@ test "hover handler replacement preserves subscriptions and cleanup preserves a 
     node.behavior.events.on_hover.?.invoke();
     try std.testing.expectEqual(@as(usize, 2), calls);
     try std.testing.expect(node.behavior.events.on_leave == null);
+}
+
+test "useFocusRing: modality and overrides update same owner without focus events" {
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    const root = try core.box(cx, .{}, .{});
+    cx.root = root;
+    const node = try core.box(cx, .{}, .{});
+    try root.appendChild(cx.allocator, node);
+    const scope = try Scope.init(cx.allocator, null, cx.owner);
+    defer scope.dispose();
+    const Counts = struct {
+        focus: usize = 0,
+        blur: usize = 0,
+        fn onFocus(p: *anyopaque) void {
+            const c: *@This() = @ptrCast(@alignCast(p));
+            c.focus += 1;
+        }
+        fn onBlur(p: *anyopaque) void {
+            const c: *@This() = @ptrCast(@alignCast(p));
+            c.blur += 1;
+        }
+    };
+    var counts: Counts = .{};
+    node.behavior.events.on_focus = Cx.simpleHandler(Counts.onFocus, &counts);
+    node.behavior.events.on_blur = Cx.simpleHandler(Counts.onBlur, &counts);
+    const state = try @import("hooks.zig").useFocusState(scope, cx, node);
+    try useFocusRing(scope, cx, node, .{ .width = 1, .duration = 0 });
+    cx.focus_manager.setFocus(node);
+    try std.testing.expect(state.focused.get());
+    try std.testing.expect(!state.visible.get());
+    try std.testing.expect(node.style.outline() == null);
+    cx.focus_manager.noteInputModality(.keyboard);
+    try std.testing.expect(state.visible.get());
+    try std.testing.expectEqual(@as(f32, 1), node.style.outline().?.width);
+    cx.focus_manager.setFocusWithVisibility(node, .programmatic, .hide);
+    try std.testing.expect(!state.visible.get());
+    try std.testing.expectEqual(@import("focus.zig").InputModality.keyboard, cx.focus_manager.input_modality);
+    cx.focus_manager.setFocus(node);
+    try std.testing.expect(state.visible.get());
+    cx.focus_manager.noteInputModality(.pointer);
+    try std.testing.expect(!state.visible.get());
+    cx.focus_manager.setFocusWithVisibility(node, .programmatic, .show);
+    try std.testing.expect(state.visible.get());
+    cx.focus_manager.setFocus(node);
+    try std.testing.expect(!state.visible.get());
+    try std.testing.expectEqual(@as(usize, 1), counts.focus);
+    try std.testing.expectEqual(@as(usize, 0), counts.blur);
+}
+
+test "useFocusRing: prior handler clears focus without publishing stale visibility" {
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    const node = try core.box(cx, .{}, .{});
+    cx.root = node;
+    const scope = try Scope.init(cx.allocator, null, cx.owner);
+    defer scope.dispose();
+    const Clear = struct {
+        fn run(p: *anyopaque) void {
+            const c: *Cx = @ptrCast(@alignCast(p));
+            c.focus_manager.clearFocus();
+        }
+    };
+    node.behavior.events.on_focus = Cx.simpleHandler(Clear.run, cx);
+    const state = try @import("hooks.zig").useFocusState(scope, cx, node);
+    try useFocusRing(scope, cx, node, .{});
+    cx.focus_manager.setFocusWithReason(node, .tab);
+    try std.testing.expect(cx.focus_manager.getFocused() == null);
+    try std.testing.expect(!state.focused.get());
+    try std.testing.expect(!state.visible.get());
+    try std.testing.expect(node.style.outline() == null);
+}
+
+test "useFocusRing: disposed scope unregisters handlers and visibility subscription" {
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    const node = try core.box(cx, .{}, .{});
+    cx.root = node;
+    const scope = try Scope.init(cx.allocator, null, cx.owner);
+    _ = try @import("hooks.zig").useFocusState(scope, cx, node);
+    try useFocusRing(scope, cx, node, .{});
+    cx.focus_manager.setFocusWithReason(node, .tab);
+    scope.dispose();
+    try std.testing.expectEqual(@as(usize, 0), cx.focus_manager.visibility_listeners.items.len);
+    try std.testing.expect(node.behavior.events.on_focus == null);
+    try std.testing.expect(node.behavior.events.on_blur == null);
+    cx.focus_manager.noteInputModality(.pointer);
+    cx.focus_manager.noteInputModality(.keyboard);
+    cx.focus_manager.clearFocus();
+}
+
+test "useFocusRing: component config propagates one logical pixel and reacts" {
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    const root = try core.box(cx, .{}, .{});
+    cx.root = root;
+    const scope = try Scope.init(cx.allocator, null, cx.owner);
+    defer scope.dispose();
+    const Config = @import("ui.zig").FocusRingConfig;
+    const config = try scope.createSignal(Config, .{ .width = 1, .offset = 0, .duration = 0 });
+    const button = try @import("components/button/mod.zig").Button(.{ .label = "Focus", .focus_ring = config }).mount(scope, cx);
+    try root.appendChild(cx.allocator, button);
+    cx.focus_manager.setFocusWithReason(button, .tab);
+    try std.testing.expectEqual(@as(f32, 1), button.style.outline().?.width);
+    try std.testing.expectEqual(@as(f32, 0), button.style.outline().?.offset);
+    config.set(.{ .width = 3, .offset = 4, .duration = 0 });
+    for (button.meta.per_frame.hooks.before_render.hooks[0..button.meta.per_frame.hooks.before_render.count]) |callback| {
+        if (callback) |f| f(button);
+    }
+    try std.testing.expectEqual(@as(f32, 3), button.style.outline().?.width);
+    try std.testing.expectEqual(@as(f32, 4), button.style.outline().?.offset);
+}
+
+test "useFocusRing: prior handler disposes hook scope safely" {
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    const node = try core.box(cx, .{}, .{});
+    cx.root = node;
+    const scope = try Scope.init(cx.allocator, null, cx.owner);
+    const Dispose = struct {
+        fn run(p: *anyopaque) void {
+            const s: *Scope = @ptrCast(@alignCast(p));
+            s.dispose();
+        }
+    };
+    node.behavior.events.on_focus = Cx.simpleHandler(Dispose.run, scope);
+    _ = try @import("hooks.zig").useFocusState(scope, cx, node);
+    try useFocusRing(scope, cx, node, .{});
+    cx.focus_manager.setFocusWithReason(node, .tab);
+    try std.testing.expectEqual(@as(usize, 0), cx.focus_manager.visibility_listeners.items.len);
+    // The application's own handler borrowed that disposed scope too.
+    node.behavior.events.on_focus = null;
+    cx.focus_manager.clearFocus();
+}
+
+test "useFocusRing: external scope cleanup after Cx does not touch freed manager" {
+    const cx = try Cx.init(std.testing.allocator, std.testing.io);
+    const node = try core.box(cx, .{}, .{});
+    cx.root = node;
+    // An independent owner lets the external scope outlive the Cx.
+    const owner = try core.SignalOwner.init(std.testing.allocator);
+    defer owner.deinit();
+    const scope = try Scope.init(std.testing.allocator, null, owner);
+    defer scope.dispose();
+    _ = try @import("hooks.zig").useFocusState(scope, cx, node);
+    try useFocusRing(scope, cx, node, .{});
+    cx.deinit();
+}
+
+test "useFocusRing: another focus owner does not dirty or animate an idle ring" {
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    const root = try core.box(cx, .{}, .{});
+    cx.root = root;
+    const idle = try core.box(cx, .{}, .{});
+    const target = try core.box(cx, .{}, .{});
+    try root.appendChild(cx.allocator, idle);
+    try root.appendChild(cx.allocator, target);
+    const scope = try Scope.init(cx.allocator, null, cx.owner);
+    defer scope.dispose();
+    try useFocusRing(scope, cx, idle, .{});
+    try useFocusRing(scope, cx, target, .{});
+    idle.frame_state.state_bits.dirty = std.mem.zeroes(@TypeOf(idle.frame_state.state_bits.dirty));
+    const content_version = idle.meta.per_frame.caches.versions.content;
+    const anim: *@import("hooks.zig").FocusRingAnimState = @ptrCast(@alignCast(idle.meta.per_frame.hooks.slots.focus_ring_anim.?));
+    cx.focus_manager.setFocusWithReason(target, .tab);
+    cx.focus_manager.noteInputModality(.pointer);
+    cx.focus_manager.noteInputModality(.keyboard);
+    cx.focus_manager.clearFocus();
+    try std.testing.expectEqual(content_version, idle.meta.per_frame.caches.versions.content);
+    try std.testing.expect(!idle.frame_state.state_bits.dirty.core.render);
+    try std.testing.expect(!idle.frame_state.state_bits.dirty.core.subtree_render);
+    try std.testing.expect(!anim.opacity_anim.isAnimating());
+    try std.testing.expectEqual(@as(f32, 0), anim.opacity_anim.getTarget());
+}
+
+test "useFocusRing: one logical pixel outline expands node geometry and effective radii" {
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    cx.setViewport(200, 120);
+    const root = try core.box(cx, .{ .width = .{ .px = 200 }, .height = .{ .px = 120 } }, .{});
+    cx.root = root;
+    const node = try core.box(cx, .{ .width = .{ .px = 80 }, .height = .{ .px = 40 } }, .{});
+    (try node.style.ensureExtFallible(cx.allocator)).corner_radius = .{ .each = .{ 0, 4, 8, 12 } };
+    try root.appendChild(cx.allocator, node);
+    const scope = try Scope.init(cx.allocator, null, cx.owner);
+    defer scope.dispose();
+    try useFocusRing(scope, cx, node, .{ .width = 1, .offset = 2, .duration = 0 });
+    cx.focus_manager.setFocusWithReason(node, .tab);
+    cx.layout();
+    const items = cx.render();
+    var outlines: usize = 0;
+    for (items) |item| switch (item) {
+        .outline_rect => |outline| {
+            outlines += 1;
+            try std.testing.expectApproxEqAbs(@as(f32, -3), outline.x, 0.001);
+            try std.testing.expectApproxEqAbs(@as(f32, -3), outline.y, 0.001);
+            try std.testing.expectApproxEqAbs(@as(f32, 86), outline.w, 0.001);
+            try std.testing.expectApproxEqAbs(@as(f32, 46), outline.h, 0.001);
+            try std.testing.expectEqual(@as(f32, 1), outline.width);
+            for (outline.radius, [_]f32{ 3, 7, 11, 15 }) |actual, expected|
+                try std.testing.expectApproxEqAbs(expected, actual, 0.001);
+        },
+        else => {},
+    };
+    try std.testing.expectEqual(@as(usize, 1), outlines);
 }

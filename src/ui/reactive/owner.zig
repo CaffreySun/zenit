@@ -52,6 +52,8 @@ pub const SignalOwner = struct {
     /// Scope disposal requested from inside an effect/memo callback must wait
     /// until the outer reactive facade has stopped touching its allocation.
     reactive_callback_depth: u32 = 0,
+    /// Direct scope cleanup may call into the window host outside reactive dispatch.
+    scope_disposal_depth: usize = 0,
     deferred_disposals: @import("deferred_disposal.zig").Queue = .{},
     draining_disposals: bool = false,
 

@@ -7,6 +7,7 @@ extern "user32" fn SendMessageW(*anyopaque, u32, usize, isize) callconv(.winapi)
 extern "user32" fn GetForegroundWindow() callconv(.winapi) ?*anyopaque;
 extern "user32" fn GetCapture() callconv(.winapi) ?*anyopaque;
 extern fn zenit_windows_contract_press(*anyopaque, c_int, c_int, c_int) c_int;
+extern fn zenit_windows_contract_key(*anyopaque, u16, u32, c_int) c_int;
 var clicks: usize = 0;
 var lost: usize = 0;
 fn require(ok: bool) !void {
@@ -66,7 +67,7 @@ fn batchedDrag(app: *App, node: *ui.Node, x: c_int, y: c_int) !void {
     try require(zenit_windows_contract_press(app.win.getNativeSurfaceHandle(), 0, x, y) != 0);
     sendPoint(app, 0x200, x + 8, y);
     sendPoint(app, 0x200, x + 20, y);
-    _ = SendMessageW(app.win.getNativeSurfaceHandle(), 0x100, 0x87, 0); // F24: no shortcut/text.
+    try require(zenit_windows_contract_key(app.win.getNativeSurfaceHandle(), 0x87, 0, 1) != 0); // Owned F24 separator.
     sendPoint(app, 0x200, x + 35, y);
     sendPoint(app, 0x200, x + 40, y);
     sendPoint(app, 0x202, x + 40, y);

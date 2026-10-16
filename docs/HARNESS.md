@@ -89,6 +89,41 @@ Pointer isolation also has a `ZENIT_E2E_BACKGROUND`-driven default on the
 Windows worker; keyboard isolation is explicit-only. Window focus, resize and
 drag-and-drop sessions are never isolated.
 
+On macOS and Windows, keyboard isolation also drops native keyboard events
+before menu accelerators, keyboard window-management actions and IME handling.
+The gate is per window and is configured only by test-enabled runtimes.
+Programmatic menu actions, mouse-driven window controls and contract injection
+remain available. This does not lock the OS keyboard or suppress system-wide
+shortcuts. Native-message contracts must explicitly seed owned input rather
+than relying on OS keyboard messages while isolation is enabled.
+
+## Select a screenshot window
+
+`GET /windows` returns `{ windows: [{ window_id, native_id, bound, closing }] }`.
+`window_id` is a string token for one window instance, unique within a process
+session; restarting the app changes the session. `native_id` is a diagnostic
+string, not an accepted screenshot identity. Closing and recreating a native
+window never reuses its harness identity.
+
+```ts
+const { windows: targets } = await windows();
+await screenshot("artifacts/secondary.png", targets[1].window_id);
+```
+
+The equivalent request is `POST /screenshot` with
+`{ "path": "artifacts/secondary.png", "window_id": "<token>" }`. Omitting
+`window_id` keeps the currently bound window behavior. An explicit target is
+resolved on the UI thread and captured directly from its submitted surface;
+it does not activate the window or change the input/tree binding. Windows
+capture retains the worker's BMP-to-PNG conversion.
+
+Errors keep the `error` text field and add `code`: `invalid-window-id`,
+`window-not-found`, `window-closing`, `no-bound-target`, `capture-unsupported`,
+or `capture-failed`. A stale or closing target never falls back to another
+window. Successful replies retain `{ "ok": true, "path": "..." }`.
+Input, tree inspection, recording, and `frames_*` retain their existing
+binding semantics; this selector applies only to screenshots.
+
 ## Record the application surface
 
 ```ts

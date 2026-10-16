@@ -15,6 +15,7 @@ pub const SwitchProps = struct {
     checked: ui.Model(bool) = .{ .local = false },
     label: ui.Source([]const u8) = .{ .value = "" },
     disabled: ui.Source(bool) = .{ .value = false },
+    focus_ring: ui.Source(ui.FocusRingConfig) = .{ .value = .{} },
     on_change: ?ui.Handler(bool) = null,
     /// Text children of the tag go into this parameter (ui.view.textChild)
     pub const text_child = "label";
@@ -22,6 +23,7 @@ pub const SwitchProps = struct {
 fn __yix_Switch(__yix_props: SwitchProps, scope: *ui.Scope, cx: *ui.Cx) anyerror!*ui.Node {
     const label = __yix_props.label;
     const disabled = __yix_props.disabled;
+    const focusRing = __yix_props.focus_ring;
     const onChange = __yix_props.on_change;
     const __yix_model_checked = try ui.reactive.resolveModelFor(bool, scope, __yix_props.checked);
     const checked = __yix_model_checked.read;
@@ -31,7 +33,7 @@ fn __yix_Switch(__yix_props: SwitchProps, scope: *ui.Scope, cx: *ui.Cx) anyerror
             return !__yix_ctx.disabled.get();
         } }.__yix_compute);
     };
-    const __yix_root = try ui.view.render(scope, cx, ui.view.row(.{ .style = S.SwitchParts.slot(.root, .{ .disabled = disabled }), .tag = .button, .focusable = enabled, .focus_ring = true, .a11y = .{ .role = .switch_role, .checked = checked, .disabled = disabled, .label = label }, .on_click = try ui.on.bind(scope, .{ .disabled = disabled, .checked = checked, .__yix_model_checked = __yix_model_checked, .onChange = onChange, .__yix_owner = scope.owner, }, struct { fn __yix_run(__yix_ctx: anytype) void { __yix_ctx.__yix_owner.beginBatch(); defer __yix_ctx.__yix_owner.endBatch(); if (!__yix_ctx.disabled.peek()) { __yix_ctx.__yix_model_checked.propose(!__yix_ctx.checked.peek(), __yix_ctx.onChange); }  } }.__yix_run), }, .{
+    const __yix_root = try ui.view.render(scope, cx, ui.view.row(.{ .style = S.SwitchParts.slot(.root, .{ .disabled = disabled }), .tag = .button, .focusable = enabled, .focus_ring = focusRing, .a11y = .{ .role = .switch_role, .checked = checked, .disabled = disabled, .label = label }, .on_click = try ui.on.bind(scope, .{ .disabled = disabled, .checked = checked, .__yix_model_checked = __yix_model_checked, .onChange = onChange, .__yix_owner = scope.owner, }, struct { fn __yix_run(__yix_ctx: anytype) void { __yix_ctx.__yix_owner.beginBatch(); defer __yix_ctx.__yix_owner.endBatch(); if (!__yix_ctx.disabled.peek()) { __yix_ctx.__yix_model_checked.propose(!__yix_ctx.checked.peek(), __yix_ctx.onChange); }  } }.__yix_run), }, .{
             ui.view.box(.{ .style = S.SwitchParts.slot(.track, .{ .checked = checked }), }, .{
                 ui.view.box(.{ .style = S.SwitchParts.slot(.thumb, .{ .checked = checked }), }, .{ }),
             }),

@@ -879,6 +879,11 @@ pub const Cx = struct {
     /// freeNode must **defer** to end, else yanks memory of currently-iterated node, see
     /// deferred_free_nodes.
     tick_depth: u32 = 0,
+    /// Window destruction is deferred until all host/dispatch stacks unwind.
+    /// Unlike tick_depth this does not delay node unmount or reactive effects.
+    active_use_depth: usize = 0,
+    close_requested: bool = false,
+
     /// Post-layout callback: after before_render tick's layout round, reads final geometry this
     /// frame. Callback can modify geometry and request re-layout (round capped); hit index rebuilt
     /// after all rounds.
@@ -1044,6 +1049,7 @@ pub const Cx = struct {
         cx.focus_manager.on_focus_settled = &cx_platform.focusSettled;
         cx.dispatcher.setRegistry(&cx.node_registry);
         cx.action_dispatcher.setRegistry(&cx.node_registry);
+        cx.action_dispatcher.active_use_depth = &cx.active_use_depth;
         cx.overlay_stack.setRegistry(&cx.node_registry);
 
         // Enable layout intrinsic cache (currently global static; v0.2-P3 dismantles Node, migrates
@@ -1096,6 +1102,24 @@ pub const Cx = struct {
         return cx;
     }
 
+    /// Keep the context alive across a complete host call, including callback tails.
+    pub fn beginActiveUse(self: *Cx) void {
+        self.active_use_depth += 1;
+    }
+
+    pub fn endActiveUse(self: *Cx) void {
+        std.debug.assert(self.active_use_depth > 0);
+        self.active_use_depth -= 1;
+    }
+
+    pub fn hasActiveCalls(self: *const Cx) bool {
+        return self.active_use_depth != 0 or self.tick_depth != 0 or
+            self.focus_manager.transition_depth != 0 or self.focus_manager.callback_depth != 0 or
+            self.dispatcher.dispatch_depth != 0 or
+            self.owner.reactive_callback_depth != 0 or self.owner.scope_disposal_depth != 0 or
+            self.owner.draining_disposals;
+    }
+
     /// Acquire a liveness reference that remains valid after this `Cx` is
     /// destroyed. The caller must eventually call `LifetimeToken.release()`.
     pub fn retainLifetimeToken(self: *Cx) *LifetimeToken {
@@ -1116,6 +1140,7 @@ pub const Cx = struct {
     }
 
     pub fn deinit(self: *Cx) void {
+        if (self.hasActiveCalls()) @panic("Cx.deinit during an active UI call; request window close instead");
         // Invalidate external observers before any owned state starts tearing
         // down. They can now stop without ever touching this soon-to-be-freed Cx.
         const lifetime_token = self.lifetime_token;
@@ -1228,6 +1253,8 @@ pub const Cx = struct {
 
     /// Retain mode: destroy current UI tree and root_scope
     pub fn unmount(self: *Cx) void {
+        self.beginActiveUse();
+        defer self.endActiveUse();
         self.cancelPointerInteractions(.window_blur);
         self.cursor_override = null;
         // unmount clears focus pointer without triggering component blur; session owner atomically
@@ -1556,6 +1583,8 @@ pub const Cx = struct {
     }
 
     pub fn freeNode(self: *Cx, node: *Node) void {
+        self.beginActiveUse();
+        defer self.endActiveUse();
         return cx_node_lifetime.freeNode(self, node);
     }
 
@@ -2205,10 +2234,14 @@ pub const Cx = struct {
     // ---- Focus management ----
 
     pub fn setFocus(self: *Cx, node: ?*Node) void {
+        self.beginActiveUse();
+        defer self.endActiveUse();
         self.focus_manager.setFocus(node);
     }
 
     pub fn clearFocus(self: *Cx) void {
+        self.beginActiveUse();
+        defer self.endActiveUse();
         self.focus_manager.clearFocus();
     }
 
@@ -2340,6 +2373,8 @@ pub const Cx = struct {
     /// Synthesize down+up. No outer batch: each fires its own batch, matching two independent
     /// platform events' effect ordering.
     pub fn handleClick(self: *Cx, x: f32, y: f32) void {
+        self.beginActiveUse();
+        defer self.endActiveUse();
         return cx_input.handleClick(self, x, y);
     }
 
@@ -2639,6 +2674,7 @@ pub const Cx = struct {
     /// dispatcher handle (dispatch bubbling chain, hover epoch, click synthesis, drag relays all
     /// obey this). Regression in core/host_entry_lifetime_tests.zig.
     fn enterHost(self: *Cx) render_engine.SavedFrameClock {
+        self.beginActiveUse();
         const outer = render_engine.saveFrameClock();
         self.bindEventClock();
         self.owner.beginBatch();
@@ -2647,6 +2683,7 @@ pub const Cx = struct {
 
     /// Drain this batch's effects in this window's clock, restore outer clock.
     fn exitHost(self: *Cx, outer: render_engine.SavedFrameClock) void {
+        defer self.endActiveUse();
         self.owner.endBatch();
         render_engine.restoreFrameClock(outer);
     }
@@ -2665,6 +2702,8 @@ pub const Cx = struct {
     }
 
     pub fn layout(self: *Cx) void {
+        self.beginActiveUse();
+        defer self.endActiveUse();
         return cx_frame.layout(self);
     }
 
@@ -2757,6 +2796,8 @@ pub const Cx = struct {
     /// derive (appendAllDisplayItemsToRenderList) lowering to self.lowering.main + inspector
     /// overlay; encoder fetches via lowerForEncoder() lowered DisplayItem slice.
     pub fn render(self: *Cx) []const display_list_mod.DisplayItem {
+        self.beginActiveUse();
+        defer self.endActiveUse();
         return cx_render.render(self);
     }
 

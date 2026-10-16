@@ -429,6 +429,17 @@ function Invoke-WindowsNativeInput($proc, $body, $held) {
   if ($body.action -eq 'receiver-status') { return [ZenitNativeInput]::ReceiverStatus() }
   if ($body.action -eq 'receiver-stop') { [ZenitNativeInput]::ReceiverStop();return @{ok=$true} }
   if ($body.action -eq 'drag-cancel') { [ZenitNativeInput]::DragCancel();return @{ok=$true} }
+  # Inventory/foreground observation has no target window. In a background
+  # multi-window suite the foreground may belong to another app, so do not
+  # fall back to AppWindow's deliberately strict single-input-target guard.
+  if ($body.action -eq 'status' -and $body.inventory_only -eq $true) {
+    $proc.Refresh()
+    if ($proc.HasExited) { throw 'Owned native process unavailable' }
+    $windows=@([ZenitNativeInput]::WindowInventory($proc.Id))
+    if ($windows.Count -eq 0) { throw 'Owned native window unavailable' }
+    $foreground=[ZenitNativeInput]::GetForegroundWindow()
+    return @{ok=$true; pid=$proc.Id; windows=$windows; foreground_hwnd=$foreground.ToInt64(); foreground_owned=[ZenitNativeInput]::Owned($foreground,$proc.Id); session=$proc.SessionId}
+  }
   $status=Get-WindowsNativeStatus $proc ($body.action -eq 'status')
   $hwnd=[IntPtr]::new([long]$status.hwnd)
   if ($body.action -eq 'uia-tree') { return Get-WindowsUiaTree $proc }

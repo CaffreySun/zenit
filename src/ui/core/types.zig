@@ -2472,7 +2472,7 @@ pub const InteractionState = struct {
     is_hovered: bool = false,
     is_pressed: bool = false,
     is_focused: bool = false,
-    /// Focus obtained via keyboard or other non-pointer means (CSS :focus-visible).
+    /// Resolved focus visibility: input modality plus an optional explicit policy.
     is_focus_visible: bool = false,
     is_disabled: bool = false,
     /// Persistent selected state. selected and checked merge: same node won't both exist (list

@@ -497,8 +497,12 @@ export async function inputState(testId: string): Promise<InputState> {
   return request("POST", "/input_state", { test_id: testId });
 }
 
-export async function screenshot(path: string): Promise<{ ok: boolean; path?: string }> {
-  return request("POST", "/screenshot", { path });
+export async function windows(): Promise<{ windows: Array<{ window_id: string; native_id: string; bound: boolean; closing: boolean }> }> {
+  return request("GET", "/windows");
+}
+
+export async function screenshot(path: string, window_id?: string): Promise<{ ok: boolean; path?: string }> {
+  return request("POST", "/screenshot", { path, ...(window_id === undefined ? {} : { window_id }) });
 }
 
 /**

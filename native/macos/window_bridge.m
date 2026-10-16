@@ -815,7 +815,8 @@ static NSString * const ZenitInternalDragType = @"dev.zenit.internal-drag";
     }
 
     id wrapper = wrapperForWindow(self.window);
-    if (!wrapper || ![[wrapper valueForKey:@"textInputEnabled"] boolValue]) {
+    if (!wrapper || [[wrapper valueForKey:@"keyboardIsolated"] boolValue] ||
+        ![[wrapper valueForKey:@"textInputEnabled"] boolValue]) {
         if (input_debug_enabled()) {
             NSLog(@"[bridge-input] insertText ignored without active text editor");
         }
@@ -915,7 +916,8 @@ static NSString * const ZenitInternalDragType = @"dev.zenit.internal-drag";
     }
     if (!text) text = @"";
     id wrapper = wrapperForWindow(self.window);
-    if (!wrapper || ![[wrapper valueForKey:@"textInputEnabled"] boolValue]) {
+    if (!wrapper || [[wrapper valueForKey:@"keyboardIsolated"] boolValue] ||
+        ![[wrapper valueForKey:@"textInputEnabled"] boolValue]) {
         if (input_debug_enabled()) {
             NSLog(@"[bridge-input] setMarkedText ignored without active text editor");
         }
@@ -2957,6 +2959,7 @@ typedef struct {
 // Whether the focused zenit node is an editable text control. This gates only
 // NSTextInputContext; raw keyDown/keyUp packets remain enabled for every UI.
 @property (nonatomic) BOOL textInputEnabled;
+@property (nonatomic) BOOL keyboardIsolated;
 // Source bound at the last AppKit responder activation. InputMethodKit can
 // otherwise expose a new source ID while continuing to emit literal ASCII.
 @property (nonatomic, copy) NSString *lastKeyboardInputSource;
@@ -4318,6 +4321,12 @@ void macos_set_ime_cursor_rect(void* window_ptr, float x, float y, float width, 
             }
         }
     }
+}
+
+// Set by the test-enabled runtime before it pumps this window's input.
+void macos_set_keyboard_isolated(void *window_ptr, int isolated) {
+    WindowWrapper *wrapper = (__bridge WindowWrapper *)window_ptr;
+    wrapper.keyboardIsolated = isolated != 0;
 }
 
 // Enable/disable AppKit text interpretation independently from raw keyboard
@@ -6024,6 +6033,11 @@ static void pumpAppEventsWithTimeout(uint32_t timeout_ms) {
                 [NSApp updateWindows];
                 break;
             }
+
+            // Drop physical keys before native menu, close and IME side effects.
+            // The harness injects directly into Cx and never uses this path.
+            if (target.keyboardIsolated && (event.type == NSEventTypeKeyDown ||
+                event.type == NSEventTypeKeyUp || event.type == NSEventTypeFlagsChanged)) continue;
 
             // keyboard event handling. FlagsChanged separate branch: no
             // characters, skip menu keyEquivalent/firstResponder keyDown logic.

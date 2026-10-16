@@ -38,6 +38,7 @@ pub fn handleMouseDown(self: *Cx, x: f32, y: f32, modifiers: Modifiers) void {
 }
 
 pub fn handleMouseDownEx(self: *Cx, x: f32, y: f32, button: MouseButton, modifiers: Modifiers) void {
+    self.focus_manager.noteInputModality(.pointer);
     self.mouse_x = x;
     self.mouse_y = y;
     self.cursor_state.pointer_valid = true;
@@ -413,6 +414,10 @@ fn findActionContextNode(node: *Node, context: []const u8) ?*Node {
 }
 
 pub fn handleKeyDown(self: *Cx, key: KeyCode, modifiers: Modifiers) void {
+    switch (key) {
+        .left_shift, .right_shift, .left_ctrl, .right_ctrl, .left_alt, .right_alt, .left_super, .right_super, .unknown => {},
+        else => self.focus_manager.noteInputModality(.keyboard),
+    }
     self.needs_redraw = true;
     // The inspector is a development overlay: its chord (Ctrl+Shift+I on
     // Windows/Linux) is also an ordinary application shortcut there, so the

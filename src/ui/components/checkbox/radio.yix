@@ -22,7 +22,7 @@ pub fn Radio(checked: bool = false, label: Text = "", disabled: bool = false) Vi
 /// RadioGroup option: button semantic node, focusable, focus ring; unhovered
 /// highlights circle border on hover. Caller's `testId` lands on root node (this
 /// button semantic node).
-fn RadioChoice(label: []const u8, checked: bool, disabled: bool, onPick: ?Handler(void) = null) View {
+fn RadioChoice(label: []const u8, checked: bool, disabled: bool, onPick: ?Handler(void) = null, focusRing: ui.FocusRingConfig = .{}) View {
     var hovered: bool = signal(false);
     const enabled = computed(!disabled);
     return (
@@ -30,7 +30,7 @@ fn RadioChoice(label: []const u8, checked: bool, disabled: bool, onPick: ?Handle
             style={S.RadioParts.slot(.root, .{ .disabled = disabled })}
             tag={.button}
             focusable={enabled}
-            focusRing
+            focusRing={focusRing}
             a11y={.{ .role = .radio, .label = label, .checked = checked, .disabled = disabled }}
             onClick={onPick}
             onHover={hovered = true}
@@ -59,6 +59,7 @@ pub fn RadioGroup(
     value: Model(?[]const u8) = null,
     disabled: bool = false,
     horizontal: bool = false,
+    focusRing: ui.FocusRingConfig = .{},
     onChange: ?Handler([]const u8) = null,
 ) View {
     return (
@@ -66,6 +67,7 @@ pub fn RadioGroup(
             {for (options) |opt|
                 <RadioChoice
                     key={.{ opt.value, opt.label, opt.disabled }}
+                    focusRing={focusRing}
                     label={opt.label}
                     checked={isSelected(value, opt.value)}
                     disabled={disabled or opt.disabled}

@@ -12,6 +12,8 @@ extern "user32" fn GetMenuState(*anyopaque, u32, u32) callconv(.winapi) u32;
 extern "user32" fn GetMenuStringW(*anyopaque, u32, [*]u16, c_int, u32) callconv(.winapi) c_int;
 extern "user32" fn SendMessageW(*anyopaque, u32, usize, isize) callconv(.winapi) isize;
 extern fn zenit_win_menu_clear(*anyopaque) c_int;
+extern fn zenit_windows_contract_keyboard_isolated(*anyopaque) c_int;
+extern fn zenit_windows_contract_key(*anyopaque, u16, u32, c_int) c_int;
 var stage: []const u8 = "initial";
 extern fn zenit_win_menu_translate(*anyopaque, *anyopaque) c_int;
 extern "user32" fn GetKeyboardState([*]u8) callconv(.winapi) c_int;
@@ -46,6 +48,9 @@ fn menuEvents(app: *App, expected: ?u64) !void {
 pub fn run(app: *App) !void {
     const owner = app.win.getNativeSurfaceHandle();
     const size = app.win.getSize();
+    const was_isolated = zenit_windows_contract_keyboard_isolated(owner) != 0;
+    defer app.win.setKeyboardIsolated(was_isolated);
+    app.win.setKeyboardIsolated(false);
     defer {
         _ = zenit_win_menu_clear(owner);
         app.win.setSize(size[0], size[1]);
@@ -83,6 +88,36 @@ pub fn run(app: *App) !void {
     stage = "native accelerator translation";
     try shortcut(app);
     try menuEvents(app, command);
+    if (@import("zenit_app").test_harness.enabled) {
+        stage = "isolated native keyboard and owned injection";
+        app.win.setKeyboardIsolated(true);
+        try shortcut(app);
+        try menuEvents(app, null);
+        _ = SendMessageW(owner, 0x104, 0x73, 1 << 29); // Alt+F4 must not close.
+        _ = SendMessageW(owner, 0x100, 'X', 1);
+        _ = SendMessageW(owner, 0x102, 'x', 1);
+        _ = SendMessageW(owner, 0x10d, 0, 0); // IME start must not mutate state.
+        _ = SendMessageW(owner, 0x10f, 0, 0); // IME composition.
+        _ = SendMessageW(owner, 0x10e, 0, 0); // IME end.
+        _ = try app.sdk.pump(0);
+        for (app.sdk.events()) |event| switch (event) {
+            .key, .text_input, .ime_preedit, .ime_commit, .window_close_requested => return error.IsolationLeak,
+            else => {},
+        };
+        try require(zenit_windows_contract_key(owner, 0x87, 0, 1) != 0);
+        _ = try app.sdk.pump(0);
+        var owned_keys: usize = 0;
+        for (app.sdk.events()) |event| {
+            if (event == .key) owned_keys += 1;
+            app.processTestContractEvent(event);
+        }
+        try require(owned_keys == 1);
+        _ = SendMessageW(owner, 0x111, old_id, 0); // Programmatic menu remains available.
+        try menuEvents(app, command);
+        app.win.setKeyboardIsolated(false);
+        try shortcut(app);
+        try menuEvents(app, command);
+    }
     // Failed installation must preserve the committed menu and command map.
     stage = "atomic rejected role";
     nodes[5].role = .services;

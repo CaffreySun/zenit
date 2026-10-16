@@ -11,6 +11,7 @@ pub fn Switch(
     checked: Model(bool) = false,
     label: Text = "",
     disabled: bool = false,
+    focusRing: ui.FocusRingConfig = .{},
     onChange: ?Handler(bool) = null,
 ) View {
     const enabled = computed(!disabled);
@@ -19,7 +20,7 @@ pub fn Switch(
             style={S.SwitchParts.slot(.root, .{ .disabled = disabled })}
             tag={.button}
             focusable={enabled}
-            focusRing
+            focusRing={focusRing}
             a11y={.{ .role = .switch_role, .checked = checked, .disabled = disabled, .label = label }}
             onClick={if (!disabled) checked = !checked}
         >

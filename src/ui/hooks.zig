@@ -343,9 +343,13 @@ pub fn invalidateSubtreeHookState(node: *Node) void {
     while (node.behavior.events.on_focus) |h| {
         if (h.callback == &focusRingOnFocus) {
             const rc: *FocusRingCtx = @ptrCast(@alignCast(h.context));
+            rc.fm.unsubscribeVisibility(rc.subscription_id);
+            rc.node = null;
             node.behavior.events.on_focus = rc.prev_on_focus;
         } else if (h.callback == &focusStateOnFocus) {
             const fs: *FocusStateCtx = @ptrCast(@alignCast(h.context));
+            fs.fm.unsubscribeVisibility(fs.subscription_id);
+            fs.node = null;
             node.behavior.events.on_focus = fs.prev_on_focus;
         } else break;
     }
@@ -613,6 +617,9 @@ pub const FocusRingConfig = struct {
 const FocusRingCtx = struct {
     signal: *Signal(bool),
     fm: *FocusManager,
+    subscription_id: u64 = 0,
+    active: bool = false,
+    node: ?*Node = null,
     /// Focus ring animation state
     anim_state: ?*FocusRingAnimState = null,
     /// previous callback for chained on_focus/on_blur
@@ -633,6 +640,25 @@ pub const FocusRingAnimState = struct {
     /// set allocator needed for outline
     allocator: std.mem.Allocator,
 };
+
+/// Update a mounted outline without adding another subscription or animation hook.
+pub fn updateFocusRingConfig(cx: *Cx, node: *Node, config: FocusRingConfig) void {
+    const ptr = node.meta.per_frame.hooks.slots.focus_ring_anim orelse return;
+    const state: *FocusRingAnimState = @ptrCast(@alignCast(ptr));
+    state.focus_color = config.color orelse cx.tokens.tokens.color.focus_ring;
+    state.focus_width = config.width;
+    state.focus_offset = config.offset;
+    switch (state.opacity_anim.animator) {
+        .transition => |*transition| {
+            transition.config.duration_ms = config.duration * 1000;
+            transition.config.easing = config.easing;
+        },
+        else => {},
+    }
+    // Force the next pre-render update even when opacity is already settled.
+    node.setStyle(state.allocator, .outline, null);
+    node.markRenderDirty();
+}
 
 /// Focus ring pre-render hook: tick opacity animation and update outline alpha
 fn focusRingBeforeRender(node: *Node) void {
@@ -674,12 +700,46 @@ fn focusRingBeforeRender(node: *Node) void {
     }
 }
 
+// Remove a scope's wrappers even when another hook is stacked above them.
+fn detachFocusHandlers(node: *Node, context: *anyopaque) void {
+    inline for (.{ "on_focus", "on_blur" }) |field| {
+        var slot = &@field(node.behavior.events, field);
+        while (slot.*) |handler| {
+            const previous: *?HandlerRef = if (handler.callback == &focusRingOnFocus)
+                &@as(*FocusRingCtx, @ptrCast(@alignCast(handler.context))).prev_on_focus
+            else if (handler.callback == &focusRingOnBlur)
+                &@as(*FocusRingCtx, @ptrCast(@alignCast(handler.context))).prev_on_blur
+            else if (handler.callback == &focusStateOnFocus)
+                &@as(*FocusStateCtx, @ptrCast(@alignCast(handler.context))).prev_on_focus
+            else if (handler.callback == &focusStateOnBlur)
+                &@as(*FocusStateCtx, @ptrCast(@alignCast(handler.context))).prev_on_blur
+            else
+                break;
+            if (handler.context == context) {
+                slot.* = previous.*;
+                break;
+            }
+            slot = previous;
+        }
+    }
+}
+
 /// add focus ring visual feedback around node (Scope manages lifecycle)
 fn focusRingOnFocus(context: *anyopaque) void {
     const rc: *FocusRingCtx = @ptrCast(@alignCast(context));
+    const fm = rc.fm;
+    const id = rc.subscription_id;
+    const epoch = fm.transition_epoch;
+    rc.active = true;
     if (rc.prev_on_focus) |prev| prev.invoke();
-    const focus_visible = rc.fm.last_focus_reason != .click;
-    rc.signal.set(focus_visible);
+    if (!fm.hasVisibilitySubscription(id) or fm.transition_epoch != epoch) return;
+    focusRingVisibilityChanged(context);
+}
+
+fn focusRingVisibilityChanged(context: *anyopaque) void {
+    const rc: *FocusRingCtx = @ptrCast(@alignCast(context));
+    const focus_visible = rc.active and rc.fm.focus_visible;
+    if (rc.signal.peek() == focus_visible) return;
     if (rc.anim_state) |state| {
         const now_ms = @import("core/render_engine/mod.zig").current_frame_time_ms;
         if (focus_visible) {
@@ -708,29 +768,23 @@ fn focusRingOnFocus(context: *anyopaque) void {
             }
         }
     }
+    rc.signal.set(focus_visible);
 }
 
 fn focusRingOnBlur(context: *anyopaque) void {
     const rc: *FocusRingCtx = @ptrCast(@alignCast(context));
+    const fm = rc.fm;
+    const id = rc.subscription_id;
+    const epoch = fm.transition_epoch;
+    rc.active = false;
     if (rc.prev_on_blur) |prev| prev.invoke();
-    rc.signal.set(false);
-    if (rc.anim_state) |state| {
-        state.opacity_anim.setTo(0.0, @import("core/render_engine/mod.zig").current_frame_time_ms);
-        if (state.node) |n| {
-            // void callback cannot propagate; z_index is visual only, allocation failure degrades
-            // gracefully but must never panic the process
-            if (n.style.ensureExtFallible(state.allocator)) |ext| {
-                ext.z_index = 0;
-            } else |_| {}
-            n.markRenderDirty();
-        }
-    }
+    if (!fm.hasVisibilitySubscription(id) or fm.transition_epoch != epoch) return;
+    focusRingVisibilityChanged(context);
 }
 
 /// node's focus state (used by view's `_focus` / `_focus_visible` style conditions): `focused` is
 /// true when focused;
-/// `visible` is focus from keyboard or non-click methods (like CSS :focus-visible, determined by
-/// FocusManager's last_focus_reason).
+/// `visible` is the FocusManager resolved policy, including current input modality.
 /// on_focus / on_blur chain in front of original handler; unmounted by invalidateSubtreeHookState
 /// using function address.
 pub const FocusState = struct { focused: *Signal(bool), visible: *Signal(bool) };
@@ -739,36 +793,70 @@ const FocusStateCtx = struct {
     focused: *Signal(bool),
     visible: *Signal(bool),
     fm: *FocusManager,
+    subscription_id: u64 = 0,
+    active: bool = false,
+    node: ?*Node = null,
     prev_on_focus: ?HandlerRef = null,
     prev_on_blur: ?HandlerRef = null,
 };
 
 fn focusStateOnFocus(context: *anyopaque) void {
     const fs: *FocusStateCtx = @ptrCast(@alignCast(context));
+    const fm = fs.fm;
+    const id = fs.subscription_id;
+    const epoch = fm.transition_epoch;
+    fs.active = true;
     if (fs.prev_on_focus) |prev| prev.invoke();
-    fs.focused.set(true);
-    fs.visible.set(fs.fm.last_focus_reason != .click);
+    if (!fm.hasVisibilitySubscription(id) or fm.transition_epoch != epoch) return;
+    focusStateVisibilityChanged(context);
 }
 
 fn focusStateOnBlur(context: *anyopaque) void {
     const fs: *FocusStateCtx = @ptrCast(@alignCast(context));
+    const fm = fs.fm;
+    const id = fs.subscription_id;
+    const epoch = fm.transition_epoch;
+    fs.active = false;
     if (fs.prev_on_blur) |prev| prev.invoke();
-    fs.focused.set(false);
-    fs.visible.set(false);
+    if (!fm.hasVisibilitySubscription(id) or fm.transition_epoch != epoch) return;
+    focusStateVisibilityChanged(context);
+}
+
+fn focusStateVisibilityChanged(context: *anyopaque) void {
+    const fs: *FocusStateCtx = @ptrCast(@alignCast(context));
+    const fm = fs.fm;
+    const id = fs.subscription_id;
+    const epoch = fm.transition_epoch;
+    fs.focused.set(fs.active);
+    if (!fm.hasVisibilitySubscription(id) or fm.transition_epoch != epoch) return;
+    fs.visible.set(fs.active and fm.focus_visible);
 }
 
 pub fn useFocusState(scope: *Scope, cx: *Cx, node: *Node) !FocusState {
     const focused_now = cx.isFocused(node);
     const focused = try scope.createSignal(bool, focused_now);
-    const visible = try scope.createSignal(bool, focused_now and cx.focus_manager.last_focus_reason != .click);
+    const visible = try scope.createSignal(bool, focused_now and cx.focus_manager.focus_visible);
     node.addDebugSignal(@ptrCast(focused), "focused", .bool);
     const ctx = try scope.createState(FocusStateCtx, .{
         .focused = focused,
         .visible = visible,
         .fm = &cx.focus_manager,
+        .node = node,
         .prev_on_focus = node.behavior.events.on_focus,
         .prev_on_blur = node.behavior.events.on_blur,
     });
+    ctx.active = focused_now;
+    ctx.subscription_id = try cx.focus_manager.subscribeVisibility(ctx, focusStateVisibilityChanged);
+    errdefer cx.focus_manager.unsubscribeVisibility(ctx.subscription_id);
+    try scope.onCleanup(FocusStateCtx, ctx, struct {
+        fn detach(c: *FocusStateCtx) void {
+            // Node invalidation already unsubscribes; its Cx may now be gone.
+            const n = c.node orelse return;
+            c.fm.unsubscribeVisibility(c.subscription_id);
+            detachFocusHandlers(n, c);
+            c.node = null;
+        }
+    }.detach);
     node.behavior.events.on_focus = Cx.simpleHandler(focusStateOnFocus, @ptrCast(ctx));
     node.behavior.events.on_blur = Cx.simpleHandler(focusStateOnBlur, @ptrCast(ctx));
     return .{ .focused = focused, .visible = visible };
@@ -827,6 +915,7 @@ pub fn useFocusRing(scope: *Scope, cx: *Cx, node: *Node, config: FocusRingConfig
     ring_ctx.* = .{
         .signal = is_focused,
         .fm = &cx.focus_manager,
+        .node = node,
         .anim_state = anim_state,
         .prev_on_focus = node.behavior.events.on_focus,
         .prev_on_blur = node.behavior.events.on_blur,
@@ -840,6 +929,18 @@ pub fn useFocusRing(scope: *Scope, cx: *Cx, node: *Node, config: FocusRingConfig
             }
         }.destroy);
     }
+
+    ring_ctx.subscription_id = try cx.focus_manager.subscribeVisibility(ring_ctx, focusRingVisibilityChanged);
+    errdefer cx.focus_manager.unsubscribeVisibility(ring_ctx.subscription_id);
+    try scope.onCleanup(FocusRingCtx, ring_ctx, struct {
+        fn detach(c: *FocusRingCtx) void {
+            // Node invalidation already unsubscribes; its Cx may now be gone.
+            const n = c.node orelse return;
+            c.fm.unsubscribeVisibility(c.subscription_id);
+            detachFocusHandlers(n, c);
+            c.node = null;
+        }
+    }.detach);
 
     // Focus / Blur handlers (chain to previous callback). Named function:
     // invalidateSubtreeHookState

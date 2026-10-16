@@ -593,6 +593,12 @@ pub const MacOSWindow = struct {
 
     /// Controls text interpretation / IME only; raw keyDown/keyUp always dispatched from window
     /// event queue.
+    extern fn macos_set_keyboard_isolated(window: *anyopaque, isolated: c_int) void;
+    /// Test-runtime ingress gate; defaults off for every native window.
+    pub fn setKeyboardIsolated(self: *MacOSWindow, isolated: bool) void {
+        macos_set_keyboard_isolated(self.window_ptr, @intFromBool(isolated));
+    }
+
     pub fn setTextInputEnabled(self: *MacOSWindow, enabled: bool) void {
         macos_set_text_input_enabled(self.window_ptr, @intFromBool(enabled));
     }

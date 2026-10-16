@@ -350,11 +350,13 @@ while ($true) {
   try {
     if ($job.kind -eq 'probe') {
       $exeName = [string]$job.exe_name
-      if ($exeName -notin @('zenit-windows-font-smoke.exe', 'zenit-windows-drop-contract.exe', 'zenit-windows-gpu-resources-contract.exe', 'zenit-windows-d3d11-contract.exe')) { throw 'Unknown native probe' }
+      if ($exeName -notin @('zenit-windows-font-smoke.exe', 'zenit-windows-drop-contract.exe', 'zenit-windows-gpu-resources-contract.exe', 'zenit-windows-d3d11-contract.exe', 'zenit-windows-window-chrome.exe')) { throw 'Unknown native probe' }
       $exe = Join-Path $dir $exeName
       Get-JobArtifact $job $exeName $exe
       $proc = New-Object System.Diagnostics.Process
       $proc.StartInfo.FileName = $exe
+      # This executable has one approved batch mode; never accept caller-provided arguments.
+      if ($exeName -eq 'zenit-windows-window-chrome.exe') { $proc.StartInfo.Arguments = '--lifetime-smoke' }
       $proc.StartInfo.WorkingDirectory = $dir
       $proc.StartInfo.UseShellExecute = $false
       $proc.StartInfo.CreateNoWindow = $true
@@ -561,7 +563,7 @@ while ($true) {
             $requestText = @{method='POST';path=$rpc.path;body_json=$body} | ConvertTo-Json -Compress
             Write-RpcRequest $reqPath $requestText
             $capture = (Wait-RpcResult $resPath $proc) | ConvertFrom-Json
-            if ($rpc.path -eq '/frames/capture' -and -not $capture.ok) {
+            if (-not $capture.ok) {
               # Rejected/timed-out requests are RPC errors, not App failures.
               Complete-Rpc $jobId $requestId ($capture | ConvertTo-Json -Compress)
               continue

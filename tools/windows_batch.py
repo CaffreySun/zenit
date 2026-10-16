@@ -65,6 +65,10 @@ def stages(include_a11y: bool, renderer: str = "d3d12", full_app_suites: bool = 
         out.append({"name": name, "kind": "e2e", "exe_name": queue.E2E_APPS[app],
                     "suite_source": f"e2e/windows-{name}.test.ts", "minimum_cases": cases,
                     "blocking": True, "filter": ""})
+    # Native WM_MOUSE(W/H)WHEEL must reach the SDK instead of the Harness /scroll route.
+    out.append({"name": "native-scroll", "kind": "e2e", "exe_name": queue.E2E_APPS["storybook"],
+                "suite_source": "e2e/windows-native-scroll.test.ts", "minimum_cases": 1,
+                "blocking": True, "filter": "", "app_env": {"ZENIT_E2E_ISOLATE_POINTER": "0"}})
     # The adaptive window example: preset gallery geometry, real caption actions,
     # F11 fullscreen reveal and one real "Try" window opened from a preset.
     out.append({"name": "adaptive-window", "kind": "e2e", "exe_name": queue.E2E_APPS["adaptive-window"],
@@ -73,6 +77,11 @@ def stages(include_a11y: bool, renderer: str = "d3d12", full_app_suites: bool = 
     # (screenshots for review).
     out.append({"name": "storybook-header", "kind": "e2e", "exe_name": queue.E2E_APPS["storybook"],
                 "suite_source": "e2e/window-header-probe.test.ts", "minimum_cases": 1, "blocking": True, "filter": ""})
+    out.append({"name": "multi-window-screenshot", "kind": "e2e", "exe_name": queue.E2E_APPS["storybook"],
+                "suite_source": "e2e/multi-window-screenshot.test.ts", "minimum_cases": 1,
+                "blocking": True, "filter": ""})
+    out.append({"name": "window-lifetime", "kind": "probe",
+                "exe_name": "zenit-windows-window-chrome.exe", "blocking": True})
     out.append({"name": "gpu-contracts", "kind": "probe",
                 "exe_name": "zenit-windows-d3d11-contract.exe" if renderer == "d3d11" else GPU_PROBE,
                 "renderer": renderer, "blocking": True})
@@ -116,6 +125,9 @@ def build(arch: str, prefix: Path, renderer: str = "d3d12") -> None:
     common = [f"-Dwindows-arch={arch}", "--prefix", str(prefix)]
     subprocess.run(["zig", "build", "windows-arm64-storybook", "windows-arm64-text-input", "windows-arm64-render-gallery", "windows-adaptive-window",
                     "-Dtest-mode=true", f"-Dgpu-backend={renderer}", "-Doptimize=fast", *common], cwd=REPO, check=True)
+    # DebugAllocator exit checks are part of the lifetime contract.
+    subprocess.run(["zig", "build", "windows-window-chrome", "-Dtest-mode=true",
+                    f"-Dgpu-backend={renderer}", "-Doptimize=Debug", *common], cwd=REPO, check=True)
     if renderer == "d3d11":
         subprocess.run(["zig", "build", "windows-d3d11-contract", "-Dgpu-backend=d3d11", "-Doptimize=fast", *common], cwd=REPO, check=True)
         return
@@ -225,6 +237,14 @@ def judge(stage: dict, stage_dir: Path) -> tuple[bool, str]:
     if error:
         return False, f"stage error (exit {result['exit_code']}): {error[:300]}"
     if stage["kind"] == "probe":
+        if stage.get("name") == "window-lifetime":
+            stderr = (stage_dir / "windows-probe-stderr.log").read_text(errors="replace")
+            case_records = re.findall(r"lifetime callback passed: trigger=(click|focus|key|cleanup) close_owner=(true|false)", stderr)
+            cases = len(set(case_records))
+            complete = "lifetime smoke complete:" in stderr
+            leaks = bool(re.search(r"(?i)(memory address .* leaked|\bleaked:|error\(gpa\)|error\(debug_allocator\))", stderr))
+            ok = result["exit_code"] == 0 and cases == 8 and len(case_records) == 8 and complete and not leaks
+            return ok, f"{cases}/8 callback cases, completion={complete}, allocator_leaks={leaks}, exit={result['exit_code']}"
         if stage.get("renderer") == "d3d11":
             stdout = (stage_dir / "windows-probe-stdout.log").read_text(errors="replace")
             stderr = (stage_dir / "windows-probe-stderr.log").read_text(errors="replace")

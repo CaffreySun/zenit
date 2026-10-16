@@ -99,6 +99,7 @@ fn logSidebarHit(comptime phase: []const u8, x: f32, y: f32, target: ?*Node) voi
 
 /// Event dispatcher - Node tree based
 pub const EventDispatcher = struct {
+    dispatch_depth: usize = 0,
     allocator: Allocator,
     io: std.Io,
 
@@ -215,6 +216,8 @@ pub const EventDispatcher = struct {
     }
 
     pub fn syncHover(self: *EventDispatcher, new_hovered: ?*Node) ?*Node {
+        self.dispatch_depth += 1;
+        defer self.dispatch_depth -= 1;
         self.updateHoveredNode(new_hovered);
         return self.currentHovered();
     }
@@ -258,6 +261,8 @@ pub const EventDispatcher = struct {
     /// Without a registry, the caller must keep every path node and its handler
     /// contexts alive until dispatch returns (including nested dispatches).
     pub fn dispatch(self: *EventDispatcher, event: Event, target: *Node) EventResult {
+        self.dispatch_depth += 1;
+        defer self.dispatch_depth -= 1;
         // Build path from root to target
         var path_buf: [128]*Node = undefined;
         const storage = pathStorage(*Node, self.allocator, &path_buf, pathDepth(target)) catch return .stop;
@@ -367,11 +372,15 @@ pub const EventDispatcher = struct {
 
     /// Dispatch mouse move, handle hover change (modifiers degrade to `.{}` compat entry)
     pub fn dispatchMouseMove(self: *EventDispatcher, x: f32, y: f32, new_hovered: ?*Node) ?*Node {
+        self.dispatch_depth += 1;
+        defer self.dispatch_depth -= 1;
         return self.dispatchMouseMoveEx(x, y, new_hovered, .{});
     }
 
     /// Dispatch mouse move with movement-time modifier flags
     pub fn dispatchMouseMoveEx(self: *EventDispatcher, x: f32, y: f32, new_hovered: ?*Node, modifiers: events.Modifiers) ?*Node {
+        self.dispatch_depth += 1;
+        defer self.dispatch_depth -= 1;
         const dx: f32 = if (self.has_last_mouse) x - self.last_mouse_pos[0] else 0;
         const dy: f32 = if (self.has_last_mouse) y - self.last_mouse_pos[1] else 0;
         self.last_mouse_pos = .{ x, y };
@@ -398,6 +407,8 @@ pub const EventDispatcher = struct {
 
     /// Dispatch mouse down (button support)
     pub fn dispatchMouseDownButton(self: *EventDispatcher, x: f32, y: f32, target: ?*Node, button: events.MouseButton, modifiers: events.Modifiers) ?*Node {
+        self.dispatch_depth += 1;
+        defer self.dispatch_depth -= 1;
         const identity = if (target) |node| HandlerTarget.init(self.registry, node) else null;
         // RMB/MMB skip click synthesis and press tracking; dispatch raw down only.
         if (button != .left) {
@@ -426,6 +437,8 @@ pub const EventDispatcher = struct {
 
     /// Dispatch mouse down, LMB default convenience overload
     pub fn dispatchMouseDown(self: *EventDispatcher, x: f32, y: f32, target: ?*Node, modifiers: events.Modifiers) ?*Node {
+        self.dispatch_depth += 1;
+        defer self.dispatch_depth -= 1;
         return self.dispatchMouseDownButton(x, y, target, .left, modifiers);
     }
 
@@ -435,6 +448,8 @@ pub const EventDispatcher = struct {
     /// Shift pressed after down), and hosts need up-time truth for 'add-select vs exclusive
     /// select'. The synthesized click still uses last_modifiers; click's semantic anchor is down.
     pub fn dispatchMouseUpButton(self: *EventDispatcher, x: f32, y: f32, target: ?*Node, button: events.MouseButton, modifiers: events.Modifiers) void {
+        self.dispatch_depth += 1;
+        defer self.dispatch_depth -= 1;
         const target_handle = if (target) |t|
             if (self.registry) |registry| registry.handleFor(t) else null
         else
@@ -550,33 +565,45 @@ pub const EventDispatcher = struct {
 
     /// Dispatch mouse up, LMB default, no modifiers convenience overload
     pub fn dispatchMouseUp(self: *EventDispatcher, x: f32, y: f32, target: ?*Node) void {
+        self.dispatch_depth += 1;
+        defer self.dispatch_depth -= 1;
         self.dispatchMouseUpButton(x, y, target, .left, .{});
     }
 
     /// Dispatch keyboard event to focus node
     pub fn dispatchKeyDown(self: *EventDispatcher, target: *Node, key_event: KeyEvent) EventResult {
+        self.dispatch_depth += 1;
+        defer self.dispatch_depth -= 1;
         const event = Event{ .key_down = key_event };
         return self.dispatch(event, target);
     }
 
     pub fn dispatchKeyUp(self: *EventDispatcher, target: *Node, key_event: KeyEvent) EventResult {
+        self.dispatch_depth += 1;
+        defer self.dispatch_depth -= 1;
         const event = Event{ .key_up = key_event };
         return self.dispatch(event, target);
     }
 
     /// Dispatch text input to focus node
     pub fn dispatchTextInput(self: *EventDispatcher, target: *Node, text: []const u8) EventResult {
+        self.dispatch_depth += 1;
+        defer self.dispatch_depth -= 1;
         const event = Event{ .text_input = .{ .text = text } };
         return self.dispatch(event, target);
     }
 
     /// Dispatch IME preedit to focus node
     pub fn dispatchImePreedit(self: *EventDispatcher, target: *Node, text: []const u8, cursor_utf8_offset: u32) EventResult {
+        self.dispatch_depth += 1;
+        defer self.dispatch_depth -= 1;
         return self.dispatchImePreeditReplace(target, text, cursor_utf8_offset, events.ime_no_replacement, events.ime_no_replacement);
     }
 
     /// Dispatch IME preedit with replacementRange (reconversion); sentinel == dispatchImePreedit
     pub fn dispatchImePreeditReplace(self: *EventDispatcher, target: *Node, text: []const u8, cursor_utf8_offset: u32, replace_start_utf8: u32, replace_end_utf8: u32) EventResult {
+        self.dispatch_depth += 1;
+        defer self.dispatch_depth -= 1;
         const event = Event{ .ime_preedit = .{
             .text = text,
             .cursor_utf8_offset = cursor_utf8_offset,
@@ -588,11 +615,15 @@ pub const EventDispatcher = struct {
 
     /// Dispatch IME commit to focus node
     pub fn dispatchImeCommit(self: *EventDispatcher, target: *Node, text: []const u8) EventResult {
+        self.dispatch_depth += 1;
+        defer self.dispatch_depth -= 1;
         return self.dispatchImeCommitReplace(target, text, events.ime_no_replacement, events.ime_no_replacement);
     }
 
     /// Dispatch IME commit with replacementRange; sentinel == dispatchImeCommit
     pub fn dispatchImeCommitReplace(self: *EventDispatcher, target: *Node, text: []const u8, replace_start_utf8: u32, replace_end_utf8: u32) EventResult {
+        self.dispatch_depth += 1;
+        defer self.dispatch_depth -= 1;
         const event = Event{ .ime_commit = .{
             .text = text,
             .replace_start_utf8 = replace_start_utf8,
@@ -621,6 +652,8 @@ pub const EventDispatcher = struct {
     /// moves under a steady pointer, so hit changes but it is not a new gesture); released on
     /// ended/cancelled; ended transfers owner to momentum. Mouse wheel (.none) is stateless.
     pub fn dispatchScroll(self: *EventDispatcher, scroll: events.ScrollEvent, hit_target: ?*Node) EventResult {
+        self.dispatch_depth += 1;
+        defer self.dispatch_depth -= 1;
         const hit = nearestCompatibleScrollOwner(hit_target, scroll.dx, scroll.dy) orelse hit_target;
         if (scrollDebugEnabled() and !scroll.isMomentum() and !scroll.phaseEnded() and (scroll.dy != 0 or scroll.dx != 0)) {
             logScrollHitWithoutScrollArea(hit, scroll.x, scroll.y);
@@ -717,6 +750,8 @@ pub const EventDispatcher = struct {
     /// System interrupt (window blur etc) ends active scroll: synthesize cancelled to
     /// gesture owner, momentum ended to momentum owner, same code path as real device end.
     pub fn cancelScrollGesture(self: *EventDispatcher) void {
+        self.dispatch_depth += 1;
+        defer self.dispatch_depth -= 1;
         // Extract both owners once, clear, then dispatch: handler re-entering scroll sees
         // clean state, new session it builds not overwritten. Extracted is **identity** (registry
         // handle, not raw ptr): first dispatch handler may sync-destroy second owner, second

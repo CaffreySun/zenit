@@ -27,6 +27,24 @@ pub fn frameCaptureFinished() bool {
     return enabled and command_executor.frameCaptureFinished();
 }
 
+pub fn setCommandBoundaryCallbacks(begin: ?*const fn () void, end: ?*const fn () void) void {
+    if (!enabled) return;
+    command_executor.setCommandBoundaryCallbacks(begin, end);
+}
+
+pub fn registerScreenshotWindow(io: std.Io, owner: *anyopaque, native_id: u64, capture: ?@import("screenshot_windows.zig").Capture, closing: @import("screenshot_windows.zig").Closing) void {
+    if (!enabled) return;
+    var session: u128 = command_executor.screenshot_windows.session orelse 0;
+    if (command_executor.screenshot_windows.session == null) io.randomSecure(std.mem.asBytes(&session)) catch @panic("harness window session entropy unavailable");
+    command_executor.screenshot_windows.register(session, owner, native_id, capture, closing);
+}
+pub fn bindScreenshotWindow(owner: *anyopaque) void {
+    if (enabled) command_executor.screenshot_windows.bound = owner;
+}
+pub fn unregisterScreenshotWindow(owner: *anyopaque) void {
+    if (enabled) command_executor.screenshot_windows.unregister(owner);
+}
+
 /// Register screenshot callback
 pub fn setScreenshotCallback(f: command_executor.CaptureScreenshotFn) void {
     if (!enabled) return;

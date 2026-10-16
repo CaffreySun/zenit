@@ -196,6 +196,10 @@ fn dispatchRequest(queue: *CommandQueue, method: []const u8, path: []const u8, b
             const result = queue.submitAndWait(.{ .query_tree = {} });
             return .{ .status = 200, .body = result.getData() };
         }
+        if (std.mem.eql(u8, path, "/windows")) {
+            const result = queue.submitAndWait(.{ .windows = {} });
+            return .{ .status = 200, .body = result.getData() };
+        }
         if (std.mem.eql(u8, path, "/focused")) {
             const result = queue.submitAndWait(.{ .get_focused = {} });
             return .{ .status = 200, .body = result.getData() };
@@ -459,9 +463,10 @@ fn dispatchRequest(queue: *CommandQueue, method: []const u8, path: []const u8, b
             return .{ .status = 200, .body = result.getData() };
         }
         if (std.mem.eql(u8, path, "/screenshot")) {
-            const out_path = findJsonString(body, "path") orelse "/tmp/zenit_screenshot.png";
-            var payload = TestIdPayload{};
-            copyTestId(out_path, &payload);
+            const payload = parseScreenshot(body) catch |err| return .{ .status = 400, .body = switch (err) {
+                error.InvalidWindowId => "{\"error\":\"invalid-window-id\",\"code\":\"invalid-window-id\"}",
+                error.InvalidPayload => "{\"error\":\"invalid screenshot payload\"}",
+            } };
             const result = queue.submitAndWait(.{ .screenshot = payload });
             return .{ .status = 200, .body = result.getData() };
         }
@@ -868,4 +873,38 @@ test "file-RPC owner: 坏 owner.json 被接管" {
     const text = try readFileCompat(tmp.dir, std.testing.io, OWNER_FILE, std.testing.allocator);
     defer std.testing.allocator.free(text);
     try std.testing.expectEqual(std.c.getpid(), parseOwnerPid(text) orelse return error.TestUnexpectedResult);
+}
+
+fn parseScreenshot(body: []const u8) error{ InvalidPayload, InvalidWindowId }!@import("command_queue.zig").ScreenshotPayload {
+    const parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, if (body.len == 0) "{}" else body, .{}) catch return error.InvalidPayload;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidPayload;
+    var payload: @import("command_queue.zig").ScreenshotPayload = .{};
+    const out_path = if (parsed.value.object.get("path")) |value| switch (value) {
+        .string => |text| text,
+        else => return error.InvalidPayload,
+    } else "/tmp/zenit_screenshot.png";
+    copyTestId(out_path, &payload.path);
+    if (parsed.value.object.get("window_id")) |value| {
+        const id = switch (value) {
+            .string => |text| text,
+            else => return error.InvalidWindowId,
+        };
+        if (!@import("screenshot_windows.zig").Registry.validToken(id)) return error.InvalidWindowId;
+        payload.window_id = .{};
+        copyTestId(id, &payload.window_id.?);
+    }
+    return payload;
+}
+
+test "screenshot parser preserves window identity and rejects native or malformed ids" {
+    try std.testing.expectEqualStrings("/tmp/zenit_screenshot.png", (try parseScreenshot("")).getText());
+    const payload = try parseScreenshot("{\"path\":\"a.png\",\"window_id\":\"ab12-3\"}");
+    try std.testing.expectEqualStrings("a.png", payload.getText());
+    try std.testing.expectEqualStrings("ab12-3", payload.window_id.?.getText());
+    try std.testing.expect((try parseScreenshot("{\"path\":\"a.png\"}")).window_id == null);
+    try std.testing.expectError(error.InvalidWindowId, parseScreenshot("{\"window_id\":12}"));
+    try std.testing.expectError(error.InvalidWindowId, parseScreenshot("{\"window_id\":null}"));
+    try std.testing.expectError(error.InvalidWindowId, parseScreenshot("{\"window_id\":\"12\"}"));
+    try std.testing.expectError(error.InvalidWindowId, parseScreenshot("{\"window_id\":\"ab-1-2\"}"));
 }

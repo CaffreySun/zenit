@@ -35,6 +35,10 @@ pub const SCOPE_STACK_CAP: usize = 64;
 /// Scoped focus order buffer (v0.1-P6: 64->512)
 pub const SCOPED_BUF_CAP: usize = 512;
 
+/// Explicit visibility affects this focus request only; it does not change input modality.
+pub const FocusVisibility = enum { inherit, show, hide };
+pub const InputModality = enum { pointer, keyboard };
+
 /// Focus manager
 pub const FocusManager = struct {
     allocator: Allocator,
@@ -47,6 +51,8 @@ pub const FocusManager = struct {
     // Only that newest transition may continue publishing state/events.
     transition_epoch: u64 = 0,
     transition_depth: usize = 0,
+    /// Lifetime guard independent of focus nesting (settled callbacks may redirect).
+    callback_depth: usize = 0,
 
     /// Tab order table (focusable node list)
     focus_order: std.ArrayList(*Node),
@@ -88,6 +94,79 @@ pub const FocusManager = struct {
     /// Most recent focus change reason (for :focus-visible)
     last_focus_reason: FocusReason = .programmatic,
 
+    input_modality: InputModality = .pointer,
+    focus_visible: bool = false,
+    visibility_listeners: std.ArrayList(VisibilityListener) = .empty,
+    next_visibility_id: u64 = 0,
+
+    const VisibilityListener = struct {
+        id: u64,
+        context: *anyopaque,
+        callback: *const fn (*anyopaque) void,
+    };
+
+    pub fn subscribeVisibility(self: *FocusManager, context: *anyopaque, callback: *const fn (*anyopaque) void) !u64 {
+        const id = std.math.add(u64, self.next_visibility_id, 1) catch return error.OutOfMemory;
+        try self.visibility_listeners.append(self.allocator, .{ .id = id, .context = context, .callback = callback });
+        self.next_visibility_id = id;
+        return id;
+    }
+
+    // IDs remain sorted because subscription appends and removal preserves order.
+    fn visibilityLowerBound(self: *FocusManager, id: u64) usize {
+        var low: usize = 0;
+        var high = self.visibility_listeners.items.len;
+        while (low < high) {
+            const middle = low + (high - low) / 2;
+            if (self.visibility_listeners.items[middle].id < id) low = middle + 1 else high = middle;
+        }
+        return low;
+    }
+
+    pub fn unsubscribeVisibility(self: *FocusManager, id: u64) void {
+        const index = self.visibilityLowerBound(id);
+        if (index < self.visibility_listeners.items.len and self.visibility_listeners.items[index].id == id)
+            _ = self.visibility_listeners.orderedRemove(index);
+    }
+
+    pub fn hasVisibilitySubscription(self: *FocusManager, id: u64) bool {
+        const index = self.visibilityLowerBound(id);
+        return index < self.visibility_listeners.items.len and self.visibility_listeners.items[index].id == id;
+    }
+
+    fn notifyVisibility(self: *FocusManager) void {
+        self.callback_depth += 1;
+        defer self.callback_depth -= 1;
+        const epoch = self.transition_epoch;
+        const last_id = self.next_visibility_id;
+        var index: usize = 0;
+        while (index < self.visibility_listeners.items.len) {
+            // Copy before invoking: callbacks may remove subscriptions or grow the list.
+            const listener = self.visibility_listeners.items[index];
+            if (listener.id > last_id) break;
+            listener.callback(listener.context);
+            if (self.transition_epoch != epoch) return;
+            if (index < self.visibility_listeners.items.len and self.visibility_listeners.items[index].id == listener.id) {
+                index += 1;
+            } else {
+                // Only removals at/before the cursor require a reseek. Unchanged
+                // delivery is linear; callbacks added mid-delivery wait until next time.
+                index = self.visibilityLowerBound(listener.id);
+                if (index < self.visibility_listeners.items.len and self.visibility_listeners.items[index].id == listener.id) index += 1;
+            }
+        }
+    }
+
+    /// Record input before dispatch: programmatic focus inside a handler inherits it.
+    pub fn noteInputModality(self: *FocusManager, modality: InputModality) void {
+        self.input_modality = modality;
+        const visible = modality == .keyboard and self.getFocused() != null;
+        if (visible == self.focus_visible) return;
+        self.transition_epoch = std.math.add(u64, self.transition_epoch, 1) catch @panic("focus epoch exhausted");
+        self.focus_visible = visible;
+        self.notifyVisibility();
+    }
+
     pub fn init(allocator: Allocator) FocusManager {
         return .{
             .allocator = allocator,
@@ -96,6 +175,7 @@ pub const FocusManager = struct {
     }
 
     pub fn deinit(self: *FocusManager) void {
+        self.visibility_listeners.deinit(self.allocator);
         self.focus_order.deinit(self.allocator);
     }
 
@@ -168,8 +248,13 @@ pub const FocusManager = struct {
     fn finishFocusTransition(self: *FocusManager) void {
         self.transition_depth -= 1;
         if (self.transition_depth != 0) return;
+        // Settled callbacks can start another fully settled transition. Keep a
+        // separate lifetime guard so this does not suppress its notification.
+        self.callback_depth += 1;
+        defer self.callback_depth -= 1;
         // Publish only the settled owner, never an outer transition's stale
         // local target. The settled hook may itself request a new transition.
+        self.notifyVisibility();
         self.a11y_bridge.notifyFocusChange(self.getFocused());
         if (self.on_focus_settled) |callback| {
             if (self.settled_context) |context| callback(context);
@@ -182,14 +267,27 @@ pub const FocusManager = struct {
     /// Identity checks independently protect targets destroyed by callbacks.
     /// Without a registry the caller must retain nodes across callbacks.
     pub fn setFocusWithReason(self: *FocusManager, node: ?*Node, reason: FocusReason) void {
+        self.setFocusWithVisibility(node, reason, .inherit);
+    }
+
+    pub fn setFocusWithVisibility(self: *FocusManager, node: ?*Node, reason: FocusReason, visibility: FocusVisibility) void {
+        // Capture the inherited policy before callbacks can change it.
+        switch (reason) {
+            .click => self.input_modality = .pointer,
+            .tab => self.input_modality = .keyboard,
+            .programmatic => {},
+        }
+        const visible = node != null and switch (visibility) {
+            .inherit => self.input_modality == .keyboard,
+            .show => true,
+            .hide => false,
+        };
         const old_node = self.getFocused();
         if (old_node == node) {
-            // During blur, null is the published owner but an outer transition
-            // may still intend to focus a target. An explicit clear cancels it.
-            if (node == null and self.transition_depth != 0) {
-                self.transition_epoch = std.math.add(u64, self.transition_epoch, 1) catch @panic("focus epoch exhausted");
-                self.last_focus_reason = reason;
-            }
+            self.transition_epoch = std.math.add(u64, self.transition_epoch, 1) catch @panic("focus epoch exhausted");
+            self.last_focus_reason = reason;
+            self.focus_visible = visible;
+            self.notifyVisibility();
             return;
         }
 
@@ -209,6 +307,7 @@ pub const FocusManager = struct {
         self.current_focus = null;
         self.current_focus_handle = null;
         self.last_focus_reason = reason;
+        self.focus_visible = visible;
         if (old_node) |old| {
             old.markRenderDirty();
             if (old.behavior.events.on_blur) |handler| handler.invoke();
@@ -2478,4 +2577,65 @@ test "FocusManager: settled hook may synchronously redirect again" {
     try std.testing.expectEqual(b, cx.focus_manager.getFocused().?);
     try std.testing.expectEqual(b, cx.focused_node.?);
     try std.testing.expectEqual(cx.node_registry.handleFor(b), cx.focused_handle.?);
+}
+
+test "FocusManager: visibility observer removal and nested focus keep newest policy" {
+    var cx = try core.Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    const node = try core.box(cx, .{}, .{});
+    cx.root = node;
+    const Observer = struct {
+        fm: *FocusManager,
+        node: *Node,
+        id: u64 = 0,
+        calls: usize = 0,
+        guarded: bool = false,
+        fn run(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            self.guarded = self.fm.callback_depth != 0;
+            self.fm.unsubscribeVisibility(self.id);
+            self.fm.setFocusWithVisibility(self.node, .programmatic, .hide);
+        }
+    };
+    var observer: Observer = .{ .fm = &cx.focus_manager, .node = node };
+    observer.id = try cx.focus_manager.subscribeVisibility(&observer, Observer.run);
+    cx.focus_manager.setFocusWithReason(node, .tab);
+    try std.testing.expectEqual(@as(usize, 1), observer.calls);
+    try std.testing.expect(observer.guarded);
+    try std.testing.expect(!cx.focus_manager.focus_visible);
+    try std.testing.expectEqual(@as(usize, 0), cx.focus_manager.callback_depth);
+    try std.testing.expectEqual(@as(usize, 0), cx.focus_manager.transition_depth);
+}
+
+test "FocusManager: notification cursor survives removing earlier current and later observers" {
+    var fm = FocusManager.init(std.testing.allocator);
+    defer fm.deinit();
+    const Observer = struct {
+        fm: *FocusManager,
+        id: u64 = 0,
+        remove_before: u64 = 0,
+        remove_after: u64 = 0,
+        calls: usize = 0,
+        remove_self: bool = false,
+        fn run(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            if (self.remove_before != 0) self.fm.unsubscribeVisibility(self.remove_before);
+            if (self.remove_after != 0) self.fm.unsubscribeVisibility(self.remove_after);
+            if (self.remove_self) self.fm.unsubscribeVisibility(self.id);
+        }
+    };
+    var observers = [_]Observer{ .{ .fm = &fm }, .{ .fm = &fm }, .{ .fm = &fm }, .{ .fm = &fm } };
+    for (&observers) |*observer| observer.id = try fm.subscribeVisibility(observer, Observer.run);
+    observers[1].remove_before = observers[0].id;
+    observers[1].remove_self = true;
+    observers[1].remove_after = observers[2].id;
+    fm.notifyVisibility();
+    try std.testing.expectEqual(@as(usize, 1), observers[0].calls);
+    try std.testing.expectEqual(@as(usize, 1), observers[1].calls);
+    try std.testing.expectEqual(@as(usize, 0), observers[2].calls);
+    try std.testing.expectEqual(@as(usize, 1), observers[3].calls);
+    fm.notifyVisibility();
+    try std.testing.expectEqual(@as(usize, 2), observers[3].calls);
 }

@@ -237,8 +237,13 @@ fn sharedSmoke(allocator: std.mem.Allocator, io: std.Io) !void {
 var reopen_application: ?*app.MultiWindowApp = null;
 var reopened_window: ?*app.App = null;
 var reopen_error: ?anyerror = null;
+var reopen_peer_id: ?u64 = null;
 fn reopenOnDestroy(window: *app.App) void {
     const application = reopen_application orelse return;
+    if (reopen_peer_id) |id| {
+        reopen_peer_id = null;
+        if (!application.closeWindow(id)) reopen_error = error.DestroyPeerCloseRejected;
+    }
     reopened_window = application.createWindowWith(.{ .io = window.cx.io }, smokeMount) catch |err| {
         reopen_error = err;
         return;
@@ -251,13 +256,23 @@ fn reopenSmoke(allocator: std.mem.Allocator, io: std.Io) !void {
     defer reopen_application = null;
     reopened_window = null;
     reopen_error = null;
+    const peer = try application.createWindowWith(.{ .io = io }, smokeMount);
+    const peer_id = peer.windowId();
+    reopen_peer_id = peer_id;
+    defer reopen_peer_id = null;
     const a = try application.createWindowWith(.{ .io = io, .on_destroy = reopenOnDestroy }, smokeMount);
     const old_id = a.windowId();
     if (!try application.tick()) return error.InitialTickStopped;
     try a.requestClose();
     // The last window is removed inside the real pump/tick, and its destroy
     // callback creates B. The loop must render B and continue receiving events.
-    if (!try application.tick()) return error.DestroyReplacementTickStopped;
+    const close_start = std.Io.Clock.awake.now(io);
+    while (application.window(old_id) != null or application.window(peer_id) != null or reopened_window == null) {
+        if (close_start.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() >= 5000) return error.DestroyReplacementCloseTimeout;
+        if (!try application.tick()) return error.DestroyReplacementTickStopped;
+        std.Io.sleep(io, .fromMilliseconds(2), .awake) catch {};
+        if (reopen_error) |err| return err;
+    }
     if (reopen_error) |err| return err;
     const b = reopened_window orelse return error.DestroyReplacementMissing;
     if (application.windowCount() != 1 or application.window(old_id) != null) return error.DestroyReplacementRegistration;
@@ -538,6 +553,138 @@ fn multiSmoke(allocator: std.mem.Allocator, io: std.Io) !void {
     if (app.MultiWindowApp.nativeWindowCount() != 0) return error.SharedNativeWindowLeak;
     std.log.info("chrome multi-window: independent state, reentrant veto, accepted close, owned panel cascade, survivor and native cleanup passed", .{});
 }
+// Real dispatch regression: callbacks must return before their window/owner is freed.
+// Run separately with --lifetime-smoke or as part of the existing multi-window gate.
+const LifetimeTrigger = enum { click, focus, key, cleanup };
+const LifetimeState = struct {
+    application: *app.MultiWindowApp,
+    source: *app.App,
+    close_id: u64,
+    calls: u32 = 0,
+    failure: ?anyerror = null,
+};
+var lifetime_state: ?*LifetimeState = null;
+var lifetime_destroyed: [8]u64 = undefined;
+var lifetime_destroy_count: usize = 0;
+fn lifetimeDestroyed(window: *app.App) void {
+    lifetime_destroyed[lifetime_destroy_count] = window.windowId();
+    lifetime_destroy_count += 1;
+}
+fn lifetimeClose(_: *anyopaque) void {
+    const state = lifetime_state.?;
+    state.calls += 1;
+    const source_id = state.source.windowId();
+    if (!state.application.closeWindow(state.close_id)) {
+        state.failure = error.CallbackCloseRejected;
+        return;
+    }
+    // Check registration before touching the source again: the pre-fix runtime
+    // destroys it synchronously here (and subsequently resumes its dispatch stack).
+    if (state.application.window(source_id) == null or state.application.window(state.close_id) == null or lifetime_destroy_count != 0) {
+        state.failure = error.WindowDestroyedInsideCallback;
+        return;
+    }
+    state.source.cx.requestRedraw();
+    if (state.application.pump(0)) |_| {
+        state.failure = error.NestedPumpAccepted;
+    } else |err| if (err != error.ReentrantWindowLoop) {
+        state.failure = err;
+    }
+    if (state.application.frame()) |_| {
+        state.failure = error.NestedFrameAccepted;
+    } else |err| if (err != error.ReentrantWindowLoop) {
+        state.failure = err;
+    }
+}
+fn lifetimeCleanup(state: *LifetimeState) void {
+    lifetimeClose(state);
+}
+fn lifetimeKey(_: ui.events.KeyCode, _: ui.events.Modifiers, context: ?*anyopaque) ui.events.EventResult {
+    lifetimeClose(context.?);
+    return .handled;
+}
+var duplicate_mount_calls: usize = 0;
+fn duplicateMount(_: *ui.Cx, _: *ui.Scope) anyerror!*ui.Node {
+    duplicate_mount_calls += 1;
+    return error.DuplicateMountBuilderInvoked;
+}
+fn lifetimeRoot(cx: *ui.Cx, scope: *ui.Scope) anyerror!*ui.Node {
+    return v.render(scope, cx, v.box(.{ .test_id = "lifetime.target", .style = .{ .width = .fill, .height = .fill } }, .{"Lifetime callback target"}));
+}
+fn lifetimeSmoke(allocator: std.mem.Allocator, io: std.Io) !void {
+    for ([_]LifetimeTrigger{ .click, .focus, .key, .cleanup }) |trigger| {
+        for ([_]bool{ false, true }) |close_owner| {
+            var application = app.MultiWindowApp.init(allocator, .{ .pump_timeout_ms = 0 });
+            defer application.deinit();
+            lifetime_destroy_count = 0;
+            const survivor = try application.createWindowWith(.{ .io = io }, lifetimeRoot);
+            const original_root = survivor.cx.root;
+            const original_scope = survivor.cx.root_scope;
+            duplicate_mount_calls = 0;
+            if (survivor.mount(duplicateMount)) |_| return error.DuplicateMountAccepted else |err| {
+                if (err != error.AlreadyMounted) return err;
+            }
+            if (duplicate_mount_calls != 0 or survivor.cx.root != original_root or survivor.cx.root_scope != original_scope) return error.DuplicateMountChangedTree;
+            const owner = try application.createWindowWith(.{ .io = io, .on_destroy = lifetimeDestroyed }, lifetimeRoot);
+            const owner_id = owner.windowId();
+            const source = if (close_owner) try application.createWindowWith(.{ .io = io, .window = .{ .owner = owner_id }, .on_destroy = lifetimeDestroyed }, lifetimeRoot) else owner;
+            const source_id = source.windowId();
+            for (0..3) |_| _ = try application.tick();
+            const target = findTestId(source.cx.root.?, "lifetime.target") orelse return error.LifetimeTargetMissing;
+            target.setFocusable(true);
+            var state = LifetimeState{ .application = &application, .source = source, .close_id = owner_id };
+            lifetime_state = &state;
+            defer lifetime_state = null;
+            switch (trigger) {
+                .click => {
+                    target.behavior.events.on_click = ui.Cx.simpleHandler(lifetimeClose, &state);
+                    const rect = target.globalRect();
+                    source.cx.handleMouseDown(rect.x + rect.w / 2, rect.y + rect.h / 2, .{});
+                    source.cx.handleMouseUp(rect.x + rect.w / 2, rect.y + rect.h / 2);
+                },
+                .focus => {
+                    target.behavior.events.on_focus = ui.Cx.simpleHandler(lifetimeClose, &state);
+                    source.cx.setFocus(target);
+                },
+                .cleanup => {
+                    const scope = try ui.Scope.init(allocator, source.cx.root_scope, source.cx.owner);
+                    try scope.onCleanup(LifetimeState, &state, lifetimeCleanup);
+                    scope.dispose();
+                },
+                .key => {
+                    source.cx.setFocus(target);
+                    target.behavior.events.on_key_down = lifetimeKey;
+                    target.behavior.events.key_context = &state;
+                    source.cx.handleKeyDown(.a, .{});
+                },
+            }
+            if (state.failure) |err| return err;
+            if (state.calls != 1) return error.LifetimeCallbackNotExactlyOnce;
+            if (application.window(source_id) == null) return error.CloseCommittedBeforeHostBoundary;
+            const survivor_frames = survivor.cx.frame_count;
+            // AppKit finishes its native close asynchronously. Observe completion,
+            // bounded by elapsed time, instead of assuming a fixed tick count.
+            const close_start = std.Io.Clock.awake.now(io);
+            while (application.window(owner_id) != null or application.window(source_id) != null or survivor.cx.frame_count <= survivor_frames) {
+                if (close_start.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() >= 5000) return error.LifetimeCloseNotCommitted;
+                survivor.cx.requestRedraw();
+                if (!try application.tick()) return error.LifetimeSurvivorStopped;
+                std.Io.sleep(io, .fromMilliseconds(2), .awake) catch {};
+            }
+            if (lifetime_destroy_count != @as(usize, if (close_owner) 2 else 1)) return error.LifetimeDestroyCount;
+            if (lifetime_destroyed[0] != source_id or lifetime_destroyed[lifetime_destroy_count - 1] != owner_id) return error.LifetimeDestroyOrder;
+            const survivor_target = findTestId(survivor.cx.root.?, "lifetime.target").?;
+            survivor_target.setFocusable(true);
+            survivor.cx.setFocus(survivor_target);
+            survivor.cx.handleKeyDown(.a, .{});
+            if (!survivor.cx.isFocused(survivor_target) or survivor.cx.frame_count <= survivor_frames) return error.LifetimeSurvivorUnusable;
+            std.log.info("lifetime callback passed: trigger={s} close_owner={any}", .{ @tagName(trigger), close_owner });
+        }
+    }
+    try reopenSmoke(allocator, io);
+    if (app.MultiWindowApp.nativeWindowCount() != 0) return error.LifetimeNativeWindowLeak;
+    std.log.info("lifetime smoke complete: eight direct dispatch/cleanup cases, nested loop rejection, child-first teardown, survivor focus/render and replacement passed", .{});
+}
 pub fn main(init: std.process.Init) !void {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer std.debug.assert(gpa.deinit() == .ok);
@@ -545,7 +692,11 @@ pub fn main(init: std.process.Init) !void {
     var strict = false;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     for (args[1..]) |arg| {
-        if (std.mem.eql(u8, arg, "--multi-smoke")) return multiSmoke(gpa.allocator(), init.io);
+        if (std.mem.eql(u8, arg, "--lifetime-smoke")) return lifetimeSmoke(gpa.allocator(), init.io);
+        if (std.mem.eql(u8, arg, "--multi-smoke")) {
+            try multiSmoke(gpa.allocator(), init.io);
+            return lifetimeSmoke(gpa.allocator(), init.io);
+        }
         if (std.mem.eql(u8, arg, "--native")) config.window.chrome = .native else if (std.mem.eql(u8, arg, "--application-controls")) config.window.chrome = .{ .custom = .{ .controls = .application } } else if (std.mem.eql(u8, arg, "--frameless")) config.window.chrome = .{ .frameless = .{} } else if (std.mem.eql(u8, arg, "--strict")) strict = true else if (std.mem.eql(u8, arg, "--validation")) {
             if (comptime app.build_environment.os == .linux) config.require_gpu_validation = true;
         } else return error.InvalidArgument;

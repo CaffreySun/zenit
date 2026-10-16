@@ -740,6 +740,14 @@ test("Windows procedural noise preserves local value fields, seed, scale, alpha,
   // Film grain is reseeded per encoded frame and a visible grain asks for the
   // next frame itself (the renderer's paint-table scan), so a static scene
   // keeps rendering and the presented grain changes without any input.
+  // The shader uses an 8-bit frame seed: patterns repeat every 256 frames.
+  // The earlier capture precedes dozens of pixel-query RPCs, so comparing it
+  // here can sample the same phase of that cycle even while grain animates.
+  // Take a fresh baseline and prove both captures fit inside one seed period.
+  const animationStart=(await stats()).frame_count;
+  await capture("noise-animation-baseline");
+  const animatedGrain=await region("noise-animation-baseline","noise.film");
+  const opacity=await region("noise-animation-baseline","noise.film-opacity");
   const grainBefore=(await stats()).frame_count;
   // Check autonomous progress rather than a minimum frame rate: Debug builds
   // under x64 emulation can take longer than 300 ms to encode one frame.
@@ -747,11 +755,14 @@ test("Windows procedural noise preserves local value fields, seed, scale, alpha,
   const grainAfter=(await stats()).frame_count;
   assert(grainAfter-grainBefore>=3,`film grain did not drive frames by itself: ${grainBefore} -> ${grainAfter}`);
   await capture("noise-next-frame");
-  const next=await region("noise-next-frame","noise.film"),stable=await region("noise-next-frame","noise.value"),opacity=await region("noise-initial","noise.film-opacity"),opacityNext=await region("noise-next-frame","noise.film-opacity");
+  const animationEnd=(await stats()).frame_count;
+  assert(animationEnd-animationStart<256,`noise capture interval aliases the 256-frame seed period: ${animationStart}->${animationEnd}`);
+  const next=await region("noise-next-frame","noise.film"),stable=await region("noise-next-frame","noise.value"),opacityNext=await region("noise-next-frame","noise.film-opacity");
   const changed=(x:number[],y:number[])=>x.reduce((n,v,i)=>n+(Math.abs(v-y[i])>5?1:0),0)/x.length;
-  assert(changed(grain,next)>.6&&changed(opacity,opacityNext)>.6,"film grain or nested opacity grain froze between rendered frames");
+  console.log(`  noise frame progress=${grainBefore}->${grainAfter}, film changed=${changed(animatedGrain,next).toFixed(3)}, opacity film changed=${changed(opacity,opacityNext).toFixed(3)}`);
+  assert(changed(animatedGrain,next)>.6&&changed(opacity,opacityNext)>.6,"film grain or nested opacity grain froze between rendered frames");
   assert(changed(smooth,stable)===0,"value noise changed between frames");
-  console.log(`  noise: physical roughness=${rough(grain).toFixed(2)}, logical roughness=${rough(smooth).toFixed(2)}, film changed=${changed(grain,next).toFixed(3)}, opacity film changed=${changed(opacity,opacityNext).toFixed(3)}`);
+  console.log(`  noise: physical roughness=${rough(grain).toFixed(2)}, logical roughness=${rough(smooth).toFixed(2)}, film changed=${changed(animatedGrain,next).toFixed(3)}, opacity film changed=${changed(opacity,opacityNext).toFixed(3)}`);
   // Retained hits count per rendered frame: render frames between the two
   // captures (a static scene renders none), with the tree marked dirty so
   // the group's content is re-emitted and must still hit its retained surface.

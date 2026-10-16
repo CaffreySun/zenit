@@ -231,6 +231,13 @@ var g_frame_capture_finished = false;
 pub fn frameCaptureFinished() bool {
     return g_frame_capture_finished;
 }
+pub var screenshot_windows: @import("screenshot_windows.zig").Registry = .{};
+var command_begin: ?*const fn () void = null;
+var command_end: ?*const fn () void = null;
+pub fn setCommandBoundaryCallbacks(begin: ?*const fn () void, end: ?*const fn () void) void {
+    command_begin = begin;
+    command_end = end;
+}
 var g_capture_screenshot_fn: ?CaptureScreenshotFn = null;
 var g_start_recording_fn: ?StartRecordingFn = null;
 var g_recording_status_fn: ?RecordingStateFn = null;
@@ -287,7 +294,10 @@ pub fn setResizeWindowFn(f: ResizeWindowFn) void {
 }
 
 fn getCtx() ?*Cx {
-    if (g_get_ctx_fn) |f| return f();
+    if (g_get_ctx_fn) |f| {
+        const ctx = f() orelse return null;
+        return if (ctx.close_requested) null else ctx;
+    }
     return null;
 }
 
@@ -428,7 +438,13 @@ pub fn drainCommandsRequestFrame(queue: *CommandQueue) bool {
     var request_frame = false;
     while (queue.dequeue()) |cmd| {
         request_frame = commandRequestsFrame(cmd) or request_frame;
-        const handled = executeCommand(queue, cmd);
+        const handled = blk: {
+            // Snapshot paired callbacks: teardown may rebind the surviving window.
+            const end = command_end;
+            if (command_begin) |begin| begin();
+            defer if (end) |finish| finish();
+            break :blk executeCommand(queue, cmd);
+        };
         if (handled) {
             queue.signalDone();
         }
@@ -441,6 +457,7 @@ fn commandRequestsFrame(cmd: TestCommand) bool {
         .window => |command| command != .status and command != .close and command != .minimize,
         // These commands observe state; reset_timing changes measurements only.
         .health,
+        .windows,
         .query_tree,
         .query_selector,
         .get_focused,
@@ -466,6 +483,13 @@ var g_app_route_fn: ?AppRouteFn = null;
 
 pub fn setAppRouteFn(f: AppRouteFn) void {
     g_app_route_fn = f;
+}
+
+fn setScreenshotError(queue: *CommandQueue, code: []const u8) void {
+    var buf: [256]u8 = undefined;
+    const json = std.fmt.bufPrint(&buf, "{{\"error\":\"{s}\",\"code\":\"{s}\"}}", .{ code, code }) catch unreachable;
+    queue.result.setJson(json);
+    queue.result.success = false;
 }
 
 fn executeCommand(queue: *CommandQueue, cmd_in: TestCommand) bool {
@@ -495,7 +519,9 @@ fn executeCommand(queue: *CommandQueue, cmd_in: TestCommand) bool {
                 // exclusive' usually on up, only down carrying means shift-multiselect e2e silently
                 // breaks.
                 for (0..c.count) |_| {
+                    if (ctx.close_requested) break;
                     ctx.handleMouseDown(c.x, c.y, c.modifiers());
+                    if (ctx.close_requested) break;
                     ctx.updateAutomationCursor(c.x, c.y, true);
                     ctx.handleMouseUpEx(c.x, c.y, .left, c.modifiers());
                     ctx.updateAutomationCursor(c.x, c.y, false);
@@ -541,10 +567,12 @@ fn executeCommand(queue: *CommandQueue, cmd_in: TestCommand) bool {
                                 return true;
                             }
                         }
-                        ctx.handleMouseDown(x, y, .{});
-                        ctx.updateAutomationCursor(x, y, true);
-                        ctx.handleMouseUp(x, y);
-                        ctx.updateAutomationCursor(x, y, false);
+                        if (!ctx.close_requested) ctx.handleMouseDown(x, y, .{});
+                        if (!ctx.close_requested) {
+                            ctx.updateAutomationCursor(x, y, true);
+                            ctx.handleMouseUp(x, y);
+                            ctx.updateAutomationCursor(x, y, false);
+                        }
                         var buf: [256]u8 = undefined;
                         const out = std.fmt.bufPrint(&buf, "{{\"ok\":true,\"clicked_x\":{d:.1},\"clicked_y\":{d:.1}}}", .{ x, y }) catch "{\"ok\":true}";
                         queue.result.setJson(out);
@@ -1376,20 +1404,44 @@ fn executeCommand(queue: *CommandQueue, cmd_in: TestCommand) bool {
             }
             return true;
         },
+        .windows => {
+            var buf: [command_queue.RESULT_BUF_SIZE]u8 = undefined;
+            var writer = JsonWriter.init(&buf);
+            screenshot_windows.writeJson(&writer);
+            if (writer.hasOverflowed()) queue.result.setError("window enumeration overflow") else queue.result.setJson(writer.getWritten());
+            return true;
+        },
         .screenshot => |payload| {
             const path = payload.getText();
-            if (g_capture_screenshot_fn) |f| {
-                const ok = f(path);
-                if (ok) {
-                    var buf: [512]u8 = undefined;
-                    const out = std.fmt.bufPrint(&buf, "{{\"ok\":true,\"path\":\"{s}\"}}", .{path}) catch "{\"ok\":true}";
-                    queue.result.setJson(out);
-                } else {
-                    queue.result.setError("screenshot failed");
+            const id: ?[]const u8 = if (payload.window_id) |token| token.getText() else null;
+            // Legacy custom applications without registered windows retain their callback.
+            if (id == null and screenshot_windows.session == null and g_capture_screenshot_fn != null) {
+                if (!g_capture_screenshot_fn.?(path)) {
+                    setScreenshotError(queue, "capture-failed");
+                    return true;
                 }
             } else {
-                queue.result.setError("screenshot not supported");
+                screenshot_windows.capture(id, path) catch |err| {
+                    setScreenshotError(queue, switch (err) {
+                        error.InvalidWindowId => "invalid-window-id",
+                        error.WindowNotFound => "window-not-found",
+                        error.WindowClosing => "window-closing",
+                        error.NoBoundTarget => "no-bound-target",
+                        error.CaptureUnsupported => "capture-unsupported",
+                        error.CaptureFailed => "capture-failed",
+                    });
+                    return true;
+                };
             }
+            var buf: [1024]u8 = undefined;
+            var writer = JsonWriter.init(&buf);
+            writer.beginObject();
+            writer.key("ok");
+            writer.boolean(true);
+            writer.key("path");
+            writer.string(path);
+            writer.endObject();
+            queue.result.setJson(writer.getWritten());
             return true;
         },
         .window => |command| {
@@ -2035,4 +2087,100 @@ test "harness pacing: a consumed batch requests a frame once without a persisten
     queue.tail.store(2, .release);
     try std.testing.expect(drainCommandsRequestFrame(&queue));
     try std.testing.expect(!drainCommandsRequestFrame(&queue));
+}
+
+test "harness command boundary ends before next command including failed commands" {
+    const Boundary = struct {
+        var begins: usize = 0;
+        var ends: usize = 0;
+        var depth: usize = 0;
+        fn begin() void {
+            std.debug.assert(depth == 0 and begins == ends);
+            begins += 1;
+            depth += 1;
+        }
+        fn end() void {
+            std.debug.assert(depth == 1);
+            depth -= 1;
+            ends += 1;
+        }
+    };
+    Boundary.begins = 0;
+    Boundary.ends = 0;
+    Boundary.depth = 0;
+    setCommandBoundaryCallbacks(Boundary.begin, Boundary.end);
+    defer setCommandBoundaryCallbacks(null, null);
+    var queue: CommandQueue = .{ .io = std.testing.io };
+    queue.commands[0] = .{ .health = {} };
+    queue.commands[1] = .{ .app_route = command_queue.AppRoutePayload.init("/missing", "").? };
+    queue.tail.store(2, .release);
+    _ = drainCommandsRequestFrame(&queue);
+    try std.testing.expectEqual(@as(usize, 2), Boundary.begins);
+    try std.testing.expectEqual(Boundary.begins, Boundary.ends);
+    try std.testing.expectEqual(@as(usize, 0), Boundary.depth);
+}
+
+test "harness multi-click stops generating input after callback requests close" {
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    cx.setWindowMetrics(200, 200, 1);
+    const root = try ui.box(cx, .{ .width = .{ .px = 200 }, .height = .{ .px = 200 } }, .{});
+    cx.root = root;
+    const State = struct {
+        cx: *Cx,
+        count: usize = 0,
+        fn click(context: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.count += 1;
+            self.cx.close_requested = true;
+        }
+    };
+    var state: State = .{ .cx = cx };
+    root.behavior.events.on_click = Cx.simpleHandler(State.click, &state);
+    cx.layout();
+    _ = cx.render();
+    const old = g_get_ctx_fn;
+    g_console_test_ctx = cx;
+    setGetCtxFn(getConsoleTestCtx);
+    defer {
+        g_console_test_ctx = null;
+        g_get_ctx_fn = old;
+    }
+    var queue: CommandQueue = .{ .io = std.testing.io };
+    try std.testing.expect(executeCommand(&queue, .{ .click = .{ .x = 10, .y = 10, .count = 3 } }));
+    try std.testing.expectEqual(@as(usize, 1), state.count);
+    try std.testing.expect(getCtx() == null);
+}
+
+test "targeted screenshot executor preserves compatible success and structured errors" {
+    const old = screenshot_windows;
+    defer screenshot_windows = old;
+    screenshot_windows = .{};
+    const Fake = struct {
+        fn closing(_: *anyopaque) bool {
+            return false;
+        }
+        fn capture(_: *anyopaque, _: []const u8) bool {
+            return true;
+        }
+    };
+    var owner: u8 = 0;
+    screenshot_windows.register(123, &owner, 1, Fake.capture, Fake.closing);
+    screenshot_windows.bound = &owner;
+    var queue: CommandQueue = .{ .io = std.testing.io };
+    var payload: command_queue.ScreenshotPayload = .{};
+    const path = "escaped\\path.png";
+    @memcpy(payload.path.buf[0..path.len], path);
+    payload.path.len = path.len;
+    try std.testing.expect(executeCommand(&queue, .{ .screenshot = payload }));
+    try std.testing.expectEqualStrings("{\"ok\":true,\"path\":\"escaped\\\\path.png\"}", queue.result.getData());
+    payload.window_id = .{};
+    const invalid = "7b-999";
+    @memcpy(payload.window_id.?.buf[0..invalid.len], invalid);
+    payload.window_id.?.len = invalid.len;
+    try std.testing.expect(executeCommand(&queue, .{ .screenshot = payload }));
+    try std.testing.expect(!queue.result.success);
+    try std.testing.expectEqualStrings("{\"error\":\"window-not-found\",\"code\":\"window-not-found\"}", queue.result.getData());
+    try std.testing.expect(executeCommand(&queue, .{ .windows = {} }));
+    try std.testing.expect(std.mem.indexOf(u8, queue.result.getData(), "\"window_id\":\"7b-1\"") != null);
 }

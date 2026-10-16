@@ -28,6 +28,7 @@ pub fn Button(
     iconOnly: bool = false,
     loading: bool = false,
     disabled: bool = false,
+    focusRing: ui.FocusRingConfig = .{},
     block: bool = false,
     onClick: ?Handler(void) = null,
     icon: ?u32 = null,
@@ -56,7 +57,7 @@ pub fn Button(
         <row
             style={.{ ui.view.statesBy(shape, S.root), S.fade }}
             focusable={enabled}
-            focusRing
+            focusRing={focusRing}
             a11y={semantics}
             onClick={if (!disabled and !loading) onClick}
             onEvent={events}

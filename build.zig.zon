@@ -266,6 +266,8 @@
         "e2e/windows-shared-resize.test.ts",
         "e2e/windows-shared-sheet-archive.test.ts",
         "e2e/windows-shared-timing.test.ts",
+        "e2e/windows-native-scroll.test.ts",
+        "e2e/multi-window-screenshot.test.ts",
         "e2e/windows-storybook-render.test.ts",
         "e2e/windows-submitted-screenshot.test.ts",
         "e2e/windows-text-input-visual.test.ts",

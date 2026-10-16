@@ -4409,6 +4409,14 @@ fn bindFocus(scope: *Scope, cx: *Cx, node: *Node, props: anytype) !void {
         const R = @TypeOf(props.focus_ring);
         if (R == bool) {
             if (props.focus_ring) try hooks.useFocusRing(scope, cx, node, .{});
+        } else if (comptime isReactiveSource(R)) {
+            const src = sourceOf(hooks.FocusRingConfig, "ui.view .focus_ring", props.focus_ring);
+            try hooks.useFocusRing(scope, cx, node, src.peek());
+            if (!src.isStatic()) try bind_mod.bind(scope, src, .{ .cx = cx, .node = node }, struct {
+                fn apply(c: anytype, config: hooks.FocusRingConfig) void {
+                    hooks.updateFocusRingConfig(c.cx, c.node, config);
+                }
+            }.apply);
         } else try hooks.useFocusRing(scope, cx, node, coerceLiteral(hooks.FocusRingConfig, props.focus_ring));
     }
 }

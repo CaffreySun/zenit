@@ -135,6 +135,9 @@ pub const Scope = struct {
             @panic("Scope.disposeNow: scope 已被释放（double dispose）或内存已损坏");
         }
         if (self.disposed) return;
+        const lifetime_owner = self.owner;
+        lifetime_owner.scope_disposal_depth += 1;
+        defer lifetime_owner.scope_disposal_depth -= 1;
         self.disposed = true;
         self.dispose_pending = false;
         self.deferred_disposal.cancel();

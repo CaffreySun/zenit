@@ -256,6 +256,7 @@ typedef struct ZenitWindow {
     unsigned ime_read, ime_write;
     int ime_active;
     int ime_enabled;
+    int keyboard_isolated;
     HIMC detached_ime_context;
     void (*render_callback)(void *);
     void *render_context;
@@ -961,10 +962,20 @@ int zenit_windows_menu_peek(ZenitWindow *win,uint64_t *command) {
 int zenit_windows_menu_consume(ZenitWindow *win) {
     if(!win||win->menu_read==win->menu_write)return 0;win->menu_read=queue_next(win->menu_read);return 1;
 }
+static int keyboard_message(UINT message) {
+    return (message >= WM_KEYFIRST && message <= WM_KEYLAST) ||
+        (message >= WM_IME_STARTCOMPOSITION && message <= WM_IME_COMPOSITION) ||
+        (message >= WM_IME_SETCONTEXT && message <= WM_IME_KEYUP);
+}
+void zenit_windows_set_keyboard_isolated(ZenitWindow *win, int isolated) {
+    if (win) win->keyboard_isolated = isolated != 0;
+}
+
 // Shared by the message pump and deterministic tests with thread-local key state.
 int zenit_win_menu_translate(void *owner,void *message) {
     ZenitWindow *win=window_owner((HWND)owner);MSG *msg=(MSG *)message;
     if(!win||!msg||msg->hwnd!=win->hwnd||GetWindowThreadProcessId(win->hwnd,NULL)!=GetCurrentThreadId())return 0;
+    if (win->keyboard_isolated && keyboard_message(msg->message)) return 1;
     return win->accelerators?TranslateAcceleratorW(win->hwnd,win->accelerators,msg):0;
 }
 static void dispatch_native_message(MSG *msg) {
@@ -984,6 +995,7 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPAR
         return TRUE;
     }
     if (!win) return DefWindowProcW(hwnd, message, wparam, lparam);
+    if (win->keyboard_isolated && keyboard_message(message)) return 0;
     if (win->chrome_fullscreen && message==WM_NCHITTEST) return HTCLIENT;
     if (win->custom_frame && !win->chrome_hide_controls && (message==WM_NCHITTEST || message==WM_NCMOUSELEAVE)) {
         LRESULT result=0;
@@ -1277,8 +1289,10 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPAR
                 (float)GET_WHEEL_DELTA_WPARAM(wparam) * 40.0f / WHEEL_DELTA);
             return 0;
         case WM_MOUSEHWHEEL:
+            // Win32 positive means scroll right; Zenit deltas describe content
+            // motion, so a rightward viewport scroll must carry negative dx.
             push_wheel(win, hwnd, lparam,
-                (float)GET_WHEEL_DELTA_WPARAM(wparam) * 40.0f / WHEEL_DELTA, 0);
+                -(float)GET_WHEEL_DELTA_WPARAM(wparam) * 40.0f / WHEEL_DELTA, 0);
             return 0;
         case WM_KEYDOWN: case WM_SYSKEYDOWN:
         case WM_KEYUP: case WM_SYSKEYUP:
@@ -2070,6 +2084,17 @@ int zenit_windows_button_pressed(ZenitWindow *win, int button) {
 void zenit_windows_activate(ZenitWindow *win) { if (win && win->hwnd) SetForegroundWindow(win->hwnd); }
 
 #ifdef ZENIT_WINDOW_CONTRACT
+int zenit_windows_contract_keyboard_isolated(HWND hwnd) {
+    ZenitWindow *win = window_owner(hwnd);
+    return win && win->keyboard_isolated;
+}
+/* Owned key seeding bypasses OS translation without executing shortcuts/IME. */
+int zenit_windows_contract_key(HWND hwnd, uint16_t key, uint32_t mods, int pressed) {
+    ZenitWindow *win = window_owner(hwnd);
+    if (!win || GetWindowThreadProcessId(hwnd, NULL) != GetCurrentThreadId()) return 0;
+    push_key(win, key, mods, pressed);
+    return 1;
+}
 /* Gallery-only queue injection: no SetCapture/SetFocus or desktop input. */
 int zenit_windows_contract_press(HWND hwnd, int button, int x, int y) {
     ZenitWindow *win = window_owner(hwnd);

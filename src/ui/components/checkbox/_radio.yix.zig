@@ -50,12 +50,14 @@ const RadioChoiceProps = struct {
     checked: ui.Source(bool),
     disabled: ui.Source(bool),
     on_pick: ?ui.Handler(void) = null,
+    focus_ring: ui.Source(ui.FocusRingConfig) = .{ .value = .{} },
 };
 fn __yix_RadioChoice(__yix_props: RadioChoiceProps, scope: *ui.Scope, cx: *ui.Cx) anyerror!*ui.Node {
     const label = __yix_props.label;
     const checked = __yix_props.checked;
     const disabled = __yix_props.disabled;
     const onPick = __yix_props.on_pick;
+    const focusRing = __yix_props.focus_ring;
     const hovered = try scope.createSignalFor(bool, false);
     const enabled = __yix_d1: {
         const __yix_T = @TypeOf(!disabled.peek());
@@ -63,7 +65,7 @@ fn __yix_RadioChoice(__yix_props: RadioChoiceProps, scope: *ui.Scope, cx: *ui.Cx
             return !__yix_ctx.disabled.get();
         } }.__yix_compute);
     };
-    const __yix_root = try ui.view.render(scope, cx, ui.view.row(.{ .style = S.RadioParts.slot(.root, .{ .disabled = disabled }), .tag = .button, .focusable = enabled, .focus_ring = true, .a11y = .{ .role = .radio, .label = label, .checked = checked, .disabled = disabled }, .on_click = onPick, .on_hover = try ui.on.bind(scope, .{ .hovered = hovered, .__yix_owner = scope.owner, }, struct { fn __yix_run(__yix_ctx: anytype) void { __yix_ctx.__yix_owner.beginBatch(); defer __yix_ctx.__yix_owner.endBatch(); __yix_ctx.hovered.set(true);  } }.__yix_run), .on_leave = try ui.on.bind(scope, .{ .hovered = hovered, .__yix_owner = scope.owner, }, struct { fn __yix_run(__yix_ctx: anytype) void { __yix_ctx.__yix_owner.beginBatch(); defer __yix_ctx.__yix_owner.endBatch(); __yix_ctx.hovered.set(false);  } }.__yix_run), }, .{
+    const __yix_root = try ui.view.render(scope, cx, ui.view.row(.{ .style = S.RadioParts.slot(.root, .{ .disabled = disabled }), .tag = .button, .focusable = enabled, .focus_ring = focusRing, .a11y = .{ .role = .radio, .label = label, .checked = checked, .disabled = disabled }, .on_click = onPick, .on_hover = try ui.on.bind(scope, .{ .hovered = hovered, .__yix_owner = scope.owner, }, struct { fn __yix_run(__yix_ctx: anytype) void { __yix_ctx.__yix_owner.beginBatch(); defer __yix_ctx.__yix_owner.endBatch(); __yix_ctx.hovered.set(true);  } }.__yix_run), .on_leave = try ui.on.bind(scope, .{ .hovered = hovered, .__yix_owner = scope.owner, }, struct { fn __yix_run(__yix_ctx: anytype) void { __yix_ctx.__yix_owner.beginBatch(); defer __yix_ctx.__yix_owner.endBatch(); __yix_ctx.hovered.set(false);  } }.__yix_run), }, .{
             ui.view.box(.{ .style = S.RadioParts.slot(.circle, .{ .checked = checked, .hovered = hovered }), }, .{
                 ui.view.box(.{ .style = S.RadioParts.slot(.dot, .{ .checked = checked }), }, .{ }),
             }),
@@ -92,22 +94,24 @@ pub const RadioGroupProps = struct {
     value: ui.Model(?[]const u8) = .{ .local = null },
     disabled: ui.Source(bool) = .{ .value = false },
     horizontal: ui.Source(bool) = .{ .value = false },
+    focus_ring: ui.Source(ui.FocusRingConfig) = .{ .value = .{} },
     on_change: ?ui.Handler([]const u8) = null,
 };
 fn __yix_RadioGroup(__yix_props: RadioGroupProps, scope: *ui.Scope, cx: *ui.Cx) anyerror!*ui.Node {
     const options = __yix_props.options;
     const disabled = __yix_props.disabled;
     const horizontal = __yix_props.horizontal;
+    const focusRing = __yix_props.focus_ring;
     const onChange = __yix_props.on_change;
     const __yix_model_value = try ui.reactive.resolveModelFor(?[]const u8, scope, __yix_props.value);
     const value = __yix_model_value.read;
     const __yix_root = try ui.view.render(scope, cx, ui.view.box(.{ .style = S.RadioGroupLayout.of(.{ .horizontal = horizontal }), .a11y = .{ .role = .radiogroup, .required = true }, }, .{
-            __yix_e1: { const __yix_items_1 = options; break :__yix_e1 ui.view.eachWith(.{ .value = value, .disabled = disabled, .onChange = onChange, .__yix_model_value = __yix_model_value, }, __yix_items_1, struct { fn __yix_k(opt: ui.view.yixItem(@TypeOf(__yix_items_1))) u64 { return ui.view.keyOf(.{ opt.value, opt.label, opt.disabled }); } }.__yix_k, struct { fn __yix_row(__yix_row_1: anytype, opt: ui.Source(ui.view.yixItem(@TypeOf(__yix_items_1))), __yix_scope_1: *ui.Scope, __yix_cx_1: *ui.Cx) anyerror!*ui.Node { return ui.view.render(__yix_scope_1, __yix_cx_1, ui.view.templateAttrs(.{ .test_id = __yix_d4: {
+            __yix_e1: { const __yix_items_1 = options; break :__yix_e1 ui.view.eachWith(.{ .value = value, .disabled = disabled, .focusRing = focusRing, .onChange = onChange, .__yix_model_value = __yix_model_value, }, __yix_items_1, struct { fn __yix_k(opt: ui.view.yixItem(@TypeOf(__yix_items_1))) u64 { return ui.view.keyOf(.{ opt.value, opt.label, opt.disabled }); } }.__yix_k, struct { fn __yix_row(__yix_row_1: anytype, opt: ui.Source(ui.view.yixItem(@TypeOf(__yix_items_1))), __yix_scope_1: *ui.Scope, __yix_cx_1: *ui.Cx) anyerror!*ui.Node { return ui.view.render(__yix_scope_1, __yix_cx_1, ui.view.templateAttrs(.{ .test_id = __yix_d4: {
         const __yix_T = if (ui.view.attrType(RadioChoice, "test_id")) |__yix_A| __yix_A else @TypeOf(opt.peek().test_id);
         break :__yix_d4 try __yix_scope_1.derive(__yix_T, .{ .opt = opt, }, struct { fn __yix_compute(__yix_ctx: anytype) __yix_T {
             return __yix_ctx.opt.get().test_id;
         } }.__yix_compute);
-    }, }, RadioChoice(.{ .label = __yix_d1: {
+    }, }, RadioChoice(.{ .focus_ring = __yix_row_1.focusRing, .label = __yix_d1: {
         const __yix_T = if (ui.view.attrType(RadioChoice, "label")) |__yix_A| __yix_A else @TypeOf(opt.peek().label);
         break :__yix_d1 try __yix_scope_1.derive(__yix_T, .{ .opt = opt, }, struct { fn __yix_compute(__yix_ctx: anytype) __yix_T {
             return __yix_ctx.opt.get().label;
@@ -129,6 +133,6 @@ fn __yix_RadioGroup(__yix_props: RadioGroupProps, scope: *ui.Scope, cx: *ui.Cx) 
 
 }
 
-//# yix-map-data [[430,425],[2509,1162],[5299,2559]]
+//# yix-map-data [[430,425],[2509,1162],[5417,2608]]
 
 //# yix-map radio.yix

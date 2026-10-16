@@ -152,6 +152,7 @@ pub const App = struct {
         // An owned window appears only once it is owned and placed (attachOwner).
         self.win = try platform.Window.initApplication(config.window.width, config.window.height, config.window.title, config.window.owner != null);
         errdefer self.win.deinit();
+        if (test_harness.enabled) self.win.setKeyboardIsolated(pointer_isolation.keyboardEnabled());
         self.chrome = .{ .initial = try chrome_backend.configure(&self.win, @import("window_config.zig").requestedChrome(config.window), config.window.titlebar_height) };
         try chrome_backend.configureHeader(&self.win, self.chrome.initial, config.window.fullscreen_header, config.window.titlebar_height);
         try chrome_backend.setMinimumSize(&self.win, config.window.min_width, config.window.min_height);
@@ -283,6 +284,7 @@ pub const App = struct {
     }
 
     pub fn deinit(self: *App) void {
+        if (self.cx.hasActiveCalls()) @panic("App.deinit during an active UI call; request window close instead");
         if (self.destroying) return;
         self.destroying = true;
         // Nothing paints once the renderer detaches below.
@@ -295,6 +297,7 @@ pub const App = struct {
         self.win.setTitlebarHitCallback(null, null);
         self.win.setRenderCallback(null, null);
         @import("windows_accessibility.zig").detach(&self.win);
+        test_harness.unregisterScreenshotWindow(self);
         if (test_harness.enabled and g_test_cx == self.cx) g_test_cx = null;
         if (test_harness.enabled and g_test_app == self) g_test_app = null;
         if (g_recording_app == self) {
@@ -462,6 +465,8 @@ pub const App = struct {
     /// Replace the mounted UI at a host safe boundary (outside UI callbacks).
     /// A failed builder leaves an empty wrapper and portal, ready for another remount.
     pub fn remount(self: *App, mount_fn: MountFn) !void {
+        self.cx.beginActiveUse();
+        defer self.cx.endActiveUse();
         self.cx.unmount();
         self.mount(mount_fn) catch |err| {
             // Also reset any builder state before beginning the fallback transaction.
@@ -477,6 +482,8 @@ pub const App = struct {
     }
 
     pub fn mount(self: *App, mount_fn: MountFn) !void {
+        self.cx.beginActiveUse();
+        defer self.cx.endActiveUse();
         if (self.cx.root != null) return error.AlreadyMounted;
         const allocator = self.cx.allocator;
         const app_root = try ui.box(self.cx, .{
@@ -546,6 +553,8 @@ pub const App = struct {
         if (!test_harness.enabled) return;
         g_test_cx = self.cx;
         g_test_app = self;
+        test_harness.registerScreenshotWindow(self.config.io, self, self.windowId(), captureWindowScreenshot, screenshotWindowClosing);
+        test_harness.bindScreenshotWindow(self);
         test_harness.setResizeWindowCallback(resizeWindowForHarness);
         test_harness.setScreenshotCallback(captureScreenshotForHarness);
         test_harness.setFrameStatsCallback(frameStatsForHarness);
@@ -570,6 +579,7 @@ pub const App = struct {
     }
 
     pub fn quit(self: *App) void {
+        self.cx.close_requested = true;
         self.should_quit = true;
     }
 
@@ -589,6 +599,8 @@ pub const App = struct {
     }
 
     pub fn frame(self: *App) !void {
+        self.cx.beginActiveUse();
+        defer self.cx.endActiveUse();
         if (self.native_frame_active) {
             self.native_redraw_pending = true;
             return;
@@ -670,6 +682,8 @@ pub const App = struct {
     }
 
     pub fn processEvent(self: *App, event: system_sdk.events.Event) void {
+        self.cx.beginActiveUse();
+        defer self.cx.endActiveUse();
         self.processEventFrom(.os, event);
     }
 
@@ -693,7 +707,7 @@ pub const App = struct {
         // Harness pointer injection calls Cx directly, so dropping the OS pointer here leaves
         // only the test's own input. Without it, a person using the machine during a background
         // run moves the real cursor over the window and its hover state lands in screenshots.
-        if (pointer_isolation.shouldDropEvent(test_harness.enabled, test_harness.enabled and isolateOsPointer(), source, event)) return;
+        if (pointer_isolation.shouldDropEvent(test_harness.enabled, test_harness.enabled and isolateOsPointer(), test_harness.enabled and pointer_isolation.keyboardEnabled(), source, event)) return;
         // Same IME contract as the macOS runtime: re-sync the native text-input
         // session with the focused node after every event (focus, clicks and
         // key handlers can all move it). The generation filter only drops
@@ -790,14 +804,16 @@ pub const MultiWindowApp = struct {
     shared_gpu: ?*SharedGpu = null,
     windows: std.ArrayList(*App) = .empty,
     lifecycle: window_lifecycle.State = .{},
-    iterating: bool = false,
+    execution_depth: usize = 0,
+    tearing_down: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, config: MultiWindowConfig) MultiWindowApp {
         return .{ .allocator = allocator, .config = config };
     }
 
     pub fn deinit(self: *MultiWindowApp) void {
-        self.iterating = true;
+        if (self.execution_depth != 0 or self.tearing_down or self.hasActiveCalls()) @panic("MultiWindowApp.deinit during an active callback");
+        self.execution_depth += 1;
         while (self.windows.pop()) |app| {
             self.detachOwner(app);
             app.deinit();
@@ -807,7 +823,7 @@ pub const MultiWindowApp = struct {
         self.windows.deinit(self.allocator);
         self.windows = .empty;
         self.lifecycle = .{};
-        self.iterating = false;
+        self.execution_depth -= 1;
     }
 
     pub fn windowCount(self: *const MultiWindowApp) usize {
@@ -864,14 +880,47 @@ pub const MultiWindowApp = struct {
     }
     pub fn closeWindow(self: *MultiWindowApp, id: system_sdk.events.WindowId) bool {
         if (!self.lifecycle.requestClose(id)) return false;
-        if (!self.iterating) self.applyPendingCloses();
+        self.markClosingTree(id);
+        self.applyPendingCloses();
         return true;
     }
+    fn hasActiveCalls(self: *const MultiWindowApp) bool {
+        for (self.windows.items) |app| if (app.cx.hasActiveCalls()) return true;
+        return false;
+    }
+
+    fn markClosingTree(self: *MultiWindowApp, id: system_sdk.events.WindowId) void {
+        if (self.window(id)) |app| app.cx.close_requested = true;
+        for (self.windows.items) |app| {
+            if (app.owner_window == id) self.markClosingTree(app.windowId());
+        }
+    }
+
+    fn beginHarnessCommand() void {
+        if (g_harness_host) |host| host.execution_depth += 1;
+    }
+
+    fn endHarnessCommand() void {
+        if (g_harness_host) |host| {
+            host.execution_depth -= 1;
+            host.applyPendingCloses();
+        }
+    }
+
     fn applyPendingCloses(self: *MultiWindowApp) void {
-        if (self.iterating) return;
-        self.iterating = true;
-        defer self.iterating = false;
-        while (self.lifecycle.popPendingClose()) |id| self.destroyWindowNow(id);
+        for (self.windows.items) |app| {
+            if (app.should_quit) {
+                _ = self.lifecycle.requestClose(app.windowId());
+                self.markClosingTree(app.windowId());
+            }
+        }
+        if (self.execution_depth != 0 or self.tearing_down or self.hasActiveCalls()) return;
+        self.tearing_down = true;
+        defer self.tearing_down = false;
+        while (self.lifecycle.popPendingClose()) |id| {
+            self.markClosingTree(id);
+            self.destroyWindowNow(id);
+        }
     }
     fn destroyWindowNow(self: *MultiWindowApp, id: system_sdk.events.WindowId) void {
         // Owned windows close with their owner, and go first: Win32 destroys
@@ -918,7 +967,9 @@ pub const MultiWindowApp = struct {
     }
     fn ownerFor(self: *MultiWindowApp, config: Config) !?*App {
         const owner_id = config.window.owner orelse return null;
-        return self.window(owner_id) orelse error.UnknownOwnerWindow;
+        const owner = self.window(owner_id) orelse return error.UnknownOwnerWindow;
+        if (owner.cx.close_requested or owner.destroying) return error.OwnerWindowClosing;
+        return owner;
     }
     fn attachOwner(app: *App, owner: ?*App, placement: @import("window_config.zig").Placement) void {
         const target = owner orelse return;
@@ -934,6 +985,7 @@ pub const MultiWindowApp = struct {
         app.owner_window = null;
     }
     pub fn pump(self: *MultiWindowApp, timeout_ms: u32) !bool {
+        if (self.execution_depth != 0 or self.tearing_down or self.hasActiveCalls()) return error.ReentrantWindowLoop;
         if (!self.shouldContinue()) return false;
         // Retire already accepted closes before any potentially blocking native wait.
         for (self.windows.items) |app| {
@@ -943,10 +995,10 @@ pub const MultiWindowApp = struct {
         if (!self.shouldContinue()) return false;
         var maintenance_timeout_ms = timeout_ms;
         for (self.windows.items) |app| maintenance_timeout_ms = app.offscreenMaintenanceTimeoutMs(maintenance_timeout_ms);
-        platform.Window.pumpAppEventsTimeout(maintenance_timeout_ms);
-        self.iterating = true;
+        self.execution_depth += 1;
         {
-            defer self.iterating = false;
+            defer self.execution_depth -= 1;
+            platform.Window.pumpAppEventsTimeout(maintenance_timeout_ms);
             // The native quit flag is process-wide, so every window's pump
             // reports it with a `.quit` event. Ask the application once per
             // pump; a veto withdraws the request and the rest of the batch
@@ -988,14 +1040,16 @@ pub const MultiWindowApp = struct {
         return self.shouldContinue();
     }
     pub fn frame(self: *MultiWindowApp) !void {
-        self.iterating = true;
+        if (self.execution_depth != 0 or self.tearing_down or self.hasActiveCalls()) return error.ReentrantWindowLoop;
+        self.execution_depth += 1;
         {
-            defer self.iterating = false;
+            defer self.execution_depth -= 1;
             for (self.windows.items) |app| try app.frame();
         }
         self.applyPendingCloses();
     }
     pub fn tick(self: *MultiWindowApp) !bool {
+        if (self.execution_depth != 0 or self.tearing_down or self.hasActiveCalls()) return error.ReentrantWindowLoop;
         var timeout = self.config.pump_timeout_ms;
         for (self.windows.items) |app| {
             if (app.cx.wantsFrame()) {
@@ -1004,7 +1058,15 @@ pub const MultiWindowApp = struct {
             }
         }
         if (!try self.pump(timeout)) return false;
-        if (test_harness.enabled) test_harness.drainCommands();
+        if (test_harness.enabled) {
+            g_harness_host = self;
+            test_harness.setCommandBoundaryCallbacks(beginHarnessCommand, endHarnessCommand);
+            defer {
+                test_harness.setCommandBoundaryCallbacks(null, null);
+                g_harness_host = null;
+            }
+            test_harness.drainCommands();
+        }
         if (!self.shouldContinue()) return false;
         try self.frame();
         return self.shouldContinue();
@@ -1036,6 +1098,7 @@ pub const MultiWindowApp = struct {
     }
 };
 
+var g_harness_host: ?*MultiWindowApp = null;
 var g_test_cx: ?*ui.Cx = null;
 var g_test_app: ?*App = null;
 var g_recording_app: ?*App = null;
@@ -1103,6 +1166,18 @@ fn frameStatsForHarness() test_harness.FrameStatsSnapshot {
             else => false,
         },
     };
+}
+
+fn screenshotWindowClosing(owner: *anyopaque) bool {
+    const app: *App = @ptrCast(@alignCast(owner));
+    return app.destroying or app.cx.close_requested or app.should_quit;
+}
+fn captureWindowScreenshot(owner: *anyopaque, path: []const u8) bool {
+    const app: *App = @ptrCast(@alignCast(owner));
+    app.cx.beginActiveUse();
+    defer app.cx.endActiveUse();
+    if (!std.mem.endsWith(u8, path, ".bmp")) return false;
+    return app.painter.captureBmp(path) catch false;
 }
 
 fn captureScreenshotForHarness(path: []const u8) bool {

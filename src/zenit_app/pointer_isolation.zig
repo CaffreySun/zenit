@@ -171,12 +171,12 @@ test "keyboard isolation never drops pointer events and vice versa" {
 /// The default App path handles OS input. Only a test-mode caller that owns
 /// the seeded queue may explicitly mark input as a contract injection.
 pub const Source = enum { os, test_contract };
-pub fn shouldDropEvent(comptime test_mode: bool, isolated: bool, comptime source: Source, event: system_sdk.events.Event) bool {
+pub fn shouldDropEvent(comptime test_mode: bool, isolated: bool, keyboard_isolated: bool, comptime source: Source, event: system_sdk.events.Event) bool {
     if (source == .test_contract) {
         if (!test_mode) @compileError("owned contract input requires a test-mode build");
         return false;
     }
-    return isolated and isOsPointerEvent(event);
+    return (isolated and isOsPointerEvent(event)) or (keyboard_isolated and isOsKeyboardEvent(event));
 }
 
 test "background isolation preserves owned contract input while dropping real OS pointer input" {
@@ -201,11 +201,11 @@ test "background isolation preserves owned contract input while dropping real OS
         .y = 10,
     } };
     for ([_]system_sdk.events.Event{ cancel, down, move }) |event| {
-        try std.testing.expect(shouldDropEvent(true, true, .os, event));
-        try std.testing.expect(!shouldDropEvent(true, true, .test_contract, event));
-        try std.testing.expect(!shouldDropEvent(true, false, .os, event));
+        try std.testing.expect(shouldDropEvent(true, true, false, .os, event));
+        try std.testing.expect(!shouldDropEvent(true, true, false, .test_contract, event));
+        try std.testing.expect(!shouldDropEvent(true, false, false, .os, event));
         // Production input still follows the OS path; contract source fails to compile.
-        try std.testing.expect(shouldDropEvent(false, true, .os, event));
+        try std.testing.expect(shouldDropEvent(false, true, false, .os, event));
     }
 }
 
@@ -223,4 +223,17 @@ test "keyboard isolation suppresses frames for every keyboard event only" {
     };
     try std.testing.expect(requestsFrame(true, true, &mixed));
     try std.testing.expect(!requestsFrame(true, true, &.{}));
+}
+
+// Windows gallery contracts seed the SDK queue rather than calling Cx directly.
+// Their keyboard and IME packets must survive the same opt-in OS filter.
+test "keyboard isolation preserves owned contract input across every event kind" {
+    const E = system_sdk.events.Event;
+    inline for (@import("zenit_reflection").fields(E)) |field| {
+        const event = @unionInit(E, field.name, std.mem.zeroes(field.type));
+        try std.testing.expectEqual(isOsKeyboardEvent(event), shouldDropEvent(true, false, true, .os, event));
+        try std.testing.expect(!shouldDropEvent(true, true, true, .test_contract, event));
+        try std.testing.expect(!shouldDropEvent(false, false, false, .os, event));
+        try std.testing.expectEqual(isOsPointerEvent(event) or isOsKeyboardEvent(event), shouldDropEvent(true, true, true, .os, event));
+    }
 }

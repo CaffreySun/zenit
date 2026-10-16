@@ -624,3 +624,40 @@ test "Modal: split open — ✕ and Esc are proposals the parent can reject" {
     try std.testing.expect(!open.peek());
     try std.testing.expect(ctx.overlay_stack.anyExiting()); // settle then open effect drive exit
 }
+
+test "Modal: composition Escape reaches Input and Textarea before overlay dismissal" {
+    const input_mod = @import("../input/mod.zig");
+    inline for (.{ false, true }) |multiline| {
+        const ctx = try Cx.init(std.testing.allocator, std.testing.io);
+        defer ctx.deinit();
+        ctx.root = try box(ctx, .{ .width = .{ .px = 800 }, .height = .{ .px = 600 } }, .{});
+        ctx.setViewport(800, 600);
+        const scope = try Scope.init(std.testing.allocator, null, ctx.owner);
+        defer scope.dispose();
+        const visible = try scope.createSignal(bool, false);
+        const modal = try Modal(.{ .open = visible, .enter_transition = .none, .exit_transition = .none }).mount(scope, ctx);
+        if (!modal.portaled) try ctx.root.?.appendChild(std.testing.allocator, modal.overlay);
+        const field = if (multiline) blk: {
+            const mounted = try input_mod.Textarea(.{ .value = "draft" }).mountResult(scope, ctx);
+            try modal.body.appendChild(std.testing.allocator, mounted.wrapper);
+            break :blk mounted.input;
+        } else blk: {
+            const mounted = try input_mod.Input(.{ .value = "draft" }).mountResult(scope, ctx);
+            try modal.body.appendChild(std.testing.allocator, mounted.node);
+            break :blk mounted.input_container;
+        };
+        visible.set(true);
+        ctx.layout();
+        ctx.setFocus(field);
+        try std.testing.expect(ctx.isFocused(field));
+        ctx.handleImePreedit("候", 3);
+        const client = field.behavior.interaction.text_input_client.?;
+        try std.testing.expect(client.is_composing.?(client.context));
+        ctx.handleKeyDown(.escape, .{});
+        try std.testing.expect(visible.peek());
+        try std.testing.expect(!client.is_composing.?(client.context));
+        try std.testing.expect(ctx.isFocused(field));
+        ctx.handleKeyDown(.escape, .{});
+        try std.testing.expect(!visible.peek());
+    }
+}

@@ -27,6 +27,7 @@ pub const ReusedAllocator = struct {
     pub fn beforeReuse(self: *@This(), io: std.Io) !void {
         const background = zenit_windows_contract_background(1);
         defer _ = zenit_windows_contract_background(background);
+        try @import("windows_window_contract.zig").runInitialGeometry();
         const before = Window.liveWindowCount();
         const foreground = GetForegroundWindow();
         if (App.init(self.allocator(), .{ .io = io, .font = .{ .small_size = 0 } })) |unexpected| {

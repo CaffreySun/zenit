@@ -243,6 +243,14 @@ fn shadowBox(cx: *ui.Cx, parent: *ui.Node, id: []const u8, shadow: ?ui.Shadow) !
     return node;
 }
 
+fn scrollFixture(cx: *ui.Cx, scope: *ui.Scope, fixture: *ui.Node) !*ui.Node {
+    const area = try ui.widgets.ScrollArea(.{ .rubber_band_y = false }).mount(scope, cx);
+    fixture.setDisplay(.flex);
+    try area.content.appendChild(cx.allocator, fixture);
+    area.container.setDisplay(.none);
+    return area.container;
+}
+
 fn mount(cx: *ui.Cx, scope: *ui.Scope) anyerror!*ui.Node {
     const menu_ok = ok: {
         menu_contract.run(app) catch |err| {
@@ -381,7 +389,7 @@ fn mount(cx: *ui.Cx, scope: *ui.Scope) anyerror!*ui.Node {
     try clipboard_row.appendChild(cx.allocator, icons_button);
     icon_gallery = try path_contract.mountIcons(cx);
     try root.appendChild(cx.allocator, icon_gallery);
-    path_gallery = try path_contract.mount(cx);
+    path_gallery = try scrollFixture(cx, scope, try path_contract.mount(cx));
     try root.appendChild(cx.allocator, path_gallery);
     blend_gallery = try blend_contract.mount(cx);
     try root.appendChild(cx.allocator, blend_gallery);
@@ -444,7 +452,7 @@ fn mount(cx: *ui.Cx, scope: *ui.Scope) anyerror!*ui.Node {
     try root.appendChild(cx.allocator, dialog_gallery);
     noise_gallery = try noise_contract.mount(cx, scope);
     try root.appendChild(cx.allocator, noise_gallery);
-    gradient_gallery = try gradient_contract.mount(cx);
+    gradient_gallery = try scrollFixture(cx, scope, try gradient_contract.mount(cx));
     try root.appendChild(cx.allocator, gradient_gallery);
     try retained_contract.mount(app, cx, scope);
     return root;

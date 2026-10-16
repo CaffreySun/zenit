@@ -6,6 +6,7 @@ const std = @import("std");
 const display_list_mod = @import("../display_list.zig");
 const text_blob_mod = @import("../text_blob.zig");
 const scene_runtime_mod = @import("../scene_runtime.zig");
+const id_hash = @import("../id_hash.zig");
 const property_tree_mod = @import("../property_tree.zig");
 const layer_tree_mod = @import("../layer_tree.zig");
 const hit_runtime_mod = @import("../hit_runtime.zig");
@@ -50,7 +51,7 @@ pub const RenderContext = struct {
     /// Nodes whose subtree-payload cache crosses a disable_render_cache
     /// boundary, either as an ancestor or a descendant. Built once per
     /// prebuild pass so cache eligibility stays O(1) per node.
-    render_cache_boundary_blocked: ?*const std.AutoHashMapUnmanaged(u32, void) = null,
+    render_cache_boundary_blocked: ?*const id_hash.U32HashMapUnmanaged(void) = null,
     /// Node external clip rects table (node.id -> viewport-space rect; see Cx.external_clip_rects).
     /// null = host did not enable this capability (DevTools etc. sidecar construction ignores).
     external_clip_rects: ?*const std.AutoHashMapUnmanaged(u32, [4]f32) = null,

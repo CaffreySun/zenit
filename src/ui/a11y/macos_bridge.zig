@@ -91,9 +91,46 @@ pub const MAX_WINDOWS = 16;
 const Slot = struct {
     window_id: u32,
     ctx: ActiveContext,
+    demand: ?ProjectionDemand = null,
 };
 
 var g_active: [MAX_WINDOWS]?Slot = @splat(null);
+
+/// Lazy projection (Chrome-style "accessibility mode on first client"): a host
+/// that skips per-frame projection until an assistive client shows up registers
+/// a demand handler. The first query for its window runs the handler
+/// synchronously, so the client never reads an unprojected tree; after that
+/// `clientsSeen()` stays true and the host projects every frame again.
+pub const ProjectionDemand = struct {
+    ctx: *anyopaque,
+    project: *const fn (ctx: *anyopaque) void,
+};
+
+/// Set by every NSAccessibility query. Never cleared: clients come and go
+/// (VoiceOver, Accessibility Inspector, automation) and a dropped projection
+/// would leave the next one reading stale geometry.
+var g_clients_seen: bool = false;
+
+pub fn clientsSeen() bool {
+    return g_clients_seen;
+}
+
+/// Register (or clear, with null) the demand handler for a window. The slot
+/// must already exist: hosts call this right after `setActiveContext*`.
+pub fn setProjectionDemand(window_id: u32, demand: ?ProjectionDemand) void {
+    for (&g_active) |*maybe| {
+        if (maybe.*) |*slot| {
+            if (slot.window_id == window_id) {
+                slot.demand = demand;
+                return;
+            }
+        }
+    }
+}
+
+pub fn resetClientsSeenForTesting() void {
+    g_clients_seen = false;
+}
 
 pub const TextInputAppliedHook = *const fn (window_id: u32, start_utf16: u64, end_utf16: u64, start_utf8: u32, end_utf8: u32) callconv(.c) c_int;
 var g_text_input_applied_hook: ?TextInputAppliedHook = null;
@@ -177,16 +214,21 @@ pub const ANY_WINDOW: u32 = 0;
 pub const INVALID_HANDLE: u64 = AXId.NULL.raw();
 
 fn lookup(window_id: u32) ?ActiveContext {
-    if (window_id == ANY_WINDOW) {
-        for (g_active) |maybe| {
-            if (maybe) |slot| return slot.ctx;
-        }
-        return null;
+    g_clients_seen = true;
+    const idx = slotIndex(window_id) orelse return null;
+    if (g_active[idx].?.demand) |demand| {
+        // Projection re-registers this window in place (same index), so read
+        // the slot again afterwards rather than holding a copy across it.
+        demand.project(demand.ctx);
     }
-    for (g_active) |maybe| {
-        if (maybe) |slot| {
-            if (slot.window_id == window_id) return slot.ctx;
-        }
+    const slot = g_active[idx] orelse return null;
+    return slot.ctx;
+}
+
+fn slotIndex(window_id: u32) ?usize {
+    for (g_active, 0..) |maybe, i| {
+        const slot = maybe orelse continue;
+        if (window_id == ANY_WINDOW or slot.window_id == window_id) return i;
     }
     return null;
 }
@@ -279,7 +321,12 @@ pub fn setActiveContextWithFullInteractions(
     for (&g_active, 0..) |*maybe, i| {
         if (maybe.*) |slot| {
             if (slot.window_id == window_id) {
-                maybe.* = .{ .window_id = window_id, .ctx = ctx };
+                // Hosts re-register every frame: keep the projection demand, but
+                // only for the same owner. Another Cx taking over this window id
+                // must not inherit a handler pointing at the old one, which can
+                // be freed while the slot stays registered to the new owner.
+                const demand = if (slot.demand) |d| (if (d.ctx == ctx.label_ctx) d else null) else null;
+                maybe.* = .{ .window_id = window_id, .ctx = ctx, .demand = demand };
                 return true;
             }
         } else if (free_idx == null) {
@@ -313,10 +360,13 @@ pub fn clearActiveContext(window_id: u32) void {
 /// registrations merely because the numeric window id happens to match.
 pub fn clearActiveContextForOwner(window_id: u32, owner: *anyopaque) void {
     var removed = false;
-    for (&g_active) |*maybe| if (maybe.*) |slot| {
+    for (&g_active) |*maybe| if (maybe.*) |*slot| {
         if (slot.window_id == window_id and slot.ctx.label_ctx == owner) {
             maybe.* = null;
             removed = true;
+        } else if (slot.demand) |d| {
+            // Belt and braces: never leave a demand handler to a freed owner.
+            if (d.ctx == owner) slot.demand = null;
         }
     };
     if (removed) {

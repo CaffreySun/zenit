@@ -29,7 +29,7 @@ fn clipping(x: usize, y: usize, clip_case: usize) f64 {
     if (clip_case >= 3) cover *= reference.polygonCoverage(x, y, clip_case == 4);
     return cover;
 }
-fn render(context: *r.Context, pipeline: *const d12.RenderPipeline, target: *const r.Texture, mask: *const r.Texture, color: *const r.Texture, sampler: *const d12.Sampler, uniform: reference.Uniforms, data: []const u8, stride: usize) !void {
+fn render(context: *r.Context, pipeline: *const d12.RenderPipeline, target: *const r.Texture, mask: *const r.Texture, color: *const r.Texture, sampler: *const d12.Sampler, uniform: reference.Uniforms, data: []const u8, stride: usize, clear: [4]f64) !void {
     var buffer = try context.createBuffer(a, .{ .size = stride * 2 + data.len, .usage = .{ .vertex = true, .map_write = true } });
     defer buffer.destroy();
     const mapped = try buffer.getMappedRange(0, buffer.size);
@@ -41,12 +41,18 @@ fn render(context: *r.Context, pipeline: *const d12.RenderPipeline, target: *con
     defer encoder.deinit();
     var view = target.binding().createView();
     defer view.destroy();
-    var pass = try encoder.beginRenderPass(.{ .color_attachments = &.{.{ .view = view, .load_op = .clear, .store_op = .store, .clear_value = .TRANSPARENT }} });
+    var pass = try encoder.beginRenderPass(.{ .color_attachments = &.{.{ .view = view, .load_op = .clear, .store_op = .store, .clear_value = .{ .r = @floatCast(clear[0]), .g = @floatCast(clear[1]), .b = @floatCast(clear[2]), .a = @floatCast(clear[3]) } }} });
     pass.setPipeline(pipeline);
     pass.setVertexBuffer(1, &buffer, stride);
     pass.setFragmentBuffer(1, &buffer, stride);
-    try pass.setVertexBytesChecked(0, std.mem.asBytes(&uniform));
-    try pass.setFragmentBytesChecked(0, std.mem.asBytes(&uniform));
+    const text_uniform = extern struct {
+        base: reference.Uniforms,
+        gamma: [4]f32 = @splat(0),
+        settings: [4]f32 = @splat(0),
+    }{ .base = uniform };
+    const bytes = if (stride == 80) std.mem.asBytes(&text_uniform) else std.mem.asBytes(&uniform);
+    try pass.setVertexBytesChecked(0, bytes);
+    try pass.setFragmentBytesChecked(0, bytes);
     pass.setFragmentTexture(0, mask);
     pass.setFragmentTexture(1, color);
     pass.setFragmentSampler(0, sampler);
@@ -101,7 +107,7 @@ pub fn run() !void {
         if (try pipeline.bufferStride(0, 1) != 64) return error.IncorrectIconStride;
         for ([_]f32{ 1, 2 }) |scale| for ([_]f32{ 0, 0.35, 1 }) |opacity| for (0..2) |rotate| for (0..5) |clip_case| {
             const instance = Icon{ .rect = .{ 0, 0, 8 / scale, 8 / scale }, .radius = 1.3 / scale, .opacity = opacity, .rotate = if (rotate == 0) 0 else std.math.pi / 2.0, .clip = if (clip_case == 0) .{ 0, 0, -1, -1 } else .{ 0.5 / scale, 0.5 / scale, 7 / scale, 7 / scale } };
-            try render(context, &pipeline, &target, &mask, &color, &sampler, uniformsFor(scale, clip_case), std.mem.asBytes(&instance), 64);
+            try render(context, &pipeline, &target, &mask, &color, &sampler, uniformsFor(scale, clip_case), std.mem.asBytes(&instance), 64, @splat(0));
             try target.readBgra8(8, 8, &output, 32);
             for (0..8) |y| for (0..8) |x| {
                 const tx = if (rotate == 0) x / 2 else y / 2;
@@ -123,12 +129,12 @@ pub fn run() !void {
         defer vs.deinit();
         var ps = try module.getFunction("text_fragment_main");
         defer ps.deinit();
-        var pipeline = try p.createRenderPipeline(&device, .{ .vertex_function = &vs, .fragment_function = &ps, .color_attachment_formats = &.{.bgra8_unorm} });
+        var pipeline = try p.createRenderPipeline(&device, .{ .vertex_function = &vs, .fragment_function = &ps, .color_attachment_formats = &.{.bgra8_unorm}, .blend_state = .{}, .dual_source_blending = true });
         defer pipeline.deinit();
         if (try pipeline.bufferStride(0, 1) != 80) return error.IncorrectTextStride;
         for ([_]f32{ 1, 2 }) |scale| for (0..2) |is_color| for (0..2) |snap| for (0..2) |skew| for (0..5) |clip_case| {
             const instance = Glyph{ .position = .{ 0.26 / scale, 0.26 / scale }, .size = .{ 7.6 / scale, 7.6 / scale }, .clip = if (clip_case == 0) .{ 0, 0, -1, -1 } else .{ 0.5 / scale, 0.5 / scale, 7 / scale, 7 / scale }, .skew = if (skew == 0) 0 else 0.8 / scale, .is_color = @floatFromInt(is_color), .snap = @floatFromInt(snap) };
-            try render(context, &pipeline, &target, &mask, &color, &sampler, uniformsFor(scale, clip_case), std.mem.asBytes(&instance), 80);
+            try render(context, &pipeline, &target, &mask, &color, &sampler, uniformsFor(scale, clip_case), std.mem.asBytes(&instance), 80, @splat(0));
             try target.readBgra8(8, 8, &output, 32);
             for (0..8) |y| for (0..8) |x| {
                 const base: f64 = if (snap == 1) 0 else 0.26;
@@ -150,6 +156,20 @@ pub fn run() !void {
             };
             text_draws += 1;
         };
+        const lcd = Glyph{ .position = .{ 0, 0 }, .size = .{ 8, 8 }, .uv = .{ 0, 0, 1, 1 }, .clip = .{ 0, 0, -1, -1 }, .skew = 0, .is_color = 2, .snap = 1 };
+        const backdrop: [4]f64 = .{ 0.8, 0.6, 0.4, 1 };
+        try render(context, &pipeline, &target, &color, &color, &sampler, uniformsFor(1, 0), std.mem.asBytes(&lcd), 80, backdrop);
+        try target.readBgra8(8, 8, &output, 32);
+        for (0..8) |y| for (0..8) |x| {
+            const texel = ((y / 2) * 4 + x / 2) * 4;
+            var expected: [4]f64 = .{ 0, 0, 0, 1 };
+            for (0..3) |ch| {
+                const alpha = @as(f64, @floatFromInt(color_bytes[texel + ch])) / 255 * lcd.color[3];
+                expected[ch] = lcd.color[2 - ch] * alpha + backdrop[2 - ch] * (1 - alpha);
+            }
+            try check(output[(y * 8 + x) * 4 ..][0..4], expected, x, y, "LCD dual source WARP", 0);
+        };
+        std.debug.print("PASS: WARP production HLSL LCD independent RGB weights over opaque destination: 64 pixel readbacks\n", .{});
     }
     for (0..64) |i| std.mem.swap(u8, &output[i * 4], &output[i * 4 + 2]);
     std.debug.print("RENDERER_TEXT_RGBA8_HEX={s}\nPASS: production HLSL text, {d} draws/{d} CPU-reference pixels (byte tolerance2), R8 grayscale/BGRA color glyph, no color-glyph RGB tint, stride80, snap/continuous position, skew, atlas UV subrect, scale/clips and nonzero instance/buffer offsets\n", .{ std.fmt.bytesToHex(output, .lower), text_draws, text_draws * 64 });

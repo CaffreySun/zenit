@@ -63,6 +63,7 @@ pub const RenderPipelineDescriptor = struct {
     sample_count: u32 = 1,
     vertex_buffers: []const VertexBufferLayoutDescriptor = &.{},
     blend_state: ?BlendState = null,
+    dual_source_blending: bool = false,
 };
 fn blendFactor(factor: BlendFactor) !gpu.BlendFactor {
     return switch (factor) {
@@ -157,5 +158,5 @@ pub fn createRenderPipeline(device: *d12.Device, desc: RenderPipelineDescriptor)
     var blend: ?gpu.BlendState = null;
     if (desc.blend_state) |b| blend = .{ .color = .{ .src_factor = try blendFactor(b.source_rgb), .dst_factor = try blendFactor(b.destination_rgb), .operation = b.rgb_operation }, .alpha = .{ .src_factor = try blendFactor(b.source_alpha), .dst_factor = try blendFactor(b.destination_alpha), .operation = b.alpha_operation } };
     for (desc.color_attachment_formats, targets) |format, *target| target.* = .{ .format = format, .blend = blend };
-    return device.createRenderPipeline(.{ .vertex_function = vertex, .fragment_function = fragment, .layout = &layout, .vertex_buffers = vertices, .targets = targets, .multisample = .{ .count = desc.sample_count }, .depth_stencil = if (desc.depth_attachment_format) |format| .{ .format = format, .depth_write_enabled = false, .depth_compare = .always } else null });
+    return device.createRenderPipeline(.{ .vertex_function = vertex, .fragment_function = fragment, .dual_source_blending = desc.dual_source_blending, .layout = &layout, .vertex_buffers = vertices, .targets = targets, .multisample = .{ .count = desc.sample_count }, .depth_stencil = if (desc.depth_attachment_format) |format| .{ .format = format, .depth_write_enabled = false, .depth_compare = .always } else null });
 }

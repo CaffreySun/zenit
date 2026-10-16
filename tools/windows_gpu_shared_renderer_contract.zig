@@ -27,13 +27,17 @@ pub fn run(io: std.Io) !void {
     var sdf = try render.SdfRenderer.init(a, &dq.device);
     var sdf_live = true;
     defer if (sdf_live) sdf.deinit();
-    var image = try render.ImageRenderer.init(a, &dq.device);
+    const image = try a.create(render.ImageRenderer);
+    defer a.destroy(image);
+    try image.init(a, &dq.device);
     defer image.deinit();
     var path = try render.PathRenderer.init(a, &dq.device);
     defer path.deinit();
     var text = try render.TextRenderer.init(a, &dq.device);
     defer text.deinit();
-    var icon = try render.IconRenderer.init(a, &dq.device);
+    const icon = try a.create(render.IconRenderer);
+    defer a.destroy(icon);
+    try icon.init(a, &dq.device);
     defer icon.deinit();
     var target = try dq.device.createTexture(a, .{ .size = .{ .width = 8, .height = 4 }, .format = gpu.color_format, .usage = .{ .render_attachment = true, .copy_src = true } });
     defer target.destroy();
@@ -583,7 +587,9 @@ fn checkUniformOverflow(a: std.mem.Allocator, device: *gpu.Backend.Device, queue
 }
 
 fn profileImageMaskSpecialization(a: std.mem.Allocator, device: *gpu.Backend.Device, queue: *gpu.Backend.Queue) !void {
-    var renderer = try render.ImageRenderer.init(a, device);
+    const renderer = try a.create(render.ImageRenderer);
+    defer a.destroy(renderer);
+    try renderer.init(a, device);
     defer renderer.deinit();
     var texels: [64 * 64 * 4]u8 = undefined;
     for (0..64 * 64) |i| {

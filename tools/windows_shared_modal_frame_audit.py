@@ -39,6 +39,22 @@ def find(node, test_id):
             return found
     return None
 
+def validate_viewport(meta, tree):
+    viewport = tree.get('rect')
+    if not viewport or (round(viewport['w']*meta['scale']) != meta['width'] or
+                        round(viewport['h']*meta['scale']) != meta['height']):
+        raise ValueError('layout viewport/drawable mismatch')
+    geometry = meta.get('frame_work_area')
+    if geometry is None:
+        raise ValueError('missing native frame/work area')
+    if geometry is not None:
+        if len(geometry) != 10 or not all(math.isfinite(v) for v in geometry):
+            raise ValueError('invalid native frame/work area')
+        x,y,w,h,_,_,wx,wy,ww,wh = geometry
+        if min(w,h,ww,wh) <= 0 or x < wx or y < wy or x+w > wx+ww or y+h > wy+wh:
+            raise ValueError('window frame outside monitor work area')
+
+
 def audit(folder, desktop=False):
     log = (folder / 'windows-e2e-stderr.log').read_text()
     desktop_records = {}
@@ -86,6 +102,7 @@ def audit(folder, desktop=False):
             width, height, _ = bitmap(archive.read(meta['image']))
             if (width, height) != (meta['width'], meta['height']) or not math.isfinite(meta['scale']) or meta['scale'] <= 0:
                 raise ValueError('invalid frame dimensions/scale')
+            validate_viewport(meta, tree)
             windows.setdefault(meta['window_id'], []).append(meta)
             node = find(tree, 'story.modal.dialog')
             if node is not None:
@@ -113,7 +130,11 @@ def audit(folder, desktop=False):
         _, _, baseline = bitmap(archive.read(records[0][0]['image']))
         rect = sn['rect']
         left, top, right, bottom = rect['x'], rect['y'], rect['x'] + rect['w'], rect['y'] + rect['h']
-        ref_bg = reference(round(900 * scale), round(700 * scale))
+        bx = round((right+(rw/scale-right)/2)*scale)
+        by = round((bottom+(rh/scale-bottom)/2)*scale)
+        if not (0 <= bx < rw and 0 <= by < rh) or min(bx/scale-right, by/scale-bottom) < 64:
+            raise ValueError('no clear backdrop sample outside dialog shadow')
+        ref_bg = reference(bx, by)
         bounds = (max(0, math.ceil((left - 64) * scale)), max(0, math.ceil((top - 64) * scale)),
                   min(rw, math.floor((right + 64) * scale)), min(rh, math.floor((bottom + 64) * scale)))
         results = []
@@ -130,7 +151,7 @@ def audit(folder, desktop=False):
                 visible = desktop_records[meta['index']][0]
                 vx, vy, vw, vh = visible
                 if not (vx <= bounds[0] and vy <= bounds[1] and vx + vw >= bounds[2] and vy + vh >= bounds[3]
-                        and vx <= round(900 * scale) < vx + vw and vy <= round(700 * scale) < vy + vh):
+                        and vx <= bx < vx + vw and vy <= by < vy + vh):
                     raise ValueError('desktop visible region does not cover the Modal audit')
             alpha = node['effective_opacity']
             if 0 < alpha < .999:
@@ -143,7 +164,7 @@ def audit(folder, desktop=False):
             # The fixture uses fade only. Fail rather than compare an unmodeled transform.
             if alpha > 0 and any(abs(current[k] - rect[k]) > .02 for k in ('x', 'y', 'w', 'h')):
                 raise ValueError('Modal moved/scaled; this fixture audit requires stable geometry')
-            bg = pixel(round(900 * scale), round(700 * scale))
+            bg = pixel(bx, by)
             if min(bg) < 90:
                 raise ValueError('Modal backdrop became black')
             interior_error = 0.

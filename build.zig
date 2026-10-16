@@ -9,6 +9,45 @@ const linux_native_revision_flag = blk: {
         @embedFile("native/linux/vulkan_device.h") ++ @embedFile("native/linux/png.inc") ++
         @embedFile("native/linux/text_layout.h") ++ @embedFile("native/linux/opengl_device.h") ++ @embedFile("native/linux/opengl_resources.inc") ++ @embedFile("native/linux/opengl_pipeline.inc"))});
 };
+// Hash local native include contents explicitly. Enumerate macOS includes and
+// shared headers in native/, so newly added bridge includes cannot silently
+// reuse an old native object. Stable path order avoids filesystem-order churn.
+fn macosNativeFlags(owner: *std.Build, source: *std.Build) []const []const u8 {
+    // Zig 0.17 caches configuration separately from compiler dependency
+    // manifests. Register both file contents and directory entries: raw IO
+    // alone would reuse stale flags, including when a new header is added.
+    owner.dependOnDirectoryContents(source.path("native"));
+    owner.dependOnDirectoryContents(source.path("native/macos"));
+    var dir = source.root.openDir(owner.graph.io, "native", .{ .iterate = true }) catch @panic("open native includes");
+    defer dir.close(owner.graph.io);
+    var walker = dir.walk(owner.allocator) catch @panic("walk native includes");
+    defer walker.deinit();
+    var paths: std.ArrayList([]const u8) = .empty;
+    while (walker.next(owner.graph.io) catch @panic("enumerate native includes")) |entry| {
+        if (entry.kind == .directory and std.mem.startsWith(u8, entry.path, "macos/")) {
+            owner.dependOnDirectoryContents(source.path(source.pathJoin(&.{ "native", entry.path })));
+        }
+        if (entry.kind != .file) continue;
+        if (!std.mem.startsWith(u8, entry.path, "macos/") and std.mem.indexOfScalar(u8, entry.path, '/') != null) continue;
+        if (!std.mem.endsWith(u8, entry.basename, ".inc") and !std.mem.endsWith(u8, entry.basename, ".h")) continue;
+        paths.append(owner.allocator, owner.dupe(entry.path)) catch @panic("native include paths");
+    }
+    std.mem.sort([]const u8, paths.items, {}, struct {
+        fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lessThan);
+    var digest = std.hash.Wyhash.init(0);
+    for (paths.items) |path| {
+        owner.dependOnFileContents(source.path(source.pathJoin(&.{ "native", path })));
+        const bytes = dir.readFileAlloc(owner.graph.io, path, owner.allocator, .limited(16 * 1024 * 1024)) catch @panic("read native include");
+        digest.update(path);
+        digest.update("\x00");
+        digest.update(bytes);
+        digest.update("\x00");
+    }
+    return owner.allocator.dupe([]const u8, &.{ "-fobjc-arc", owner.fmt("-DZENIT_MACOS_RENDER_REV=0x{x}ULL", .{digest.final()}) }) catch @panic("macOS native flags");
+}
 const macos_bundle = @import("src/system_sdk/bundle/macos_app.zig");
 
 // Zig's x86 PE linker defaults to a 2 GiB process address space. Produce a
@@ -216,13 +255,13 @@ pub fn addNativeLibs(zenit_dep: *std.Build.Dependency, exe: *std.Build.Step.Comp
     };
     for (bridges) |src| exe.root_module.addCSourceFile(.{
         .file = zenit_dep.path(src),
-        .flags = &.{"-fobjc-arc"},
+        .flags = macosNativeFlags(exe.step.owner, zenit_dep.builder),
     });
     const frameworks = [_][]const u8{
-        "Cocoa",     "Metal",                  "QuartzCore",
-        "CoreVideo", "UniformTypeIdentifiers", "Foundation",
-        "CoreText",  "CoreGraphics",           "CoreFoundation",
-        "ImageIO",   "AVFoundation",           "CoreMedia",
+        "Cocoa",        "Metal",                  "QuartzCore", "IOSurface",
+        "CoreVideo",    "UniformTypeIdentifiers", "Foundation", "CoreText",
+        "CoreGraphics", "CoreFoundation",         "ImageIO",    "AVFoundation",
+        "CoreMedia",
     };
     for (frameworks) |fw| exe.root_module.linkFramework(fw, .{});
     exe.root_module.link_libc = true;
@@ -535,6 +574,7 @@ pub fn build(b: *std.Build) void {
 
     const build_opts = b.addOptions();
     build_opts.addOption(bool, "test_mode", test_mode);
+    build_opts.addOption(bool, "engine_diagnostics", b.option(bool, "engine-diagnostics", "Enable opt-in per-frame GPU engine diagnostics in development builds") orelse test_mode or optimize == .debug);
     build_opts.addOption(u16, "e2e_port", e2e_port);
     build_opts.addOption([]const u8, "gpu_backend", gpu_backend);
     const build_options_module = build_opts.createModule();
@@ -605,7 +645,7 @@ pub fn build(b: *std.Build) void {
         .dependOn(&b.addInstallArtifact(windows_recording_contract, .{}).step);
 
     const windows_smoke = b.addExecutable(.{ .name = "zenit-windows-smoke", .root_module = windows_smoke_root });
-    windows_smoke.root_module.addCSourceFile(.{ .file = b.path("native/windows/window_bridge.c"), .flags = &.{} });
+    windows_smoke.root_module.addCSourceFile(.{ .file = b.path("native/windows/window_bridge.c"), .flags = &.{"-DZENIT_GDI_PROBE=1"} });
     windows_smoke.root_module.addCSourceFile(.{ .file = b.path("native/windows/recording_bridge.cpp"), .flags = &.{ "-std=c++17", "-fno-exceptions", "-fno-rtti" } });
     windows_smoke.root_module.linkSystemLibrary("mfuuid", .{});
     windows_smoke.root_module.addCSourceFile(.{ .file = b.path("native/windows/file_dialog.cpp"), .flags = &.{ "-std=c++17", "-fno-exceptions", "-fno-rtti" } });
@@ -644,6 +684,9 @@ pub fn build(b: *std.Build) void {
     const windows_font_smoke = b.addExecutable(.{ .name = "zenit-windows-font-smoke", .root_module = windows_font_smoke_root });
     windows_font_smoke.root_module.addCSourceFile(.{ .file = b.path("native/windows/dwrite_bridge.cpp"), .flags = &.{ "-std=c++17", "-fno-exceptions", "-fno-rtti" } });
     windows_font_smoke.root_module.linkSystemLibrary("dwrite", .{});
+    windows_font_smoke.root_module.linkSystemLibrary("d2d1", .{});
+    windows_font_smoke.root_module.linkSystemLibrary("ole32", .{});
+    windows_font_smoke.root_module.linkSystemLibrary("windowscodecs", .{});
     windows_font_smoke.root_module.linkSystemLibrary("dxguid", .{});
     windows_font_smoke.root_module.linkSystemLibrary("user32", .{});
     windows_font_smoke.root_module.link_libc = true;
@@ -666,8 +709,8 @@ pub fn build(b: *std.Build) void {
     const d12_contract_root = b.createModule(.{ .root_source_file = b.path("tools/windows_gpu_resources_contract.zig"), .target = windows_arm64, .optimize = optimize });
     d12_contract_root.addImport("gpu", d12_gpu);
     const gpu_contract_options = b.addOptions();
-    const GpuContractScope = enum { all, sdf, other, app, resources, resources_core, resources_shared, bindings };
-    gpu_contract_options.addOption(GpuContractScope, "scope", b.option(GpuContractScope, "windows-gpu-contract-scope", "Native GPU contracts: all, sdf, other, focused app, bindings, or resources (sdf + other cover all; resources_core + resources_shared = resources)") orelse .all);
+    const GpuContractScope = enum { all, sdf, other, app, resources, resources_core, resources_shared, bindings, buffer_arrays, atomic_probe_failure };
+    gpu_contract_options.addOption(GpuContractScope, "scope", b.option(GpuContractScope, "windows-gpu-contract-scope", "Native GPU contracts: all, sdf, other, focused app, bindings, buffer_arrays, atomic_probe_failure, or resources (sdf + other cover all; resources_core + resources_shared = resources)") orelse .all);
     d12_contract_root.addOptions("contract_options", gpu_contract_options);
     const d12_text = b.createModule(.{ .root_source_file = b.path("src/text/text.zig"), .target = windows_arm64, .optimize = optimize });
     const d12_trace = b.createModule(.{ .root_source_file = b.path("src/trace/mod.zig"), .target = windows_arm64, .optimize = optimize });
@@ -696,6 +739,7 @@ pub fn build(b: *std.Build) void {
     d12_contract.stack_size = windowsStackReserve(d12_contract.stack_size);
     d12_contract.root_module.addCSourceFile(.{ .file = b.path("native/windows/dwrite_bridge.cpp"), .flags = &.{ "-std=c++17", "-fno-exceptions", "-fno-rtti" } });
     d12_contract.root_module.linkSystemLibrary("dwrite", .{});
+    d12_contract.root_module.linkSystemLibrary("d2d1", .{});
     for ([_][]const u8{ "native/windows/d3d12_resources.cpp", "native/windows/d3d12_shader.cpp", "native/windows/d3d12_pipeline.cpp", "native/windows/d3d12_png.cpp", "native/windows/d3d12_resources_tests.cpp", "native/windows/d3d12_views_tests.cpp" }) |source|
         d12_contract.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c++17", "-fno-exceptions", "-fno-rtti", "-DZENIT_D12_TEST=1" } });
     for ([_][]const u8{ "d3d12", "dcomp", "dwmapi", "gdi32", "dxgi", "dxguid", "uuid", "d3dcompiler_47", "user32", "ole32", "windowscodecs" }) |library| d12_contract.root_module.linkSystemLibrary(library, .{});
@@ -1044,16 +1088,23 @@ pub fn build(b: *std.Build) void {
     windows_app.addImport("text", windows_text);
     windows_app.addImport("test_harness", windows_test_harness);
     windows_app.addImport("build_options", windows_app_opts_module);
+    // Optimize native GPU command encoding independently of the app mode.
+    // Use -Dnative-debug=true for unoptimized C++ with UBSan.
+    const native_debug = b.option(bool, "native-debug", "Compile the Windows GPU backend C++ unoptimized, with UBSan (debugging it)") orelse false;
+    const gpu_cpp_flags: []const []const u8 = if (native_debug)
+        &.{ "-std=c++17", "-fno-exceptions", "-fno-rtti" }
+    else
+        &.{ "-std=c++17", "-fno-exceptions", "-fno-rtti", "-O2", "-fno-sanitize=undefined" };
     if (std.mem.eql(u8, gpu_backend, "d3d12")) {
         for ([_][]const u8{ "native/windows/d3d12_resources.cpp", "native/windows/d3d12_shader.cpp", "native/windows/d3d12_pipeline.cpp", "native/windows/d3d12_png.cpp" }) |source|
-            windows_app.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c++17", "-fno-exceptions", "-fno-rtti" } });
+            windows_app.addCSourceFile(.{ .file = b.path(source), .flags = gpu_cpp_flags });
         for ([_][]const u8{ "d3d12", "dcomp", "dwmapi", "gdi32", "dxgi", "d3dcompiler_47", "windowscodecs" }) |lib| windows_app.linkSystemLibrary(lib, .{});
     }
 
     windows_ui_smoke_root.addImport("zenit_app", windows_app);
     if (std.mem.eql(u8, gpu_backend, "d3d11")) {
         for ([_][]const u8{ "native/windows/d3d11_backend.cpp", "native/windows/d3d12_png.cpp" }) |source|
-            windows_app.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c++17", "-fno-exceptions", "-fno-rtti" } });
+            windows_app.addCSourceFile(.{ .file = b.path(source), .flags = gpu_cpp_flags });
         for ([_][]const u8{ "d3d11", "dcomp", "dxgi", "d3dcompiler_47", "windowscodecs" }) |lib| windows_app.linkSystemLibrary(lib, .{});
     }
     const windows_app_gate_root = b.createModule(.{ .root_source_file = b.path("tools/windows_app_gate.zig"), .target = windows_arm64, .optimize = optimize });
@@ -1341,7 +1392,7 @@ pub fn build(b: *std.Build) void {
         // font_catalog uses CoreText bridge; without linking it's undefined symbols.
         text_tests.root_module.addCSourceFile(.{
             .file = b.path("native/macos/coretext_bridge.m"),
-            .flags = &.{"-fobjc-arc"},
+            .flags = macosNativeFlags(b, b),
         });
         for ([_][]const u8{
             "Foundation", "CoreText", "CoreGraphics", "CoreFoundation", "AppKit",
@@ -1745,13 +1796,22 @@ pub fn build(b: *std.Build) void {
         addCoreTextBridge(b, render_tests);
         render_tests.root_module.addCSourceFile(.{
             .file = b.path("native/macos/metal_bridge.m"),
-            .flags = &.{"-fobjc-arc"},
+            .flags = macosNativeFlags(b, b),
         });
         render_tests.root_module.linkFramework("Metal", .{});
         render_tests.root_module.linkFramework("QuartzCore", .{});
         const run_render_tests = b.addRunArtifact(render_tests);
         const render_test_step = b.step("test-render", "Run render module tests");
         render_test_step.dependOn(&run_render_tests.step);
+
+        const lcd_validation = b.addExecutable(.{
+            .name = "zenit-text-dual-source-validation",
+            .root_module = b.createModule(.{ .root_source_file = b.path("tools/windows_dual_source_validation_test.zig"), .target = b.graph.host, .optimize = .debug, .link_libc = true, .link_libcpp = true }),
+        });
+        lcd_validation.root_module.addCSourceFile(.{ .file = b.path("tools/windows_dual_source_validation_test.cpp"), .flags = &.{ "-std=c++17", "-DZENIT_TEST_ZIG_ENTRY=1" } });
+        const run_lcd_validation = b.addRunArtifact(lcd_validation);
+        b.step("test-text-dual-source", "Validate LCD secondary shader signatures on the host").dependOn(&run_lcd_validation.step);
+        render_test_step.dependOn(&run_lcd_validation.step);
 
         // Live-device Metal integration tests are a separate infrastructure
         // contract. They must never be hidden as SkipZigTest/no-op cases inside
@@ -1768,7 +1828,7 @@ pub fn build(b: *std.Build) void {
         });
         metal_preflight.root_module.addCSourceFile(.{
             .file = b.path("native/macos/metal_bridge.m"),
-            .flags = &.{"-fobjc-arc"},
+            .flags = macosNativeFlags(b, b),
         });
         metal_preflight.root_module.linkFramework("Metal", .{});
         metal_preflight.root_module.linkFramework("QuartzCore", .{});
@@ -1791,8 +1851,13 @@ pub fn build(b: *std.Build) void {
         addCoreTextBridge(b, metal_integration_tests);
         metal_integration_tests.root_module.addCSourceFile(.{
             .file = b.path("native/macos/metal_bridge.m"),
+            .flags = macosNativeFlags(b, b),
+        });
+        metal_integration_tests.root_module.addCSourceFile(.{
+            .file = b.path("native/macos/tests/fractional_drawable.m"),
             .flags = &.{"-fobjc-arc"},
         });
+        metal_integration_tests.root_module.linkFramework("Cocoa", .{});
         metal_integration_tests.root_module.linkFramework("Metal", .{});
         metal_integration_tests.root_module.linkFramework("QuartzCore", .{});
         const run_metal_integration_tests = b.addRunArtifact(metal_integration_tests);
@@ -1972,6 +2037,13 @@ pub fn build(b: *std.Build) void {
             "Run deterministic multi-window lifecycle and routing tests",
         );
         window_lifecycle_test_step.dependOn(&run_window_lifecycle_tests.step);
+        // Owned-window placement is pure geometry shared by every backend.
+        const owned_window_tests = b.addTest(.{ .root_module = b.createModule(.{
+            .root_source_file = b.path("src/platform/owned_window.zig"),
+            .target = target,
+            .optimize = optimize,
+        }) });
+        window_lifecycle_test_step.dependOn(&b.addRunArtifact(owned_window_tests).step);
 
         // Process-level text hook stack (multi-app: closing window doesn't
         // tear down other apps' measure hooks). runtime.zig pulls Metal/ObjC
@@ -2083,6 +2155,7 @@ pub fn build(b: *std.Build) void {
         }) });
         test_headless_step.dependOn(&b.addRunArtifact(pe_tests).step);
         test_headless_step.dependOn(app_test_step);
+        test_headless_step.dependOn(window_lifecycle_test_step);
         test_headless_step.dependOn(test_tokens);
         test_headless_step.dependOn(&run_harness_tests.step);
         test_headless_step.dependOn(&run_timing_ring_tests.step);
@@ -2129,6 +2202,8 @@ pub fn build(b: *std.Build) void {
             "scripts/test_native_drag_events.sh",
             "scripts/test_native_global_events.sh",
             "scripts/test_native_menu_actions.sh",
+            "scripts/test_native_fullscreen_header.sh",
+            "scripts/test_native_memory.sh",
             "scripts/test_native_text_events.sh",
             "scripts/test_native_input_pump.sh",
         };
@@ -2140,10 +2215,17 @@ pub fn build(b: *std.Build) void {
             run_native.setEnvironmentVariable("ZIG_BIN", b.graph.zig_exe);
             run_native.has_side_effects = true;
             test_native_step.dependOn(&run_native.step);
+            if (std.mem.eql(u8, script, "scripts/test_native_fullscreen_header.sh")) {
+                b.step("test-fullscreen-header-native", "Verify hidden AppKit fullscreen header lifecycle and toolbar ownership")
+                    .dependOn(&run_native.step);
+            }
         }
 
         const test_all_step = b.step("test-all", "Run deterministic, live-device Metal and native bridge tests");
         const windows_batch_contract = b.addSystemCommand(&.{ "python3", "tools/windows_batch_test.py" });
+        const run_geometry_test = b.addSystemCommand(&.{ "bash", "scripts/test_windows_geometry.sh" });
+        b.step("test-windows-window-geometry", "Verify shared window sizing at fractional DPI and menu wrap boundaries").dependOn(&run_geometry_test.step);
+        test_all_step.dependOn(&run_geometry_test.step);
         b.step("test-windows-batch", "Verify offline Windows batch preparation and strict acceptance").dependOn(&windows_batch_contract.step);
         test_all_step.dependOn(&windows_batch_contract.step);
         const windows_upload_contract = b.addSystemCommand(&.{ "python3", "tools/windows_upload_parts_test.py" });
@@ -2407,7 +2489,7 @@ fn addMacOSNativeLibs(b: *std.Build, exe: *std.Build.Step.Compile) void {
 fn addMacOSScreenRecordingBridge(b: *std.Build, exe: *std.Build.Step.Compile) void {
     exe.root_module.addCSourceFile(.{
         .file = b.path("native/macos/screen_recording_bridge.m"),
-        .flags = &.{"-fobjc-arc"},
+        .flags = macosNativeFlags(b, b),
     });
     exe.root_module.linkFramework("AVFoundation", .{});
     exe.root_module.linkFramework("CoreMedia", .{});
@@ -2421,11 +2503,12 @@ fn addMacOSScreenRecordingBridge(b: *std.Build, exe: *std.Build.Step.Compile) vo
 fn addMacOSWindowBridge(b: *std.Build, exe: *std.Build.Step.Compile) void {
     exe.root_module.addCSourceFile(.{
         .file = b.path("native/macos/window_bridge.m"),
-        .flags = &.{"-fobjc-arc"},
+        .flags = macosNativeFlags(b, b),
     });
     exe.root_module.linkFramework("Cocoa", .{});
     exe.root_module.linkFramework("Metal", .{});
     exe.root_module.linkFramework("QuartzCore", .{});
+    exe.root_module.linkFramework("IOSurface", .{});
     exe.root_module.linkFramework("CoreVideo", .{});
     exe.root_module.linkFramework("UniformTypeIdentifiers", .{});
     exe.root_module.link_libc = true;
@@ -2434,7 +2517,7 @@ fn addMacOSWindowBridge(b: *std.Build, exe: *std.Build.Step.Compile) void {
 fn addMacOSMetalBridge(b: *std.Build, exe: *std.Build.Step.Compile) void {
     exe.root_module.addCSourceFile(.{
         .file = b.path("native/macos/metal_bridge.m"),
-        .flags = &.{"-fobjc-arc"},
+        .flags = macosNativeFlags(b, b),
     });
     exe.root_module.linkFramework("Metal", .{});
     exe.root_module.linkFramework("QuartzCore", .{});
@@ -2453,7 +2536,7 @@ fn addCoreTextBridge(b: *std.Build, exe: *std.Build.Step.Compile) void {
     }
     exe.root_module.addCSourceFile(.{
         .file = b.path("native/macos/coretext_bridge.m"),
-        .flags = &.{"-fobjc-arc"},
+        .flags = macosNativeFlags(b, b),
     });
     exe.root_module.linkFramework("CoreText", .{});
     exe.root_module.linkFramework("CoreGraphics", .{});
@@ -2465,7 +2548,7 @@ fn addCoreTextBridge(b: *std.Build, exe: *std.Build.Step.Compile) void {
 fn addImageBridge(b: *std.Build, exe: *std.Build.Step.Compile) void {
     exe.root_module.addCSourceFile(.{
         .file = b.path("native/macos/image_bridge.m"),
-        .flags = &.{"-fobjc-arc"},
+        .flags = macosNativeFlags(b, b),
     });
     exe.root_module.linkFramework("ImageIO", .{});
     exe.root_module.linkFramework("CoreGraphics", .{});

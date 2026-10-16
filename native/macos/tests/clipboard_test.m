@@ -1,6 +1,7 @@
 // Exercise the actual bridge against a private pasteboard. Swizzling is local
 // to this test process; the user's general pasteboard is never read or changed.
 #import "../window_bridge.m"
+#include "no_render_copy.inc"
 // Standalone empty accessibility client; no dependency on other local tests.
 uint64_t zenit_a11y_focused(uint32_t window_id) { return UINT32_MAX; }
 int zenit_a11y_value(uint32_t window_id, uint64_t handle, char *buf, int buf_len) { return 0; }

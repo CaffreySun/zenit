@@ -2215,6 +2215,12 @@ fn textareaLiveClient(state: *TextareaState) core_ui.TextInputClient {
         .text_len = textareaLiveLength,
         .copy_text = textareaLiveCopy,
         .selection = textareaLiveSelection,
+        .is_composing = struct {
+            fn read(context: *anyopaque) bool {
+                const input: *TextareaState = @ptrCast(@alignCast(context));
+                return input.imeIsComposing();
+            }
+        }.read,
         .set_selection = struct {
             fn set(context: *anyopaque, start_utf8: u32, end_utf8: u32) bool {
                 const textarea: *TextareaState = @ptrCast(@alignCast(context));

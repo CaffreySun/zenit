@@ -14,6 +14,7 @@
 //! - dirty set is the 'global dirty queue'; subsystems only push to it, no recursive push
 
 const std = @import("std");
+const id_hash = @import("id_hash.zig");
 const builtin = @import("builtin");
 const testing = std.testing;
 const element_id_mod = @import("element_id.zig");
@@ -82,6 +83,8 @@ const NodeStyleOrigins = struct {
 
 pub const World = struct {
     allocator: std.mem.Allocator,
+    /// Optional UI-thread ownership probe for retained node command payloads.
+    render_cache_allocator: ?std.mem.Allocator = null,
     elements: ElementTable,
     layout: LayoutTable,
     paint: PaintTable,
@@ -93,10 +96,12 @@ pub const World = struct {
     /// NodeLayoutOutput SoA mirror (vector + artifacts; double-write phase)
     layout_output: LayoutOutputTable,
     /// dirty set: pending this frame; consumed by stage at end_frame
-    dirty_set: std.AutoHashMapUnmanaged(u32, DirtyFlags),
+    dirty_set: id_hash.U32HashMapUnmanaged(DirtyFlags),
+    /// Monotonic notification serial, including repeated marks of an already dirty node.
+    mutation_epoch: u64 = 0,
     /// DevTools-only sparse source table. Node body does not allocate for 50+ StyleFields;
     /// only styled / setStyle-modified nodes occupy an entry.
-    style_origins: std.AutoHashMapUnmanaged(u32, NodeStyleOrigins),
+    style_origins: id_hash.U32HashMapUnmanaged(NodeStyleOrigins),
 
     pub fn init(allocator: std.mem.Allocator) World {
         return .{
@@ -147,8 +152,8 @@ pub const World = struct {
         // the
         // destroy side, but bare elements.destroy / Node.destroy bypass it, so alloc also clears
         // content.
-        // Do not clear layout_output: it is the layout source of truth; clearing breaks post-mount
-        // unlayouted queries (read 0 rect). Content is overwritten by setText immediately; safe.
+        // ensureSlot preserves same-generation output and clears/reclaims a
+        // reused generation before it can expose the previous owner's cache.
         self.content.clear(id);
         return id;
     }
@@ -162,7 +167,7 @@ pub const World = struct {
         _ = self.dirty_set.remove(id.raw());
         self.content.clear(id);
         self.paint_state.clear(id);
-        self.layout_output.clear(id); // v0.10-§L stage 1: non-owning mirror, clear does not free
+        self.layout_output.clear(id); // table-owned sparse text payload is reclaimed
         self.layout.clear(id);
         // Paint chunk must clear content (free display_items + zero hash/epoch/property_state),
         // else slot reuse + hash collision causes beginRecord to emit old owner's items (see
@@ -213,6 +218,7 @@ pub const World = struct {
     /// Mark element dirty. Flags merged to existing entry via union.
     pub fn markDirty(self: *World, id: ElementId, flags: DirtyFlags) !void {
         if (id.isNull()) return;
+        self.mutation_epoch +%= 1;
         const gop = try self.dirty_set.getOrPut(self.allocator, id.raw());
         if (!gop.found_existing) {
             gop.value_ptr.* = flags;

@@ -124,7 +124,7 @@ pub const Surface = struct {
             return error.SurfaceTimeout;
         errdefer mtl.release(drawable);
 
-        // WARNING—ABI exception: metal_drawable_get_texture defined in window_bridge.m:2966,
+        // WARNING—ABI exception: metal_drawable_get_texture defined in metal_bridge.m,
         // uses __bridge (**+0 borrow**), opposite the __bridge_retained contract of other getters
         // here.
         // Thus retain here is **required**, can't delete alongside above.
@@ -136,7 +136,7 @@ pub const Surface = struct {
         const texture = resources.Texture{
             .raw = texture_raw,
             .format = self.format orelse return error.SurfaceNotConfigured,
-            .size = self.extent,
+            .size = .{ .width = mtl.metal_texture_get_width(texture_raw), .height = mtl.metal_texture_get_height(texture_raw), .depth = 1 },
             .mip_level_count = 1,
             .dimension = .@"2d",
             .memory = .device_local,

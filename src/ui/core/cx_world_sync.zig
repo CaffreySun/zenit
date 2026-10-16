@@ -57,6 +57,7 @@ fn paintChunkBoundsOrLayoutFallback(w: *world.World, eid: world.ElementId) paint
 }
 
 pub fn layerizeFrame(self: *Cx, extra_hints: []const layerize_mod.LayerizeInput) u32 {
+    ensureWorldTablesSynced(self);
     // Frame start: clear layer damage state
     self.layer_tree.beginFrame();
 
@@ -146,6 +147,27 @@ fn syncLayoutNodeRecursive(self: *Cx, node: *Node) void {
     for (node.children.items) |child| syncLayoutNodeRecursive(self, child);
 }
 
+/// Mirror the last rendered frame into World.paint and World.interaction if a
+/// render happened since the previous mirror.
+///
+/// Both tables were rebuilt at the end of every `Cx.render`, a full-tree walk
+/// that hashed each node's paint content and probed two hash maps per node, yet
+/// nothing in rendering, hit testing or event dispatch reads them: their readers
+/// are `layerizeFrame`, the sampled layout integrity audit and tests. In a Debug
+/// build of a ~700-node Markdown editor the walk was about a sixth of every
+/// scroll frame. Readers call this instead (the same lazy pattern as the a11y
+/// projection). The mirror reads the display list and scene runtime of the last
+/// render, which stay intact until the next one begins.
+pub fn ensureWorldTablesSynced(self: *Cx) void {
+    if (!self.world_tables_stale) return;
+    const root = self.root orelse return;
+    self.world_tables_stale = false;
+    // Same order as the former end-of-frame passes: the paint chunk reads the
+    // scroll_id that ScrollArea stored in the interaction table.
+    syncPaintToTable(self, root);
+    syncInteractionToTable(self, root);
+}
+
 pub fn syncPaintToTable(self: *Cx, root: *Node) void {
     self.perf.synced_node_count = 0;
     syncPaintNodeRecursive(self, root);
@@ -165,21 +187,21 @@ fn syncPaintNodeRecursive(self: *Cx, node: *Node) void {
             .max_x = rect.x + rect.w,
             .max_y = rect.y + rect.h,
         };
-        // beginRecord returns true = need re-record (hash mismatch / first time); false = cache
-        // hit.
-        const need_record = self.world.paint.beginRecord(eid, hash) catch return;
+        // Items always come from the last render (see PaintTable.mirrorBegin for why a hash
+        // hit cannot skip the copy); `changed` only says whether the content moved.
+        const changed = self.world.paint.mirrorBegin(eid, hash) catch return;
         // v0.5-P3 Stage 3-3 Phase 3 (session 37): take property tree refs from SceneRuntime
         // (transform_id / clip_id / effect_id), take scroll_id from InteractionTable, write to
         // chunk.property_state.
-        const runtime = self.scene_runtime.get(node.id);
-        const interaction_data = self.world.interaction.get(eid);
+        const runtime = self.scene_runtime.getPtr(node.id);
+        const interaction_data = self.world.interaction.getPtr(eid);
         const property_state = paint_table.PropertyStateRef{
             .transform_id = if (runtime) |rt| rt.transform_id else std.math.maxInt(u32),
             .clip_id = if (runtime) |rt| rt.clip_id else std.math.maxInt(u32),
             .effect_id = if (runtime) |rt| rt.effect_id else std.math.maxInt(u32),
             .scroll_id = if (interaction_data) |d| d.scroll_id else std.math.maxInt(u32),
         };
-        if (need_record) {
+        {
             // Truly mirror node's own DisplayItem range.
             if (runtime) |rt| {
                 const start: usize = rt.display_item_start;
@@ -202,17 +224,12 @@ fn syncPaintNodeRecursive(self: *Cx, node: *Node) void {
                     }
                 }
             }
-            self.world.paint.endRecord(eid, property_state);
+            self.world.paint.mirrorEnd(eid, property_state, changed);
         }
-        // Single get merges two writes: a cache hit must also update property_state
-        // (transform_id / scroll_id can change); chunk.bounds is the world-space
-        // element rect. pushItem's internal unionWith accumulates local_bounds
-        // (item-local coords), a semantic mismatch with world bounds, so override here.
-        // Downstream (LayerTree.layerizeFrame) needs world bounds.
-        if (self.world.paint.get(eid)) |chunk| {
-            if (!need_record) chunk.property_state = property_state;
-            chunk.bounds = bounds;
-        }
+        // chunk.bounds is the world-space element rect. pushItem's internal unionWith
+        // accumulates local_bounds (item-local coords), a semantic mismatch with world
+        // bounds, so override here. Downstream (LayerTree.layerizeFrame) needs world bounds.
+        if (self.world.paint.get(eid)) |chunk| chunk.bounds = bounds;
     }
     for (node.children.items) |child| syncPaintNodeRecursive(self, child);
 }
@@ -222,62 +239,45 @@ fn syncPaintNodeRecursive(self: *Cx, node: *Node) void {
 /// Session 43: expanded from background-only to 8 common visual properties,
 /// letting PaintTable cache invalidation cover more real-world change scenarios.
 fn paintContentHash(node: *const Node, rect: ComputedRect) u64 {
-    var h = std.hash.Wyhash.init(0);
-    // Concatenate field bytes, not a struct's memory: preserve the existing
-    // invalidation key exactly without introducing inter-field padding.
+    // Runs for every node on every rendered frame. One-shot Wyhash calls chained
+    // through the seed instead of a streaming Wyhash: the streaming form copies
+    // each update into its 48-byte buffer and drains it in `final`, which in a
+    // Debug build cost about as much as the rest of the paint sync. The key is
+    // process-local (compared against last frame's value only), so its exact
+    // value carries no compatibility contract; every visual field still feeds it.
+    // Field bytes are concatenated rather than hashing struct memory, so padding
+    // never enters the key.
     const visual_bytes = std.mem.toBytes(node.getBackground()) ++
         std.mem.toBytes(node.style.border.color) ++
         std.mem.toBytes(node.style.border.width) ++
         std.mem.toBytes(node.getOpacity()) ++
         std.mem.toBytes(rect.w) ++ std.mem.toBytes(rect.h);
-    h.update(&visual_bytes);
+    var h = std.hash.Wyhash.hash(0, &visual_bytes);
     if (node.getText()) |t| {
-        h.update(t.content);
         const text_bytes = std.mem.toBytes(t.font_size) ++ std.mem.toBytes(t.color);
-        h.update(&text_bytes);
+        h = std.hash.Wyhash.hash(h, &text_bytes);
+        // Length-prefixed by the seed chain: content moving between text and the
+        // fixed fields cannot alias.
+        h = std.hash.Wyhash.hash(h ^ t.content.len, t.content);
     }
     if (node.getImage()) |im| {
         const image_bytes = std.mem.toBytes(im.texture_id) ++ std.mem.toBytes(im.tint);
-        h.update(&image_bytes);
+        h = std.hash.Wyhash.hash(h +% 1, &image_bytes);
     }
     if (node.getIcon()) |ic| {
         const icon_bytes = std.mem.toBytes(ic.icon_id) ++ std.mem.toBytes(ic.tint);
-        h.update(&icon_bytes);
+        h = std.hash.Wyhash.hash(h +% 2, &icon_bytes);
     }
-    return h.final();
+    return h;
 }
 
-test "paint content hash preserves incremental keys and each visual field" {
+test "paint content hash is stable and reacts to each visual field" {
     const Fixture = struct {
-        // The pre-batching implementation is the cache-key compatibility oracle.
-        fn incremental(node: *const Node, rect: ComputedRect) u64 {
-            var h = std.hash.Wyhash.init(0);
-            const bg = node.getBackground();
-            h.update(std.mem.asBytes(&bg));
-            h.update(std.mem.asBytes(&node.style.border.color));
-            h.update(std.mem.asBytes(&node.style.border.width));
-            h.update(std.mem.asBytes(&node.getOpacity()));
-            h.update(std.mem.asBytes(&rect.w));
-            h.update(std.mem.asBytes(&rect.h));
-            if (node.getText()) |t| {
-                h.update(t.content);
-                h.update(std.mem.asBytes(&t.font_size));
-                h.update(std.mem.asBytes(&t.color));
-            }
-            if (node.getImage()) |im| {
-                h.update(std.mem.asBytes(&im.texture_id));
-                h.update(std.mem.asBytes(&im.tint));
-            }
-            if (node.getIcon()) |ic| {
-                h.update(std.mem.asBytes(&ic.icon_id));
-                h.update(std.mem.asBytes(&ic.tint));
-            }
-            return h.final();
-        }
-
         fn changed(previous: *u64, node: *const Node, rect: ComputedRect) !void {
             const next = paintContentHash(node, rect);
-            try std.testing.expectEqual(incremental(node, rect), next);
+            // Deterministic for identical input (the cache compares frame to frame)...
+            try std.testing.expectEqual(next, paintContentHash(node, rect));
+            // ...and every visual field below moves the key.
             try std.testing.expect(previous.* != next);
             previous.* = next;
         }
@@ -288,7 +288,8 @@ test "paint content hash preserves incremental keys and each visual field" {
     cx.root = node;
     var rect = ComputedRect{ .x = 7, .y = 9, .w = 100, .h = 80 };
     var previous = paintContentHash(node, rect);
-    try std.testing.expectEqual(Fixture.incremental(node, rect), previous);
+    // Position is not part of the key: bounds are written separately every frame.
+    try std.testing.expectEqual(previous, paintContentHash(node, .{ .x = 70, .y = 90, .w = 100, .h = 80 }));
 
     node.setBackgroundRaw(core.Color.rgba(10, 20, 30, 255));
     try Fixture.changed(&previous, node, rect);
@@ -349,10 +350,10 @@ fn syncInteractionNodeRecursive(self: *Cx, node: *Node) void {
         // v0.5-P3 Stage 3-4 fix (session 34): preserve existing scroll_id
         // (ScrollArea.mount injection), not erased by syncInteractionToTable after each frame
         // render.
-        const existing_scroll_id: u32 = if (self.world.interaction.get(eid)) |existing|
-            existing.scroll_id
-        else
-            std.math.maxInt(u32);
+        // One probe per node: the existing slot is both the scroll_id source and,
+        // when present, the write target (put/remove would probe again).
+        const existing = self.world.interaction.getPtr(eid);
+        const existing_scroll_id: u32 = if (existing) |e| e.scroll_id else std.math.maxInt(u32);
         const has_scroll = existing_scroll_id != std.math.maxInt(u32);
         if (node.behavior.interaction.focusable or has_a11y or has_event or has_scroll) {
             const focused = if (self.focus_manager.current_focus) |fn_node| (fn_node == node) else false;
@@ -360,7 +361,7 @@ fn syncInteractionNodeRecursive(self: *Cx, node: *Node) void {
                 @as(i16, @intCast(@max(@min(t, std.math.maxInt(i16)), std.math.minInt(i16))))
             else
                 0;
-            const role: u16 = if (node.behavior.interaction.a11y) |a| @backingInt(a.role) else 0;
+            const role: u16 = if (node.behavior.interaction.a11y) |*a| @backingInt(a.role) else 0;
             const data: interaction_table.InteractionData = .{
                 .focus = .{
                     .focusable = node.behavior.interaction.focusable,
@@ -372,12 +373,16 @@ fn syncInteractionNodeRecursive(self: *Cx, node: *Node) void {
                 .a11y_role = role,
                 .scroll_id = existing_scroll_id,
             };
-            // failure -> that node this frame **cannot be hit** (click/hover fail silent),
-            // completely silent. Same 'silent degradation' family as core.paint_push_failures.
-            self.world.interaction.put(eid, data) catch {
-                core.interaction_put_failures += 1;
-            };
-        } else {
+            if (existing) |slot| {
+                slot.* = data;
+            } else {
+                // failure -> that node this frame **cannot be hit** (click/hover fail silent),
+                // completely silent. Same 'silent degradation' family as core.paint_push_failures.
+                self.world.interaction.put(eid, data) catch {
+                    core.interaction_put_failures += 1;
+                };
+            }
+        } else if (existing != null) {
             _ = self.world.interaction.remove(eid);
         }
     }
@@ -385,7 +390,7 @@ fn syncInteractionNodeRecursive(self: *Cx, node: *Node) void {
 }
 
 fn nodeHasAnyEvent(node: *const Node) bool {
-    const e = node.behavior.events;
+    const e = &node.behavior.events;
     return e.on_click != null or e.on_hover != null or e.on_leave != null or
         e.on_focus != null or e.on_blur != null or
         e.on_key_down != null or e.on_key_up != null or
@@ -393,6 +398,7 @@ fn nodeHasAnyEvent(node: *const Node) bool {
 }
 
 pub fn assertLayoutSyncIntegrity(self: *Cx, root: *Node) bool {
+    ensureWorldTablesSynced(self);
     return assertLayoutSyncIntegrityRecursive(self, root);
 }
 

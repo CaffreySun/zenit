@@ -198,14 +198,43 @@ pub const LinuxWindow = struct {
     pub fn appShouldQuit() bool {
         return false;
     }
+    pub fn cancelAppQuit() void {}
     pub fn activate(self: *LinuxWindow) void {
         _ = self;
+    }
+    // Owned windows are not wired to xdg_toplevel.set_parent yet; Wayland also
+    // forbids client positioning, so placement stays with the compositor.
+    pub fn setOwner(self: *LinuxWindow, owner: *LinuxWindow) bool {
+        _ = self;
+        _ = owner;
+        return false;
+    }
+    pub fn clearOwner(self: *LinuxWindow, owner: *LinuxWindow) void {
+        _ = self;
+        _ = owner;
+    }
+    pub fn centerOnOwner(self: *LinuxWindow, owner: *LinuxWindow) bool {
+        _ = self;
+        _ = owner;
+        return false;
+    }
+    pub fn armFocusLossReporting(self: *LinuxWindow) void {
+        _ = self;
+    }
+    pub fn takeFocusLoss(self: *LinuxWindow) ?@import("../owned_window.zig").FocusLoss {
+        _ = self;
+        return null;
     }
     pub fn setTrafficLightsInset(self: *LinuxWindow, x: f32, y: f32) void {
         _ = self;
         _ = x;
         _ = y;
     }
+    /// Change the window title after creation (libdecor frame title).
+    pub fn setTitle(self: *LinuxWindow, title: [:0]const u8) void {
+        self.native.setTitle(title);
+    }
+
     pub fn setTitlebarDragHeight(self: *LinuxWindow, height: f32) void {
         _ = self;
         _ = height;

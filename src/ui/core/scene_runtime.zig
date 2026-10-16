@@ -6,6 +6,7 @@
 const std = @import("std");
 const types = @import("types.zig");
 const property_tree = @import("property_tree.zig");
+const id_hash = @import("id_hash.zig");
 
 const Allocator = std.mem.Allocator;
 const ComputedRect = types.ComputedRect;
@@ -115,14 +116,14 @@ pub const PromotedSurfaceFrameFlags = packed struct(u8) {
 
 pub const SceneRuntime = struct {
     allocator: Allocator,
-    nodes: std.AutoHashMap(u32, SceneNodeRuntime),
+    nodes: id_hash.U32HashMap(SceneNodeRuntime),
     /// Per-frame increment for timing validation
     frame_epoch: u64 = 0,
 
     pub fn init(allocator: Allocator) SceneRuntime {
         return .{
             .allocator = allocator,
-            .nodes = std.AutoHashMap(u32, SceneNodeRuntime).init(allocator),
+            .nodes = id_hash.U32HashMap(SceneNodeRuntime).init(allocator),
         };
     }
 
@@ -141,5 +142,12 @@ pub const SceneRuntime = struct {
 
     pub fn get(self: *const SceneRuntime, node_id: u32) ?SceneNodeRuntime {
         return self.nodes.get(node_id);
+    }
+
+    /// Borrowed record, valid until the next `put`/`clear`. `SceneNodeRuntime` is a
+    /// few hundred bytes; per-node passes that only read a handful of fields
+    /// should not copy it out (Debug builds copy it through memcpy every time).
+    pub fn getPtr(self: *const SceneRuntime, node_id: u32) ?*const SceneNodeRuntime {
+        return self.nodes.getPtr(node_id);
     }
 };

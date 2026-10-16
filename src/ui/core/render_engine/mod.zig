@@ -9,6 +9,7 @@ const display_list_mod = @import("../display_list.zig");
 const text_blob_mod = @import("../text_blob.zig");
 const retained_scene = @import("../retained_scene.zig");
 const scene_runtime_mod = @import("../scene_runtime.zig");
+const id_hash = @import("../id_hash.zig");
 const paint_order = @import("../paint_order.zig");
 
 const render_context_mod = @import("render_context.zig");
@@ -760,7 +761,7 @@ const subtree_payload_cache_max_items: usize = 256;
 ///
 /// Escape hatch ZENIT_DISABLE_HOOK_SELF_SCOPE=1 disables the downgrade entirely.
 fn hookScopeIsSelfOnly(node: *Node, exec_state: *const NodeExecutionState, parent_effect_id: u32) bool {
-    if (!node.frame_state.state_bits.flags.before_render_hook_affects_self_only) return false;
+    if (!node.beforeRenderHooksSelfOnly()) return false;
     // Escape hatch is not cached, consistent with ZENIT_DISABLE_SUBTREE_PAYLOAD_REPLAY /
     // ZENIT_DISABLE_SUBTREE_SPLICE: a process-level one-shot cache bakes the value, so the same
     // test binary can't reach the other branch and behavior contradicts the "current env".
@@ -793,7 +794,7 @@ fn indexRenderCacheBoundaries(
     allocator: Allocator,
     node: *Node,
     ancestor_has_boundary: bool,
-    blocked: *std.AutoHashMapUnmanaged(u32, void),
+    blocked: *id_hash.U32HashMapUnmanaged(void),
 ) !bool {
     const self_is_boundary = node.frame_state.state_bits.flags.disable_render_cache;
     var subtree_has_boundary = self_is_boundary;
@@ -1037,7 +1038,7 @@ fn prebuildDisplayPayloadSubtrees(
         !node.frame_state.state_bits.dirty.core.render and
         !node.frame_state.state_bits.dirty.core.subtree_render)
     {
-        if (cx.scene_runtime.get(node.id)) |runtime| {
+        if (cx.scene_runtime.getPtr(node.id)) |runtime| {
             if (runtime.display_payload_subtree_prebuilt) return;
         }
     }
@@ -1144,6 +1145,17 @@ fn prebuildDisplayPayloadSubtrees(
         return; // subtree_prebuilt=false → paint pass fresh emit
     }
 
+    // A legacy overflow cache hit appends its descendants during the paint
+    // pass. Leave them out of the prebuild prefix, otherwise the same child
+    // commands are emitted once here and once by the cache replay. Later
+    // siblings must also wait so paint order remains a contiguous prefix.
+    if (node.meta.per_frame.caches.commands.own != null and
+        buildNodeExecutionPlan(cx, node, &exec_state, parent_effect_id).should_try_legacy_overflow_replay)
+    {
+        cx.display_payload_prefix_broken = true;
+        return;
+    }
+
     // Scroll container children's clip pair also must record into fallback path
     // display_list section (paint pass may still take replay shortcut for locally prebuilt
     // descendants), see prebuildScrollClipBegin.
@@ -1217,7 +1229,7 @@ fn prebuildOwnDisplayPayloads(
     // (skip at function start) or own already landed in subtree pass (epoch check skip),
     // global bail misses no legitimate work.
     if (cx.display_payload_prefix_broken) return;
-    const runtime = cx.scene_runtime.get(node.id) orelse return;
+    const runtime = cx.scene_runtime.getPtr(node.id) orelse return;
     if (runtime.display_payload_subtree_prebuilt) return;
 
     const exec_state = buildNodeExecutionState(
@@ -1271,7 +1283,7 @@ fn prebuildDisplayPayloads(
     inherited_force_linear_text: bool,
     parent_effect_id: u32,
 ) !void {
-    var boundary_blocked = std.AutoHashMapUnmanaged(u32, void){};
+    var boundary_blocked = id_hash.U32HashMapUnmanaged(void){};
     defer boundary_blocked.deinit(cx.frame_allocator);
     _ = try indexRenderCacheBoundaries(cx.frame_allocator, node, false, &boundary_blocked);
     const previous_boundary_index = cx.render_cache_boundary_blocked;
@@ -1607,7 +1619,7 @@ fn buildRetainedSubtree(
     surface_inverse: Transform2D,
 ) void {
     if (!node.frame_state.state_bits.dirty.core.render and !node.frame_state.state_bits.dirty.core.subtree_render and !node.frame_state.state_bits.dirty.core.layout and !node.frame_state.state_bits.dirty.core.subtree_layout) {
-        if (cx.scene_runtime.get(node.id) != null) return;
+        if (cx.scene_runtime.nodes.contains(node.id)) return;
     }
     const render_state = computeNodeRenderState(cx, node, parent_transform, parent_clip) orelse return;
     // Retained/property-tree recursion must follow the same content-space transform
@@ -2392,7 +2404,7 @@ fn appendNodeText(
     exec_state: *const NodeExecutionState,
 ) !void {
     const logical_t = resolveNodeLogicalTextProps(node) orelse return;
-    try appendDisplayTextItem(cx, node, exec_state, &logical_t, node.getLayoutOutput().artifacts.text_layout);
+    try appendDisplayTextItem(cx, node, exec_state, &logical_t, node.layoutTextLayout());
 }
 
 /// scroll container (tag==.scroll) children render between a real pixel clip pair.
@@ -3101,8 +3113,13 @@ pub fn renderNode(cx: *RenderContext, node: *Node) anyerror!void {
         cx.property_tree.transforms.items,
         cx.scene_runtime,
     );
-    syncPromotedLayerIds(cx);
-    _ = syncPromotedDescendantState(cx, node);
+    // Both passes visit every node to copy plan-layer promotion into its runtime
+    // record. With no promoted plan layer they would write back exactly the defaults
+    // `appendRetainedMetadata` stored this frame (records are rebuilt every frame).
+    if (cx.layer_tree.frame_promoted_count != 0) {
+        syncPromotedLayerIds(cx);
+        _ = syncPromotedDescendantState(cx, node);
+    }
     try prebuildDisplayPayloads(cx, node, Transform2D.identity(), null, false, INVALID_ID);
     const r = renderNodeTransform(cx, node, Transform2D.identity(), null, false, 0, INVALID_ID, INVALID_ID);
 
@@ -3230,7 +3247,7 @@ fn renderNodeTransform(
     // (cx.display_list length at paint pass entry). Use scene_runtime's subtree_display_item_count
     // (written by prebuild) instead: if > 0, prebuild wrote this node's subtree, so truncate the
     // fresh portion.
-    if (cx.scene_runtime.get(node.id)) |rt| {
+    if (cx.scene_runtime.getPtr(node.id)) |rt| {
         if (rt.display_payload_subtree_prebuilt and rt.subtree_display_item_count > 0) {
             cx.display_list.items.shrinkRetainingCapacity(subtree_display_start);
             // WARNING: only display_list can be truncated, never text_blob_store.

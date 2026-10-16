@@ -318,7 +318,7 @@ pub fn resolveNodeRenderClipSpec(cx: *@import("render_context.zig").RenderContex
         // clip shape, no overflow.
         node.ensureCustomClipGeometry(allocator) catch {};
     }
-    const lo_vec = node.getLayoutOutput().vector;
+    const lo_vec = if (node.layoutOutput()) |lo| lo.vector else @import("../node_layout_output.zig").NodeVector{};
     const clip_geometry = switch (clip_shape) {
         .path => lo_vec.fill.path,
         .custom => lo_vec.fill.custom_clip orelse lo_vec.fill.path,

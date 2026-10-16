@@ -89,7 +89,7 @@ pub fn cacheRenderCommands(self: *Node, allocator: Allocator, commands: []const 
         });
     }
     const fresh = buildCachedRenderSlice(
-        allocator,
+        if (self.world_ref) |w| w.render_cache_allocator orelse allocator else allocator,
         commands,
         scroll_ox,
         scroll_oy,
@@ -141,7 +141,7 @@ pub fn cachePromotedRenderCommands(
         });
     }
     const fresh = buildCachedRenderSlice(
-        allocator,
+        if (self.world_ref) |w| w.render_cache_allocator orelse allocator else allocator,
         commands,
         scroll_ox,
         scroll_oy,
@@ -191,7 +191,7 @@ pub fn cacheSubtreePayloadCommands(
     world_bounds: ComputedRect,
 ) void {
     var fresh = buildCachedRenderSlice(
-        allocator,
+        if (self.world_ref) |w| w.render_cache_allocator orelse allocator else allocator,
         commands,
         0,
         0,

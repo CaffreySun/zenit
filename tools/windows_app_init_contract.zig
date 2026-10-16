@@ -51,6 +51,7 @@ pub const ReusedAllocator = struct {
     }
 
     pub fn beforeReuse(self: *@This(), io: std.Io) !void {
+        try @import("windows_window_contract.zig").runInitialGeometry();
         const before = Window.liveWindowCount();
         const foreground = GetForegroundWindow();
         try @import("windows_alert_contract.zig").run();

@@ -134,7 +134,9 @@ int zenit_d12_shader_bindings(ZenitD12Shader *, ZenitD12ShaderBinding *, uint32_
 void zenit_d12_shader_retain(ZenitD12Shader *);
 void zenit_d12_shader_release(ZenitD12Shader *);
 const void *zenit_d12_shader_data(ZenitD12Shader *);
+int zenit_d12_shader_non_uniform_buffer_atomics(ZenitD12Shader *);
 size_t zenit_d12_shader_size(ZenitD12Shader *);
+int zenit_d12_shader_atomic_switch(ZenitD12Shader *, ZenitD12Shader **);
 int zenit_d12_shader_warp_blob(ZenitD12Shader *, void **);
 void zenit_d12_shader_diagnostic_free(char *);
 typedef struct ZenitD12TextureRegion {
@@ -145,7 +147,12 @@ typedef struct ZenitD12TextureLayout {
     uint32_t row_pitch, width, height, depth;
 } ZenitD12TextureLayout;
 /* Status: 0 success, 1 invalid descriptor, 2 allocation/device failure. */
+typedef struct ZenitD12DriverInfo {
+    uint32_t vendor_id, device_id; uint16_t driver_version[4];
+    uint32_t driver_version_known, software;
+} ZenitD12DriverInfo;
 int zenit_d12_device_create(int force_warp, ZenitD12Device **out);
+void zenit_d12_device_driver_info(ZenitD12Device *, ZenitD12DriverInfo *);
 void zenit_d12_device_retain(ZenitD12Device *device);
 void zenit_d12_device_release(ZenitD12Device *device);
 int zenit_d12_device_vertex_viewport_index(ZenitD12Device *device);

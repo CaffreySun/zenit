@@ -46,8 +46,7 @@ pub fn textRasterControls(policy_byte: u8) TextRasterControls {
     return switch (mode) {
         .static_crisp => .{ .force_linear = false, .shader_snap = true },
         .direct_animated => .{ .force_linear = true, .shader_snap = false },
-        // P0 keeps status quo within surface (linear, CPU no snap); shader snap matches old
-        // behavior. P2 plans upgrade to static_crisp rasterization within surface.
+        // Cached layer contents retain filtering for fractional layer composition.
         .surface_cached => .{ .force_linear = true, .shader_snap = true },
     };
 }

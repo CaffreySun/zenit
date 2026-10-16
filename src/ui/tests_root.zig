@@ -5,6 +5,9 @@
 //! name such as @import("ui_core"), or its tests are never compiled/run.
 
 test {
+    _ = @import("core/counting_allocator.zig");
+    _ = @import("core/shaping_cache.zig");
+    _ = @import("core/layout_output_table.zig"); // Explicitly discover sparse storage/OOM tests.
     _ = @import("core/tests.zig");
     _ = @import("core/bulk_quad_layer.zig"); // Cx split: BulkQuad layer unit test (refAllDecls won't auto-discover)
     _ = @import("core/render_engine/gpu_draw_shadow.zig");

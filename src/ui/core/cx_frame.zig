@@ -39,12 +39,10 @@ pub fn advanceFrameClock(self: *Cx) void {
     // stays valid (else clock changes every frame, always full render, e2e query on idle gives
     // unstable frame). any active signal advances clock, drives overlay/Spring etc
     // absolute-timestamp animations.
-    const idle = if (self.root) |r|
-        cx_render.isTreeFullyClean(r) and
-            !self.overlay_stack.hasActiveAnimations() and
-            !self.needs_redraw
-    else
-        true;
+    // A frame requested for interaction/runtime work or animation is active
+    // even when paint/layout bits are clean. Otherwise its clock freezes and
+    // render's cache can keep the host-requesting work alive indefinitely.
+    const idle = !hasPendingSceneWork(self) and !self.needs_redraw;
     if (idle) {
         // Locked test clock with budget left but nothing animating: the granted
         // time still elapses (timers come due), in one step.
@@ -70,6 +68,11 @@ pub fn advanceFrameClock(self: *Cx) void {
     // driving next frame; end of frame still false = can enter idle gating. note consume point must
     // be AFTER idle check, clearing early in frame loop freezes time this wake (time-driven overlay
     // entrance freezes at 0).
+    // Every host renews declarations only when advancing/painting a fresh frame.
+    // The idle cache fast path retains its last declaration and wake deadline.
+    self.caret_phase_valid = false;
+    self.caret_rect_count = 0;
+    self.caret_rect_overflow = false;
     self.needs_redraw = false;
 
     if (self.test_frame_step_ms) |step| {
@@ -243,6 +246,10 @@ fn takeTimer(self: *Cx, id: u64) ?Timer {
 
 pub fn nextWakeDelayNs(self: *const Cx) ?u64 {
     var best: ?u64 = nextTimerDelayNs(self);
+    if (self.caret_phase_valid) {
+        const delay = @max(0, self.caret_next_ns - @import("zenit_time").monotonicTimestamp(self.io));
+        best = if (best) |b| @min(b, @as(u64, @intCast(delay))) else @intCast(delay);
+    }
     if (self.next_redraw_scheduled_at) |scheduled_at| {
         if (self.next_redraw_delay_ns) |delay_ns| {
             const now = @import("zenit_time").Instant.now(self.io) catch return 0;
@@ -263,6 +270,9 @@ pub fn nextWakeDelayNs(self: *const Cx) ?u64 {
 
 pub fn wantsFrame(self: *Cx) bool {
     _ = self.processScheduledRedraw();
+    if (!self.caret_flip_host and self.caret_phase_valid and
+        @import("zenit_time").monotonicTimestamp(self.io) >= self.caret_next_ns)
+        self.needs_redraw = true;
     if (self.test_force_frames) {
         if (self.root) |root| root.markSubtreeDirty();
         self.needs_redraw = true;
@@ -308,8 +318,8 @@ fn wantsFrameDiagnosed(self: *Cx) bool {
                     d.pipeline.composite, d.pipeline.subtree_composite, d.runtime.dirty, d.runtime.subtree_dirty,
                 });
                 append(&buf, &w, " order={} sub_order={} inter={} sub_inter={} loose={}", .{
-                    d.pipeline.order,               d.pipeline.subtree_order,                               d.pipeline.interaction,
-                    d.pipeline.subtree_interaction, cx_runtime_index.subtreeHasLooseInteractionDirty(root),
+                    d.pipeline.order,               d.pipeline.subtree_order,                                     d.pipeline.interaction,
+                    d.pipeline.subtree_interaction, cx_runtime_index.subtreeHasLooseInteractionDirty(self, root),
                 });
             }
             append(&buf, &w, " anim={} overlay_anim={}", .{
@@ -323,19 +333,7 @@ fn wantsFrameDiagnosed(self: *Cx) bool {
 
 pub fn hasPendingSceneWork(self: *const Cx) bool {
     const root = self.root orelse return false;
-    return root.frame_state.state_bits.dirty.core.layout or
-        root.frame_state.state_bits.dirty.core.subtree_layout or
-        root.frame_state.state_bits.dirty.core.render or
-        root.frame_state.state_bits.dirty.core.subtree_render or
-        root.frame_state.state_bits.dirty.pipeline.composite or
-        root.frame_state.state_bits.dirty.pipeline.subtree_composite or
-        root.frame_state.state_bits.dirty.runtime.dirty or
-        root.frame_state.state_bits.dirty.runtime.subtree_dirty or
-        root.frame_state.state_bits.dirty.pipeline.order or
-        root.frame_state.state_bits.dirty.pipeline.subtree_order or
-        root.frame_state.state_bits.dirty.pipeline.interaction or
-        root.frame_state.state_bits.dirty.pipeline.subtree_interaction or
-        cx_runtime_index.subtreeHasLooseInteractionDirty(root) or
+    return !cx_render.isTreeFullyClean(self, root) or
         self.last_tick_animations_active or
         self.overlay_stack.hasActiveAnimations();
 }

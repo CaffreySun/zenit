@@ -7,6 +7,7 @@ const ui = @import("ui");
 const platform = @import("platform");
 const system_sdk = @import("system_sdk");
 const text = @import("text");
+const SharedGpu = @import("shared_gpu.zig").SharedGpu;
 const shared_renderer = @import("gpu").is_direct3d;
 const windows_paint = if (shared_renderer) @import("windows_shared_paint.zig") else @import("windows_paint.zig");
 const test_harness = @import("test_harness");
@@ -31,11 +32,28 @@ pub const Config = struct {
     window: WindowConfig = .{},
     /// Return false to cancel. Called for native and application close requests.
     on_close_request: ?*const fn (*App) bool = null,
+    /// Called once before teardown, while every App resource is still usable.
+    on_destroy: ?*const fn (*App) void = null,
+    /// Application-level shortcuts: called for every native key event before
+    /// UI dispatch; return true to consume it. Runs whether or not a node has
+    /// focus, so commands such as "open global search" work from any state.
+    /// Use `ui.events.primaryModifier` for the platform command key. Test
+    /// harness key injection goes straight to the UI and does not pass here.
+    on_key: ?*const fn (*App, @import("window_config.zig").KeyEvent) bool = null,
+    /// Called after this window stops being the active window, at the
+    /// event-dispatch boundary, with where focus went. Typically set on owned
+    /// panels (`WindowConfig.owner`) that close when the user returns to
+    /// another window of the application.
+    on_focus_lost: ?*const fn (*App, platform.owned_window.FocusLoss) void = null,
     font: FontConfig = .{},
     clear_color: ClearColor = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
     visual_quality: ?@import("render").visual_quality.Quality = null,
     pump_timeout_ms: u32 = 16,
     idle_skip_frames: bool = true,
+    /// Start Zenit's file-RPC test harness for this window when the build has
+    /// test-mode. An application that runs its own harness on the same RPC
+    /// directory turns this off (two servers would race for each request).
+    builtin_test_harness: bool = true,
 };
 
 /// D3D12 compiles HLSL at runtime, and the blur + glass sources (~87 KB) take
@@ -77,6 +95,9 @@ pub const App = struct {
     renderer: *windows_paint.Painter,
     chrome: chrome_controller.Controller,
     should_quit: bool = false,
+    destroying: bool = false,
+    /// Owner of this window when created through `WindowConfig.owner`.
+    owner_window: ?system_sdk.events.WindowId = null,
     width: u32,
     height: u32,
     scale: f32,
@@ -107,6 +128,13 @@ pub const App = struct {
     }
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !*App {
+        return initWithSharedGpu(allocator, config, null);
+    }
+
+    fn initWithSharedGpu(allocator: std.mem.Allocator, config: Config, shared_slot: ?*?*SharedGpu) !*App {
+        if (comptime !shared_renderer) {
+            if (shared_slot != null) return error.SharedGpuRequiresDirect3D;
+        }
         const sizes = [_]u32{ config.font.small_size, config.font.medium_size, config.font.large_size };
         for (sizes) |size| if (size == 0) return error.InvalidFontSize;
         const self = try allocator.create(App);
@@ -114,9 +142,15 @@ pub const App = struct {
         self.config = config;
         self.allocator = allocator;
         self.should_quit = false;
+        self.destroying = false;
+        self.owner_window = null;
+        // allocator.create applies no field defaults; deinit and the init
+        // errdefer read this on every backend.
+        self.prewarm_thread = null;
         self.font_registry = null;
         self.fallback_stack = null;
-        self.win = try platform.Window.init(config.window.width, config.window.height, config.window.title);
+        // An owned window appears only once it is owned and placed (attachOwner).
+        self.win = try platform.Window.initApplication(config.window.width, config.window.height, config.window.title, config.window.owner != null);
         errdefer self.win.deinit();
         self.chrome = .{ .initial = try chrome_backend.configure(&self.win, @import("window_config.zig").requestedChrome(config.window), config.window.titlebar_height) };
         try chrome_backend.configureHeader(&self.win, self.chrome.initial, config.window.fullscreen_header, config.window.titlebar_height);
@@ -172,8 +206,14 @@ pub const App = struct {
         self.native_frame_active = false;
         self.native_redraw_pending = false;
         self.in_native_callback = false;
-        self.cx.setWindowMetrics(@floatFromInt(self.width), @floatFromInt(self.height), self.scale);
-        self.painter = try windows_paint.Painter.init(allocator, config.io, &self.win, .{
+        const logical = self.win.getLogicalSize();
+        self.cx.setWindowMetrics(logical[0], logical[1], self.scale);
+        self.painter = if (comptime shared_renderer) try windows_paint.Painter.initWithSharedGpu(allocator, config.io, &self.win, .{
+            config.clear_color.r,
+            config.clear_color.g,
+            config.clear_color.b,
+            config.clear_color.a,
+        }, shared_slot) else try windows_paint.Painter.init(allocator, config.io, &self.win, .{
             config.clear_color.r,
             config.clear_color.g,
             config.clear_color.b,
@@ -213,7 +253,41 @@ pub const App = struct {
         return if (self.cx.legacyWindowControlAt(x, y)) 1 else 0;
     }
 
+    /// Change this window's title after creation (Window menu / taskbar /
+    /// accessibility name). WindowConfig.title only sets the initial one.
+    pub fn setTitle(self: *App, title: [:0]const u8) void {
+        self.win.setTitle(title);
+    }
+
+    /// The GPU renderer behind this window: the shared AppRenderer when this
+    /// Windows build paints through it, null for the native Direct2D painter.
+    pub fn appRenderer(self: *App) ?*@import("renderer.zig").AppRenderer {
+        if (comptime shared_renderer) return &self.painter.state.renderer;
+        return null;
+    }
+
+    /// Window content size in logical units (same meaning on every runtime).
+    pub fn viewportLogicalSize(self: *const App) [2]f32 {
+        return .{ self.cx.viewport.width, self.cx.viewport.height };
+    }
+
+    pub fn bindMenuCommand(self: *App, command_id: u64, action: ui.actions.Action) void {
+        self.cx.bindCommandAction(command_id, action);
+    }
+
+    pub fn sharedImageStore(self: *App) ?*@import("render").ImageTextureStore {
+        if (comptime shared_renderer) {
+            return if (self.painter.state.shared_gpu) |shared| &shared.images else null;
+        }
+        return null;
+    }
+
     pub fn deinit(self: *App) void {
+        if (self.destroying) return;
+        self.destroying = true;
+        // Nothing paints once the renderer detaches below.
+        self.win.conceal();
+        if (self.config.on_destroy) |callback| callback(self);
         if (self.prewarm_thread) |thread| thread.join();
         self.prewarm_thread = null;
         chrome_backend.setHitCallback(&self.win, null, null);
@@ -223,6 +297,11 @@ pub const App = struct {
         @import("windows_accessibility.zig").detach(&self.win);
         if (test_harness.enabled and g_test_cx == self.cx) g_test_cx = null;
         if (test_harness.enabled and g_test_app == self) g_test_app = null;
+        if (g_recording_app == self) {
+            if (comptime shared_renderer) self.painter.flushRecording(&self.win);
+            g_last_recording = mapRecordingState(self.win.stopWindowRecording());
+            g_recording_app = null;
+        }
         self.cx.deinit();
         self.painter.deinit(&self.win);
         self.font_selector.deinitDerivedCache();
@@ -380,6 +459,23 @@ pub const App = struct {
         return self.font_system.findFont(.{ .family = self.resolved_font_family, .size = size, .weight = mapped }) catch null;
     }
 
+    /// Replace the mounted UI at a host safe boundary (outside UI callbacks).
+    /// A failed builder leaves an empty wrapper and portal, ready for another remount.
+    pub fn remount(self: *App, mount_fn: MountFn) !void {
+        self.cx.unmount();
+        self.mount(mount_fn) catch |err| {
+            // Also reset any builder state before beginning the fallback transaction.
+            self.cx.unmount();
+            try self.mount(emptyRoot);
+            return err;
+        };
+        self.cx.requestRedraw();
+    }
+
+    fn emptyRoot(cx: *ui.Cx, _: *ui.Scope) anyerror!*ui.Node {
+        return ui.box(cx, .{ .width = .{ .grow = .{} }, .height = .{ .grow = .{} } }, .{});
+    }
+
     pub fn mount(self: *App, mount_fn: MountFn) !void {
         if (self.cx.root != null) return error.AlreadyMounted;
         const allocator = self.cx.allocator;
@@ -388,7 +484,7 @@ pub const App = struct {
             .height = .{ .grow = .{} },
         }, .{});
         var app_root_orphan = true;
-        errdefer if (app_root_orphan) app_root.destroy(allocator);
+        errdefer if (app_root_orphan) self.cx.freeDetachedNodeAfterScopeDispose(app_root);
 
         const portal = try ui.box(self.cx, .{
             .position = .absolute,
@@ -396,7 +492,7 @@ pub const App = struct {
             .height = .{ .grow = .{} },
         }, .{});
         var portal_orphan = true;
-        errdefer if (portal_orphan) portal.destroy(allocator);
+        errdefer if (portal_orphan) self.cx.freeDetachedNodeAfterScopeDispose(portal);
         portal.meta.ownership.meta.component_name = "WindowOverlayPortal";
         const portal_ext = try portal.style.ensureExtFallible(allocator);
         portal_ext.z_index = ui.Cx.window_portal_z_index;
@@ -405,10 +501,8 @@ pub const App = struct {
         const scope = try ui.Scope.init(allocator, null, self.cx.owner);
         var scope_owned = true;
         errdefer if (scope_owned) {
-            if (self.cx.root_scope == scope) self.cx.root_scope = null;
-            if (self.cx.popover_portal_root == portal) self.cx.popover_portal_root = null;
-            if (self.cx.root == app_root) self.cx.root = null;
-            scope.dispose();
+            @import("mount_rollback.zig").rollback(self.cx, portal, null);
+            app_root_orphan = false;
         };
         self.cx.root_scope = scope;
         self.cx.root = app_root;
@@ -416,20 +510,15 @@ pub const App = struct {
 
         const user_root = try mount_fn(self.cx, scope);
         app_root.appendChild(allocator, user_root) catch |err| {
-            scope.dispose();
+            @import("mount_rollback.zig").rollback(self.cx, portal, user_root);
             scope_owned = false;
-            self.cx.root_scope = null;
-            self.cx.popover_portal_root = null;
-            self.cx.root = null;
-            user_root.destroy(allocator);
+            app_root_orphan = false;
             return err;
         };
         app_root.appendChild(allocator, portal) catch |err| {
-            scope.dispose();
+            @import("mount_rollback.zig").rollback(self.cx, portal, null);
             scope_owned = false;
-            self.cx.root_scope = null;
-            self.cx.popover_portal_root = null;
-            self.cx.root = null;
+            app_root_orphan = false;
             return err;
         };
         portal_orphan = false;
@@ -438,7 +527,7 @@ pub const App = struct {
         self.cx.is_mounted = true;
         self.cx.content_root = user_root;
         self.cx.needs_redraw = true;
-        if (test_harness.enabled) {
+        if (test_harness.enabled and self.config.builtin_test_harness) {
             self.rebindTestHarness();
             test_harness.init(self.cx.io, getTestCx, wakeTestHarness);
         }
@@ -513,18 +602,25 @@ pub const App = struct {
             }
         }
         chrome_controller.syncChrome(self);
-        defer self.cx.publishWindowRegions();
+        // Publish fresh window regions for the native titlebar hit callback
+        // only when this frame did not render: Cx.render already rebuilt the
+        // hit scene, and forcing freshness afterwards re-ran every
+        // before_render hook outside the frame (state changed after paint,
+        // e.g. a just-mounted toolbar revealed a frame before it was drawn).
+        var rendered = false;
+        defer if (!rendered) self.cx.publishWindowRegions();
         const size = self.win.getSize();
         const scale = self.win.getScaleFactor();
         self.cx.display_refresh_hz = self.win.getDisplayRefreshRate();
-        if (size[0] != self.width or size[1] != self.height or scale != self.scale) {
+        const logical = self.win.getLogicalSize();
+        if (logical[0] != self.cx.viewport.width or logical[1] != self.cx.viewport.height or scale != self.scale) {
             self.width = size[0];
             self.height = size[1];
             self.scale = scale;
             self.font_selector.setScaleFactor(scale);
             if (self.painter.fonts) |fonts| fonts.setScaleFactor(scale);
             if (self.font_registry) |registry| registry.setScaleFactor(scale);
-            self.cx.setWindowMetrics(@floatFromInt(self.width), @floatFromInt(self.height), scale);
+            self.cx.setWindowMetrics(logical[0], logical[1], scale);
         }
         self.cx.bindFrameClock();
         // Native paint must not execute queued provider/business mutations.
@@ -536,7 +632,25 @@ pub const App = struct {
         // measurement requests one frame so adaptive hooks see it; unfinished
         // readbacks neither block the UI nor force continuous GPU redraws.
         if (self.painter.refreshLuminance(self.cx)) self.cx.needs_redraw = true;
-        if (!self.idle_skip_frames or self.cx.wantsFrame() or self.win.windowRecordingStatus().active != 0) try self.painter.update(self.cx, &self.win);
+        if (!self.idle_skip_frames or self.cx.wantsFrame() or self.win.windowRecordingStatus().active != 0) {
+            rendered = true;
+            try self.painter.update(self.cx, &self.win);
+            // Reveal on the first frame that carries the application's UI.
+            // Showing the window paints synchronously before the app mounts
+            // its root; that frame is background only and must stay cloaked.
+            // Both painters present every non-empty frame they are given.
+            if (self.cx.root != null and size[0] != 0 and size[1] != 0) self.win.notePresented();
+        }
+    }
+
+    fn offscreenMaintenanceTimeoutMs(self: *const App, timeout_ms: u32) u32 {
+        if (comptime shared_renderer) {
+            if (self.painter.state.renderer.nextOffscreenMaintenanceDelayNs()) |delay_ns| {
+                const ms = @max(1, (delay_ns +| (std.time.ns_per_ms - 1)) / std.time.ns_per_ms);
+                return @min(timeout_ms, @as(u32, @intCast(@min(ms, std.math.maxInt(u32)))));
+            }
+        }
+        return timeout_ms;
     }
 
     pub fn run(self: *App) !void {
@@ -544,11 +658,12 @@ pub const App = struct {
         try self.frame();
         while (!self.should_quit) {
             const timeout = if (self.cx.wantsFrame()) 0 else if (test_harness.enabled) @min(self.pump_timeout_ms, 16) else self.pump_timeout_ms;
-            platform.Window.pumpAppEventsTimeout(timeout);
+            platform.Window.pumpAppEventsTimeout(self.offscreenMaintenanceTimeoutMs(timeout));
             self.cx.bindFrameClock();
             if (test_harness.enabled) test_harness.drainCommands();
             const result = try self.sdk.pump(0);
             for (self.sdk.events()) |event| self.processEvent(event);
+            self.dispatchFocusLoss();
             if (!result.should_continue or self.should_quit) break;
             try self.frame();
         }
@@ -556,6 +671,12 @@ pub const App = struct {
 
     pub fn processEvent(self: *App, event: system_sdk.events.Event) void {
         self.processEventFrom(.os, event);
+    }
+
+    /// Deliver a focus loss recorded by WM_ACTIVATE to `on_focus_lost`.
+    pub fn dispatchFocusLoss(self: *App) void {
+        const loss = self.win.takeFocusLoss() orelse return;
+        if (self.config.on_focus_lost) |callback| callback(self, loss);
     }
 
     /// Only for gallery contracts that own and synchronously seed the native
@@ -573,13 +694,30 @@ pub const App = struct {
         // only the test's own input. Without it, a person using the machine during a background
         // run moves the real cursor over the window and its hover state lands in screenshots.
         if (pointer_isolation.shouldDropEvent(test_harness.enabled, test_harness.enabled and isolateOsPointer(), source, event)) return;
+        // Same IME contract as the macOS runtime: re-sync the native text-input
+        // session with the focused node after every event (focus, clicks and
+        // key handlers can all move it). The generation filter only drops
+        // stale composition events on backends that report IME generations;
+        // the Win32 backend does not yet, so it passes everything.
+        if (!self.sdk.imeEventCurrent(event)) return;
+        defer self.cx.refreshTextInputSession();
         switch (event) {
             .quit => self.should_quit = true,
             .window_close_requested => self.requestClose() catch {},
             .window_resized, .frame_requested, .system_theme_changed => self.cx.needs_redraw = true,
             .window_focused => |e| {
                 self.cx.needs_redraw = true;
-                if (!e.focused) self.cx.cancelPointerInteractions(.window_blur);
+                // Win32 has no separate key/main distinction: the window looks
+                // active exactly while it is the focused foreground window.
+                // Test-mode runs in the background, so treat it as active unless
+                // the test asks for real activation (inactive baselines).
+                const appears_active = if (test_harness.enabled and !@import("zenit_environment").has("ZENIT_E2E_REAL_ACTIVATION")) true else e.focused and e.appears_active;
+                if (self.cx.window_active != appears_active) {
+                    self.cx.window_active = appears_active;
+                    // Inactive appearance (caption text, glass tint) is resolved in hooks.
+                    if (self.cx.root) |root| root.markSubtreeBeforeRenderHook();
+                }
+                if (!e.focused) self.cx.cancelPointerInteractions(.window_blur) else self.cx.replayCursor();
             },
             .mouse_move => |e| self.cx.handleMouseMoveEx(e.x, e.y, toUiModifiers(e.modifiers)),
             .mouse_button => |e| {
@@ -599,10 +737,12 @@ pub const App = struct {
             .mouse_wheel => |e| self.cx.handleSdkWheel(e),
             .key => |e| {
                 const key = ui.events.KeyCode.fromWindowsVirtualKey(e.keycode);
-                if (e.pressed) self.cx.handleKeyDown(key, toUiModifiers(e.modifiers)) else self.cx.handleKeyUp(key, toUiModifiers(e.modifiers));
+                const mods = toUiModifiers(e.modifiers);
+                if (self.config.on_key) |filter| if (filter(self, .{ .key = key, .modifiers = mods, .pressed = e.pressed })) return;
+                if (e.pressed) self.cx.handleKeyDown(key, mods) else self.cx.handleKeyUp(key, mods);
             },
             .text_input => |e| self.cx.handleTextInput(e.text),
-            .ime_preedit => |e| self.cx.handleImePreeditReplace(e.text, e.cursor_utf8_offset, e.replace_start_utf8, e.replace_end_utf8),
+            .ime_preedit => |e| self.cx.handleImePreeditEvent(.{ .text = e.text, .cursor_utf8_offset = e.cursor_utf8_offset, .cursor_visible = e.cursor_visible, .selection_end_utf8 = e.selection_end_utf8, .replace_start_utf8 = e.replace_start_utf8, .replace_end_utf8 = e.replace_end_utf8 }),
             .ime_commit => |e| self.cx.handleImeCommitReplace(e.text, e.replace_start_utf8, e.replace_end_utf8),
             .ime_delete_surrounding => |e| self.cx.handleImeDeleteSurrounding(e.before_bytes, e.after_bytes),
             .magnify => |e| self.cx.handleMagnify(e.magnification, e.x, e.y, @fromBackingInt(@intCast(e.phase))),
@@ -615,12 +755,39 @@ pub const App = struct {
     }
 };
 
-pub const MultiWindowConfig = struct { pump_timeout_ms: u32 = 16 };
+pub const MultiWindowConfig = struct {
+    /// Share one device, queue and image namespace until MultiWindowApp.deinit.
+    shared_gpu: bool = false,
+    pump_timeout_ms: u32 = 16,
+    /// Called for a user quit request (application menu Quit) before any
+    /// window is torn down. Return false to keep running, e.g. after reporting
+    /// unsaved work. `quit()` itself is never vetoed.
+    on_quit_request: ?*const fn (*MultiWindowApp) bool = null,
+    /// Sees every native event in queue order before it is routed to a
+    /// window (input recording, diagnostics). Runs while windows are being
+    /// iterated: observe only, do not create or close windows here.
+    on_event: ?*const fn (*MultiWindowApp, system_sdk.events.Event) void = null,
+    /// Application-level menu commands, offered before window routing.
+    /// Return true to consume the command. Commands chosen with no key window
+    /// (window_id 0, e.g. a process command with no window open) arrive here
+    /// too; they used to be dropped. Commands captured for a window that has
+    /// since closed are discarded with that window and are not offered.
+    on_menu_command: ?*const fn (*MultiWindowApp, MenuCommand) bool = null,
+};
+
+/// A custom menu command as delivered to `MultiWindowConfig.on_menu_command`.
+/// `window_id` is the window that was key when the command was chosen, or 0
+/// when there was none.
+pub const MenuCommand = struct {
+    command_id: u64,
+    window_id: system_sdk.events.WindowId,
+};
 
 pub const MultiWindowApp = struct {
     pub const max_windows = window_lifecycle.MAX_WINDOWS;
     allocator: std.mem.Allocator,
     config: MultiWindowConfig,
+    shared_gpu: ?*SharedGpu = null,
     windows: std.ArrayList(*App) = .empty,
     lifecycle: window_lifecycle.State = .{},
     iterating: bool = false,
@@ -630,9 +797,17 @@ pub const MultiWindowApp = struct {
     }
 
     pub fn deinit(self: *MultiWindowApp) void {
-        while (self.windows.pop()) |app| app.deinit();
+        self.iterating = true;
+        while (self.windows.pop()) |app| {
+            self.detachOwner(app);
+            app.deinit();
+        }
+        if (self.shared_gpu) |shared| shared.deinit();
+        self.shared_gpu = null;
         self.windows.deinit(self.allocator);
+        self.windows = .empty;
         self.lifecycle = .{};
+        self.iterating = false;
     }
 
     pub fn windowCount(self: *const MultiWindowApp) usize {
@@ -657,19 +832,25 @@ pub const MultiWindowApp = struct {
     }
     pub fn createWindow(self: *MultiWindowApp, config: Config) !*App {
         try self.reserve();
-        const app = try App.init(self.allocator, config);
+        const owner = try self.ownerFor(config);
+        const app = try App.initWithSharedGpu(self.allocator, config, if (self.config.shared_gpu) &self.shared_gpu else null);
         errdefer app.deinit();
+        attachOwner(app, owner, config.window.placement);
+        errdefer self.detachOwner(app);
         try self.lifecycle.add(app.windowId());
         self.windows.appendAssumeCapacity(app);
         return app;
     }
     pub fn createWindowWith(self: *MultiWindowApp, config: Config, mount_fn: App.MountFn) !*App {
         try self.reserve();
-        const app = try App.init(self.allocator, config);
+        const owner = try self.ownerFor(config);
+        const app = try App.initWithSharedGpu(self.allocator, config, if (self.config.shared_gpu) &self.shared_gpu else null);
         errdefer {
             app.deinit();
             if (self.activeWindow()) |survivor| survivor.rebindTestHarness();
         }
+        attachOwner(app, owner, config.window.placement);
+        errdefer self.detachOwner(app);
         try app.mount(mount_fn);
         try self.lifecycle.add(app.windowId());
         self.windows.appendAssumeCapacity(app);
@@ -687,16 +868,70 @@ pub const MultiWindowApp = struct {
         return true;
     }
     fn applyPendingCloses(self: *MultiWindowApp) void {
-        while (self.lifecycle.popPendingClose()) |id| {
-            for (self.windows.items, 0..) |app, index| {
-                if (app.windowId() != id) continue;
-                _ = self.windows.orderedRemove(index);
-                _ = self.lifecycle.removed(id);
-                app.deinit();
-                if (self.activeWindow()) |survivor| survivor.rebindTestHarness();
-                break;
+        if (self.iterating) return;
+        self.iterating = true;
+        defer self.iterating = false;
+        while (self.lifecycle.popPendingClose()) |id| self.destroyWindowNow(id);
+    }
+    fn destroyWindowNow(self: *MultiWindowApp, id: system_sdk.events.WindowId) void {
+        // Owned windows close with their owner, and go first: Win32 destroys
+        // owned HWNDs together with the owner, so cut the relation while both
+        // native windows still exist.
+        var child_index: usize = 0;
+        while (child_index < self.windows.items.len) {
+            const child = self.windows.items[child_index];
+            if (child.owner_window == id) {
+                self.destroyWindowNow(child.windowId());
+                child_index = 0;
+                continue;
             }
+            child_index += 1;
         }
+        for (self.windows.items, 0..) |app, index| {
+            if (app.windowId() != id) continue;
+            const owner_id = app.owner_window;
+            self.detachOwner(app);
+            _ = self.windows.orderedRemove(index);
+            _ = self.lifecycle.removed(id);
+            app.deinit();
+            if (self.activeWindow()) |survivor| survivor.rebindTestHarness();
+            // Windows hands activation to an arbitrary window (or another
+            // application) when the active one is destroyed. Make the fallback
+            // explicit so keyboard focus, IME and shortcuts stay with this app.
+            if (!self.lifecycle.quit_requested) {
+                // A closing panel hands focus back to its owner.
+                if (owner_id) |owner| if (self.window(owner) != null) self.lifecycle.setFocused(owner, true);
+                if (self.activeWindow()) |survivor| survivor.activate();
+            }
+            break;
+        }
+    }
+    /// A user quit request: the application may veto it, which withdraws the
+    /// native request so the next pump does not report it again.
+    fn requestUserQuit(self: *MultiWindowApp) void {
+        if (self.lifecycle.quit_requested) return;
+        if (self.config.on_quit_request) |allow| if (!allow(self)) {
+            platform.Window.cancelAppQuit();
+            return;
+        };
+        self.quit();
+    }
+    fn ownerFor(self: *MultiWindowApp, config: Config) !?*App {
+        const owner_id = config.window.owner orelse return null;
+        return self.window(owner_id) orelse error.UnknownOwnerWindow;
+    }
+    fn attachOwner(app: *App, owner: ?*App, placement: @import("window_config.zig").Placement) void {
+        const target = owner orelse return;
+        app.owner_window = target.windowId();
+        if (!app.win.setOwner(&target.win)) std.log.scoped(.zenit_runtime).warn("owned window relation failed", .{});
+        if (placement == .center_on_owner) _ = app.win.centerOnOwner(&target.win);
+        app.win.show();
+    }
+    /// Cut the native owner relation while both windows are still alive.
+    fn detachOwner(self: *MultiWindowApp, app: *App) void {
+        const owner_id = app.owner_window orelse return;
+        if (self.window(owner_id)) |owner| app.win.clearOwner(&owner.win);
+        app.owner_window = null;
     }
     pub fn pump(self: *MultiWindowApp, timeout_ms: u32) !bool {
         if (!self.shouldContinue()) return false;
@@ -706,27 +941,46 @@ pub const MultiWindowApp = struct {
         }
         self.applyPendingCloses();
         if (!self.shouldContinue()) return false;
-        platform.Window.pumpAppEventsTimeout(timeout_ms);
+        var maintenance_timeout_ms = timeout_ms;
+        for (self.windows.items) |app| maintenance_timeout_ms = app.offscreenMaintenanceTimeoutMs(maintenance_timeout_ms);
+        platform.Window.pumpAppEventsTimeout(maintenance_timeout_ms);
         self.iterating = true;
         {
             defer self.iterating = false;
+            // The native quit flag is process-wide, so every window's pump
+            // reports it with a `.quit` event. Ask the application once per
+            // pump; a veto withdraws the request and the rest of the batch
+            // (input, focus, resize) is still delivered.
+            var quit_asked = false;
             for (self.windows.items) |app| {
                 app.cx.bindFrameClock();
                 const result = try app.sdk.pump(0);
-                if (!result.should_continue) {
+                if (!result.should_continue and !platform.Window.appShouldQuit()) {
+                    // The native window itself is gone.
                     _ = self.lifecycle.requestClose(app.windowId());
                     continue;
                 }
                 app.sdk.dispatching = true;
                 defer app.sdk.dispatching = false;
                 for (app.sdk.events()) |event| {
+                    if (self.config.on_event) |observe| observe(self, event);
+                    if (event == .menu_command) if (self.config.on_menu_command) |handle| {
+                        const e = event.menu_command;
+                        if (handle(self, .{ .command_id = e.command_id, .window_id = e.window_id })) continue;
+                    };
                     if (event == .quit) {
-                        self.quit();
-                        break;
+                        if (!quit_asked) {
+                            quit_asked = true;
+                            self.requestUserQuit();
+                        }
+                        if (self.lifecycle.quit_requested) break;
+                        continue;
                     }
                     if (event == .window_focused) self.lifecycle.setFocused(event.window_focused.window_id, event.window_focused.focused);
                     app.processEvent(event);
                 }
+                if (self.lifecycle.quit_requested) break;
+                app.dispatchFocusLoss();
                 if (app.should_quit) _ = self.lifecycle.requestClose(app.windowId());
             }
         }
@@ -758,6 +1012,22 @@ pub const MultiWindowApp = struct {
     pub fn run(self: *MultiWindowApp) !void {
         while (try self.tick()) {}
     }
+    /// Render this window on the next `frame()` without waiting for a display
+    /// tick. For work the application did outside event dispatch whose result
+    /// must be on screen before more input is handled, such as a command from
+    /// its own test harness (the built-in harness does this itself).
+    pub fn requestFrame(self: *MultiWindowApp, id: system_sdk.events.WindowId) void {
+        // Windows has no display tick gate: a dirty window renders next frame().
+        if (self.window(id)) |app| app.cx.needs_redraw = true;
+    }
+
+    /// Wake the application loop from any thread (a watcher, a language
+    /// server reader, terminal output) so it handles new work without waiting
+    /// for its pump timeout. Safe to call before or during a pump.
+    pub fn wakeFromAnyThread() void {
+        platform.Window.postEmptyEvent();
+    }
+
     pub fn quit(self: *MultiWindowApp) void {
         self.lifecycle.requestQuit();
     }
@@ -768,6 +1038,8 @@ pub const MultiWindowApp = struct {
 
 var g_test_cx: ?*ui.Cx = null;
 var g_test_app: ?*App = null;
+var g_recording_app: ?*App = null;
+var g_last_recording: test_harness.RecordingState = .{};
 
 fn getTestCx() ?*ui.Cx {
     return g_test_cx;
@@ -815,6 +1087,7 @@ fn frameStatsForHarness() test_harness.FrameStatsSnapshot {
         .texture_creates = if (shared_renderer) app.painter.state.renderer.last_frame_stats.texture_creates else 0,
         .render_passes = if (shared_renderer) app.painter.state.renderer.last_frame_stats.render_passes else 0,
         .blit_passes = if (shared_renderer) app.painter.state.renderer.last_frame_stats.blit_passes else 0,
+        .compute_passes = if (shared_renderer) app.painter.state.renderer.last_frame_stats.compute_passes else 0,
         .pass_native_us = if (shared_renderer) app.painter.state.renderer.last_frame_stats.pass_native_us else 0,
         .gpu_p95_us = st.gpu_p95_us,
         .cpu_p95_us = st.cpu_p95_us,
@@ -858,16 +1131,27 @@ fn startRecordingForHarness(path: []const u8, fps: u32) test_harness.RecordingSt
         state.setError("window recording requires the D3D12 renderer");
         return state;
     }
+    if (g_recording_app) |owner| {
+        const active = mapRecordingState(owner.win.windowRecordingStatus());
+        if (active.active) {
+            var state = active;
+            state.ok = false;
+            state.setError("a window recording is already active");
+            return state;
+        }
+    }
     const app = g_test_app orelse return .{};
     if (shared_renderer) app.painter.flushRecording(&app.win);
-    return mapRecordingState(app.win.startWindowRecording(path, fps));
+    const state = mapRecordingState(app.win.startWindowRecording(path, fps));
+    if (state.ok and state.active) g_recording_app = app;
+    return state;
 }
 fn recordingStatusForHarness() test_harness.RecordingState {
-    const app = g_test_app orelse return .{};
+    const app = g_recording_app orelse return g_last_recording;
     return mapRecordingState(app.win.windowRecordingStatus());
 }
 fn stopRecordingForHarness() test_harness.RecordingState {
-    const app = g_test_app orelse return .{};
+    const app = g_recording_app orelse return g_last_recording;
     if (shared_renderer) app.painter.flushRecording(&app.win);
     return mapRecordingState(app.win.stopWindowRecording());
 }

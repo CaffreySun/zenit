@@ -13,6 +13,13 @@ require() {
   fi
 }
 
+# v1 reverses the archive platform/architecture and cannot install modern releases.
+if rg -q 'uses: mlugg/setup-zig@v1([[:space:]]|$)' "$WORKFLOW"; then
+  echo "CI must use a release-aware Zig installer, not setup-zig v1" >&2
+  exit 1
+fi
+require 'test "\$\(zig version\)" = "0\.17\.0"' 'installed compiler version smoke check'
+
 require '^  push:$' 'push trigger'
 require '^  pull_request:$' 'pull-request trigger'
 require '^permissions:$' 'explicit least-privilege permissions'

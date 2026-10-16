@@ -142,6 +142,10 @@ pub const PanelOptions = struct {
     /// target; initial theme takes cx.tokens scheme at mountPanel.
     light_theme: *const theme.ThemeTokens = &theme.light,
     dark_theme: *const theme.ThemeTokens = &theme.dark,
+    /// Space reserved above the panel header for the window's titlebar (the
+    /// macOS traffic lights over full-size content). Pass 0 when the host
+    /// already draws its own window header above the panel.
+    titlebar_safe_top: f32 = 28,
 };
 
 // ========== View mode ==========
@@ -533,8 +537,8 @@ fn buildPanelContent(cx: *Cx, target: *Cx, state: *DevToolsState, root: *Node) !
     // caller bottom-up; state node pointers publish only after assembly success.
     const a = cx.allocator;
 
-    const titlebar_safe_top: f32 = 28;
-    _ = try core.adoptChild(cx, a, root, try core.box(cx, .{
+    const titlebar_safe_top = state.panel_opts.titlebar_safe_top;
+    if (titlebar_safe_top > 0) _ = try core.adoptChild(cx, a, root, try core.box(cx, .{
         .height = .{ .px = titlebar_safe_top },
         .background = t.tokens.color.bg_primary,
     }, .{}));
@@ -4313,6 +4317,26 @@ test "DevTools header theme toggle flips scheme and rebuilds panel content" {
     try std.testing.expectEqual(child_count, panel.children.items.len);
 }
 
+test "DevTools titlebar_safe_top = 0 drops the titlebar spacer for hosts with their own header" {
+    var target = try Cx.init(std.testing.allocator, std.testing.io);
+    defer target.deinit();
+    target.root = try core.box(target, .{}, .{});
+
+    var with_spacer = try Cx.init(std.testing.allocator, std.testing.io);
+    defer with_spacer.deinit();
+    const a = try mountPanel(with_spacer, target, .{});
+    with_spacer.root = a;
+
+    var without = try Cx.init(std.testing.allocator, std.testing.io);
+    defer without.deinit();
+    const b = try mountPanel(without, target, .{ .titlebar_safe_top = 0 });
+    without.root = b;
+
+    try std.testing.expectEqual(a.children.items.len - 1, b.children.items.len);
+    try std.testing.expectEqual(@as(f32, 28), a.children.items[0].style.height.px);
+    try std.testing.expect(b.children.items[0].style.height != .px or b.children.items[0].style.height.px != 28);
+}
+
 test "DevTools float formatting accepts non-finite and extreme rect values" {
     var buf: [12]u8 = undefined;
     try std.testing.expectEqualStrings("nan", dv_fmt.fmtFloat(&buf, std.math.nan(f32)));
@@ -4613,3 +4637,8 @@ test "mountPanel 在任意分配点失败时不泄漏" {
     if (leaked > 0) std.debug.print("\n[devtools.mountPanel] LEAK at {d}/{d} failure points; induced={d}; first={?d}\n", .{ leaked, total_allocs, induced, first_leak });
     try t.expectEqual(@as(usize, 0), leaked);
 }
+
+/// Stable-address requested allocation ledger for opt-in subsystem diagnostics.
+pub const CountingAllocator = @import("core/counting_allocator.zig").CountingAllocator;
+
+pub const intrinsicCacheMemoryStats = @import("core/layout_engine.zig").intrinsicCacheMemoryStats;

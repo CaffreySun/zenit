@@ -60,7 +60,7 @@ pub fn debugOverlayPlan(
     stage: []const u8,
 ) void {
     if (!shouldDebugOverlayNode(node)) return;
-    const bbox = node.getLayoutOutput().artifacts.children_bbox orelse ComputedRect.init(0, 0, 0, 0);
+    const bbox = node.layoutChildrenBbox() orelse ComputedRect.init(0, 0, 0, 0);
     std.debug.print(
         "[overlay-debug] frame={d} stage={s} component={s} id={d} dirty(r={any} sr={any} c={any} sc={any}) runtime(anim={any} op={any} tx={any} valid={any} promoted={d}) plan(replay={any} write={any} strategy={s} invalid={s}) style(op={d:.3} sx={d:.3} sy={d:.3}) rect=({d:.1},{d:.1},{d:.1},{d:.1}) bbox=({d:.1},{d:.1},{d:.1},{d:.1}) opacity_bounds=({d:.1},{d:.1},{d:.1},{d:.1})\n",
         .{

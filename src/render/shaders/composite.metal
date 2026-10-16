@@ -1,3 +1,6 @@
+#ifndef ZENIT_FRAMEBUFFER_FETCH
+#define ZENIT_FRAMEBUFFER_FETCH 1
+#endif
 #include <metal_stdlib>
 using namespace metal;
 
@@ -93,12 +96,18 @@ float zb_rounded_rect_mask(float2 point, float2 size, float radius) {
 fragment float4 blend_fragment_main(
     VOut in [[stage_in]],
     texture2d<float> source_texture [[texture(0)]],
+#if ZENIT_FRAMEBUFFER_FETCH
+    float4 destination_premul [[color(0)]],
+#else
     texture2d<float> destination_texture [[texture(1)]],
+#endif
     sampler texture_sampler [[sampler(0)]],
     constant BlendUniforms& uniforms [[buffer(0)]])
 {
     float2 fragment_pixel = in.position.xy;
+#if !ZENIT_FRAMEBUFFER_FETCH
     float4 destination_premul = destination_texture.read(uint2(fragment_pixel));
+#endif
     // Destination pixel -> layer-local pixel (arbitrary affine: rotate / draw_transform)
     float2 local = float2(uniforms.inv.x * fragment_pixel.x + uniforms.inv.z * fragment_pixel.y,
                           uniforms.inv.y * fragment_pixel.x + uniforms.inv.w * fragment_pixel.y) + uniforms.inv_offset;
@@ -128,6 +137,7 @@ fragment float4 blend_fragment_main(
         sample_local = clamp(local - dir * amount * fade, float2(0.0), uniforms.rect_size - 1.0);
     }
     float2 source_uv = uniforms.src_uv_origin.xy + (sample_local / uniforms.rect_size) * uniforms.src_uv_scale;
+    source_uv = min(source_uv, uniforms.src_uv_origin.zw);
     float4 source_premul = source_texture.sample(texture_sampler, source_uv);
     source_premul *= zb_rounded_rect_mask(local - uniforms.params.w, uniforms.rect_size - 2.0 * uniforms.params.w, uniforms.params.z) * zb_clip_coverage(fragment_pixel, uniforms);
     float4 source = zb_unpremul(source_premul);

@@ -1,4 +1,5 @@
 const std = @import("std");
+const id_hash = @import("id_hash.zig");
 const node_dirty_gen = @import("node_dirty.zig");
 
 const types = @import("types.zig");
@@ -32,12 +33,11 @@ pub const PerfCounters = struct {
     hit_test_count: u32 = 0,
     cursor_hit_test_count: u32 = 0,
     registry_resolve_count: u32 = 0,
-    /// Nodes visited by `syncPaintToTable`, i.e. the size of the live node
-    /// tree. The remaining end-of-frame shadow-sync passes (paint, interaction,
-    /// a11y) are each an ungated full-tree recursion, so frame cost is O(this)
-    /// it is the number to watch when a frame gets slower without any single
-    /// stage getting slower. Reset and counted in the same function so the two
-    /// cannot drift apart.
+    /// Nodes visited by `syncPaintToTable` in this frame, i.e. the size of the
+    /// live node tree on frames that mirrored the World tables. The mirror runs
+    /// on demand (`Cx.ensureWorldTablesSynced`), so frames without a table
+    /// reader report 0. Reset and counted in the same function so the two cannot
+    /// drift apart.
     synced_node_count: u32 = 0,
     tick_before_render_count: u32 = 0,
     render_cache_hit: u32 = 0,
@@ -184,14 +184,14 @@ const GenerationEntry = struct {
 
 pub const NodeRegistry = struct {
     allocator: Allocator,
-    entries: std.AutoHashMap(u32, RegistryEntry),
-    generations: std.AutoHashMap(u32, GenerationEntry),
+    entries: id_hash.U32HashMap(RegistryEntry),
+    generations: id_hash.U32HashMap(GenerationEntry),
 
     pub fn init(allocator: Allocator) NodeRegistry {
         return .{
             .allocator = allocator,
-            .entries = std.AutoHashMap(u32, RegistryEntry).init(allocator),
-            .generations = std.AutoHashMap(u32, GenerationEntry).init(allocator),
+            .entries = id_hash.U32HashMap(RegistryEntry).init(allocator),
+            .generations = id_hash.U32HashMap(GenerationEntry).init(allocator),
         };
     }
 
@@ -983,10 +983,9 @@ pub const HitRuntime = struct {
             .custom => {
                 record.kind = .custom;
                 if (node.meta.per_frame.custom_hooks.hit_test == null) {
-                    if (node.getLayoutOutput().vector.fill.custom_clip != null or node.getLayoutOutput().vector.fill.path != null) {
+                    const lo_fill_geometry = if (node.layoutOutput()) |lo| lo.vector.fill.custom_clip orelse lo.vector.fill.path else null;
+                    if (lo_fill_geometry) |geometry| {
                         record.kind = .path;
-                        const lo_fill = node.getLayoutOutput().vector.fill;
-                        const geometry = lo_fill.custom_clip orelse lo_fill.path.?;
                         record.path_fill_rule = geometry.fill_rule;
                     } else {
                         record.kind = .rect;
@@ -1022,10 +1021,9 @@ pub const HitRuntime = struct {
             .custom => {
                 record.kind = .custom;
                 if (node.meta.per_frame.custom_hooks.hit_test == null) {
-                    if (node.getLayoutOutput().vector.fill.custom_clip != null or node.getLayoutOutput().vector.fill.path != null) {
+                    const lo_fill_geometry = if (node.layoutOutput()) |lo| lo.vector.fill.custom_clip orelse lo.vector.fill.path else null;
+                    if (lo_fill_geometry) |geometry| {
                         record.kind = .path;
-                        const lo_fill = node.getLayoutOutput().vector.fill;
-                        const geometry = lo_fill.custom_clip orelse lo_fill.path.?;
                         record.path_fill_rule = geometry.fill_rule;
                     } else {
                         record.kind = .rect;
@@ -1414,8 +1412,8 @@ fn shapeContainsRecord(shape: ShapeRecord, node: ?*const Node, local_rect: Compu
         },
         .path => {
             const n = node orelse return false;
-            const n_lo_fill = n.getLayoutOutput().vector.fill;
-            const geometry = n_lo_fill.custom_clip orelse n_lo_fill.path orelse return shape_x >= 0 and shape_x < shape_w and shape_y >= 0 and shape_y < shape_h;
+            const n_lo = n.layoutOutput();
+            const geometry = (if (n_lo) |lo| lo.vector.fill.custom_clip orelse lo.vector.fill.path else null) orelse return shape_x >= 0 and shape_x < shape_w and shape_y >= 0 and shape_y < shape_h;
             if (!geometry.bounds.contains(local_x, local_y)) return false;
             return pathContainsPoint(geometry, shape.path_fill_rule, local_x, local_y);
         },

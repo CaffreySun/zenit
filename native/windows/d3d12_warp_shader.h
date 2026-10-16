@@ -70,7 +70,9 @@ static bool instruction(const Words &code, size_t at, size_t &end, size_t &paylo
     return true;
 }
 
-static bool rewrite(Words &code, bool &changed) {
+// Intel mode keeps declarations and static/SRV accesses in their original
+// spaces. Only dynamic buffer atomics get per-lane constant-index cases.
+static bool rewrite(Words &code, bool &changed, bool atomics_only=false) {
     changed=false;
     if (code.size()<2 || code[1]!=code.size() || (code[0]&255)!=0x51) return false;
     std::vector<Declaration> declarations;
@@ -96,7 +98,7 @@ static bool rewrite(Words &code, bool &changed) {
         if (id==UINT32_MAX) return false;
         uint32_t &next=resource.type==7?next_srv:next_uav;
         if (next<=id) next=id+1;
-        if (!buffer) continue;
+        if (!buffer || (atomics_only && resource.type!=30)) continue;
         uint32_t low=code[resource.immediate[1]],high=code[resource.immediate[2]];
         if (low>=high) continue;
         // Raw declarations have only the space after the operand; structured
@@ -111,6 +113,7 @@ static bool rewrite(Words &code, bool &changed) {
         // Buffer reads, writes, atomics and dimension queries. Other instruction
         // payloads (notably custom data) must never be scanned as operands.
         if (!(op==61 || op==121 || (op>=165 && op<=189) || op==226 || op==227)) continue;
+        if (atomics_only && (op<169 || op>189)) continue;
         while (payload<end) {
             size_t operand_at=payload;
             Operand resource;
@@ -122,11 +125,11 @@ static bool rewrite(Words &code, bool &changed) {
                 const auto &decl=declarations[d];
                 if (decl.type!=resource.type || decl.id!=id) continue;
                 if (resource.immediate[1]==SIZE_MAX) {
-                    // Old WARP also repeats a divergent atomic once per active
-                    // SIMD lane. Select a scalar UAV with real control flow so
-                    // each invocation performs exactly one atomic operation.
+                    // Real control flow selects one constant descriptor per
+                    // invocation. WARP additionally needs scalar alias declarations.
                     if (resource.type!=30 || op<169 || op>189) break;
                     if (temporary>=4096 || decl.high==UINT32_MAX ||
+                        (atomics_only && decl.high-decl.low>=65536) ||
                         (resource.representation[1]!=2 && resource.representation[1]!=3)) return false;
                     size_t relative=resource.begin[1];
                     uint32_t base=0;
@@ -139,7 +142,7 @@ static bool rewrite(Words &code, bool &changed) {
                     for (uint32_t index=decl.low;index<=decl.high;++index) {
                         size_t a=0;
                         while (a<aliases.size() && (aliases[a].declaration!=d || aliases[a].index!=index)) ++a;
-                        if (a==aliases.size()) {
+                        if (!atomics_only && a==aliases.size()) {
                             if (next_uav==UINT32_MAX) return false;
                             aliases.push_back({d,index,next_uav++});
                         }
@@ -151,7 +154,7 @@ static bool rewrite(Words &code, bool &changed) {
                             ++extension;
                             body[extension-at]&=~(1u<<17); // scalar descriptor is uniform
                         }
-                        body[resource.immediate[0]-at]=aliases[a].id;
+                        if (!atomics_only) body[resource.immediate[0]-at]=aliases[a].id;
                         body.push_back(index);
                         body.insert(body.end(),code.begin()+resource.end[1],code.begin()+end);
                         if (body.size()>127) return false;
@@ -163,6 +166,7 @@ static bool rewrite(Words &code, bool &changed) {
                     replacements.push_back({at,lowered});
                     break;
                 }
+                if (atomics_only) break;
                 uint32_t index=code[resource.immediate[1]];
                 if (index<decl.low || index>decl.high) return false;
                 size_t a=0;
@@ -177,7 +181,7 @@ static bool rewrite(Words &code, bool &changed) {
             }
         }
     }
-    if (aliases.empty()) return true;
+    if (aliases.empty() && replacements.empty()) return true;
     Words result(code.begin(),code.begin()+2);
     if (!replacements.empty() && !has_temporaries) result.insert(result.end(),{0x02000068,temporary+1});
     for (size_t at=2,end,payload;at<code.size();at=end) {
@@ -208,7 +212,7 @@ static bool rewrite(Words &code, bool &changed) {
     return true;
 }
 
-static HRESULT blob(ID3DBlob *input, ID3DBlob **output) {
+static HRESULT blob(ID3DBlob *input, ID3DBlob **output, bool atomics_only=false) {
     *output=nullptr;
     size_t size=input->GetBufferSize();
     if (size<32 || size>UINT32_MAX-128 || size%4) return E_INVALIDARG;
@@ -227,7 +231,7 @@ static HRESULT blob(ID3DBlob *input, ID3DBlob **output) {
         Words contents(chunk+2,chunk+2+length/4);
         if (chunk[0]==0x58454853) { // SHEX
             bool rewritten=false;
-            if (!rewrite(contents,rewritten)) return E_INVALIDARG;
+            if (!rewrite(contents,rewritten,atomics_only)) return E_INVALIDARG;
             changed|=rewritten;
         }
         result.push_back(chunk[0]); result.push_back(uint32_t(contents.size()*4));

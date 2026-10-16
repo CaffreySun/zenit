@@ -42,7 +42,7 @@ pub fn getNodeDisplayItems(
     node_id: u32,
     scope: DisplayPayloadScope,
 ) ?[]const display_list_mod.DisplayItem {
-    const runtime = cx.scene_runtime.get(node_id) orelse return null;
+    const runtime = cx.scene_runtime.getPtr(node_id) orelse return null;
     const start: usize = switch (scope) {
         .own => runtime.display_item_start,
         .subtree => runtime.subtree_display_item_start,
@@ -60,7 +60,7 @@ pub fn getNodeTextBlobs(
     node_id: u32,
     scope: TextBlobPayloadScope,
 ) ?[]const text_blob_mod.TextLayoutBlob {
-    const runtime = cx.scene_runtime.get(node_id) orelse return null;
+    const runtime = cx.scene_runtime.getPtr(node_id) orelse return null;
     const start: usize = switch (scope) {
         .own => runtime.text_blob_start,
         .subtree => runtime.subtree_text_blob_start,

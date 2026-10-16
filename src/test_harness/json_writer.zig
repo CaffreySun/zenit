@@ -160,17 +160,28 @@ pub const JsonWriter = struct {
     }
 
     fn writeFloat(self: *JsonWriter, f: f32) void {
-        const i: i64 = @intFromFloat(f);
-        const diff = f - @as(f32, @floatFromInt(i));
-        if (diff == 0 and f >= -1e15 and f <= 1e15) {
-            var num_buf: [24]u8 = undefined;
-            const len = formatInt(i, &num_buf);
-            self.writeRaw(num_buf[0..len]);
-        } else {
-            var float_buf: [32]u8 = undefined;
-            const s = std.fmt.bufPrint(&float_buf, "{d:.3}", .{f}) catch "0";
-            self.writeRaw(s);
+        // JSON has no NaN/Infinity representation. Keep unknown geometry or
+        // metrics explicit; never turn it into a plausible zero or invalid JSON.
+        if (!std.math.isFinite(f)) {
+            self.writeRaw("null");
+            return;
         }
+        // Check the range before converting: ReleaseFast treats an out-of-range
+        // float-to-int conversion as illegal behavior too.
+        if (f >= -1e15 and f <= 1e15) {
+            const i: i64 = @intFromFloat(f);
+            if (f - @as(f32, @floatFromInt(i)) == 0) {
+                var num_buf: [24]u8 = undefined;
+                const len = formatInt(i, &num_buf);
+                self.writeRaw(num_buf[0..len]);
+                return;
+            }
+        }
+        // The longest finite f32 in fixed notation fits in45 bytes, including
+        // sign, decimal point and three fractional digits.
+        var float_buf: [64]u8 = undefined;
+        const s = std.fmt.bufPrint(&float_buf, "{d:.3}", .{f}) catch unreachable;
+        self.writeRaw(s);
     }
 
     pub fn boolean(self: *JsonWriter, b: bool) void {
@@ -258,3 +269,36 @@ pub const JsonWriter = struct {
         return len;
     }
 };
+
+test "JSON floating values preserve unknown nonfinite values as null" {
+    var buf: [256]u8 = undefined;
+    var writer = JsonWriter.init(&buf);
+    writer.beginArray();
+    for ([_]f32{ std.math.nan(f32), std.math.inf(f32), -std.math.inf(f32) }) |value| {
+        writer.float(value);
+        writer.floatValue(value);
+    }
+    writer.endArray();
+    try std.testing.expectEqualStrings("[null,null,null,null,null,null]", writer.getWritten());
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, writer.getWritten(), .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 6), parsed.value.array.items.len);
+    for (parsed.value.array.items) |value| try std.testing.expect(value == .null);
+}
+
+test "JSON large finite floats stay numeric without integer conversion overflow" {
+    for ([_]f32{ std.math.floatMax(f32), -std.math.floatMax(f32), 1e30, -1e30, 1e18, -1e18, 1e15, -1e15 }) |value| {
+        var buf: [256]u8 = undefined;
+        var writer = JsonWriter.init(&buf);
+        writer.floatValue(value);
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, writer.getWritten(), .{});
+        defer parsed.deinit();
+        const observed: f64 = switch (parsed.value) {
+            .float => |v| v,
+            .integer => |v| @floatFromInt(v),
+            else => return error.TestUnexpectedResult,
+        };
+        try std.testing.expect(std.math.isFinite(observed));
+        try std.testing.expect(std.math.approxEqRel(f64, @as(f64, value), observed, 1e-6));
+    }
+}

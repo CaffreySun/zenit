@@ -29,7 +29,7 @@ pub const ShapeTextOpts = struct {
     use_symbols: bool = false,
 };
 
-/// Trim to longest valid UTF-8 prefix.
+/// Trim to the longest complete UTF-8/WTF-8 storage prefix.
 ///
 /// Gotcha: a caller slicing by byte may land mid-multibyte sequence (half a CJK/emoji).
 /// Invalid UTF-8 fails CoreText NSString construction, the shaping layer reports
@@ -37,7 +37,7 @@ pub const ShapeTextOpts = struct {
 /// width 0.00 collapses the bbox. Trimming to the longest valid prefix matches the
 /// actual render output; valid input passes through with zero overhead.
 pub fn validUtf8Prefix(bytes: []const u8) []const u8 {
-    return utf8.validPrefix(bytes);
+    return utf8.validStoragePrefix(bytes);
 }
 
 /// Compute shaping cache key.
@@ -168,4 +168,11 @@ test "shapingKey distinguishes registry family ids and font kinds" {
     try std.testing.expect(!ShapingKey.eq(shapingKey(family), shapingKey(mono)));
     try std.testing.expect(!ShapingKey.eq(shapingKey(family), shapingKey(symbols)));
     try std.testing.expect(ShapingKey.eq(shapingKey(family), shapingKey(family)));
+}
+
+test "validUtf8Prefix: WTF8 storage remains complete for native projection" {
+    const stored = "A\xed\xa0\x80Z";
+    try std.testing.expectEqualStrings(stored, validUtf8Prefix(stored));
+    try std.testing.expectEqualStrings(stored, validUtf8Prefix(stored ++ "\xed\xa0"));
+    try std.testing.expect(!utf8.isValid(stored));
 }

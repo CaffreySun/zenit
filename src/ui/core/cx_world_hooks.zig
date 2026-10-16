@@ -61,8 +61,7 @@ pub fn onLayoutOutputWrite(element_id_raw: u32, v: core_node.NodeLayoutOutput) v
     const w = g_active_world orelse return;
     if (element_id_raw == 0xFFFFFFFF) return;
     const eid = world.ElementId.fromRaw(element_id_raw);
-    w.layout_output.ensureSlot(eid) catch return;
-    w.layout_output.set(eid, v);
+    w.layout_output.set(eid, v) catch return;
 }
 
 pub fn onLayoutOutputRead(element_id_raw: u32) ?core_node.NodeLayoutOutput {
@@ -76,7 +75,6 @@ pub fn onLayoutOutputPtr(element_id_raw: u32) ?*core_node.NodeLayoutOutput {
     const w = g_active_world orelse return null;
     if (element_id_raw == 0xFFFFFFFF) return null;
     const eid = world.ElementId.fromRaw(element_id_raw);
-    w.layout_output.ensureSlot(eid) catch return null;
     return w.layout_output.getPtr(eid);
 }
 

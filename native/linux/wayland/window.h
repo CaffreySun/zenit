@@ -40,6 +40,7 @@ int zenit_wayland_pop_scroll(ZenitWaylandWindow *, ZenitWaylandScrollEvent *);
 /* Independent of Vulkan. Owns display, native surface and xdg-shell objects. */
 ZenitWaylandWindow *zenit_wayland_create(const char *title, uint32_t width, uint32_t height);
 void zenit_wayland_destroy(ZenitWaylandWindow *window);
+void zenit_wayland_set_title(ZenitWaylandWindow *window, const char *title);
 /* Clipboard negative results: -1 failure, -2 capacity, -3 unavailable,
  * -4 allocation, -5 timeout, -6 invalid focus/serial/reentry, -7 wrong thread. */
 int zenit_wayland_clipboard_available(ZenitWaylandWindow *window);

@@ -443,6 +443,28 @@ pub const PaintTable = struct {
         return self.chunks.items[id.index].paint_epoch;
     }
 
+    /// Mirror path (Cx.ensureWorldTablesSynced): the chunk's items are always replaced,
+    /// because they come from the last render's display list while the hash is taken from
+    /// the node as it is *now*. Skipping the copy on a hash hit could pair a hash computed
+    /// after a post-render edit with items from before it, and the next mirror would then
+    /// hit on that hash and keep the stale items forever. The hash only decides whether
+    /// this counts as a content change (`mirrorEnd` bumps paint_epoch). Returns that.
+    pub fn mirrorBegin(self: *PaintTable, id: ElementId, content_hash: u64) !bool {
+        try self.ensureSlot(id);
+        const chunk = &self.chunks.items[id.index];
+        const changed = chunk.paint_epoch == 0 or chunk.content_hash != content_hash;
+        chunk.clear();
+        chunk.content_hash = content_hash;
+        return changed;
+    }
+
+    pub fn mirrorEnd(self: *PaintTable, id: ElementId, prop_ref: PropertyStateRef, changed: bool) void {
+        if (id.isNull() or id.index >= self.chunks.items.len) return;
+        const chunk = &self.chunks.items[id.index];
+        chunk.property_state = prop_ref;
+        if (changed) chunk.paint_epoch +%= 1;
+    }
+
     /// Re-record chunk only if content_hash differs; then clear and re-record.
     /// Returns true if actually re-recorded; false if hash cache-hit.
     pub fn beginRecord(self: *PaintTable, id: ElementId, new_content_hash: u64) !bool {

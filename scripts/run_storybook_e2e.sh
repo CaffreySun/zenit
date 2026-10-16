@@ -29,10 +29,6 @@ else
   RPCDIR="$(mktemp -d "/tmp/zenit_e2e_rpc.${PORT}.XXXXXX")" || { echo "mktemp failed" >&2; exit 71; }
   RPCDIR_AUTO=1
 fi
-# Incidentally reclaim historic auto dirs over 1 day old (dot-naming pattern only
-# matches mktemp products, won't touch manual workflow fixed dir
-# zenit_e2e_rpc_<port>).
-find /tmp -maxdepth 1 -type d -name "zenit_e2e_rpc.*.??????" -mmin +1440 -exec rm -rf {} + 2>/dev/null || true
 APP="${ZENIT_E2E_APP:-zig-out/zenit Storybook.app/Contents/MacOS/storybook}"
 BUN="${ZENIT_E2E_BUN:-bun}"
 APP_LOG="${ZENIT_E2E_APP_LOG:-/tmp/zenit_storybook_app.log}"

@@ -1,3 +1,4 @@
+extern fn zenit_d12_test_atomic_probe_device_loss() c_int;
 const std = @import("std");
 const d12 = @import("gpu").Backend.native;
 extern fn zenit_d12_test_fail_next_signal(*anyopaque) void;
@@ -190,6 +191,15 @@ pub fn main(init: std.process.Init) !void {
     const shared = requested_scope != .resources_core;
     std.debug.print("NATIVE_GPU_SCOPE={s}\n", .{@tagName(requested_scope)});
     zenit_d12_test_debug_enable();
+    if (scope == .atomic_probe_failure) {
+        switch (zenit_d12_test_atomic_probe_device_loss()) {
+            0 => std.debug.print("PASS: isolated removed-device atomic self-test fails explicitly and caches failure\n", .{}),
+            4 => std.debug.print("SKIP: hardware-only atomic self-test device-loss injection on software adapter\n", .{}),
+            else => return error.IncorrectAtomicProbeDeviceLossHandling,
+        }
+        return;
+    }
+    if (scope == .buffer_arrays) return @import("windows_gpu_buffer_array_contract.zig").run();
     if (scope == .bindings) return @import("windows_gpu_pipeline_contract.zig").run(init.io);
     if (scope == .app) return @import("windows_gpu_app_renderer_contract.zig").run(init.io);
     if (scope != .sdf and core) try run(false);

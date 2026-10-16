@@ -1,5 +1,6 @@
 // Real bridge queue reads, with no global input or system input-source changes.
 #import "../window_bridge.m"
+#include "no_render_copy.inc"
 // Standalone empty accessibility fixture; no untracked helper dependency.
 uint64_t zenit_a11y_focused(uint32_t window_id) { return UINT32_MAX; }
 int zenit_a11y_value(uint32_t window_id, uint64_t handle, char *buf, int buf_len) { return 0; }

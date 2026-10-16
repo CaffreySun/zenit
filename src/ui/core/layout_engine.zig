@@ -101,6 +101,17 @@ var g_intrinsic_cache: std.AutoHashMapUnmanaged(u64, IntrinsicCacheEntry) = .{};
 var g_intrinsic_cache_refcount: u32 = 0;
 var g_intrinsic_cache_allocator: Allocator = undefined;
 
+/// A destroyed node can never hit this memo again; remove both axis keys.
+pub fn forgetIntrinsicCache(world_id: u16, node_id: u32) void {
+    if (g_intrinsic_cache_refcount == 0) return;
+    _ = g_intrinsic_cache.remove(intrinsicCacheKey(world_id, node_id, false));
+    _ = g_intrinsic_cache.remove(intrinsicCacheKey(world_id, node_id, true));
+}
+
+pub fn intrinsicCacheMemoryStats() struct { entries: usize, capacity: usize, slot_bytes: usize } {
+    return .{ .entries = g_intrinsic_cache.count(), .capacity = g_intrinsic_cache.capacity(), .slot_bytes = g_intrinsic_cache.capacity() * (@sizeOf(u64) + @sizeOf(IntrinsicCacheEntry) + 1) };
+}
+
 fn intrinsicCacheKey(world_id: u16, node_id: u32, is_main_row: bool) u64 {
     // The key must include world_id: this table is process-wide, while node.id is a per-Cx counter
     // and ids of two windows fully overlap. Without world_id, a node in window B would hit the
@@ -591,7 +602,7 @@ fn calcIntrinsicSizeUncached(node: *Node, comptime is_main_row: bool) f32 {
         const pad = if (is_main_row) node.style.padding.horizontal() else node.style.padding.vertical();
         // Multi-line text: use computed text_layout
         if (t.wrap != .none) {
-            if (node.getLayoutOutput().artifacts.text_layout) |tl| {
+            if (node.layoutTextLayout()) |tl| {
                 if (is_main_row) {
                     return tl.max_line_width + pad;
                 } else {
@@ -807,7 +818,12 @@ pub fn measureNode(node: *Node, constraints: types.LayoutConstraints) Size {
                         t.spans,
                     );
                     // cache to node, avoiding redundant computation in subsequent layout phase
-                    if (node.layoutOutputPtr()) |lo| lo.artifacts.text_layout = tl;
+                    node.storeTextLayout(&tl) catch {
+                        layout_alloc_failure_hits += 1;
+                        // Never publish a partial cache or render stale wraps.
+                        node.clearTextLayout();
+                        node.frame_state.state_bits.dirty.core.layout = true;
+                    };
                     break :blk tl.total_height + pad_h;
                 }
             }
@@ -1459,19 +1475,25 @@ fn absoluteChildNeedsResolve(child: *const Node) bool {
 /// absolute-positioned text nodes previously skipped wrapping, wrap always rendered single-line).
 /// returns wrapped total height (with vertical padding), for fit height use; null if inapplicable.
 fn computeWrapTextLayoutForWidth(child: *Node, child_width: f32) ?f32 {
-    const t = child.getText() orelse return null;
-    if (t.wrap == .none) return null;
+    const t = child.getText() orelse {
+        child.clearTextLayout();
+        return null;
+    };
+    if (t.wrap == .none) {
+        child.clearTextLayout();
+        return null;
+    }
     const text_avail_w = child_width - child.style.padding.horizontal();
     if (text_avail_w <= 0) return null;
     const layout_spans = if (t.spans_affect_layout) t.spans else &.{};
     // cache hit check (layoutOutputPtr gives stable address, isCacheValid takes *const)
     if (child.layoutOutputPtr()) |c_lo| {
-        const need_recompute = if (c_lo.artifacts.text_layout) |*tl|
+        const need_recompute = if (c_lo.artifacts.text_layout) |tl|
             !text_layout.isCacheValid(tl, t.content, text_avail_w, t.font_weight, t.font_size, t.use_italic_font, t.use_monospace_font, t.wrap, t.max_lines, layout_spans)
         else
             true;
         if (need_recompute) {
-            c_lo.artifacts.text_layout = text_layout.computeTextLayout(
+            const computed = text_layout.computeTextLayout(
                 t.content,
                 text_avail_w,
                 t.wrap,
@@ -1483,9 +1505,15 @@ fn computeWrapTextLayoutForWidth(child: *Node, child_width: f32) ?f32 {
                 t.use_monospace_font,
                 layout_spans,
             );
+            child.storeTextLayout(&computed) catch {
+                layout_alloc_failure_hits += 1;
+                child.clearTextLayout();
+                child.frame_state.state_bits.dirty.core.layout = true;
+                return computed.total_height + child.style.padding.vertical();
+            };
         }
     }
-    if (child.getLayoutOutput().artifacts.text_layout) |tl| {
+    if (child.layoutTextLayout()) |tl| {
         return tl.total_height + child.style.padding.vertical();
     }
     return null;

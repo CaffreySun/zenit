@@ -10,6 +10,9 @@ const builtin = @import("builtin");
 const std = @import("std");
 
 pub const rhi = @import("rhi.zig");
+pub const DriverInfo = @import("driver_info.zig").DriverInfo;
+pub const driver_bugs = @import("driver_bugs.zig");
+pub const DriverBugs = driver_bugs.DriverBugs;
 /// Native Vulkan diagnostics and explicit acceptance options.
 pub const opengl_native = @import("opengl/device.zig");
 pub const vulkan_native = @import("vulkan_bootstrap.zig");
@@ -553,7 +556,10 @@ pub const Features = packed struct(u64) {
     texture_compression_etc2: bool = false,
     texture_compression_astc: bool = false,
     indirect_first_instance: bool = false,
-    _padding: u57 = 0,
+    /// Nonuniform descriptor indexing for raw/structured UAV buffer array atomics.
+    /// Includes verified backend workarounds; query before choosing this path.
+    non_uniform_uav_buffer_array_atomics: bool = false,
+    _padding: u56 = 0,
 };
 
 /// Limits.
@@ -989,4 +995,12 @@ test "backend selection is compile-time and matches the built backend" {
         .vulkan => try std.testing.expect(Backend == @import("vulkan/renderer_device.zig")),
         .opengl => try std.testing.expect(Backend == @import("opengl/renderer_device.zig")),
     }
+}
+
+/// Exact pixel copy, render-only on Metal. Other backends keep blit semantics.
+pub const copyTextureRegion = @import("texture_copy.zig").copyTextureRegion;
+pub const copyTextureRegionAudited = @import("texture_copy.zig").copyTextureRegionAudited;
+
+test {
+    _ = @import("texture_copy.zig");
 }

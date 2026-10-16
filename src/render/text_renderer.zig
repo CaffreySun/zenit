@@ -19,6 +19,12 @@ const text_shader_source: []const u8 = @import("shader_sources.zig").text;
 const MAX_CLIP_POLYGON_POINTS = 32;
 const MAX_CLIP_POLYGON_CONTOURS = 8;
 
+const NativeRaster = struct {
+    extern fn zenit_dwrite_raster_context_create() ?*anyopaque;
+    extern fn zenit_dwrite_raster_context_destroy(?*anyopaque) void;
+    extern fn zenit_dwrite_raster_context_refresh(?*anyopaque, ?*anyopaque, u64, *[8]f32) c_int;
+};
+
 /// Uniforms struct (must match shader).
 const Uniforms = extern struct {
     viewport_size: [2]f32, // Physical pixels.
@@ -31,29 +37,135 @@ const Uniforms = extern struct {
     clip_contour_count: u32 = 0,
     clip_polygon_end_points: [MAX_CLIP_POLYGON_CONTOURS]u32 = @as([MAX_CLIP_POLYGON_CONTOURS]u32, @splat(0)),
     clip_polygon_points: [MAX_CLIP_POLYGON_POINTS][2]f32 = @as([MAX_CLIP_POLYGON_POINTS][2]f32, @splat(.{ 0, 0 })),
+    dwrite_gamma: if (builtin.os.tag == .windows) [4]f32 else [0]f32 = undefined,
+    dwrite_settings: if (builtin.os.tag == .windows) [4]f32 else [0]f32 = undefined,
 };
 
-/// Glyph instance data (must match shader).
+comptime {
+    if (builtin.os.tag == .windows and (@offsetOf(Uniforms, "dwrite_gamma") != 336 or @offsetOf(Uniforms, "dwrite_settings") != 352 or @sizeOf(Uniforms) != 368))
+        @compileError("DirectWrite runtime uniforms do not match text.hlsl cbuffer layout");
+}
+
+/// Packed 32-bit glyph metadata for Metal: bits 0..7 page, 8..9 color mode, 10 snap, 11..31 zero.
+const MetalGlyphMetadata = extern struct {
+    flags: u32 = 0,
+
+    pub fn init(page: u8, color_mode: u2, snap: bool) MetalGlyphMetadata {
+        return .{
+            .flags = @as(u32, page) | (@as(u32, color_mode) << 8) | (@as(u32, @intFromBool(snap)) << 10),
+        };
+    }
+
+    pub fn pageIndex(self: MetalGlyphMetadata) u8 {
+        return @truncate(self.flags & 0xFF);
+    }
+
+    pub fn colorMode(self: MetalGlyphMetadata) u2 {
+        return @truncate((self.flags >> 8) & 0x3);
+    }
+
+    pub fn snaps(self: MetalGlyphMetadata) bool {
+        return (self.flags >> 10) & 1 != 0;
+    }
+};
+
+/// Legacy float metadata for non-Metal backends; matches original GlyphInstance trailing fields
+/// (stride 80) and shader bytes exactly.
+const LegacyGlyphMetadata = extern struct {
+    page_index: f32 = 0,
+    is_color: f32 = 0,
+    shader_snap: f32 = 1,
+
+    pub fn init(page: u8, color_mode: u2, snap: bool) LegacyGlyphMetadata {
+        return .{
+            .page_index = @floatFromInt(page),
+            .is_color = @floatFromInt(color_mode),
+            .shader_snap = if (snap) 1 else 0,
+        };
+    }
+
+    pub fn pageIndex(self: LegacyGlyphMetadata) u8 {
+        return @intFromFloat(self.page_index);
+    }
+
+    pub fn colorMode(self: LegacyGlyphMetadata) u2 {
+        return @intFromFloat(self.is_color);
+    }
+
+    pub fn snaps(self: LegacyGlyphMetadata) bool {
+        return self.shader_snap > 0.5;
+    }
+};
+
+const GlyphMetadata = if (gpu.backend_kind == .metal) MetalGlyphMetadata else LegacyGlyphMetadata;
+
+// UV packing and the shader decoder share this exact atlas size.
+// Changing the atlas requires reviewing the wire format and shader together.
+comptime {
+    if (atlas_mod.GlyphAtlas.ATLAS_SIZE != 4096)
+        @compileError("glyph UV compression requires GlyphAtlas.ATLAS_SIZE == 4096");
+}
+const atlas_size_f: f32 = 4096.0;
+
+/// Metal UV compression: exact integer texels in [0, 4096] stored as u16 (8 bytes vs 16).
+/// Atlas emission always yields uv = texel / 4096 with texel an exact f32 integer, so
+/// texel = uv * 4096 round-trips exactly; no rounding, no UNORM, no half floats.
+const MetalGlyphUV = extern struct {
+    texels: [4]u16,
+
+    pub fn init(v: [4]f32) MetalGlyphUV {
+        if (builtin.mode == .debug) {
+            for (v) |u| {
+                std.debug.assert(std.math.isFinite(u));
+                std.debug.assert(u >= 0.0 and u <= 1.0);
+                const t = u * atlas_size_f;
+                // Integer grid: atlas UVs are always texel/4096; reject anything else early.
+                std.debug.assert(t == @trunc(t));
+            }
+        }
+        return .{ .texels = .{
+            @intFromFloat(v[0] * atlas_size_f),
+            @intFromFloat(v[1] * atlas_size_f),
+            @intFromFloat(v[2] * atlas_size_f),
+            @intFromFloat(v[3] * atlas_size_f),
+        } };
+    }
+
+    pub fn normalized(self: MetalGlyphUV) [4]f32 {
+        return .{
+            @as(f32, @floatFromInt(self.texels[0])) / atlas_size_f,
+            @as(f32, @floatFromInt(self.texels[1])) / atlas_size_f,
+            @as(f32, @floatFromInt(self.texels[2])) / atlas_size_f,
+            @as(f32, @floatFromInt(self.texels[3])) / atlas_size_f,
+        };
+    }
+};
+
+/// Legacy UV: byte-exact identity with the original [4]f32 wire format; arbitrary floats preserved.
+const LegacyGlyphUV = extern struct {
+    values: [4]f32,
+
+    pub fn init(v: [4]f32) LegacyGlyphUV {
+        return .{ .values = v };
+    }
+
+    pub fn normalized(self: LegacyGlyphUV) [4]f32 {
+        return self.values;
+    }
+};
+
+/// Backend-selected UV representation.
+const GlyphUV = if (gpu.backend_kind == .metal) MetalGlyphUV else LegacyGlyphUV;
+
+/// Glyph instance wire format; Metal uses packed vectors and exact flags.
 const GlyphInstance = extern struct {
     position: [2]f32, // Glyph bottom-left position.
     size: [2]f32, // Glyph size.
-    uv_rect: [4]f32, // UV rect (u_min, v_min, u_max, v_max).
+    uv_rect: GlyphUV, // UV rect (u_min, v_min, u_max, v_max); Metal stores exact 4096-grid texels.
     color: [4]f32, // Color RGBA.
     rect_clip: [4]f32 = .{ 0, 0, -1, -1 }, // x, y, w, h (logical pixels); negative size = disabled.
     skew_x: f32 = 0, // Synthetic italic x offset (logical pixels).
-    page_index: f32 = 0, // Atlas page number (CPU bucketing, shader doesn't read).
-    /// >0.5 = this glyph in BGRA color page; shader picks sample path per it (color direct output
-    /// sample,
-    /// not multiply text color).
-    is_color: f32 = 0,
-    /// >0.5 = vertex shader snap position to physical pixel (round). direct_animated text must set
-    /// 0: each glyph
-    /// fractional part differs, per-glyph round causes adjacent glyphs cross rounding threshold
-    /// different frames,
-    /// produce letter spacing / baseline jitter. per-instance not per-draw: nearest/linear lists
-    /// mix multi-strategy
-    /// (static composite italic, static scale text also linear list).
-    shader_snap: f32 = 1,
+    metadata: GlyphMetadata = GlyphMetadata.init(0, 0, true),
 };
 
 /// Single-frame instance buffer capacity (all frame flushes share one buffer). Editor ~1000 +
@@ -118,10 +230,9 @@ const SegmentCacheKey = struct {
     flags: u8, // bit0: use_italic
 };
 
-/// Segment-level cache entry (all inline, no alloc).
+/// Exact-size shaped slice. The cache adopts the shaper allocation without copying.
 const SegmentCacheEntry = struct {
-    glyphs_buf: [MAX_SEGMENT_GLYPHS]text_module.ShapedGlyph = undefined,
-    glyph_count: u8 = 0,
+    glyphs: []text_module.ShapedGlyph,
     frame_last_used: u64 = 0,
 };
 
@@ -361,6 +472,23 @@ fn isRtlScript(cp: u21) bool {
         (cp >= 0xFE70 and cp <= 0xFEFF); // Arabic Presentation Forms-B
 }
 
+// Decode storage without splitting a UTF-16 pair formed across edit seams.
+// Keep original byte lengths so cache clusters remain document offsets.
+fn storageScalar(text: []const u8, offset: usize) ?struct { cp: u21, len: u32 } {
+    const n = std.unicode.utf8ByteSequenceLength(text[offset]) catch return .{ .cp = 0xfffd, .len = 1 };
+    if (n > text.len - offset) return null;
+    const cp = std.unicode.wtf8Decode(text[offset..][0..n]) catch return .{ .cp = 0xfffd, .len = n };
+    if (cp >= 0xd800 and cp <= 0xdbff and text.len - offset >= n + 3) {
+        const tail = text[offset + n ..][0..3];
+        if (tail[0] == 0xed) {
+            const low = std.unicode.wtf8Decode(tail) catch return .{ .cp = cp, .len = n };
+            if (low >= 0xdc00 and low <= 0xdfff)
+                return .{ .cp = 0x10000 + ((cp - 0xd800) << 10) + (low - 0xdc00), .len = n + 3 };
+        }
+    }
+    return .{ .cp = cp, .len = n };
+}
+
 /// Split text by shaping equivalence to min cache unit.
 /// Return segment count (0 = empty text), over MAX_SEGMENTS return MAX_SEGMENTS + 1 overflow.
 fn segmentText(text: []const u8, out: *[MAX_SEGMENTS]Segment) u32 {
@@ -373,26 +501,9 @@ fn segmentText(text: []const u8, out: *[MAX_SEGMENTS]Segment) u32 {
         if (seg_count >= MAX_SEGMENTS) return MAX_SEGMENTS + 1; // Overflow.
 
         const byte = text[i];
-        // Judge first byte get codepoint length.
-        const cp_len: u32 = if (byte < 0x80)
-            1
-        else if (byte < 0xE0)
-            2
-        else if (byte < 0xF0)
-            3
-        else
-            4;
-
-        if (i + cp_len > len) break; // Truncated UTF-8, skip.
-
-        // Decode codepoint.
-        const cp: u21 = switch (cp_len) {
-            1 => @intCast(byte),
-            2 => (@as(u21, byte & 0x1F) << 6) | @as(u21, text[i + 1] & 0x3F),
-            3 => (@as(u21, byte & 0x0F) << 12) | (@as(u21, text[i + 1] & 0x3F) << 6) | @as(u21, text[i + 2] & 0x3F),
-            4 => (@as(u21, byte & 0x07) << 18) | (@as(u21, text[i + 1] & 0x3F) << 12) | (@as(u21, text[i + 2] & 0x3F) << 6) | @as(u21, text[i + 3] & 0x3F),
-            else => unreachable,
-        };
+        const scalar = storageScalar(text, i) orelse break;
+        const cp_len = scalar.len;
+        const cp = scalar.cp;
 
         if (isCJK(cp)) {
             // CJK: each codepoint solo segment.
@@ -435,16 +546,9 @@ fn segmentText(text: []const u8, out: *[MAX_SEGMENTS]Segment) u32 {
             const seg_start = i;
             i += cp_len;
             while (i < len) {
-                const nb = text[i];
-                const ncl: u32 = if (nb < 0x80) 1 else if (nb < 0xE0) 2 else if (nb < 0xF0) 3 else 4;
-                if (i + ncl > len) break;
-                const ncp: u21 = switch (ncl) {
-                    1 => @intCast(nb),
-                    2 => (@as(u21, nb & 0x1F) << 6) | @as(u21, text[i + 1] & 0x3F),
-                    3 => (@as(u21, nb & 0x0F) << 12) | (@as(u21, text[i + 1] & 0x3F) << 6) | @as(u21, text[i + 2] & 0x3F),
-                    4 => (@as(u21, nb & 0x07) << 18) | (@as(u21, text[i + 1] & 0x3F) << 12) | (@as(u21, text[i + 2] & 0x3F) << 6) | @as(u21, text[i + 3] & 0x3F),
-                    else => unreachable,
-                };
+                const next = storageScalar(text, i) orelse break;
+                const ncl = next.len;
+                const ncp = next.cp;
                 // Only **prior codepoint is ZWJ** accept BMP emoji base (like heart ZWJ flame =
                 // U+1F525 ZWJ U+2764).
                 // Unconditional isEmojiCapable swallow normal symbol (-> / box etc) right after
@@ -479,16 +583,9 @@ fn segmentText(text: []const u8, out: *[MAX_SEGMENTS]Segment) u32 {
             const seg_start = i;
             i += cp_len;
             while (i < len) {
-                const nb = text[i];
-                const ncl: u32 = if (nb < 0x80) 1 else if (nb < 0xE0) 2 else if (nb < 0xF0) 3 else 4;
-                if (i + ncl > len) break;
-                const ncp: u21 = switch (ncl) {
-                    1 => @intCast(nb),
-                    2 => (@as(u21, nb & 0x1F) << 6) | @as(u21, text[i + 1] & 0x3F),
-                    3 => (@as(u21, nb & 0x0F) << 12) | (@as(u21, text[i + 1] & 0x3F) << 6) | @as(u21, text[i + 2] & 0x3F),
-                    4 => (@as(u21, nb & 0x07) << 18) | (@as(u21, text[i + 1] & 0x3F) << 12) | (@as(u21, text[i + 2] & 0x3F) << 6) | @as(u21, text[i + 3] & 0x3F),
-                    else => unreachable,
-                };
+                const next = storageScalar(text, i) orelse break;
+                const ncl = next.len;
+                const ncp = next.cp;
                 // Trailing spaces not consumed: left for space branch below, avoid counting
                 // RTL segment trailing spaces into RTL run (would offset LTR continuation).
                 if (isRtlScript(ncp) or isJoiner(ncp)) {
@@ -498,16 +595,8 @@ fn segmentText(text: []const u8, out: *[MAX_SEGMENTS]Segment) u32 {
                     var j = i + 1;
                     while (j < len and text[j] == 0x20) j += 1;
                     if (j >= len) break;
-                    const fb = text[j];
-                    const fcl: u32 = if (fb < 0x80) 1 else if (fb < 0xE0) 2 else if (fb < 0xF0) 3 else 4;
-                    if (j + fcl > len) break;
-                    const fcp: u21 = switch (fcl) {
-                        1 => @intCast(fb),
-                        2 => (@as(u21, fb & 0x1F) << 6) | @as(u21, text[j + 1] & 0x3F),
-                        3 => (@as(u21, fb & 0x0F) << 12) | (@as(u21, text[j + 1] & 0x3F) << 6) | @as(u21, text[j + 2] & 0x3F),
-                        4 => (@as(u21, fb & 0x07) << 18) | (@as(u21, text[j + 1] & 0x3F) << 12) | (@as(u21, text[j + 2] & 0x3F) << 6) | @as(u21, text[j + 3] & 0x3F),
-                        else => unreachable,
-                    };
+                    const following = storageScalar(text, j) orelse break;
+                    const fcp = following.cp;
                     if (isRtlScript(fcp)) i = j else break;
                 } else break;
             }
@@ -552,6 +641,34 @@ pub const TextRenderer = struct {
     /// Shared shaping-equivalence segmentation for platform layout adapters.
     pub const SegmentSpan = Segment;
     pub const segment_capacity = MAX_SEGMENTS;
+    pub const CpuMemoryStats = struct {
+        segment_entries: usize,
+        segment_capacity: usize,
+        segment_entry_bytes: usize,
+        segment_slot_bytes: usize,
+        segment_live_glyph_bytes: usize,
+        segment_hits: u64,
+        segment_misses: u64,
+        instance_capacity_bytes: usize,
+        width_cache_text_bytes: usize,
+    };
+    /// Hash slots exclude allocation header/alignment; not a resident metric.
+    pub fn cpuMemoryStats(self: *const TextRenderer) CpuMemoryStats {
+        var glyph_bytes: usize = 0;
+        var it = self.segment_cache.valueIterator();
+        while (it.next()) |entry| glyph_bytes += @as(usize, entry.glyphs.len) * @sizeOf(text_module.ShapedGlyph);
+        return .{
+            .segment_entries = self.segment_cache.count(),
+            .segment_capacity = self.segment_cache.capacity(),
+            .segment_entry_bytes = @sizeOf(SegmentCacheEntry),
+            .segment_slot_bytes = self.segment_cache.capacity() * (@sizeOf(SegmentCacheEntry) + @sizeOf(SegmentCacheKey) + 1),
+            .segment_live_glyph_bytes = glyph_bytes,
+            .segment_hits = self.segment_cache_hits,
+            .segment_misses = self.segment_cache_misses,
+            .instance_capacity_bytes = (self.instances_nearest.capacity + self.instances_linear.capacity) * @sizeOf(GlyphInstance),
+            .width_cache_text_bytes = self.width_cache.bytes,
+        };
+    }
     pub fn splitSegments(content: []const u8, out: *[segment_capacity]SegmentSpan) u32 {
         return segmentText(content, out);
     }
@@ -618,6 +735,9 @@ pub const TextRenderer = struct {
     /// (shrinkRetainingCapacity), encoding text almost twice. With this flag emitGlyphInstance
     /// returns the advance after atlas insertion, skipping all instance construction and append.
     glyph_only: bool = false,
+    prewarm_layered: bool = false,
+    prewarm_scales: [9]f32 = @splat(0),
+    prewarm_scale_count: usize = 0,
 
     /// Text signature of the last fully-run prewarm command stream + atlas GC generation.
     /// Prewarm's only output is "missing glyphs enter the atlas". If this frame's text matches the
@@ -632,6 +752,8 @@ pub const TextRenderer = struct {
 
     // Segment-level shaping cache, word/CJK-single-char granularity, inline-stored no-alloc
     segment_cache: std.AutoHashMap(SegmentCacheKey, SegmentCacheEntry),
+    segment_cache_hits: u64 = 0,
+    segment_cache_misses: u64 = 0,
     width_cache: WidthCache = .{},
     cache_long_segments: bool = false,
     long_segment_cache: LongSegmentCache = .{},
@@ -672,6 +794,14 @@ pub const TextRenderer = struct {
     /// Font smoothing for the glyphs being emitted (set per text command by the encoder from
     /// TextFontFlag.no_smoothing, reset after it)
     smooth_fonts: bool = true,
+    cleartype_enabled: bool = false,
+    raster_context: ?*anyopaque = null,
+    dwrite_params: [8]f32 = @splat(0),
+    cleartype_allowed: bool = false,
+    lcd_glyph_count: usize = 0,
+    gray_glyph_count: usize = 0,
+    run_lcd_rejected: bool = false,
+    lcd_backdrop: ?*const @import("text_render_policy.zig").Backdrop = null,
     fade_x0: f32 = std.math.inf(f32),
     fade_x1: f32 = std.math.inf(f32),
     instance_high_water_mark: usize = 0,
@@ -680,8 +810,17 @@ pub const TextRenderer = struct {
 
     /// Initialize Text Renderer
     pub fn init(allocator: std.mem.Allocator, device: *gpu.Backend.Device) !TextRenderer {
-        // Compile shader
-        var shader = try gpu.Backend.ShaderModule.initFromSource(device, text_shader_source);
+        var raster_context: ?*anyopaque = null;
+        var params: [8]f32 = @splat(0);
+        if (comptime builtin.os.tag == .windows) {
+            raster_context = NativeRaster.zenit_dwrite_raster_context_create() orelse return error.TextRenderingParamsFailed;
+            errdefer NativeRaster.zenit_dwrite_raster_context_destroy(raster_context);
+            if (NativeRaster.zenit_dwrite_raster_context_refresh(raster_context, null, 0, &params) < 0) return error.TextRenderingParamsFailed;
+        }
+        errdefer if (comptime builtin.os.tag == .windows) NativeRaster.zenit_dwrite_raster_context_destroy(raster_context);
+        const lcd_enabled = params[7] != 0 and !@import("zenit_environment").has("ZENIT_TEXT_BASELINE_GRAYSCALE");
+        const source = text_shader_source;
+        var shader = try gpu.Backend.ShaderModule.initFromSource(device, source);
         defer shader.deinit();
 
         // Get function
@@ -694,7 +833,7 @@ pub const TextRenderer = struct {
         // created resources; GPU objects GPA won't detect, leaks are MTLBuffer/PSO/CoreText.
         // Note: errdefer in for loop body loses scope with iteration (dead code, used to be
         // that way); counter must go outside loop.
-        var pipeline = try gpu.Backend.createRenderPipeline(device, .{
+        var pipeline_desc = gpu.Backend.RenderPipelineDescriptor{
             .vertex_function = &vertex_func,
             .fragment_function = &fragment_func,
             .color_attachment_formats = &[_]gpu.TextureFormat{gpu.color_format},
@@ -706,7 +845,9 @@ pub const TextRenderer = struct {
                 .destination_alpha = .one_minus_src_alpha,
                 .alpha_operation = .add,
             },
-        });
+        };
+        if (comptime gpu.is_direct3d) pipeline_desc.dual_source_blending = true;
+        var pipeline = try gpu.Backend.createRenderPipeline(device, pipeline_desc);
         errdefer pipeline.deinit();
 
         // Create uniform buffer
@@ -740,15 +881,20 @@ pub const TextRenderer = struct {
         // Create glyph atlas
         var atlas = try GlyphAtlas.init(allocator, device);
         errdefer atlas.deinit();
+        atlas.raster_context = raster_context;
 
         // Create text shaper
         const shaper = try TextShaper.init(allocator);
 
+        if (comptime builtin.os.tag == .windows) std.debug.print("TEXT_RASTER_PIPELINE glyph-coverage phase_bins=4 dynamic-monitor-params\n", .{});
         std.log.info("[TextRenderer] Initialized", .{});
 
         return TextRenderer{
             .allocator = allocator,
             .device = device,
+            .cleartype_enabled = lcd_enabled,
+            .raster_context = raster_context,
+            .dwrite_params = params,
             .pipeline = pipeline,
             .uniform_buffers = uniform_buffers,
             .instance_buffers = instance_buffers,
@@ -769,7 +915,7 @@ pub const TextRenderer = struct {
     pub fn deinit(self: *TextRenderer) void {
         var seg_iter = self.segment_cache.iterator();
         while (seg_iter.next()) |entry| {
-            releaseGlyphFallbackFontRefs(entry.value_ptr.glyphs_buf[0..entry.value_ptr.glyph_count]);
+            releaseSegmentEntry(self.allocator, entry.value_ptr.*);
         }
         self.segment_cache.deinit();
         self.long_segment_cache.deinit(self.allocator);
@@ -784,6 +930,7 @@ pub const TextRenderer = struct {
         self.instances_linear.deinit(self.allocator);
         self.shaper.deinit();
         self.atlas.deinit();
+        if (comptime builtin.os.tag == .windows) NativeRaster.zenit_dwrite_raster_context_destroy(self.raster_context);
         for (&self.instance_buffers) |*buf| buf.destroy();
         for (&self.uniform_buffers) |*ubuf| ubuf.destroy();
         for (&self.overflow_buffers) |*maybe_buf| {
@@ -794,6 +941,18 @@ pub const TextRenderer = struct {
         }
         self.pipeline.deinit();
         std.log.info("[TextRenderer] Destroyed", .{});
+    }
+
+    pub fn updateWindowTextParameters(self: *TextRenderer, window: ?*anyopaque) !bool {
+        if (comptime builtin.os.tag != .windows) return false;
+        const changed = NativeRaster.zenit_dwrite_raster_context_refresh(self.raster_context, window, 0, &self.dwrite_params);
+        if (changed < 0) return error.TextRenderingParamsFailed;
+        self.cleartype_enabled = self.dwrite_params[7] != 0 and !@import("zenit_environment").has("ZENIT_TEXT_BASELINE_GRAYSCALE");
+        if (changed != 0) {
+            self.atlas.invalidateRaster();
+            self.prewarm_signature_valid = false;
+        }
+        return changed != 0;
     }
 
     /// Start new frame. width/height: logical pixels; scale: DPI scale factor (Retina=2.0)
@@ -833,7 +992,9 @@ pub const TextRenderer = struct {
 
         // Sync frame number to atlas (used for page-level last_used_frame GC judgment)
         self.atlas.current_frame = self.current_frame;
-        self.atlas.frame_insert_count = 0;
+        self.atlas.resetFrameStats();
+        self.lcd_glyph_count = 0;
+        self.gray_glyph_count = 0;
         // Periodic age-based GC (self-throttled internally + budget gate, not every-frame scan).
         // Previously atlas only evicted when page count hit MAX_PAGES (=512 MiB);
         // EVICT_THRESHOLD was dead code (review report P1).
@@ -924,7 +1085,7 @@ pub const TextRenderer = struct {
         }
         for (keys_buf[0..remove_count]) |key| {
             if (self.segment_cache.fetchRemove(key)) |kv| {
-                releaseGlyphFallbackFontRefs(kv.value.glyphs_buf[0..kv.value.glyph_count]);
+                releaseSegmentEntry(self.allocator, kv.value);
             }
         }
     }
@@ -976,7 +1137,7 @@ pub const TextRenderer = struct {
         }
         for (keys_buf[0..remove_count]) |key| {
             if (self.segment_cache.fetchRemove(key)) |kv| {
-                releaseGlyphFallbackFontRefs(kv.value.glyphs_buf[0..kv.value.glyph_count]);
+                releaseSegmentEntry(self.allocator, kv.value);
             }
         }
 
@@ -996,7 +1157,7 @@ pub const TextRenderer = struct {
                     if (c2 == keys2.len) {
                         for (keys2[0..c2]) |k| {
                             if (self.segment_cache.fetchRemove(k)) |kv| {
-                                releaseGlyphFallbackFontRefs(kv.value.glyphs_buf[0..kv.value.glyph_count]);
+                                releaseSegmentEntry(self.allocator, kv.value);
                             }
                         }
                         c2 = 0;
@@ -1005,7 +1166,7 @@ pub const TextRenderer = struct {
             }
             for (keys2[0..c2]) |k| {
                 if (self.segment_cache.fetchRemove(k)) |kv| {
-                    releaseGlyphFallbackFontRefs(kv.value.glyphs_buf[0..kv.value.glyph_count]);
+                    releaseSegmentEntry(self.allocator, kv.value);
                 }
             }
         }
@@ -1159,9 +1320,8 @@ pub const TextRenderer = struct {
     fn selectSegmentFont(self: *TextRenderer, seg_text: []const u8, font: *Font, requested_size: f32) *Font {
         const stack = self.fallback_stack orelse return font;
         if (seg_text.len == 0 or seg_text[0] < 0x80) return font;
-        const seq_len = std.unicode.utf8ByteSequenceLength(seg_text[0]) catch return font;
-        if (seq_len > seg_text.len) return font;
-        const cp = std.unicode.utf8Decode(seg_text[0..seq_len]) catch return font;
+        const scalar = storageScalar(seg_text, 0) orelse return font;
+        const cp = if (scalar.cp >= 0xd800 and scalar.cp <= 0xdfff) 0xfffd else scalar.cp;
         if (self.primaryCoversCodepoint(font, cp)) return font;
         if (stack.selectForCodepoint(cp, requested_size, font.weight)) |stack_font| {
             // Same scale-following as fallback wrapper: stack fonts are shared instances;
@@ -1174,9 +1334,8 @@ pub const TextRenderer = struct {
 
     /// EmitParams adapted above selectSegmentFont: the stack font and primary font may be
     /// different pixelSize instances, so shaping advance/offset scale must be recalculated per
-    /// segment font. use_subpixel is turned off: keep the whole-pixel raster path consistent with
-    /// the existing cascade fallback, to avoid a CJK large charset x subpixel bins exploding the glyph atlas
-    /// (must not be reintroduced).
+    /// segment font. Existing backends keep whole-pixel fallback caching; Windows
+    /// preserves the actual phase so a selected CJK face matches native scan conversion.
     fn emitParamsForSegmentFont(p: EmitParams, seg_font: *Font) EmitParams {
         var seg_p = p;
         seg_p.font = seg_font;
@@ -1185,7 +1344,7 @@ pub const TextRenderer = struct {
         if (p.requested_size > 0 and seg_px > 0) {
             seg_p.layout_scale = p.requested_size / seg_px;
         }
-        seg_p.use_subpixel = false;
+        seg_p.use_subpixel = if (builtin.os.tag == .windows) p.use_subpixel else false;
         return seg_p;
     }
 
@@ -1272,7 +1431,7 @@ pub const TextRenderer = struct {
         use_subpixel: bool,
         snap_to_device_pixels: bool,
         /// Does vertex shader snap position to physical pixels (written to
-        /// GlyphInstance.shader_snap).
+        /// GlyphInstance.metadata.snaps()).
         /// Must match snap_to_device_pixels origin: CPU snap + shader snap is idempotent;
         /// CPU no-snap + shader snap is direct_animated jitter cause (both sides contract
         /// in text_blob.TextRasterPolicy).
@@ -1331,6 +1490,35 @@ pub const TextRenderer = struct {
 
     /// Convert single ShapedGlyph to GlyphInstance and append to instance list;
     /// return cursor_x delta (glyph.x_advance * text_scale)
+    fn prewarmGlyphVariants(self: *TextRenderer, font: *Font, glyph: u32, phase: ?u32) void {
+        if (comptime builtin.os.tag != .windows) return;
+        if (!self.glyph_only) return;
+        const saved_scale = font.scale_factor;
+        const saved_lcd = font.cleartype;
+        defer {
+            font.setScaleFactor(saved_scale);
+            font.cleartype = saved_lcd;
+        }
+        const scale_count = if (self.prewarm_scale_count > 0) self.prewarm_scale_count else 1;
+        scales: for (0..scale_count) |i| {
+            const scale = if (self.prewarm_scale_count > 0) self.prewarm_scales[i] else saved_scale;
+            if (self.prewarm_scale_count > 0) for (0..i) |prior| {
+                if (self.prewarm_scales[prior] == scale) continue :scales;
+            };
+            font.setScaleFactor(scale);
+            const mode_count: usize = if (!self.prewarm_layered and phase != null and self.cleartype_enabled) 2 else 1;
+            for (0..mode_count) |mode| {
+                font.cleartype = if (mode == 0) saved_lcd else !saved_lcd;
+                if (phase) |bin| {
+                    if (self.prewarm_layered) {
+                        font.cleartype = false;
+                        for (0..atlas_mod.SUBPIXEL_BINS) |x| _ = self.atlas.getOrInsertSubpixel(font, glyph, atlas_mod.packSubpixelBin(@intCast(x), 0)) catch {};
+                    } else _ = self.atlas.getOrInsertSubpixel(font, glyph, bin) catch {};
+                } else _ = self.atlas.getOrInsert(font, glyph) catch {};
+            }
+        }
+    }
+
     fn emitGlyphInstance(
         self: *TextRenderer,
         glyph: text_module.ShapedGlyph,
@@ -1360,6 +1548,7 @@ pub const TextRenderer = struct {
         if (p.scale > 0 and render_font.scale_factor != p.scale) render_font.setScaleFactor(p.scale);
         // and with the command's font smoothing (TextProps.font_smoothing; atlas-keyed)
         render_font.smooth_fonts = self.smooth_fonts;
+        if (comptime builtin.os.tag == .windows) render_font.cleartype = self.cleartype_enabled and self.cleartype_allowed and p.use_subpixel and !glyph.is_synthetic_italic and glyph_color.a == 1;
         const layout_scale = p.layout_scale;
         const render_font_px = render_font.pixelSize();
         // bitmap_scale applies to bearing/bitmap size; layout_scale continues for
@@ -1369,6 +1558,10 @@ pub const TextRenderer = struct {
         else
             layout_scale;
 
+        if (comptime builtin.os.tag == .windows) {
+            if (bitmap_scale != 1) render_font.cleartype = false;
+            if (self.cleartype_enabled and self.cleartype_allowed and !render_font.cleartype and !render_font.hasColorGlyphs()) self.run_lcd_rejected = true;
+        }
         const cur_instance_list = if (glyph.is_synthetic_italic)
             &self.instances_linear
         else
@@ -1380,9 +1573,26 @@ pub const TextRenderer = struct {
             const pen = atlas_mod.subpixelPen(phys_x);
             const bin_packed = atlas_mod.packSubpixelBin(pen.bin, 0);
 
-            const region = self.atlas.getOrInsertSubpixel(render_font, glyph.glyph_index, bin_packed) catch {
+            var region = self.atlas.getOrInsertSubpixel(render_font, glyph.glyph_index, bin_packed) catch {
                 return glyphAdvance(glyph, cluster_span, p);
             };
+            self.prewarmGlyphVariants(render_font, glyph.glyph_index, bin_packed);
+            if (comptime builtin.os.tag == .windows) {
+                if (!self.glyph_only and region.is_cleartype) {
+                    const left = clampFixedAdvanceGlyphX(subpixelGlyphLeftPx(pen, @as(f32, @floatFromInt(region.bearing_x))) / p.scale, cursor_x, glyph, p);
+                    const top = cursor_y + glyph.y_offset * layout_scale - @as(f32, @floatFromInt(region.bearing_y)) / p.scale;
+                    const x = if (p.shader_snap or p.snap_to_device_pixels) @round(left * p.scale) / p.scale else left;
+                    const y = if (p.shader_snap or p.snap_to_device_pixels) @round(top * p.scale) / p.scale else top;
+                    const rect: [4]f32 = .{ @max(0, x), @max(0, y), @min(self.viewport_width / p.scale, x + @as(f32, @floatFromInt(region.width)) / p.scale), @min(self.viewport_height / p.scale, y + @as(f32, @floatFromInt(region.height)) / p.scale) };
+                    const supported = if (self.lcd_backdrop) |backdrop| backdrop.contains(rect) else false;
+                    if (!supported) {
+                        self.run_lcd_rejected = true;
+                        render_font.cleartype = false;
+                        region = self.atlas.getOrInsertSubpixel(render_font, glyph.glyph_index, bin_packed) catch return glyphAdvance(glyph, cluster_span, p);
+                    }
+                }
+            }
+
             if (region.width == 0 or region.height == 0) {
                 return glyphAdvance(glyph, cluster_span, p);
             }
@@ -1407,20 +1617,19 @@ pub const TextRenderer = struct {
                     (region_w / render_font.scale_factor) * bitmap_scale,
                     (region_h / render_font.scale_factor) * bitmap_scale,
                 },
-                .uv_rect = .{
+                .uv_rect = GlyphUV.init(.{
                     region.uv_min[0],
                     region.uv_min[1],
                     region.uv_max[0],
                     region.uv_max[1],
-                },
+                }),
                 .color = glyph_color.toArray(),
                 .rect_clip = self.current_rect_clip,
-                .page_index = @floatFromInt(region.page_index),
-                .is_color = if (region.is_color) 1 else 0,
-                .shader_snap = if (p.shader_snap) 1 else 0,
+                .metadata = GlyphMetadata.init(region.page_index, if (region.is_color) 1 else if (region.is_cleartype) 2 else 0, p.shader_snap),
             });
         } else {
             const region = try self.atlas.getOrInsert(render_font, glyph.glyph_index);
+            self.prewarmGlyphVariants(render_font, glyph.glyph_index, null);
             if (region.width == 0 or region.height == 0) {
                 return glyphAdvance(glyph, cluster_span, p);
             }
@@ -1443,18 +1652,16 @@ pub const TextRenderer = struct {
                     (region_w / render_font.scale_factor) * bitmap_scale,
                     (region_h / render_font.scale_factor) * bitmap_scale,
                 },
-                .uv_rect = .{
+                .uv_rect = GlyphUV.init(.{
                     region.uv_min[0],
                     region.uv_min[1],
                     region.uv_max[0],
                     region.uv_max[1],
-                },
+                }),
                 .color = glyph_color.toArray(),
                 .rect_clip = self.current_rect_clip,
                 .skew_x = if (glyph.is_synthetic_italic) p.synthetic_skew else 0,
-                .page_index = @floatFromInt(region.page_index),
-                .is_color = if (region.is_color) 1 else 0,
-                .shader_snap = if (p.shader_snap) 1 else 0,
+                .metadata = GlyphMetadata.init(region.page_index, if (region.is_color) 1 else if (region.is_cleartype) 2 else 0, p.shader_snap),
             });
         }
 
@@ -1491,8 +1698,9 @@ pub const TextRenderer = struct {
         };
 
         if (self.segment_cache.getPtr(cache_key)) |entry| {
+            self.segment_cache_hits += 1;
             entry.frame_last_used = self.current_frame;
-            return .{ .glyphs = entry.glyphs_buf[0..entry.glyph_count], .owned = false };
+            return .{ .glyphs = entry.glyphs, .owned = false };
         }
 
         if (self.cache_long_segments) {
@@ -1501,6 +1709,7 @@ pub const TextRenderer = struct {
         }
 
         // cache miss, shape this segment
+        self.segment_cache_misses += 1;
         const shaped = try self.shaper.shapeWithOptions(seg_text, font, use_italic);
 
         // When inline capacity exceeded, try bounded long-segment cache; failure still hands
@@ -1510,27 +1719,23 @@ pub const TextRenderer = struct {
             return .{ .glyphs = shaped, .owned = !cached };
         }
 
-        // Evict when full
-        if (self.segment_cache.count() >= SEGMENT_CACHE_MAX) {
-            self.evictSegmentCacheOnFull();
-        }
+        const cached = self.adoptShortSegment(cache_key, shaped);
+        return .{ .glyphs = shaped, .owned = !cached };
+    }
 
-        var entry = SegmentCacheEntry{
-            .glyph_count = @intCast(shaped.len),
-            .frame_last_used = self.current_frame,
-        };
-        @memcpy(entry.glyphs_buf[0..shaped.len], shaped);
-        const gop = self.segment_cache.getOrPut(cache_key) catch {
-            // put failed (extremely rare): entry didn't enter cache, refs unclaimed, ownership
-            // handed back to caller. Old impl threw stale stack entry plus already-memcpied
-            // fallback refs away, each ref leaked a retain.
-            return .{ .glyphs = shaped, .owned = true };
-        };
-        gop.value_ptr.* = entry;
-        // fallback_font_ref's retain already went into cache entry via memcpy (sole owner,
-        // released by evict/deinit); heap slice itself no longer carries ownership, return.
-        self.allocator.free(shaped);
-        return .{ .glyphs = gop.value_ptr.glyphs_buf[0..gop.value_ptr.glyph_count], .owned = false };
+    fn releaseSegmentEntry(allocator: std.mem.Allocator, entry: SegmentCacheEntry) void {
+        releaseGlyphFallbackFontRefs(entry.glyphs);
+        allocator.free(entry.glyphs);
+    }
+
+    /// Failure leaves incoming ownership with the caller and existing entries intact.
+    /// Reserve metadata before eviction; committing the adopted slice cannot fail.
+    fn adoptShortSegment(self: *TextRenderer, key: SegmentCacheKey, glyphs: []text_module.ShapedGlyph) bool {
+        self.segment_cache.ensureUnusedCapacity(1) catch return false;
+        if (self.segment_cache.fetchRemove(key)) |old| releaseSegmentEntry(self.allocator, old.value);
+        if (self.segment_cache.count() >= SEGMENT_CACHE_MAX) self.evictSegmentCacheOnFull();
+        self.segment_cache.putAssumeCapacity(key, .{ .glyphs = glyphs, .frame_last_used = self.current_frame });
+        return true;
     }
 
     /// How wide a text segment ACTUALLY draws: uses the same segmentation, shaper and
@@ -1626,6 +1831,12 @@ pub const TextRenderer = struct {
         return total;
     }
 
+    fn runHasLCD(self: *const TextRenderer, nearest_start: usize, linear_start: usize) bool {
+        for ([_][]const GlyphInstance{ self.instances_nearest.items[nearest_start..], self.instances_linear.items[linear_start..] }) |instances|
+            for (instances) |instance| if (instance.metadata.colorMode() == 2) return true;
+        return false;
+    }
+
     pub fn drawTextWithOptions(
         self: *TextRenderer,
         text: []const u8,
@@ -1640,6 +1851,43 @@ pub const TextRenderer = struct {
         shader_snap: bool,
         fixed_advance: f32,
     ) !void {
+        if (comptime builtin.os.tag != .windows) return self.drawTextWithOptionsInternal(text, x, y, font, color, requested_size, use_italic, fallback_font, force_linear, shader_snap, fixed_advance);
+        const nearest_start = self.instances_nearest.items.len;
+        const linear_start = self.instances_linear.items.len;
+        const allowed = self.cleartype_allowed;
+        self.run_lcd_rejected = false;
+        try self.drawTextWithOptionsInternal(text, x, y, font, color, requested_size, use_italic, fallback_font, force_linear, shader_snap, fixed_advance);
+        if (allowed and self.run_lcd_rejected and !self.glyph_only and self.runHasLCD(nearest_start, linear_start)) {
+            // A text command is one AA decision, including spans and fallback faces.
+            self.instances_nearest.items.len = nearest_start;
+            self.instances_linear.items.len = linear_start;
+            self.cleartype_allowed = false;
+            defer self.cleartype_allowed = allowed;
+            try self.drawTextWithOptionsInternal(text, x, y, font, color, requested_size, use_italic, fallback_font, force_linear, shader_snap, fixed_advance);
+        }
+    }
+
+    fn drawTextWithOptionsInternal(
+        self: *TextRenderer,
+        text: []const u8,
+        x: f32,
+        y: f32,
+        font: *Font,
+        color: Color,
+        requested_size: f32,
+        use_italic: bool,
+        fallback_font: ?*Font,
+        force_linear: bool,
+        shader_snap: bool,
+        fixed_advance: f32,
+    ) !void {
+        if (comptime builtin.os.tag == .windows) {
+            if (@import("zenit_environment").has("ZENIT_TEXT_DIAGNOSTICS") and !self.glyph_only) {
+                const record = try std.json.Stringify.valueAlloc(self.allocator, .{ .text = text, .x = x, .baseline = y, .size = requested_size, .weight = font.weight, .color = color.toArray(), .scale = self.scale_factor, .cleartype = self.cleartype_enabled and self.cleartype_allowed and !force_linear, .force_linear = force_linear }, .{});
+                defer self.allocator.free(record);
+                std.debug.print("TEXT_DRAW {s}\n", .{record});
+            }
+        }
         const instances_before = self.instances_nearest.items.len + self.instances_linear.items.len;
 
         // Calculate scale factor: UI requested size / font physical size
@@ -1649,7 +1897,9 @@ pub const TextRenderer = struct {
         else
             1.0;
         const use_nearest = !force_linear and @abs(text_scale - 1.0) <= 0.01;
-        const use_subpixel = use_nearest and self.scale_factor > 0;
+        // Static cached Windows text keeps raster phase; the surface still composites
+        // linearly. Animated glyphs retain continuous placement without phase bins.
+        const use_subpixel = (use_nearest or (builtin.os.tag == .windows and shader_snap)) and self.scale_factor > 0;
         const scale = self.scale_factor;
         const synthetic_skew: f32 = requested_size * 0.75 * 0.2126;
         const instance_list = if (use_nearest) &self.instances_nearest else &self.instances_linear;
@@ -1828,13 +2078,46 @@ pub const TextRenderer = struct {
         fixed_advance: f32,
         spans: []const ColorSpan,
     ) !void {
+        if (comptime builtin.os.tag != .windows) return self.drawTextWithSpansInternal(text, x, y, font, base_color, requested_size, use_italic, fallback_font, force_linear, shader_snap, fixed_advance, spans);
+        const nearest_start = self.instances_nearest.items.len;
+        const linear_start = self.instances_linear.items.len;
+        const allowed = self.cleartype_allowed;
+        self.run_lcd_rejected = false;
+        try self.drawTextWithSpansInternal(text, x, y, font, base_color, requested_size, use_italic, fallback_font, force_linear, shader_snap, fixed_advance, spans);
+        if (allowed and self.run_lcd_rejected and !self.glyph_only and self.runHasLCD(nearest_start, linear_start)) {
+            // A text command is one AA decision, including spans and fallback faces.
+            self.instances_nearest.items.len = nearest_start;
+            self.instances_linear.items.len = linear_start;
+            self.cleartype_allowed = false;
+            defer self.cleartype_allowed = allowed;
+            try self.drawTextWithSpansInternal(text, x, y, font, base_color, requested_size, use_italic, fallback_font, force_linear, shader_snap, fixed_advance, spans);
+        }
+    }
+
+    fn drawTextWithSpansInternal(
+        self: *TextRenderer,
+        text: []const u8,
+        x: f32,
+        y: f32,
+        font: *Font,
+        base_color: Color,
+        requested_size: f32,
+        use_italic: bool,
+        fallback_font: ?*Font,
+        force_linear: bool,
+        shader_snap: bool,
+        fixed_advance: f32,
+        spans: []const ColorSpan,
+    ) !void {
         const font_physical_size = font.pixelSize();
         const text_scale: f32 = if (requested_size > 0 and font_physical_size > 0)
             requested_size / font_physical_size
         else
             1.0;
         const use_nearest = !force_linear and @abs(text_scale - 1.0) <= 0.01;
-        const use_subpixel = use_nearest and self.scale_factor > 0;
+        // Static cached Windows text keeps raster phase; the surface still composites
+        // linearly. Animated glyphs retain continuous placement without phase bins.
+        const use_subpixel = (use_nearest or (builtin.os.tag == .windows and shader_snap)) and self.scale_factor > 0;
         const scale = self.scale_factor;
         const synthetic_skew: f32 = requested_size * 0.75 * 0.2126;
         const instance_list = if (use_nearest) &self.instances_nearest else &self.instances_linear;
@@ -1955,6 +2238,14 @@ pub const TextRenderer = struct {
         const nearest_count = self.instances_nearest.items.len;
         const linear_count = self.instances_linear.items.len;
         if (nearest_count == 0 and linear_count == 0) return;
+        if (comptime builtin.os.tag == .windows) {
+            for ([_][]const GlyphInstance{ self.instances_nearest.items, self.instances_linear.items }) |instances| {
+                for (instances) |instance| {
+                    if (instance.metadata.colorMode() == 2) self.lcd_glyph_count += 1;
+                    if (instance.metadata.colorMode() == 0) self.gray_glyph_count += 1;
+                }
+            }
+        }
 
         // Update uniform buffer.
         //
@@ -1976,8 +2267,8 @@ pub const TextRenderer = struct {
             self.uniform_overflow_count += 1;
             text_uniform_overflow_total += 1;
             const slot = self.uniform_overflow_used;
-            self.uniform_overflow_used += 1;
             const buf = try self.ensureUniformOverflowCapacity(slot + 1);
+            self.uniform_overflow_used += 1;
             break :blk .{ buf, slot * UNIFORM_STRIDE };
         };
         const peak = self.uniform_write_offset + self.uniform_overflow_used;
@@ -1993,6 +2284,8 @@ pub const TextRenderer = struct {
             .clip_contour_count = self.clip_contour_count,
             .clip_polygon_end_points = self.clip_polygon_end_points,
             .clip_polygon_points = self.clip_polygon_points,
+            .dwrite_gamma = if (builtin.os.tag == .windows) self.dwrite_params[0..4].* else .{},
+            .dwrite_settings = if (builtin.os.tag == .windows) self.dwrite_params[4..8].* else .{},
         };
         const uniform_data = try uniform_buffer.getMappedRange(uniform_byte_offset, @sizeOf(Uniforms));
         @memcpy(uniform_data, std.mem.asBytes(&uniforms));
@@ -2040,12 +2333,14 @@ pub const TextRenderer = struct {
                 UNIFORM_STRIDE * 64,
             );
             while (new_capacity < needed) new_capacity *= 2;
-            if (self.uniform_overflow_buffers[self.current_buffer]) |*old| old.destroy();
-            self.uniform_overflow_buffers[self.current_buffer] = try self.device.createBuffer(self.allocator, .{
+            // Keep the owned buffer intact if replacement allocation fails.
+            const replacement = try self.device.createBuffer(self.allocator, .{
                 .label = "Zenit.Text.OverflowUniforms",
                 .size = new_capacity,
                 .usage = .{ .vertex = true, .map_write = true },
             });
+            if (self.uniform_overflow_buffers[self.current_buffer]) |*old| old.destroy();
+            self.uniform_overflow_buffers[self.current_buffer] = replacement;
             self.uniform_overflow_capacities[self.current_buffer] = new_capacity;
         }
         return &self.uniform_overflow_buffers[self.current_buffer].?;
@@ -2061,9 +2356,9 @@ pub const TextRenderer = struct {
 
         var batch_start: usize = 0;
         while (batch_start < total) {
-            const cur_page: u8 = @intFromFloat(items[batch_start].page_index);
+            const cur_page: u8 = items[batch_start].metadata.pageIndex();
             var batch_end = batch_start + 1;
-            while (batch_end < total and @as(u8, @intFromFloat(items[batch_end].page_index)) == cur_page) {
+            while (batch_end < total and items[batch_end].metadata.pageIndex() == cur_page) {
                 batch_end += 1;
             }
 
@@ -2122,12 +2417,14 @@ pub const TextRenderer = struct {
                     if (self.overflow_capacities[self.current_buffer] < needed) {
                         var new_capacity = @max(self.overflow_capacities[self.current_buffer], instance_size);
                         while (new_capacity < needed) new_capacity *= 2;
-                        if (self.overflow_buffers[self.current_buffer]) |*old| old.destroy();
-                        self.overflow_buffers[self.current_buffer] = try self.device.createBuffer(self.allocator, .{
+                        // Keep the owned buffer intact if replacement allocation fails.
+                        const replacement = try self.device.createBuffer(self.allocator, .{
                             .label = "Zenit.Text.OverflowInstanceBuffer",
                             .size = new_capacity,
                             .usage = .{ .vertex = true, .map_write = true },
                         });
+                        if (self.overflow_buffers[self.current_buffer]) |*old| old.destroy();
+                        self.overflow_buffers[self.current_buffer] = replacement;
                         self.overflow_capacities[self.current_buffer] = new_capacity;
                     }
                     const overflow_buffer = &self.overflow_buffers[self.current_buffer].?;
@@ -2144,7 +2441,11 @@ pub const TextRenderer = struct {
                     gpu.setFragmentBufferRange(render_pass, 1, &self.instance_buffers[self.current_buffer], @intCast(byte_offset), @intCast(instance_size));
                     self.buffer_write_offset += batch;
                 }
-                render_pass.draw(6, @intCast(batch), 0, 0);
+                if (comptime gpu.backend_kind == .metal) {
+                    render_pass.drawTriangleStrip(4, @intCast(batch), 0, 0);
+                } else {
+                    render_pass.draw(6, @intCast(batch), 0, 0);
+                }
                 text_draw_calls += 1;
                 seg_offset += batch;
             }
@@ -2555,4 +2856,125 @@ test "frame width cache owns text, rejects collisions and clears results" {
     defer std.testing.allocator.free(oversized);
     cache.put(std.testing.allocator, key, oversized, 99);
     try std.testing.expectEqual(@as(usize, 0), cache.entries.count());
+}
+
+test "segmentText: WTF8 pairs and joined emoji keep original storage spans" {
+    const pair = "\xed\xa0\xbd\xed\xb8\x80";
+    var segments: [MAX_SEGMENTS]Segment = undefined;
+    for ([_][]const u8{ pair, pair ++ "\u{200d}" ++ pair, pair ++ "\u{fe0f}" }) |emoji| {
+        try std.testing.expectEqual(@as(u32, 1), segmentText(emoji, &segments));
+        try std.testing.expectEqual(@as(u32, 0), segments[0].start);
+        try std.testing.expectEqual(@as(u32, @intCast(emoji.len)), segments[0].end);
+    }
+    const mixed = "A" ++ pair ++ "Z";
+    try std.testing.expectEqual(@as(u32, 3), segmentText(mixed, &segments));
+    try std.testing.expectEqual(@as(u32, 1), segments[1].start);
+    try std.testing.expectEqual(@as(u32, 7), segments[1].end);
+    try std.testing.expectEqual(@as(u32, 3), segmentText("A\xed\xa0\x80Z", &segments));
+    try std.testing.expectEqual(@as(u32, 4), segments[1].end);
+}
+
+fn checkShortSegmentAdoptionOom(allocator: std.mem.Allocator) !void {
+    var tr: TextRenderer = undefined;
+    tr.allocator = allocator;
+    tr.segment_cache = std.AutoHashMap(SegmentCacheKey, SegmentCacheEntry).init(allocator);
+    tr.current_frame = 1;
+    defer {
+        var it = tr.segment_cache.valueIterator();
+        while (it.next()) |entry| TextRenderer.releaseSegmentEntry(allocator, entry.*);
+        tr.segment_cache.deinit();
+    }
+    const glyphs = try allocator.alloc(text_module.ShapedGlyph, 3);
+    var adopted = false;
+    defer if (!adopted) allocator.free(glyphs);
+    @memset(glyphs, .{ .glyph_index = 1, .cluster = 0, .x_advance = 4, .y_advance = 0, .x_offset = 0, .y_offset = 0 });
+    const key = SegmentCacheKey{ .content_hash = 1, .font_ptr = 0, .flags = 0 };
+    adopted = tr.adoptShortSegment(key, glyphs);
+    if (!adopted) return error.OutOfMemory;
+    try std.testing.expectEqual(@intFromPtr(glyphs.ptr), @intFromPtr(tr.segment_cache.get(key).?.glyphs.ptr));
+}
+
+test "short segment cache adoption exhaustively rolls back allocation failures" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkShortSegmentAdoptionOom, .{});
+}
+
+test "short segment cache retains exact payload and frees stale and full entries" {
+    const allocator = std.testing.allocator;
+    var tr: TextRenderer = undefined;
+    tr.allocator = allocator;
+    tr.segment_cache = std.AutoHashMap(SegmentCacheKey, SegmentCacheEntry).init(allocator);
+    tr.current_frame = 1;
+    defer {
+        var it = tr.segment_cache.valueIterator();
+        while (it.next()) |entry| TextRenderer.releaseSegmentEntry(allocator, entry.*);
+        tr.segment_cache.deinit();
+    }
+    var first: ?[*]text_module.ShapedGlyph = null;
+    for (0..SEGMENT_CACHE_MAX + 1) |i| {
+        const glyphs = try allocator.alloc(text_module.ShapedGlyph, 2);
+        @memset(glyphs, .{ .glyph_index = 1, .cluster = 0, .x_advance = 4, .y_advance = 0, .x_offset = 0, .y_offset = 0 });
+        if (!tr.adoptShortSegment(.{ .content_hash = i, .font_ptr = 0, .flags = 0 }, glyphs)) {
+            allocator.free(glyphs);
+            return error.OutOfMemory;
+        }
+        if (i == 0) first = glyphs.ptr;
+        if (i == 200) try std.testing.expectEqual(@intFromPtr(first.?), @intFromPtr(tr.segment_cache.get(.{ .content_hash = 0, .font_ptr = 0, .flags = 0 }).?.glyphs.ptr));
+    }
+    try std.testing.expect(tr.segment_cache.count() < SEGMENT_CACHE_MAX);
+    try std.testing.expect(@sizeOf(SegmentCacheEntry) < 64);
+    tr.current_frame = 2000;
+    const count = tr.segment_cache.count();
+    tr.evictStaleSegments();
+    try std.testing.expectEqual(count - 128, tr.segment_cache.count());
+}
+
+test "glyph metadata preserves Metal and legacy backend wire contracts" {
+    const t = std.testing;
+    try t.expectEqual(@as(usize, if (gpu.backend_kind == .metal) 64 else 80), @sizeOf(GlyphInstance));
+    try t.expectEqual(@as(usize, if (gpu.backend_kind == .metal) 60 else 68), @offsetOf(GlyphInstance, "metadata"));
+    const Meta = @FieldType(GlyphInstance, "metadata");
+    const default = GlyphInstance{ .position = .{ 0, 0 }, .size = .{ 1, 1 }, .uv_rect = @FieldType(GlyphInstance, "uv_rect").init(.{ 0, 0, 1, 1 }), .color = .{ 1, 1, 1, 1 } };
+    try t.expectEqual(@as(u8, 0), default.metadata.pageIndex());
+    try t.expectEqual(@as(u2, 0), default.metadata.colorMode());
+    try t.expect(default.metadata.snaps());
+    if (comptime gpu.backend_kind != .metal) {
+        try t.expectEqual(@as(usize, 0), @offsetOf(Meta, "page_index"));
+        try t.expectEqual(@as(usize, 4), @offsetOf(Meta, "is_color"));
+        try t.expectEqual(@as(usize, 8), @offsetOf(Meta, "shader_snap"));
+    }
+    for (0..256) |page| for (0..3) |mode| for ([_]bool{ false, true }) |snap| {
+        const m = Meta.init(@intCast(page), @intCast(mode), snap);
+        try t.expectEqual(@as(u8, @intCast(page)), m.pageIndex());
+        try t.expectEqual(@as(u2, @intCast(mode)), m.colorMode());
+        try t.expectEqual(snap, m.snaps());
+        if (comptime gpu.backend_kind == .metal) try t.expectEqual(@as(u32, @intCast(page)) | (@as(u32, @intCast(mode)) << 8) | (@as(u32, @intFromBool(snap)) << 10), m.flags) else {
+            try t.expectEqual(@as(f32, @floatFromInt(page)), m.page_index);
+            try t.expectEqual(@as(f32, @floatFromInt(mode)), m.is_color);
+            try t.expectEqual(@as(f32, if (snap) 1 else 0), m.shader_snap);
+        }
+    };
+}
+
+test "glyph UV wire round trips every 4096 atlas texel boundary exactly" {
+    const UV = @FieldType(GlyphInstance, "uv_rect");
+    try std.testing.expectEqual(@as(usize, if (gpu.backend_kind == .metal) 8 else 16), @sizeOf(UV));
+    try std.testing.expectEqual(@as(usize, 16), @offsetOf(GlyphInstance, "uv_rect"));
+    try std.testing.expectEqual(@as(usize, if (gpu.backend_kind == .metal) 24 else 32), @offsetOf(GlyphInstance, "color"));
+    try std.testing.expectEqual(@as(usize, if (gpu.backend_kind == .metal) 40 else 48), @offsetOf(GlyphInstance, "rect_clip"));
+    try std.testing.expectEqual(@as(usize, if (gpu.backend_kind == .metal) 56 else 64), @offsetOf(GlyphInstance, "skew_x"));
+    for (0..4097) |i| {
+        const expected: [4]f32 = .{ @as(f32, @floatFromInt(i)) / 4096, @as(f32, @floatFromInt(4096 - i)) / 4096, @as(f32, @floatFromInt((i * 17) % 4097)) / 4096, 1 };
+        const uv = UV.init(expected);
+        const decoded = uv.normalized();
+        for (expected, decoded) |x, y| try std.testing.expectEqual(@as(u32, @bitCast(x)), @as(u32, @bitCast(y)));
+        if (comptime gpu.backend_kind == .metal) {
+            const bytes = std.mem.asBytes(&uv);
+            for (0..4) |j| try std.testing.expectEqual(@as(u16, @intFromFloat(expected[j] * 4096)), std.mem.readInt(u16, bytes[j * 2 ..][0..2], .little));
+        } else try std.testing.expectEqualSlices(u8, std.mem.asBytes(&expected), std.mem.asBytes(&uv));
+    }
+    if (comptime gpu.backend_kind != .metal) {
+        const arbitrary: [4]f32 = .{ 0.1, 0.2, 0.7, 0.9 };
+        const uv = UV.init(arbitrary);
+        try std.testing.expectEqualSlices(u8, std.mem.asBytes(&arbitrary), std.mem.asBytes(&uv));
+    }
 }

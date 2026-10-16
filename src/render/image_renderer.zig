@@ -64,6 +64,7 @@ const TextureSlot = struct {
     height: u32,
     mip_level_count: u32,
     atlas_page_index: u16 = 0,
+    sampling_max: [2]f32 = .{ 0, 0 },
     uv_rect: [4]f32 = .{ 0, 0, 1, 1 },
 };
 
@@ -163,8 +164,15 @@ pub const ImageTextureStore = struct {
     /// Admission limit for resident storage; configure before the first upload.
     memory_budget_bytes: u64 = std.math.maxInt(u64),
 
-    pub fn init(allocator: std.mem.Allocator, device: *gpu.Backend.Device, shared: bool) ImageTextureStore {
-        return .{ .allocator = allocator, .device = device, .namespace = if (shared) SHARED_TEXTURE_BIT else 0 };
+    pub fn init(self: *ImageTextureStore, allocator: std.mem.Allocator, device: *gpu.Backend.Device, shared: bool) void {
+        self.allocator = allocator;
+        self.device = device;
+        self.namespace = if (shared) SHARED_TEXTURE_BIT else 0;
+        @memset(&self.textures, null);
+        @memset(&self.generations, 0);
+        self.texture_count = 0;
+        self.atlas_pages = .empty;
+        self.memory_budget_bytes = std.math.maxInt(u64);
     }
 
     pub fn deinit(self: *ImageTextureStore) void {
@@ -548,7 +556,31 @@ pub const ImageRenderer = struct {
     buffer_write_offset: usize = 0,
 
     /// Initialization
-    pub fn init(allocator: std.mem.Allocator, device: *gpu.Backend.Device) !ImageRenderer {
+    pub fn init(self: *ImageRenderer, allocator: std.mem.Allocator, device: *gpu.Backend.Device) !void {
+        self.solid_fallback_texture = null;
+        self.unmasked_pipeline = null;
+        self.uniform_write_offset = 0;
+        self.uniform_overflow_count = 0;
+        self.current_buffer = 0;
+        @memset(&self.uniform_overflow_buffers, null);
+        @memset(&self.uniform_overflow_capacities, 0);
+        self.uniform_overflow_used = 0;
+        @memset(&self.overflow_buffers, null);
+        @memset(&self.overflow_capacities, 0);
+        self.overflow_write_offset = 0;
+        self.shared_texture_store = null;
+        self.clip_rect = .{ 0, 0, 0, 0 };
+        self.clip_radius = 0;
+        self.clip_shape_kind = 0;
+        self.clip_fill_rule = 0;
+        self.clip_point_count = 0;
+        self.clip_contour_count = 0;
+        @memset(&self.clip_polygon_end_points, 0);
+        @memset(&self.clip_polygon_points, .{ 0, 0 });
+        self.current_rect_clip = .{ 0, 0, -1, -1 };
+        self.instance_high_water_mark = 0;
+        self.buffer_write_offset = 0;
+
         // Compile shader
         var shader = try gpu.Backend.ShaderModule.initFromSource(device, image_shader_source);
         defer shader.deinit();
@@ -626,21 +658,19 @@ pub const ImageRenderer = struct {
 
         std.log.info("[ImageRenderer] Initialized (64-byte image pipeline)", .{});
 
-        return ImageRenderer{
-            .allocator = allocator,
-            .device = device,
-            .pipeline = pipeline,
-            .unmasked_pipeline = unmasked_pipeline,
-            .uniform_buffers = uniform_buffers,
-            .instance_buffers = instance_buffers,
-            .sampler = sampler,
-            .texture_store = ImageTextureStore.init(allocator, device, false),
-            .instances = .empty,
-            .instance_textures = .empty,
-            .viewport_width = 800,
-            .viewport_height = 600,
-            .scale_factor = 1.0,
-        };
+        self.allocator = allocator;
+        self.device = device;
+        self.pipeline = pipeline;
+        self.unmasked_pipeline = unmasked_pipeline;
+        self.uniform_buffers = uniform_buffers;
+        self.instance_buffers = instance_buffers;
+        self.sampler = sampler;
+        self.texture_store.init(allocator, device, false);
+        self.instances = .empty;
+        self.instance_textures = .empty;
+        self.viewport_width = 800;
+        self.viewport_height = 600;
+        self.scale_factor = 1.0;
     }
 
     /// Destruction
@@ -684,6 +714,17 @@ pub const ImageRenderer = struct {
 
     pub fn unloadTexture(self: *ImageRenderer, id: TextureId) void {
         self.texture_store.unloadTexture(id);
+    }
+
+    /// Clamp borrowed opacity surfaces to their used texel centers on Metal.
+    /// Stored in existing instance padding: other backend shader ABIs are unchanged.
+    pub fn setTextureSamplingExtent(self: *ImageRenderer, id: TextureId, width: u32, height: u32) void {
+        const slot = self.texture_store.resolveTextureSlot(id) orelse return;
+        const index = id & SLOT_MASK;
+        self.texture_store.textures[index].?.sampling_max = .{
+            (@as(f32, @floatFromInt(width)) - 0.5) / @as(f32, @floatFromInt(slot.width)),
+            (@as(f32, @floatFromInt(height)) - 0.5) / @as(f32, @floatFromInt(slot.height)),
+        };
     }
 
     pub fn getTextureSize(self: *const ImageRenderer, id: TextureId) ?[2]u32 {
@@ -859,6 +900,7 @@ pub const ImageRenderer = struct {
             .corner_radius = corner_radius,
             .opacity = opacity,
             .source_premultiplied = if (source_premultiplied) 1 else 0,
+            ._rect_clip_padding = .{ slot.sampling_max[0], slot.sampling_max[1], 0 },
             .rect_clip = self.current_rect_clip,
         });
         self.instance_textures.appendAssumeCapacity(.{ .binding = slot.binding, .view = slot.binding.createView() });
@@ -920,8 +962,8 @@ pub const ImageRenderer = struct {
             }
             self.uniform_overflow_count += 1;
             const slot = self.uniform_overflow_used;
-            self.uniform_overflow_used += 1;
             const buf = try self.ensureUniformOverflowCapacity(slot + 1);
+            self.uniform_overflow_used += 1;
             break :blk .{ buf, slot * UNIFORM_STRIDE };
         };
         const uniforms = Uniforms{
@@ -1330,9 +1372,13 @@ test "ImageInstance ABI matches image shader layout" {
 
 test "texture namespaces and generations reject released handles and wrong owners" {
     var device: gpu.Backend.Device = undefined;
-    var local = ImageTextureStore.init(std.testing.allocator, &device, false);
+    const local = try std.testing.allocator.create(ImageTextureStore);
+    defer std.testing.allocator.destroy(local);
+    local.init(std.testing.allocator, &device, false);
     defer local.deinit();
-    var shared = ImageTextureStore.init(std.testing.allocator, &device, true);
+    const shared = try std.testing.allocator.create(ImageTextureStore);
+    defer std.testing.allocator.destroy(shared);
+    shared.init(std.testing.allocator, &device, true);
     defer shared.deinit();
     const binding = gpu.Backend.TextureBinding.testBinding(16, 1, 1);
     const local_id = try local.registerTextureBinding(binding, 1, 1);
@@ -1365,7 +1411,9 @@ test "external 绑定槽位 generation 回绕：高频 register/unregister 不�
     // register ~10s of times/frame -> ~1 week TooManyTextures, all opacity
     // layers vanish.
     var device: gpu.Backend.Device = undefined;
-    var store = ImageTextureStore.init(std.testing.allocator, &device, false);
+    const store = try std.testing.allocator.create(ImageTextureStore);
+    defer std.testing.allocator.destroy(store);
+    store.init(std.testing.allocator, &device, false);
     defer store.deinit();
     const binding = gpu.Backend.TextureBinding.testBinding(16, 1, 1);
 
@@ -1393,10 +1441,11 @@ test "external 绑定槽位 generation 回绕：高频 register/unregister 不�
 test "image instance preparation failure cannot leave mismatched instance and texture arrays" {
     for (0..2) |fail_index| {
         var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
-        var renderer: ImageRenderer = undefined;
+        const renderer = try std.testing.allocator.create(ImageRenderer);
+        defer std.testing.allocator.destroy(renderer);
         renderer.allocator = failing.allocator();
         renderer.shared_texture_store = null;
-        renderer.texture_store = ImageTextureStore.init(std.testing.allocator, undefined, false);
+        renderer.texture_store.init(std.testing.allocator, undefined, false);
         defer renderer.texture_store.deinit();
         renderer.instances = .empty;
         defer renderer.instances.deinit(renderer.allocator);
@@ -1411,7 +1460,9 @@ test "image instance preparation failure cannot leave mismatched instance and te
 }
 
 test "invalid image dimensions fail before touching the GPU" {
-    var store = ImageTextureStore.init(std.testing.allocator, undefined, true);
+    const store = try std.testing.allocator.create(ImageTextureStore);
+    defer std.testing.allocator.destroy(store);
+    store.init(std.testing.allocator, undefined, true);
     defer store.deinit();
     try std.testing.expectError(error.InvalidPixelData, store.loadTexture(0, 2, &.{}));
     try std.testing.expectError(error.InvalidPixelData, store.loadTexture(std.math.maxInt(u32), 2, &.{}));

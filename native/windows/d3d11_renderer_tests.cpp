@@ -277,6 +277,63 @@ static void diagnose_immediate_timestamp() {
           (unsigned long)hr, (unsigned long long)result.Frequency,
           result.Disjoint);
 }
+static int check_lcd_blend(ZenitD12Device *device, ZenitD12Queue *queue) {
+  const char vertex[] = "float4 vs(uint id:SV_VertexID):SV_Position{float2 p=float2((id<<1)&2,id&2);return float4(p*float2(2,-2)+float2(-1,1),0,1);}";
+  const char *fragments[] = {
+    "struct O{float4 color:SV_Target0;float4 weights:SV_Target1;};O ps(){O o;o.color=float4(.05,.2,.45,.6);o.weights=float4(.2,.4,.6,.6);return o;}",
+    "float4 ps():SV_Target0{return float4(.05,.2,.45,.6);}",
+    "struct O{float4 color:SV_Target0;float3 weights:SV_Target1;};O ps(){O o;o.color=float4(.05,.2,.45,.6);o.weights=float3(.2,.4,.6);return o;}"
+  };
+  ZenitD12Shader *vs=nullptr; char *diagnostic=nullptr; size_t diagnostic_size=0;
+  CHECK(zenit_d12_shader_compile(vertex,strlen(vertex),"vs",1,&vs,&diagnostic,&diagnostic_size)==0);
+  zenit_d12_shader_diagnostic_free(diagnostic);
+  ZenitD12PipelineLayout *layout=nullptr;
+  CHECK(zenit_d12_pipeline_layout_create(device,0,nullptr,0,&layout)==0);
+  ZenitD12ColorTarget target={};target.format=28;target.write_mask=15;target.blend=1;
+  target.color_src=target.alpha_src=D3D11_BLEND_ONE;
+  target.color_dst=D3D11_BLEND_INV_SRC1_COLOR;target.alpha_dst=D3D11_BLEND_INV_SRC1_ALPHA;
+  target.color_op=target.alpha_op=D3D11_BLEND_OP_ADD;
+  ZenitD12RenderDescriptor descriptor={};descriptor.targets=&target;descriptor.target_count=1;
+  descriptor.topology=D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;descriptor.fill=D3D11_FILL_SOLID;
+  descriptor.cull=D3D11_CULL_NONE;descriptor.depth_clip=1;descriptor.sample_mask=UINT32_MAX;descriptor.samples=1;
+  ZenitD12RenderPipeline *pipeline=nullptr;
+  for(int i=0;i<3;i++) {
+    ZenitD12Shader *ps=nullptr;diagnostic=nullptr;
+    CHECK(zenit_d12_shader_compile(fragments[i],strlen(fragments[i]),"ps",2,&ps,&diagnostic,&diagnostic_size)==0);
+    zenit_d12_shader_diagnostic_free(diagnostic);
+    ZenitD12RenderPipeline *candidate=nullptr;
+    int status=zenit_d12_render_pipeline_create(device,layout,vs,ps,&descriptor,&candidate);
+    CHECK(i==0 ? status==0 && candidate : status==1 && !candidate);
+    if(i==0)pipeline=candidate;
+    zenit_d12_shader_release(ps);
+  }
+  ZenitD12Texture *texture=nullptr;ZenitD12Buffer *readback=nullptr;ZenitD12Commands *commands=nullptr;
+  CHECK(zenit_d12_texture_create(device,2,4,4,1,1,28,1|16,1,&texture)==0);
+  CHECK(zenit_d12_buffer_create(device,1024,1|8,&readback)==0);
+  CHECK(zenit_d12_commands_create(device,&commands)==0);
+  ZenitD12ColorAttachment attachment={};attachment.texture=texture;attachment.load_op=1;
+  attachment.clear[0]=.8f;attachment.clear[1]=.6f;attachment.clear[2]=.4f;attachment.clear[3]=1;
+  ZenitD12RenderPass *pass=nullptr;
+  CHECK(zenit_d12_render_pass_begin(commands,&attachment,1,nullptr,&pass)==0);
+  ZenitD12Draw draw={};draw.vertices=3;draw.instances=1;draw.width=draw.height=4;
+  CHECK(zenit_d12_render_pass_draw(pass,pipeline,&draw)==0);
+  CHECK(zenit_d12_render_pass_end(pass)==0);
+  ZenitD12TextureRegion region={};region.width=region.height=4;region.depth=1;
+  CHECK(zenit_d12_commands_texture_copy(commands,readback,0,256,texture,&region,0)==0);
+  CHECK(zenit_d12_commands_finish(commands)==0);uint64_t serial=0;
+  CHECK(zenit_d12_queue_submit(queue,commands,&serial)==0);
+  CHECK(zenit_d12_queue_wait(queue,serial,30000)==0);
+  const auto *pixels=static_cast<const uint8_t *>(zenit_d12_buffer_mapping(readback));CHECK(pixels);
+  for(int y=0;y<4;y++)for(int x=0;x<4;x++) {
+    const auto *pixel=pixels+y*256+x*4;
+    CHECK(pixel[0]==176 && pixel[1]==143 && pixel[2]==156 && pixel[3]==255);
+  }
+  zenit_d12_commands_release(commands);zenit_d12_buffer_release(readback);zenit_d12_texture_release(texture);
+  zenit_d12_render_pipeline_release(pipeline);zenit_d12_pipeline_layout_release(layout);zenit_d12_shader_release(vs);
+  puts("D3D11 LCD contract: arbitrary opaque RGB blend and invalid secondary signatures PASS");
+  return 0;
+}
+
 extern "C" int zenit_d11_test_contract() {
   diagnose_immediate_timestamp();
   SetEnvironmentVariableA("ZENIT_D11_TIMESTAMP_TRACE", "1");
@@ -293,6 +350,7 @@ extern "C" int zenit_d11_test_contract() {
   CHECK(zenit_d11_uniform_buffer_creations(device) == 2);
   CHECK(check_storage_snapshots(device, queue, false, false, true, true) == 0);
   CHECK(zenit_d11_uniform_buffer_creations(device) == 2);
+  CHECK(check_lcd_blend(device, queue) == 0);
   puts("D3D11 cross-command uniform cache: no second-frame allocation, cache eviction preserves recorded pixels PASS");
   puts("D3D11 uniform snapshot contract: equal bytes across offsets reuse storage, overwrite/caller release pixels PASS");
   puts("D3D11 storage snapshot contract: mapped content reuse, GPU write "

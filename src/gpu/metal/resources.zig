@@ -35,7 +35,13 @@ pub const Buffer = struct {
         _ = self;
     }
 
+    pub fn destroyCountForTesting() usize {
+        if (comptime !@import("builtin").is_test) @compileError("test-only ownership counter");
+        return test_support.buffer_destroy_count;
+    }
+
     pub fn destroy(self: *Buffer) void {
+        if (comptime @import("builtin").is_test) test_support.buffer_destroy_count += 1;
         mtl.release(self.raw);
     }
 };

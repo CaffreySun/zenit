@@ -6,6 +6,6 @@ TEST_DIR="$(mktemp -d -t zenit-clipboard)"
 trap 'rm -rf "$TEST_DIR"' EXIT
 xcrun clang -fobjc-arc -Wno-deprecated-declarations \
   "$ROOT/native/macos/tests/clipboard_test.m" \
-  -framework Cocoa -framework Metal -framework QuartzCore -framework CoreVideo \
+  -framework Cocoa -framework Metal -framework IOSurface -framework QuartzCore -framework CoreVideo \
   -framework UniformTypeIdentifiers -o "$TEST_DIR/clipboard-test"
 "$TEST_DIR/clipboard-test"

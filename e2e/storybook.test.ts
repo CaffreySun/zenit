@@ -2782,10 +2782,14 @@ test("zindex: 三级嵌套 modal → popover → modal2（tier 链）", async ()
 
 function glassRegionRmse(pathA: string, pathB: string, r: {x:number;y:number;w:number;h:number}, exclude?: {x:number;y:number;radius:number}): number {
   const a=decodePng(pathA),b=decodePng(pathB),scale=decodedCaptureScale(a);
-  assert(a.width===b.width&&a.height===b.height,"glass screenshots dimensions changed");
+  assert(a.width===b.width&&a.height===b.height&&a.channels===b.channels,"glass screenshots dimensions changed");
+  const x0=Math.ceil((r.x+6)*scale),x1=Math.floor((r.x+r.w-6)*scale);
+  const y0=Math.ceil((r.y+6)*scale),y1=Math.floor((r.y+r.h-6)*scale);
+  assert(x0>=0&&y0>=0&&x1<=a.width&&y1<=a.height&&x1>x0&&y1>y0,
+    `glass material region must be fully captured: ${JSON.stringify({r,scale,x0,x1,y0,y1,width:a.width,height:a.height})}`);
   let sum=0,n=0;
-  for(let y=Math.ceil((r.y+6)*scale);y<Math.floor((r.y+r.h-6)*scale);y++) {
-    for(let x=Math.ceil((r.x+6)*scale);x<Math.floor((r.x+r.w-6)*scale);x++) {
+  for(let y=y0;y<y1;y++) {
+    for(let x=x0;x<x1;x++) {
       // the harness draws a virtual cursor into screenshots; keep it out of material comparisons
       if(exclude&&Math.abs(x/scale-exclude.x)<exclude.radius&&Math.abs(y/scale-exclude.y)<exclude.radius) continue;
       for(let c=0;c<3;c++) {const d=a.pixels[(y*a.width+x)*a.channels+c]-b.pixels[(y*b.width+x)*b.channels+c];sum+=d*d;n++;}
@@ -2844,13 +2848,20 @@ test("GlassLab: real pointer drag moves glass and preserves rendered content", a
 
 test("GlassBox: 原生 macOS 交互——悬停玻璃不变、按下内容变淡、松开复原", async () => {
   await switchTo("glassbox");
+  // Native windows can be clamped to a shorter desktop than the requested
+  // test size. Measure the captured client rather than assuming 940px fits.
+  const viewportPath=`${DIR}/glassbox-viewport.png`;
+  assert((await screenshot(viewportPath)).ok===true,"viewport screenshot failed");
+  const viewport=decodePng(viewportPath),scale=decodedCaptureScale(viewport);
+  const visibleWidth=viewport.width/scale,visibleBottom=viewport.height/scale-20;
   let r=(await query("story.glassbox.interactive"))[0]?.rect;
   assert(r,"interactive glass missing");
-  for(let i=0;i<12&&(r.y<80||r.y+r.h>940);i++){
-    await scrollAt(950,700,0,r.y<80?120:-120);await sleep(100);
+  for(let i=0;i<12&&(r.y<80||r.y+r.h>visibleBottom);i++){
+    await scrollAt(Math.min(950,visibleWidth-20),Math.min(700,visibleBottom),0,r.y<80?120:-120);await sleep(100);
     r=(await query("story.glassbox.interactive"))[0].rect;
   }
-  assert(r.y>=80&&r.y+r.h<=940,`interactive glass offscreen: ${JSON.stringify(r)}`);
+  assert(r.x>=0&&r.x+r.w<=visibleWidth&&r.y>=80&&r.y+r.h<=visibleBottom,
+    `interactive glass offscreen: ${JSON.stringify({r,visibleWidth,visibleBottom})}`);
   await mouseMove(-10,-10);await sleep(700);
   const paths=["rest","hover","press","released"].map(k=>`${DIR}/glassbox-${k}.png`);
   assert((await screenshot(paths[0])).ok===true,"rest screenshot failed");
@@ -5436,6 +5447,30 @@ test("绘制不变式：整轮 storybook 没有任何节点在一帧里重复发
   const st = await stats();
   appendLog(`  paint_duplicate_fills(total)=${st.paint_duplicate_fills} last_node=${st.paint_duplicate_node}`);
   assert(st.paint_duplicate_fills === 0, `整轮出现 ${st.paint_duplicate_fills} 次重复发射（最近的节点 ${st.paint_duplicate_node}）；用 ZENIT_DEBUG_CMDSTREAM 看是哪帧哪个节点`);
+});
+
+
+// Metal's per-command-buffer native counter includes the header host as well
+// as the normal renderer. Exercise settled and continuously repainted frames;
+// screenshots must use the same render-only retained-present path.
+test("Metal render-only frames: glass, opacity, blend and lens", async () => {
+  if ((await stats()).renderer_backend !== "metal") { appendLog("Metal engine gate: not applicable on this backend"); return; }
+  for (const story of ["glasslab", "glassgroup", "glassmerge", "glassedge", "glassislands", "secopacity", "blend", "blendlab", "glassioslens"]) {
+    await switchTo(story);
+    await request("POST", "/redraw", { continuous: true });
+    try {
+      let previous = (await stats()).frame_count;
+      for (let i = 0; i < 8; i++) {
+        await request("POST", "/wait", { frames: 2 });
+        const perf = await stats();
+        assert(perf.frame_count > previous, `${story}: no new submitted frame`);
+        previous = perf.frame_count;
+        assert(perf.render_passes > 0 && perf.blit_passes === 0 && perf.compute_passes === 0,
+          `${story}: engines R/B/C=${perf.render_passes}/${perf.blit_passes}/${perf.compute_passes}`);
+      }
+      await shot(`render-only-${story}`);
+    } finally { await request("POST", "/redraw", { continuous: false }); }
+  }
 });
 
 run();

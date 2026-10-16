@@ -50,6 +50,12 @@ pub const LayoutData = struct {
 pub const LayoutTable = struct {
     allocator: std.mem.Allocator,
     items: std.MultiArrayList(LayoutData),
+    /// Field arrays of `items`, re-derived only when `ensureSlot` grows it (the
+    /// sole structural mutation). Every frame reads rects ~10^5 times through
+    /// `rectIfLaidOut`; deriving them per read meant a full `MultiArrayList.slice()`
+    /// (pointer math for all six fields, un-inlined in Debug) per lookup.
+    final_rects: []Rect = &.{},
+    layout_epochs: []u64 = &.{},
 
     pub fn init(allocator: std.mem.Allocator) LayoutTable {
         return .{ .allocator = allocator, .items = .{} };
@@ -65,9 +71,19 @@ pub const LayoutTable = struct {
     pub fn ensureSlot(self: *LayoutTable, id: ElementId) !void {
         if (id.isNull()) return;
         const idx = id.index;
+        if (self.items.len > idx) return;
+        // Refresh even when an append fails midway: the appends that succeeded
+        // may already have reallocated the storage.
+        defer self.refreshFieldArrays();
         while (self.items.len <= idx) {
             try self.items.append(self.allocator, .{});
         }
+    }
+
+    fn refreshFieldArrays(self: *LayoutTable) void {
+        const s = self.items.slice();
+        self.final_rects = s.items(.final_rect);
+        self.layout_epochs = s.items(.layout_epoch);
     }
 
     pub fn get(self: *const LayoutTable, id: ElementId) ?LayoutData {
@@ -76,13 +92,13 @@ pub const LayoutTable = struct {
     }
 
     pub fn rect(self: *const LayoutTable, id: ElementId) ?Rect {
-        if (id.isNull() or id.index >= self.items.len) return null;
-        return self.items.items(.final_rect)[id.index];
+        if (id.isNull() or id.index >= self.final_rects.len) return null;
+        return self.final_rects[id.index];
     }
 
     pub fn setRect(self: *LayoutTable, id: ElementId, r: Rect) void {
-        if (id.isNull() or id.index >= self.items.len) return;
-        self.items.items(.final_rect)[id.index] = r;
+        if (id.isNull() or id.index >= self.final_rects.len) return;
+        self.final_rects[id.index] = r;
     }
 
     /// Reset a dense slot before its ElementTable index is reused by another
@@ -94,27 +110,25 @@ pub const LayoutTable = struct {
     }
 
     pub fn epoch(self: *const LayoutTable, id: ElementId) u64 {
-        if (id.isNull() or id.index >= self.items.len) return 0;
-        return self.items.items(.layout_epoch)[id.index];
+        if (id.isNull() or id.index >= self.layout_epochs.len) return 0;
+        return self.layout_epochs[id.index];
     }
 
-    /// Single combined read of epoch and rect: epoch==0 (seeded, not markLaidOut) returns null. Hot
-    /// read path (rectFromWorldOrFallback, ~100k times per frame) previously did two separate
-    /// MultiArrayList field slice derivations; in Debug each derivation is several non-inlined
-    /// calls. Merged into one slice() + two field indices here.
+    /// Single combined read of epoch and rect: epoch==0 (seeded, not markLaidOut) returns null.
+    /// Hot read path (rectFromWorldOrFallback, ~100k times per frame): reads the cached field
+    /// arrays directly.
     pub fn rectIfLaidOut(self: *const LayoutTable, id: ElementId) ?Rect {
-        if (id.isNull() or id.index >= self.items.len) return null;
-        const s = self.items.slice();
-        if (s.items(.layout_epoch)[id.index] == 0) return null;
-        return s.items(.final_rect)[id.index];
+        if (id.isNull() or id.index >= self.final_rects.len) return null;
+        if (self.layout_epochs[id.index] == 0) return null;
+        return self.final_rects[id.index];
     }
 
     /// Mark id for relayout; epoch++, clear intrinsic cache (input constraint changed)
     pub fn markLaidOut(self: *LayoutTable, id: ElementId, measured: Size2D, r: Rect) void {
         if (id.isNull() or id.index >= self.items.len) return;
         self.items.items(.measured)[id.index] = measured;
-        self.items.items(.final_rect)[id.index] = r;
-        self.items.items(.layout_epoch)[id.index] +%= 1;
+        self.final_rects[id.index] = r;
+        self.layout_epochs[id.index] +%= 1;
     }
 };
 

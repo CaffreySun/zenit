@@ -372,6 +372,7 @@ pub fn invalidateSubtreeHookState(node: *Node) void {
     node.meta.per_frame.hooks.slots.view_loop = null;
     node.meta.per_frame.hooks.before_render.main = null;
     node.meta.per_frame.hooks.before_render.count = 0;
+    node.meta.per_frame.hooks.before_render.self_only_mask = 0;
     node.meta.per_frame.hooks.on_theme = null;
     node.meta.per_frame.hooks.view_theme = null;
 
@@ -547,7 +548,8 @@ pub fn useAnimatedBackground(scope: *Scope, cx: *Cx, node: *Node, config: Animat
 
     // Register as extended callback (does not override main on_before_render, no protection logic
     // needed)
-    node.addBeforeRender(animBgBeforeRender);
+    // Only this node's background, written with markRenderDirty.
+    node.addBeforeRenderScoped(animBgBeforeRender, .self);
 
     // Effect drives color changes (reads color from anim_state, supports runtime setColors updates)
     if (config.pressed != null) {
@@ -815,7 +817,8 @@ pub fn useFocusRing(scope: *Scope, cx: *Cx, node: *Node, config: FocusRingConfig
     }
 
     // register as extended callback (does not override main on_before_render)
-    node.addBeforeRender(focusRingBeforeRender);
+    // Only this node's outline, written through setStyle + markRenderDirty.
+    node.addBeforeRenderScoped(focusRingBeforeRender, .self);
     node.meta.per_frame.hooks.slots.focus_ring_anim = anim_state;
     node.meta.per_frame.hooks.slots.focus_ring_owned = true;
 

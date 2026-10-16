@@ -190,7 +190,30 @@ fn finishDeferredNodeFree(ptr: *anyopaque) void {
     const node: *Node = @ptrCast(@alignCast(ptr));
     const cx: *Cx = @ptrCast(@alignCast(node.pending_free_cx.?));
     node.pending_free_cx = null;
+    // Decide before the call: when freeNode frees immediately, `node` is gone.
+    const deferred_again = cx.owner.reactive_callback_depth > 0 or cx.tick_depth > 0;
     cx.freeNode(node);
+    // The owner queue drains when the reactive depth returns to zero, which can
+    // happen inside a tick (and the tick queue can drain inside a reactive
+    // callback). freeNode then defers the node again, into the other queue.
+    // Entries queued behind it may borrow it (deferDisposalLikeFreeNode is FIFO:
+    // node first), so they move with it instead of running ahead of it.
+    if (deferred_again) migrateDrainingQueueTail(cx);
+}
+
+/// Move what is left of the queue currently being drained behind the node that
+/// was just deferred again, preserving order. Postponing a disposal is always
+/// safe; running one before an earlier entry is not.
+fn migrateDrainingQueueTail(cx: *Cx) void {
+    const DeferredQueue = @import("../reactive/deferred_disposal.zig").Queue;
+    const target: *DeferredQueue = if (cx.owner.reactive_callback_depth > 0) &cx.owner.deferred_disposals else &cx.deferred_free_nodes;
+    const source: *DeferredQueue = if (cx.owner.draining_disposals and target != &cx.owner.deferred_disposals)
+        &cx.owner.deferred_disposals
+    else if (cx.draining_deferred_frees and target != &cx.deferred_free_nodes)
+        &cx.deferred_free_nodes
+    else
+        return;
+    while (source.popFirst()) |entry| target.append(entry, entry.ptr, entry.dispose_fn);
 }
 
 pub fn freeNode(self: *Cx, node: *Node) void {
@@ -386,6 +409,8 @@ fn freeNodeNow(self: *Cx, node: *Node) void {
     node.invalidateRenderCache();
     node.invalidatePromotedRenderCache();
     node.invalidateSubtreePayloadCache();
+    @import("node_lifecycle.zig").releaseStandaloneState(node);
+    @import("layout_engine.zig").forgetIntrinsicCache(node.world_id, node.id);
     node.children.deinit(self.allocator);
     // poison (like node_lifecycle.destroy): Allocator.destroy doesn't overwrite, no poison
     // freed node still reads ALIVE + freeing=true, double freeNode silent no-op.

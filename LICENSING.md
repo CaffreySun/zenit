@@ -89,6 +89,11 @@ redistributing zenit means redistributing them under their own terms:
                           Copyright 2011 The Lora Project Authors.
                           Full text: tools/fixtures/fonts/Lora-OFL.txt
 
+  native/windows/dwrite_alpha_correction.h
+                          Microsoft Windows Terminal alpha correction, MIT.
+                          Copyright (c) Microsoft Corporation.
+                          Full text: native/windows/dwrite_alpha_correction.LICENSE
+
   vendor/vulkan-headers/  Khronos Vulkan headers, Apache-2.0 / MIT.
                           Full text: vendor/vulkan-headers/LICENSE.md
   vendor/wayland/         Wayland and wayland-protocols headers, XML and

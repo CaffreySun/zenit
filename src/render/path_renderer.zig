@@ -6,6 +6,7 @@
 ///   3. AA fringe strip along contour (outer alpha_scale=0, inner=1)
 ///   4. flush() uploads via vertex buffer to GPU, draw renders.
 const std = @import("std");
+const pixel_domain = @import("command_encoder/pixel_domain.zig");
 const gpu = @import("gpu");
 const Contour = @import("path_tessellator.zig").Contour;
 const TPoint = @import("path_tessellator.zig").TPoint;
@@ -316,6 +317,7 @@ pub const PathRenderer = struct {
     /// Delayed-free queue (see RetiredBuffer / drainRetiredBuffers).
     retired_buffers: std.ArrayListUnmanaged(RetiredBuffer) = .empty,
 
+    raster_viewport: [2]f32 = .{ 800, 600 },
     viewport_width: f32,
     viewport_height: f32,
     scale_factor: f32,
@@ -385,6 +387,15 @@ pub const PathRenderer = struct {
         self.viewport_width = w;
         self.viewport_height = h;
         self.scale_factor = scale;
+        self.raster_viewport = .{ @floatFromInt(pixel_domain.physicalPixelExtent(w, scale)), @floatFromInt(pixel_domain.physicalPixelExtent(h, scale)) };
+    }
+
+    pub fn setDrawableExtent(self: *PathRenderer, width: u32, height: u32) void {
+        self.raster_viewport = .{ @floatFromInt(width), @floatFromInt(height) };
+    }
+
+    pub fn setOffscreenViewport(self: *PathRenderer) void {
+        self.raster_viewport = .{ self.viewport_width * self.scale_factor, self.viewport_height * self.scale_factor };
     }
 
     pub fn beginFrame(self: *PathRenderer, w: f32, h: f32, scale: f32) void {
@@ -774,8 +785,8 @@ pub const PathRenderer = struct {
         render_pass.setViewport(
             0,
             0,
-            self.viewport_width * self.scale_factor,
-            self.viewport_height * self.scale_factor,
+            self.raster_viewport[0],
+            self.raster_viewport[1],
             0,
             1,
         );
@@ -876,17 +887,25 @@ pub const PathRenderer = struct {
     fn applyScissor(self: *PathRenderer, render_pass: *gpu.Backend.RenderPass, rect_clip: [4]f32) void {
         var sx: u32 = 0;
         var sy: u32 = 0;
-        var sw = nonNegativeFloatToU32(self.viewport_width * self.scale_factor);
-        var sh = nonNegativeFloatToU32(self.viewport_height * self.scale_factor);
+        var sw = nonNegativeFloatToU32(@ceil(self.raster_viewport[0]));
+        var sh = nonNegativeFloatToU32(@ceil(self.raster_viewport[1]));
         if (rect_clip[2] >= 0 and rect_clip[3] >= 0) {
             const clip_x0 = std.math.clamp(rect_clip[0], 0, self.viewport_width);
             const clip_y0 = std.math.clamp(rect_clip[1], 0, self.viewport_height);
             const clip_x1 = std.math.clamp(rect_clip[0] + rect_clip[2], clip_x0, self.viewport_width);
             const clip_y1 = std.math.clamp(rect_clip[1] + rect_clip[3], clip_y0, self.viewport_height);
-            sx = nonNegativeFloatToU32(clip_x0 * self.scale_factor);
-            sy = nonNegativeFloatToU32(clip_y0 * self.scale_factor);
-            sw = nonNegativeFloatToU32(@max(0, clip_x1 - clip_x0) * self.scale_factor);
-            sh = nonNegativeFloatToU32(@max(0, clip_y1 - clip_y0) * self.scale_factor);
+            // A hard rect clip includes exactly the pixel centers in [start, end).
+            sx = if (clip_x0 == self.viewport_width) sw else nonNegativeFloatToU32(@ceil(clip_x0 * self.scale_factor - 0.5));
+            sy = if (clip_y0 == self.viewport_height) sh else nonNegativeFloatToU32(@ceil(clip_y0 * self.scale_factor - 0.5));
+            const ex = if (clip_x1 == self.viewport_width) sw else @min(sw, nonNegativeFloatToU32(@ceil(clip_x1 * self.scale_factor - 0.5)));
+            const ey = if (clip_y1 == self.viewport_height) sh else @min(sh, nonNegativeFloatToU32(@ceil(clip_y1 * self.scale_factor - 0.5)));
+            if (clip_x0 == clip_x1 or clip_y0 == clip_y1) {
+                sw = 0;
+                sh = 0;
+            } else {
+                sw = ex -| sx;
+                sh = ey -| sy;
+            }
         }
         // Partial redraw pass: intersect with dirty-area scissor; pixels outside dirty area must
         // not be touched

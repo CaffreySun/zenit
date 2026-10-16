@@ -53,7 +53,9 @@ pub fn run(io: std.Io) !void {
         try coloredRects(&pixels);
     }
     {
-        var icon = try render.IconRenderer.init(a, &dq.device);
+        const icon = try a.create(render.IconRenderer);
+        defer a.destroy(icon);
+        try icon.init(a, &dq.device);
         defer icon.deinit();
         const points = [_]ir.Point{ .{ .x = 0, .y = 0 }, .{ .x = 24, .y = 0 }, .{ .x = 24, .y = 24 }, .{ .x = 0, .y = 24 } };
         const contours = [_]ir.Contour{.{ .points = &points, .closed = true }};

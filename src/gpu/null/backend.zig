@@ -309,7 +309,10 @@ pub const Adapter = struct {
     ) !struct { device: Device, queue: Queue } {
         _ = self;
         _ = allocator;
-        _ = desc;
+        if (@hasField(@TypeOf(desc), "required_features")) {
+            if (@hasField(@TypeOf(desc.required_features), "non_uniform_uav_buffer_array_atomics") and desc.required_features.non_uniform_uav_buffer_array_atomics)
+                return error.UnsupportedFeatures;
+        }
         return .{ .device = .{}, .queue = .{} };
     }
 

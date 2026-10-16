@@ -330,6 +330,16 @@
         "scripts/write_evidence_manifest.sh",
         "scripts/zig_fmt_allowlist.txt",
 
+        "e2e/offscreen-idle-resize.test.ts",
+        "scripts/test_caret_patch_native.ts",
+        "scripts/test_coretext_storage.sh",
+        "scripts/test_native_fullscreen_header.sh",
+        "scripts/test_native_memory.sh",
+        "scripts/test_windows_geometry.sh",
+        "tools/windows_dual_source_validation_test.cpp",
+        "tools/windows_dual_source_validation_test.zig",
+        "tools/windows_text_raster_context_smoke.cpp",
+
         "templates",
         "vendor",
     },

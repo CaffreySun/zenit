@@ -804,7 +804,7 @@ pub fn appendNodeDisplayPayloadToRenderList(
     const payload = getNodeDisplayPayload(cx, node_id, scope) orelse return false;
     if (payload.items.len == 0) return false;
 
-    const runtime = cx.scene_runtime.get(node_id) orelse return false;
+    const runtime = cx.scene_runtime.getPtr(node_id) orelse return false;
     const start: usize = switch (scope) {
         .own => runtime.display_item_start,
         .subtree => runtime.subtree_display_item_start,
@@ -823,7 +823,7 @@ pub fn appendNodeDisplayPayloadToRenderListForReplay(
 ) !bool {
     const payload = getNodeDisplayPayload(cx, node.id, scope) orelse return false;
     if (payload.items.len == 0) return false;
-    const runtime = cx.scene_runtime.get(node.id) orelse return false;
+    const runtime = cx.scene_runtime.getPtr(node.id) orelse return false;
 
     if (text_trace.enabled()) {
         var text_item_count: usize = 0;

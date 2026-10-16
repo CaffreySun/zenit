@@ -508,6 +508,11 @@ pub const DisplayList = struct {
         self.payload_arena.deinit();
     }
 
+    pub const MemoryStats = struct { item_capacity_bytes: usize, payload_capacity_bytes: usize };
+    pub fn memoryStats(self: *const DisplayList) MemoryStats {
+        return .{ .item_capacity_bytes = self.items.capacity * @sizeOf(DisplayItem), .payload_capacity_bytes = self.payload_arena.queryCapacity() };
+    }
+
     pub fn clear(self: *DisplayList) void {
         self.items.clearRetainingCapacity();
         _ = self.payload_arena.reset(.retain_capacity);

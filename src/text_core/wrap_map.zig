@@ -768,7 +768,7 @@ pub fn WrapMap(comptime Doc: type) type {
 
             if (snap.totalLength() == 0) {
                 self.bg_result = work_buf;
-                work_buf = .{};
+                work_buf = .empty;
                 return;
             }
 
@@ -811,7 +811,7 @@ pub fn WrapMap(comptime Doc: type) type {
             }
 
             self.bg_result = work_buf;
-            work_buf = .{};
+            work_buf = .empty;
         }
 
         /// Background thread wrap calc (independent self's wrap_width / char_width

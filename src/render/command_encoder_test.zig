@@ -1600,12 +1600,13 @@ test "image with an unknown texture is skipped instead of aborting the frame" {
     const img = @import("image_renderer.zig");
     // addImageUV lookup-fail fast-return before any GPU access; unrelated fields never
     // read.
-    var ir: img.ImageRenderer = undefined;
-    ir.texture_store = img.ImageTextureStore.init(std.testing.allocator, undefined, false);
+    const ir = try std.testing.allocator.create(img.ImageRenderer);
+    defer std.testing.allocator.destroy(ir);
+    ir.texture_store.init(std.testing.allocator, undefined, false);
     ir.shared_texture_store = null;
     const stale_handle: u64 = 0x8000_1003;
-    try ce.addImageOrSkip(&ir, stale_handle, 0, 0, 10, 10, .{ 1, 1, 1, 1 }, 0, 1, 0);
-    try ce.addImageOrSkip(&ir, 7, 0, 0, 10, 10, .{ 1, 1, 1, 1 }, 0, 1, 0);
+    try ce.addImageOrSkip(ir, stale_handle, 0, 0, 10, 10, .{ 1, 1, 1, 1 }, 0, 1, 0);
+    try ce.addImageOrSkip(ir, 7, 0, 0, 10, 10, .{ 1, 1, 1, 1 }, 0, 1, 0);
 }
 
 test "encoder.deinit 归还帧中途中止时 offscreen 栈上层借用的 external 纹理槽位" {
@@ -1613,8 +1614,9 @@ test "encoder.deinit 归还帧中途中止时 offscreen 栈上层借用的 exter
     // deinit direct, pushed layer texture_id never unregister. external 256-slot pool,
     // handles don't cross frame, leak = permanent slot loss.
     const img = @import("image_renderer.zig");
-    var ir: img.ImageRenderer = undefined;
-    ir.texture_store = img.ImageTextureStore.init(std.testing.allocator, undefined, false);
+    const ir = try std.testing.allocator.create(img.ImageRenderer);
+    defer std.testing.allocator.destroy(ir);
+    ir.texture_store.init(std.testing.allocator, undefined, false);
     defer ir.texture_store.deinit();
     ir.shared_texture_store = null;
     const gpu = @import("gpu");
@@ -1626,7 +1628,7 @@ test "encoder.deinit 归还帧中途中止时 offscreen 栈上层借用的 exter
         .offscreen_pool = undefined,
         .persistent = undefined,
     };
-    encoder.image_renderer = &ir;
+    encoder.image_renderer = ir;
     var ids: [2]u32 = undefined;
     for (&ids, 0..) |*id, i| {
         id.* = @intCast(try ir.registerTextureBinding(binding, 8, 8));

@@ -9,7 +9,11 @@ const ComputedRect = ui.ComputedRect;
 const JsonWriter = @import("json_writer.zig").JsonWriter;
 const OverlayStack = @FieldType(ui.Cx, "overlay_stack");
 
-const MAX_DEPTH = 20;
+/// Recursion guard, not a product limit. Real apps nest well past 20 levels
+/// (an App wraps the user root, window headers and editors add more), and
+/// the guard also stops queryByTestId/findByTestId silently, so keep it far
+/// above realistic depth. Output size is bounded separately (TreeTooLarge).
+const MAX_DEPTH = 64;
 
 // -- zenit v0.5 field access helpers --
 
@@ -276,6 +280,12 @@ fn serializeNode(jw: *JsonWriter, node: *Node, overlays: ?*const OverlayStack, d
     jw.floatValue(global.h);
     jw.endObject();
 
+    const transform = node.worldTransform();
+    jw.key("world_transform");
+    jw.beginArray();
+    for ([_]f32{ transform.a, transform.b, transform.c, transform.d, transform.tx, transform.ty }) |value| jw.floatValue(value);
+    jw.endArray();
+
     if (nodeText(node)) |t| {
         if (t.content.len > 0) {
             jw.key("text");
@@ -447,4 +457,28 @@ test "effective_opacity: 0×0 的 overflow_hidden 祖先把子树计 0" {
     clipper.markRenderDirty();
     pumpFrames(ctx, 1);
     try testing.expectEqual(@as(f32, 1), effectiveOpacity(leaf, null));
+}
+
+test "deep trees: nodes 30 levels down are serialized and found by test id" {
+    const allocator = testing.allocator;
+    var ctx = try ui.Cx.init(allocator, std.testing.io);
+    defer ctx.deinit();
+    ctx.setViewport(400, 300);
+    const root = try ui.box(ctx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
+    ctx.root = root;
+    var parent = root;
+    for (0..30) |_| {
+        const child = try ui.box(ctx, .{}, .{});
+        try parent.appendChild(allocator, child);
+        parent = child;
+    }
+    parent.meta.ownership.meta.test_id = "probe.deep";
+    pumpFrames(ctx, 1);
+
+    try testing.expect(findByTestId(root, "probe.deep") == parent);
+    const buf = try allocator.alloc(u8, 256 * 1024);
+    defer allocator.free(buf);
+    const json = try serializeTree(root, null, buf);
+    try testing.expect(std.mem.indexOf(u8, json, "null") == null);
+    try testing.expect(std.mem.indexOf(u8, json, "probe.deep") != null);
 }

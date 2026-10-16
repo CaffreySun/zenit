@@ -330,6 +330,7 @@ pub const HitProxySpec = core_types.HitProxySpec;
 
 // ========== UI nodes ==========
 pub const Node = core_node.Node;
+pub const BeforeRenderScope = core_node.BeforeRenderScope;
 /// Focus strategy on left-click, see `NodeInteraction.pointer_down_focus`.
 pub const PointerDownFocus = core_node.PointerDownFocus;
 /// Sentinel value for Node.world_id (not registered to any World). See P0-3 owner identification.
@@ -467,7 +468,10 @@ pub const AfterLayoutFn = *const fn (ctx: *anyopaque, round: u8, last_round: boo
 pub const max_after_layout_rounds: u8 = 4;
 const AfterLayoutHook = struct { ctx: *anyopaque, run: AfterLayoutFn };
 
+pub const CountingAllocator = @import("core/counting_allocator.zig").CountingAllocator;
+
 pub const Cx = struct {
+    pub const AllocationOwner = enum { text, world, display_list, property_tree, frame_arena, interaction, node_cache, text_blob, scene_runtime };
     pub const PresentationSample = @import("core/presentation_clock.zig").Sample;
     /// Retained as public alias (implementation: core/frame_perf.zig).
     pub const frame_perf_history_size: usize = frame_perf_mod.history_size;
@@ -498,6 +502,8 @@ pub const Cx = struct {
         }
     };
 
+    allocation_probe_enabled: bool = false,
+    allocation_counters: [9]CountingAllocator = undefined,
     allocator: Allocator,
     io: std.Io,
     owner: *SignalOwner,
@@ -698,6 +704,13 @@ pub const Cx = struct {
 
     node_registry: NodeRegistry,
     interaction_index: InteractionIndex,
+    /// Window-local observation cache; global dirty generation invalidates it.
+    loose_interaction_memo: struct {
+        root: ?*Node = null,
+        gen: u64 = 0,
+        result: bool = false,
+        scans: u64 = 0,
+    } = .{},
     /// SVG texture cache + hit geometry (implementation: core/svg_texture_store.zig). Originally
     /// three fields + six methods here, self-contained ownership loop, moved entirely out.
     svg_textures: svg_texture_store.SvgTextureStore,
@@ -758,6 +771,19 @@ pub const Cx = struct {
     /// reverse map, lets platform bridge (NSAccessibility / IAccessible) look up real UTF-8 string
     /// for AT tools. Rebuilt each frame tail in syncA11yTreeFromInteractions.
     a11y_label_buf: @import("core/a11y_projection.zig").LabelStore = .{},
+    /// macOS: skip the per-frame a11y projection until an assistive client
+    /// queries this process (see `a11y.macos_bridge.ProjectionDemand`). App
+    /// runtimes enable it; a bare Cx (tests, tools) keeps eager projection.
+    /// Other platforms always project: their bridges read the tree directly.
+    a11y_on_demand: bool = false,
+    /// A frame skipped projection, so the a11y tree lags the node tree.
+    a11y_projection_stale: bool = false,
+    /// A render happened since World.paint / World.interaction last mirrored the
+    /// node tree. Those tables have no reader in the render, hit-test or event
+    /// path (only `layerizeFrame`, the layout integrity audit and tests), so the
+    /// full-tree mirror runs when a reader asks (`ensureWorldTablesSynced`)
+    /// instead of at the end of every frame.
+    world_tables_stale: bool = false,
     /// push-side bridge context, holds window_id + label_resolver pointer. Reset each
     /// syncA11yTreeFromInteractions; flushToBridge calls macos_bridge extern push fn, bounces back
     /// this ref for window_id.
@@ -771,6 +797,19 @@ pub const Cx = struct {
     before_render_time_ms: f64 = std.math.nan(f64),
     next_redraw_scheduled_at: ?@import("zenit_time").Instant = null,
     next_redraw_delay_ns: ?u64 = null,
+
+    /// Frame-local app declaration; only the host may override paint visibility.
+    /// Host input generation distinguishes new interaction from retry-generated redraws.
+    input_epoch: u64 = 0,
+    caret_flip_host: bool = false,
+    caret_phase_valid: bool = false,
+    caret_visible: bool = true,
+    caret_next_ns: i128 = 0,
+    caret_half_ns: u64 = 500 * std.time.ns_per_ms,
+    caret_paint_override: ?bool = null,
+    caret_rects: [64][4]f32 = undefined,
+    caret_rect_count: usize = 0,
+    caret_rect_overflow: bool = false,
 
     // Theme tokens (runtime switchable)
     tokens: *const theme.ThemeTokens = &theme.dark,
@@ -981,6 +1020,23 @@ pub const Cx = struct {
             // on perf data).
             .text = text_context.TextContext.init(allocator, 1024),
         };
+        // These constructors allocate lazily. Rebind before their first use;
+        // Cx is heap-owned, so the ledger addresses survive all table growth.
+        if (@import("zenit_environment").has("ZENIT_CPU_ALLOC_PROBE")) {
+            cx.allocation_probe_enabled = true;
+            for (&cx.allocation_counters) |*counter| counter.* = .{ .parent = allocator };
+            cx.text = text_context.TextContext.init(cx.allocation_counters[0].allocator(), 1024);
+            cx.world = world.World.init(cx.allocation_counters[1].allocator());
+            cx.display_list = display_list_mod.DisplayList.init(cx.allocation_counters[2].allocator());
+            cx.property_tree = property_tree_mod.PropertyTree.init(cx.allocation_counters[3].allocator());
+            cx.frame_arena = std.heap.ArenaAllocator.init(cx.allocation_counters[4].allocator());
+            cx.interaction_index.deinit();
+            cx.interaction_index = InteractionIndex.init(cx.allocation_counters[5].allocator());
+            cx.world.interaction = world.InteractionTable.init(cx.allocation_counters[5].allocator());
+            cx.world.render_cache_allocator = cx.allocation_counters[6].allocator();
+            cx.text_blob_store = text_blob_mod.BlobStore.init(cx.allocation_counters[7].allocator());
+            cx.scene_runtime = scene_runtime_mod.SceneRuntime.init(cx.allocation_counters[8].allocator());
+        }
         // Connect focus_manager + dispatcher, let focus/blur events bubble
         cx.focus_manager.dispatcher = &cx.dispatcher;
         cx.focus_manager.setRegistry(&cx.node_registry);
@@ -1181,6 +1237,9 @@ pub const Cx = struct {
         // dereference released node (downstream app).
         self.focus_manager.current_focus = null;
         self.focus_manager.current_focus_handle = null;
+        // Retire every reference while parent links and scope-owned state still
+        // exist. Immediate freeNode intentionally skips callback invalidation.
+        if (self.root) |r| self.invalidateReferencesToEx(r, true);
         if (self.root_scope) |rs| {
             if (self.root) |r| {
                 hooks_mod.invalidateSubtreeHookState(r);
@@ -1626,6 +1685,12 @@ pub const Cx = struct {
         return cx_world_sync.syncPaintToTable(self, root);
     }
 
+    /// Bring World.paint and World.interaction up to date with the last render.
+    /// Call before reading either table; a no-op when nothing rendered since.
+    pub fn ensureWorldTablesSynced(self: *Cx) void {
+        return cx_world_sync.ensureWorldTablesSynced(self);
+    }
+
     // mapDisplayItem + colorToRGBA + radiusArrayToCorners in cx merged to
     // gpu_draw_shadow.lowerDisplayItem (sole display_list -> paint_table map point). Callsite:
     // syncPaintToTable.
@@ -1698,6 +1763,12 @@ pub const Cx = struct {
 
     pub fn syncA11yTreeFromInteractions(self: *Cx, root: *Node) void {
         return cx_a11y.syncA11yTreeFromInteractions(self, root);
+    }
+
+    /// Frame-end a11y step: project now, or (on-demand mode with no client
+    /// yet) defer until the first assistive query.
+    pub fn syncOrDeferA11yProjection(self: *Cx, root: *Node) void {
+        return cx_a11y.syncOrDeferA11yProjection(self, root);
     }
 
     // Whole-tree health check: LayoutTable and Node.rect strictly consistent.
@@ -2154,12 +2225,14 @@ pub const Cx = struct {
     // cx_render.
 
     pub fn handleMouseDown(self: *Cx, x: f32, y: f32, modifiers: Modifiers) void {
+        self.input_epoch +%= 1;
         const host = self.enterHost();
         defer self.exitHost(host);
         return cx_input.handleMouseDown(self, x, y, modifiers);
     }
 
     pub fn handleMouseDownEx(self: *Cx, x: f32, y: f32, button: MouseButton, modifiers: Modifiers) void {
+        self.input_epoch +%= 1;
         const host = self.enterHost();
         defer self.exitHost(host);
         return cx_input.handleMouseDownEx(self, x, y, button, modifiers);
@@ -2169,12 +2242,14 @@ pub const Cx = struct {
     /// .left, .{})`. Host wanting mouse_up with **actual modifiers at release** uses
     /// `handleMouseUpEx`.
     pub fn handleMouseUp(self: *Cx, x: f32, y: f32) void {
+        self.input_epoch +%= 1;
         const host = self.enterHost();
         defer self.exitHost(host);
         return cx_input.handleMouseUp(self, x, y);
     }
 
     pub fn handleMouseUpEx(self: *Cx, x: f32, y: f32, button: MouseButton, modifiers: Modifiers) void {
+        self.input_epoch +%= 1;
         const host = self.enterHost();
         defer self.exitHost(host);
         return cx_input.handleMouseUpEx(self, x, y, button, modifiers);
@@ -2193,12 +2268,14 @@ pub const Cx = struct {
     /// Compatibility entry point: mouse move without modifiers. Equivalent to `handleMouseMoveEx(x,
     /// y, .{})`.
     pub fn handleMouseMove(self: *Cx, x: f32, y: f32) void {
+        self.input_epoch +%= 1;
         const host = self.enterHost();
         defer self.exitHost(host);
         return cx_input.handleMouseMove(self, x, y);
     }
 
     pub fn handleMouseMoveEx(self: *Cx, x: f32, y: f32, modifiers: Modifiers) void {
+        self.input_epoch +%= 1;
         const host = self.enterHost();
         defer self.exitHost(host);
         return cx_input.handleMouseMoveEx(self, x, y, modifiers);
@@ -2272,40 +2349,47 @@ pub const Cx = struct {
 
     /// Native menus and keyboard bindings converge on ActionDispatcher.
     pub fn handleCommand(self: *Cx, command_id: u64) void {
+        self.input_epoch +%= 1;
         const host = self.enterHost();
         defer self.exitHost(host);
         return cx_input.handleCommand(self, command_id);
     }
 
     pub fn handleKeyDown(self: *Cx, key: KeyCode, modifiers: Modifiers) void {
+        self.input_epoch +%= 1;
         const host = self.enterHost();
         defer self.exitHost(host);
         return cx_input.handleKeyDown(self, key, modifiers);
     }
 
     pub fn handleKeyUp(self: *Cx, key: KeyCode, modifiers: Modifiers) void {
+        self.input_epoch +%= 1;
         const host = self.enterHost();
         defer self.exitHost(host);
         return cx_input.handleKeyUp(self, key, modifiers);
     }
 
     pub fn handleTextInput(self: *Cx, t: []const u8) void {
+        self.input_epoch +%= 1;
         const host = self.enterHost();
         defer self.exitHost(host);
         return cx_input.handleTextInput(self, t);
     }
 
     pub fn handleImePreeditEvent(self: *Cx, event: @import("events.zig").ImePreeditEvent) void {
+        self.input_epoch +%= 1;
         const host = self.enterHost();
         defer self.exitHost(host);
         return cx_input.handleImePreeditEvent(self, event);
     }
     pub fn handleImeDeleteSurrounding(self: *Cx, before: u32, after: u32) void {
+        self.input_epoch +%= 1;
         const host = self.enterHost();
         defer self.exitHost(host);
         return cx_input.handleImeDeleteSurrounding(self, before, after);
     }
     pub fn handleImePreedit(self: *Cx, preedit_text: []const u8, cursor_utf8_offset: u32) void {
+        self.input_epoch +%= 1;
         const host = self.enterHost();
         defer self.exitHost(host);
         return cx_input.handleImePreedit(self, preedit_text, cursor_utf8_offset);
@@ -2320,12 +2404,14 @@ pub const Cx = struct {
         replace_start_utf8: u32,
         replace_end_utf8: u32,
     ) void {
+        self.input_epoch +%= 1;
         const host = self.enterHost();
         defer self.exitHost(host);
         return cx_input.handleImePreeditReplace(self, preedit_text, cursor_utf8_offset, replace_start_utf8, replace_end_utf8);
     }
 
     pub fn handleImeCommit(self: *Cx, commit_text: []const u8) void {
+        self.input_epoch +%= 1;
         const host = self.enterHost();
         defer self.exitHost(host);
         return cx_input.handleImeCommit(self, commit_text);
@@ -2338,12 +2424,14 @@ pub const Cx = struct {
         replace_start_utf8: u32,
         replace_end_utf8: u32,
     ) void {
+        self.input_epoch +%= 1;
         const host = self.enterHost();
         defer self.exitHost(host);
         return cx_input.handleImeCommitReplace(self, commit_text, replace_start_utf8, replace_end_utf8);
     }
 
     pub fn handleScroll(self: *Cx, scroll: events_mod.ScrollEvent) void {
+        self.input_epoch +%= 1;
         const host = self.enterHost();
         defer self.exitHost(host);
         return cx_input.handleScroll(self, scroll);
@@ -2351,6 +2439,7 @@ pub const Cx = struct {
 
     /// SystemSdk native scroll event -> handleScroll (retains gesture phase, modifiers).
     pub fn handleSdkWheel(self: *Cx, wheel: system_sdk_mod.events.MouseWheel) void {
+        self.input_epoch +%= 1;
         const host = self.enterHost();
         defer self.exitHost(host);
         return cx_input.handleScroll(self, cx_input.scrollEventFromSdk(wheel));
@@ -2359,6 +2448,7 @@ pub const Cx = struct {
     /// Pinch gesture: dispatch by pointer hit to target node (bubbles). Target locked at began,
     /// avoiding content move -> target change.
     pub fn handleMagnify(self: *Cx, magnification: f32, x: f32, y: f32, phase: events_mod.GesturePhase) void {
+        self.input_epoch +%= 1;
         const host = self.enterHost();
         defer self.exitHost(host);
         return cx_input.handleMagnify(self, magnification, x, y, phase);
@@ -2372,6 +2462,7 @@ pub const Cx = struct {
     /// drop target, bridges gap with exited/entered. Otherwise dragging over multiple drop targets
     /// in window only first receives entered.
     pub fn handleDrag(self: *Cx, x: f32, y: f32, kind: u8, paths: []const u8) void {
+        self.input_epoch +%= 1;
         const host = self.enterHost();
         defer self.exitHost(host);
         return cx_input.handleDrag(self, x, y, kind, paths);
@@ -2390,6 +2481,7 @@ pub const Cx = struct {
         payload_truncated: bool,
         payload_is_untrusted: bool,
     ) void {
+        self.input_epoch +%= 1;
         const host = self.enterHost();
         defer self.exitHost(host);
         return cx_input.handlePlatformDrag(self, x, y, kind, paths, payload_kind, payload_truncated, payload_is_untrusted);
@@ -2680,6 +2772,31 @@ pub const Cx = struct {
 
     pub fn scheduleRedrawAfterNs(self: *Cx, delay_ns: u64) void {
         return cx_render.scheduleRedrawAfterNs(self, delay_ns);
+    }
+
+    /// Declare during before-render. Does not request an ordinary scene redraw.
+    pub fn setBlinkCaretPhase(self: *Cx, visible: bool, remaining_ns: u64, half_ns: u64) void {
+        if (half_ns == 0) return;
+        self.caret_phase_valid = true;
+        self.caret_visible = visible;
+        self.caret_half_ns = half_ns;
+        self.caret_next_ns = @import("zenit_time").monotonicTimestamp(self.io) + @as(i128, @intCast(remaining_ns));
+    }
+
+    pub fn blinkCaretVisible(self: *const Cx, normal: bool) bool {
+        return self.caret_paint_override orelse normal;
+    }
+
+    /// Scene-space visible portion, declared even when paint is hidden.
+    pub fn addBlinkCaretRect(self: *Cx, rect: [4]f32) void {
+        for (rect) |v| if (!std.math.isFinite(v)) return;
+        if (rect[2] <= 0 or rect[3] <= 0) return;
+        if (self.caret_rect_count == self.caret_rects.len) {
+            self.caret_rect_overflow = true;
+            return;
+        }
+        self.caret_rects[self.caret_rect_count] = rect;
+        self.caret_rect_count += 1;
     }
 
     pub fn processScheduledRedraw(self: *Cx) bool {

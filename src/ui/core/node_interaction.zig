@@ -172,7 +172,7 @@ pub fn ensureCustomClipGeometry(self: *Node, allocator: Allocator) !void {
     const provider = self.meta.per_frame.custom_hooks.clip_meta.provider orelse return;
     const r = self.rectFromWorldOrFallback();
     const current_rect = ComputedRect.init(0, 0, r.w, r.h);
-    if (self.getLayoutOutput().vector.fill.custom_clip != null and
+    if ((if (self.layoutOutput()) |lo| lo.vector.fill.custom_clip != null else false) and
         self.meta.per_frame.custom_hooks.clip_meta.cache_epoch == self.meta.per_frame.custom_hooks.clip_meta.epoch and
         !self.frame_state.state_bits.dirty.hit.geometry and
         std.math.approxEqAbs(f32, self.meta.per_frame.custom_hooks.clip_meta.cache_rect.w, current_rect.w, 0.0001) and

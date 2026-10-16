@@ -16,6 +16,7 @@
 #include <windows.h>
 #include <windowsx.h>
 #include <shellapi.h>
+#include <shobjidl.h>
 #include <imm.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -28,12 +29,13 @@
 #include "drop_bridge.h"
 #include "drag_source.h"
 #include "accessibility_bridge.h"
+#include "window_geometry.h"
 
 /* Only lock acquisition is retried; never repeat clipboard mutations or pump
    messages here. A busy reader/sync agent must not make ordinary copy/paste
    fail immediately, and a persistent lock must not stall the UI indefinitely. */
 #ifdef ZENIT_WINDOW_CONTRACT
-static int contract_background_windows;
+static int contract_background_windows = -1;
 int zenit_windows_contract_background(int enabled) {
     int previous = contract_background_windows;
     contract_background_windows = enabled;
@@ -56,6 +58,20 @@ static int clipboard_open(HWND owner) {
         }
         Sleep(5);
     }
+}
+
+/* Window title after creation (taskbar, Alt+Tab, UIA name). Returns 0 on
+ * invalid UTF-8 or a dead window. */
+int zenit_win_set_title(void *owner, const char *title) {
+    if (!owner || !IsWindow((HWND)owner) || !title) return 0;
+    int chars = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, title, -1, NULL, 0);
+    if (chars <= 0) return 0;
+    wchar_t *wide = (wchar_t *)malloc((size_t)chars * sizeof(wchar_t));
+    if (!wide) return 0;
+    int ok = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, title, -1, wide, chars) == chars &&
+        SetWindowTextW((HWND)owner, wide);
+    free(wide);
+    return ok;
 }
 
 /* UTF-8 text clipboard used by the SystemSdk's standard edit commands. */
@@ -175,6 +191,7 @@ typedef struct ZenitMenuEntry { ZenitMenuNode node; HMENU menu; WORD native_id; 
 
 typedef struct ZenitWindow {
     HWND hwnd;
+    uint32_t requested_width, requested_height;
     HMENU menu;
     HACCEL accelerators;
     ZenitMenuEntry *menu_entries;
@@ -203,7 +220,17 @@ typedef struct ZenitWindow {
     int close_requested;
     int alive;
     int redraw_requested;
+    uint64_t text_settings_generation;
+    /* Runtime windows stay DWM-cloaked from creation until their first GPU
+       frame is presented, and again from teardown until destruction, so the
+       desktop never shows a window without application content. */
+    int reveal_on_present;
+    int presented;
+    int cloaked;
+    int concealed; /* teardown began: stays cloaked until destruction */
     int live_resize;
+    int dpi_changing;
+    int owner_changing;
     HMONITOR refresh_monitor;
     float refresh_hz;
 #ifdef ZENIT_WINDOW_CONTRACT
@@ -232,9 +259,38 @@ typedef struct ZenitWindow {
     HIMC detached_ime_context;
     void (*render_callback)(void *);
     void *render_context;
+    /* Owned-window focus loss: 0 none, 1 focus went to this process, 2 elsewhere. */
+    int focus_loss;
 } ZenitWindow;
 
 #define ZENIT_RESIZE_TIMER ((UINT_PTR)0x5a4e0001)
+#define ZENIT_REVEAL_TIMER ((UINT_PTR)0x5a4e0002)
+/* Uncloak anyway when no frame is presented in time (a failed renderer must
+   not leave an invisible running application). */
+#define ZENIT_REVEAL_TIMEOUT_MS 3000
+#define ZENIT_CREATE_HIDDEN 1
+#define ZENIT_CREATE_REVEAL_ON_PRESENT 2
+
+void zenit_windows_show(ZenitWindow *win);
+
+static void set_cloak(ZenitWindow *win, int cloak) {
+    BOOL value = cloak ? TRUE : FALSE;
+    if (win && win->hwnd && SUCCEEDED(DwmSetWindowAttribute(win->hwnd, DWMWA_CLOAK, &value, sizeof(value))))
+        win->cloaked = cloak;
+}
+
+static int removed_caption(ZenitWindow *win, UINT dpi) {
+    if (!win->custom_frame || win->chrome_fullscreen) return 0;
+    int removed = GetSystemMetricsForDpi(SM_CYCAPTION, dpi);
+    if (!IsZoomed(win->hwnd)) removed += GetSystemMetricsForDpi(SM_CYSIZEFRAME, dpi)+GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
+    return removed;
+}
+
+static int client_window_extent(uint32_t width, uint32_t height, UINT dpi,
+    DWORD style, DWORD ex_style, BOOL menu, int removed_caption, int *outer_width, int *outer_height);
+
+static int window_client_extent(ZenitWindow *win, uint32_t width, uint32_t height,
+    UINT dpi, int *outer_width, int *outer_height);
 
 static const wchar_t class_name[] = L"ZenitWindow";
 static ATOM window_class;
@@ -245,6 +301,28 @@ static uint64_t mouse_move_coalesced;
 
 static float window_scale(ZenitWindow *win) {
     return win && win->hwnd ? (float)GetDpiForWindow(win->hwnd) / 96.0f : 1.0f;
+}
+
+/* Keep normal frames inside the destination work area, including non-client
+   borders. Maximized and fullscreen windows retain their native frame policy. */
+static void constrain_frame_to_work(RECT *frame, RECT work) {
+    LONG width = frame->right-frame->left, height = frame->bottom-frame->top;
+    LONG work_width = work.right-work.left;
+    LONG work_height = work.bottom-work.top;
+    if (width > work_width) width = work_width;
+    if (height > work_height) height = work_height;
+    if (frame->left > work.right-width) frame->left = work.right-width;
+    if (frame->top > work.bottom-height) frame->top = work.bottom-height;
+    if (frame->left < work.left) frame->left = work.left;
+    if (frame->top < work.top) frame->top = work.top;
+    frame->right = frame->left+width;
+    frame->bottom = frame->top+height;
+}
+static int constrain_window_frame(RECT *frame, HMONITOR monitor) {
+    MONITORINFO info = { .cbSize = sizeof(info) };
+    if (!monitor || !GetMonitorInfoW(monitor, &info)) return 0;
+    constrain_frame_to_work(frame, info.rcWork);
+    return 1;
 }
 
 static unsigned queue_next(unsigned index) { return (index + 1) % 128; }
@@ -259,6 +337,8 @@ static void push_key(ZenitWindow *win, uint16_t code, uint32_t mods, int down) {
     win->keys[win->key_write].down = down;
     win->keys[win->key_write].serial = ++win->next_input_serial;
     win->key_write = next;
+    if (getenv("ZENIT_WINDOWS_INPUT_TRACE"))
+        fprintf(stderr, "[windows-key] hwnd=%p vk=0x%02x mods=0x%x down=%d serial=%llu\n", (void *)win->hwnd, code, mods, down, (unsigned long long)win->next_input_serial);
 }
 
 static void push_button(ZenitWindow *win, int code, int down, int x, int y) {
@@ -892,6 +972,8 @@ static void dispatch_native_message(MSG *msg) {
     if(win&&zenit_win_menu_translate(win->hwnd,msg))return;
     TranslateMessage(msg);DispatchMessageW(msg);
 }
+static int show_without_activation(void);
+
 static LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
     ZenitWindow *win = (ZenitWindow *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
     if (message == WM_NCCREATE) {
@@ -908,13 +990,26 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPAR
         if (DwmDefWindowProc(hwnd,message,wparam,lparam,&result)) return result;
     }
     switch (message) {
+        case WM_MOUSEACTIVATE:
+            /* Background input is injected into Cx; OS mouse messages must not
+               activate the window before runtime pointer isolation runs. */
+            if (show_without_activation()) return MA_NOACTIVATEANDEAT;
+            break;
         case WM_GETMINMAXINFO:
             if(win->chrome_min_width||win->chrome_min_height) {
-                MINMAXINFO *limits=(MINMAXINFO *)lparam;UINT dpi=GetDpiForWindow(hwnd);if(!dpi)dpi=96;
-                RECT frame={0,0,MulDiv((int)win->chrome_min_width,dpi,96),MulDiv((int)win->chrome_min_height,dpi,96)};
-                AdjustWindowRectExForDpi(&frame,(DWORD)GetWindowLongPtrW(hwnd,GWL_STYLE),FALSE,(DWORD)GetWindowLongPtrW(hwnd,GWL_EXSTYLE),dpi);
-                if(win->chrome_min_width)limits->ptMinTrackSize.x=frame.right-frame.left;
-                if(win->chrome_min_height)limits->ptMinTrackSize.y=frame.bottom-frame.top;
+                MINMAXINFO *limits=(MINMAXINFO *)lparam;
+                UINT dpi=GetDpiForWindow(hwnd);if(!dpi)dpi=96;
+                int width=INT_MAX,height=INT_MAX;
+                window_client_extent(win, win->chrome_min_width?win->chrome_min_width:1,
+                    win->chrome_min_height?win->chrome_min_height:1, dpi, &width, &height);
+                MONITORINFO info={.cbSize=sizeof(info)};
+                if(GetMonitorInfoW(MonitorFromWindow(hwnd,MONITOR_DEFAULTTONEAREST),&info)) {
+                    /* A minimum larger than the monitor must not undo the fit. */
+                    if(width>info.rcWork.right-info.rcWork.left)width=info.rcWork.right-info.rcWork.left;
+                    if(height>info.rcWork.bottom-info.rcWork.top)height=info.rcWork.bottom-info.rcWork.top;
+                }
+                if(win->chrome_min_width)limits->ptMinTrackSize.x=width;
+                if(win->chrome_min_height)limits->ptMinTrackSize.y=height;
                 return 0;
             }
             break;
@@ -932,6 +1027,7 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPAR
             win->chrome_hover=0;win->chrome_pressed=0;win->redraw_requested=1;
             break;
         case WM_NCLBUTTONDOWN:
+            if (show_without_activation()) return 0;
             if(win->chrome_hide_controls&&win->custom_frame) {
                 win->chrome_pressed=wparam==HTMINBUTTON?1:wparam==HTMAXBUTTON?2:wparam==HTCLOSE?3:0;
                 win->redraw_requested=1;
@@ -964,9 +1060,7 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPAR
                 DefWindowProcW(hwnd,message,wparam,lparam);
                 NCCALCSIZE_PARAMS *params=(NCCALCSIZE_PARAMS *)lparam;
                 UINT dpi=GetDpiForWindow(hwnd); if (!dpi) dpi=96;
-                int removed=GetSystemMetricsForDpi(SM_CYCAPTION,dpi);
-                if (!IsZoomed(hwnd)) removed+=GetSystemMetricsForDpi(SM_CYSIZEFRAME,dpi)+GetSystemMetricsForDpi(SM_CXPADDEDBORDER,dpi);
-                params->rgrc[0].top-=removed;
+                params->rgrc[0].top-=removed_caption(win, dpi);
                 return 0;
             }
             break;
@@ -983,6 +1077,17 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPAR
             InvalidateRect(hwnd, NULL, FALSE);
             return 0;
         case WM_TIMER:
+            if (wparam == ZENIT_REVEAL_TIMER) {
+                if (win->owner_changing) return 0;
+                KillTimer(hwnd, ZENIT_REVEAL_TIMER);
+                if (win->cloaked && !win->presented && !win->concealed && win->alive) {
+                    // Degraded path: the renderer never presented a UI frame.
+                    fprintf(stderr, "[zenit-window] no frame presented within %d ms; revealing window %u\n",
+                        ZENIT_REVEAL_TIMEOUT_MS, (unsigned)win->id);
+                    set_cloak(win, 0);
+                }
+                return 0;
+            }
             if (wparam == ZENIT_RESIZE_TIMER && win->live_resize) {
                 if (win->render_callback) win->render_callback(win->render_context);
                 return 0;
@@ -1059,7 +1164,15 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPAR
             // Refresh screen-space accessibility bounds even with an idle UI.
             if (win->render_callback) InvalidateRect(hwnd, NULL, FALSE);
             break;
+        case WM_SETTINGCHANGE:
+            win->text_settings_generation++;
+            SetPropW(hwnd, L"Zenit.TextSettingsGeneration", (HANDLE)(uintptr_t)win->text_settings_generation);
+            win->redraw_requested = 1;
+            InvalidateRect(hwnd, NULL, FALSE);
+            break;
         case WM_DISPLAYCHANGE:
+            win->text_settings_generation++;
+            SetPropW(hwnd, L"Zenit.TextSettingsGeneration", (HANDLE)(uintptr_t)win->text_settings_generation);
             win->refresh_monitor = NULL;
             if (win->render_callback) InvalidateRect(hwnd, NULL, FALSE);
             break;
@@ -1069,7 +1182,15 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPAR
             return 0;
         case WM_ACTIVATE:
             if (win->custom_frame) custom_frame_margins(win);
-            if(LOWORD(wparam)==WA_INACTIVE)zenit_drag_source_cancel(win->drag_source);
+            if(LOWORD(wparam)==WA_INACTIVE){
+                zenit_drag_source_cancel(win->drag_source);
+                /* lParam is the window being activated; NULL or a window of
+                   another thread/process means the user switched away. */
+                HWND next = (HWND)lparam;
+                DWORD pid = 0;
+                if (next) GetWindowThreadProcessId(next, &pid);
+                win->focus_loss = (next && pid == GetCurrentProcessId()) ? 1 : 2;
+            }
             break;
         case WM_DESTROY:
             KillTimer(hwnd, ZENIT_RESIZE_TIMER);
@@ -1090,9 +1211,9 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPAR
                 ImmAssociateContext(hwnd, win->detached_ime_context);
                 win->detached_ime_context = NULL;
             }
+            if (win->alive && live_windows > 0) --live_windows;
             win->alive = 0;
             win->hwnd = NULL;
-            if (live_windows > 0) --live_windows;
             return 0;
         case WM_SETFOCUS:
             if (win->render_callback) InvalidateRect(hwnd, NULL, FALSE);
@@ -1115,15 +1236,25 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPAR
             // Present the new extent before DWM composes it. Otherwise resize,
             // maximize and restore show the previous frame until the next
             // timer tick or WM_PAINT. The App defers a nested frame.
-            if (wparam != SIZE_MINIMIZED && LOWORD(lparam) && HIWORD(lparam) && win->render_callback)
+            if (wparam != SIZE_MINIMIZED && LOWORD(lparam) && HIWORD(lparam) && win->render_callback && !win->dpi_changing && !win->owner_changing)
                 win->render_callback(win->render_context);
             break;
         case WM_DPICHANGED: {
-            RECT *suggested = (RECT *)lparam;
+            RECT next = *(RECT *)lparam;
+            HMONITOR monitor = MonitorFromRect(&next, MONITOR_DEFAULTTONEAREST);
+            if (win->chrome_fullscreen) {
+                MONITORINFO info = { .cbSize = sizeof(info) };
+                if (GetMonitorInfoW(monitor, &info)) next = info.rcMonitor;
+            } else if (!IsZoomed(hwnd)) constrain_window_frame(&next, monitor);
+            RECT *suggested = &next;
+            win->dpi_changing = 1;
             SetWindowPos(hwnd, NULL, suggested->left, suggested->top,
                 suggested->right - suggested->left, suggested->bottom - suggested->top,
                 SWP_NOZORDER | SWP_NOACTIVATE);
             if (win->custom_frame) custom_frame_margins(win);
+            win->dpi_changing = 0;
+            win->redraw_requested = 1;
+            if (win->render_callback && !win->owner_changing) win->render_callback(win->render_context);
             return 0;
         }
         case WM_LBUTTONDOWN: case WM_LBUTTONUP:
@@ -1136,7 +1267,7 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPAR
             win->mouse_y = GET_Y_LPARAM(lparam);
             if (down) win->button_mask |= 1u << code;
             else win->button_mask &= ~(1u << code);
-            if (down) { SetCapture(hwnd); SetFocus(hwnd); }
+            if (down && !show_without_activation()) { SetCapture(hwnd); SetFocus(hwnd); }
             else if (!win->button_mask && GetCapture() == hwnd) ReleaseCapture();
             push_button(win, code, down, GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam));
             return 0;
@@ -1152,8 +1283,24 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPAR
         case WM_KEYDOWN: case WM_SYSKEYDOWN:
         case WM_KEYUP: case WM_SYSKEYUP:
             if(wparam==VK_ESCAPE&&(message==WM_KEYDOWN||message==WM_SYSKEYDOWN))zenit_drag_source_cancel(win->drag_source);
-            push_key(win, (uint16_t)wparam, modifiers(),
-                message == WM_KEYDOWN || message == WM_SYSKEYDOWN);
+            {
+                uint16_t code = (uint16_t)wparam;
+                uint32_t mods = modifiers();
+                /* An active IME (e.g. Microsoft Pinyin) reports keys it
+                   processes as VK_PROCESSKEY. With Ctrl or Alt held the key
+                   is a shortcut, not text: report the key that was pressed
+                   (ImmGetVirtualKey), or every Ctrl+letter shortcut is lost
+                   while the IME is on. */
+                if (code == VK_PROCESSKEY && (mods & (2 | 4))) {
+                    UINT real = ImmGetVirtualKey(hwnd);
+                    if (real && real != VK_PROCESSKEY) code = (uint16_t)real;
+                    else if (lparam) {
+                        UINT mapped = MapVirtualKeyW((UINT)((lparam >> 16) & 0xFF), MAPVK_VSC_TO_VK);
+                        if (mapped) code = (uint16_t)mapped;
+                    }
+                }
+                push_key(win, code, mods, message == WM_KEYDOWN || message == WM_SYSKEYDOWN);
+            }
             break;
         case WM_IME_STARTCOMPOSITION:
             win->ime_active = 1;
@@ -1189,6 +1336,11 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPAR
                 return 0;
             }
             win->high_surrogate = 0;
+            /* Control characters are keys, not text: Ctrl+letter arrives as
+               a C0 code (Ctrl+F = 0x06) and Backspace/Enter/Tab/Escape as
+               theirs, all of which the key events already carry. As text they
+               would land in the document as invisible characters. */
+            if (unit < 0x20 || unit == 0x7F) return 0;
             wchar_t wide = (wchar_t)unit;
             push_text(win, &wide, 1);
             return 0;
@@ -1202,6 +1354,11 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPAR
         case WM_PAINT: {
             PAINTSTRUCT ps;
             HDC dc = BeginPaint(hwnd, &ps);
+            if (win->owner_changing) {
+                EndPaint(hwnd,&ps);
+                win->redraw_requested=1;
+                return 0;
+            }
             if (win->render_callback) {
                 // The DWM-owned button region must have zero alpha in the
                 // underlying redirection bitmap as well as the GPU visual.
@@ -1212,6 +1369,7 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPAR
                         buttons.bottom-buttons.top,BLACKNESS);
                 win->render_callback(win->render_context);
             } else {
+#ifdef ZENIT_GDI_PROBE
                 RECT rect;
                 GetClientRect(hwnd, &rect);
                 FillRect(dc, &rect, (HBRUSH)(COLOR_WINDOW + 1));
@@ -1221,6 +1379,10 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPAR
                 DeleteObject(color);
                 static const wchar_t label[] = L"Zenit Win32 ARM64 window probe";
                 TextOutW(dc, 32, 32, label, (int)(sizeof(label) / sizeof(label[0]) - 1));
+#endif
+                /* Without a renderer an application window has no content to
+                   show: it is cloaked before its first frame and after
+                   teardown begins, so validating the update region is all. */
             }
             EndPaint(hwnd, &ps);
             win->redraw_requested = 0;
@@ -1245,7 +1407,7 @@ static int ensure_window_class(void) {
 }
 
 static int client_window_extent(uint32_t width, uint32_t height, UINT dpi,
-        DWORD style, DWORD ex_style, BOOL menu, int *outer_width, int *outer_height) {
+        DWORD style, DWORD ex_style, BOOL menu, int removed_caption, int *outer_width, int *outer_height) {
     if (!width || !height) return 0;
     if (!dpi) dpi = 96;
     // Round up using the DPI ratio exactly. Truncation loses a logical pixel
@@ -1259,43 +1421,157 @@ static int client_window_extent(uint32_t width, uint32_t height, UINT dpi,
     RECT bounds = {-half_w, -half_h, (LONG)(pixels_w-half_w), (LONG)(pixels_h-half_h)};
     if (!AdjustWindowRectExForDpi(&bounds, style, menu, ex_style, dpi)) return 0;
     int64_t w = (int64_t)bounds.right - bounds.left;
-    int64_t h = (int64_t)bounds.bottom - bounds.top;
+    int64_t h = (int64_t)bounds.bottom - bounds.top - removed_caption;
     if (w <= 0 || h <= 0 || w > INT_MAX || h > INT_MAX) return 0;
     *outer_width = (int)w;
     *outer_height = (int)h;
     return 1;
 }
 
-ZenitWindow *zenit_windows_create(uint32_t width, uint32_t height, const char *title) {
+static void calculated_client(void *context, int width, int height, int *client_width, int *client_height) {
+    ZenitWindow *win=context;
+    NCCALCSIZE_PARAMS params = {0};
+    params.rgrc[0] = (RECT){0,0,width,height};
+    WINDOWPOS pos = {.hwnd=win->hwnd,.cx=width,.cy=height};
+    params.lppos = &pos;
+    SendMessageW(win->hwnd, WM_NCCALCSIZE, TRUE, (LPARAM)&params);
+    *client_width=params.rgrc[0].right-params.rgrc[0].left;
+    *client_height=params.rgrc[0].bottom-params.rgrc[0].top;
+}
+
+static int window_client_extent(ZenitWindow *win, uint32_t width, uint32_t height,
+        UINT dpi, int *outer_width, int *outer_height) {
+    if (!dpi) dpi=96;
+    DWORD style = (DWORD)GetWindowLongPtrW(win->hwnd, GWL_STYLE);
+    DWORD ex_style = (DWORD)GetWindowLongPtrW(win->hwnd, GWL_EXSTYLE);
+    int w, h;
+    if (!client_window_extent(width,height,dpi,style,ex_style,GetMenu(win->hwnd)!=NULL,
+            removed_caption(win,dpi),&w,&h)) return 0;
+    int64_t wanted_w=((uint64_t)width*dpi+95)/96;
+    int64_t wanted_h=((uint64_t)height*dpi+95)/96;
+    MONITORINFO info = {.cbSize=sizeof(info)};
+    int cap_w=INT_MAX, cap_h=INT_MAX;
+    if (!win->chrome_fullscreen && !IsZoomed(win->hwnd)) {
+        if (!GetMonitorInfoW(MonitorFromWindow(win->hwnd,MONITOR_DEFAULTTONEAREST),&info)) return 0;
+        cap_w=info.rcWork.right-info.rcWork.left; cap_h=info.rcWork.bottom-info.rcWork.top;
+    }
+    return zenit_resolve_client_extent(wanted_w,wanted_h,cap_w,cap_h,w,h,
+        win,calculated_client,outer_width,outer_height);
+}
+
+static int initial_geometry(ZenitWindow *win, uint32_t width, uint32_t height, RECT *frame) {
+    int w,h;
+    if (!window_client_extent(win,width,height,GetDpiForWindow(win->hwnd),&w,&h)) return 0;
+    frame->right=frame->left+w; frame->bottom=frame->top+h;
+    return constrain_window_frame(frame,MonitorFromWindow(win->hwnd,MONITOR_DEFAULTTONEAREST));
+}
+
+#ifdef ZENIT_WINDOW_CONTRACT
+/* The contract sizes a real HWND through the same path as create/set_size. */
+int zenit_windows_contract_initial_geometry(ZenitWindow *win, uint32_t width, uint32_t height) {
+    RECT frame;
+    if (!win || !GetWindowRect(win->hwnd,&frame) || !initial_geometry(win,width,height,&frame)) return 0;
+    return SetWindowPos(win->hwnd,NULL,frame.left,frame.top,frame.right-frame.left,
+        frame.bottom-frame.top,SWP_NOZORDER|SWP_NOACTIVATE);
+}
+#endif
+
+/* Background e2e runs (and window contracts) never take the foreground. */
+static int show_without_activation(void) {
+    char background[2] = {0};
+    int no_activate = GetEnvironmentVariableA("ZENIT_E2E_BACKGROUND", background, sizeof(background)) == 1 && background[0] == '1';
+#ifdef ZENIT_WINDOW_CONTRACT
+    if (contract_background_windows >= 0) no_activate = contract_background_windows;
+#endif
+    return no_activate;
+}
+
+/* flags: ZENIT_CREATE_HIDDEN — the runtime configures the window first (an
+   owner, a position) and shows it with zenit_windows_show.
+   ZENIT_CREATE_REVEAL_ON_PRESENT — the window is shown cloaked and appears
+   only once zenit_windows_note_presented reports its first GPU frame. Showing an active window and then making
+   it owned re-shows it, which hands activation to the owner and reports a
+   focus loss to the new window (an owned panel closing itself at once). */
+ZenitWindow *zenit_windows_create_ex(uint32_t width, uint32_t height, const char *title, int flags) {
+    int hidden = (flags & ZENIT_CREATE_HIDDEN) != 0;
     if (!ensure_window_class()) return NULL;
-    int outer_width, outer_height;
-    if (!client_window_extent(width, height, GetDpiForSystem(), WS_OVERLAPPEDWINDOW, 0, FALSE, &outer_width, &outer_height)) return NULL;
+    if (!width || !height) return NULL;
     ZenitWindow *win = (ZenitWindow *)calloc(1, sizeof(*win));
     if (!win) return NULL;
+    win->requested_width = width;
+    win->requested_height = height;
     win->id = next_id++;
     win->ime_enabled = 1;
+    win->reveal_on_present = (flags & ZENIT_CREATE_REVEAL_ON_PRESENT) != 0;
     int title_chars = MultiByteToWideChar(CP_UTF8, 0, title, -1, NULL, 0);
     wchar_t *wide = title_chars > 0 ? (wchar_t *)calloc((size_t)title_chars, sizeof(wchar_t)) : NULL;
     if (!wide) { free(win); return NULL; }
     MultiByteToWideChar(CP_UTF8, 0, title, -1, wide, title_chars);
-    HWND hwnd = CreateWindowExW(0, class_name, wide, WS_OVERLAPPEDWINDOW,
-        CW_USEDEFAULT, CW_USEDEFAULT, outer_width,
-        outer_height, NULL, NULL, GetModuleHandleW(NULL), win);
+    DWORD ex_style = 0;
+    HWND hwnd = CreateWindowExW(ex_style, class_name, wide, WS_OVERLAPPEDWINDOW,
+        CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
+        CW_USEDEFAULT, NULL, NULL, GetModuleHandleW(NULL), win);
     free(wide);
     if (!hwnd) { free(win); return NULL; }
+    /* Let Win32 select the launch monitor before querying its per-window DPI.
+       The HWND remains hidden until its final client extent is established. */
+    RECT frame;
+    if (!GetWindowRect(hwnd, &frame) || !initial_geometry(win,width,height,&frame)) {
+        DestroyWindow(hwnd); free(win); return NULL;
+    }
+    if (!SetWindowPos(hwnd, NULL, frame.left, frame.top, frame.right-frame.left,
+            frame.bottom-frame.top, SWP_NOZORDER | SWP_NOACTIVATE)) {
+        DestroyWindow(hwnd); free(win); return NULL;
+    }
     if(!live_windows)app_quit_requested=0;
     win->alive = 1;
     win->accessibility = zenit_uia_create(hwnd);
     win->drop_target = zenit_drop_create(hwnd, next_drag_serial, win);
     ++live_windows;
-    const char *background = getenv("ZENIT_E2E_BACKGROUND");
-    int no_activate = background && !strcmp(background, "1");
-#ifdef ZENIT_WINDOW_CONTRACT
-    no_activate |= contract_background_windows;
-#endif
-    ShowWindow(hwnd, no_activate ? SW_SHOWNOACTIVATE : SW_SHOW);
-    UpdateWindow(hwnd);
+    if (!hidden) zenit_windows_show(win);
     return win;
+}
+
+ZenitWindow *zenit_windows_create(uint32_t width, uint32_t height, const char *title) {
+    return zenit_windows_create_ex(width, height, title, 0);
+}
+
+void zenit_windows_show(ZenitWindow *win) {
+    if (!win || !win->hwnd || IsWindowVisible(win->hwnd)) return;
+    // Showing cloaked keeps activation, sizing and the swap chain real while
+    // DWM composes nothing until the first frame is presented.
+    if (win->reveal_on_present && !win->presented) {
+        set_cloak(win, 1);
+        // Without the fallback timer a renderer that never presents would
+        // leave an invisible running application: stay uncloaked instead.
+        if (win->cloaked && !SetTimer(win->hwnd, ZENIT_REVEAL_TIMER, ZENIT_REVEAL_TIMEOUT_MS, NULL))
+            set_cloak(win, 0);
+    }
+    ShowWindow(win->hwnd, show_without_activation() ? SW_SHOWNOACTIVATE : SW_SHOW);
+    UpdateWindow(win->hwnd);
+}
+
+/* The renderer presented a frame: reveal a window waiting for its first one. */
+void zenit_windows_note_presented(ZenitWindow *win) {
+    // Only a shown window reveals; teardown keeps a concealed window cloaked.
+    if (!win || win->presented || win->concealed || win->owner_changing || !win->hwnd || !IsWindowVisible(win->hwnd)) return;
+    win->presented = 1;
+    if (!win->cloaked || !win->hwnd) return;
+    KillTimer(win->hwnd, ZENIT_REVEAL_TIMER);
+    // A presented buffer (and a DirectComposition commit) reaches the screen
+    // on DWM's next composition. Uncloaking first composes the redirection
+    // surface behind it for one refresh; wait for that composition once.
+    DwmFlush();
+    set_cloak(win, 0);
+}
+
+/* Teardown is starting: hide the window's contents before the renderer
+   detaches, without moving activation as SW_HIDE would mid-close. */
+void zenit_windows_conceal(ZenitWindow *win) {
+    if (!win || !win->hwnd) return;
+    win->concealed = 1;
+    KillTimer(win->hwnd, ZENIT_REVEAL_TIMER);
+    set_cloak(win, 1);
 }
 
 void zenit_windows_destroy(ZenitWindow *win) {
@@ -1319,6 +1595,133 @@ int zenit_windows_drain_accessibility(ZenitWindow *win) {
     return win && win->alive ? zenit_uia_drain(win->accessibility) : 0;
 }
 int zenit_windows_app_should_quit(void) {return app_quit_requested;}
+/* The application vetoed the quit request (e.g. unsaved work); keep running. */
+void zenit_windows_cancel_app_quit(void) {app_quit_requested = 0;}
+
+/* Owned window: stays above its owner, hides when the owner is minimised and
+   has no taskbar button. Owner destruction also destroys the owned HWND, so the
+   runtime closes owned windows before their owner. */
+int zenit_windows_set_size(ZenitWindow *win, uint32_t width, uint32_t height);
+
+#ifdef ZENIT_WINDOW_CONTRACT
+static int contract_owner_resize_failure;
+void zenit_windows_contract_owner_resize_failure(void) { contract_owner_resize_failure=1; }
+static int contract_taskbar_failure;
+void zenit_windows_contract_taskbar_failure(void) { contract_taskbar_failure=1; }
+#endif
+
+static int fit_owned_frame(HWND hwnd, const RECT *frame) {
+#ifdef ZENIT_WINDOW_CONTRACT
+    if (contract_owner_resize_failure) { contract_owner_resize_failure=0; return 0; }
+#endif
+    return SetWindowPos(hwnd,NULL,frame->left,frame->top,frame->right-frame->left,
+        frame->bottom-frame->top,SWP_NOZORDER|SWP_NOACTIVATE);
+}
+
+static int restore_owner_frame(ZenitWindow *win, const RECT *frame) {
+    if (SetWindowPos(win->hwnd,NULL,frame->left,frame->top,frame->right-frame->left,
+            frame->bottom-frame->top,SWP_NOZORDER|SWP_NOACTIVATE)) return 1;
+    fprintf(stderr,"[zenit-window] owner geometry rollback failed: %lu\n",GetLastError());
+    zenit_windows_conceal(win);
+    return 0;
+}
+
+static HRESULT remove_taskbar_tab(HWND hwnd) {
+#ifdef ZENIT_WINDOW_CONTRACT
+    if (contract_taskbar_failure) { contract_taskbar_failure=0; return E_FAIL; }
+#endif
+    ITaskbarList *taskbar=NULL;
+    HRESULT hr=CoCreateInstance(&CLSID_TaskbarList,NULL,CLSCTX_INPROC_SERVER,&IID_ITaskbarList,(void **)&taskbar);
+    if (SUCCEEDED(hr)) {
+        hr=ITaskbarList_HrInit(taskbar);
+        if (SUCCEEDED(hr)) hr=ITaskbarList_DeleteTab(taskbar,hwnd);
+        ITaskbarList_Release(taskbar);
+    }
+    return hr;
+}
+
+int zenit_windows_set_owner(ZenitWindow *win, ZenitWindow *owner) {
+    if (!win || !win->hwnd || !owner || !owner->hwnd || win == owner) return 0;
+    RECT frame, fitted;
+    if (!GetWindowRect(win->hwnd,&frame)) return 0;
+    fitted=frame;
+    if (!win->chrome_fullscreen && !IsZoomed(win->hwnd)) {
+        MONITORINFO info={.cbSize=sizeof(info)};
+        if (!GetMonitorInfoW(MonitorFromWindow(win->hwnd,MONITOR_DEFAULTTONEAREST),&info)) return 0;
+        RECT visible=frame;
+        RECT dwm;
+        int known=SUCCEEDED(DwmGetWindowAttribute(win->hwnd,DWMWA_EXTENDED_FRAME_BOUNDS,&dwm,sizeof(dwm))) &&
+            dwm.right>dwm.left && dwm.bottom>dwm.top && dwm.left>=frame.left && dwm.top>=frame.top &&
+            dwm.right<=frame.right && dwm.bottom<=frame.bottom;
+        if (known) visible=dwm;
+        /* Both rectangles are screen pixels in the per-monitor-aware context.
+           Without DWM bounds, constrain extent but do not guess placement. */
+        ZenitGeometryRect out;
+        if (!zenit_fit_owned_geometry((ZenitGeometryRect){frame.left,frame.top,frame.right,frame.bottom},
+                (ZenitGeometryRect){visible.left,visible.top,visible.right,visible.bottom},
+                (ZenitGeometryRect){info.rcWork.left,info.rcWork.top,info.rcWork.right,info.rcWork.bottom},known,&out)) return 0;
+        fitted=(RECT){out.left,out.top,out.right,out.bottom};
+    }
+    int needs_fit=memcmp(&frame,&fitted,sizeof(frame))!=0;
+#ifdef ZENIT_WINDOW_CONTRACT
+    needs_fit |= contract_owner_resize_failure;
+#endif
+    /* Finish fallible geometry before assigning the owner. Suppress synchronous
+       resize rendering until ownership and shell bookkeeping are complete. */
+    win->owner_changing=1;
+    if (needs_fit && !fit_owned_frame(win->hwnd,&fitted)) {
+        restore_owner_frame(win,&frame);
+        win->owner_changing=0;
+        return 0;
+    }
+    SetLastError(0);
+    LONG_PTR previous=SetWindowLongPtrW(win->hwnd,GWLP_HWNDPARENT,(LONG_PTR)owner->hwnd);
+    if (!previous && GetLastError()) {
+        if (needs_fit) restore_owner_frame(win,&frame);
+        win->owner_changing=0;
+        return 0;
+    }
+    /* Best effort for an already-visible window; shell availability does not
+       determine ownership. Runtime-owned windows are configured before show. */
+    if (IsWindowVisible(win->hwnd)) {
+        HRESULT hr=remove_taskbar_tab(win->hwnd);
+        if (FAILED(hr)) fprintf(stderr,"[zenit-window] taskbar tab removal failed: 0x%08lx\n",(unsigned long)hr);
+    }
+    win->owner_changing=0;
+    if ((needs_fit || win->redraw_requested) && win->render_callback) win->render_callback(win->render_context);
+    return 1;
+}
+void zenit_windows_clear_owner(ZenitWindow *win) {
+    if (win && win->hwnd) SetWindowLongPtrW(win->hwnd, GWLP_HWNDPARENT, 0);
+}
+/* Outer frames and the owner's monitor work area in virtual-screen pixels
+   (top-left origin, y down): host x,y,w,h, panel w,h, work x,y,w,h.
+   Returns 0 when either window is gone. */
+int zenit_windows_owner_geometry(ZenitWindow *win, ZenitWindow *owner, double out[10]) {
+    if (!win || !win->hwnd || !owner || !owner->hwnd) return 0;
+    RECT host, panel;
+    if (!GetWindowRect(owner->hwnd, &host) || !GetWindowRect(win->hwnd, &panel)) return 0;
+    MONITORINFO info = { .cbSize = sizeof(info) };
+    HMONITOR monitor = MonitorFromWindow(owner->hwnd, MONITOR_DEFAULTTONEAREST);
+    if (!monitor || !GetMonitorInfoW(monitor, &info)) return 0;
+    out[0] = host.left; out[1] = host.top;
+    out[2] = host.right - host.left; out[3] = host.bottom - host.top;
+    out[4] = panel.right - panel.left; out[5] = panel.bottom - panel.top;
+    out[6] = info.rcWork.left; out[7] = info.rcWork.top;
+    out[8] = info.rcWork.right - info.rcWork.left; out[9] = info.rcWork.bottom - info.rcWork.top;
+    return 1;
+}
+void zenit_windows_set_origin(ZenitWindow *win, double x, double y) {
+    if (win && win->hwnd)
+        SetWindowPos(win->hwnd, NULL, (int)x, (int)y, 0, 0,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+}
+int zenit_windows_take_focus_loss(ZenitWindow *win) {
+    if (!win) return 0;
+    int value = win->focus_loss;
+    win->focus_loss = 0;
+    return value;
+}
 int zenit_windows_poll(ZenitWindow *win) {
     MSG msg;
     while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
@@ -1326,8 +1729,27 @@ int zenit_windows_poll(ZenitWindow *win) {
     }
     return win && win->alive && !app_quit_requested;
 }
+/* Cross-thread wake for the UI pump (watchers, LSP readers, terminal
+ * output): an auto-reset event the pump waits on next to the message queue.
+ * Created lazily with a compare-exchange so any thread may wake first. */
+static HANDLE volatile g_wake_event;
+static HANDLE zenit_wake_event(void) {
+    HANDLE existing = g_wake_event;
+    if (existing) return existing;
+    HANDLE created = CreateEventW(NULL, FALSE, FALSE, NULL);
+    if (!created) return NULL;
+    HANDLE previous = InterlockedCompareExchangePointer((PVOID volatile *)&g_wake_event, created, NULL);
+    if (previous) { CloseHandle(created); return previous; }
+    return created;
+}
+void zenit_windows_post_empty_event(void) {
+    HANDLE event = zenit_wake_event();
+    if (event) SetEvent(event);
+}
+
 void zenit_windows_pump_timeout(uint32_t timeout_ms) {
-    MsgWaitForMultipleObjectsEx(0, NULL, timeout_ms, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+    HANDLE event = zenit_wake_event();
+    MsgWaitForMultipleObjectsEx(event ? 1 : 0, event ? &event : NULL, timeout_ms, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
     MSG msg;
     while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
         dispatch_native_message(&msg);
@@ -1359,31 +1781,17 @@ void zenit_windows_drawable_size(ZenitWindow *win, uint32_t *width, uint32_t *he
 int zenit_windows_set_size(ZenitWindow *win, uint32_t width, uint32_t height) {
     if (!win || !win->hwnd || window_owner(win->hwnd) != win) return 0;
     int outer_width, outer_height;
-    if (!client_window_extent(width, height, GetDpiForWindow(win->hwnd),
-            (DWORD)GetWindowLongPtrW(win->hwnd, GWL_STYLE),
-            (DWORD)GetWindowLongPtrW(win->hwnd, GWL_EXSTYLE),
-            GetMenu(win->hwnd) != NULL, &outer_width, &outer_height)) return 0;
-    if (!SetWindowPos(win->hwnd, NULL, 0, 0, outer_width,
-        outer_height, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE)) return 0;
-    // The adjustment API omits wrapped menu rows and native scrollbars.
-    // Measure the real client area. A width correction can change menu wrapping,
-    // so allow one further correction after the width has settled.
-    for (unsigned attempt = 0; attempt < 2; ++attempt) {
-        RECT client, outer;
-        if (!GetClientRect(win->hwnd, &client) || !GetWindowRect(win->hwnd, &outer)) return 0;
-        UINT dpi = GetDpiForWindow(win->hwnd);
-        if (!dpi) dpi = 96;
-        int64_t wanted_w = ((uint64_t)width * dpi + 95) / 96;
-        int64_t wanted_h = ((uint64_t)height * dpi + 95) / 96;
-        int64_t delta_w = wanted_w - ((int64_t)client.right - client.left);
-        int64_t delta_h = wanted_h - ((int64_t)client.bottom - client.top);
-        if (!delta_w && !delta_h) break;
-        int64_t corrected_w = (int64_t)outer.right - outer.left + delta_w;
-        int64_t corrected_h = (int64_t)outer.bottom - outer.top + delta_h;
-        if (corrected_w <= 0 || corrected_h <= 0 || corrected_w > INT_MAX || corrected_h > INT_MAX) return 0;
-        if (!SetWindowPos(win->hwnd, NULL, 0, 0, (int)corrected_w,
-            (int)corrected_h, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE)) return 0;
-    }
+    if (!window_client_extent(win, width, height, GetDpiForWindow(win->hwnd), &outer_width, &outer_height)) return 0;
+    RECT requested;
+    if (!GetWindowRect(win->hwnd, &requested)) return 0;
+    requested.right = requested.left+outer_width;
+    requested.bottom = requested.top+outer_height;
+    if (!win->chrome_fullscreen && !IsZoomed(win->hwnd))
+        constrain_window_frame(&requested, MonitorFromWindow(win->hwnd, MONITOR_DEFAULTTONEAREST));
+    if (!SetWindowPos(win->hwnd, NULL, requested.left, requested.top, requested.right-requested.left,
+        requested.bottom-requested.top, SWP_NOZORDER | SWP_NOACTIVATE)) return 0;
+    win->requested_width = width;
+    win->requested_height = height;
     return 1;
 }
 int zenit_windows_live_resize(ZenitWindow *win) {
@@ -1473,8 +1881,8 @@ void zenit_windows_set_render_callback(ZenitWindow *win, void (*callback)(void *
     int attaching = callback && !win->render_callback;
     win->render_callback = callback;
     win->render_context = ctx;
-    // Retire the initial GDI probe contents once GPU presentation owns this
-    // window. Avoid erasing its background or activating another window.
+    // Ask for the first GPU paint as soon as presentation owns this window.
+    // Avoid erasing its background or activating another window.
     if (attaching && win->hwnd) InvalidateRect(win->hwnd, NULL, FALSE);
 }
 void zenit_windows_mouse(ZenitWindow *win, float *x, float *y) {
@@ -1940,6 +2348,7 @@ int zenit_win_chrome_action(void *owner, int action, int value) {
             next=info.rcMonitor;
             next_style=style & ~(WS_CAPTION|WS_THICKFRAME);
         }
+        if (!value && !(next_style & WS_MAXIMIZE)) constrain_window_frame(&next, MonitorFromRect(&next, MONITOR_DEFAULTTONEAREST));
         SetLastError(0);
         if (!SetWindowLongPtrW(w->hwnd,GWL_STYLE,next_style) && GetLastError()) return 0;
         int previous_fullscreen=w->chrome_fullscreen;

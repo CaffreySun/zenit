@@ -3,6 +3,7 @@
 #include <dwrite.h>
 #include <dwrite_3.h>
 #include <d2d1.h>
+#include <wincodec.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -10,16 +11,102 @@
 #include <stdlib.h>
 #include <string.h>
 #include "dwrite_font_ranges.h"
+#include "dwrite_alpha_correction.h"
 
 // The bridge uses COM interfaces without linking a C++ runtime. A pure
 // virtual dispatch is a programming error; provide its freestanding ABI hook.
 extern "C" __attribute__((weak, noreturn)) void __cxa_pure_virtual() { abort(); }
+
+struct ZenitDWriteRasterContext {
+    DWORD thread;
+    bool apartment_owned;
+    IDWriteFactory *factory;
+    ID2D1Factory *d2d;
+    IWICImagingFactory *wic;
+    IDWriteRenderingParams *params;
+    IDWriteRenderingParams1 *raw;
+    IWICBitmap *bitmap;
+    ID2D1RenderTarget *target;
+    ID2D1SolidColorBrush *brush;
+    HMONITOR monitor;
+    uint64_t epoch;
+    bool cleartype;
+    UINT width, height, target_allocations;
+};
+extern "C" int zenit_dwrite_cleartype_enabled();
+extern "C" void zenit_dwrite_raster_context_destroy(ZenitDWriteRasterContext *ctx) {
+    if (!ctx) return;
+    // All context resources and the matching COM apartment belong to the UI thread.
+    if (ctx->thread != GetCurrentThreadId()) abort();
+    if (ctx->brush) ctx->brush->Release();
+    if (ctx->target) ctx->target->Release();
+    if (ctx->bitmap) ctx->bitmap->Release();
+    if (ctx->raw) ctx->raw->Release();
+    if (ctx->params) ctx->params->Release();
+    if (ctx->wic) ctx->wic->Release();
+    if (ctx->d2d) ctx->d2d->Release();
+    if (ctx->factory) ctx->factory->Release();
+    if (ctx->apartment_owned) CoUninitialize();
+    free(ctx);
+}
+extern "C" ZenitDWriteRasterContext *zenit_dwrite_raster_context_create() {
+    auto *ctx = static_cast<ZenitDWriteRasterContext *>(calloc(1, sizeof(ZenitDWriteRasterContext)));
+    if (!ctx) return nullptr;
+    ctx->thread = GetCurrentThreadId(); ctx->epoch = UINT64_MAX;
+    // Do not introduce MTA before drop_bridge's OleInitialize (STA).
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    ctx->apartment_owned = SUCCEEDED(hr);
+    if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) { free(ctx); return nullptr; }
+    hr = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory), reinterpret_cast<IUnknown **>(&ctx->factory));
+    if (SUCCEEDED(hr)) hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, &ctx->d2d);
+    if (SUCCEEDED(hr)) hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&ctx->wic));
+    if (FAILED(hr)) { zenit_dwrite_raster_context_destroy(ctx); return nullptr; }
+    return ctx;
+}
+extern "C" int zenit_dwrite_raster_context_refresh(ZenitDWriteRasterContext *ctx, void *window, uint64_t epoch, float out[8]) {
+    if (!ctx || ctx->thread != GetCurrentThreadId()) return -1;
+    if (window) epoch = (uint64_t)(uintptr_t)GetPropW(static_cast<HWND>(window), L"Zenit.TextSettingsGeneration");
+    HMONITOR monitor = window ? MonitorFromWindow(static_cast<HWND>(window), MONITOR_DEFAULTTONEAREST) : MonitorFromPoint(POINT{0,0}, MONITOR_DEFAULTTOPRIMARY);
+    bool enabled = zenit_dwrite_cleartype_enabled() != 0;
+    bool changed = !ctx->params || ctx->monitor != monitor || ctx->epoch != epoch || ctx->cleartype != enabled;
+    if (changed) {
+        IDWriteRenderingParams *params = nullptr; IDWriteRenderingParams1 *raw = nullptr; IDWriteFactory1 *factory = nullptr;
+        HRESULT hr = ctx->factory->CreateMonitorRenderingParams(monitor, &params);
+        if (SUCCEEDED(hr)) hr = ctx->factory->QueryInterface(__uuidof(IDWriteFactory1), (void **)&factory);
+        if (SUCCEEDED(hr)) hr = factory->CreateCustomRenderingParams(1.f, 0.f, 0.f, params->GetClearTypeLevel(), params->GetPixelGeometry(), params->GetRenderingMode(), &raw);
+        if (factory) factory->Release();
+        if (FAILED(hr)) { if (params) params->Release(); if (raw) raw->Release(); return -1; }
+        if (ctx->params) ctx->params->Release(); if (ctx->raw) ctx->raw->Release();
+        ctx->params = params; ctx->raw = raw; ctx->monitor = monitor; ctx->epoch = epoch; ctx->cleartype = enabled;
+    }
+    IDWriteRenderingParams1 *params1 = nullptr;
+    if (FAILED(ctx->params->QueryInterface(__uuidof(IDWriteRenderingParams1), (void **)&params1))) return -1;
+    dwrite_gamma_ratios(ctx->params->GetGamma(), out);
+    out[4] = params1->GetGrayscaleEnhancedContrast(); out[5] = ctx->params->GetEnhancedContrast(); out[6] = ctx->params->GetClearTypeLevel();
+    out[7] = enabled && ctx->params->GetPixelGeometry() != DWRITE_PIXEL_GEOMETRY_FLAT && out[6] > 0;
+    params1->Release(); return changed ? 1 : 0;
+}
+static HRESULT raster_context_target(ZenitDWriteRasterContext *ctx, UINT width, UINT height) {
+    if (ctx->target && width <= ctx->width && height <= ctx->height) return S_OK;
+    UINT w = 64, h = 64; while (w < width) w *= 2; while (h < height) h *= 2;
+    w = w > ctx->width ? w : ctx->width; h = h > ctx->height ? h : ctx->height;
+    IWICBitmap *bitmap = nullptr; ID2D1RenderTarget *target = nullptr; ID2D1SolidColorBrush *brush = nullptr;
+    HRESULT hr = ctx->wic->CreateBitmap(w, h, GUID_WICPixelFormat32bppPBGRA, WICBitmapCacheOnLoad, &bitmap);
+    if (SUCCEEDED(hr)) hr = ctx->d2d->CreateWicBitmapRenderTarget(bitmap, D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,D2D1_ALPHA_MODE_PREMULTIPLIED)), &target);
+    if (SUCCEEDED(hr)) hr = target->CreateSolidColorBrush(D2D1::ColorF(1.f,1.f,1.f), &brush);
+    if (FAILED(hr)) { if (brush) brush->Release(); if (target) target->Release(); if (bitmap) bitmap->Release(); return hr; }
+    if (ctx->brush) ctx->brush->Release(); if (ctx->target) ctx->target->Release(); if (ctx->bitmap) ctx->bitmap->Release();
+    ctx->bitmap = bitmap; ctx->target = target; ctx->brush = brush; ctx->width = w; ctx->height = h; ctx->target_allocations++;
+    return S_OK;
+}
+extern "C" UINT zenit_dwrite_raster_context_target_allocations(const ZenitDWriteRasterContext *ctx) { return ctx ? ctx->target_allocations : 0; }
 
 struct ZenitDWriteFont {
     LONG refs;
     IDWriteFactory *factory;
     IDWriteFontFace *face;
     IDWriteTextFormat *format;
+    ZenitDWriteRasterContext *coverage;
     float size;
     DWRITE_FONT_METRICS metrics;
 };
@@ -130,6 +217,7 @@ failed:
     if (match) match->Release();
     if (family) family->Release();
     if (collection) collection->Release();
+    if (font->coverage) zenit_dwrite_raster_context_destroy(font->coverage);
     if (font->format) font->format->Release();
     if (font->face) font->face->Release();
     if (font->factory) font->factory->Release();
@@ -315,6 +403,7 @@ extern "C" int zenit_dwrite_font_italic(const ZenitDWriteFont *font) {
 
 extern "C" void zenit_dwrite_release_font(ZenitDWriteFont *font) {
     if (!font || InterlockedDecrement(&font->refs) != 0) return;
+    if (font->coverage) zenit_dwrite_raster_context_destroy(font->coverage);
     if (font->format) font->format->Release();
     if (font->face) font->face->Release();
     if (font->factory) font->factory->Release();
@@ -558,15 +647,51 @@ static int rasterize_color_glyph(ZenitDWriteFont *font, const DWRITE_GLYPH_RUN &
     return result;
 }
 
-extern "C" int zenit_dwrite_rasterize_glyph(
-    ZenitDWriteFont *font, uint32_t glyph_index, float scale,
-    float offset_x, float offset_y, uint8_t **out_pixels,
+extern "C" int zenit_dwrite_cleartype_enabled() {
+    BOOL smoothing = FALSE; UINT type = 0;
+    if (!SystemParametersInfoW(SPI_GETFONTSMOOTHING, 0, &smoothing, 0) ||
+        !SystemParametersInfoW(SPI_GETFONTSMOOTHINGTYPE, 0, &type, 0)) return 0;
+    return smoothing && type == FE_FONTSMOOTHINGCLEARTYPE;
+}
+
+// Keep raw masks color-independent; alpha correction belongs to the final blend.
+extern "C" int zenit_dwrite_text_rendering_params(float out[8]) {
+    if (!out) return -1;
+    IDWriteFactory *factory = nullptr;
+    IDWriteRenderingParams *params = nullptr;
+    IDWriteRenderingParams1 *params1 = nullptr;
+    HRESULT hr = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
+        reinterpret_cast<IUnknown **>(&factory));
+    if (SUCCEEDED(hr)) hr = factory->CreateMonitorRenderingParams(MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY), &params);
+    if (SUCCEEDED(hr)) hr = params->QueryInterface(__uuidof(IDWriteRenderingParams1), (void **)&params1);
+    if (SUCCEEDED(hr)) {
+        dwrite_gamma_ratios(params->GetGamma(), out);
+        out[4] = params1->GetGrayscaleEnhancedContrast();
+        out[5] = params->GetEnhancedContrast();
+        out[6] = params->GetClearTypeLevel();
+        out[7] = params->GetPixelGeometry() != DWRITE_PIXEL_GEOMETRY_FLAT && params->GetClearTypeLevel() > 0;
+    }
+    if (params1) params1->Release();
+    if (params) params->Release();
+    if (factory) factory->Release();
+    return SUCCEEDED(hr) ? 0 : -1;
+}
+
+extern "C" int zenit_dwrite_rasterize_glyph_context(
+    ZenitDWriteRasterContext *ctx, ZenitDWriteFont *font, uint32_t glyph_index, float scale,
+    float offset_x, float offset_y, uint32_t cleartype, uint8_t **out_pixels,
     uint32_t *out_width, uint32_t *out_height,
     int32_t *out_bearing_x, int32_t *out_bearing_y,
     int32_t *out_advance, uint32_t *out_is_color) {
     if (!font || !out_pixels || !out_width || !out_height ||
         !out_bearing_x || !out_bearing_y || !out_advance || !out_is_color ||
         glyph_index > UINT16_MAX || scale <= 0) return -1;
+    if (!ctx) {
+        if (!font->coverage) font->coverage = zenit_dwrite_raster_context_create();
+        ctx = font->coverage;
+        float params[8]; if (!ctx || zenit_dwrite_raster_context_refresh(ctx, nullptr, 0, params) < 0) return -1;
+    }
+    if (ctx->thread != GetCurrentThreadId() || !ctx->params) return -1;
     *out_pixels = nullptr;
     *out_is_color = 0;
     *out_width = *out_height = 0;
@@ -589,38 +714,87 @@ extern "C" int zenit_dwrite_rasterize_glyph(
             out_pixels, out_width, out_height, out_bearing_x, out_bearing_y);
         if (color <= 0) { *out_is_color = color == 0; return color; }
     }
+    IDWriteFactory2 *factory = nullptr;
     IDWriteGlyphRunAnalysis *analysis = nullptr;
-    HRESULT hr = font->factory->CreateGlyphRunAnalysis(&run, scale, nullptr,
-        DWRITE_RENDERING_MODE_NATURAL, DWRITE_MEASURING_MODE_NATURAL,
-        offset_x, offset_y, &analysis);
+    HRESULT hr = font->factory->QueryInterface(__uuidof(IDWriteFactory2), (void **)&factory);
+    if (FAILED(hr)) return -1;
+    DWRITE_RENDERING_MODE mode;
+    hr = font->face->GetRecommendedRenderingMode(font->size, scale,
+        DWRITE_MEASURING_MODE_NATURAL, ctx->params, &mode);
+    if (FAILED(hr)) { factory->Release(); return -1; }
+    // Very large text recommends outlines; the atlas still needs an AA bitmap.
+    if (mode == DWRITE_RENDERING_MODE_OUTLINE) mode = DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC;
+    // Atlas offsets are physical pixels. Translation must follow DIP scaling.
+    DWRITE_MATRIX transform = {scale, 0, 0, scale, offset_x, offset_y};
+    hr = factory->CreateGlyphRunAnalysis(&run, &transform,
+        mode, DWRITE_MEASURING_MODE_NATURAL,
+        DWRITE_GRID_FIT_MODE_ENABLED, DWRITE_TEXT_ANTIALIAS_MODE_GRAYSCALE,
+        0, 0, &analysis);
+    factory->Release();
     if (FAILED(hr)) return -1;
     RECT bounds;
-    hr = analysis->GetAlphaTextureBounds(DWRITE_TEXTURE_CLEARTYPE_3x1, &bounds);
-    if (FAILED(hr)) { analysis->Release(); return -1; }
-    int width = bounds.right - bounds.left;
-    int height = bounds.bottom - bounds.top;
-    *out_bearing_x = bounds.left;
-    *out_bearing_y = -bounds.top;
-    if (width <= 0 || height <= 0) { analysis->Release(); return 0; }
-    if (width > 4096 || height > 4096) { analysis->Release(); return -1; }
-    size_t count = (size_t)width * (size_t)height;
-    uint8_t *rgb = (uint8_t *)malloc(count * 3);
-    uint8_t *gray = (uint8_t *)malloc(count);
-    if (!rgb || !gray) {
-        free(rgb); free(gray); analysis->Release(); return -1;
-    }
-    hr = analysis->CreateAlphaTexture(DWRITE_TEXTURE_CLEARTYPE_3x1,
-        &bounds, rgb, (UINT32)(count * 3));
+    hr = analysis->GetAlphaTextureBounds(DWRITE_TEXTURE_ALIASED_1x1, &bounds);
     analysis->Release();
-    if (FAILED(hr)) { free(rgb); free(gray); return -1; }
-    for (size_t i = 0; i < count; ++i) {
-        gray[i] = (uint8_t)(((unsigned)rgb[i * 3] + rgb[i * 3 + 1] + rgb[i * 3 + 2] + 1) / 3);
+    if (FAILED(hr)) return -1;
+    if (bounds.right <= bounds.left || bounds.bottom <= bounds.top) return 0;
+    // D2D and GlyphRunAnalysis do not use identical grayscale scan conversion.
+    // Draw an uncorrected mask, as Terminal's atlas does, rather than averaging LCD.
+    bounds.left -= 2; bounds.top -= 2; bounds.right += 2; bounds.bottom += 2;
+    const int width = bounds.right - bounds.left, height = bounds.bottom - bounds.top;
+    if (width > 4094 || height > 4094) return 2;
+    hr = raster_context_target(ctx, width, height);
+    ID2D1RenderTarget *target = ctx->target;
+    IWICBitmap *bitmap = ctx->bitmap;
+    ID2D1SolidColorBrush *brush = ctx->brush;
+    uint8_t *bgra = nullptr, *pixels = nullptr;
+    if (SUCCEEDED(hr)) {
+        target->SetDpi(96*scale, 96*scale);
+        target->SetTextRenderingParams(ctx->raw);
+        target->SetTextAntialiasMode(cleartype ? D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE : D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+        target->BeginDraw();
+        target->PushAxisAlignedClip(D2D1::RectF(0,0,width/scale,height/scale), D2D1_ANTIALIAS_MODE_ALIASED);
+        target->Clear(D2D1::ColorF(0.f, 0.f, 0.f, 1.f));
+        glyph_offset.advanceOffset = offset_x / scale;
+        glyph_offset.ascenderOffset = -offset_y / scale;
+        target->DrawGlyphRun(D2D1::Point2F(-bounds.left / scale, -bounds.top / scale), &run, brush, DWRITE_MEASURING_MODE_NATURAL);
+        target->PopAxisAlignedClip();
+        hr = target->EndDraw();
     }
-    free(rgb);
-    *out_pixels = gray;
-    *out_width = (uint32_t)width;
-    *out_height = (uint32_t)height;
-    return 0;
+    const size_t count = (size_t)width * height;
+    if (SUCCEEDED(hr)) {
+        bgra = (uint8_t *)malloc(count * 4);
+        pixels = (uint8_t *)malloc(count * (cleartype ? 4 : 1));
+        if (!bgra || !pixels) hr = E_OUTOFMEMORY;
+    }
+    if (SUCCEEDED(hr)) { WICRect region = {0,0,width,height}; hr = bitmap->CopyPixels(&region, width * 4, (UINT)(count * 4), bgra); }
+    if (SUCCEEDED(hr)) {
+        for (size_t i = 0; i < count; ++i) {
+            if (cleartype) { pixels[i*4] = bgra[i*4+2]; pixels[i*4+1] = bgra[i*4+1]; pixels[i*4+2] = bgra[i*4]; pixels[i*4+3] = 255; }
+            else pixels[i] = bgra[i*4];
+        }
+        *out_pixels = pixels; *out_width = width; *out_height = height;
+        *out_bearing_x = bounds.left; *out_bearing_y = -bounds.top;
+        *out_is_color = cleartype ? 2 : 0;
+    } else free(pixels);
+    free(bgra);
+    if (hr == D2DERR_RECREATE_TARGET) {
+        if (ctx->brush) ctx->brush->Release();
+        if (ctx->target) ctx->target->Release();
+        if (ctx->bitmap) ctx->bitmap->Release();
+        ctx->brush = nullptr; ctx->target = nullptr; ctx->bitmap = nullptr;
+        ctx->width = ctx->height = 0;
+    }
+    return SUCCEEDED(hr) ? 0 : -1;
+}
+
+extern "C" int zenit_dwrite_rasterize_glyph_mode(ZenitDWriteFont *font, uint32_t glyph, float scale, float x, float y, uint32_t lcd,
+    uint8_t **pixels, uint32_t *width, uint32_t *height, int32_t *bx, int32_t *by, int32_t *advance, uint32_t *color) {
+    return zenit_dwrite_rasterize_glyph_context(nullptr, font, glyph, scale, x, y, lcd, pixels, width, height, bx, by, advance, color);
+}
+extern "C" int zenit_dwrite_rasterize_glyph(
+    ZenitDWriteFont *font, uint32_t glyph_index, float scale, float offset_x, float offset_y,
+    uint8_t **pixels, uint32_t *width, uint32_t *height, int32_t *bx, int32_t *by, int32_t *advance, uint32_t *color) {
+    return zenit_dwrite_rasterize_glyph_mode(font, glyph_index, scale, offset_x, offset_y, 0, pixels, width, height, bx, by, advance, color);
 }
 
 extern "C" void zenit_dwrite_free_bitmap(uint8_t *pixels) { free(pixels); }

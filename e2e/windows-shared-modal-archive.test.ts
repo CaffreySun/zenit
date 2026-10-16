@@ -1,6 +1,6 @@
 // State driver for --audit-modal-frames target. Pixel acceptance is performed
 // on every native submitted frame by the host archive auditor, not by sleeps.
-import {clickTestId,query,waitFor,waitForServerReady,mouseMove,request,stats} from './client';
+import {clickTestId,query,waitFor,waitForServerReady,mouseMove,request,stats,tree} from './client';
 import {test,run,assert} from './runner';
 test('Windows shared Modal drives three cycles for submitted frame audit',async()=>{
  await waitForServerReady(15000);
@@ -13,7 +13,7 @@ test('Windows shared Modal drives three cycles for submitted frame audit',async(
    return node && (node.effective_opacity??0)>=.999 ? node:null;
   },15000,50);
   assert((await clickTestId('modal.close')).ok,'modal close failed');
-  await mouseMove(1050,850);
+  await mouseMove((await tree()).rect.w-20,(await tree()).rect.h-20);
   await waitFor(async()=>{
    const node=(await query('story.modal.dialog'))[0];
    return node && (node.effective_opacity??1)===0 ? node:null;

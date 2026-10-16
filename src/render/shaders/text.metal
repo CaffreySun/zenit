@@ -25,16 +25,17 @@ struct Uniforms {
 
 /// glyph instance data
 struct GlyphInstance {
-    float2 position; // glyph bottom-left position (pixels)
-    float2 size; // glyph size (pixels)
-    float4 uv_rect; // UV rect (u_min, v_min, u_max, v_max)
-    float4 color; // glyph color RGBA
-    float4 rect_clip; // x, y, w, h (logical pixels); 0-size = disabled
+    packed_float2 position; // glyph bottom-left position (pixels)
+    packed_float2 size; // glyph size (pixels)
+    // UV compression: exact integer texels on a 4096 grid, decoded with 1/4096.
+    packed_ushort4 uv_rect; // texel coords (u_min, v_min, u_max, v_max); UV = texel / 4096
+    packed_float4 color; // glyph color RGBA
+    packed_float4 rect_clip; // x, y, w, h (logical pixels); 0-size = disabled
     float skew_x; // synthetic italic x offset (logical pixels)
-    float page_index; // atlas page index (CPU bucketing only, shader doesn't read)
-    float is_color; // >0.5 = glyph on BGRA color page (emoji), sample is final color
-    float shader_snap; // >0.5 = position snaps to physical pixel; animated text set 0 (continuous coords)
+    // Exact metadata: page[0..7], color mode[8..9], pixel snap[10].
+    uint metadata;
 };
+static_assert(sizeof(GlyphInstance) == 64, "Metal glyph wire stride must match Zig (UV compressed to packed_ushort4)");
 
 /// vertex output
 struct VertexOutput {
@@ -198,18 +199,16 @@ vertex VertexOutput text_vertex_main(
         float2(1.0, 1.0) // top-right
     };
 
-    uint indices[6] = {0, 1, 2, 1, 3, 2};
-    uint corner_index = indices[vertex_id];
-    float2 corner = corners[corner_index];
+    float2 corner = corners[vertex_id];
 
     // compute pixel position (logical -> physical pixel)
-    // shader_snap>0.5 snaps to physical pixel (static/in-surface text; CPU already snapped per same
+    // metadata bit 10 snaps to physical pixel (static/in-surface text; CPU already snapped per same
     // rule, idempotent here). animated text (direct_animated) set 0: keep continuous float coords,
     // per-glyph rounding lets adjacent glyphs cross rounding threshold on different frames,
     // producing kerning/baseline jitter.
     float s = uniforms.scale_factor;
     float2 scaled_pos = inst.position * s;
-    float2 base_pos = (inst.shader_snap > 0.5) ? round(scaled_pos) : scaled_pos;
+    float2 base_pos = ((inst.metadata & (1u << 10)) != 0) ? round(scaled_pos) : scaled_pos;
     float2 pixel_pos = base_pos + corner * inst.size * s;
 
     // synthetic italic: top offset right, bottom fixed
@@ -223,7 +222,10 @@ vertex VertexOutput text_vertex_main(
     out.position = float4(ndc, 0.0, 1.0);
 
     // compute UV
-    out.uv = mix(inst.uv_rect.xy, inst.uv_rect.zw, corner);
+    // Decode compressed UV texels back to normalized UV; texel/4096 is exact (float4 decode, no rounding).
+    constexpr float kAtlasSizeInv = 1.0f / 4096.0f;
+    const float4 uv_rect = float4(inst.uv_rect) * kAtlasSizeInv;
+    out.uv = mix(uv_rect.xy, uv_rect.zw, corner);
     out.screen_pos = pixel_pos;
     out.rect_clip = inst.rect_clip;
 
@@ -248,7 +250,7 @@ fragment float4 text_fragment_main(
     const float clip_a = clip_alpha_text(in.screen_pos, in.rect_clip, uniforms);
 
     float4 result;
-    if (inst.is_color > 0.5) {
+    if (((inst.metadata >> 8) & 3u) != 0) {
         // color glyphs (emoji): BGRA page already stores premultiplied final color. **must not**
         // multiply by inst.color -- emoji has its own color, multiplying by text color would
         // recolor to monochrome, wasted. here only apply clip alpha and overall opacity.

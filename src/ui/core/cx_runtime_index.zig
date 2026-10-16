@@ -53,7 +53,7 @@ pub fn collectPartialInteractionRootsWithFallback(self: *Cx, node: *Node, roots:
         collectPartialInteractionRoots(self, node, roots);
         if (roots.len > 0 or roots.overflow) return;
     }
-    if (subtreeHasLooseInteractionDirty(node)) {
+    if (subtreeHasLooseInteractionDirty(self, node)) {
         collectPartialInteractionRootsFallback(self, node, roots);
     }
 }
@@ -109,19 +109,17 @@ fn partialInteractionRootForLayoutNode(node: *Node) ?*Node {
 /// by (root, node_dirty.g_loose_interaction_gen): all set/clear sites bump gen
 /// (see node_dirty.bumpLooseInteractionGen contract); unchanged gen => unchanged
 /// bits => same result as scanning each time.
-pub fn subtreeHasLooseInteractionDirty(node: *Node) bool {
-    const LooseMemo = struct {
-        var root: ?*Node = null;
-        var gen: u64 = 0;
-        var result: bool = false;
-    };
+pub fn subtreeHasLooseInteractionDirty(self: *const Cx, node: *Node) bool {
+    // Mutating an observation cache does not mutate scene state. Each Cx keeps
+    // its own root slot, so alternating windows do not evict one another.
+    const memo = &@constCast(self).loose_interaction_memo;
     const cur_gen = @import("node_dirty.zig").g_loose_interaction_gen;
-    if (LooseMemo.root == node and LooseMemo.gen == cur_gen) return LooseMemo.result;
-    const scanned = subtreeHasLooseInteractionDirtyScan(node);
-    LooseMemo.root = node;
-    LooseMemo.gen = cur_gen;
-    LooseMemo.result = scanned;
-    return scanned;
+    if (memo.root == node and memo.gen == cur_gen) return memo.result;
+    memo.result = subtreeHasLooseInteractionDirtyScan(node);
+    memo.root = node;
+    memo.gen = cur_gen;
+    memo.scans += 1;
+    return memo.result;
 }
 
 fn subtreeHasLooseInteractionDirtyScan(node: *Node) bool {

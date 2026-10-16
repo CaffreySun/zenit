@@ -78,6 +78,28 @@ pub fn isOsKeyboardEvent(event: system_sdk.events.Event) bool {
     };
 }
 
+/// Discarded OS pointer and keyboard traffic must not reset an idle interval or force GPU
+/// frames. Harness injection still requests its frames directly through Cx.
+pub fn requestsFrame(isolated: bool, keyboard_isolated: bool, input: []const system_sdk.events.Event) bool {
+    for (input) |event| {
+        if (isolated and isOsPointerEvent(event)) continue;
+        if (keyboard_isolated and isOsKeyboardEvent(event)) continue;
+        return true;
+    }
+    return false;
+}
+
+test "isolated pointer batches do not force frames but native lifecycle events do" {
+    const input = [_]system_sdk.events.Event{
+        .{ .mouse_move = .{ .window_id = 1, .x = 10, .y = 20 } },
+        .{ .frame_requested = {} },
+    };
+    try std.testing.expect(!requestsFrame(true, false, input[0..1]));
+    try std.testing.expect(requestsFrame(false, false, input[0..1]));
+    try std.testing.expect(requestsFrame(true, false, &input));
+    try std.testing.expect(!requestsFrame(false, false, &.{}));
+}
+
 test "explicit ZENIT_E2E_ISOLATE_POINTER wins over the background default" {
     try std.testing.expect(enabledFrom("1", null, false));
     try std.testing.expect(!enabledFrom("0", "1", true));
@@ -185,4 +207,20 @@ test "background isolation preserves owned contract input while dropping real OS
         // Production input still follows the OS path; contract source fails to compile.
         try std.testing.expect(shouldDropEvent(false, true, .os, event));
     }
+}
+
+test "keyboard isolation suppresses frames for every keyboard event only" {
+    const E = system_sdk.events.Event;
+    inline for (@import("zenit_reflection").fields(E)) |field| {
+        const input = [_]E{@unionInit(E, field.name, std.mem.zeroes(field.type))};
+        try std.testing.expectEqual(!isOsKeyboardEvent(input[0]), requestsFrame(false, true, &input));
+        try std.testing.expectEqual(!isOsKeyboardEvent(input[0]) and !isOsPointerEvent(input[0]), requestsFrame(true, true, &input));
+        try std.testing.expect(requestsFrame(false, false, &input));
+    }
+    const mixed = [_]E{
+        .{ .key = std.mem.zeroes(@FieldType(E, "key")) },
+        .{ .frame_requested = {} },
+    };
+    try std.testing.expect(requestsFrame(true, true, &mixed));
+    try std.testing.expect(!requestsFrame(true, true, &.{}));
 }

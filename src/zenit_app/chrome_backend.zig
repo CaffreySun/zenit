@@ -11,6 +11,11 @@ extern fn macos_chrome_state(*anyopaque, *chrome.NativeState) void;
 extern fn macos_chrome_action(*anyopaque, c_int, c_int) c_int;
 extern fn macos_fullscreen_header_configure(*anyopaque, c_int, f32) c_int;
 extern fn macos_fullscreen_header_layout(*anyopaque, c_int, *f32, *f32) void;
+extern fn macos_fullscreen_header_take_frame_request(*anyopaque) c_int;
+pub fn takeHeaderFrameRequest(win: *Window) bool {
+    if (comptime builtin.os.tag != .macos) return false;
+    return macos_fullscreen_header_take_frame_request(handle(win)) != 0;
+}
 extern fn macos_fullscreen_header_post_pointer(*anyopaque, f32, f32, c_int) c_int;
 extern fn macos_fullscreen_header_background(*anyopaque, u8, u8, u8, u8) void;
 extern fn macos_fullscreen_header_test_hover(*anyopaque, c_int) c_int;
@@ -105,6 +110,9 @@ pub fn configure(win: *Window, config: chrome.Config, height: f32) !chrome.State
     return chrome.resolve(config, supported, reason, builtin.os.tag == .macos or builtin.os.tag == .windows);
 }
 pub fn setHitCallback(win: *Window, callback: ?HitFn, context: ?*anyopaque) void {
+    // The native window can already be gone (Win32 destroys owned windows with
+    // their owner); there is no callback left to clear then.
+    if (builtin.os.tag == .windows and callback == null and win.closeCompleted()) return;
     switch (builtin.os.tag) {
         .macos => macos_chrome_hit(handle(win), callback, context),
         .windows => zenit_win_chrome_hit(handle(win), callback, context),

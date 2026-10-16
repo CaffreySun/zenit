@@ -30,10 +30,11 @@ extern "C" int zenit_win_file_dialog(void *owner, unsigned kind,
             (kind==2 ? FOS_PICKFOLDERS : 0));
         // The shared SDK uses title as the suggested filename for Save As.
         if (SUCCEEDED(hr) && title && *title) hr=kind==1 ? dialog->SetFileName(title) : dialog->SetTitle(title);
-        if (SUCCEEDED(hr) && directory && *directory) {
-            hr=SHCreateItemFromParsingName(directory,nullptr,IID_IShellItem,(void **)&folder);
-            if (SUCCEEDED(hr)) hr=dialog->SetFolder(folder);
-        }
+        // The starting folder is a hint, as on macOS: one that cannot be
+        // resolved leaves the dialog at its default location.
+        if (SUCCEEDED(hr) && directory && *directory &&
+                SUCCEEDED(SHCreateItemFromParsingName(directory,nullptr,IID_IShellItem,(void **)&folder)))
+            dialog->SetFolder(folder);
         if (SUCCEEDED(hr)) hr=dialog->Show(hwnd);
         if (hr==HRESULT_FROM_WIN32(ERROR_CANCELLED)) answer=0;
         else if (SUCCEEDED(hr)) {

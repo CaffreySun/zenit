@@ -25,6 +25,7 @@
 //! Not yet: filter, mask, blend-mode, 3D transform.
 
 const std = @import("std");
+const id_hash = @import("id_hash.zig");
 const testing = std.testing;
 const element_id_mod = @import("element_id.zig");
 const paint_table_mod = @import("paint_table.zig");
@@ -207,6 +208,19 @@ pub const LayerTree = struct {
     plan_by_node: std.AutoHashMapUnmanaged(u64, LayerId) = .{},
     /// plan frame epoch (planBuildFromPropertyTree increments, sweeps exits).
     plan_epoch: u64 = 0,
+    /// root_node_id -> first/last plan_layer_id of this frame with that root, and
+    /// `frame_root_next[plan_layer_id]` links the rest in append order. The render
+    /// passes query a root's plan state for every node every frame
+    /// (`planQueryRootNode`); scanning all plan layers per node made that
+    /// O(nodes x layers). Cleared with the plan in `planClear`.
+    frame_root_chains: id_hash.U32HashMapUnmanaged(RootChain) = .{},
+    frame_root_next: std.ArrayList(u32) = .empty,
+    /// Plan layers appended this frame with a promotion reason. While it is zero no
+    /// node has a promoted layer, so the per-node promoted-state passes would only
+    /// rewrite the defaults `appendRetainedMetadata` already stored.
+    frame_promoted_count: u32 = 0,
+
+    const RootChain = struct { head: u32, tail: u32 };
 
     pub fn init(allocator: std.mem.Allocator, config: LayerTreeConfig) LayerTree {
         return .{
@@ -232,6 +246,8 @@ pub const LayerTree = struct {
         self.frame_ops.deinit(self.allocator);
         self.frame_layer_ids.deinit(self.allocator);
         self.plan_by_node.deinit(self.allocator);
+        self.frame_root_chains.deinit(self.allocator);
+        self.frame_root_next.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -525,9 +541,19 @@ pub const LayerTree = struct {
 
     /// Get CompositedLayer descriptor for plan_layer_id.
     pub fn planCompositedAt(self: *const LayerTree, plan_layer_id: u32) ?CompositedLayer {
+        const layer = self.planCompositedPtrAt(plan_layer_id) orelse return null;
+        return layer.*;
+    }
+
+    /// Borrowed form of `planCompositedAt` for scans. CompositedLayer carries
+    /// glass/warp parameters and is several hundred bytes; the per-node plan
+    /// queries below scan every plan layer, and copying each one out was a
+    /// memcpy per (node x layer) on every frame.
+    fn planCompositedPtrAt(self: *const LayerTree, plan_layer_id: u32) ?*const CompositedLayer {
         const tree_id = self.planTreeLayerOf(plan_layer_id);
         const tree_layer = self.get(tree_id) orelse return null;
-        return tree_layer.composited;
+        if (tree_layer.composited) |*layer| return layer;
+        return null;
     }
 
     /// Clear frame's plan ops and ordinal indices between frames. Retained form
@@ -536,6 +562,9 @@ pub const LayerTree = struct {
     pub fn planClear(self: *LayerTree) void {
         self.frame_ops.clearRetainingCapacity();
         self.frame_layer_ids.clearRetainingCapacity();
+        self.frame_root_chains.clearRetainingCapacity();
+        self.frame_root_next.clearRetainingCapacity();
+        self.frame_promoted_count = 0;
     }
 
     fn planLayerKey(root_node_id: u32, kind: EffectKind) u64 {
@@ -549,6 +578,8 @@ pub const LayerTree = struct {
         // plan_by_node, never reclaimed, each failure adds one.
         try self.frame_layer_ids.ensureUnusedCapacity(self.allocator, 1);
         try self.plan_by_node.ensureUnusedCapacity(self.allocator, 1);
+        try self.frame_root_next.ensureUnusedCapacity(self.allocator, 1);
+        try self.frame_root_chains.ensureUnusedCapacity(self.allocator, 1);
 
         const id: u32 = @intCast(self.frame_layer_ids.items.len);
         var l = layer;
@@ -576,6 +607,15 @@ pub const LayerTree = struct {
             tl.plan_seen_epoch = self.plan_epoch;
         }
         self.frame_layer_ids.appendAssumeCapacity(tree_id);
+        self.frame_root_next.appendAssumeCapacity(INVALID_ID);
+        if (l.promotion_reason.any()) self.frame_promoted_count += 1;
+        const chain = self.frame_root_chains.getOrPutAssumeCapacity(l.root_node_id);
+        if (chain.found_existing) {
+            self.frame_root_next.items[chain.value_ptr.tail] = id;
+            chain.value_ptr.tail = id;
+        } else {
+            chain.value_ptr.* = .{ .head = id, .tail = id };
+        }
         return id;
     }
 
@@ -625,7 +665,7 @@ pub const LayerTree = struct {
 
     pub fn planFindLayerIdByEffectId(self: *const LayerTree, effect_id: u32) ?u32 {
         for (self.frame_layer_ids.items, 0..) |_, i| {
-            const layer = self.planCompositedAt(@intCast(i)) orelse continue;
+            const layer = self.planCompositedPtrAt(@intCast(i)) orelse continue;
             if (layer.effect_id == effect_id) return @intCast(i);
         }
         return null;
@@ -634,9 +674,13 @@ pub const LayerTree = struct {
     pub fn planQueryRootNode(self: *const LayerTree, root_node_id: u32) RootLayerState {
         var state = RootLayerState{};
         var best_priority: u8 = 0;
-        for (self.frame_layer_ids.items, 0..) |_, i| {
-            const layer = self.planCompositedAt(@intCast(i)) orelse continue;
-            if (layer.root_node_id != root_node_id) continue;
+        const chain = self.frame_root_chains.get(root_node_id) orelse return state;
+        var next: u32 = chain.head;
+        while (next != INVALID_ID) {
+            const i = next;
+            next = self.frame_root_next.items[i];
+            const layer = self.planCompositedPtrAt(i) orelse continue;
+            std.debug.assert(layer.root_node_id == root_node_id);
             state.has_plan_layer = true;
             if (!layer.promotion_reason.any()) continue;
             const priority = promotedLayerPriority(layer);
@@ -983,7 +1027,7 @@ pub const LayerTree = struct {
     }
 };
 
-fn promotedLayerPriority(layer: CompositedLayer) u8 {
+fn promotedLayerPriority(layer: *const CompositedLayer) u8 {
     return switch (layer.effect_kind) {
         .backdrop_blur => 3,
         .composited_group => 2,
@@ -1228,6 +1272,55 @@ test "P1.10': planAppendLayer creates layer in tree and returns plan_id" {
     const tree_id = tree.planTreeLayerOf(plan_id);
     try testing.expect(!tree_id.isNull());
     try testing.expect(tree.isAlive(tree_id));
+}
+
+test "planQueryRootNode: per-root chain keeps the scan's priority and first-wins order" {
+    var tree = LayerTree.init(testing.allocator, .{});
+    defer tree.deinit();
+    const base: CompositedLayer = .{
+        .root_node_id = 0,
+        .content_bounds_local = ComputedRect.init(0, 0, 10, 10),
+        .surface_bounds_world = ComputedRect.init(0, 0, 10, 10),
+        .transform_id = 0,
+        .effect_id = 0,
+        .effect_kind = .opacity,
+    };
+    const promoted: CompositedPromotionReason = .{ .has_opacity_animation = true };
+    var l = base;
+    // root 7: unpromoted, then opacity (prio 1), then blur (prio 3), then another blur.
+    l.root_node_id = 7;
+    _ = try tree.planAppendLayer(l);
+    l.effect_kind = .opacity;
+    l.promotion_reason = promoted;
+    l.effect_id = 1;
+    const opacity_7 = try tree.planAppendLayer(l);
+    // An unrelated root interleaved between root 7's layers.
+    var other = base;
+    other.root_node_id = 9;
+    other.effect_id = 2;
+    other.effect_kind = .composited_group;
+    other.promotion_reason = promoted;
+    const group_9 = try tree.planAppendLayer(other);
+    l.effect_kind = .backdrop_blur;
+    l.effect_id = 3;
+    const blur_7 = try tree.planAppendLayer(l);
+    l.effect_id = 4;
+    _ = try tree.planAppendLayer(l);
+    try testing.expectEqual(@as(u32, 4), tree.frame_promoted_count);
+
+    const s7 = tree.planQueryRootNode(7);
+    try testing.expect(s7.has_plan_layer);
+    // Highest priority wins; the first of equal priority stays.
+    try testing.expectEqual(blur_7, s7.promoted_layer_id);
+    try testing.expect(blur_7 != opacity_7);
+    try testing.expectEqual(group_9, tree.planQueryRootNode(9).promoted_layer_id);
+    const none = tree.planQueryRootNode(8);
+    try testing.expect(!none.has_plan_layer);
+    try testing.expectEqual(INVALID_ID, none.promoted_layer_id);
+
+    tree.planClear();
+    try testing.expectEqual(@as(u32, 0), tree.frame_promoted_count);
+    try testing.expect(!tree.planQueryRootNode(7).has_plan_layer);
 }
 
 test "retained plan: planClear 保留 layer，跨帧身份稳定，epoch sweep 清退场" {

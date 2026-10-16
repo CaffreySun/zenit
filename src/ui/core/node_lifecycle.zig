@@ -398,16 +398,29 @@ pub fn destroy(self: *Node, allocator: Allocator) void {
     releaseStrokeGeometry(self, allocator);
     releaseCustomClipGeometry(self, allocator);
 
+    if (self.world_ref) |w| {
+        w.layout_output.clear(world_mod.ElementId.fromRaw(self.element_id_raw));
+    }
+    releaseStandaloneState(self);
+
     // World's DevTools style source table sparsely holds by element raw key; remove
     // on node reclaim to prevent diagnosis table only growing in long-lived windows with
     // frequent mount/unmount.
     if (self.world_ref) |w| w.clearStyleOrigins(self.element_id_raw);
 
+    @import("layout_engine.zig").forgetIntrinsicCache(self.world_id, self.id);
     self.children.deinit(allocator);
     // Poison: if freed node used as live, sentinel check panics immediately rather
     // than relying on 0xaa to make `freeing` read true for silent early-return.
     self.alive_sentinel = node_mod.DEAD_SENTINEL;
     allocator.destroy(self);
+}
+
+/// Called by both standalone destroy and Cx reclamation, after owned payloads.
+pub fn releaseStandaloneState(node: *Node) void {
+    const ptr = @intFromPtr(node);
+    @import("paint_content_accessor.zig").releaseStandaloneNode(ptr);
+    if (g_standalone_rects_init) _ = g_standalone_rects.remove(ptr);
 }
 
 pub fn releasePathGeometry(self: *Node, allocator: Allocator) void {

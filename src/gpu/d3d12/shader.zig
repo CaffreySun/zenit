@@ -8,6 +8,8 @@ extern fn zenit_d12_shader_retain(*NativeShader) void;
 extern fn zenit_d12_shader_release(*NativeShader) void;
 extern fn zenit_d12_shader_data(*NativeShader) [*]const u8;
 extern fn zenit_d12_shader_size(*NativeShader) usize;
+extern fn zenit_d12_shader_atomic_switch(*NativeShader, *?*NativeShader) c_int;
+extern fn zenit_d12_shader_non_uniform_buffer_atomics(*NativeShader) c_int;
 extern fn zenit_d12_shader_diagnostic_free([*]u8) void;
 pub const ResourceBinding = extern struct { group: u32, binding: u32, kind: u32, count: u32, dimension: u32, sample_type: u32, sampler_type: u32, stride: u32, min_size: u64 };
 extern fn zenit_d12_shader_bindings(*NativeShader, ?[*]ResourceBinding, u32, *u32) c_int;
@@ -100,6 +102,24 @@ pub const ShaderFunction = struct {
             else => return error.ShaderReflectionFailed,
         };
         return bindings;
+    }
+    pub fn requiresNonUniformUavBufferArrayAtomics(self: *const ShaderFunction) !bool {
+        if (gpu.backend_kind != .d3d12) return false;
+        return switch (zenit_d12_shader_non_uniform_buffer_atomics(self.raw)) {
+            0 => false,
+            1 => true,
+            else => error.InvalidShaderBytecode,
+        };
+    }
+    pub fn retained(self: *const ShaderFunction) ShaderFunction {
+        zenit_d12_shader_retain(self.raw);
+        return self.*;
+    }
+    pub fn withAtomicSwitch(self: *const ShaderFunction) !ShaderFunction {
+        var raw: ?*NativeShader = null;
+        if (zenit_d12_shader_atomic_switch(self.raw, &raw) != 0)
+            return error.UnsupportedNonUniformUavBufferArrayAtomics;
+        return .{ .raw = raw.?, .stage = self.stage };
     }
     pub fn bytecode(self: *const ShaderFunction) []const u8 {
         return zenit_d12_shader_data(self.raw)[0..zenit_d12_shader_size(self.raw)];

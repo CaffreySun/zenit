@@ -78,8 +78,16 @@ pub const ContentTable = struct {
     }
 
     pub fn get(self: *const ContentTable, id: ElementId) ?ContentData {
+        const entry = self.getPtr(id) orelse return null;
+        return entry.*;
+    }
+
+    /// Borrowed entry. `ContentData` carries a whole `TextProps` (inline text
+    /// buffer included); per-node readers that want one field (image, icon)
+    /// must not copy the entry to get it.
+    pub fn getPtr(self: *const ContentTable, id: ElementId) ?*const ContentData {
         if (id.isNull() or id.index >= self.items.items.len) return null;
-        return self.items.items[id.index];
+        return &self.items.items[id.index];
     }
 
     /// Return TextProps value copy. After caller receives copy, content still points

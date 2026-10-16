@@ -362,6 +362,13 @@ pub const UnsupportedWindow = struct {
         _ = inset_y;
     }
 
+    pub fn postEmptyEvent() void {}
+
+    pub fn setTitle(self: *UnsupportedWindow, title: [:0]const u8) void {
+        _ = self;
+        _ = title;
+    }
+
     pub fn setTitlebarDragHeight(self: *UnsupportedWindow, height: f32) void {
         _ = self;
         _ = height;

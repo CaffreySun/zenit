@@ -18,9 +18,13 @@ pub fn run(io: std.Io) !void {
     defer sdf.deinit();
     var text = try render.TextRenderer.init(a, &dq.device);
     defer text.deinit();
-    var image = try render.ImageRenderer.init(a, &dq.device);
+    const image = try a.create(render.ImageRenderer);
+    defer a.destroy(image);
+    try image.init(a, &dq.device);
     defer image.deinit();
-    var icon = try render.IconRenderer.init(a, &dq.device);
+    const icon = try a.create(render.IconRenderer);
+    defer a.destroy(icon);
+    try icon.init(a, &dq.device);
     defer icon.deinit();
     var pool: render.OffscreenTexturePool = .{};
     defer pool.deinit();
@@ -42,7 +46,7 @@ pub fn run(io: std.Io) !void {
         var gpu_encoder = try gpu.Backend.CommandEncoder.init(&dq.queue);
         defer gpu_encoder.deinit();
         var pass = try gpu_encoder.beginRenderPass(.{ .color_attachments = &.{.{ .view = view, .load_op = .clear, .store_op = .store, .clear_value = .TRANSPARENT }} });
-        var enc = render.RenderCommandEncoder.initWithImageAndIcon(&sdf, &text, &image, &icon, &pool, &persistent);
+        var enc = render.RenderCommandEncoder.initWithImageAndIcon(&sdf, &text, image, icon, &pool, &persistent);
         defer enc.deinit();
         enc.beginFrame(16, 8, 1);
         enc.frame_index = frame + 1;

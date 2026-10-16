@@ -38,9 +38,29 @@ public static class ZenitNativeInput {
   [DllImport("user32.dll")] static extern bool EnumWindows(EnumWindowProc callback,IntPtr param);
   public static IntPtr AppWindow(int process) {
     IntPtr found=IntPtr.Zero;int count=0;
-    EnumWindows(delegate(IntPtr hwnd,IntPtr ignored){if(Owned(hwnd,process)&&Class(hwnd)=="ZenitWindow"){found=hwnd;count++;}return true;},IntPtr.Zero);
+    // Owned panels (a find or palette window) are not the app window: count
+    // only windows without an owner (GW_OWNER = 4).
+    EnumWindows(delegate(IntPtr hwnd,IntPtr ignored){if(Owned(hwnd,process)&&Class(hwnd)=="ZenitWindow"&&GetWindow(hwnd,4)==IntPtr.Zero){found=hwnd;count++;}return true;},IntPtr.Zero);
     if(count!=1)throw new InvalidOperationException("Expected one owned ZenitWindow, found "+count);
     return found;
+  }
+  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hwnd);
+  [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hwnd);
+  // Status may inspect several owned app windows; input retains AppWindow's
+  // single-window guard. Prefer the real foreground app window, never guess.
+  public static IntPtr StatusWindow(int process) {
+    IntPtr foreground=GetForegroundWindow();
+    if(Owned(foreground,process)&&Class(foreground)=="ZenitWindow"&&GetWindow(foreground,4)==IntPtr.Zero)return foreground;
+    return AppWindow(process);
+  }
+  public static System.Collections.Hashtable[] WindowInventory(int process) {
+    var rows=new System.Collections.Generic.List<System.Collections.Hashtable>();
+    EnumWindows(delegate(IntPtr hwnd,IntPtr ignored){
+      if(Owned(hwnd,process)&&Class(hwnd)=="ZenitWindow"&&GetWindow(hwnd,4)==IntPtr.Zero)
+        rows.Add(new System.Collections.Hashtable{{"hwnd",hwnd.ToInt64()},{"visible",IsWindowVisible(hwnd)},{"minimized",IsIconic(hwnd)}});
+      return true;
+    },IntPtr.Zero);
+    return rows.ToArray();
   }
   public static string Title(IntPtr hwnd) { var s=new StringBuilder(512);GetWindowText(hwnd,s,s.Capacity);return s.ToString(); }
   public static string Class(IntPtr hwnd) { var s=new StringBuilder(128);GetClassName(hwnd,s,s.Capacity);return s.ToString(); }
@@ -393,23 +413,23 @@ public static class ZenitNativeInput {
 }
 '@
 }
-function Get-WindowsNativeStatus($proc) {
+function Get-WindowsNativeStatus($proc, [bool]$InspectionOnly = $false) {
   Initialize-WindowsNativeInput
   $proc.Refresh()
-  $hwnd=[ZenitNativeInput]::AppWindow($proc.Id)
+  $hwnd=if($InspectionOnly){[ZenitNativeInput]::StatusWindow($proc.Id)}else{[ZenitNativeInput]::AppWindow($proc.Id)}
   if ($proc.HasExited -or $hwnd -eq [IntPtr]::Zero) { throw 'Owned native window unavailable' }
   $open=[ZenitNativeInput]::Open($hwnd)
   $conversion=[ZenitNativeInput]::Conversion($hwnd)
   $foreground=[ZenitNativeInput]::GetForegroundWindow()
   $owned=[ZenitNativeInput]::Owned($foreground,$proc.Id)
-  return @{ok=$true; foreground_hwnd=$foreground.ToInt64(); foreground_owned=$owned; foreground_title=$(if($owned){[ZenitNativeInput]::Title($foreground)}else{''}); foreground_class=$(if($owned){[ZenitNativeInput]::Class($foreground)}else{''}); foreground_owner=$(if($owned){([ZenitNativeInput]::GetWindow($foreground,4)).ToInt64()}else{0}); pid=$proc.Id; hwnd=$hwnd.ToInt64(); foreground=($foreground -eq $hwnd); layout=[ZenitNativeInput]::Layout($hwnd); ime_open=$(if($open -ge 0){$open -eq 1}else{$null}); conversion=$(if($conversion -ge 0){$conversion}else{$null}); session=$proc.SessionId}
+  return @{ok=$true; visible=[ZenitNativeInput]::IsWindowVisible($hwnd); minimized=[ZenitNativeInput]::IsIconic($hwnd); windows=@([ZenitNativeInput]::WindowInventory($proc.Id)); foreground_hwnd=$foreground.ToInt64(); foreground_owned=$owned; foreground_title=$(if($owned){[ZenitNativeInput]::Title($foreground)}else{''}); foreground_class=$(if($owned){[ZenitNativeInput]::Class($foreground)}else{''}); foreground_owner=$(if($owned){([ZenitNativeInput]::GetWindow($foreground,4)).ToInt64()}else{0}); pid=$proc.Id; hwnd=$hwnd.ToInt64(); foreground=($foreground -eq $hwnd); layout=[ZenitNativeInput]::Layout($hwnd); ime_open=$(if($open -ge 0){$open -eq 1}else{$null}); conversion=$(if($conversion -ge 0){$conversion}else{$null}); session=$proc.SessionId}
 }
 function Invoke-WindowsNativeInput($proc, $body, $held) {
   Initialize-WindowsNativeInput
   if ($body.action -eq 'receiver-status') { return [ZenitNativeInput]::ReceiverStatus() }
   if ($body.action -eq 'receiver-stop') { [ZenitNativeInput]::ReceiverStop();return @{ok=$true} }
   if ($body.action -eq 'drag-cancel') { [ZenitNativeInput]::DragCancel();return @{ok=$true} }
-  $status=Get-WindowsNativeStatus $proc
+  $status=Get-WindowsNativeStatus $proc ($body.action -eq 'status')
   $hwnd=[IntPtr]::new([long]$status.hwnd)
   if ($body.action -eq 'uia-tree') { return Get-WindowsUiaTree $proc }
   if ($body.action -in @('uia-invoke','uia-toggle','uia-set-value','uia-set-range','uia-select','uia-expand','uia-text-action')) { return Invoke-WindowsUiaControl $proc $body }

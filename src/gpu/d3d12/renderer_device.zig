@@ -55,15 +55,24 @@ pub const Adapter = struct {
     pub fn isSoftware(self: *const Adapter) bool {
         return self.native_device.isSoftware();
     }
+    pub fn getFeatures(self: *const Adapter) gpu.Features {
+        return self.native_device.getFeatures();
+    }
+    pub fn driverInfo(self: *const Adapter) gpu.DriverInfo {
+        return self.native_device.driverInfo();
+    }
+    pub fn driverBugs(self: *const Adapter) gpu.DriverBugs {
+        return self.native_device.driverBugs();
+    }
     pub fn requestDevice(self: *Adapter, allocator: std.mem.Allocator, desc: gpu.DeviceDescriptor) !struct { device: Device, queue: Queue } {
-        // Optional renderer feature negotiation is not yet exposed by this facade.
-        if (@as(u64, @bitCast(desc.required_features)) != 0) return error.UnsupportedFeatures;
+        const features = self.getFeatures();
+        if ((@as(u64, @bitCast(desc.required_features)) & ~@as(u64, @bitCast(features))) != 0) return error.UnsupportedFeatures;
         const supported = gpu.Limits{};
         if (desc.required_limits) |required| inline for (@import("zenit_reflection").fields(gpu.Limits)) |field| {
             if (@field(required, field.name) > @field(supported, field.name)) return error.UnsupportedLimits;
         };
         const context = try resources.Context.init(allocator, &self.native_device);
-        return .{ .device = .{ .context = context, .features = .{}, .limits = supported }, .queue = Queue.init(context) };
+        return .{ .device = .{ .context = context, .features = features, .limits = supported }, .queue = Queue.init(context) };
     }
     pub fn deinit(self: *Adapter) void {
         self.native_device.destroy();
@@ -88,6 +97,12 @@ pub const Device = struct {
     }
     pub fn supportsVertexViewportIndex(self: *const Device) bool {
         return self.context.device.supportsVertexViewportIndex();
+    }
+    pub fn driverInfo(self: *const Device) gpu.DriverInfo {
+        return self.context.device.driverInfo();
+    }
+    pub fn driverBugs(self: *const Device) gpu.DriverBugs {
+        return self.context.device.driverBugs();
     }
     pub fn isSoftware(self: *const Device) bool {
         return self.context.device.isSoftware();

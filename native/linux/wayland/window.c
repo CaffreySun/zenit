@@ -514,6 +514,11 @@ int zenit_wayland_poll(ZenitWaylandWindow *w, int timeout_ms) {
     return w->closed ? 0 : 1;
 }
 
+void zenit_wayland_set_title(ZenitWaylandWindow *w, const char *title) {
+    if (!w || !title || !w->decor_frame || !w->decor_api.set_title) return;
+    w->decor_api.set_title(w->decor_frame, title);
+}
+
 void zenit_wayland_destroy(ZenitWaylandWindow *w) {
     if (!w) return;
     for (size_t i = 0; i < sizeof(live_windows) / sizeof(live_windows[0]); ++i)

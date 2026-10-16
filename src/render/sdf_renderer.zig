@@ -26,6 +26,7 @@ const Uniforms = extern struct {
     clip_polygon_points: [MAX_CLIP_POLYGON_POINTS][2]f32 = @as([MAX_CLIP_POLYGON_POINTS][2]f32, @splat(.{ 0, 0 })),
     /// Per-frame seed increment; supplies film_grain shader with per-frame noise variation.
     frame_seed: u32 = 0,
+    raster_clip_pos: u32 = 0,
 };
 
 /// SDF instance data, aligned with sdf_primitives.metal InstanceData (176 bytes).
@@ -758,14 +759,14 @@ pub const SdfRenderer = struct {
                 UNIFORM_STRIDE * 64,
             );
             while (new_capacity < needed) new_capacity *= 2;
-            if (self.uniform_overflow_buffers[self.current_buffer]) |*old| old.destroy();
-            self.uniform_overflow_buffers[self.current_buffer] = null;
-            self.uniform_overflow_capacities[self.current_buffer] = 0;
-            self.uniform_overflow_buffers[self.current_buffer] = try self.device.createBuffer(self.allocator, .{
+            // Preserve the owned buffer if replacement allocation fails.
+            const replacement = try self.device.createBuffer(self.allocator, .{
                 .label = "Zenit.SDF.OverflowUniforms",
                 .size = new_capacity,
                 .usage = .{ .vertex = true, .map_write = true },
             });
+            if (self.uniform_overflow_buffers[self.current_buffer]) |*old| old.destroy();
+            self.uniform_overflow_buffers[self.current_buffer] = replacement;
             self.uniform_overflow_capacities[self.current_buffer] = new_capacity;
         }
         return &self.uniform_overflow_buffers[self.current_buffer].?;
@@ -1367,8 +1368,8 @@ pub const SdfRenderer = struct {
             }
             self.uniform_overflow_count += 1;
             const slot = self.uniform_overflow_used;
-            self.uniform_overflow_used += 1;
             const buf = try self.ensureUniformOverflowCapacity(slot + 1);
+            self.uniform_overflow_used += 1;
             break :blk .{ buf, slot * UNIFORM_STRIDE };
         };
         // Only film-grain batches consume the frame seed in the shader.
@@ -1392,6 +1393,10 @@ pub const SdfRenderer = struct {
             .clip_polygon_end_points = self.clip_polygon_end_points,
             .clip_polygon_points = self.clip_polygon_points,
             .frame_seed = batch_seed,
+            .raster_clip_pos = if (comptime gpu.is_direct3d)
+                @intFromBool(render_pass.matchesViewport(.{ self.viewport_width, self.viewport_height }))
+            else
+                0,
         };
         const uniform_data = try uniform_buffer.getMappedRange(uniform_byte_offset, @sizeOf(Uniforms));
         @memcpy(uniform_data, std.mem.asBytes(&uniforms));
@@ -1545,12 +1550,14 @@ pub const SdfRenderer = struct {
                 if (self.overflow_capacities[self.current_buffer] < needed) {
                     var new_capacity = @max(self.overflow_capacities[self.current_buffer], instance_size);
                     while (new_capacity < needed) new_capacity *= 2;
-                    if (self.overflow_buffers[self.current_buffer]) |*old| old.destroy();
-                    self.overflow_buffers[self.current_buffer] = try self.device.createBuffer(self.allocator, .{
+                    // Preserve the owned buffer if replacement allocation fails.
+                    const replacement = try self.device.createBuffer(self.allocator, .{
                         .label = "Zenit.SDF.OverflowInstanceBuffer",
                         .size = new_capacity,
                         .usage = .{ .vertex = true, .map_write = true },
                     });
+                    if (self.overflow_buffers[self.current_buffer]) |*old| old.destroy();
+                    self.overflow_buffers[self.current_buffer] = replacement;
                     self.overflow_capacities[self.current_buffer] = new_capacity;
                 }
                 const overflow_buffer = &self.overflow_buffers[self.current_buffer].?;

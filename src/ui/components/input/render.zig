@@ -330,6 +330,12 @@ pub fn textInputClient(state: *TextInputState) core.TextInputClient {
         .text_len = liveTextLength,
         .copy_text = liveTextCopy,
         .selection = liveTextSelection,
+        .is_composing = struct {
+            fn read(context: *anyopaque) bool {
+                const input: *TextInputState = @ptrCast(@alignCast(context));
+                return input.imeIsComposing();
+            }
+        }.read,
         .set_selection = setA11ySelection,
         .frame_for_range = a11yTextFrame,
         .range_at_point = a11yRangeAtPoint,

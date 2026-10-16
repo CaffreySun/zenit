@@ -12,6 +12,7 @@ pub const Adapter = struct {
 
     pub fn requestDevice(self: *Adapter, allocator: std.mem.Allocator, desc: gpu.DeviceDescriptor) !struct { device: Device, queue: Queue } {
         _ = allocator;
+        if (desc.required_features.non_uniform_uav_buffer_array_atomics) return error.UnsupportedFeatures;
 
         // Create command queue
         const command_queue = mtl.metal_device_new_command_queue(self.device) orelse {

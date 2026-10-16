@@ -11,11 +11,12 @@ pub const GlyphBitmap = struct {
     /// true = pixels are BGRA premultiplied (4 bytes/pixel, color glyphs);
     /// false = single-channel coverage mask (1 byte/pixel).
     is_color: bool = false,
+    is_cleartype: bool = false,
 
     /// Bytes per pixel, determined solely by is_color. Used to calculate bytes_per_row when
     /// uploading texture.
     pub fn bytesPerPixel(self: GlyphBitmap) u32 {
-        return if (self.is_color) 4 else 1;
+        return if (self.is_color or self.is_cleartype) 4 else 1;
     }
 
     pub fn deinit(self: GlyphBitmap, allocator: std.mem.Allocator) void {

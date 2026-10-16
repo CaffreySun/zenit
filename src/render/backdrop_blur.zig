@@ -477,17 +477,15 @@ fn debugGlassBlit(
             .label = "Zenit.GlassDebugStaging",
             .size = .{ .width = 64, .height = 64 },
             .format = gpu.color_format,
-            .usage = .{ .copy_dst = true, .copy_src = true },
+            .usage = .{ .copy_dst = true, .copy_src = true, .render_attachment = gpu.backend_kind == .metal },
             .memory = .host_upload,
         }) catch null;
     }
     if (slot.staging) |*staging| {
-        var blit = (encoder.gpu_command_encoder.?.beginBlitPass() catch null) orelse return;
         const copied = blk: {
-            blit.copyTextureRegion(src, src_x, src_y, dw, dh, staging.binding(), 0, 0) catch break :blk false;
+            encoder.copyTextureRegion(src, src_x, src_y, dw, dh, staging.binding(), 0, 0, false) catch break :blk false;
             break :blk true;
         };
-        blit.end();
         if (copied) {
             slot.cur_pending = true;
             slot.cur_w = dw;
@@ -526,7 +524,10 @@ fn restoreRenderTargetPass(
     encoder.text_renderer.setViewport(encoder.viewport_width, encoder.viewport_height, scale);
     image_renderer.setViewport(encoder.viewport_width, encoder.viewport_height, scale);
     if (encoder.icon_renderer) |icon_renderer| icon_renderer.setViewport(encoder.viewport_width, encoder.viewport_height, scale);
-    if (encoder.persistent.path_renderer) |*pr| pr.setViewport(encoder.viewport_width, encoder.viewport_height, scale);
+    if (encoder.persistent.path_renderer) |*pr| {
+        pr.setViewport(encoder.viewport_width, encoder.viewport_height, scale);
+        if (encoder.offscreen_depth > 0) pr.setOffscreenViewport();
+    }
     encoder.applyOffscreenTargetViewport();
     encoder.syncRectClipState();
     encoder.syncRendererClipMask();
@@ -1006,6 +1007,151 @@ test "native grid sigma: compact fine needs no Gaussian, main retains measured w
     try std.testing.expectApproxEqAbs(x * 1283 / 320, y * 963 / 240, 0.00001);
 }
 
+/// Conservative legacy rounded-rect support in target pixels. The viewport/UV
+/// mapping stays unchanged. Outside this box the shader's first mask discards.
+pub fn legacyGlassScissor(width: u32, height: u32, u: *const GlassUniforms) ?[4]u32 {
+    // Keep numerically unusual inputs, groups and native silhouettes on the old
+    // full pass. These limits also keep f32 mapping error well below the 2px guard.
+    if (width == 0 or height == 0 or width > 65536 or height > 65536 or
+        u.group_params[0] != 0 or !std.math.isFinite(u.surface_params[0]) or
+        !std.math.isFinite(u.native_params[0]) or !std.math.isFinite(u.corner_radius) or
+        !std.math.isFinite(u.scale_factor) or u.scale_factor <= 0) return null;
+    if (@round(u.surface_params[0]) == 5 and u.native_params[0] > 0) return null;
+    const scale = @max(u.scale_factor, 0.1);
+    const dimensions = [2]u32{ width, height };
+    var slope: [2]f64 = undefined;
+    for (0..2) |axis| {
+        const extent = u.content_uv[axis + 2];
+        if (!std.math.isFinite(u.content_uv[axis]) or @abs(u.content_uv[axis]) > 2 or
+            !std.math.isFinite(extent) or extent < 1e-4 or extent > 2 or
+            !std.math.isFinite(u.rect_size[axis]) or u.rect_size[axis] <= 0) return null;
+        // Match the shader's f32 multiply and max before widening the bounds.
+        const rect_px = @max(u.rect_size[axis] * scale, 2.0);
+        if (!std.math.isFinite(rect_px) or rect_px > 65536) return null;
+        slope[axis] = @as(f64, rect_px) / (@as(f64, extent) * @as(f64, @floatFromInt(dimensions[axis])));
+        if (slope[axis] < 1.0 / 64.0 or slope[axis] > 64) return null;
+    }
+    const ratio = slope[0] / slope[1];
+    if (ratio < 1.0 / 256.0 or ratio > 256) return null;
+    // sdf_rr is 1-Lipschitz: |ddx(d)| <= sx, |ddy(d)| <= sy, hence
+    // aa <= max((sx+sy)/2, .5). Use twice that bound plus two target
+    // pixels per axis for floating-point/rounding slack and derivative helpers.
+    const aa = @max(slope[0] + slope[1], 1.0);
+    var lo: [2]u32 = undefined;
+    var hi: [2]u32 = undefined;
+    for (0..2) |axis| {
+        const limit: f64 = @floatFromInt(dimensions[axis]);
+        const offset: f64 = u.content_uv[axis];
+        const extent: f64 = u.content_uv[axis + 2];
+        const margin = aa / slope[axis] + 2;
+        // content_uv stores offset + extent, never left/right endpoints.
+        // Outward 4px alignment preserves whole derivative quads; at attachment
+        // edges the original full pass has exactly the same clipped helpers.
+        const lower = std.math.clamp(@floor((offset * limit - margin) / 4) * 4, 0, limit);
+        const upper = std.math.clamp(@ceil(((offset + extent) * limit + margin) / 4) * 4, 0, limit);
+        lo[axis] = @intFromFloat(lower);
+        hi[axis] = @intFromFloat(upper);
+        if (hi[axis] <= lo[axis]) return null;
+    }
+    if (lo[0] == 0 and lo[1] == 0 and hi[0] == width and hi[1] == height) return null;
+    return .{ lo[0], lo[1], hi[0] - lo[0], hi[1] - lo[1] };
+}
+
+fn legacyScissorTestUniforms() GlassUniforms {
+    return .{ .texel_size = .{ 1.0 / 128.0, 1.0 / 128.0 }, .corner_radius = 8, .glass_intensity = 1, .rect_size = .{ 64, 64 }, .scale_factor = 1, .glass_tint = .{ 1, 1, 1, 0 }, .content_uv = .{ 0.25, 0.25, 0.5, 0.5 } };
+}
+
+test "legacy glass scissor: extent, outward alignment and anisotropic AA bounds" {
+    var u = legacyScissorTestUniforms();
+    try std.testing.expectEqual([4]u32{ 28, 28, 72, 72 }, legacyGlassScissor(128, 128, &u).?);
+    u.rect_size[1] = 16;
+    // sx=1, sy=.25: y needs a larger support than the isotropic case.
+    try std.testing.expectEqual([4]u32{ 28, 24, 72, 80 }, legacyGlassScissor(128, 128, &u).?);
+    u.content_uv = .{ -0.125, 0.25, 0.5, 0.5 };
+    const sc = legacyGlassScissor(131, 127, &u).?;
+    try std.testing.expectEqual(@as(u32, 0), sc[0]);
+    try std.testing.expect(sc[0] + sc[2] >= 50); // right=(offset+extent)*131, not extent*131
+    try std.testing.expect(sc[0] + sc[2] <= 131 and sc[1] + sc[3] <= 127);
+    try std.testing.expect(sc[1] % 4 == 0 and (sc[1] + sc[3]) % 4 == 0);
+}
+
+test "legacy glass scissor: native, groups, empty/full and unstable mappings retain full pass" {
+    var u = legacyScissorTestUniforms();
+    u.surface_params[0] = 5;
+    u.native_params[0] = 1;
+    try std.testing.expect(legacyGlassScissor(128, 128, &u) == null);
+    u.native_params[0] = 0;
+    try std.testing.expect(legacyGlassScissor(128, 128, &u) != null); // surface 5 can still be legacy
+    u.group_params[0] = 1;
+    try std.testing.expect(legacyGlassScissor(128, 128, &u) == null);
+    u = legacyScissorTestUniforms();
+    u.content_uv = .{ 0, 0, 1, 1 };
+    try std.testing.expect(legacyGlassScissor(128, 128, &u) == null);
+    u.content_uv = .{ 2, 2, 0.5, 0.5 };
+    try std.testing.expect(legacyGlassScissor(128, 128, &u) == null);
+    u = legacyScissorTestUniforms();
+    u.rect_size[0] = 0.001;
+    u.rect_size[1] = 4096;
+    try std.testing.expect(legacyGlassScissor(128, 128, &u) == null); // extreme axis ratio
+    for ([_]f32{ 0, -1, std.math.nan(f32), std.math.inf(f32), 1e-8 }) |extent| {
+        u = legacyScissorTestUniforms();
+        u.content_uv[2] = extent;
+        try std.testing.expect(legacyGlassScissor(128, 128, &u) == null);
+    }
+    u = legacyScissorTestUniforms();
+    try std.testing.expect(legacyGlassScissor(0, 128, &u) == null);
+    try std.testing.expect(legacyGlassScissor(std.math.maxInt(u32), 128, &u) == null);
+    u.content_uv[0] = std.math.nan(f32);
+    try std.testing.expect(legacyGlassScissor(128, 128, &u) == null);
+}
+
+test "legacy glass scissor: every excluded pixel lies beyond the rounded-rect AA support" {
+    // Independent SDF/finite-difference oracle, including clipping, small physical
+    // rectangles, odd target extents and opposing anisotropy. The helper itself
+    // never evaluates the SDF or per-pixel derivatives.
+    const cases = [_]struct { rect: [2]f32, uv: [4]f32, radius: f32 }{
+        .{ .rect = .{ 64, 64 }, .uv = .{ 0.25, 0.25, 0.5, 0.5 }, .radius = 16 },
+        .{ .rect = .{ 96, 4 }, .uv = .{ 0.125, 0.375, 0.75, 0.125 }, .radius = 2 },
+        .{ .rect = .{ 4, 96 }, .uv = .{ 0.375, 0.125, 0.125, 0.75 }, .radius = 2 },
+        .{ .rect = .{ 32, 48 }, .uv = .{ -0.125, 0.25, 0.5, 0.5 }, .radius = 12 },
+        .{ .rect = .{ 0.5, 0.75 }, .uv = .{ 0.375, 0.375, 0.125, 0.125 }, .radius = 8 },
+    };
+    const Oracle = struct {
+        fn distance(x: u32, y: u32, u: *const GlassUniforms) f32 {
+            const s = @max(u.scale_factor, 0.1);
+            const rx = @max(u.rect_size[0] * s, 2.0);
+            const ry = @max(u.rect_size[1] * s, 2.0);
+            const r = std.math.clamp(u.corner_radius * s, 0, @max(@min(rx, ry) * 0.5, 1));
+            const px = ((@as(f32, @floatFromInt(x)) + 0.5) / 131 - u.content_uv[0]) / u.content_uv[2] * rx - 0.5 * rx;
+            const py = ((@as(f32, @floatFromInt(y)) + 0.5) / 127 - u.content_uv[1]) / u.content_uv[3] * ry - 0.5 * ry;
+            const qx = @abs(px) - rx * 0.5 + r;
+            const qy = @abs(py) - ry * 0.5 + r;
+            return @min(@max(qx, qy), 0) + @sqrt(@max(qx, 0) * @max(qx, 0) + @max(qy, 0) * @max(qy, 0)) - r;
+        }
+    };
+    for (cases) |c| {
+        var u = legacyScissorTestUniforms();
+        u.rect_size = c.rect;
+        u.content_uv = c.uv;
+        u.corner_radius = c.radius;
+        const sc = legacyGlassScissor(131, 127, &u) orelse return error.ExpectedReducedScissor;
+        var excluded: u32 = 0;
+        for (0..127) |y| for (0..131) |x| {
+            if (x >= sc[0] and x < sc[0] + sc[2] and y >= sc[1] and y < sc[1] + sc[3]) continue;
+            const qx: u32 = @intCast(x & ~@as(usize, 1));
+            const qy: u32 = @intCast(y & ~@as(usize, 1));
+            const d00 = Oracle.distance(qx, qy, &u);
+            const d10 = Oracle.distance(qx + 1, qy, &u);
+            const d01 = Oracle.distance(qx, qy + 1, &u);
+            const d11 = Oracle.distance(qx + 1, qy + 1, &u);
+            const aa = @max((@max(@abs(d10 - d00), @abs(d11 - d01)) + @max(@abs(d01 - d00), @abs(d11 - d10))) * 0.5, 0.5);
+            try std.testing.expect(Oracle.distance(@intCast(x), @intCast(y), &u) > aa);
+            excluded += 1;
+        };
+        try std.testing.expect(excluded > 0);
+    }
+}
+
 /// Glass composite pass: overlay refraction + Fresnel highlight on blur texture.
 /// Input src (blur result), output dst (glass composite result)
 pub fn executeGlassComposite(
@@ -1150,6 +1296,9 @@ pub fn executeGlassComposite(
     mutable_pass.setFragmentTextureBinding(4, alternate_main_texture);
     mutable_pass.setFragmentSampler(0, &sampler_state);
     mutable_pass.setViewport(0, 0, @floatFromInt(tex_w), @floatFromInt(tex_h), 0, 1);
+    if (comptime gpu.backend_kind == .metal) {
+        if (legacyGlassScissor(tex_w, tex_h, &uniforms)) |sc| mutable_pass.setScissorRect(sc[0], sc[1], sc[2], sc[3]);
+    }
     mutable_pass.draw(3, 1, 0, 0);
     mutable_pass.end();
     return true;
@@ -1856,32 +2005,12 @@ fn tryBackdropBlur(encoder: anytype, p: BackdropBlurParams) !bool {
         return false;
     };
 
-    // ---- 2. Blit region copy ----
-    {
-        if (!capture_region.coversFullTexture() and !encoder.clearTextureToTransparent(level0_binding)) {
-            _ = encoder.offscreen_pool.releaseForReuseInFrame(level0);
-            return false;
-        }
-        var blit = encoder.gpu_command_encoder.?.beginBlitPass() catch {
-            _ = encoder.offscreen_pool.releaseForReuseInFrame(level0);
-            return false;
-        };
-        blit.copyTextureRegion(
-            current_rt,
-            capture_region.src_x,
-            capture_region.src_y,
-            capture_region.copy_w,
-            capture_region.copy_h,
-            level0_binding,
-            capture_region.dst_x,
-            capture_region.dst_y,
-        ) catch {
-            blit.end();
-            _ = encoder.offscreen_pool.releaseForReuseInFrame(level0);
-            return false;
-        };
-        blit.end();
-    }
+    // ---- 2. Pixel-region capture (render-only on Metal) ----
+    // One clear+copy pass also clears uncaptured padding for edge glass.
+    encoder.copyTextureRegion(current_rt, capture_region.src_x, capture_region.src_y, capture_region.copy_w, capture_region.copy_h, level0_binding, capture_region.dst_x, capture_region.dst_y, !capture_region.coversFullTexture()) catch {
+        _ = encoder.offscreen_pool.releaseForReuseInFrame(level0);
+        return false;
+    };
     // Debug: capture content center region -> debug slot 0
     debugGlassBlit(
         encoder,
@@ -2118,19 +2247,15 @@ fn tryBackdropBlur(encoder: anytype, p: BackdropBlurParams) !bool {
                 }
                 break :lum;
             }
-            if (encoder.gpu_command_encoder.?.beginBlitPass() catch null) |blit_value| {
-                var blit = blit_value;
-                const copied = blk: {
-                    blit.copyTextureRegion(deep_binding, 0, 0, dw, dh, staging.binding(), 0, 0) catch break :blk false;
-                    break :blk true;
-                };
-                blit.end();
-                if (copied) {
-                    slot.cur_pending = true;
-                    slot.cur_w = dw;
-                    slot.cur_h = dh;
-                    slot.last_used_frame = encoder.frame_index;
-                }
+            const copied = blk: {
+                encoder.copyTextureRegion(deep_binding, 0, 0, dw, dh, staging.binding(), 0, 0, false) catch break :blk false;
+                break :blk true;
+            };
+            if (copied) {
+                slot.cur_pending = true;
+                slot.cur_w = dw;
+                slot.cur_h = dh;
+                slot.last_used_frame = encoder.frame_index;
             }
         }
     }
@@ -2142,25 +2267,24 @@ fn tryBackdropBlur(encoder: anytype, p: BackdropBlurParams) !bool {
     // Softly filtered detail for native regular material:
     // half-resolution downsample (sigma ~= 2-3 physical px at 2x; native grid-line dips 9px wide 6
     // deep) copied before upsample overwrites.
-    // One small blit, no extra passes. Unavailable (no chain / pool pressure) -> composite gets
-    // level0.
+    // With one level there is no upsample overwrite: the blur input itself
+    // already holds the soft pixels. Borrow its binding at composite time,
+    // rather than allocating and copying an identical texture. Native Gaussian
+    // success replaces that input and supplies its own fine bank instead.
+    // Unavailable (no chain / pool pressure) -> composite gets level0.
     var soft_tex: ?TextureLease = null;
-    if (actual_levels >= 1 and p.native_params[0] > 0) soft: {
+    const single_level_soft = actual_levels == 1 and p.native_params[0] > 0;
+    if (actual_levels > 1 and p.native_params[0] > 0) soft: {
         const src_binding = encoder.offscreen_pool.binding(tex_chain[1]) orelse break :soft;
         const tex = encoder.offscreen_pool.acquire(device, w_chain[1], h_chain[1], encoder.frame_index) orelse break :soft;
         const dst_binding = encoder.offscreen_pool.binding(tex) orelse {
             _ = encoder.offscreen_pool.releaseForReuseInFrame(tex);
             break :soft;
         };
-        var blit = encoder.gpu_command_encoder.?.beginBlitPass() catch {
-            _ = encoder.offscreen_pool.releaseForReuseInFrame(tex);
-            break :soft;
-        };
         const copied = blk: {
-            blit.copyTextureRegion(src_binding, 0, 0, w_chain[1], h_chain[1], dst_binding, 0, 0) catch break :blk false;
+            encoder.copyTextureRegion(src_binding, 0, 0, w_chain[1], h_chain[1], dst_binding, 0, 0, false) catch break :blk false;
             break :blk true;
         };
-        blit.end();
         if (!copied) {
             _ = encoder.offscreen_pool.releaseForReuseInFrame(tex);
             break :soft;
@@ -2191,6 +2315,12 @@ fn tryBackdropBlur(encoder: anytype, p: BackdropBlurParams) !bool {
             upsample_ran += 1;
         }
     }
+    // Luminance and upsampling have encoded their last reads of the deeper
+    // levels. Make these leases reusable before allocating the native banks;
+    // later commands in this buffer may reuse them after those reads finish.
+    if (actual_levels > 1) for (2..actual_levels + 1) |i| {
+        _ = encoder.offscreen_pool.releaseForReuseInFrame(tex_chain[i]);
+    };
     if (@import("zenit_environment").has("ZENIT_DEBUG_GLASS")) {
         std.debug.print("[glassup] frame={d} owner={d} up={d}/{d}\n", .{ encoder.frame_index, p.glass_owner_id, upsample_ran, if (actual_levels > 0) actual_levels - 1 else 0 });
     }
@@ -2320,12 +2450,6 @@ fn tryBackdropBlur(encoder: anytype, p: BackdropBlurParams) !bool {
         }
     }
 
-    // tex_chain[1] is composite blur input, survives to composite/flush before release; deeper
-    // intermediate levels finished being used, return to pool first.
-    for (2..actual_levels + 1) |i| {
-        _ = encoder.offscreen_pool.releaseForReuseInFrame(tex_chain[i]);
-    }
-
     // ---- 6. Glass composite ----
     // Fallback (no glass pipeline / glass_tex fetch failed): composite back to RT must be blur
     // result blur_tex (half-res stretched draw).
@@ -2360,7 +2484,12 @@ fn tryBackdropBlur(encoder: anytype, p: BackdropBlurParams) !bool {
                     std.debug.print("[glass-fallback] glass_binding missing owner={d}\n", .{p.glass_owner_id});
                 break :glass;
             };
-            const soft_binding: gpu.Backend.TextureBinding = if (soft_tex) |st| (encoder.offscreen_pool.binding(st) orelse level0_binding) else level0_binding;
+            const soft_binding: gpu.Backend.TextureBinding = if (soft_tex) |st|
+                (encoder.offscreen_pool.binding(st) orelse level0_binding)
+            else if (single_level_soft and blur_tex.eql(tex_chain[1]))
+                blur_binding
+            else
+                level0_binding;
             const coarse_binding = if (coarse_tex) |ct| (encoder.offscreen_pool.binding(ct) orelse level0_binding) else level0_binding;
             const ran = try executeGlassComposite(
                 encoder,

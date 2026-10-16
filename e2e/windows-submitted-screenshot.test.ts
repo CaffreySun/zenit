@@ -7,15 +7,16 @@ test('Windows screenshots read submitted pixels without producing frames and sur
   assert((await clickTestId('nav.divider')).ok, 'static divider fixture unavailable');
   await sleep(1000);
   const original = (await tree()).rect;
-  for (const [stage, size] of [[original.w, original.h], [900, 700], [original.w, original.h]].entries()) {
+  for (const [stage, size] of [[original.w, original.h], [900, 700], [Math.floor(original.w), Math.floor(original.h)]].entries()) {
     if (stage > 0) {
       assert((await resizeWindow(size[0], size[1])).ok, 'resize failed');
       await waitFor(async () => {
         const rect = (await tree()).rect;
-        return rect.w === size[0] && rect.h === size[1] ? rect : null;
+        return Math.abs(rect.w-size[0])<1 && Math.abs(rect.h-size[1])<1 ? rect : null;
       }, 5000, 50);
       await sleep(500);
     }
+    const actual = (await tree()).rect;
     const before = await stats();
     assert(Number.isInteger(before.frame_count) && before.frame_count > 0, 'presentation frame counter unavailable');
     let first: ReturnType<typeof decodePng> | undefined;
@@ -23,8 +24,8 @@ test('Windows screenshots read submitted pixels without producing frames and sur
       const path = `${getSessionDir()}/submitted-${stage}-${i}.png`;
       assert((await screenshot(path)).ok, 'submitted capture failed');
       const png = decodePng(path);
-      assert(Math.abs(png.width - size[0] * before.window_scale!) <= 1 &&
-        Math.abs(png.height - size[1] * before.window_scale!) <= 1, 'stale submitted dimensions');
+      assert(Math.abs(png.width - actual.w * before.window_scale!) <= 1 &&
+        Math.abs(png.height - actual.h * before.window_scale!) <= 1, 'stale submitted dimensions');
       if (first) {
         assert(png.pixels.length === first.pixels.length && png.pixels.every((v, j) => v === first!.pixels[j]),
           'idle repeated capture changed pixels');

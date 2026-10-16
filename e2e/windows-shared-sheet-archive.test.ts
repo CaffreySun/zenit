@@ -1,6 +1,6 @@
 // Real-time driver: captures every submitted frame through the VM archive.
 // No fixed frame clock and no intermediate-state claim from delayed HTTP queries.
-import { clickAt, clickTestId, mouseMove, query, waitFor, waitForServerReady, runsOnWindowsWorker } from './client';
+import { clickAt, clickTestId, mouseMove, query, tree, waitFor, waitForServerReady, runsOnWindowsWorker } from './client';
 import { assert, run, test } from './runner';
 
 test('Windows shared Sheet drives three real-time open and close cycles', async () => {
@@ -15,7 +15,9 @@ test('Windows shared Sheet drives three real-time open and close cycles', async 
       const panel = (await query('story.sheet.panel'))[0];
       return panel && panel.effective_opacity >= .999 ? panel : null;
     }, 15000, 50);
-    assert((await clickAt(80, 500)).ok, 'Sheet backdrop click failed');
+    const viewport = (await tree()).rect;
+    const panel = (await query('story.sheet.panel'))[0].rect;
+    assert((await clickAt(panel.x/2, viewport.h/2)).ok, 'Sheet backdrop click failed');
     await mouseMove(10, 10);
     await waitFor(async () => {
       const panel = (await query('story.sheet.panel'))[0];

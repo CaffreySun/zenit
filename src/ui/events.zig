@@ -11,7 +11,91 @@ const std = @import("std");
 
 /// Platform's standard application shortcut modifier.
 pub fn primaryModifier(modifiers: Modifiers) bool {
-    return if (@import("builtin").target.os.tag == .macos) modifiers.super else modifiers.ctrl;
+    return primaryModifierOn(ShortcutPlatform.native, modifiers);
+}
+
+/// Keyboard-shortcut convention family. Bindings are written once in terms of
+/// the platform command key (`Chord.primary`) and resolved per family, so tests
+/// can check every family's table on any host.
+pub const ShortcutPlatform = enum {
+    /// macOS: ⌘ is the command key; ⌃ is a separate text-navigation modifier.
+    mac,
+    /// Windows / Linux: Ctrl is the command key; the Windows/Super key belongs
+    /// to the desktop shell and never takes part in application shortcuts.
+    pc,
+
+    pub const native: ShortcutPlatform = if (@import("builtin").target.os.tag == .macos) .mac else .pc;
+};
+
+pub fn primaryModifierOn(platform: ShortcutPlatform, modifiers: Modifiers) bool {
+    return switch (platform) {
+        .mac => modifiers.super,
+        .pc => modifiers.ctrl,
+    };
+}
+
+/// A platform-neutral modifier combination for application shortcuts.
+pub const Chord = struct {
+    /// ⌘ on macOS, Ctrl on Windows/Linux.
+    primary: bool = false,
+    shift: bool = false,
+    alt: bool = false,
+    /// macOS ⌃, a modifier distinct from the command key. On Windows/Linux
+    /// Ctrl *is* the command key, so a chord that needs `mac_ctrl` never
+    /// matches there.
+    mac_ctrl: bool = false,
+
+    /// The chord the user pressed, or null when the modifiers have no meaning
+    /// for application shortcuts on that platform (Super on Windows/Linux).
+    pub fn of(modifiers: Modifiers, platform: ShortcutPlatform) ?Chord {
+        return switch (platform) {
+            .mac => .{ .primary = modifiers.super, .shift = modifiers.shift, .alt = modifiers.alt, .mac_ctrl = modifiers.ctrl },
+            .pc => if (modifiers.super) null else .{ .primary = modifiers.ctrl, .shift = modifiers.shift, .alt = modifiers.alt },
+        };
+    }
+
+    pub fn matches(self: Chord, modifiers: Modifiers, platform: ShortcutPlatform) bool {
+        const actual = of(modifiers, platform) orelse return false;
+        return std.meta.eql(self, actual);
+    }
+
+    /// Exact match against the host platform's conventions.
+    pub fn pressed(self: Chord, modifiers: Modifiers) bool {
+        return self.matches(modifiers, ShortcutPlatform.native);
+    }
+
+    /// The raw modifiers that produce this chord (null: unreachable there).
+    pub fn modifiersOn(self: Chord, platform: ShortcutPlatform) ?Modifiers {
+        return switch (platform) {
+            .mac => .{ .super = self.primary, .shift = self.shift, .alt = self.alt, .ctrl = self.mac_ctrl },
+            .pc => if (self.mac_ctrl) null else .{ .ctrl = self.primary, .shift = self.shift, .alt = self.alt },
+        };
+    }
+
+    /// ⌥⌘ on macOS. Windows reads Ctrl+Alt as AltGr, which types characters on
+    /// most European layouts, so the same command is Ctrl+Shift there.
+    pub fn primaryAlt(platform: ShortcutPlatform) Chord {
+        return switch (platform) {
+            .mac => .{ .primary = true, .alt = true },
+            .pc => .{ .primary = true, .shift = true },
+        };
+    }
+};
+
+test "Chord: primary is Cmd on mac and Ctrl on Windows/Linux" {
+    const undo = Chord{ .primary = true };
+    try std.testing.expect(undo.matches(.{ .super = true }, .mac));
+    try std.testing.expect(!undo.matches(.{ .ctrl = true }, .mac));
+    try std.testing.expect(undo.matches(.{ .ctrl = true }, .pc));
+    try std.testing.expect(!undo.matches(.{ .super = true }, .pc));
+    // Super never takes part in shortcuts on Windows/Linux.
+    try std.testing.expect(Chord.of(.{ .ctrl = true, .super = true }, .pc) == null);
+    // A macOS-only ⌃ chord is unreachable elsewhere.
+    const emacs = Chord{ .mac_ctrl = true };
+    try std.testing.expect(emacs.matches(.{ .ctrl = true }, .mac));
+    try std.testing.expect(!emacs.matches(.{ .ctrl = true }, .pc));
+    try std.testing.expect(emacs.modifiersOn(.pc) == null);
+    try std.testing.expectEqual(Modifiers{ .ctrl = true, .shift = true }, (Chord{ .primary = true, .shift = true }).modifiersOn(.pc).?);
 }
 
 /// Multi-click detection window and pixel tolerance. 300ms / 5px is tight in desktop editors,
@@ -139,6 +223,8 @@ pub const KeyCode = enum(u16) {
     end = 119,
     page_up = 116,
     page_down = 121,
+    /// Insert (PC keyboards; the Help key on Apple keyboards).
+    insert = 114,
 
     // Function keys F1-F12 (macOS keycode)
     f1 = 122,
@@ -246,6 +332,7 @@ pub const KeyCode = enum(u16) {
             107 => .end,
             108 => .down,
             109 => .page_down,
+            110 => .insert,
             111 => .forward_delete,
             125 => .left_super,
             126 => .right_super,
@@ -296,6 +383,7 @@ pub const KeyCode = enum(u16) {
             0x20 => .space,
             0x08 => .delete,
             0x1B => .escape,
+            0x2D => .insert,
             0x2E => .forward_delete,
             0x25 => .left,
             0x27 => .right,
@@ -565,6 +653,8 @@ test "KeyCode: Win32 virtual keys" {
     try std.testing.expectEqual(KeyCode.v, KeyCode.fromWindowsVirtualKey(0x56));
     try std.testing.expectEqual(KeyCode.escape, KeyCode.fromWindowsVirtualKey(0x1B));
     try std.testing.expectEqual(KeyCode.left, KeyCode.fromWindowsVirtualKey(0x25));
+    try std.testing.expectEqual(KeyCode.insert, KeyCode.fromWindowsVirtualKey(0x2D));
+    try std.testing.expectEqual(KeyCode.insert, KeyCode.fromLinuxEvdev(110));
     try std.testing.expectEqual(KeyCode.unknown, KeyCode.fromWindowsVirtualKey(0xFF));
 }
 

@@ -1,3 +1,4 @@
+extern int metal_command_buffer_copy_texture_region_render(void *, void *, unsigned int, unsigned int, unsigned int, unsigned int, void *, unsigned int, unsigned int, int);
 #import <AVFoundation/AVFoundation.h>
 #import <CoreMedia/CoreMedia.h>
 #import <CoreVideo/CoreVideo.h>
@@ -171,7 +172,7 @@ static BOOL zenitWaitForSemaphore(dispatch_semaphore_t semaphore, NSTimeInterval
         kCFAllocatorDefault,
         _textureCache,
         pixelBuffer,
-        NULL,
+        (__bridge CFDictionaryRef)@{(__bridge NSString *)kCVMetalTextureUsage: @(MTLTextureUsageRenderTarget)},
         source.pixelFormat,
         self.width,
         self.height,
@@ -188,17 +189,13 @@ static BOOL zenitWaitForSemaphore(dispatch_semaphore_t semaphore, NSTimeInterval
 
     id<MTLTexture> destination = CVMetalTextureGetTexture(cvTexture);
     id<MTLCommandBuffer> commandBuffer = [self.blitQueue commandBuffer];
-    id<MTLBlitCommandEncoder> blit = [commandBuffer blitCommandEncoder];
-    [blit copyFromTexture:source
-              sourceSlice:0
-              sourceLevel:0
-             sourceOrigin:MTLOriginMake(0, 0, 0)
-               sourceSize:MTLSizeMake(self.width, self.height, 1)
-                toTexture:destination
-         destinationSlice:0
-         destinationLevel:0
-        destinationOrigin:MTLOriginMake(0, 0, 0)];
-    [blit endEncoding];
+    if (!metal_command_buffer_copy_texture_region_render((__bridge void *)commandBuffer, (__bridge void *)source,
+        0,0,(unsigned int)self.width,(unsigned int)self.height,(__bridge void *)destination,0,0,0)) {
+        CFRelease(cvTexture);CVPixelBufferRelease(pixelBuffer);
+        self.failure=[NSError errorWithDomain:@"com.zenit.harness.recording" code:14
+            userInfo:@{NSLocalizedDescriptionKey:@"unable to render-copy the recording frame"}];
+        return NO;
+    }
     [commandBuffer commit];
     [commandBuffer waitUntilCompleted];
     if (commandBuffer.status == MTLCommandBufferStatusError) {

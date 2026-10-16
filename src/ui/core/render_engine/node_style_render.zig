@@ -260,7 +260,7 @@ pub fn appendNodeShadowAndBackgroundBorrowed(
         });
     } else if (effective_bg) |bg| {
         // path_geometry node rendered with fill_path command, skip background rect
-        if (node.getLayoutOutput().vector.fill.path == null) {
+        if (if (node.layoutOutput()) |lo| lo.vector.fill.path == null else true) {
             try cx.display_list.append(.{
                 .fill_rect = .{
                     .header = header,

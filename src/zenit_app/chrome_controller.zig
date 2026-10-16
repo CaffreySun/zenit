@@ -23,15 +23,35 @@ pub fn windowCapabilities(self: anytype) chrome.Capabilities {
     return chromeState(self).capabilities;
 }
 pub fn syncChrome(self: anytype) void {
-    if (self.cx.window_header_node) |header| native.headerBackground(&self.win, header.getBackground());
+    syncChromeWithBackend(self, native);
+}
+
+/// Internal backend seam for exercising chrome sync without a native window.
+pub fn syncChromeWithBackend(self: anytype, comptime backend: type) void {
+    if (self.cx.window_header_node) |header| backend.headerBackground(&self.win, header.getBackground());
     var header_lock = self.cx.window_header_reveal_leases > 0 or self.cx.windowHeaderOwns(self.cx.focused_node) or self.cx.windowHeaderOwns(self.cx.pressed_node);
+    var header_overlay_open = false;
     for (self.cx.overlay_stack.layers) |slot| {
         if (slot) |layer| {
-            if (!layer.suspended and self.cx.windowHeaderOwns(layer.trigger_node)) header_lock = true;
+            if (!layer.suspended and self.cx.windowHeaderOwns(layer.trigger_node)) {
+                header_lock = true;
+                if (layer.state != .exiting) header_overlay_open = true;
+            }
         }
     }
-    self.cx.window_header_offset = native.headerLayout(&self.win, header_lock);
-    const state = chromeState(self);
+    // AppKit moves the titlebar accessory over the body when the menu bar
+    // drops. Keep content layout fixed. An open header overlay needs a frame
+    // to reposition its anchor when the offset changes, even with no input;
+    // without one, native reveal/retraction needs no extra UI frame.
+    const offset = backend.headerLayout(&self.win, header_lock);
+    // Native prewarm/first-paint requests survive renderer idle gating. Ordinary
+    // menu reveal still adds no frame when there is no header overlay.
+    if (comptime @hasDecl(backend, "takeHeaderFrameRequest")) {
+        if (backend.takeHeaderFrameRequest(&self.win)) self.cx.needs_redraw = true;
+    }
+    if (header_overlay_open and !std.meta.eql(self.cx.window_header_offset, offset)) self.cx.needs_redraw = true;
+    self.cx.window_header_offset = offset;
+    const state = backend.state(&self.win, self.chrome.initial);
     if (self.chrome.pending_maximized) |desired| {
         if (state.maximized == desired or state.state_generation != self.chrome.pending_maximized_generation) self.chrome.pending_maximized = null;
     }
@@ -45,7 +65,7 @@ pub fn syncChrome(self: anytype) void {
     if (self.chrome.inflight_fullscreen == null) {
         if (self.chrome.desired_fullscreen) |desired| {
             if (state.fullscreen != desired) {
-                if (native.perform(&self.win, .{ .fullscreen = desired })) |_| {
+                if (backend.perform(&self.win, .{ .fullscreen = desired })) |_| {
                     self.chrome.inflight_fullscreen = desired;
                     self.chrome.inflight_fullscreen_generation = state.state_generation;
                 } else |_| {
@@ -86,7 +106,7 @@ pub fn syncChrome(self: anytype) void {
     }
 }
 pub fn requestClose(self: anytype) !void {
-    if (self.should_quit or self.chrome.checking_close) return;
+    if (self.destroying or self.should_quit or self.chrome.checking_close) return;
     self.chrome.checking_close = true;
     defer self.chrome.checking_close = false;
     self.win.resetShouldClose();

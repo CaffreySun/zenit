@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Check real-time Sheet submitted frames, independently of host RPC latency.
 
-The fixed fixture is a right Sheet in the 1100x1000 Storybook window. Its
-content-free row at logical y=500 tests the moving panel edge and closed-state
+The fixture is a right Sheet in the actual Storybook viewport. A
+content-free row at half its height tests the moving panel edge and closed-state
 residue. This is surface correctness, not compositor or frame-rate acceptance.
 """
 import argparse
@@ -12,23 +12,24 @@ from pathlib import Path
 import re
 import zipfile
 from windows_modal_frame_audit import bitmap
-from windows_shared_modal_frame_audit import find
+from windows_shared_modal_frame_audit import find, validate_viewport
 
 
-def check_row(width, pixel, scale, expected_x, alpha):
-    y = round(500 * scale)
+def check_row(width, pixel, scale, expected_x, alpha, height, panel_width=320):
+    logical_width = width / scale
+    y = round(height / 2)
     lum = lambda x: sum(pixel(x, y)) / 3
     panel = sum(lum(x) for x in range(width - 16, width - 4)) / 12
-    x0, x1 = round(660 * scale), round(715 * scale)
+    x0, x1 = round((logical_width-panel_width-120) * scale), round((logical_width-panel_width-65) * scale)
     background = sum(lum(x) for x in range(x0, x1)) / (x1 - x0)
     contrast = panel - background
     edge = None
     if contrast >= 2:
         threshold = (panel + background) / 2
-        edge = next(((x + 1) / scale for x in range(width - 1, round(740 * scale), -1)
+        edge = next(((x + 1) / scale for x in range(width - 1, round((logical_width-panel_width-40) * scale), -1)
                      if lum(x) < threshold), None)
     if alpha == 0:
-        residue = max(abs(lum(x) - background) for x in range(round(740 * scale), width - 2))
+        residue = max(abs(lum(x) - background) for x in range(round((logical_width-panel_width-40) * scale), width - 2))
         passed = residue <= 2 and edge is None
     else:
         residue = None
@@ -67,23 +68,26 @@ def audit(folder):
             scale = meta['scale']
             if not math.isfinite(scale) or scale <= 0 or (width, height) != (meta['width'], meta['height']):
                 raise ValueError('invalid drawable')
-            if abs(width / scale - 1100) > 1 or abs(height / scale - 1000) > 1:
-                raise ValueError('unexpected Sheet fixture dimensions')
             windows.setdefault(meta['window_id'], []).append(meta)
-            node = find(json.loads(archive.read(meta['tree'])), 'story.sheet.panel')
+            tree = json.loads(archive.read(meta['tree']))
+            validate_viewport(meta, tree)
+            viewport = tree['rect']
+            if abs(viewport['w'] - width/scale) > 1/scale or abs(viewport['h'] - height/scale) > 1/scale:
+                raise ValueError('layout viewport/drawable mismatch')
+            node = find(tree, 'story.sheet.panel')
             if node is None:
                 continue
             alpha = node.get('effective_opacity')
             if not isinstance(alpha, (int, float)) or not math.isfinite(alpha) or not 0 <= alpha <= 1:
                 raise ValueError('invalid effective opacity')
             rect = node['rect']
-            if alpha > 0 and (abs(rect['w'] - 320) > .1 or abs(rect['h'] - 1000) > .1 or not 778 <= rect['x'] <= 1102):
+            if alpha > 0 and (abs(rect['w'] - 320) > .1 or abs(rect['h'] - viewport['h']) > .1 or abs(rect['y']) > .1 or not viewport['w']-rect['w']-2 <= rect['x'] <= viewport['w']+2):
                 raise ValueError('unexpected Sheet panel geometry')
             cursor = meta['cursor']
-            if cursor['visible'] and abs(cursor['y'] - 500) <= 32 and cursor['x'] >= 628:
+            if cursor['visible'] and abs(cursor['y'] - viewport['h']/2) <= 32 and cursor['x'] >= viewport['w']-rect['w']-152:
                 raise ValueError('cursor obscures audit row')
-            row = check_row(width, pixel, scale, rect['x'], alpha)
-            records.append(dict(index=meta['index'], window=meta['window_id'], frame_time_ms=meta['frame_time_ms'], **row))
+            row = check_row(width, pixel, scale, rect['x'], alpha, height, rect['w'])
+            records.append(dict(index=meta['index'], window=meta['window_id'], frame_time_ms=meta['frame_time_ms'], viewport_width=viewport['w'], panel_width=rect['w'], **row))
         if not seen or seen != expected or committed != set(names):
             raise ValueError('orphan, missing or unlogged frame artifacts')
         for frames in windows.values():
@@ -93,28 +97,30 @@ def audit(folder):
     if len({r['window'] for r in records}) != 1:
         raise ValueError('missing or ambiguous Sheet window')
     records.sort(key=lambda r: r['index'])
-    prior_alpha, prior_x = 0, 1100
+    prior_alpha, prior_x = 0, records[0]['viewport_width']
     starts = closes = entries = exits = settled = 0
     cycles = []
     for row in records:
         alpha, x = row['alpha'], row['expected_x']
+        right = row['viewport_width']
+        left = right-row['panel_width']
         if prior_alpha == 0 and alpha > 0:
             cycles.append(dict(entries=0, exits=0, settled=False, closed=False))
         starts += prior_alpha == 0 and alpha > 0
         closes += prior_alpha > 0 and alpha == 0
-        is_settled = alpha >= .999 and abs(x - 780) <= 1 and row['passed']
+        is_settled = alpha >= .999 and abs(x - left) <= 1 and row['passed']
         settled += is_settled
         if cycles:
             cycles[-1]['settled'] |= is_settled
             cycles[-1]['closed'] |= prior_alpha > 0 and alpha == 0
-        if row['passed'] and not row['deferred'] and 788 < x < 1098 and alpha > 0:
+        if row['passed'] and not row['deferred'] and left+8 < x < right-2 and alpha > 0:
             entering = x < prior_x
             exiting = x > prior_x and prior_alpha > 0
             entries += entering
             exits += exiting
             cycles[-1]['entries'] += entering
             cycles[-1]['exits'] += exiting
-        prior_alpha, prior_x = alpha, x if alpha > 0 else 1100
+        prior_alpha, prior_x = alpha, x if alpha > 0 else right
     return dict(passed=starts == closes == 3 and all(c['entries'] and c['exits'] and c['settled'] and c['closed'] for c in cycles) and all(r['passed'] for r in records),
                 capture_source='Direct3D retained submitted surface', animation_clock='real time',
                 archive_frames=len(seen), checked_frames=len(records), starts=starts, closes=closes,

@@ -2627,7 +2627,7 @@ pub const TextInputState = struct {
                 return true;
             },
             .forward_delete => {
-                if (modifiers.alt) {
+                if (modifiers.alt or ((@import("builtin").target.os.tag == .windows or @import("builtin").target.os.tag == .linux) and modifiers.ctrl)) {
                     const cursor = @min(self.cursor_pos, self.getText().len);
                     const anchor = @min(self.selection_anchor orelse cursor, self.getText().len);
                     const end = if (anchor != cursor) anchor else self.findWordBoundaryRight(cursor);

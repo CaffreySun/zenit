@@ -224,6 +224,11 @@ function Next-SuiteRpc([System.Diagnostics.Process]$suite) {
 # the network, keep their evidence locally, and the whole result set goes back
 # in one upload at the end: no per-stage transfer or round trip over the tunnel.
 $script:batchQueue = New-Object System.Collections.Queue
+# A single path component inside a stage directory (no separators, no "..").
+function Test-StageEntryName([string]$name) {
+  return $name -match '^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$' -and $name -notmatch '\.\.'
+}
+
 function Get-JobArtifact([object]$job, [string]$name, [string]$destination) {
   if ($job.batch) {
     $source = Join-Path ([string]$job.batch.bundle) ([string]$job.batch.files.$name)
@@ -288,8 +293,11 @@ while ($true) {
         $script:batchQueue.Enqueue([pscustomobject]@{
           kind=[string]$stage.kind; id=[guid]::NewGuid().ToString('N'); exe_name=[string]$stage.exe_name
           custom_titlebar=[bool]$stage.custom_titlebar; capture_frames=[bool]$stage.capture_frames
-          trace_frames=[bool]$stage.trace_frames; capture_desktop=$false; allow_foreground=$false
+          trace_frames=[bool]$stage.trace_frames; capture_desktop=$false
+          # Native input only where both the batch and its stage asked for it.
+          allow_foreground=([bool]$job.allow_foreground -and [bool]$stage.allow_foreground)
           local_suite=$stageSuite; startup_timeout_ms=$stage.startup_timeout_ms
+          app_env=$stage.app_env; extra_dirs=$stage.extra_dirs
           batch=[pscustomobject]@{parent=$batchId; stage=[string]$stage.name; bundle=$bundleDir; results=$resultsDir; files=[pscustomobject]$files}
         })
       }
@@ -373,11 +381,35 @@ while ($true) {
       }
     } elseif ($job.kind -eq 'e2e') {
       $exeName = [string]$job.exe_name
-      if ($exeName -notin @('zenit-windows-text-input.exe', 'zenit-windows-storybook.exe', 'zenit-windows-render-gallery.exe', 'zenit-windows-adaptive-window.exe')) { throw 'Unknown E2E executable' }
+      if ($exeName -notin @('zenit-windows-text-input.exe', 'zenit-windows-storybook.exe', 'zenit-windows-render-gallery.exe', 'zenit-windows-adaptive-window.exe', 'zdoc-e2e.exe') -and $exeName -notmatch '^zdoc-e2e-[a-z0-9-]{1,32}\.exe$') { throw 'Unknown E2E executable' }
       $exe = Join-Path $dir $exeName
       $rpcDir = Join-Path $dir 'rpc'
       New-Item -ItemType Directory -Force -Path $rpcDir | Out-Null
       Get-JobArtifact $job $exeName $exe
+      # Batch apps may ship resource directories beside the executable (an
+      # application's assets/), copied as is from the extracted bundle.
+      if ($job.batch -and $job.extra_dirs) {
+        foreach ($extra in @($job.extra_dirs)) {
+          $extraName = [string]$extra
+          if (-not (Test-StageEntryName $extraName)) { throw 'Invalid extra directory' }
+          $extraSource = Join-Path ([string]$job.batch.bundle) $extraName
+          if (-not (Test-Path -LiteralPath $extraSource -PathType Container)) { throw ('Batch directory missing: '+$extraName) }
+          Copy-Item -Recurse -Force -LiteralPath $extraSource -Destination (Join-Path $dir $extraName)
+        }
+      }
+      # The app's environment goes to its StartInfo only: the worker's own
+      # environment never changes, so a failure before or during start cannot
+      # leak a stage's variables into later stages.
+      $childEnv = @{}
+      # Per-app environment (e.g. an isolated test workspace); {stage_dir}
+      # expands to this stage's directory, whose workspace\ exists up front.
+      if ($job.app_env) {
+        New-Item -ItemType Directory -Force -Path (Join-Path $dir 'workspace') | Out-Null
+        foreach ($entry in $job.app_env.PSObject.Properties) {
+          if ($entry.Name -notmatch '^[A-Z][A-Z0-9_]{0,63}$') { throw 'Invalid app environment name' }
+          $childEnv[$entry.Name] = ([string]$entry.Value).Replace('{stage_dir}', $dir)
+        }
+      }
       $script:suiteRpcDir = $null
       $suiteProc = $null
       if ($job.local_suite) {
@@ -391,16 +423,16 @@ while ($true) {
       Initialize-WindowsNativeInput
       $foregroundBeforeLaunch = [ZenitNativeInput]::GetForegroundWindow()
       if ($job.allow_foreground) { $originalForeground = $foregroundBeforeLaunch }
-      $env:ZENIT_E2E_BACKGROUND = if ($job.allow_foreground) { '0' } else { '1' }
-      if ($job.allow_foreground) { $env:ZENIT_WINDOWS_INPUT_TRACE = '1' }
-      $env:ZENIT_E2E_FILE_RPC_DIR = $rpcDir
-      if ($job.capture_desktop -and $job.allow_foreground) { $env:ZENIT_WINDOWS_DESKTOP_WAKE_INPUT = '1' }
-      if ($job.capture_desktop) { $env:ZENIT_WINDOWS_DESKTOP_CAPTURE = '1' }
-      if ($job.trace_frames) { $env:ZENIT_WINDOWS_FRAME_TIMING = '1' }
+      $childEnv['ZENIT_E2E_BACKGROUND'] = if ($job.allow_foreground) { '0' } else { '1' }
+      if ($job.allow_foreground) { $childEnv['ZENIT_WINDOWS_INPUT_TRACE'] = '1' }
+      $childEnv['ZENIT_E2E_FILE_RPC_DIR'] = $rpcDir
+      if ($job.capture_desktop -and $job.allow_foreground) { $childEnv['ZENIT_WINDOWS_DESKTOP_WAKE_INPUT'] = '1' }
+      if ($job.capture_desktop) { $childEnv['ZENIT_WINDOWS_DESKTOP_CAPTURE'] = '1' }
+      if ($job.trace_frames) { $childEnv['ZENIT_WINDOWS_FRAME_TIMING'] = '1' }
       $frameDir = Join-Path $dir 'presented-frames'
       if ($job.capture_frames) {
         New-Item -ItemType Directory -Force -Path $frameDir | Out-Null
-        $env:ZENIT_WINDOWS_FRAME_CAPTURE_DIR = $frameDir
+        $childEnv['ZENIT_WINDOWS_FRAME_CAPTURE_DIR'] = $frameDir
       }
       # Console-subsystem examples otherwise spawn conhost and steal foreground
       # even when their Win32 UI uses SW_SHOWNOACTIVATE.
@@ -413,18 +445,12 @@ while ($true) {
       $proc.StartInfo.RedirectStandardError = $true
       $proc.StartInfo.StandardOutputEncoding = New-Object System.Text.UTF8Encoding($false)
       $proc.StartInfo.StandardErrorEncoding = New-Object System.Text.UTF8Encoding($false)
+      foreach ($name in $childEnv.Keys) { $proc.StartInfo.EnvironmentVariables[$name] = [string]$childEnv[$name] }
       if (-not $proc.Start()) { throw 'E2E app did not start' }
       $appStdout = $proc.StandardOutput.ReadToEndAsync()
       $appStderr = $proc.StandardError.ReadToEndAsync()
       try {
       $proc.Id | Set-Content (Join-Path $PSScriptRoot 'active-app.pid')
-      Remove-Item Env:ZENIT_E2E_BACKGROUND
-      Remove-Item Env:ZENIT_WINDOWS_INPUT_TRACE -ErrorAction SilentlyContinue
-      Remove-Item Env:ZENIT_E2E_FILE_RPC_DIR
-      Remove-Item Env:ZENIT_WINDOWS_FRAME_CAPTURE_DIR -ErrorAction SilentlyContinue
-      Remove-Item Env:ZENIT_WINDOWS_DESKTOP_WAKE_INPUT -ErrorAction SilentlyContinue
-      Remove-Item Env:ZENIT_WINDOWS_DESKTOP_CAPTURE -ErrorAction SilentlyContinue
-      Remove-Item Env:ZENIT_WINDOWS_FRAME_TIMING -ErrorAction SilentlyContinue
       # First-run shader compilation and fixture startup contracts can exceed
       # ten seconds. Use the host's requested startup deadline for both sides.
       $startupTimeoutMs = if ($job.startup_timeout_ms) { [int]$job.startup_timeout_ms } else { 90000 }
@@ -636,11 +662,37 @@ while ($true) {
     # Batch stage: evidence stays here (uploaded once with the batch); the stage
     # directory moves under the batch results by stage name.
     @{stage=[string]$job.batch.stage; exit_code=$exitCode; error=$errorText} | ConvertTo-Json | Set-Content -Encoding UTF8 (Join-Path $dir 'stage-result.json')
-    foreach ($leftover in @('zenit-e2e-suite.js', [string]$job.exe_name, 'rpc', 'suite-rpc', 'presented-frames', 'session')) {
+    # extra_dirs come from the manifest: only names the copy step accepts may
+    # be removed (it throws on others, and cleanup still runs after that).
+    foreach ($leftover in @('zenit-e2e-suite.js', [string]$job.exe_name, 'rpc', 'suite-rpc', 'presented-frames', 'session', 'workspace') + @($job.extra_dirs | Where-Object { Test-StageEntryName ([string]$_) })) {
       $path = Join-Path $dir $leftover
       if (Test-Path -LiteralPath $path) { Remove-Item -Recurse -Force -LiteralPath $path -ErrorAction SilentlyContinue }
     }
-    Move-Item -Force -LiteralPath $dir -Destination (Join-Path ([string]$job.batch.results) ([string]$job.batch.stage))
+    # Directory rename can fail when a scanner/evidence reader briefly holds a
+    # handle. Copy the small retained evidence instead; cleanup is best effort.
+    # A failed copy must be explicit and must not abort all subsequent stages.
+    $stageDestination = Join-Path ([string]$job.batch.results) ([string]$job.batch.stage)
+    $evidenceCopied = $false
+    for ($copyAttempt = 0; $copyAttempt -lt 5; $copyAttempt++) {
+      try {
+        New-Item -ItemType Directory -Force -Path $stageDestination | Out-Null
+        foreach ($evidenceFile in Get-ChildItem -LiteralPath $dir -File) {
+          Copy-Item -LiteralPath $evidenceFile.FullName -Destination (Join-Path $stageDestination $evidenceFile.Name) -Force -ErrorAction Stop
+        }
+        $evidenceCopied = $true
+        break
+      } catch {
+        Write-Warning ('Stage evidence copy failed: '+$_.Exception.Message)
+        Start-Sleep -Milliseconds 300
+      }
+    }
+    if ($evidenceCopied) {
+      Remove-Item -Recurse -Force -LiteralPath $dir -ErrorAction SilentlyContinue
+    } else {
+      $exitCode = 1
+      $errorText += ' Evidence copy failed; original retained at '+$dir
+      @{stage=[string]$job.batch.stage; exit_code=$exitCode; error=$errorText} | ConvertTo-Json | Set-Content -Encoding UTF8 (Join-Path $stageDestination 'stage-result.json')
+    }
     Write-Host ('  stage '+$job.batch.stage+': exit '+$exitCode)
     continue
   }

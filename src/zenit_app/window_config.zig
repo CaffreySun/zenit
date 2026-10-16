@@ -9,6 +9,22 @@ pub const TitlebarStyle = enum {
 
 pub const WindowChrome = @import("system_sdk").window_chrome.Config;
 
+/// A native key event offered to `Config.on_key` before UI dispatch.
+pub const KeyEvent = struct {
+    key: @import("ui").events.KeyCode,
+    modifiers: @import("ui").events.Modifiers,
+    pressed: bool,
+};
+
+/// Initial position of a window.
+pub const Placement = enum {
+    /// Platform default (AppKit centres on screen, Win32 cascades).
+    default,
+    /// Centre on `WindowConfig.owner`, slightly above the middle and clamped to
+    /// the owner's screen work area. Palette / find panel convention.
+    center_on_owner,
+};
+
 pub const WindowConfig = struct {
     min_width: u32 = 0,
     min_height: u32 = 0,
@@ -23,6 +39,12 @@ pub const WindowConfig = struct {
     /// Experimental AppKit host prototype; other backends reject visible policies.
     /// Final host preference/fallback contract is not frozen yet.
     fullscreen_header: @import("system_sdk").window_chrome.HeaderVisibility = .hidden,
+    /// Owner window (MultiWindowApp only). An owned window stays above its
+    /// owner, comes forward with it, never floats over other applications, and
+    /// is closed with it. Use with `chrome = .frameless` for panels. Linux
+    /// keeps an independent window for now.
+    owner: ?@import("system_sdk").events.WindowId = null,
+    placement: Placement = .default,
 };
 
 pub fn requestedChrome(config: WindowConfig) WindowChrome {

@@ -112,7 +112,8 @@ def audit(folder, allow_shadow_halo=False, desktop=False):
                     raise ValueError(f'frame {index} has no matching visible presentation serial; desktop gate unverified')
                 x, y, w, h = visible[index]
                 # Includes all panel/shadow samples and the backdrop sample.
-                if x > 300*scale or y > 340*scale or x+w <= 900*scale or y+h <= 700*scale:
+                dw, dh, _ = bitmap(archive.read(names[f'frame-{index:04d}.bmp']))
+                if x > 0 or y > 0 or x+w < dw or y+h < dh:
                     raise ValueError(f'Modal audit samples outside visible desktop in frame {index}')
             missing = [r[0] for r in records if r[0] != 0 and f'desktop-{r[0]:04d}.bmp' not in names]
             if missing:
@@ -135,7 +136,9 @@ def audit(folder, allow_shadow_halo=False, desktop=False):
         reference_width, reference_height, reference_pixel = read(settled[0])
         pixel = reference_pixel
         reference_scale = scale
-        reference_bg = pixel(round(900 * scale), round(700 * scale))
+        bx = round((layer[0]+layer[2]+reference_width/scale)/2*scale)
+        by = round((layer[1]+layer[3]+reference_height/scale)/2*scale)
+        reference_bg = pixel(bx, by)
         bg = reference_bg[0]
         # Recover the fixture's actual solid panel rectangle from settled ink;
         # its layer bounds include shadow padding, so they are much larger.
@@ -149,7 +152,7 @@ def audit(folder, allow_shadow_halo=False, desktop=False):
                 continue
             _, _, pixel = read(index)
             target_pixel = bitmap(archive.read(names[f'frame-{index:04d}.bmp']))[2] if desktop else None
-            bg = pixel(round(900*scale), round(700*scale))
+            bg = pixel(bx, by)
             if current:
                 factor = current[2] / layer[2]
                 cx, cy = (base[0]+base[2])/2, (base[1]+base[3])/2

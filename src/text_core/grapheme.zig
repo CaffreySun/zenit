@@ -213,9 +213,9 @@ fn utf8SeqLen(b: u8) usize {
 /// Generic engine: generic on (Doc, R), R provide byteAt/len.
 fn Engine(comptime Doc: type, comptime R: type) type {
     return struct {
-        /// Decode codepoint at offset, return {cp, byte length}. Invalid bytes treat as U+FFFD
-        /// single-byte.
-        fn decodeAt(doc: *const Doc, offset: usize) struct { cp: u21, size: usize } {
+        /// Decode UTF-8/WTF-8 storage; other malformed sequences remain
+        /// single-byte replacement characters. This is not a UTF-8 validator.
+        fn decodeUnitAt(doc: *const Doc, offset: usize) struct { cp: u21, size: usize } {
             const total = R.len(doc);
             const b0 = R.byteAt(doc, offset) orelse return .{ .cp = 0xFFFD, .size = 1 };
             const n = utf8SeqLen(b0);
@@ -230,8 +230,31 @@ fn Engine(comptime Doc: type, comptime R: type) type {
                 if ((b & 0xC0) != 0x80) return .{ .cp = 0xFFFD, .size = 1 };
                 buf[i] = b;
             }
-            const cp = std.unicode.utf8Decode(buf[0..n]) catch return .{ .cp = 0xFFFD, .size = 1 };
+            const cp = std.unicode.wtf8Decode(buf[0..n]) catch return .{ .cp = 0xFFFD, .size = 1 };
             return .{ .cp = cp, .size = n };
+        }
+
+        fn decodeAt(doc: *const Doc, offset: usize) struct { cp: u21, size: usize } {
+            const first = decodeUnitAt(doc, offset);
+            // Edits can bring separately stored surrogate halves together.
+            // Apply grapheme rules to their combined scalar without rewriting
+            // storage or changing byte offsets used by undo/selection.
+            if (first.cp >= 0xd800 and first.cp <= 0xdbff and offset + first.size < R.len(doc)) {
+                const second = decodeUnitAt(doc, offset + first.size);
+                if (second.cp >= 0xdc00 and second.cp <= 0xdfff) return .{
+                    .cp = 0x10000 + ((first.cp - 0xd800) << 10) + second.cp - 0xdc00,
+                    .size = first.size + second.size,
+                };
+            }
+            return .{ .cp = first.cp, .size = first.size };
+        }
+
+        fn joinPreviousSurrogate(doc: *const Doc, offset: usize) usize {
+            if (offset < 3) return offset;
+            const current = decodeUnitAt(doc, offset);
+            if (current.cp < 0xdc00 or current.cp > 0xdfff) return offset;
+            const previous = decodeUnitAt(doc, offset - 3);
+            return if (previous.size == 3 and previous.cp >= 0xd800 and previous.cp <= 0xdbff) offset - 3 else offset;
         }
 
         /// Previous codepoint start (pure UTF-8 backtrack)
@@ -241,12 +264,12 @@ fn Engine(comptime Doc: type, comptime R: type) type {
             var steps: usize = 0;
             while (i > 0 and steps < 3) : (steps += 1) {
                 const b = R.byteAt(doc, i) orelse return offset - 1;
-                if ((b & 0xC0) != 0x80) return i;
+                if ((b & 0xC0) != 0x80) return joinPreviousSurrogate(doc, i);
                 i -= 1;
             }
             const b = R.byteAt(doc, i) orelse return offset - 1;
             if ((b & 0xC0) == 0x80) return offset - 1; // Out-of-bounds continuation stream: fault-tolerance
-            return i;
+            return joinPreviousSurrogate(doc, i);
         }
 
         /// Scan from text start to offset, get State at offset + prev codepoint prop.
@@ -319,6 +342,7 @@ fn Engine(comptime Doc: type, comptime R: type) type {
         /// Is offset on cluster boundary
         pub fn isBoundaryAt(doc: *const Doc, offset: usize) bool {
             if (offset == 0 or offset >= R.len(doc)) return true;
+            if (joinPreviousSurrogate(doc, offset) != offset) return false;
             const ctx = contextAt(doc, offset);
             const prev_p = ctx.prev orelse return true;
             const d = decodeAt(doc, offset);
@@ -596,5 +620,25 @@ test "边界幂等：prev(next(x)) == x" {
         try testing.expect(n > i);
         try testing.expectEqual(i, prevBoundary(s, n));
         i = n;
+    }
+}
+
+test "WTF8 graphemes keep isolated surrogates and paired edit seams whole" {
+    const Case = struct { text: []const u8, boundaries: []const usize };
+    const cases = [_]Case{
+        .{ .text = "A\xed\xa0\x80�\xed\xb0\x80Z", .boundaries = &.{ 0, 1, 4, 7, 10, 11 } },
+        .{ .text = "\xed\xa0\x80\xcc\x81x", .boundaries = &.{ 0, 5, 6 } },
+        .{ .text = "\xed\xa0\xbd\xed\xb8\x80\xcc\x81x", .boundaries = &.{ 0, 8, 9 } },
+        .{ .text = "\xed\xa0\x80\xed\xa0\x80\xed\xb0\x80\xed\xb0\x80", .boundaries = &.{ 0, 3, 9, 12 } },
+    };
+    for (cases) |case| {
+        var scanner = BoundaryCursor.init(case.text);
+        for (case.boundaries[0 .. case.boundaries.len - 1], case.boundaries[1..]) |start, end| {
+            try testing.expectEqual(end, nextBoundary(case.text, start));
+            try testing.expectEqual(end, scanner.next(start));
+            try testing.expectEqual(start, prevBoundary(case.text, end));
+            for (start..end) |interior| try testing.expectEqual(start, prevBoundary(case.text, interior + 1));
+        }
+        try testing.expectEqual(case.boundaries.len - 1, count(case.text));
     }
 }

@@ -9,6 +9,11 @@ test("Windows Notification portal keeps title and body inside the placed card", 
   await waitFor(async () => (await query("story.notify.pos.tr"))[0] ?? null, 5000, 50);
   assert((await clickTestId("story.notify.pos.tr")).ok, "position action failed");
   await waitFor(async () => (await query("story.notify.status"))[0]?.text === "top_right" ? true : null, 3000, 50);
+  // The source origin is not empty: the window header draws its title there.
+  // Measure leaked ink against this pre-notification frame.
+  const baselinePath = `${getSessionDir()}/windows-notification-portal-baseline.png`;
+  assert((await screenshot(baselinePath)).ok, "baseline screenshot failed");
+  const baseline = decodePng(baselinePath);
   assert((await clickTestId("story.notify.btn.warning")).ok, "warning action failed");
   // This checks settled placement/ink, not animation latency. WARP can take
   // longer than 800 ms to submit the nested title/body entrance layers.
@@ -31,13 +36,14 @@ test("Windows Notification portal keeps title and body inside the placed card", 
   const scale = png.width / root.rect.w;
   const card = (await query("story.notify.warning"))[0]?.rect;
   assert(card && Math.abs(card.x + card.w - (root.rect.w - 22)) < 2 && Math.abs(card.y - 78) < 2, "card is not top-right");
-  const ink = (x: number, y: number, w: number, h: number) => {
+  assert(baseline.width === png.width && baseline.height === png.height, "baseline size changed");
+  const ink = (x: number, y: number, w: number, h: number, image = png) => {
     let coverage = 0;
     for (let py = Math.ceil(y * scale); py < Math.floor((y + h) * scale); py++) {
       for (let px = Math.ceil(x * scale); px < Math.floor((x + w) * scale); px++) {
-        assert(px >= 0 && py >= 0 && px < png.width && py < png.height, "notification sample outside screenshot");
-        const i = (py * png.width + px) * png.channels;
-        const gray = (png.pixels[i] + png.pixels[i+1] + png.pixels[i+2]) / 3;
+        assert(px >= 0 && py >= 0 && px < image.width && py < image.height, "notification sample outside screenshot");
+        const i = (py * image.width + px) * image.channels;
+        const gray = (image.pixels[i] + image.pixels[i+1] + image.pixels[i+2]) / 3;
         // Integrate antialiased glyph coverage in logical pixels. Counting only
         // samples darker than 120 discards thin 1x glyphs that are visible, but
         // succeeds at 1.75x merely because it has more physical samples.
@@ -49,7 +55,7 @@ test("Windows Notification portal keeps title and body inside the placed card", 
   };
   const title = ink(card.x + 50, card.y + 10, 160, 22);
   const body = ink(card.x + 50, card.y + 34, 250, 19);
-  const leaked = ink(58, 10, 160, 22);
+  const leaked = ink(58, 10, 160, 22) - ink(58, 10, 160, 22, baseline);
   console.log(`  notification title=${title}, body=${body}, source-origin=${leaked}, ${path}`);
   assert(title > 70 && body > 70, "placed notification has no title/body ink");
   assert(leaked < 20, "notification content leaked to source origin");
@@ -72,7 +78,7 @@ test("Windows Notification glass fade captures entry and exit for frame audit", 
   // Hold the actual notification before potentially slow WAN screenshot upload.
   await mouseMove(card.x+20,card.y+20);
   if(cycle===0) assert((await screenshot(`${directory}/notification-fade-settled.png`)).ok,"notification settled failed");
-  if(cycle===0) writeFileSync(`${directory}/notification-fade-fixture.json`,JSON.stringify({card,scale:(await stats()).window_scale}));
+  if(cycle===0) writeFileSync(`${directory}/notification-fade-fixture.json`,JSON.stringify({card,node:(await query("story.notify.warning"))[0],scale:(await stats()).window_scale}));
   await mouseMove(card.x+20,card.y+20);
   await sleep(350);
   // The close control is hover-revealed. A coordinate click while it is still
@@ -197,7 +203,7 @@ test("Windows Modal settled content and closed background preserve pixels", asyn
       const dialog = (await query("story.modal.dialog"))[0];
       return dialog && dialog.effective_opacity === 0 ? dialog : null;
     }, 10000, 50);
-    assert((await mouseMove(1050, 850)).ok, "pointer relocation failed");
+    assert((await mouseMove((await tree()).rect.w-20, (await tree()).rect.h-20)).ok, "pointer relocation failed");
     await check("closed", false);
   }
 });
@@ -268,7 +274,7 @@ test("Windows Modal interrupted transitions clear the panel and shadow", async (
   await waitFor(async () => (await query("story.modal.dialog"))[0]?.visible === false ? true : null, 10000, 50);
   // Park the virtual pointer where every cycle parks it, so the cursor glyph
   // never counts as a difference inside the audited region.
-  assert((await mouseMove(1050, 850)).ok, "pointer relocation failed");
+  assert((await mouseMove((await tree()).rect.w-20, (await tree()).rect.h-20)).ok, "pointer relocation failed");
   await sleep(300);
   const basePath = `${getSessionDir()}/windows-modal-interrupted-baseline.png`;
   assert((await screenshot(basePath)).ok, "baseline screenshot failed");
@@ -280,7 +286,7 @@ test("Windows Modal interrupted transitions clear the panel and shadow", async (
     // Escape is dispatched locally after the first submitted entering frame.
     // A LAN round trip cannot reliably catch this short state on a slow adapter.
     await waitModalStage(`${cycle}-exit`, async () => (await query("story.modal.dialog"))[0]?.visible === false ? true : null, 20);
-    assert((await mouseMove(1050, 850)).ok, "pointer relocation failed");
+    assert((await mouseMove((await tree()).rect.w-20, (await tree()).rect.h-20)).ok, "pointer relocation failed");
     const path = `${getSessionDir()}/windows-modal-interrupted-${cycle}-closed.png`;
     assert((await screenshot(path)).ok, "closed screenshot failed");
     const png = decodePng(path);

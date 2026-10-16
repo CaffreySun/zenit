@@ -12,6 +12,7 @@ pub const NativeSurface = extern struct {
 };
 extern fn zenit_wayland_create([*:0]const u8, u32, u32) ?*Handle;
 extern fn zenit_wayland_destroy(?*Handle) void;
+extern fn zenit_wayland_set_title(?*Handle, [*:0]const u8) void;
 extern fn zenit_wayland_clipboard_available(*Handle) c_int;
 extern fn zenit_wayland_clipboard_set_text(*Handle, [*]const u8, usize) c_int;
 extern fn zenit_wayland_clipboard_get_text_len(*Handle) c_int;
@@ -180,6 +181,10 @@ pub const Window = struct {
     pub fn init(title: [:0]const u8, width: u32, height: u32) !Window {
         return .{ .handle = zenit_wayland_create(title, width, height) orelse return error.WaylandWindowUnavailable };
     }
+    pub fn setTitle(self: *Window, title: [:0]const u8) void {
+        zenit_wayland_set_title(self.handle, title.ptr);
+    }
+
     pub fn deinit(self: *Window) void {
         zenit_wayland_destroy(self.handle);
         self.handle = null;

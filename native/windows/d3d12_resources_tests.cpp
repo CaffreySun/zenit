@@ -74,9 +74,22 @@ extern "C" void zenit_d12_test_debug_enable() {
     HRESULT hr = D3D12GetDebugInterface(IID_ID3D12Debug, (void **)&debug);
     if (FAILED(hr)) {
         fprintf(stderr, "D3D12 debug layer unavailable HRESULT=%08lx (validation not claimed)\n", (unsigned long)hr);
+        if (getenv("ZENIT_D3D12_REQUIRE_VALIDATION")) ExitProcess(7);
         return;
     }
-    debug->EnableDebugLayer(); debug->Release();
+    debug->EnableDebugLayer();
+    if (getenv("ZENIT_D3D12_GBV")) {
+        ID3D12Debug1 *validation = nullptr;
+        hr = debug->QueryInterface(IID_ID3D12Debug1, (void **)&validation);
+        if (SUCCEEDED(hr)) {
+            validation->SetEnableGPUBasedValidation(TRUE); validation->Release();
+            fprintf(stderr, "D3D12 GPU-based validation enabled\n");
+        } else {
+            fprintf(stderr, "D3D12 GPU-based validation unavailable HRESULT=%08lx\n", (unsigned long)hr);
+            if (getenv("ZENIT_D3D12_REQUIRE_VALIDATION")) ExitProcess(7);
+        }
+    }
+    debug->Release();
     fprintf(stderr, "D3D12 debug layer enabled\n");
 }
 extern "C" void zenit_d12_test_debug_check(ZenitD12Device *owner) {
@@ -91,12 +104,15 @@ extern "C" void zenit_d12_test_debug_check(ZenitD12Device *owner) {
         auto message = (D3D12_MESSAGE *)malloc(size);
         if (!message) ExitProcess(5);
         check(info->GetMessage(i, message, &size), "debug message");
+        if (message->Severity == D3D12_MESSAGE_SEVERITY_WARNING)
+            fprintf(stderr, "D3D12 validation warning id=%u: %s\n", unsigned(message->ID), message->pDescription);
         if (message->Severity == D3D12_MESSAGE_SEVERITY_ERROR || message->Severity == D3D12_MESSAGE_SEVERITY_CORRUPTION) {
             fprintf(stderr, "D3D12 validation error: %s\n", message->pDescription); ++errors;
         }
         free(message);
     }
     info->Release();
+    fprintf(stderr, "D3D12 validation messages=%llu errors=%u\n", (unsigned long long)count, errors);
     if (errors) ExitProcess(6);
     fprintf(stderr, "PASS: D3D12 debug layer found no errors/corruption\n");
 }

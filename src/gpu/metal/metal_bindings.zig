@@ -697,3 +697,7 @@ pub extern "c" fn metal_render_pipeline_color_attachment_set_source_alpha_blend_
 pub extern "c" fn metal_render_pipeline_color_attachment_set_destination_alpha_blend_factor(desc: *MTLRenderPipelineDescriptor, index: c_ulong, factor: c_ulong) void;
 pub extern "c" fn metal_render_pipeline_color_attachment_set_alpha_blend_operation(desc: *MTLRenderPipelineDescriptor, index: c_ulong, operation: c_ulong) void;
 pub extern "c" fn metal_render_pipeline_color_attachment_set_write_mask(desc: *MTLRenderPipelineDescriptor, index: c_ulong, mask: c_ulong) void;
+
+pub extern "c" fn metal_command_buffer_copy_texture_region_render(buffer: *MTLCommandBuffer, source: *MTLTexture, sx: u32, sy: u32, width: u32, height: u32, destination: *MTLTexture, dx: u32, dy: u32, clear: c_int) c_int;
+
+pub extern "c" fn metal_device_supports_framebuffer_fetch(device: *MTLDevice) bool;

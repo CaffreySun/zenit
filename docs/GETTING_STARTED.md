@@ -381,3 +381,11 @@ affect the four bundled examples.
 
 If you hit something not listed, please file an issue. Repro snippets are
 welcome; the smaller, the better.
+
+### Linux multi-window GPU ownership
+
+`MultiWindowConfig.shared_gpu = true` uses a shared device and image store on macOS
+and Windows. Linux Vulkan/OpenGL devices currently bind to one Wayland surface,
+so Linux deliberately uses an independent GPU for each window and logs one warning
+per application. `App.sharedImageStore()` returns `null` on Linux; load images into
+each window's renderer and keep texture ids local to that window.

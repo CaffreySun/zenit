@@ -5,8 +5,8 @@
 //! cache.
 //!
 //! Pitfalls:
-//! - **do not** hold Allocator-owned []GlyphPosition in entries; use a per-frame arena buffer +
-//!   slice view
+//! - Entry slices have one owner; eviction/replacement releases that owner. Borrows
+//!   must be consumed before a cache mutation that can evict their entry.
 //! - **do not** set a small hard capacity; default 4096 entries + LRU eviction
 //! - **do not** key on `[]const u8` (ptr unstable); key on hash + length, caller passes original to
 //!   verify
@@ -53,12 +53,12 @@ pub const ShapingKey = struct {
     }
 };
 
-/// Cache entry, owned glyph + cluster slices (arena allocated)
+/// Cache entry, owned glyph + cluster slices
 pub const Entry = struct {
     key: ShapingKey,
-    /// Arena-allocated glyph sequence
+    /// Entry-owned glyph sequence
     glyphs: []GlyphPosition,
-    /// Arena-allocated cluster sequence
+    /// Entry-owned cluster sequence
     clusters: []Cluster,
     metrics: FontMetrics,
     direction: glyph_run.Direction,
@@ -122,29 +122,34 @@ const VisualEntry = struct {
 
 pub const ShapingCache = struct {
     allocator: std.mem.Allocator,
-    /// Arena for glyph/cluster slices; entire arena reset on each evict + cache.deinit
-    arena: std.heap.ArenaAllocator,
+    /// Payload byte ceiling; map metadata is separately bounded by entry capacity.
+    max_payload_bytes: usize = 32 * 1024 * 1024,
     /// HashMap key -> entry index
     map: std.HashMapUnmanaged(ShapingKey, Entry, KeyContext, 80),
     visual_map: std.HashMapUnmanaged(ShapingKey, VisualEntry, KeyContext, 80),
     capacity: u32,
     current_frame: u64 = 0,
     stats: ShapingCacheStats = .{},
+    live_payload_bytes: usize = 0,
+    peak_payload_bytes: usize = 0,
 
     pub fn init(parent_allocator: std.mem.Allocator, capacity: u32) ShapingCache {
         return .{
             .allocator = parent_allocator,
-            .arena = std.heap.ArenaAllocator.init(parent_allocator),
             .map = .{},
             .visual_map = .{},
-            .capacity = capacity,
+            .capacity = @max(capacity, 1),
         };
     }
 
     pub fn deinit(self: *ShapingCache) void {
+        var entries = self.map.valueIterator();
+        while (entries.next()) |entry| self.freeEntry(entry.*);
+        var visuals = self.visual_map.valueIterator();
+        while (visuals.next()) |entry| self.freeVisual(entry.*);
         self.map.deinit(self.allocator);
         self.visual_map.deinit(self.allocator);
-        self.arena.deinit();
+        std.debug.assert(self.live_payload_bytes == 0);
         self.* = undefined;
     }
 
@@ -172,18 +177,17 @@ pub const ShapingCache = struct {
     }
 
     pub fn insertVisual(self: *ShapingCache, key: ShapingKey, line: text_coordinates.VisualLine) !void {
-        if (self.visual_map.count() >= self.capacity) {
-            // Caret geometry is small and cheap to rebuild. A bounded wholesale
-            // reset avoids per-entry arena ownership and keeps lookup O(1).
-            self.visual_map.clearRetainingCapacity();
-        }
-        if (self.arena.queryCapacity() >= ARENA_CLEAR_BYTES and self.map.count() == 0) {
-            self.visual_map.clearRetainingCapacity();
-            _ = self.arena.reset(.retain_capacity);
-        }
-        const owned = try self.arena.allocator().alloc(text_coordinates.CaretStop, line.caret_stops.len);
-        @memcpy(owned, line.caret_stops);
-        try self.visual_map.put(self.allocator, key, .{
+        const bytes = std.math.mul(usize, line.caret_stops.len, @sizeOf(text_coordinates.CaretStop)) catch return error.OutOfMemory;
+        if (bytes > self.max_payload_bytes) return error.OutOfMemory;
+        const owned = try self.allocator.dupe(text_coordinates.CaretStop, line.caret_stops);
+        errdefer self.allocator.free(owned);
+        // All fallible work precedes replacement or eviction. Borrowed input may
+        // even be the old entry's slice; it is already copied before freeing it.
+        try self.visual_map.ensureUnusedCapacity(self.allocator, 1);
+        if (self.visual_map.fetchRemove(key)) |old| self.freeVisual(old.value);
+        if (self.visual_map.count() >= self.capacity) self.evictOldestVisual();
+        self.makeRoom(bytes);
+        self.visual_map.putAssumeCapacity(key, .{
             .caret_stops = owned,
             .width = line.width,
             .ascent = line.ascent,
@@ -192,10 +196,11 @@ pub const ShapingCache = struct {
             .base_direction = line.base_direction,
             .last_used_frame = self.current_frame,
         });
+        self.live_payload_bytes += bytes;
+        self.peak_payload_bytes = @max(self.peak_payload_bytes, self.live_payload_bytes);
     }
 
-    /// Insert cache entry. Caller provides shaping result (glyph/cluster slice stored by
-    /// cache-internal arena, so caller can pass stack-allocated). Evict by LRU when full.
+    /// Copies caller slices; a failed insert keeps all old entries and borrows valid.
     pub fn insert(
         self: *ShapingCache,
         key: ShapingKey,
@@ -205,17 +210,19 @@ pub const ShapingCache = struct {
         direction: glyph_run.Direction,
         total_advance: f32,
     ) !void {
-        if (self.map.count() >= self.capacity) {
-            self.evictBatch();
-        }
-
-        const arena_alloc = self.arena.allocator();
-        const owned_glyphs = try arena_alloc.alloc(GlyphPosition, glyphs.len);
-        @memcpy(owned_glyphs, glyphs);
-        const owned_clusters = try arena_alloc.alloc(Cluster, clusters.len);
-        @memcpy(owned_clusters, clusters);
-
-        try self.map.put(self.allocator, key, .{
+        const gb = std.math.mul(usize, glyphs.len, @sizeOf(GlyphPosition)) catch return error.OutOfMemory;
+        const cb = std.math.mul(usize, clusters.len, @sizeOf(Cluster)) catch return error.OutOfMemory;
+        const bytes = std.math.add(usize, gb, cb) catch return error.OutOfMemory;
+        if (bytes > self.max_payload_bytes) return error.OutOfMemory;
+        const owned_glyphs = try self.allocator.dupe(GlyphPosition, glyphs);
+        errdefer self.allocator.free(owned_glyphs);
+        const owned_clusters = try self.allocator.dupe(Cluster, clusters);
+        errdefer self.allocator.free(owned_clusters);
+        try self.map.ensureUnusedCapacity(self.allocator, 1);
+        if (self.map.fetchRemove(key)) |old| self.freeEntry(old.value);
+        if (self.map.count() >= self.capacity) self.evictBatch();
+        self.makeRoom(bytes);
+        self.map.putAssumeCapacity(key, .{
             .key = key,
             .glyphs = owned_glyphs,
             .clusters = owned_clusters,
@@ -224,29 +231,60 @@ pub const ShapingCache = struct {
             .total_advance = total_advance,
             .last_used_frame = self.current_frame,
         });
+        self.live_payload_bytes += bytes;
+        self.peak_payload_bytes = @max(self.peak_payload_bytes, self.live_payload_bytes);
+    }
+
+    fn entryBytes(entry: Entry) usize {
+        return entry.glyphs.len * @sizeOf(GlyphPosition) + entry.clusters.len * @sizeOf(Cluster);
+    }
+    fn freeEntry(self: *ShapingCache, entry: Entry) void {
+        self.live_payload_bytes -= entryBytes(entry);
+        self.allocator.free(entry.glyphs);
+        self.allocator.free(entry.clusters);
+    }
+    fn freeVisual(self: *ShapingCache, entry: VisualEntry) void {
+        self.live_payload_bytes -= entry.caret_stops.len * @sizeOf(text_coordinates.CaretStop);
+        self.allocator.free(entry.caret_stops);
+    }
+    fn evictOldestVisual(self: *ShapingCache) void {
+        var key: ?ShapingKey = null;
+        var frame: u64 = std.math.maxInt(u64);
+        var it = self.visual_map.iterator();
+        while (it.next()) |kv| if (key == null or kv.value_ptr.last_used_frame < frame) {
+            key = kv.key_ptr.*;
+            frame = kv.value_ptr.last_used_frame;
+        };
+        if (key) |k| {
+            self.freeVisual(self.visual_map.fetchRemove(k).?.value);
+            self.stats.evictions += 1;
+        }
+    }
+    fn makeRoom(self: *ShapingCache, incoming: usize) void {
+        while (self.live_payload_bytes > self.max_payload_bytes - incoming) {
+            var key: ?ShapingKey = null;
+            var frame: u64 = std.math.maxInt(u64);
+            var it = self.map.iterator();
+            while (it.next()) |kv| if (key == null or kv.value_ptr.last_used_frame < frame) {
+                key = kv.key_ptr.*;
+                frame = kv.value_ptr.last_used_frame;
+            };
+            var visual_frame: u64 = std.math.maxInt(u64);
+            var vi = self.visual_map.valueIterator();
+            while (vi.next()) |v| visual_frame = @min(visual_frame, v.last_used_frame);
+            if (key != null and (self.visual_map.count() == 0 or frame <= visual_frame)) {
+                self.freeEntry(self.map.fetchRemove(key.?).?.value);
+                self.stats.evictions += 1;
+            } else self.evictOldestVisual();
+        }
     }
 
     /// Entries unused for more than this frame count are stale; batch eviction prioritizes clearing
     /// them.
     const STALE_FRAMES: u64 = 120;
-    /// Entry slices hung on internal arena; evict individually without reclaiming memory.
-    /// When arena exceeds threshold, clear fully (map + arena reset); next frame reshapes hot set.
-    const ARENA_CLEAR_BYTES: usize = 32 * 1024 * 1024;
-
-    /// Batch eviction: old per-entry LRU when full scans O(capacity) per miss with no arena
-    /// reclaim. Free >= capacity/4 per eviction, amortizing scan cost to O(4)/miss.
+    /// Preserve the existing age/quarter-batch policy, now releasing every payload.
     fn evictBatch(self: *ShapingCache) void {
         if (self.map.count() == 0) return;
-
-        if (self.arena.queryCapacity() >= ARENA_CLEAR_BYTES) {
-            // Unbounded arena growth fallback: reset fully. Cost is peak shaping next frame;
-            // happens rarely.
-            self.stats.evictions += self.map.count();
-            self.map.clearRetainingCapacity();
-            self.visual_map.clearRetainingCapacity();
-            _ = self.arena.reset(.retain_capacity);
-            return;
-        }
 
         const target: u64 = @max(self.capacity / 4, 1);
         // Progressively tighten age threshold: scan all, batch removeByPtr (remove no rehash;
@@ -261,6 +299,7 @@ pub const ShapingCache = struct {
             var iter = self.map.iterator();
             while (iter.next()) |kv| {
                 if (kv.value_ptr.last_used_frame <= cutoff) {
+                    self.freeEntry(kv.value_ptr.*);
                     self.map.removeByPtr(kv.key_ptr);
                     removed += 1;
                 }
@@ -269,6 +308,38 @@ pub const ShapingCache = struct {
             age_threshold /= 2;
         }
         self.stats.evictions += removed;
+    }
+
+    pub const MemoryStats = struct {
+        arena_capacity_bytes: usize,
+        arena_used_bytes: usize,
+        arena_requested_bytes: usize,
+        live_payload_bytes: usize,
+        peak_payload_bytes: usize,
+        payload_budget_bytes: usize,
+        entries: usize,
+        visual_entries: usize,
+        hits: u64,
+        misses: u64,
+        evictions: u64,
+    };
+    /// Entry-owned requested payload; map metadata is reported separately by
+    /// subsystem allocation probes. Arena compatibility counters are always zero.
+    pub fn memoryStats(self: *const ShapingCache) MemoryStats {
+        return .{
+            // Compatibility fields intentionally become zero after arena removal.
+            .arena_capacity_bytes = 0,
+            .arena_used_bytes = 0,
+            .arena_requested_bytes = 0,
+            .live_payload_bytes = self.live_payload_bytes,
+            .peak_payload_bytes = self.peak_payload_bytes,
+            .payload_budget_bytes = self.max_payload_bytes,
+            .entries = self.map.count(),
+            .visual_entries = self.visual_map.count(),
+            .hits = self.stats.hits,
+            .misses = self.stats.misses,
+            .evictions = self.stats.evictions,
+        };
     }
 
     pub fn count(self: *const ShapingCache) u32 {
@@ -382,4 +453,74 @@ test "ShapingCache: stats hits + misses tracked" {
     try testing.expectEqual(@as(u64, 3), cache.stats.hits);
     try testing.expectEqual(@as(u64, 2), cache.stats.misses);
     try testing.expectApproxEqAbs(@as(f64, 0.6), cache.stats.hitRate(), 0.001);
+}
+
+test "ShapingCache: CPU pressure ownership ledger" {
+    var cache = ShapingCache.init(testing.allocator, 1024);
+    defer cache.deinit();
+    const glyphs: [16]GlyphPosition = @splat(.{ .glyph_id = 1, .x_advance = 10 });
+    const clusters: [16]Cluster = @splat(.{ .byte_offset = 0, .glyph_start = 0, .glyph_end = 1 });
+    for (0..20_000) |i| {
+        cache.beginFrame();
+        try cache.insert(.{ .text_hash = i, .text_len = 16, .font_id = 0, .max_width = 0, .font_size = 14 }, &glyphs, &clusters, .{ .ascent = 0, .descent = 0, .line_gap = 0, .font_size = 14 }, .ltr, 160);
+    }
+    const s = cache.memoryStats();
+    std.debug.print("CPU_SHAPING_PRESSURE capacity={d} used={d} live={d} entries={d} evictions={d}\n", .{ s.arena_capacity_bytes, s.arena_used_bytes, s.live_payload_bytes, s.entries, s.evictions });
+    try testing.expect(s.evictions > 0);
+    try testing.expectEqual(@as(usize, 0), s.arena_capacity_bytes);
+    try testing.expect(s.live_payload_bytes <= 1024 * 16 * (@sizeOf(GlyphPosition) + @sizeOf(Cluster)));
+}
+
+fn checkShapingOwnershipOom(allocator: std.mem.Allocator) !void {
+    var cache = ShapingCache.init(allocator, 1);
+    defer cache.deinit();
+    const key = ShapingKey{ .text_hash = 1, .text_len = 1, .font_id = 0, .max_width = 0, .font_size = 14 };
+    const g = [_]GlyphPosition{.{ .glyph_id = 1, .x_advance = 10 }};
+    const c = [_]Cluster{.{ .byte_offset = 0, .glyph_start = 0, .glyph_end = 1 }};
+    const m = FontMetrics{ .ascent = 0, .descent = 0, .line_gap = 0, .font_size = 14 };
+    try cache.insert(key, &g, &c, m, .ltr, 10);
+    const old = cache.lookup(key).?;
+    var next = key;
+    next.text_hash = 2;
+    cache.insert(next, &g, &c, m, .ltr, 20) catch |err| {
+        try testing.expectEqual(@intFromPtr(old.glyphs.ptr), @intFromPtr(cache.lookup(key).?.glyphs.ptr));
+        try testing.expectEqual(@as(f32, 10), cache.lookup(key).?.total_advance);
+        return err;
+    };
+    const stops = [_]text_coordinates.CaretStop{.{ .position = .{ .byte = .{ .value = 0 } }, .x = .{ .value = 0 }, .strong_direction = .ltr }};
+    const line = text_coordinates.VisualLine{ .source_start = .{ .value = 0 }, .source_end = .{ .value = 1 }, .caret_stops = &stops, .width = 10 };
+    try cache.insertVisual(key, line);
+    const visual = cache.lookupVisual(key).?;
+    var replacement = visual;
+    replacement.width = 20;
+    cache.insertVisual(key, replacement) catch |err| {
+        try testing.expectEqual(@intFromPtr(visual.caret_stops.ptr), @intFromPtr(cache.lookupVisual(key).?.caret_stops.ptr));
+        try testing.expectEqual(@as(f32, 10), cache.lookupVisual(key).?.width);
+        return err;
+    };
+    try testing.expectEqual(@as(f32, 20), cache.lookupVisual(key).?.width);
+}
+
+test "ShapingCache: owned payload replacement and eviction exhaustively roll back OOM" {
+    try testing.checkAllAllocationFailures(testing.allocator, checkShapingOwnershipOom, .{});
+}
+
+test "ShapingCache: byte pressure bounds payload without reducing entry capacity" {
+    var counter = @import("counting_allocator.zig").CountingAllocator{ .parent = testing.allocator };
+    var cache = ShapingCache.init(counter.allocator(), 128);
+    const g = [_]GlyphPosition{.{ .glyph_id = 1, .x_advance = 10 }};
+    const c = [_]Cluster{.{ .byte_offset = 0, .glyph_start = 0, .glyph_end = 1 }};
+    const m = FontMetrics{ .ascent = 0, .descent = 0, .line_gap = 0, .font_size = 14 };
+    cache.max_payload_bytes = 2 * (@sizeOf(GlyphPosition) + @sizeOf(Cluster));
+    for (0..100) |i| {
+        cache.beginFrame();
+        const key = ShapingKey{ .text_hash = i, .text_len = 1, .font_id = 0, .max_width = 0, .font_size = 14 };
+        try cache.insert(key, &g, &c, m, .ltr, 10);
+        try testing.expect(cache.live_payload_bytes <= cache.max_payload_bytes);
+        try testing.expectEqual(@as(u32, 128), cache.capacity);
+        try testing.expect(cache.lookup(key) != null);
+    }
+    try testing.expectEqual(@as(u32, 2), cache.count());
+    cache.deinit();
+    try testing.expectEqual(@as(usize, 0), counter.live_bytes);
 }

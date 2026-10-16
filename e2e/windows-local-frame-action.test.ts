@@ -1,4 +1,4 @@
-import { clickTestId, key, query, readFrameObservation, request, sleep, startFrameObservation, waitForServerReady } from './client';
+import { clickTestId, key, query, readFrameObservation, request, tree, sleep, startFrameObservation, waitForServerReady } from './client';
 import { assert, run, test } from './runner';
 
 test('Windows frame observation starts with a local click and cancels failed actions', async () => {
@@ -27,8 +27,11 @@ test('Windows frame observation starts with a local click and cancels failed act
     const observed = await readFrameObservation();
     console.log(`  cycle=${cycle} frames=${JSON.stringify(observed)}`);
     assert(!observed.overflow && observed.missing === 0 && observed.frames.length >= 3, 'incomplete local frame observation');
-    assert(observed.frames.some(f => f.x > 788 && f.x < 1098), 'no submitted intermediate geometry');
-    assert(Math.abs(observed.frames.at(-1)!.x - 780) < 2, 'Sheet did not settle at its edge');
+    const viewport = (await tree()).rect;
+    const panel = (await query('story.sheet.panel'))[0].rect;
+    const left = viewport.w-panel.w;
+    assert(observed.frames.some(f => f.x > left+8 && f.x < viewport.w-2), 'no submitted intermediate geometry');
+    assert(Math.abs(observed.frames.at(-1)!.x - left) < 2, 'Sheet did not settle at its edge');
     const after = await request('POST', '/windows/native-input', { action: 'status' });
     assert(!after.foreground_owned && after.foreground_hwnd === foreground.foreground_hwnd, 'local action changed system foreground');
     await key('escape');

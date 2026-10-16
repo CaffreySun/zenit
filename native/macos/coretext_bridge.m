@@ -6,6 +6,8 @@
 #include <limits.h>
 #include <math.h>
 
+static NSString *zenitCTStringFromUTF8(const char *bytes, NSUInteger len);
+
 // ============================================================================
 // Font Creation
 // ============================================================================
@@ -460,9 +462,7 @@ float coretext_measure_text_width_with_font(void* font_ptr, const char* text, in
     @autoreleasepool {
         if (!font_ptr || !text || len <= 0) return 0.0f;
 
-        NSString *nsText = [[NSString alloc] initWithBytes:text
-                                                    length:(NSUInteger)len
-                                                  encoding:NSUTF8StringEncoding];
+        NSString *nsText = zenitCTStringFromUTF8(text, (NSUInteger)len);
         if (!nsText || nsText.length == 0) return 0.0f;
 
         CTFontRef font = (CTFontRef)font_ptr;
@@ -479,9 +479,7 @@ float coretext_measure_text_width_with_font(void* font_ptr, const char* text, in
 float coretext_measure_text_width_utf8(const char* text, int len, float font_size) {
     if (!text || len <= 0) return 0.0f;
 
-    NSString *nsText = [[NSString alloc] initWithBytes:text
-                                                length:(NSUInteger)len
-                                              encoding:NSUTF8StringEncoding];
+    NSString *nsText = zenitCTStringFromUTF8(text, (NSUInteger)len);
     if (!nsText || nsText.length == 0) return 0.0f;
 
     CTFontRef font = CTFontCreateWithName(CFSTR("PingFang SC"), font_size, NULL);
@@ -509,9 +507,7 @@ float coretext_measure_text_width_weighted(const char* text, int len, float font
         // weight == 400: use existing logic (perf optimization)
         if (font_weight <= 400) return coretext_measure_text_width_utf8(text, len, font_size);
 
-        NSString *nsText = [[NSString alloc] initWithBytes:text
-                                                    length:(NSUInteger)len
-                                                  encoding:NSUTF8StringEncoding];
+        NSString *nsText = zenitCTStringFromUTF8(text, (NSUInteger)len);
         if (!nsText || nsText.length == 0) return 0.0f;
 
         CTFontRef font = createFontWithWeight(font_size, font_weight);
@@ -818,17 +814,60 @@ typedef struct {
     unsigned int base_rtl;
 } CoreTextLineMetrics;
 
-// Foundation UTF-8 decoding (initWithBytes/CFStringCreateWithBytes) silently
-// drops leading BOM (EF BB BF -> U+FEFF). Caller provides UTF-8 byte offsets;
-// if NSString lacks U+FEFF, UTF-8<->UTF-16 mapping shifts 3 bytes: all cluster
-// offsets wrong, caret stops fail at byte 3. Restore the dropped U+FEFF.
+// Decode one UTF-8/WTF-8 storage sequence. Surrogates are accepted; all
+// other UTF-8 restrictions still apply. Mapping uses original storage bytes,
+// not re-encoding NSString (which would lose isolated surrogate identities).
+static bool zenitCTDecodeStorage(const char *bytes, NSUInteger len, NSUInteger *offset, uint32_t *cp) {
+    if (*offset >= len) return false;
+    const unsigned char *b = (const unsigned char *)bytes + *offset;
+    unsigned int n;
+    uint32_t value;
+    if (b[0] < 0x80) { n = 1; value = b[0]; }
+    else if (b[0] >= 0xC2 && b[0] <= 0xDF) { n = 2; value = b[0] & 0x1F; }
+    else if (b[0] >= 0xE0 && b[0] <= 0xEF) { n = 3; value = b[0] & 0x0F; }
+    else if (b[0] >= 0xF0 && b[0] <= 0xF4) { n = 4; value = b[0] & 7; }
+    else return false;
+    if (n > len - *offset) return false;
+    for (unsigned int i = 1; i < n; i++) {
+        if ((b[i] & 0xC0) != 0x80) return false;
+        value = (value << 6) | (b[i] & 0x3F);
+    }
+    if ((n == 2 && value < 0x80) || (n == 3 && value < 0x800) ||
+        (n == 4 && (value < 0x10000 || value > 0x10FFFF))) return false;
+    *offset += n;
+    *cp = value;
+    return true;
+}
+
 static NSString *zenitCTStringFromUTF8(const char *bytes, NSUInteger len) {
     NSString *s = [[NSString alloc] initWithBytes:bytes length:len encoding:NSUTF8StringEncoding];
-    if (!s) return nil;
-    if (len >= 3 && (unsigned char)bytes[0] == 0xEF && (unsigned char)bytes[1] == 0xBB &&
-        (unsigned char)bytes[2] == 0xBF && (s.length == 0 || [s characterAtIndex:0] != 0xFEFF)) {
-        s = [@"\uFEFF" stringByAppendingString:s];
+    const bool startsBOM = len >= 3 && (unsigned char)bytes[0] == 0xEF &&
+        (unsigned char)bytes[1] == 0xBB && (unsigned char)bytes[2] == 0xBF;
+    // Parse leading BOMs ourselves: Foundation can strip one, and checking
+    // the first resulting character cannot distinguish repeated BOMs.
+    if (s && !startsBOM) return s;
+    if (len > SIZE_MAX / sizeof(unichar)) return nil;
+    unichar *units = malloc(len * sizeof(unichar));
+    if (!units) return nil;
+    NSUInteger offset = 0, count = 0;
+    while (offset < len) {
+        uint32_t cp;
+        if (!zenitCTDecodeStorage(bytes, len, &offset, &cp)) { free(units); return nil; }
+        if (cp <= 0xFFFF) units[count++] = (unichar)cp;
+        else {
+            units[count++] = (unichar)(0xD800 + ((cp - 0x10000) >> 10));
+            units[count++] = (unichar)(0xDC00 + ((cp - 0x10000) & 0x3FF));
+        }
     }
+    // Rendering replaces only unpaired units. Preserve unit count so the
+    // original storage-byte maps remain valid; adjacent halves render as a pair.
+    for (NSUInteger i = 0; i < count; i++) {
+        if (units[i] >= 0xD800 && units[i] <= 0xDBFF && i + 1 < count &&
+            units[i + 1] >= 0xDC00 && units[i + 1] <= 0xDFFF) { i++; continue; }
+        if (units[i] >= 0xD800 && units[i] <= 0xDFFF) units[i] = 0xFFFD;
+    }
+    s = [[NSString alloc] initWithCharacters:units length:count];
+    free(units);
     return s;
 }
 
@@ -878,20 +917,17 @@ int coretext_line_caret_stops(
             return -1;
         }
         for (unsigned int i = 0; i <= text_len; i++) utf8_to_utf16[i] = UINT_MAX;
-        const NSUInteger utf16_len = nsText.length;
-        unsigned int utf8_pos = 0;
-        for (NSUInteger i = 0; i < utf16_len && utf8_pos <= text_len; i++) {
-            utf8_to_utf16[utf8_pos] = (unsigned int)i;
-            unichar ch = [nsText characterAtIndex:i];
-            if (ch < 0x80) utf8_pos += 1;
-            else if (ch < 0x800) utf8_pos += 2;
-            else if (CFStringIsSurrogateHighCharacter(ch) && i + 1 < utf16_len &&
-                     CFStringIsSurrogateLowCharacter([nsText characterAtIndex:i + 1])) {
-                utf8_pos += 4;
-                i += 1;
-            } else utf8_pos += 3;
+        NSUInteger byte = 0;
+        unsigned int wide = 0;
+        while (byte < text_len) {
+            utf8_to_utf16[byte] = wide;
+            uint32_t cp;
+            if (!zenitCTDecodeStorage(text, text_len, &byte, &cp)) {
+                free(utf8_to_utf16); CFRelease(line); return -1;
+            }
+            wide += cp > 0xFFFF ? 2 : 1;
         }
-        utf8_to_utf16[text_len] = (unsigned int)utf16_len;
+        utf8_to_utf16[text_len] = wide;
 
         for (unsigned int i = 0; i < boundary_count; i++) {
             const unsigned int byte = boundaries[i];
@@ -967,33 +1003,27 @@ int coretext_shape_text(
             return -1;
         }
 
-        // Build UTF-16 to UTF-8 byte offset mapping for cluster info
-        // NSString uses UTF-16 internally, but we want UTF-8 byte clusters
-        const char* utf8Bytes = text;
-        unsigned int utf8Len = text_len;
-
-        // Create a mapping from UTF-16 index to UTF-8 byte offset
+        // Map original storage bytes, including six-byte surrogate pairs
+        // created at edit seams. Both units of a four-byte scalar map to its start.
         NSUInteger utf16Len = nsText.length;
-        unsigned int* utf16ToUtf8 = (unsigned int*)calloc(utf16Len + 1, sizeof(unsigned int));
-        if (utf16ToUtf8) {
-            unsigned int utf8Pos = 0;
-            for (NSUInteger i = 0; i < utf16Len && utf8Pos <= utf8Len; i++) {
-                utf16ToUtf8[i] = utf8Pos;
-                unichar ch = [nsText characterAtIndex:i];
-                if (ch < 0x80) utf8Pos += 1;
-                else if (ch < 0x800) utf8Pos += 2;
-                else if (ch >= 0xD800 && ch <= 0xDBFF) {
-                    utf8Pos += 4;
-                    i++; // skip low surrogate
-                    if (i < utf16Len) utf16ToUtf8[i] = utf8Pos;
-                }
-                else utf8Pos += 3;
-            }
-            // Sentinel
-            if (utf16Len < utf16Len + 1) {
-                utf16ToUtf8[utf16Len] = utf8Pos;
-            }
+        unsigned int* utf16ToUtf8 = calloc(utf16Len + 1, sizeof(unsigned int));
+        if (!utf16ToUtf8) {
+            free(glyphs); CFRelease(line); if (baseCgFont) CFRelease(baseCgFont);
+            return -1;
         }
+        NSUInteger byte = 0, wide = 0;
+        while (byte < text_len) {
+            const unsigned int start = (unsigned int)byte;
+            uint32_t cp;
+            if (!zenitCTDecodeStorage(text, text_len, &byte, &cp)) {
+                free(utf16ToUtf8); free(glyphs); CFRelease(line);
+                if (baseCgFont) CFRelease(baseCgFont);
+                return -1;
+            }
+            utf16ToUtf8[wide++] = start;
+            if (cp > 0xFFFF) utf16ToUtf8[wide++] = start;
+        }
+        utf16ToUtf8[wide] = text_len;
 
         // Extract glyph info from all runs
         unsigned int glyphIdx = 0;

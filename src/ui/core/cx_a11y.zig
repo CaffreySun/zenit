@@ -2,6 +2,7 @@
 //! to macOS bridge (execute action / set focus / set value / text geometry query). projection rules
 //! themselves in a11y_projection.zig (doesn't hold *Cx).
 
+const builtin = @import("builtin");
 const core = @import("../core.zig");
 const Cx = core.Cx;
 const cx_input = @import("cx_input.zig");
@@ -15,12 +16,49 @@ const a11y_router_mod = @import("../a11y/nsaccessibility_router.zig");
 const a11y_tree_mod = @import("../a11y/tree.zig");
 const core_types = @import("types.zig");
 
+pub fn syncOrDeferA11yProjection(self: *Cx, root: *Node) void {
+    if (!self.a11y_on_demand or builtin.os.tag != .macos or a11y_macos_bridge_mod.clientsSeen()) {
+        syncA11yTreeFromInteractions(self, root);
+        return;
+    }
+    self.a11y_projection_stale = true;
+    // Stay registered so the first query reaches this window and projects it.
+    registerA11yContext(self);
+    a11y_macos_bridge_mod.setProjectionDemand(cx_platform.a11yWindowKey(self), .{
+        .ctx = self,
+        .project = &cxA11yProjectOnDemand,
+    });
+}
+
+fn cxA11yProjectOnDemand(ctx: *anyopaque) void {
+    const self: *Cx = @ptrCast(@alignCast(ctx));
+    if (!self.a11y_projection_stale) return;
+    const root = self.root orelse return;
+    syncA11yTreeFromInteractions(self, root);
+}
+
 pub fn syncA11yTreeFromInteractions(self: *Cx, root: *Node) void {
+    // Cleared first: the push flush below can call back into the bridge.
+    self.a11y_projection_stale = false;
     self.a11y_label_buf.clearRetainingCapacity(self.allocator);
     self.accessibility_tree.beginProjection();
     var sibling_counter: u32 = 0;
     syncA11yNodeRecursive(self, root, AXId.NULL, &sibling_counter, false);
     self.accessibility_tree.finishProjection() catch @panic("OOM: a11y tree stale-node sweep");
+    registerA11yContext(self);
+    // Push the complete retained-tree diff to the exact native virtual
+    // element. The legacy SystemSdk snapshot path remains available only
+    // for callers which invoke it explicitly.
+    self.a11y_push_cx_ref.window_id = cx_platform.a11yWindowKey(self);
+    self.a11y_push_cx_ref.label_ctx = self;
+    self.a11y_push_cx_ref.label_resolver = &cxA11yLabelResolver;
+    a11y_router_mod.flushToBridge(
+        &self.accessibility_tree,
+        a11y_macos_bridge_mod.pushBridge(&self.a11y_push_cx_ref),
+    );
+}
+
+fn registerA11yContext(self: *Cx) void {
     // inject active pointer into macos_bridge, ObjC NSAccessibility protocol methods (from C call
     // zenit_a11y_*) bring their own window_id back to query this table, multi-window each queries
     // its own tree. registration fail only possible if table full (MAX_WINDOWS windows), then that
@@ -41,16 +79,6 @@ pub fn syncA11yTreeFromInteractions(self: *Cx, root: *Node) void {
     )) {
         core.a11y_context_register_failures +%= 1;
     }
-    // Push the complete retained-tree diff to the exact native virtual
-    // element. The legacy SystemSdk snapshot path remains available only
-    // for callers which invoke it explicitly.
-    self.a11y_push_cx_ref.window_id = cx_platform.a11yWindowKey(self);
-    self.a11y_push_cx_ref.label_ctx = self;
-    self.a11y_push_cx_ref.label_resolver = &cxA11yLabelResolver;
-    a11y_router_mod.flushToBridge(
-        &self.accessibility_tree,
-        a11y_macos_bridge_mod.pushBridge(&self.a11y_push_cx_ref),
-    );
 }
 
 fn cxA11yLabelResolver(ctx: *anyopaque, hash: u64) ?[]const u8 {

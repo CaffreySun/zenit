@@ -1,4 +1,5 @@
 const std = @import("std");
+const owned_window = @import("../owned_window.zig");
 
 /// macOS native window using Cocoa API. Bypasses GLFW entirely to solve rendering stall during
 /// window drag.
@@ -7,6 +8,9 @@ pub const MacOSWindow = struct {
     view_ptr: *anyopaque,
     width: u32,
     height: u32,
+    /// Focus loss recorded by the native resign-key callback, consumed by the
+    /// runtime between events (see `armFocusLossReporting`).
+    pending_focus_loss: ?owned_window.FocusLoss = null,
 
     // Objective-C C API function declarations
     extern fn macos_init_app() void;
@@ -60,6 +64,7 @@ pub const MacOSWindow = struct {
     extern fn macos_perform_window_drag(window_ptr: *anyopaque) void;
     extern fn macos_set_traffic_lights_inset(window_ptr: *anyopaque, inset_x: f32, inset_y: f32) void;
     extern fn macos_set_titlebar_drag_height(window_ptr: *anyopaque, height: f32) void;
+    extern fn macos_set_window_title(window_ptr: *anyopaque, title: [*:0]const u8) void;
     extern fn macos_set_titlebar_hit_callback(window_ptr: *anyopaque, cb: ?*const fn (?*anyopaque, f32, f32) callconv(.c) c_int, ctx: ?*anyopaque) void;
     extern fn macos_set_titlebar_drag_right_inset(window_ptr: *anyopaque, inset: f32) void;
     extern fn macos_destroy_window(window_ptr: *anyopaque) void;
@@ -609,6 +614,54 @@ pub const MacOSWindow = struct {
         macos_make_key_window(self.window_ptr);
     }
 
+    extern fn macos_add_child_window(parent_ptr: *anyopaque, child_ptr: *anyopaque) void;
+    extern fn macos_remove_child_window(parent_ptr: *anyopaque, child_ptr: *anyopaque) void;
+    extern fn macos_get_centering_geometry(child_ptr: *anyopaque, parent_ptr: *anyopaque, host_x: *f64, host_y: *f64, host_w: *f64, host_h: *f64, panel_w: *f64, panel_h: *f64, vis_x: *f64, vis_y: *f64, vis_w: *f64, vis_h: *f64) c_int;
+    extern fn macos_set_window_origin(window_ptr: *anyopaque, x: f64, y: f64) void;
+    extern fn macos_set_resign_key_callback(window_ptr: *anyopaque, cb: ?*const fn (?*anyopaque, c_int) callconv(.c) void, ctx: ?*anyopaque) void;
+
+    /// Attach this window to `owner`: it stays above the owner, comes forward
+    /// with it, and never floats over other applications.
+    pub fn setOwner(self: *MacOSWindow, owner: *MacOSWindow) bool {
+        macos_add_child_window(owner.window_ptr, self.window_ptr);
+        return true;
+    }
+
+    pub fn clearOwner(self: *MacOSWindow, owner: *MacOSWindow) void {
+        macos_remove_child_window(owner.window_ptr, self.window_ptr);
+    }
+
+    /// Centre on `owner` (see owned_window.centerOnOwner). Must run after the
+    /// window has its final size. Leaves the window where it is when the
+    /// geometry is unavailable.
+    pub fn centerOnOwner(self: *MacOSWindow, owner: *MacOSWindow) bool {
+        var host: owned_window.Rect = undefined;
+        var visible: owned_window.Rect = undefined;
+        var panel_w: f64 = 0;
+        var panel_h: f64 = 0;
+        if (macos_get_centering_geometry(self.window_ptr, owner.window_ptr, &host.x, &host.y, &host.w, &host.h, &panel_w, &panel_h, &visible.x, &visible.y, &visible.w, &visible.h) == 0) return false;
+        const origin = owned_window.centerOnOwner(host, panel_w, panel_h, visible, .up);
+        macos_set_window_origin(self.window_ptr, origin.x, origin.y);
+        return true;
+    }
+
+    /// Record resign-key notifications into `pending_focus_loss`. `self` must
+    /// be at its final address. The native side clears the callback when the
+    /// window starts closing.
+    pub fn armFocusLossReporting(self: *MacOSWindow) void {
+        macos_set_resign_key_callback(self.window_ptr, focusLossCallback, self);
+    }
+
+    pub fn takeFocusLoss(self: *MacOSWindow) ?owned_window.FocusLoss {
+        defer self.pending_focus_loss = null;
+        return self.pending_focus_loss;
+    }
+
+    fn focusLossCallback(ctx: ?*anyopaque, new_key_is_app: c_int) callconv(.c) void {
+        const self: *MacOSWindow = @ptrCast(@alignCast(ctx orelse return));
+        self.pending_focus_loss = if (new_key_is_app != 0) .same_application else .other_application;
+    }
+
     pub const ScrollEvent = struct {
         sequence: u64,
         x: f32,
@@ -807,6 +860,11 @@ pub const MacOSWindow = struct {
         macos_set_titlebar_hit_callback(self.window_ptr, cb, ctx);
     }
 
+    /// Change the window title after creation.
+    pub fn setTitle(self: *MacOSWindow, title: [:0]const u8) void {
+        macos_set_window_title(self.window_ptr, title.ptr);
+    }
+
     pub fn setTitlebarDragHeight(self: *MacOSWindow, height: f32) void {
         macos_set_titlebar_drag_height(self.window_ptr, height);
     }
@@ -856,6 +914,12 @@ pub const MacOSWindow = struct {
     /// Check global exit flag (Cmd+Q or terminate:)
     pub fn appShouldQuit() bool {
         return macos_should_quit() != 0;
+    }
+
+    extern fn macos_cancel_app_quit() void;
+    /// Withdraw a pending user quit request after the application vetoed it.
+    pub fn cancelAppQuit() void {
+        macos_cancel_app_quit();
     }
 
     /// Consume "app became foreground" flag: returns true and resets internally (one true per

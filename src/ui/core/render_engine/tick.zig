@@ -306,7 +306,7 @@ pub fn runBeforeRenderHook(node: *Node, hook: *const fn (*Node) void) bool {
     // ZENIT_SELF_SCOPE_AUDIT_EVERY_FRAME=1 restores per-frame auditing (debugging).
     const audit_sampled = selfScopeAuditEveryFrameEnabled() or (g_debug_frame % 64 == 1);
     const audit = (@import("builtin").mode == .debug or @import("builtin").mode == .safe) and
-        node.frame_state.state_bits.flags.before_render_hook_affects_self_only and
+        node.beforeRenderHooksSelfOnly() and
         audit_sampled;
     var audit_buf: [self_scope_audit_max]SelfScopeAuditEntry = undefined;
     var audit_count: usize = 0;

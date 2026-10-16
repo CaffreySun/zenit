@@ -414,20 +414,39 @@ fn findActionContextNode(node: *Node, context: []const u8) ?*Node {
 
 pub fn handleKeyDown(self: *Cx, key: KeyCode, modifiers: Modifiers) void {
     self.needs_redraw = true;
-    if (inspector_mod.isToggleShortcut(key, modifiers)) {
-        self.inspector.enabled = !self.inspector.enabled;
-        if (!self.inspector.enabled) {
-            self.inspector.pick_mode = false;
-            self.inspector.clearSelection();
-        }
+    // The inspector is a development overlay: its chord (Ctrl+Shift+I on
+    // Windows/Linux) is also an ordinary application shortcut there, so the
+    // application gets the key first and the inspector only opens when nothing
+    // handled it. Closing an open inspector always works.
+    const inspector_key = inspector_mod.isToggleShortcut(key, modifiers);
+    if (inspector_key and self.inspector.enabled) {
+        self.inspector.enabled = false;
+        self.inspector.pick_mode = false;
+        self.inspector.clearSelection();
         return;
     }
+    if (routeKeyDown(self, key, modifiers)) return;
+    if (inspector_key) self.inspector.enabled = true;
+}
+
+/// Delivers a key press; true when something consumed it.
+fn routeKeyDown(self: *Cx, key: KeyCode, modifiers: Modifiers) bool {
     // Drag session consumes Escape first (must be before overlay stack, else one Escape both
     // cancels the drag and dismisses the top overlay). Pending is silently cleaned, active emits
     // cancel; both swallow this Escape.
-    if (key == .escape and self.drag_manager.handleEscape(self)) return;
+    if (key == .escape and self.drag_manager.handleEscape(self)) return true;
+    if (key == .escape) {
+        if (self.focus_manager.getFocused()) |focused| {
+            if (focused.behavior.interaction.text_input_client) |client| {
+                if (client.is_composing) |composing| if (composing(client.context)) {
+                    _ = self.dispatcher.dispatchKeyDown(focused, .{ .key = key, .modifiers = modifiers });
+                    return true;
+                };
+            }
+        }
+    }
     // OverlayStack: Escape only closes topmost overlay
-    if (key == .escape and self.overlay_stack.handleEscape()) return;
+    if (key == .escape and self.overlay_stack.handleEscape()) return true;
 
     if (key == .tab) {
         // Dispatch to focused node first (editors need to intercept Tab for indent)
@@ -436,7 +455,7 @@ pub fn handleKeyDown(self: *Cx, key: KeyCode, modifiers: Modifiers) void {
                 .key = key,
                 .modifiers = modifiers,
             });
-            if (events_mod.preventsDefault(result)) return;
+            if (events_mod.preventsDefault(result)) return true;
         }
         // Node unhandled, execute default focus switch
         if (modifiers.shift) {
@@ -444,7 +463,7 @@ pub fn handleKeyDown(self: *Cx, key: KeyCode, modifiers: Modifiers) void {
         } else {
             self.focus_manager.focusNext();
         }
-        return;
+        return true;
     }
 
     if (self.focus_manager.getFocused()) |focused| {
@@ -454,8 +473,8 @@ pub fn handleKeyDown(self: *Cx, key: KeyCode, modifiers: Modifiers) void {
         // Query Action binding first
         if (self.action_dispatcher.matchKey(key, modifiers)) |action| {
             const result = self.action_dispatcher.dispatchAction(action, focused);
-            if (events_mod.preventsDefault(result)) return;
-            if (resolveKeyboardTarget(self, keyboard_target) == null) return;
+            if (events_mod.preventsDefault(result)) return true;
+            if (resolveKeyboardTarget(self, keyboard_target) == null) return true;
         }
 
         // Space/Enter: dispatch key_down first, if unhandled synthesize click
@@ -468,27 +487,28 @@ pub fn handleKeyDown(self: *Cx, key: KeyCode, modifiers: Modifiers) void {
                 // A key handler may destroy/rebind its node or redirect
                 // focus. Default activation belongs only to the original
                 // still-live, still-focused owner of this key sequence.
-                const live_target = resolveKeyboardTarget(self, keyboard_target) orelse return;
+                const live_target = resolveKeyboardTarget(self, keyboard_target) orelse return true;
                 _ = self.dispatcher.dispatch(Event{ .click = .{
                     .x = 0,
                     .y = 0,
                     .modifiers = modifiers,
                 } }, live_target);
             }
-            return;
+            return true;
         }
 
-        _ = self.dispatcher.dispatchKeyDown(focused, .{
+        return events_mod.preventsDefault(self.dispatcher.dispatchKeyDown(focused, .{
             .key = key,
             .modifiers = modifiers,
-        });
+        }));
     } else if (unfocusedKeyTarget(self)) |root| {
         // No focused node, fallback to the application root so app/island-level shortcuts work
-        _ = self.dispatcher.dispatchKeyDown(root, .{
+        return events_mod.preventsDefault(self.dispatcher.dispatchKeyDown(root, .{
             .key = key,
             .modifiers = modifiers,
-        });
+        }));
     }
+    return false;
 }
 
 /// Target for keys while nothing has focus: the application's mounted tree, else the root.

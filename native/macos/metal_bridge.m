@@ -1,3 +1,4 @@
+#include <pthread.h>
 /// Metal C API Bridge
 ///
 /// Provides C API for Zig code to call Metal Objective-C API
@@ -23,17 +24,43 @@
 /// nextDrawable block forever and freezes the screen.
 ///
 /// Known exceptions (do not 'unify' carelessly, introduces new leaks):
-///   `metal_drawable_get_texture` in window_bridge.m is
+///   `metal_drawable_get_texture` below is
 ///   [borrowed] (__bridge). Zig side surface.zig must retain it.
 
 #import <Metal/Metal.h>
+#import <objc/runtime.h>
 #import <QuartzCore/CAMetalLayer.h>
 #include <stdatomic.h>
+#include <errno.h>
 #import <Foundation/Foundation.h>
 #import <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "pooled_present.inc"
+
+// Opt-in, command-buffer-local engine accounting. Native header encoders use
+// this same hook, so /perf cannot miss work encoded outside the Zig wrapper.
+static char zenitEngineCountsKey;
+static _Atomic(int) zenitEngineTrackingEnabled = 0;
+void metal_command_buffer_track_engines(void *buffer) {
+    atomic_store_explicit(&zenitEngineTrackingEnabled, 1, memory_order_relaxed);
+    id object = (__bridge id)buffer;
+    objc_setAssociatedObject(object, &zenitEngineCountsKey,
+        [NSMutableData dataWithLength:3 * sizeof(uint32_t)], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+void metal_command_buffer_note_engine(void *buffer, unsigned int engine) {
+    if (!atomic_load_explicit(&zenitEngineTrackingEnabled, memory_order_relaxed)) return;
+    NSMutableData *data = objc_getAssociatedObject((__bridge id)buffer, &zenitEngineCountsKey);
+    if (data && engine < 3) ((uint32_t *)data.mutableBytes)[engine]++;
+}
+void metal_command_buffer_engine_counts(void *buffer, uint32_t *counts) {
+    NSData *data = objc_getAssociatedObject((__bridge id)buffer, &zenitEngineCountsKey);
+    if (data) memcpy(counts, data.bytes, 3 * sizeof(uint32_t));
+    else memset(counts, 0, 3 * sizeof(uint32_t));
+}
+
+#include "render_copy.inc"
 
 // Opt-in timing evidence only. Keep the normal submission/presentation path
 // unchanged and never wait for a diagnostic callback.
@@ -513,11 +540,49 @@ void* metal_command_queue_command_buffer(void* queue) {
 
 /// Submit command buffer
 /// @param buffer MTLCommandBuffer
+static char *memoryMetalFrameLogPath;
+static void initializeMemoryMetalFrameLogPath(void) {
+    const char *value=getenv("ZENIT_MEMORY_METAL_FRAME_LOG");
+    if(value) memoryMetalFrameLogPath=strdup(value); // Owned process-lifetime diagnostic option.
+}
+static const char *zenitMemoryMetalFrameLogPath(void) {
+    static pthread_once_t once=PTHREAD_ONCE_INIT;
+    pthread_once(&once,initializeMemoryMetalFrameLogPath);
+    return memoryMetalFrameLogPath;
+}
+
+static void zenitMemoryMetalFrameLogWarning(int error) {
+    static atomic_flag warned = ATOMIC_FLAG_INIT;
+    if (!atomic_flag_test_and_set_explicit(&warned, memory_order_relaxed))
+        fprintf(stderr, "[Metal frame log] diagnostic write failed: %s\n", strerror(error));
+}
+
 void metal_command_buffer_commit(void* buffer) {
     id<MTLCommandBuffer> buf = (__bridge id<MTLCommandBuffer>)buffer;
     if (metal_glass_clock_trace_enabled()) {
         fprintf(stderr, "[glass-clock] {\"kind\":\"commit\",\"command_buffer\":\"%p\",\"host_time\":%.9f}\n",
                 buffer, CACurrentMediaTime());
+    }
+    const char *path=zenitMemoryMetalFrameLogPath();
+    if(path) {
+        @autoreleasepool {
+            uint32_t counts[3]; metal_command_buffer_engine_counts(buffer, counts);
+            uint64_t allocated=buf.commandQueue.device.currentAllocatedSize;
+            uint32_t render=counts[0], blit=counts[1], compute=counts[2];
+            [buf addCompletedHandler:^(id<MTLCommandBuffer> completed) {
+                FILE *log=fopen(path,"a");
+                if (!log) { zenitMemoryMetalFrameLogWarning(errno); return; }
+                int written=fprintf(log,"{\"deviceAllocated\":%llu,\"render\":%u,\"blit\":%u,\"compute\":%u,\"gpu_us\":%.3f}\n",
+                    (unsigned long long)allocated,render,blit,compute,
+                    (completed.GPUEndTime-completed.GPUStartTime)*1e6);
+                int writeError = written < 0 ? errno : 0;
+                // Always close, including when fprintf failed. fclose consumes
+                // the stream even when its final flush reports an error.
+                int closed = fclose(log);
+                if (written < 0 || closed != 0)
+                    zenitMemoryMetalFrameLogWarning(writeError ? writeError : errno);
+            }];
+        }
     }
     [buf commit];
 }
@@ -576,9 +641,9 @@ void* metal_library_new_function(void* library, const char* name) {
 /// Release object
 /// @param obj any Objective-C object
 void metal_release(void* obj) {
-    if (obj) {
-        CFRelease(obj);
-    }
+    // Releasing a Metal owner can itself autorelease internal drawable/cache
+    // objects. This ABI is also called during teardown outside a render frame.
+    @autoreleasepool { if (obj) CFRelease(obj); }
 }
 
 /// Retain object
@@ -776,12 +841,14 @@ void* metal_layer_next_drawable(void* layer) {
     dispatch_semaphore_t sem = dispatch_semaphore_create(0);
     CFRunLoopRef mainLoop = CFRunLoopGetMain();
     dispatch_async(queue, ^{
-        zenitDebugDrawableDelay();
-        drawable = [l nextDrawable];
-        atomic_store(&done, true);
-        dispatch_semaphore_signal(sem);
-        CFRunLoopSourceSignal(wakeSource);
-        CFRunLoopWakeUp(mainLoop);
+        @autoreleasepool {
+            zenitDebugDrawableDelay();
+            drawable = [l nextDrawable];
+            atomic_store(&done, true);
+            dispatch_semaphore_signal(sem);
+            CFRunLoopSourceSignal(wakeSource);
+            CFRunLoopWakeUp(mainLoop);
+        }
     });
 
     atomic_fetch_add(&g_zenit_ax_service_depth, 1);
@@ -843,7 +910,7 @@ double metal_layer_get_contents_scale(void* layer) {
 void metal_command_buffer_present_drawable(void* buffer, void* drawable) {
     id<MTLCommandBuffer> buf = (__bridge id<MTLCommandBuffer>)buffer;
     id<CAMetalDrawable> d = (__bridge id<CAMetalDrawable>)drawable;
-    [buf presentDrawable:d];
+    zenitScheduleDrawablePresentation(buf,d);
 }
 
 /// Wait until scheduled
@@ -986,6 +1053,7 @@ void* metal_command_buffer_create_render_encoder(void* buffer, void* desc) {
     id<MTLCommandBuffer> buf = (__bridge id<MTLCommandBuffer>)buffer;
     MTLRenderPassDescriptor* d = (__bridge MTLRenderPassDescriptor*)desc;
     id<MTLRenderCommandEncoder> encoder = [buf renderCommandEncoderWithDescriptor:d];
+    if (encoder) metal_command_buffer_note_engine(buffer, 0);
     return (__bridge_retained void*)encoder;
 }
 
@@ -1160,6 +1228,7 @@ void metal_render_encoder_draw_indexed_primitives_full(void* encoder, unsigned l
 void* metal_command_buffer_create_compute_encoder(void* buffer) {
     id<MTLCommandBuffer> buf = (__bridge id<MTLCommandBuffer>)buffer;
     id<MTLComputeCommandEncoder> encoder = [buf computeCommandEncoder];
+    if (encoder) metal_command_buffer_note_engine(buffer, 2);
     return (__bridge_retained void*)encoder;
 }
 
@@ -1219,6 +1288,7 @@ void metal_compute_encoder_dispatch_threadgroups(void* encoder, unsigned long th
 void* metal_command_buffer_create_blit_encoder(void* buffer) {
     id<MTLCommandBuffer> buf = (__bridge id<MTLCommandBuffer>)buffer;
     id<MTLBlitCommandEncoder> encoder = [buf blitCommandEncoder];
+    if (encoder) metal_command_buffer_note_engine(buffer, 1);
     return (__bridge_retained void*)encoder;
 }
 
@@ -1598,4 +1668,16 @@ uint64_t metal_test_gate_value(void* event) {
 }
 void metal_test_gate_release(void* event) {
     ((__bridge id<MTLSharedEvent>)event).signaledValue = 1;
+}
+
+// Borrowed from the drawable; the surface retains its texture separately.
+void* metal_drawable_get_texture(void* drawable_ptr) {
+    @autoreleasepool {
+        id<CAMetalDrawable> drawable = (__bridge id<CAMetalDrawable>)drawable_ptr;
+        return (__bridge void*)drawable.texture;
+    }
+}
+
+_Bool metal_device_supports_framebuffer_fetch(void *device) {
+    return [(__bridge id<MTLDevice>)device supportsFamily:MTLGPUFamilyApple1];
 }

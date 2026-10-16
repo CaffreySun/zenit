@@ -3,8 +3,8 @@
 /// Non-normal blend reads dst: fixed-function blend factors only approximate
 /// multiply/screen, and overlay/soft_light are inexpressible. So this uses the W3C
 /// generic path:
-///  1. After the offscreen pass, before the restore pass reopens, blit the whole
-///     restore target (dst copy, temp texture borrowed from the pool);
+///  1. Apple GPUs read the loaded color attachment directly. Other Metal GPUs
+///     render-copy the restore target; other backends retain their blit copy;
 ///  2. In the restore pass draw a fullscreen triangle: fragment unpremul -> B(Cd,Cs)
 ///     -> SrcOver composite -> premul for pixels in rect; outside rect passes dst
 ///     through unchanged; pipeline has no blend state (replace).
@@ -58,7 +58,7 @@ pub const BlendUniforms = extern struct {
     /// (+ = toward the centre), z = fade start inset, w = fade width; x = y = 0 -> none.
     warp: [4]f32,
     /// xy = src texture UV of the quad's origin (a rounded layer composites its own rect out of
-    /// its grid-aligned texture, opacity_layer.compositeQuad); zw unused.
+    /// its grid-aligned texture, opacity_layer.compositeQuad); zw = last used texel center.
     src_uv_origin: [4]f32,
 };
 
@@ -118,6 +118,11 @@ test "inverseLayerMap maps rotated target pixels back to layer-local pixels" {
 
 const blend_shader_source: []const u8 = @import("shader_sources.zig").composite;
 
+pub fn usesFramebufferFetch(encoder: anytype) bool {
+    if (comptime gpu.backend_kind == .metal) return encoder.sdf_renderer.device.supportsFramebufferFetch();
+    return false;
+}
+
 /// Lazy compile blend composite pipeline (pattern same as
 /// backdrop_blur.ensureBlurPipeline).
 pub fn ensureBlendPipeline(encoder: anytype) bool {
@@ -126,7 +131,11 @@ pub fn ensureBlendPipeline(encoder: anytype) bool {
     blend_pipeline_compile_count += 1;
 
     const device = encoder.sdf_renderer.device;
-    var shader = gpu.Backend.ShaderModule.initFromSource(device, blend_shader_source) catch |e| {
+    const source = if (comptime gpu.backend_kind == .metal)
+        if (usesFramebufferFetch(encoder)) blend_shader_source else "#define ZENIT_FRAMEBUFFER_FETCH 0\n" ++ @embedFile("shaders/composite.metal")
+    else
+        blend_shader_source;
+    var shader = gpu.Backend.ShaderModule.initFromSource(device, source) catch |e| {
         std.log.err("[blend] shader compile failed: {}", .{e});
         encoder.persistent.blend_pipeline_failed = true;
         return false;
@@ -185,6 +194,7 @@ pub fn drawBlendComposite(
     /// Inset (physical px) of the true clip rect inside the quad: the rounded mask and the warp's
     /// contour distance use the rect shrunk by it (a folded rounded clip's layer is padded 2 pt)
     mask_inset_px: f32,
+    src_uv_max: [2]f32,
 ) bool {
     if (encoder.render_pass == null) return false;
     var pipeline = encoder.persistent.blend_pipeline orelse return false;
@@ -203,7 +213,7 @@ pub fn drawBlendComposite(
         .clip_shape = .{ @floatFromInt(clips.shape_kind), clips.shape_radius, 0, 0 },
         .clip_shape_rect = clips.shape_rect,
         .warp = warp,
-        .src_uv_origin = .{ src_uv_origin[0], src_uv_origin[1], 0, 0 },
+        .src_uv_origin = .{ src_uv_origin[0], src_uv_origin[1], src_uv_max[0], src_uv_max[1] },
     };
 
     var pass = encoder.render_pass.?;
@@ -212,7 +222,7 @@ pub fn drawBlendComposite(
     // (was single shared buffer + per-frame zero offset CPU/GPU race).
     pass.setFragmentBytes(0, std.mem.asBytes(&uniforms));
     pass.setFragmentTextureBinding(0, src_texture);
-    pass.setFragmentTextureBinding(1, dst_copy);
+    if (!usesFramebufferFetch(encoder)) pass.setFragmentTextureBinding(1, dst_copy);
     pass.setFragmentSampler(0, &sampler_state);
     pass.draw(3, 1, 0, 0);
     return true;

@@ -285,7 +285,7 @@ pub fn readText(world_ref: ?*world_mod.World, element_id_raw: u32, node_ptr: usi
 pub fn readImage(world_ref: ?*world_mod.World, element_id_raw: u32, node_ptr: usize) ?ImageProps {
     if (element_id_raw != 0xFFFFFFFF) {
         if (world_ref) |w| {
-            if (w.content.get(world_mod.ElementId.fromRaw(element_id_raw))) |c| return c.image;
+            if (w.content.getPtr(world_mod.ElementId.fromRaw(element_id_raw))) |c| return c.image;
             return null;
         } else if (g_content_image_read) |cb| return cb(element_id_raw);
     }
@@ -296,7 +296,7 @@ pub fn readImage(world_ref: ?*world_mod.World, element_id_raw: u32, node_ptr: us
 pub fn readIcon(world_ref: ?*world_mod.World, element_id_raw: u32, node_ptr: usize) ?IconProps {
     if (element_id_raw != 0xFFFFFFFF) {
         if (world_ref) |w| {
-            if (w.content.get(world_mod.ElementId.fromRaw(element_id_raw))) |c| return c.icon;
+            if (w.content.getPtr(world_mod.ElementId.fromRaw(element_id_raw))) |c| return c.icon;
             return null;
         } else if (g_content_icon_read) |cb| return cb(element_id_raw);
     }
@@ -364,7 +364,6 @@ pub fn layoutOutputPtr(world_ref: ?*world_mod.World, element_id_raw: u32, node_p
     if (element_id_raw != 0xFFFFFFFF) {
         if (world_ref) |w| {
             const eid = world_mod.ElementId.fromRaw(element_id_raw);
-            w.layout_output.ensureSlot(eid) catch return null;
             return w.layout_output.getPtr(eid);
         }
         if (g_layout_output_ptr) |cb| return cb(element_id_raw);
@@ -373,19 +372,81 @@ pub fn layoutOutputPtr(world_ref: ?*world_mod.World, element_id_raw: u32, node_p
     return standaloneLayoutOutputPtr(node_ptr);
 }
 
+/// Read-only view of a node's layout output, or null before it has one
+/// (callers treat null as the default `.{}`). Never allocates. Read paths that
+/// run per node per frame use this rather than copying the output header.
+/// Fixed-address chunk borrows survive growth, but not clear/reuse/teardown.
+pub fn layoutOutputConstPtr(world_ref: ?*world_mod.World, element_id_raw: u32, node_ptr: usize) ?*const NodeLayoutOutput {
+    if (element_id_raw != 0xFFFFFFFF) {
+        if (world_ref) |w| return w.layout_output.getConstPtr(world_mod.ElementId.fromRaw(element_id_raw));
+        if (g_layout_output_ptr) |cb| return cb(element_id_raw);
+        return null;
+    }
+    if (!g_standalone_layout_output_init) return null;
+    return g_standalone_layout_output.get(node_ptr);
+}
+
 pub fn writeLayoutOutput(world_ref: ?*world_mod.World, element_id_raw: u32, node_ptr: usize, v: NodeLayoutOutput) void {
     if (element_id_raw != 0xFFFFFFFF) {
         if (world_ref) |w| {
             const eid = world_mod.ElementId.fromRaw(element_id_raw);
-            if (w.layout_output.ensureSlot(eid)) |_| {
-                w.layout_output.set(eid, v);
-            } else |_| {}
+            // Only World.createElement may establish a generation. A late
+            // write from a freed node must not resurrect its old slot.
+            w.layout_output.set(eid, v) catch return;
             return;
         }
         if (g_layout_output_write) |cb| cb(element_id_raw, v);
         return;
     }
-    if (standaloneLayoutOutputPtr(node_ptr)) |p| p.* = v;
+    if (standaloneLayoutOutputPtr(node_ptr)) |p| {
+        if (v.artifacts.text_layout) |text| {
+            storeTextLayout(null, element_id_raw, node_ptr, text) catch return;
+        } else clearTextLayout(null, element_id_raw, node_ptr);
+        const owned_text = p.artifacts.text_layout;
+        p.* = v;
+        p.artifacts.text_layout = owned_text;
+    }
+}
+
+/// Layout cache writes are fallible and transactional. The mock fallback owns
+/// one stable allocation per actual text node; production uses chunked storage.
+pub fn storeTextLayout(world_ref: ?*world_mod.World, element_id_raw: u32, node_ptr: usize, value: *const @import("text_layout.zig").TextLayout) !void {
+    if (world_ref) |w| return w.layout_output.storeTextLayout(world_mod.ElementId.fromRaw(element_id_raw), value);
+    const p = standaloneLayoutOutputPtr(node_ptr) orelse return error.OutOfMemory;
+    const target = if (p.artifacts.text_layout) |text| @constCast(text) else try std.heap.page_allocator.create(@import("text_layout.zig").TextLayout);
+    target.* = value.*;
+    p.artifacts.text_layout = target;
+}
+pub fn clearTextLayout(world_ref: ?*world_mod.World, element_id_raw: u32, node_ptr: usize) void {
+    if (world_ref) |w| return w.layout_output.clearTextLayout(world_mod.ElementId.fromRaw(element_id_raw));
+    if (!g_standalone_layout_output_init) return;
+    const p = g_standalone_layout_output.get(node_ptr) orelse return;
+    if (p.artifacts.text_layout) |text| std.heap.page_allocator.destroy(text);
+    p.artifacts.text_layout = null;
+}
+
+/// Node.destroy must not leave a mock's text payload pinned until process
+/// teardown, nor let a later node at the same address inherit its output.
+pub fn releaseStandaloneLayoutOutput(node_ptr: usize) void {
+    if (!g_standalone_layout_output_init) return;
+    const entry = g_standalone_layout_output.fetchRemove(node_ptr) orelse return;
+    if (entry.value.artifacts.text_layout) |text| std.heap.page_allocator.destroy(text);
+    std.heap.page_allocator.destroy(entry.value);
+}
+
+/// Remove all pointer-keyed fallback records after the node has released owned
+/// content/geometry. A later allocation at the same address is a new owner.
+pub fn releaseStandaloneNode(node_ptr: usize) void {
+    releaseStandaloneLayoutOutput(node_ptr);
+    if (g_standalone_paint_init) {
+        _ = g_standalone_paint_bg.remove(node_ptr);
+        _ = g_standalone_paint_opacity.remove(node_ptr);
+    }
+    if (g_standalone_content_init) {
+        _ = g_standalone_content_text.remove(node_ptr);
+        _ = g_standalone_content_image.remove(node_ptr);
+        _ = g_standalone_content_icon.remove(node_ptr);
+    }
 }
 
 pub fn readLayoutOutput(world_ref: ?*world_mod.World, element_id_raw: u32, node_ptr: usize) NodeLayoutOutput {
@@ -449,7 +510,10 @@ pub fn deinitStandaloneStorage() void {
         // Value is raw pointer from page_allocator.create; must destroy individually,
         // otherwise freeing the map alone leaks each NodeLayoutOutput.
         var it = g_standalone_layout_output.valueIterator();
-        while (it.next()) |slot_ptr| std.heap.page_allocator.destroy(slot_ptr.*);
+        while (it.next()) |slot_ptr| {
+            if (slot_ptr.*.artifacts.text_layout) |text| std.heap.page_allocator.destroy(text);
+            std.heap.page_allocator.destroy(slot_ptr.*);
+        }
         g_standalone_layout_output.deinit();
         g_standalone_layout_output_init = false;
     }

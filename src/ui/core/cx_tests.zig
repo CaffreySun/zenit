@@ -35,6 +35,187 @@ const theme = core.theme;
 const transition = core.transition;
 const world = core.world;
 
+test "loose interaction memo survives alternating windows and invalidates on mutation" {
+    const t = std.testing;
+    const a = try Cx.init(t.allocator, t.io);
+    defer a.deinit();
+    const b = try Cx.init(t.allocator, t.io);
+    defer b.deinit();
+    a.root = try core.box(a, .{}, .{});
+    b.root = try core.box(b, .{}, .{});
+    a.layout();
+    _ = a.render();
+    b.layout();
+    _ = b.render();
+    const index = @import("cx_runtime_index.zig");
+    // Warm both after the last global generation change.
+    try t.expect(!index.subtreeHasLooseInteractionDirty(a, a.root.?));
+    try t.expect(!index.subtreeHasLooseInteractionDirty(b, b.root.?));
+    const a_scans = a.loose_interaction_memo.scans;
+    const b_scans = b.loose_interaction_memo.scans;
+    for (0..20) |_| {
+        try t.expect(!index.subtreeHasLooseInteractionDirty(a, a.root.?));
+        try t.expect(!index.subtreeHasLooseInteractionDirty(b, b.root.?));
+    }
+    try t.expectEqual(a_scans, a.loose_interaction_memo.scans);
+    try t.expectEqual(b_scans, b.loose_interaction_memo.scans);
+    a.root.?.frame_state.state_bits.dirty.hit.geometry = true;
+    @import("node_dirty.zig").bumpLooseInteractionGen();
+    try t.expect(index.subtreeHasLooseInteractionDirty(a, a.root.?));
+    try t.expect(!index.subtreeHasLooseInteractionDirty(b, b.root.?));
+    try t.expectEqual(a_scans + 1, a.loose_interaction_memo.scans);
+    try t.expectEqual(b_scans + 1, b.loose_interaction_memo.scans);
+    a.layout();
+    _ = a.render();
+    try t.expect(!index.subtreeHasLooseInteractionDirty(a, a.root.?));
+    try t.expect(!index.subtreeHasLooseInteractionDirty(b, b.root.?));
+}
+
+test "pending scene loose interaction survives a frozen render clock and is consumed" {
+    const t = std.testing;
+    const cx = try Cx.init(t.allocator, t.io);
+    defer cx.deinit();
+    cx.setViewport(320, 120);
+    const root = try core.box(cx, .{ .width = .{ .px = 320 }, .height = .{ .px = 120 } }, .{});
+    const child = try core.box(cx, .{ .width = .{ .px = 20 }, .height = .{ .px = 20 } }, .{});
+    try root.appendChild(t.allocator, child);
+    cx.root = root;
+    cx.layout();
+    _ = cx.render();
+    cx.needs_redraw = false;
+    cx.caret_flip_host = true; // Ordinary blink no longer masks pending work.
+    const frozen = cx.frame_time_ms;
+    // These flags intentionally do not bubble to the root render/layout bits.
+    child.frame_state.state_bits.dirty.hit.geometry = true;
+    @import("node_dirty.zig").bumpLooseInteractionGen();
+    try t.expect(!root.frame_state.state_bits.dirty.core.subtree_render);
+    try t.expect(!root.frame_state.state_bits.dirty.pipeline.subtree_interaction);
+    try t.expect(cx.hasPendingSceneWork());
+    cx.layout();
+    _ = cx.render();
+    try t.expectEqual(frozen, cx.frame_time_ms);
+    try t.expect(!child.frame_state.state_bits.dirty.hit.geometry);
+    try t.expect(!cx.hasPendingSceneWork());
+    try t.expect(!cx.wantsFrame());
+}
+
+test "pending scene interaction and animation advance the active frame clock" {
+    const t = std.testing;
+    const cx = try Cx.init(t.allocator, t.io);
+    defer cx.deinit();
+    cx.root = try core.box(cx, .{}, .{});
+    cx.layout();
+    _ = cx.render();
+    try cx.setTestFrameStep(16);
+    cx.needs_redraw = false;
+    cx.root.?.frame_state.state_bits.dirty.hit.semantics = true;
+    @import("node_dirty.zig").bumpLooseInteractionGen();
+    const before = cx.frame_time_ms;
+    cx.advanceFrameClock();
+    try t.expectEqual(before + 16, cx.frame_time_ms);
+    cx.layout();
+    _ = cx.render();
+    cx.last_tick_animations_active = true;
+    cx.needs_redraw = false;
+    const before_animation = cx.frame_time_ms;
+    cx.advanceFrameClock();
+    try t.expectEqual(before_animation + 16, cx.frame_time_ms);
+    cx.layout();
+    _ = cx.render();
+    try t.expect(!cx.last_tick_animations_active);
+}
+
+/// Drive the same wants/clock/layout/render cycle used by the native host.
+/// No forced frame budget and no manual dirty clearing: consumption must be
+/// performed by the pipeline itself, including its last animation frame.
+fn expectSceneConverges(cx: *Cx) !usize {
+    const t = std.testing;
+    var frames: usize = 0;
+    while (cx.wantsFrame() and frames < 120) : (frames += 1) {
+        cx.advanceFrameClock();
+        cx.layout();
+        _ = cx.render();
+    }
+    try t.expect(frames > 0 and frames < 120);
+    try t.expect(!cx.wantsFrame());
+    try t.expect(!cx.hasPendingSceneWork());
+    const clock = cx.frame_time_ms;
+    for (0..60) |_| {
+        try t.expect(!cx.wantsFrame());
+        // Even an incidental host query must keep the settled tree idle.
+        cx.advanceFrameClock();
+        try t.expect(!cx.wantsFrame());
+        try t.expect(!cx.hasPendingSceneWork());
+        try t.expectEqual(clock, cx.frame_time_ms);
+    }
+    return frames;
+}
+
+fn createConvergenceScene() !*Cx {
+    const cx = try Cx.init(std.testing.allocator, std.testing.io);
+    errdefer cx.deinit();
+    cx.setViewport(220, 120);
+    cx.root = try core.box(cx, .{ .width = .{ .px = 220 }, .height = .{ .px = 120 } }, .{});
+    const child = try core.box(cx, .{ .width = .{ .px = 80 }, .height = .{ .px = 32 } }, .{});
+    try cx.root.?.appendChild(cx.allocator, child);
+    try cx.setTestFrameStep(16);
+    cx.caret_flip_host = true;
+    _ = try expectSceneConverges(cx);
+    return cx;
+}
+
+test "host frame convergence consumes each loose interaction bit and stays idle" {
+    const cx = try createConvergenceScene();
+    defer cx.deinit();
+    const child = cx.root.?.children.items[0];
+    for (0..3) |bit| {
+        switch (bit) {
+            0 => child.frame_state.state_bits.dirty.hit.geometry = true,
+            1 => child.frame_state.state_bits.dirty.hit.semantics = true,
+            else => child.frame_state.state_bits.dirty.pipeline.interaction = true,
+        }
+        @import("node_dirty.zig").bumpLooseInteractionGen();
+        try std.testing.expect(!cx.root.?.frame_state.state_bits.dirty.core.subtree_render);
+        _ = try expectSceneConverges(cx);
+        const d = child.frame_state.state_bits.dirty;
+        try std.testing.expect(!d.hit.geometry and !d.hit.semantics and !d.pipeline.interaction);
+    }
+}
+
+test "host frame convergence consumes the final real animation frame and stays idle" {
+    const cx = try createConvergenceScene();
+    defer cx.deinit();
+    const child = cx.root.?.children.items[0];
+    child.applyTransition(cx.allocator, &comptime @import("../recipe.zig").transition("opacity 96ms linear"));
+    child.setOpacity(0.25);
+    try std.testing.expect(child.frame_state.frame_local.runtime.transitions.?.any_active);
+    const frames = try expectSceneConverges(cx);
+    try std.testing.expect(frames > 1);
+    try std.testing.expect(!child.frame_state.frame_local.runtime.transitions.?.any_active);
+    try std.testing.expect(!cx.last_tick_animations_active);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25), child.getOpacity(), 0.001);
+}
+
+test "host frame convergence consumes hover geometry changes and stays idle" {
+    const cx = try createConvergenceScene();
+    defer cx.deinit();
+    const child = cx.root.?.children.items[0];
+    child.behavior.events.on_hover = Cx.simpleHandler(struct {
+        fn onHover(context: *anyopaque) void {
+            const node: *Node = @ptrCast(@alignCast(context));
+            node.setWidth(120);
+        }
+    }.onHover, child);
+    child.markHitSemanticsDirty();
+    _ = try expectSceneConverges(cx);
+    cx.handleMouseMove(20, 16);
+    try std.testing.expect(cx.hovered_node == child);
+    _ = try expectSceneConverges(cx);
+    try std.testing.expectApproxEqAbs(@as(f32, 120), child.rectFromWorldOrFallback().w, 0.001);
+    try std.testing.expect(cx.hovered_node == child);
+    try std.testing.expect(cx.hitTest(100, 16) == child);
+}
+
 /// Backdate last_frame_instant by delta_ns, fake a "previous frame happened
 /// delta_ns ago" slow frame.
 fn backdateLastFrame(cx: *Cx, delta_ns: u64) !void {
@@ -173,7 +354,16 @@ test "frame clock freezes across idle frames and resumes without a time jump" {
     dirty.core.subtree_render = false;
     dirty.pipeline.composite = false;
     dirty.pipeline.subtree_composite = false;
-    try testing.expect(cx_render.isTreeFullyClean(root));
+    dirty.pipeline.order = false;
+    dirty.pipeline.subtree_order = false;
+    dirty.pipeline.interaction = false;
+    dirty.pipeline.subtree_interaction = false;
+    dirty.runtime.dirty = false;
+    dirty.runtime.subtree_dirty = false;
+    dirty.hit.geometry = false;
+    dirty.hit.semantics = false;
+    @import("node_dirty.zig").bumpLooseInteractionGen();
+    try testing.expect(cx_render.isTreeFullyClean(cx, root));
 
     // Fake "this frame 1s since last" by backdate, meanwhile backdate epoch
     // same amount, simulate real idle walltime passed. If idle branch doesn't
@@ -488,6 +678,35 @@ test "layoutOutputPtr 原地改子字段直写 World" {
 
     // No in-place fields; getLayoutOutput reads World should see changes.
     try testing.expectEqual(@as(f32, 77), node.getLayoutOutput().artifacts.children_bbox.?.w);
+}
+
+test "LayoutOutputTable node free reclaims text and late access cannot resurrect a generation" {
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    const node = try builders.box(cx, .{}, .{});
+    const eid = world.ElementId.fromRaw(node.element_id_raw);
+    const cached_layout = @import("text_layout.zig").TextLayout{ .line_count = 3 };
+    try node.storeTextLayout(&cached_layout);
+    const borrow = cx.world.layout_output.borrowText(eid).?;
+    try std.testing.expectEqual(@as(usize, 1), cx.world.layout_output.memoryStats().text_layout_live_slots);
+    cx.freeNode(node);
+    try std.testing.expect(borrow.resolve(&cx.world.layout_output) == null);
+    try std.testing.expectEqual(@as(usize, 0), cx.world.layout_output.memoryStats().text_layout_live_slots);
+    const pca = @import("paint_content_accessor.zig");
+    try std.testing.expect(pca.layoutOutputPtr(&cx.world, eid.raw(), 0) == null);
+    pca.writeLayoutOutput(&cx.world, eid.raw(), 0, .{});
+    try std.testing.expect(cx.world.layout_output.get(eid) == null);
+}
+
+test "LayoutOutputTable standalone node destroy reclaims its payload and output" {
+    const pca = @import("paint_content_accessor.zig");
+    const before = pca.standaloneEntryCount();
+    const node = try core_node.Node.create(std.testing.allocator, 123456, .box, .{});
+    const cached_layout = @import("text_layout.zig").TextLayout{ .line_count = 3 };
+    try node.storeTextLayout(&cached_layout);
+    try std.testing.expect(pca.standaloneEntryCount() == before + 1);
+    node.destroy(std.testing.allocator);
+    try std.testing.expectEqual(before, pca.standaloneEntryCount());
 }
 
 test "主题运行时切换 (dark / light / high_contrast)" {
@@ -1575,4 +1794,32 @@ test "theme replay skips an independent root destroyed by an earlier hook" {
     Probe.victim = overlay;
     root.meta.per_frame.hooks.on_theme = Probe.hook;
     cx.setTheme(&theme.modes.light);
+}
+
+test "caret declaration wakes fallback hosts without consuming an ordinary redraw" {
+    const cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    cx.needs_redraw = false;
+    cx.a11y_prefs_version = @import("../a11y/preferences.zig").version();
+    cx.setBlinkCaretPhase(true, 0, 500 * std.time.ns_per_ms);
+    cx.caret_flip_host = true;
+    try std.testing.expect(!cx.wantsFrame());
+    try std.testing.expectEqual(@as(?u64, 0), cx.nextWakeDelayNs());
+    cx.caret_flip_host = false;
+    try std.testing.expect(cx.wantsFrame());
+    cx.caret_paint_override = false;
+    try std.testing.expect(!cx.blinkCaretVisible(true));
+    cx.caret_paint_override = null;
+    try std.testing.expect(cx.blinkCaretVisible(true));
+}
+
+test "caret rectangle admission rejects nonfinite empty and overflow declarations" {
+    const cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    cx.addBlinkCaretRect(.{ 0, 0, 0, 10 });
+    cx.addBlinkCaretRect(.{ std.math.nan(f32), 0, 2, 10 });
+    try std.testing.expectEqual(@as(usize, 0), cx.caret_rect_count);
+    for (0..65) |_| cx.addBlinkCaretRect(.{ 10.25, 20.5, 2, 18 });
+    try std.testing.expectEqual(@as(usize, 64), cx.caret_rect_count);
+    try std.testing.expect(cx.caret_rect_overflow);
 }

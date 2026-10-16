@@ -390,7 +390,18 @@ pub const BeforeRenderHooks = struct {
     main: ?*const fn (*Node) void = null,
     count: u8 = 0,
     hooks: [8]?*const fn (*Node) void = @as([8]?*const fn (*Node) void, @splat(null)),
+    /// Bit i set: hooks[i] was registered with `.self` scope (see BeforeRenderScope).
+    self_only_mask: u8 = 0,
 };
+
+/// What a before_render hook may change. `.self`: only this node's own style /
+/// content, written through dirty-marking setters (setStyle, setBackground,
+/// markRenderDirty after a raw write); never descendants, siblings or a
+/// transform that moves other content. A self-scoped node keeps the paint
+/// prefix intact, so everything painted after it can still be prebuilt and
+/// reused across frames. `.subtree` (default): anything; the render pass stops
+/// prebuilding at this node. Debug/ReleaseSafe builds audit `.self` claims.
+pub const BeforeRenderScope = enum { subtree, self };
 
 /// Scope state associated with node: scope ptr + binding back-pointer. scope +
 /// scope_binding_node_slot 2 fields collapsed -> 1. Scope is component root node reactive range;
@@ -923,8 +934,35 @@ pub const Node = struct {
     // NodeLayoutOutput field deleted -> World.LayoutOutputTable is source of truth; cx-less mock
     // use pca standalone heap pool. Thin delegate to pca (element_id + node_ptr two params, pca
     // internal route World/standalone).
+    /// Cheap non-owning header snapshot. Per-node hot paths use layoutOutput().
     pub fn getLayoutOutput(self: *const Node) NodeLayoutOutput {
         return pca.readLayoutOutput(self.world_ref, self.element_id_raw, @intFromPtr(self));
+    }
+
+    /// Read-only view of the layout output; null means "nothing computed yet"
+    /// (equivalent to the default value). No copy, no allocation. The pointer
+    /// points into a fixed-address chunk. Valid until clear/reuse/teardown;
+    /// content may change on layout/cache replacement.
+    pub fn layoutOutput(self: *const Node) ?*const NodeLayoutOutput {
+        return pca.layoutOutputConstPtr(self.world_ref, self.element_id_raw, @intFromPtr(self));
+    }
+
+    pub fn layoutChildrenBbox(self: *const Node) ?ComputedRect {
+        const lo = self.layoutOutput() orelse return null;
+        return lo.artifacts.children_bbox;
+    }
+
+    pub fn layoutTextLayout(self: *const Node) ?*const @import("text_layout.zig").TextLayout {
+        const lo = self.layoutOutput() orelse return null;
+        return lo.artifacts.text_layout;
+    }
+
+    pub fn storeTextLayout(self: *Node, text: *const @import("text_layout.zig").TextLayout) !void {
+        return pca.storeTextLayout(self.world_ref, self.element_id_raw, @intFromPtr(self), text);
+    }
+
+    pub fn clearTextLayout(self: *Node) void {
+        pca.clearTextLayout(self.world_ref, self.element_id_raw, @intFromPtr(self));
     }
 
     pub fn setLayoutOutput(self: *Node, v: NodeLayoutOutput) void {
@@ -959,34 +997,65 @@ pub const Node = struct {
     }
 
     pub fn addBeforeRender(self: *Node, hook: *const fn (*Node) void) void {
+        self.addBeforeRenderScoped(hook, .subtree);
+    }
+
+    pub fn addBeforeRenderScoped(self: *Node, hook: *const fn (*Node) void, scope: BeforeRenderScope) void {
         // subtree hook flag: set and bubble ancestor (for hasBeforeRenderHookSubtree O(1) read).
         // Component-layer lots `before_render.main =` direct assign not through function, those by
         // tick.zig tickBeforeRender every run fold self-heal (see its note).
         node_interaction.markSubtreeBeforeRenderHook(self);
-        if (self.meta.per_frame.hooks.before_render.main == hook) return;
-        for (self.meta.per_frame.hooks.before_render.hooks[0..self.meta.per_frame.hooks.before_render.count]) |existing| {
-            if (existing == hook) return;
+        const hooks = &self.meta.per_frame.hooks.before_render;
+        if (hooks.main == hook) return;
+        for (hooks.hooks[0..hooks.count], 0..) |existing, i| {
+            if (existing != hook) continue;
+            // Registered again: conflicting declarations resolve to the
+            // conservative one, so a later .subtree demotes an earlier .self
+            // (a later .self never widens an earlier .subtree).
+            if (scope == .subtree) hooks.self_only_mask &= ~(@as(u8, 1) << @intCast(i));
+            return;
         }
-        if (self.meta.per_frame.hooks.before_render.count < self.meta.per_frame.hooks.before_render.hooks.len) {
-            self.meta.per_frame.hooks.before_render.hooks[self.meta.per_frame.hooks.before_render.count] = hook;
-            self.meta.per_frame.hooks.before_render.count += 1;
+        if (hooks.count < hooks.hooks.len) {
+            const bit = @as(u8, 1) << @intCast(hooks.count);
+            hooks.hooks[hooks.count] = hook;
+            if (scope == .self) hooks.self_only_mask |= bit else hooks.self_only_mask &= ~bit;
+            hooks.count += 1;
         }
     }
 
     pub fn removeBeforeRender(self: *Node, hook: *const fn (*Node) void) void {
-        if (self.meta.per_frame.hooks.before_render.count == 0) return;
+        const hooks = &self.meta.per_frame.hooks.before_render;
+        if (hooks.count == 0) return;
         var i: usize = 0;
-        while (i < self.meta.per_frame.hooks.before_render.count) : (i += 1) {
-            if (self.meta.per_frame.hooks.before_render.hooks[i] == hook) {
+        while (i < hooks.count) : (i += 1) {
+            if (hooks.hooks[i] == hook) {
                 var j = i;
-                while (j + 1 < self.meta.per_frame.hooks.before_render.count) : (j += 1) {
-                    self.meta.per_frame.hooks.before_render.hooks[j] = self.meta.per_frame.hooks.before_render.hooks[j + 1];
+                while (j + 1 < hooks.count) : (j += 1) {
+                    hooks.hooks[j] = hooks.hooks[j + 1];
                 }
-                self.meta.per_frame.hooks.before_render.count -= 1;
-                self.meta.per_frame.hooks.before_render.hooks[self.meta.per_frame.hooks.before_render.count] = null;
+                // Shift the scope bits above i down by one, like the entries.
+                const below = hooks.self_only_mask & ((@as(u8, 1) << @intCast(i)) - 1);
+                const above = (hooks.self_only_mask >> 1) & ~((@as(u8, 1) << @intCast(i)) - 1);
+                hooks.self_only_mask = below | above;
+                hooks.count -= 1;
+                hooks.hooks[hooks.count] = null;
+                hooks.self_only_mask &= ~(@as(u8, 1) << @intCast(hooks.count));
                 return;
             }
         }
+    }
+
+    /// Every before_render hook on this node is limited to the node itself:
+    /// either its owner declared the whole node (`before_render_hook_affects_self_only`,
+    /// e.g. ControlShell, which installs the `main` hook) or there is no `main`
+    /// hook and every registered hook used `.self` scope.
+    pub fn beforeRenderHooksSelfOnly(self: *const Node) bool {
+        if (self.frame_state.state_bits.flags.before_render_hook_affects_self_only) return true;
+        const hooks = self.meta.per_frame.hooks.before_render;
+        if (hooks.main != null) return false;
+        if (hooks.count == 0) return false;
+        const all = (@as(u16, 1) << @intCast(hooks.count)) - 1;
+        return (@as(u16, hooks.self_only_mask) & all) == all;
     }
 
     pub fn hasBeforeRenderHooks(self: *const Node) bool {
@@ -1099,6 +1168,11 @@ pub const Node = struct {
     /// sticky)
     pub fn globalRect(self: *const Node) ComputedRect {
         return node_lifecycle.globalRect(self);
+    }
+
+    /// Compose the same ancestor transforms used by rendering and hit testing.
+    pub fn worldTransform(self: *const Node) Transform2D {
+        return @import("retained_scene.zig").buildAncestorWorldTransform(self, .{ .include_rotation = true });
     }
 
     // ==================== inheritable property resolve (walk up parent chain) ====================

@@ -2,6 +2,7 @@
 // timing sleeps. The real bridge/pump runs against a deterministic input
 // context; the client document is advanced only at the SDK dispatch boundary.
 #import "../window_bridge.m"
+#include "no_render_copy.inc"
 #include "empty_a11y.inc"
 #include <assert.h>
 

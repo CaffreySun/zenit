@@ -20,10 +20,6 @@ const MAX_BODY_SIZE = 2 * 1024 * 1024;
 const FILE_RPC_POLL_MS: u64 = 10;
 const OwnerPid = if (builtin.os.tag == .windows) u32 else std.c.pid_t;
 
-extern "kernel32" fn OpenProcess(u32, i32, u32) callconv(.winapi) ?*anyopaque;
-extern "kernel32" fn GetExitCodeProcess(?*anyopaque, *u32) callconv(.winapi) i32;
-extern "kernel32" fn CloseHandle(?*anyopaque) callconv(.winapi) i32;
-
 fn ownerPid() OwnerPid {
     if (comptime builtin.os.tag == .windows) return std.os.windows.GetCurrentProcessId();
     return std.c.getpid();
@@ -60,53 +56,49 @@ pub fn serverThread(queue: *CommandQueue) void {
 }
 
 const OWNER_FILE = "owner.json";
+const OWNER_LOCK_FILE = "owner.lock";
 
 /// Single-owner lock: one file-RPC dir, one active server instance at a time.
 ///
 /// Concurrent e2e runs sharing one dir let a random instance serve each request, giving false
 /// 'test_id not found' failures. Conflicts must fail explicitly.
 ///
-/// Protocol: atomic O_EXCL create of owner.json (pid + timestamp) at startup. If it exists, probe
-/// the owner pid: alive -> error.FileRpcDirAlreadyOwned (caller rejects, logs error);
-/// dead -> crash residue, delete + retry lock. On exit don't delete (leave crash trace
-/// for the next instance to detect).
-fn claimFileRpcOwnership(io: std.Io, rpc_dir: []const u8) !void {
+/// Protocol: the server holds an exclusive lock on owner.lock for the life of its process; the
+/// kernel releases it when the process exits or crashes, so there is no residue to judge and
+/// no stale file to delete (deleting by path raced: a slow claimant could remove the new
+/// owner's file and both would serve). Whoever holds the lock writes owner.json (pid +
+/// timestamp) for timeout diagnostics. The lock is separate from owner.json because Windows
+/// byte-range locks are mandatory: readers of a locked owner.json would fail.
+fn claimFileRpcOwnership(io: std.Io, rpc_dir: []const u8) !std.Io.File {
     var dir = try std.Io.Dir.cwd().openDir(io, rpc_dir, .{});
     defer dir.close(io);
 
-    var attempts: u8 = 0;
-    while (attempts < 4) : (attempts += 1) {
-        if (dir.createFile(io, OWNER_FILE, .{ .exclusive = true })) |f| {
-            defer f.close(io);
-            var buf: [128]u8 = undefined;
-            // pid written as JSON string to reuse findJsonString (file's minimal parser only
-            // recognizes string values).
-            const body = std.fmt.bufPrint(&buf, "{{\"pid\":\"{d}\",\"claimed_at_ns\":\"{d}\"}}", .{
-                ownerPid(),
-                @import("zenit_time").nanoTimestamp(io),
-            }) catch unreachable;
-            try f.writeStreamingAll(io, body);
-            return;
-        } else |err| switch (err) {
-            error.PathAlreadyExists => {
-                const text = readFileCompat(dir, io, OWNER_FILE, std.heap.page_allocator) catch {
-                    // Read fails (e.g. file just deleted): retry lock creation next round.
-                    continue;
-                };
-                defer std.heap.page_allocator.free(text);
-                const pid = parseOwnerPid(text) orelse {
-                    // Malformed owner.json: treat as residue, take over.
-                    dir.deleteFile(io, OWNER_FILE) catch {};
-                    continue;
-                };
-                if (pidIsAlive(pid)) return error.FileRpcDirAlreadyOwned;
-                dir.deleteFile(io, OWNER_FILE) catch {};
-                continue;
-            },
-            else => return err,
-        }
+    const lock = dir.createFile(io, OWNER_LOCK_FILE, .{
+        .truncate = false,
+        .lock = .exclusive,
+        .lock_nonblocking = true,
+    }) catch |err| switch (err) {
+        error.WouldBlock => return error.FileRpcDirAlreadyOwned,
+        else => return err,
+    };
+    errdefer lock.close(io);
+
+    var buf: [128]u8 = undefined;
+    // pid written as JSON string to reuse findJsonString (file's minimal parser only
+    // recognizes string values).
+    const body = std.fmt.bufPrint(&buf, "{{\"pid\":\"{d}\",\"claimed_at_ns\":\"{d}\"}}", .{
+        ownerPid(),
+        @import("zenit_time").nanoTimestamp(io),
+    }) catch unreachable;
+    // Written whole, then renamed into place: readers never see it empty.
+    const tmp_name = OWNER_FILE ++ ".tmp";
+    {
+        const f = try dir.createFile(io, tmp_name, .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, body);
     }
-    return error.FileRpcOwnershipRace;
+    try dir.rename(tmp_name, dir, OWNER_FILE, io);
+    return lock;
 }
 
 fn parseOwnerPid(text: []const u8) ?OwnerPid {
@@ -114,24 +106,10 @@ fn parseOwnerPid(text: []const u8) ?OwnerPid {
     return std.fmt.parseInt(OwnerPid, pid_str, 10) catch null;
 }
 
-fn pidIsAlive(pid: OwnerPid) bool {
-    if (comptime builtin.os.tag == .windows) {
-        const process = OpenProcess(0x1000, 0, pid) orelse
-            return std.os.windows.GetLastError() == .ACCESS_DENIED;
-        defer _ = CloseHandle(process);
-        var code: u32 = 0;
-        return GetExitCodeProcess(process, &code) != 0 and code == 259;
-    }
-    const result = std.c.kill(pid, @fromBackingInt(0));
-    return switch (std.posix.errno(result)) {
-        .SUCCESS, .PERM => true,
-        else => false,
-    };
-}
-
 fn runFileRpcServer(queue: *CommandQueue, rpc_dir: []const u8) !void {
     try std.Io.Dir.cwd().createDirPath(queue.io, rpc_dir);
-    claimFileRpcOwnership(queue.io, rpc_dir) catch |err| switch (err) {
+    // Held (never closed) until the process exits: that releases ownership.
+    _ = claimFileRpcOwnership(queue.io, rpc_dir) catch |err| switch (err) {
         error.FileRpcDirAlreadyOwned => {
             std.debug.print(
                 "[test_harness] REFUSING to serve file RPC: {s} is already owned by a live " ++
@@ -812,7 +790,7 @@ test "recording start parser validates path and target fps" {
     try std.testing.expect(parseRecordingStart("{\"path\":\"/tmp/demo.mp4\",\"fps\":121}") == null);
 }
 
-// ── file-RPC single-owner lock (owner.json) ──
+// ── file-RPC single-owner lock (owner.lock + owner.json) ──
 
 fn testTmpRpcDir(tmp: *std.testing.TmpDir, buf: []u8) ![]const u8 {
     const len = try tmp.dir.realPath(std.testing.io, buf);
@@ -825,7 +803,8 @@ test "file-RPC owner: 空目录首次 claim 成功并写入自身 pid" {
     var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const dir_path = try testTmpRpcDir(&tmp, &buf);
 
-    try claimFileRpcOwnership(std.testing.io, dir_path);
+    const lock = try claimFileRpcOwnership(std.testing.io, dir_path);
+    defer lock.close(std.testing.io);
 
     const text = try readFileCompat(tmp.dir, std.testing.io, OWNER_FILE, std.testing.allocator);
     defer std.testing.allocator.free(text);
@@ -839,9 +818,24 @@ test "file-RPC owner: 活 pid 持有时二次 claim 被拒绝" {
     var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const dir_path = try testTmpRpcDir(&tmp, &buf);
 
-    // First claim writes this process pid (necessarily alive), simulating another active instance
-    // holding it.
-    try claimFileRpcOwnership(std.testing.io, dir_path);
+    // The first claim's lock stands for another live instance (locks belong to the open
+    // file, so a second claim from this process conflicts as well).
+    const lock = try claimFileRpcOwnership(std.testing.io, dir_path);
+    defer lock.close(std.testing.io);
+    try std.testing.expectError(error.FileRpcDirAlreadyOwned, claimFileRpcOwnership(std.testing.io, dir_path));
+}
+
+test "file-RPC owner: 持有者退出（锁释放）后可接管" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir_path = try testTmpRpcDir(&tmp, &buf);
+
+    // Closing the lock is what process exit or a crash does.
+    const first = try claimFileRpcOwnership(std.testing.io, dir_path);
+    first.close(std.testing.io);
+    const second = try claimFileRpcOwnership(std.testing.io, dir_path);
+    defer second.close(std.testing.io);
     try std.testing.expectError(error.FileRpcDirAlreadyOwned, claimFileRpcOwnership(std.testing.io, dir_path));
 }
 
@@ -853,7 +847,9 @@ test "file-RPC owner: 死 pid 残留被接管" {
 
     // macOS pid_max = 99998; 4000000 doesn't exist -> kill returns ESRCH -> detected dead.
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = OWNER_FILE, .data = "{\"pid\":\"4000000\"}" });
-    try claimFileRpcOwnership(std.testing.io, dir_path);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = OWNER_LOCK_FILE, .data = "" });
+    const lock = try claimFileRpcOwnership(std.testing.io, dir_path);
+    defer lock.close(std.testing.io);
 
     const text = try readFileCompat(tmp.dir, std.testing.io, OWNER_FILE, std.testing.allocator);
     defer std.testing.allocator.free(text);
@@ -867,7 +863,8 @@ test "file-RPC owner: 坏 owner.json 被接管" {
     const dir_path = try testTmpRpcDir(&tmp, &buf);
 
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = OWNER_FILE, .data = "not json at all" });
-    try claimFileRpcOwnership(std.testing.io, dir_path);
+    const lock = try claimFileRpcOwnership(std.testing.io, dir_path);
+    defer lock.close(std.testing.io);
     const text = try readFileCompat(tmp.dir, std.testing.io, OWNER_FILE, std.testing.allocator);
     defer std.testing.allocator.free(text);
     try std.testing.expectEqual(std.c.getpid(), parseOwnerPid(text) orelse return error.TestUnexpectedResult);

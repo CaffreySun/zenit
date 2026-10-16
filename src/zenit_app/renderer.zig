@@ -9,7 +9,9 @@
 ///
 /// Usage:
 /// ```
-/// var app_renderer = try AppRenderer.init(allocator, &device, &queue, &surface, &window);
+/// const app_renderer = try allocator.create(AppRenderer);
+/// defer allocator.destroy(app_renderer);
+/// try app_renderer.init(allocator, io, &device, &queue, &surface, .{});
 /// defer app_renderer.deinit();
 ///
 /// // Font setup
@@ -24,8 +26,40 @@ const std = @import("std");
 const gpu = @import("gpu");
 const render = @import("render");
 const render_pacing = @import("render_pacing.zig");
+const caret_plan = @import("caret_patch_plan.zig");
+extern fn macos_caret_patch_count(*anyopaque) c_uint;
+extern fn macos_caret_drawable_info(*anyopaque, *anyopaque, *[4]u64) void;
+extern fn metal_glass_clock_trace_line([*]const u8, usize) void;
+extern fn macos_caret_patch_target(*anyopaque, c_uint, *[4]u32) ?*anyopaque;
 const frame_testing_enabled = @import("builtin").is_test or @import("build_options").test_mode;
-extern fn macos_fullscreen_header_encode(*anyopaque, *anyopaque, *anyopaque) void;
+extern fn macos_caret_patch_command_succeeded(*anyopaque) c_int;
+extern fn macos_caret_patch_composite(*anyopaque, [*]u8, u32, u32, f32) c_int;
+extern fn macos_caret_patch_encode(*anyopaque, *anyopaque, *anyopaque, [*]const [4]f32, usize, f32) c_int;
+extern fn macos_caret_patch_show(*anyopaque, c_int) void;
+extern fn macos_caret_patch_clear(*anyopaque) void;
+const engine_diagnostics_enabled = frame_testing_enabled or (@hasDecl(@import("build_options"), "engine_diagnostics") and @import("build_options").engine_diagnostics);
+extern fn metal_command_buffer_track_engines(*anyopaque) void;
+extern fn metal_command_buffer_engine_counts(*anyopaque, *[3]u32) void;
+extern fn macos_fullscreen_header_encode(*anyopaque, *anyopaque, *anyopaque, u64) void;
+extern fn macos_fullscreen_header_needs_content_revision(*anyopaque) c_int;
+
+// Only evaluated during the bounded windowed prewarm, after Cx.render has run
+// before_render hooks. Child paint versions catch header changes without
+// invalidating the snapshot for body-only frames. No GPU readback for equality.
+fn nativeHeaderContentRevision(header: anytype) u64 {
+    var hash = std.hash.Wyhash.init(0);
+    hashNativeHeaderSubtree(&hash, header);
+    return hash.final();
+}
+fn hashNativeHeaderSubtree(hash: *std.hash.Wyhash, node: anytype) void {
+    const caches = &node.meta.per_frame.caches;
+    const stamp = [_]u64{ node.element_id_raw, caches.versions.content, caches.versions.composite, caches.text_hash.content_hash, caches.text_hash.spans_hash };
+    hash.update(std.mem.asBytes(&stamp));
+    const rect = node.rectFromWorldOrFallback();
+    const geometry = [_]f32{ rect.x, rect.y, rect.w, rect.h };
+    hash.update(std.mem.asBytes(&geometry));
+    for (node.children.items) |child| hashNativeHeaderSubtree(hash, child);
+}
 const SdfRenderer = render.SdfRenderer;
 const ImageRenderer = render.ImageRenderer;
 const IconRenderer = render.IconRenderer;
@@ -104,6 +138,7 @@ pub const FrameStats = struct {
     /// (D3D12 only; 0 elsewhere).
     render_passes: u32 = 0,
     blit_passes: u32 = 0,
+    compute_passes: u32 = 0,
     pass_native_us: u64 = 0,
     /// Path pipeline GPU draws actually issued this frame (post-batch).
     path_draw_calls: u32 = 0,
@@ -165,6 +200,14 @@ pub const RecordingFrameFn = *const fn (texture: *const gpu.Backend.Texture) boo
 pub const RecordingFrameContextFn = *const fn (?*anyopaque, *const gpu.Backend.Texture) bool;
 
 /// AppRenderer - encapsulate complete render pipeline.
+/// Called before each drawable acquisition. Returning true fails that
+/// acquisition with `error.SurfaceTimeout`, exactly like a compositor timeout,
+/// so applications can test their recovery path deterministically.
+pub const AcquireFaultHook = struct {
+    ctx: ?*anyopaque = null,
+    should_fail: *const fn (ctx: ?*anyopaque) bool,
+};
+
 pub const AppRenderer = struct {
     allocator: std.mem.Allocator,
 
@@ -190,6 +233,7 @@ pub const AppRenderer = struct {
     // Frame stats.
     frame_count: u64 = 0,
     fail_after_encode_for_testing: if (frame_testing_enabled) bool else void = if (frame_testing_enabled) false else {},
+    acquire_fault_hook: ?AcquireFaultHook = null,
     /// Opt-in desktop audit identity stamp, never enabled for normal rendering.
     desktop_capture_stamp: bool = false,
     /// Cumulative retained count (monotonic cross-frame; /stats use, per-frame overwritten by later
@@ -230,7 +274,11 @@ pub const AppRenderer = struct {
     /// each
     /// frame, continuous path/blur animation jitters (audit P1).
     persistent_gpu: render.PersistentGpuCache = .{},
+    /// Test-only submission control; production frame code never reads it.
+    developer_empty_frames: bool = false,
     frame_counter: u64 = 0,
+    pool_viewport: [3]f32 = .{ 0, 0, 0 },
+    pool_maintenance_retry: render.OffscreenMaintenanceRetry = .{},
     /// Public encoders can submit outside our FrameSync. Once one escapes,
     /// keep the pool's conservative frame quarantine for this renderer.
     has_external_encoder: bool = false,
@@ -248,11 +296,17 @@ pub const AppRenderer = struct {
     /// after
     /// next frame reads; upper layer doesn't observe native handle.
     prev_frame_cmd_buffer: ?gpu.Backend.CommandBuffer = null,
+    /// Scalar opt-in diagnostics; they never own drawables or command buffers.
+    caret_diag_exit_host_time: f64 = 0,
+    caret_diag_exit_seq: u64 = 0,
+    caret_diag_handoff: bool = false,
     /// Submitted frames whose GPU timestamps are not resolved yet, oldest
     /// first. With frames in flight the previous frame is usually still on the
     /// GPU right after this one is submitted; harvesting only it (as before)
     /// read a timestamp only while the GPU was idle (a handful at startup).
     gpu_timing_pending: [4]?gpu.Backend.CommandBuffer = @splat(null),
+    /// An idle poll may harvest before frame() publishes its statistics.
+    idle_gpu_execute_us: u64 = 0,
     /// In-flight batch per-glass luminance readback: command buffer that wrote staging (extra
     /// retain).
     /// Until the batch read is done, the encode side stops writing staging
@@ -281,6 +335,16 @@ pub const AppRenderer = struct {
     retained_w: u32 = 0,
     retained_h: u32 = 0,
     retained_valid: bool = false,
+    /// Host-only entry preparation: copy hidden background from its presented
+    /// frame, then render visible caret commands only into the small targets.
+    last_frame_presented: bool = false,
+    caret_patch_capture: bool = false,
+    caret_background_capture: bool = false,
+    /// Latches after bounded failed replacement; only renderer init resets it.
+    caret_flip_disabled: bool = false,
+    caret_test_fringe: if (frame_testing_enabled) bool else void = if (frame_testing_enabled) false else {},
+    caret_hidden_items: ?[]caret_plan.Item = null,
+    caret_patch_ready: bool = false,
 
     // E2E screenshot request, set by test harness screenshot callback (test-mode). Actual pixel
     // read
@@ -302,24 +366,43 @@ pub const AppRenderer = struct {
     ///
     /// Create sdf/image/text renderer, encapsulate pipeline.
     pub fn init(
+        self: *AppRenderer,
         allocator: std.mem.Allocator,
         io: std.Io,
         device: *gpu.Backend.Device,
         queue: *gpu.Backend.Queue,
         surface: *gpu.Backend.Surface,
         config: Config,
-    ) !AppRenderer {
-        var sdf_renderer = try SdfRenderer.init(allocator, device);
-        errdefer sdf_renderer.deinit();
+    ) !void {
+        // allocator.create/undefined storage does not apply struct field defaults.
+        // Initialize the entire owner so new optional resources cannot inherit
+        // poisoned bytes (including caret snapshots on the first preparation).
+        self.* = .{
+            .allocator = allocator,
+            .io = io,
+            .device = device,
+            .queue = queue,
+            .surface = surface,
+            .config = config,
+            .sdf_renderer = undefined,
+            .image_renderer = undefined,
+            .icon_renderer = undefined,
+            .text_renderer = undefined,
+            .frame_sync = undefined,
+            .developer_empty_frames = if (comptime frame_testing_enabled and gpu.backend_kind == .metal) @import("zenit_environment").has("ZENIT_DEV_EMPTY_FRAME") else false,
+        };
 
-        var image_renderer = try ImageRenderer.init(allocator, device);
-        errdefer image_renderer.deinit();
+        self.sdf_renderer = try SdfRenderer.init(allocator, device);
+        errdefer self.sdf_renderer.deinit();
 
-        var icon_renderer = try IconRenderer.init(allocator, device);
-        errdefer icon_renderer.deinit();
+        try self.image_renderer.init(allocator, device);
+        errdefer self.image_renderer.deinit();
 
-        var text_renderer = try TextRenderer.init(allocator, device);
-        errdefer text_renderer.deinit();
+        try self.icon_renderer.init(allocator, device);
+        errdefer self.icon_renderer.deinit();
+
+        self.text_renderer = try TextRenderer.init(allocator, device);
+        errdefer self.text_renderer.deinit();
 
         var requested = config.visual_quality;
         if (comptime gpu.is_direct3d) {
@@ -339,27 +422,14 @@ pub const AppRenderer = struct {
         }
         const quality = render.visual_quality.resolve(requested, if (comptime gpu.is_direct3d) device.isSoftware() else false);
         if (comptime gpu.is_direct3d) std.log.info("[visual-quality] requested={s} effective={s}", .{ @tagName(requested), @tagName(quality) });
-        return AppRenderer{
-            .allocator = allocator,
-            .io = io,
-            .device = device,
-            .queue = queue,
-            .surface = surface,
-            .sdf_renderer = sdf_renderer,
-            .image_renderer = image_renderer,
-            .icon_renderer = icon_renderer,
-            .text_renderer = text_renderer,
-            .config = config,
-            .visual_quality = quality,
-            // WARP cannot benefit from a deep queue of expensive stale UI
-            // frames. Keep triple-buffered storage but admit one GPU frame.
-            .frame_sync = if (comptime gpu.is_direct3d)
-                gpu.Backend.FrameSync.initWithLimit(FRAME_BUFFER_COUNT, if (device.isSoftware()) 1 else FRAME_BUFFER_COUNT)
-            else if (comptime gpu.backend_kind == .null_backend)
-                gpu.Backend.FrameSync.init(FRAME_BUFFER_COUNT, io)
-            else
-                gpu.Backend.FrameSync.init(FRAME_BUFFER_COUNT),
-        };
+        self.visual_quality = quality;
+        // WARP admits one GPU frame while retaining triple-buffered storage.
+        self.frame_sync = if (comptime gpu.is_direct3d)
+            gpu.Backend.FrameSync.initWithLimit(FRAME_BUFFER_COUNT, if (device.isSoftware()) 1 else FRAME_BUFFER_COUNT)
+        else if (comptime gpu.backend_kind == .null_backend)
+            gpu.Backend.FrameSync.init(FRAME_BUFFER_COUNT, io)
+        else
+            gpu.Backend.FrameSync.init(FRAME_BUFFER_COUNT);
     }
 
     /// Get correctly-bound RenderCommandEncoder (auto-carries fonts + persistent offscreen pool).
@@ -368,16 +438,30 @@ pub const AppRenderer = struct {
         return self.createEncoder();
     }
 
+    /// Manual submissions are not tracked by frameWithPresentation. The caller
+    /// may retire wallclock-expired textures between encoders after proving all
+    /// submissions using this pool have finished. Elapsed time is not a fence.
+    pub fn maintainExternalOffscreenPool(self: *AppRenderer, gpu_completed: bool) void {
+        const now: u64 = @intCast(@max(0, @import("zenit_time").monotonicTimestamp(self.io)));
+        self.offscreen_pool.maintain(now, gpu_completed);
+    }
+
     fn createEncoder(self: *AppRenderer) RenderCommandEncoder {
         var enc = RenderCommandEncoder.initWithImageAndIcon(&self.sdf_renderer, &self.text_renderer, &self.image_renderer, &self.icon_renderer, &self.offscreen_pool, &self.persistent_gpu);
+        // Once manual submissions escape FrameSync, automatic frames must
+        // retain the same conservative aging too. Otherwise mixed use loses
+        // both wallclock maintenance and the manual encoder's frame sweeps.
+        enc.external_pool_aging = self.has_external_encoder;
         // Reset frame-internal cursors (uniform ring write offset etc), keep pipeline/buffers.
         self.persistent_gpu.beginFrame();
         // Frame counter carried by AppRenderer (encoder per-frame new, self-increment zeroes each
         // frame).
         self.frame_counter += 1;
+        self.offscreen_pool.setClock(@intCast(@max(0, @import("zenit_time").monotonicTimestamp(self.io))));
         enc.io = self.io;
         enc.frame_index = self.frame_counter;
         enc.retained_enabled = self.retained_enabled;
+        enc.main_destination_opaque = self.config.clear_color.a == 1;
         enc.visual_quality = self.visual_quality;
         if (self.fonts) |f| enc.setFonts(f);
         return enc;
@@ -480,6 +564,16 @@ pub const AppRenderer = struct {
     /// Read any BGRA8 texture -> RGBA8 -> write PNG (same pipeline as captureSurfaceToPng, but path
     /// explicit, not dependent on pending_screenshot_* state).
     fn textureToPng(self: *AppRenderer, texture: *const gpu.Backend.Texture, width: u32, height: u32, path: []const u8) bool {
+        return self.textureToPngComposited(texture, width, height, path, null);
+    }
+
+    pub fn captureCaretCompositeToPng(self: *AppRenderer, path: []const u8, scale: f32) bool {
+        const texture = &(self.retained_tex orelse return false);
+        if (self.prev_frame_cmd_buffer) |*command| command.waitUntilCompleted();
+        return self.textureToPngComposited(texture, self.retained_w, self.retained_h, path, scale);
+    }
+
+    fn textureToPngComposited(self: *AppRenderer, texture: *const gpu.Backend.Texture, width: u32, height: u32, path: []const u8, caret_scale: ?f32) bool {
         if (width == 0 or height == 0 or path.len == 0 or path.len >= 512) return false;
         const px = @as(usize, width) * @as(usize, height);
         const bytes_per_row: u32 = width * 4;
@@ -488,6 +582,11 @@ pub const AppRenderer = struct {
         const rgba = self.allocator.alloc(u8, px * 4) catch return false;
         defer self.allocator.free(rgba);
         texture.readBgra8(width, height, bgra, bytes_per_row) catch return false;
+        if (comptime gpu.backend_kind == .metal) {
+            if (caret_scale) |scale| {
+                if (macos_caret_patch_composite(@ptrCast(self.surface.layer), bgra.ptr, width, height, scale) == 0) return false;
+            }
+        }
         var i: usize = 0;
         while (i < px * 4) : (i += 4) {
             rgba[i] = bgra[i + 2];
@@ -526,7 +625,7 @@ pub const AppRenderer = struct {
             .label = "static-frame-prefix",
             .size = .{ .width = width, .height = height, .depth = 1 },
             .format = gpu.color_format,
-            .usage = .{ .copy_src = true, .copy_dst = true },
+            .usage = .{ .copy_src = true, .copy_dst = true, .render_attachment = gpu.backend_kind == .metal },
         });
     }
 
@@ -539,7 +638,7 @@ pub const AppRenderer = struct {
             .label = "e2e-retained-present",
             .size = .{ .width = width, .height = height, .depth = 1 },
             .format = gpu.color_format,
-            .usage = .{ .copy_src = true, .copy_dst = true },
+            .usage = .{ .copy_src = true, .copy_dst = true, .render_attachment = gpu.backend_kind == .metal },
             // WARN: must be host_upload (CPU-readable shared storage). Default device_local is
             // GPU-private
             // compressed layout on Apple Silicon, getBytes directly SIGSEGV (crashes at AGX
@@ -595,6 +694,128 @@ pub const AppRenderer = struct {
         return h.final();
     }
 
+    pub fn clearCaretPreparation(self: *AppRenderer) void {
+        if (self.caret_hidden_items) |items| self.allocator.free(items);
+        self.caret_hidden_items = null;
+        self.caret_background_capture = false;
+    }
+
+    pub fn caretItems(self: *AppRenderer, commands: anytype) ![]caret_plan.Item {
+        const items = try self.allocator.alloc(caret_plan.Item, commands.len);
+        for (commands, items) |it, *item| {
+            var hash = std.hash.Wyhash.init(0);
+            render.PaintFingerprint.hashCaretPaintItemInto(&hash, it);
+            const digest = hash.final();
+            if (frame_testing_enabled and (self.caret_background_capture or self.caret_patch_capture) and it.glass_ptr != null and @import("zenit_environment").has("ZENIT_CARET_FLIP_DEBUG")) {
+                std.log.info("[caret-material] hidden={} payload=0x{x} content=0x{x}", .{ self.caret_background_capture, @intFromPtr(it.glass_ptr), digest });
+            }
+            if (frame_testing_enabled and (self.caret_background_capture or self.caret_patch_capture) and it.icon_rep_ptr != null and @import("zenit_environment").has("ZENIT_CARET_FLIP_DEBUG")) {
+                std.log.info("[caret-icon] hidden={} payload=0x{x} content=0x{x}", .{ self.caret_background_capture, @intFromPtr(it.icon_rep_ptr), digest });
+            }
+            const control = it.kind == .control;
+            const composite = control and (it.control_kind == .begin_opacity_layer or it.control_kind == .begin_blur_layer or it.control_kind == .begin_rounded_clip);
+            item.* = .{
+                .label = if (control) @tagName(it.control_kind) else @tagName(it.kind),
+                .digest = digest,
+                .bounds = if (composite) render.PaintFingerprint.nestedCompositeBounds(it) orelse render.PaintFingerprint.damageItemBounds(it) else if (control) .{ 0, 0, 0, 0 } else if (it.kind == .path) render.PaintFingerprint.pathItemBounds(it) else render.PaintFingerprint.damageItemBounds(it),
+                .drawable = if (control) switch (it.control_kind) {
+                    .push_clip, .pop_clip, .end_opacity_layer, .end_blur_layer, .end_rounded_clip => false,
+                    else => true,
+                } else it.kind != .none,
+                // Damage bounds do not cover transformed primitives or icon
+                // representations whose paths may escape geom. No trusted local
+                // envelope means later painting must conservatively reject.
+                .unbounded = (composite and render.PaintFingerprint.nestedCompositeBounds(it) == null) or
+                    (!control and (it.use_draw_transform or it.icon_rep_ptr != null)) or
+                    (control and !composite and it.control_kind != .push_clip and it.control_kind != .pop_clip and
+                        it.control_kind != .end_opacity_layer and it.control_kind != .end_blur_layer and it.control_kind != .end_rounded_clip),
+                .clip = control and (it.control_kind == .push_clip or it.control_kind == .pop_clip),
+                .clip_delta = if (!control) 0 else switch (it.control_kind) {
+                    .push_clip => 1,
+                    .pop_clip => -1,
+                    else => 0,
+                },
+                .effect_delta = if (!control) 0 else switch (it.control_kind) {
+                    .begin_opacity_layer, .begin_blur_layer, .begin_rounded_clip => 1,
+                    .end_opacity_layer, .end_blur_layer, .end_rounded_clip => -1,
+                    else => 0,
+                },
+                // Draw the application's original GPU command, with its clip
+                // stack. Effects/custom drawings use ordinary blinking until
+                // a region-local replay contract exists for them.
+                .local_caret = it.kind == .rect and it.stroke_width == 0 and it.noise_intensity == 0 and it.shadow_blur == 0 and it.rotate == 0 and !it.use_draw_transform,
+            };
+            item.paint_bounds = item.bounds;
+            if (item.local_caret) item.bounds = .{ it.geom.x, it.geom.y, it.geom.w, it.geom.h };
+        }
+        return items;
+    }
+
+    fn renderCaretTargets(self: *AppRenderer, cx: anytype, scale: f32) !void {
+        if (comptime gpu.backend_kind != .metal) return error.CaretPatchUnavailable;
+        const commands = cx.lowerForEncoderPaintTable();
+        const visible = try self.caretItems(commands);
+        defer self.allocator.free(visible);
+        const count = macos_caret_patch_count(@ptrCast(self.surface.layer));
+        if (count == 0 or count > 64) return error.CaretPatchUnavailable;
+        var patches: [64][4]f32 = undefined;
+        for (0..count) |index| {
+            var rect: [4]u32 = undefined;
+            _ = macos_caret_patch_target(@ptrCast(self.surface.layer), @intCast(index), &rect) orelse return error.CaretPatchUnavailable;
+            // Read the actual native crop, avoiding a second implementation of
+            // outset, quad alignment and clipping at fractional backing scales.
+            for (rect, &patches[index]) |v, *out| out.* = @as(f32, @floatFromInt(v)) / scale;
+        }
+        const selected = try caret_plan.select(self.allocator, self.caret_hidden_items orelse return error.CaretPatchUnavailable, visible, cx.caret_rects[0..cx.caret_rect_count], patches[0..count]);
+        defer self.allocator.free(selected);
+        for (0..count) |index| {
+            var rect: [4]u32 = undefined;
+            const raw = macos_caret_patch_target(@ptrCast(self.surface.layer), @intCast(index), &rect) orelse return error.CaretPatchUnavailable;
+            const target: gpu.Backend.Texture = .{ .raw = @ptrCast(@alignCast(raw)), .format = gpu.color_format, .size = .{ .width = rect[2], .height = rect[3] }, .mip_level_count = 1, .dimension = .@"2d", .memory = .host_upload };
+            try self.frame_sync.waitForNextFrame();
+            var slot_owned = true;
+            errdefer if (slot_owned) self.frame_sync.signal();
+            var enc = self.createEncoder();
+            defer enc.deinit();
+            enc.beginFrame(self.pool_viewport[0], self.pool_viewport[1], scale);
+            var command_encoder = try gpu.Backend.CommandEncoder.init(self.queue);
+            errdefer command_encoder.deinit();
+            var view = target.binding().createView();
+            defer view.destroy();
+            var pass = try command_encoder.beginRenderPass(.{ .color_attachments = &.{.{ .view = view, .load_op = .load, .store_op = .store }} });
+            pass.root_crop = rect;
+            pass.setViewport(0, 0, @floatFromInt(self.surface.extent.width), @floatFromInt(self.surface.extent.height), 0, 1);
+            pass.setScissorRect(0, 0, self.surface.extent.width, self.surface.extent.height);
+            enc.gpu_command_encoder = &command_encoder;
+            enc.main_render_target = target.binding();
+            enc.render_pass = &pass;
+            // One command at a time keeps the original clip/order contract;
+            // no full-window render target or drawable is acquired here.
+            for (commands, selected, 0..) |_, keep, i| if (keep) try enc.encodeCommands(commands[i .. i + 1]);
+            const current_pass = enc.render_pass orelse return error.MissingActiveRenderPass;
+            try enc.flush(current_pass);
+            current_pass.end();
+            var command = try command_encoder.finish();
+            defer command.deinit();
+            self.frame_sync.signalOnCompletion(&command);
+            slot_owned = false;
+            command.submit();
+            command.waitUntilCompleted();
+            if (self.prev_frame_cmd_buffer) |*previous| previous.deinit();
+            self.prev_frame_cmd_buffer = command.retained();
+            if (macos_caret_patch_command_succeeded(@ptrCast(command.raw)) == 0) return error.CaretPreparationGpuFailed;
+            self.frame_count += 1;
+        }
+        self.caret_patch_ready = true;
+        if (self.pending_screenshot_path) |path| {
+            macos_caret_patch_show(@ptrCast(self.surface.layer), 1);
+            defer macos_caret_patch_show(@ptrCast(self.surface.layer), 0);
+            self.last_screenshot_ok = self.captureCaretCompositeToPng(path[0..self.pending_screenshot_len], scale);
+            self.pending_screenshot_path = null;
+            self.pending_screenshot_len = 0;
+        }
+    }
+
     /// Render one frame using UI Cx context.
     ///
     /// Full pipeline:
@@ -608,10 +829,26 @@ pub const AppRenderer = struct {
     }
 
     pub fn frameWithPresentation(self: *AppRenderer, cx: anytype, viewport_width: f32, viewport_height: f32, scale: f32, presentation_sample: anytype) !void {
+        self.last_frame_presented = false;
+        if (comptime gpu.is_direct3d) {
+            if (try self.text_renderer.updateWindowTextParameters(self.surface.hwnd)) {
+                self.frame_damage.invalidate();
+                self.background_damage.invalidate();
+                self.background_valid = false;
+                self.retained_valid = false;
+                self.offscreen_pool.invalidateRetainedContents();
+                cx.needs_redraw = true;
+                if (cx.root) |root| root.markRenderDirty();
+            }
+        }
+
         if (comptime @hasField(@TypeOf(cx.*), "frame_presentation_sample")) cx.frame_presentation_sample = presentation_sample;
         defer {
             if (comptime @hasField(@TypeOf(cx.*), "frame_presentation_sample")) cx.frame_presentation_sample = null;
         }
+        const viewport = [3]f32{ viewport_width, viewport_height, scale };
+        if (self.pool_viewport[0] != 0 and !std.mem.eql(f32, &viewport, &self.pool_viewport)) self.offscreen_pool.noteResize();
+        self.pool_viewport = viewport;
         _ = self.pollBackdropLuminance(cx);
         // Permanent optional-pipeline failure downgrades this renderer once. Essential GPU errors
         // still
@@ -706,7 +943,12 @@ pub const AppRenderer = struct {
 
         // 1. Layout.
         const layout_start = @import("zenit_time").Instant.now(cx.io) catch null;
+        cx.world.layout_output.layout_oom = false;
         cx.layout();
+        if (cx.world.layout_output.layout_oom) {
+            if (cx.root) |root| root.markSizingDirty();
+            return error.OutOfMemory;
+        }
         const layout_end = @import("zenit_time").Instant.now(cx.io) catch null;
 
         // 2. Generate render commands. cx.render() runs paint pass fills cx.display_list; encoder
@@ -716,8 +958,30 @@ pub const AppRenderer = struct {
         // hold IR.
         const render_start = @import("zenit_time").Instant.now(cx.io) catch null;
         _ = cx.render();
+        if (comptime frame_testing_enabled) {
+            if (self.caret_test_fringe and cx.caret_rect_count > 0) {
+                const r = cx.caret_rects[0];
+                // A later selection/highlight covers just the AA fringe,
+                // strictly outside the tight caret geometry (one backing px).
+                try cx.lowering.main_paint.append(cx.allocator, .{
+                    .kind = .rect,
+                    .geom = .{ .x = r[0] - 1 / scale, .y = r[1], .w = 1 / scale, .h = r[3] },
+                    .color = .{ .r = 179, .g = 51, .b = 204, .a = 255 },
+                });
+            }
+        }
+        if (cx.world.layout_output.layout_oom) {
+            if (cx.root) |root| root.markSizingDirty();
+            return error.OutOfMemory;
+        }
         const render_end = @import("zenit_time").Instant.now(cx.io) catch null;
         self.scanPaintTable(cx);
+        if (self.caret_patch_capture) return self.renderCaretTargets(cx, scale);
+        if (self.caret_background_capture) {
+            if (self.caret_hidden_items) |items| self.allocator.free(items);
+            self.caret_hidden_items = null;
+            self.caret_hidden_items = try self.caretItems(cx.lowerForEncoderPaintTable());
+        }
 
         // Admission must precede ring rotation, atlas collection and GPU writes.
         // CPU layout/paint can still overlap the preceding GPU frame.
@@ -768,10 +1032,70 @@ pub const AppRenderer = struct {
         if (self.config.prewarm_text) try enc.prewarmDisplay(cx);
 
         // 3. Prepare GPU submit.
+        // Completed timing commands still retain their presented drawable.
+        // Release them before nextDrawable, particularly after idle handoff;
+        // harvesting after acquisition can permanently grow the layer pool.
+        // This polls completion only and never waits for an in-flight frame.
+        const newly_harvested_us = self.harvestGpuTimings();
+        const gpu_execute_us: u64 = if (newly_harvested_us != 0) newly_harvested_us else self.idle_gpu_execute_us;
+        self.idle_gpu_execute_us = 0;
+        self.retireCompletedPresentation();
+        const diagnostic_in_flight = if (clock_trace_enabled) self.diagnosticInFlight() else 0;
+        const diagnostic_acquire_start = if (clock_trace_enabled) metal_glass_clock_trace_host_time() else 0;
         const acquire_start = @import("zenit_time").Instant.now(cx.io) catch null;
+        if (self.acquire_fault_hook) |hook| if (hook.should_fail(hook.ctx)) return error.SurfaceTimeout;
         var surface_texture = try self.surface.acquireTexture(self.allocator);
         const acquire_end = @import("zenit_time").Instant.now(cx.io) catch null;
         defer surface_texture.deinit();
+
+        enc.setDrawableExtent(surface_texture.texture.size.width, surface_texture.texture.size.height);
+
+        if (comptime gpu.backend_kind == .metal) if (clock_trace_enabled) {
+            var info: [4]u64 = undefined;
+            macos_caret_drawable_info(@ptrCast(self.surface.layer), @ptrCast(surface_texture.drawable), &info);
+            const host_time = metal_glass_clock_trace_host_time();
+            var line: [1024]u8 = undefined;
+            const encoded = std.fmt.bufPrint(&line, "{{\"kind\":\"caret-drawable\",\"frame\":{d},\"host_time\":{d:.9},\"acquire_start\":{d:.9},\"in_flight_before\":{d},\"in_flight_after\":{d},\"iosurface_id\":{d},\"texture_ref\":{d},\"drawable_id\":{d},\"drawable_budget\":{d},\"exit_seq\":{d},\"exit_host_time\":{d:.9},\"handoff\":{},\"hidden_preparation\":{},\"input_epoch\":{d},\"mutation_epoch\":{d},\"width\":{d},\"height\":{d}}}", .{
+                self.frame_count + 1,           host_time,                  diagnostic_acquire_start,      diagnostic_in_flight, self.diagnosticInFlight(),
+                info[0],                        info[1],                    info[2],                       info[3],              self.caret_diag_exit_seq,
+                self.caret_diag_exit_host_time, self.caret_diag_handoff,    self.caret_background_capture, cx.input_epoch,       cx.world.mutation_epoch,
+                self.surface.extent.width,      self.surface.extent.height,
+            }) catch unreachable;
+            metal_glass_clock_trace_line(encoded.ptr, encoded.len);
+        };
+
+        if (comptime frame_testing_enabled and gpu.backend_kind == .metal) {
+            if (self.developer_empty_frames) {
+                // Same device, queue, layer and drawable size; no draws, header
+                // encoding or retained-present blit. For attribution only.
+                var empty_encoder = try gpu.Backend.CommandEncoder.init(self.queue);
+                metal_command_buffer_track_engines(@ptrCast(empty_encoder.raw));
+                errdefer empty_encoder.deinit();
+                var view = surface_texture.texture.binding().createView();
+                defer view.destroy();
+                var pass = try empty_encoder.beginRenderPass(.{ .color_attachments = &.{.{
+                    .view = view,
+                    .load_op = .load,
+                    .store_op = .store,
+                }} });
+                pass.end();
+                var command = try empty_encoder.finish();
+                defer command.deinit();
+                self.frame_sync.signalOnCompletion(&command);
+                acquired_slot = false;
+                surface_texture.preparePresent(&command);
+                if (comptime gpu.is_direct3d) try command.submitChecked() else command.submit();
+                submitted = true;
+                surface_texture.presentAfterSubmit(&command);
+                self.last_frame_presented = true;
+                if (self.prev_frame_cmd_buffer) |*previous| previous.deinit();
+                self.prev_frame_cmd_buffer = command.retained();
+                self.pool_maintenance_retry.reset();
+                self.retained_valid = false;
+                self.frame_count += 1;
+                return;
+            }
+        }
 
         // A provider may change its output while retaining the same context
         // address. It has no revision contract, so custom providers repaint.
@@ -808,6 +1132,10 @@ pub const AppRenderer = struct {
         }
 
         var gpu_encoder = try gpu.Backend.CommandEncoder.init(self.queue);
+        if (comptime gpu.backend_kind == .metal and engine_diagnostics_enabled) {
+            if (frame_testing_enabled or @import("zenit_environment").has("ZENIT_DEV_ENGINE_COUNTS"))
+                metal_command_buffer_track_engines(@ptrCast(gpu_encoder.raw));
+        }
         // Error path fallback: encodeDisplay/flush below may error early-return, then finish()
         // never called
         // (state != .finished), command buffer unreleased. CommandEncoder.deinit prepared for this
@@ -817,11 +1145,13 @@ pub const AppRenderer = struct {
         // no double-free.
         errdefer gpu_encoder.deinit();
 
-        if (damage != null or reuse_background or background_update != null) {
-            var blit = try gpu_encoder.beginBlitPass();
-            defer blit.end();
-            const source = if (reuse_background or background_update != null) self.background_tex.?.binding() else self.retained_tex.?.binding();
-            try blit.copyTextureRegion(source, 0, 0, source.width, source.height, surface_texture.texture.binding(), 0, 0);
+        if (comptime gpu.is_direct3d) {
+            if (damage != null or reuse_background or background_update != null) {
+                var blit = try gpu_encoder.beginBlitPass();
+                defer blit.end();
+                const source = if (reuse_background or background_update != null) self.background_tex.?.binding() else self.retained_tex.?.binding();
+                try blit.copyTextureRegion(source, 0, 0, source.width, source.height, surface_texture.texture.binding(), 0, 0);
+            }
         }
 
         var texture_view = surface_texture.texture.binding().createView();
@@ -848,6 +1178,7 @@ pub const AppRenderer = struct {
         enc.gpu_command_encoder = &gpu_encoder;
         enc.main_render_target = surface_texture.texture.binding();
         enc.render_pass = &render_pass;
+        enc.applyOffscreenTargetViewport();
         if (prefix_len > 0) {
             if (!reuse_background) {
                 if (background_update) |rect| {
@@ -861,7 +1192,7 @@ pub const AppRenderer = struct {
                 try enc.flush(&render_pass);
                 render_pass.end();
                 enc.frame_damage_scissor = null;
-                {
+                if (comptime gpu.is_direct3d) {
                     var blit = try gpu_encoder.beginBlitPass();
                     defer blit.end();
                     const source = surface_texture.texture.binding();
@@ -922,36 +1253,21 @@ pub const AppRenderer = struct {
         }
         const flush_end = @import("zenit_time").Instant.now(cx.io) catch null;
 
-        // e2e: blit soon-presented content into retained texture (see retain_present_copy). Must
+        // e2e: copy soon-presented content into retained texture (see retain_present_copy). Must
         // encode
         // into same command stream before finish.
         var frame_copy_ok = false;
         if (self.retain_present_copy or (frame_cache_enabled and self.frame_damage.pending_valid)) {
             const src = surface_texture.texture.binding();
             if (self.ensureRetainedTexture(src.width, src.height)) {
-                if (gpu_encoder.beginBlitPass()) |*bp_const| {
-                    var bp = bp_const.*;
-                    // WARN: copy failure **cannot** mark valid: captureRetainedToPng is the
-                    // preferred e2e
-                    // screenshot path and returns this texture once valid; content would be the
-                    // last frame (or
-                    // an undefined new texture). E2E pixel assertions assume "screenshot ==
-                    // just-presented
-                    // frame", so silently reading an old frame gives false-green, worse than a
-                    // screenshot
-                    // failure. On failure clear valid; captureRetainedToPng returns false and the
-                    // caller falls
-                    // back to the "render new frame" path.
-                    if (bp.copyTextureRegion(src, 0, 0, src.width, src.height, self.retained_tex.?.binding(), 0, 0)) {
-                        bp.end();
-                        self.retained_valid = true;
-                        frame_copy_ok = true;
-                    } else |err| {
-                        bp.end();
-                        self.retained_valid = false;
-                        std.log.warn("[renderer] retained present copy failed: {s}; e2e 截图回退到重渲染路径", .{@errorName(err)});
-                    }
-                } else |_| {}
+                // Valid only if this exact soon-presented frame was copied.
+                if (gpu.copyTextureRegion(&gpu_encoder, src, 0, 0, src.width, src.height, self.retained_tex.?.binding(), 0, 0, false)) {
+                    self.retained_valid = true;
+                    frame_copy_ok = true;
+                } else |err| {
+                    self.retained_valid = false;
+                    std.log.warn("[renderer] retained present copy failed: {s}", .{@errorName(err)});
+                }
             }
         }
 
@@ -972,27 +1288,18 @@ pub const AppRenderer = struct {
                     .label = "Zenit.GlassDebugRtStaging",
                     .size = .{ .width = 64, .height = 64 },
                     .format = gpu.color_format,
-                    .usage = .{ .copy_dst = true },
+                    .usage = .{ .copy_dst = true, .render_attachment = gpu.backend_kind == .metal },
                     .memory = .host_upload,
                 }) catch null;
             }
             const staging = &(slot.staging orelse break :blk);
             const src = surface_texture.texture.binding();
             if (rx + 64 > src.width or ry + 64 > src.height) break :blk;
-            if (gpu_encoder.beginBlitPass()) |*bp_const| {
-                var bp = bp_const.*;
-                const copied = inner: {
-                    bp.copyTextureRegion(src, rx, ry, 64, 64, staging.binding(), 0, 0) catch break :inner false;
-                    break :inner true;
-                };
-                bp.end();
-                if (copied) {
-                    slot.cur_pending = true;
-                    slot.cur_w = 64;
-                    slot.cur_h = 64;
-                    slot.last_used_frame = self.frame_counter;
-                    std.debug.print("[glassrt-blit] frame={d} src={d}x{d} at=({d},{d})\n", .{ self.frame_counter, src.width, src.height, rx, ry });
-                }
+            if (gpu.copyTextureRegion(&gpu_encoder, src, rx, ry, 64, 64, staging.binding(), 0, 0, false)) {
+                slot.cur_pending = true;
+                slot.cur_w = 64;
+                slot.cur_h = 64;
+                slot.last_used_frame = self.frame_counter;
             } else |_| {}
         }
         if (comptime frame_testing_enabled) {
@@ -1002,7 +1309,15 @@ pub const AppRenderer = struct {
             }
         }
         if (comptime gpu.backend_kind == .metal) {
-            macos_fullscreen_header_encode(@ptrCast(self.surface.layer), @ptrCast(surface_texture.texture.raw), @ptrCast(gpu_encoder.raw));
+            var header_revision: u64 = 0;
+            if (macos_fullscreen_header_needs_content_revision(@ptrCast(self.surface.layer)) != 0) {
+                if (cx.window_header_node) |header| header_revision = nativeHeaderContentRevision(header);
+            }
+            macos_fullscreen_header_encode(@ptrCast(self.surface.layer), @ptrCast(surface_texture.texture.raw), @ptrCast(gpu_encoder.raw), header_revision);
+
+            if (self.caret_background_capture) {
+                self.caret_patch_ready = macos_caret_patch_encode(@ptrCast(self.surface.layer), @ptrCast(surface_texture.texture.raw), @ptrCast(gpu_encoder.raw), &cx.caret_rects, cx.caret_rect_count, scale) != 0;
+            }
         }
         if (comptime gpu.is_direct3d) {
             if (self.lum_batch_cmd_buffer == null) {
@@ -1026,45 +1341,12 @@ pub const AppRenderer = struct {
         // Read true GPU execution time from prior frame (GPUStartTime/GPUEndTime valid
         // only after command buffer completion; current frame just submitted, can't read yet).
         // In steady state prior frame already finished, so this is wait-free.
-        const gpu_execute_us: u64 = self.harvestGpuTimings();
         self.queueGpuTiming(cmd_buffer.retained());
-        if (self.prev_frame_cmd_buffer) |*prev| {
-            // Debug staging consumed only after prior submission completes; production luminance
-            // polled before frame encoding. Opportunistic read: only if prior frame already
-            // completed. Never waitUntilCompleted: backdrop brightness is cosmetic and tolerates
-            // late/skipped samples, while blocking would stall the GPU pipeline every frame when
-            // GPU
-            // work exceeds budget.
-            const prev_ready = prev.isCompleted();
-            // Diagnostics (ZENIT_DEBUG_GLASS): read glass intermediate RGB average.
-            if (@import("zenit_environment").has("ZENIT_DEBUG_GLASS")) {
-                for (&self.persistent_gpu.debug_glass_slots, 0..) |*slot, si| {
-                    if (slot.prev_pending and prev_ready) {
-                        if (slot.staging) |*staging| {
-                            if (readAverageRgb(staging, slot.prev_w, slot.prev_h)) |rgb| {
-                                const stage_name = switch (si) {
-                                    0 => "capture",
-                                    1 => "composite",
-                                    else => "endrt",
-                                };
-                                std.debug.print("[glassdbg] stage={s} rgb=({d:.1},{d:.1},{d:.1})\n", .{
-                                    stage_name, rgb[0], rgb[1], rgb[2],
-                                });
-                            }
-                        }
-                    }
-                    slot.prev_pending = slot.cur_pending;
-                    slot.prev_w = slot.cur_w;
-                    slot.prev_h = slot.cur_h;
-                    slot.cur_pending = false;
-                }
-            }
-            prev.deinit();
-            self.prev_frame_cmd_buffer = null;
-        }
-        // Retain buffer for next frame read (extra retain paired with release above;
-        // cmd_buffer lifetime still managed by this frame's defer deinit).
-        self.prev_frame_cmd_buffer = cmd_buffer.retained();
+        if (self.prev_frame_cmd_buffer) |*prev| self.consumePreviousDebugGlass(prev.isCompleted());
+        self.advanceDebugGlassSlots();
+        // Keep the latest submitted fence until it completes. A completed
+        // owner is retired before acquisition; an unfinished owner survives even
+        // if this attempt fails before submit.
         // Frame wrote brightness staging & no in-flight batch: this frame starts new batch,
         // lock staging before read completes.
         if (self.lum_batch_cmd_buffer == null) {
@@ -1104,6 +1386,9 @@ pub const AppRenderer = struct {
                 }
             } else self.frame_damage.invalidate();
         } else cmd_buffer.submit();
+        if (self.prev_frame_cmd_buffer) |*previous| previous.deinit();
+        self.prev_frame_cmd_buffer = cmd_buffer.retained();
+        self.pool_maintenance_retry.reset();
         submitted = true;
 
         // E2E screenshot: read drawable pixels before present. Must wait for GPU render
@@ -1133,7 +1418,11 @@ pub const AppRenderer = struct {
         }
 
         surface_texture.presentAfterSubmit(&cmd_buffer);
+        self.last_frame_presented = true;
 
+        var engine_counts: [3]u32 = .{ 0, 0, 0 };
+        if (comptime gpu.backend_kind == .metal and engine_diagnostics_enabled)
+            metal_command_buffer_engine_counts(@ptrCast(cmd_buffer.raw), &engine_counts);
         // Collect frame performance statistics.
         const frame_end = @import("zenit_time").Instant.now(cx.io) catch null;
         // FrameStats declared wait/acquire/cpu fields but never assigned (review report §4);
@@ -1181,8 +1470,9 @@ pub const AppRenderer = struct {
             .glass_count = render.backdrop_blur.perf.glass_count,
             .glass_us = render.backdrop_blur.perf.glass_ns / std.time.ns_per_us,
             .texture_creates = render.offscreen_texture.perf_texture_creates,
-            .render_passes = if (comptime @hasDecl(gpu.Backend.CommandEncoder, "perf_counters")) gpu.Backend.CommandEncoder.perf_counters.render_passes else 0,
-            .blit_passes = if (comptime @hasDecl(gpu.Backend.CommandEncoder, "perf_counters")) gpu.Backend.CommandEncoder.perf_counters.blit_passes else 0,
+            .render_passes = if (comptime gpu.backend_kind == .metal) engine_counts[0] else if (comptime @hasDecl(gpu.Backend.CommandEncoder, "perf_counters")) gpu.Backend.CommandEncoder.perf_counters.render_passes else 0,
+            .blit_passes = if (comptime gpu.backend_kind == .metal) engine_counts[1] else if (comptime @hasDecl(gpu.Backend.CommandEncoder, "perf_counters")) gpu.Backend.CommandEncoder.perf_counters.blit_passes else 0,
+            .compute_passes = engine_counts[2],
             .pass_native_us = if (comptime @hasDecl(gpu.Backend.CommandEncoder, "perf_counters")) gpu.Backend.CommandEncoder.perf_counters.native_ns / std.time.ns_per_us else 0,
             .path_draw_calls = path_draws,
             .retained_hits = enc.retained_hits,
@@ -1263,6 +1553,18 @@ pub const AppRenderer = struct {
     /// Windows host idle-poll/pre-resize drain: luminance read unified via
     /// pollBackdropLuminance; returns whether measurement changed.
     pub fn refreshLuminance(self: *AppRenderer, cx: anytype) bool {
+        if (comptime gpu.is_direct3d) {
+            // The Windows host polls here even when no new frame is drawn.
+            // Completed commands retain upload buffers, descriptor heaps and
+            // textures through three independent owners. Retire all three;
+            // preserve in-flight fences and harvest timing before dropping it.
+            // Keep device-loss recovery with the host's existing frame/teardown
+            // path; idle maintenance never waits or hides a render failure.
+            self.frame_sync.collectChecked() catch return false;
+            const latest_us = self.harvestGpuTimings();
+            if (latest_us != 0) self.idle_gpu_execute_us = latest_us;
+            self.retireCompletedPresentation();
+        }
         return self.pollBackdropLuminance(cx);
     }
 
@@ -1271,7 +1573,42 @@ pub const AppRenderer = struct {
     /// completed staging copies even while window is idle. Reading before encoding another frame
     /// also avoids racing the next staging write. Changed measurement requests one frame; unchanged
     /// values permit idle.
+    pub fn nextOffscreenMaintenanceDelayNs(self: *const AppRenderer) ?u64 {
+        if (self.has_external_encoder) return null;
+        const now: u64 = @intCast(@max(0, @import("zenit_time").monotonicTimestamp(self.io)));
+        const retry = self.pool_maintenance_retry.delay(now) orelse return null;
+        const delay = self.offscreen_pool.nextMaintenanceDelayNs(now) orelse return null;
+        // An expired deadline with an in-flight fence gets a bounded retry,
+        // not a busy-loop or a synchronous GPU wait.
+        return @max(delay, retry, std.time.ns_per_ms * 5);
+    }
+
+    fn maintainOffscreenPool(self: *AppRenderer) void {
+        if (self.has_external_encoder) return;
+        const now: u64 = @intCast(@max(0, @import("zenit_time").monotonicTimestamp(self.io)));
+        if ((self.pool_maintenance_retry.delay(now) orelse return) != 0) return;
+        const delay = self.offscreen_pool.nextMaintenanceDelayNs(now) orelse return;
+        if (delay != 0) return;
+        if (self.prev_frame_cmd_buffer) |*last| {
+            if (comptime gpu.is_direct3d) {
+                last.waitChecked(0) catch |err| {
+                    if (err == error.DeviceLost) {
+                        // Removed devices will never advance this fence.
+                        self.pool_maintenance_retry.stopped = true;
+                    } else self.pool_maintenance_retry.pending(now);
+                    return;
+                };
+            } else if (!last.isCompleted()) {
+                self.pool_maintenance_retry.pending(now);
+                return;
+            }
+        }
+        self.offscreen_pool.maintain(now, true);
+        self.pool_maintenance_retry.reset();
+    }
+
     pub fn pollBackdropLuminance(self: *AppRenderer, cx: anytype) bool {
+        self.maintainOffscreenPool();
         comptime {
             const Slot = @TypeOf(self.persistent_gpu.luminance_slots[0]);
             const per_slot = 1 + @typeInfo(@FieldType(Slot, "shape_keys")).array.len;
@@ -1413,6 +1750,80 @@ pub const AppRenderer = struct {
             retired = true;
         }
         if (retired or (grain and self.visual_quality != .basic)) cx.needs_redraw = true;
+    }
+
+    fn diagnosticInFlight(self: *AppRenderer) u32 {
+        var count: u32 = 0;
+        for (self.gpu_timing_pending) |maybe| if (maybe) |command| {
+            if (!command.isCompleted()) count += 1;
+        };
+        return count;
+    }
+
+    pub fn diagnosticClock() f64 {
+        if (comptime gpu.backend_kind != .metal) return 0;
+        return metal_glass_clock_trace_host_time();
+    }
+
+    pub fn traceCaretBoundary(self: *AppRenderer, kind: []const u8, input_epoch: u64) void {
+        if (comptime gpu.backend_kind != .metal) return;
+        if (!metal_glass_clock_trace_enabled()) return;
+        const now = metal_glass_clock_trace_host_time();
+        if (std.mem.eql(u8, kind, "caret-exit")) {
+            self.caret_diag_exit_seq += 1;
+            self.caret_diag_exit_host_time = now;
+        }
+        var line: [512]u8 = undefined;
+        const encoded = std.fmt.bufPrint(&line, "{{\"kind\":\"{s}\",\"host_time\":{d:.9},\"frame\":{d},\"input_epoch\":{d},\"exit_seq\":{d},\"in_flight\":{d}}}", .{
+            kind, now, self.frame_count, input_epoch, self.caret_diag_exit_seq, self.diagnosticInFlight(),
+        }) catch unreachable;
+        metal_glass_clock_trace_line(encoded.ptr, encoded.len);
+    }
+
+    /// A completed command still owns its presented drawable. Keeping that
+    /// observer through nextDrawable needlessly expands the layer's pool after
+    /// caret handoff. In-flight work must retain its fence across aborted frames.
+    fn retireCompletedPresentation(self: *AppRenderer) void {
+        // Test-mode causal control reproduces the pre-24af6563 ownership path.
+        // It is accepted only together with opt-in clock diagnostics.
+        if (comptime frame_testing_enabled and gpu.backend_kind == .metal) {
+            if (metal_glass_clock_trace_enabled() and (if (@import("zenit_environment").getBorrowed("ZENIT_CARET_DIAG_RETAIN_COMPLETED")) |value| std.mem.eql(u8, value, "1") else false)) return;
+        }
+
+        if (self.prev_frame_cmd_buffer) |*previous| {
+            if (!previous.isCompleted()) return;
+            self.consumePreviousDebugGlass(true);
+            previous.deinit();
+            self.prev_frame_cmd_buffer = null;
+        }
+    }
+
+    fn consumePreviousDebugGlass(self: *AppRenderer, completed: bool) void {
+        if (!completed or !@import("zenit_environment").has("ZENIT_DEBUG_GLASS")) return;
+        for (&self.persistent_gpu.debug_glass_slots, 0..) |*slot, si| {
+            if (!slot.prev_pending) continue;
+            if (slot.staging) |*staging| {
+                if (readAverageRgb(staging, slot.prev_w, slot.prev_h)) |rgb| {
+                    const stage_name = switch (si) {
+                        0 => "capture",
+                        1 => "composite",
+                        else => "endrt",
+                    };
+                    std.debug.print("[glassdbg] stage={s} rgb=({d:.1},{d:.1},{d:.1})\n", .{ stage_name, rgb[0], rgb[1], rgb[2] });
+                }
+            }
+            slot.prev_pending = false;
+        }
+    }
+
+    fn advanceDebugGlassSlots(self: *AppRenderer) void {
+        if (!@import("zenit_environment").has("ZENIT_DEBUG_GLASS")) return;
+        for (&self.persistent_gpu.debug_glass_slots) |*slot| {
+            slot.prev_pending = slot.cur_pending;
+            slot.prev_w = slot.cur_w;
+            slot.prev_h = slot.cur_h;
+            slot.cur_pending = false;
+        }
     }
 
     /// Records the GPU time of every pending frame that has completed, in
@@ -1559,6 +1970,7 @@ pub const AppRenderer = struct {
 
     /// Destroy.
     pub fn deinit(self: *AppRenderer) void {
+        self.clearCaretPreparation();
         self.frame_damage.deinit(self.allocator);
         self.background_damage.deinit(self.allocator);
         // Wait for all in-flight frames to complete, prevent GPU reading buffer during deinit.

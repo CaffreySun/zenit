@@ -1,4 +1,4 @@
-import { clickTestId, mouseMove, stats, query, resizeWindow, screenshot, sleep, tree, waitFor, waitForServerReady, request } from "./client";
+import { clickTestId, mouseMove, stats, screenPos, query, resizeWindow, screenshot, sleep, tree, waitFor, waitForServerReady, request } from "./client";
 import { decodePng } from "./png";
 import { assert, getSessionDir, run, test } from "./runner";
 
@@ -7,7 +7,8 @@ async function capture(stage: string) {
   await sleep(100);
   const path = `${getSessionDir()}/windows-images-${stage}.png`;
   assert((await screenshot(path)).ok, "capture failed");
-  const png = decodePng(path);
+  let png = decodePng(path);
+  let scrollCaptures = 0;
   // Logical client dimensions are rounded on Windows; their ratio to drawable
   // width is not the true DPI scale at fractional scaling.
   const scale = (await stats()).window_scale;
@@ -19,6 +20,16 @@ async function capture(stage: string) {
     if (!node) {
       node = (await query(id))[0];
       assert(node, `missing ${id}`);
+      const placed = await screenPos(id);
+      if (Math.abs(placed.x-node.rect.x) > .01 || Math.abs(placed.y-node.rect.y) > .01) {
+        await sleep(100);
+        const movedPath = `${getSessionDir()}/windows-images-${stage}-scroll-${scrollCaptures++}.png`;
+        assert((await screenshot(movedPath)).ok, "scrolled capture failed");
+        png = decodePng(movedPath);
+        nodes.clear();
+        node = (await query(id))[0];
+        assert(node, `missing scrolled ${id}`);
+      }
       nodes.set(id, node);
     }
     const x = Math.floor((node.rect.x + dx) * scale);
@@ -559,7 +570,7 @@ test("Windows retained pixels match full repaint after text, alpha, movement and
   await sleep(900);
   const initial = await stats();
   const snap = async (name: string) => {
-    assert((await mouseMove(950, 800)).ok, "pointer parking failed");
+    assert((await mouseMove((await tree()).rect.w-20, (await tree()).rect.h-20)).ok, "pointer parking failed");
     await sleep(150);
     const path = `${getSessionDir()}/retained-${name}.png`;
     assert((await screenshot(path)).ok, "retained capture failed");

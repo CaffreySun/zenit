@@ -29,7 +29,7 @@ pub fn run() !void {
     defer if (device_live) dq.device.deinit();
     var queue_live = true;
     defer if (queue_live) dq.queue.deinit();
-    if (dq.queue.context != dq.device.context or dq.device.isSoftware() != adapters[0].isSoftware() or dq.device.limits.max_bind_groups != 4 or @as(u64, @bitCast(dq.device.features)) != 0) return error.IncorrectRendererDeviceInfo;
+    if (dq.queue.context != dq.device.context or dq.device.isSoftware() != adapters[0].isSoftware() or dq.device.limits.max_bind_groups != 4 or @as(u64, @bitCast(dq.device.features)) != @as(u64, @bitCast(adapters[0].getFeatures()))) return error.IncorrectRendererDeviceInfo;
     var second = try adapters[0].requestDevice(a, .{});
     defer second.device.deinit();
     defer second.queue.deinit();

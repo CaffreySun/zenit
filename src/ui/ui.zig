@@ -224,6 +224,7 @@ pub const max_after_layout_rounds = core.max_after_layout_rounds;
 /// Batch rectangle submission unit (see core.BulkQuad / Cx.setBulkQuads).
 pub const BulkQuad = core.BulkQuad;
 pub const Node = core.Node;
+pub const BeforeRenderScope = core.BeforeRenderScope;
 pub const PointerDownFocus = core.PointerDownFocus;
 pub const Scope = reactive_mod.Scope;
 pub const Style = core.Style;
@@ -475,6 +476,16 @@ pub const HandlerRef = core.HandlerRef;
 // Note: original `core_internal` top-level export removed in Phase 7 (OSS boundary discipline).
 // Framework contributors directly @import("core.zig") (inside ui module);
 // external consumers should only use `ui.*` namespace public API.
+
+// addNativeLibs links window_bridge.m on macOS, and it calls the zenit_a11y_*
+// functions exported from macos_bridge.zig. Analyse that file whenever ui is in
+// the graph: a consumer that never reaches Cx (an app's unit tests) still links.
+comptime {
+    if (@import("builtin").os.tag == .macos) {
+        _ = @import("a11y/macos_bridge.zig");
+        _ = @import("a11y/preferences.zig");
+    }
+}
 
 // Load internal contract tests independently of the unnamed API smoke test.
 // A narrow --test-filter can exclude that smoke test before these modules are

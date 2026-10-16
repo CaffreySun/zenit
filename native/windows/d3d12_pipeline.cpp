@@ -1,3 +1,4 @@
+#include "dual_source_validation.h"
 #include <float.h>
 #include "d3d12_resources.h"
 #include <windows.h>
@@ -270,8 +271,8 @@ static uint32_t color_type(uint32_t format) {
     }
 }
 static bool blend_factor(uint32_t f, bool alpha) {
-    if (f<1 || f>15 || f==12 || f==13) return false;
-    return !alpha || (f!=3 && f!=4 && f!=9 && f!=10 && f!=11);
+    if (f<1 || f>19 || f==12 || f==13) return false;
+    return !alpha || (f!=3 && f!=4 && f!=9 && f!=10 && f!=11 && f!=16 && f!=17);
 }
 extern "C" int zenit_d12_render_pipeline_create(ZenitD12Device *device, ZenitD12PipelineLayout *layout,
     ZenitD12Shader *vertex, ZenitD12Shader *fragment, const ZenitD12RenderDescriptor *input, ZenitD12RenderPipeline **out) {
@@ -337,6 +338,15 @@ extern "C" int zenit_d12_render_pipeline_create(ZenitD12Device *device, ZenitD12
         desc.RasterizerState.DepthBias=depth.bias; desc.RasterizerState.SlopeScaledDepthBias=depth.slope; desc.RasterizerState.DepthBiasClamp=depth.clamp;
     }
     desc.BlendState.AlphaToCoverageEnable=input->alpha_coverage; desc.BlendState.IndependentBlendEnable=TRUE; desc.NumRenderTargets=input->target_count;
+    bool dual_source=false;
+    for(uint32_t i=0;i<input->target_count;++i) {
+        const auto &t=input->targets[i];
+        dual_source |= t.color_src>=16 || t.color_dst>=16 || t.alpha_src>=16 || t.alpha_dst>=16;
+    }
+    if(dual_source) {
+        if(input->target_count!=1 || !input->targets[0].blend) return 1;
+        desc.BlendState.IndependentBlendEnable=FALSE;
+    }
     for (uint32_t i=0;i<input->target_count;++i) {
         const auto &t=input->targets[i];
         if (t.write_mask>15 || t.blend>1 || !blend_factor(t.color_src,false) || !blend_factor(t.color_dst,false) ||
@@ -383,12 +393,17 @@ extern "C" int zenit_d12_render_pipeline_create(ZenitD12Device *device, ZenitD12
         }
         if (!found) valid=false;
     }
+    ZenitDualSourceSignature lcd_signature;
     for (uint32_t i=0;valid && i<pdesc.OutputParameters;++i) {
         D3D12_SIGNATURE_PARAMETER_DESC p={}; if (FAILED(ps->GetOutputParameterDesc(i,&p))) { valid=false; break; }
-        if (p.SystemValueType==D3D_NAME_TARGET && (p.SemanticIndex>=input->target_count ||
-            uint32_t(p.ComponentType)!=color_type(input->targets[p.SemanticIndex].format))) valid=false;
+        if (p.SystemValueType==D3D_NAME_TARGET) {
+            if(dual_source) lcd_signature.target(p.SemanticIndex, p.ComponentType, p.Mask);
+            const uint32_t target=dual_source && p.SemanticIndex==1 ? 0 : p.SemanticIndex;
+            if(target>=input->target_count || uint32_t(p.ComponentType)!=color_type(input->targets[target].format)) valid=false;
+        }
         else if (p.SystemValueType!=D3D_NAME_TARGET && !(p.SystemValueType==D3D_NAME_DEPTH && depth.format)) valid=false; // Depth/coverage output needs a future depth/MSAA path.
     }
+    if(dual_source && !lcd_signature.valid(input->target_count, input->targets[0].blend != 0)) valid=false;
     if (!valid) { vs->Release(); ps->Release(); return 1; }
     auto pipeline=(ZenitD12RenderPipeline *)calloc(1,sizeof(ZenitD12RenderPipeline)); if (!pipeline) { vs->Release(); ps->Release(); return 2; }
     ID3DBlob *warp_vertex=nullptr,*warp_fragment=nullptr;

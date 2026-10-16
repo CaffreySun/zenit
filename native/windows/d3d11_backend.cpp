@@ -1,3 +1,4 @@
+#include "dual_source_validation.h"
 // D3D11 implementation of the shared renderer ABI. The d12 prefix is an ABI
 // name only: this translation unit uses D3D11 and DXGI exclusively.
 #include "d3d12_resources.h"
@@ -15,6 +16,7 @@
 #include <dcomp.h>
 #include <dwmapi.h>
 #include <dxgi1_2.h>
+#include "dxgi_driver_info.h"
 #include <new>
 #include <string>
 #include <unordered_map>
@@ -60,6 +62,7 @@ struct D11ExclusiveLock {
   ~D11ExclusiveLock() { release(); }
 };
 struct ZenitD12Device {
+  ZenitD12DriverInfo driver_info = {};
   LONG refs = 1;
   D11Com<ID3D11Device> raw;
   D11Com<ID3D11DeviceContext> immediate;
@@ -487,6 +490,11 @@ extern "C" int zenit_d12_device_create(int force_warp, ZenitD12Device **out) {
     delete d;
     return result(hr);
   }
+  D11Com<IDXGIDevice> dxgi;
+  D11Com<IDXGIAdapter> adapter;
+  if (SUCCEEDED(d->raw->QueryInterface(IID_IDXGIDevice, (void **)dxgi.put())) &&
+      SUCCEEDED(dxgi->GetAdapter(adapter.put())))
+    d->driver_info = zenit_dxgi_driver_info(adapter);
   *out = d;
   return 0;
 }
@@ -497,6 +505,9 @@ extern "C" void zenit_d12_device_retain(ZenitD12Device *d) {
 extern "C" void zenit_d12_device_release(ZenitD12Device *d) {
   if (d && InterlockedDecrement(&d->refs) == 0)
     delete d;
+}
+extern "C" void zenit_d12_device_driver_info(ZenitD12Device *d, ZenitD12DriverInfo *out) {
+  *out = d->driver_info;
 }
 extern "C" int zenit_d12_device_vertex_viewport_index(ZenitD12Device *) {
   return 0;
@@ -1367,6 +1378,24 @@ zenit_d12_render_pipeline_create(ZenitD12Device *d, ZenitD12PipelineLayout *l,
       (a->target_count && !a->targets) || a->topology < 1 || a->topology > 5 ||
       !shader_layout(l, vs, 1) || !shader_layout(l, ps, 2))
     return 1;
+  bool dual_source = false;
+  for (uint32_t i = 0; i < a->target_count; ++i) {
+    const auto &t = a->targets[i];
+    dual_source |= t.color_src >= 16 || t.color_dst >= 16 || t.alpha_src >= 16 || t.alpha_dst >= 16;
+  }
+  if (dual_source) {
+    D11Com<ID3D11ShaderReflection> reflection;
+    if (FAILED(D3DReflect(ps->blob->GetBufferPointer(), ps->blob->GetBufferSize(), IID_ID3D11ShaderReflection, (void **)reflection.put()))) return 1;
+    D3D11_SHADER_DESC desc = {}; if (FAILED(reflection->GetDesc(&desc))) return 1;
+    ZenitDualSourceSignature signature;
+    for (UINT i = 0; i < desc.OutputParameters; ++i) {
+      D3D11_SIGNATURE_PARAMETER_DESC output = {};
+      if (FAILED(reflection->GetOutputParameterDesc(i, &output))) return 1;
+      if (output.SystemValueType == D3D_NAME_TARGET) signature.target(output.SemanticIndex, output.ComponentType, output.Mask);
+      else if (!(output.SystemValueType == D3D_NAME_DEPTH && a->depth.format)) signature.invalid = true;
+    }
+    if (!signature.valid(a->target_count, a->targets[0].blend != 0)) return 1;
+  }
   auto p = new (std::nothrow) ZenitD12RenderPipeline;
   if (!p)
     return 2;
@@ -1430,7 +1459,7 @@ zenit_d12_render_pipeline_create(ZenitD12Device *d, ZenitD12PipelineLayout *l,
                                    zenit_d12_shader_size(vs), p->input.put());
   D3D11_BLEND_DESC blend = {};
   blend.AlphaToCoverageEnable = a->alpha_coverage;
-  blend.IndependentBlendEnable = TRUE;
+  blend.IndependentBlendEnable = !dual_source;
   for (uint32_t i = 0; i < a->target_count; ++i) {
     auto &t = a->targets[i];
     auto &b = blend.RenderTarget[i];

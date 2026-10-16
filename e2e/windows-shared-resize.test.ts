@@ -11,19 +11,27 @@ test('Windows renderer resize preserves pixels, input state and background focus
   await key('a', {ctrl:true});
   const value = 'Resize 中文 abcdefghijklmnopqrstuvwxyz';
   await imeCommit(value);
-  await mouseMove(550, 500);
+  await mouseMove((await tree()).rect.w-10, (await tree()).rect.h-10);
   let baseline: ReturnType<typeof decodePng> | undefined;
   for (const [index, [width, height]] of [[600,540],[800,650],[560,520],[720,600],[600,540]].entries()) {
+    // stats scale has three decimal places; integer Windows DPI is recoverable.
+    const dpi = Math.round((await stats()).window_scale!*96);
+    const scale = Math.fround(dpi/96);
+    const expectedWidth = Math.floor((width*dpi+95)/96);
+    const expectedHeight = Math.floor((height*dpi+95)/96);
+    // The harness serializes f32 geometry to three decimal places.
+    const logicalWidth = Number(Math.fround(expectedWidth/scale).toFixed(3));
+    const logicalHeight = Number(Math.fround(expectedHeight/scale).toFixed(3));
     assert((await resizeWindow(width, height)).ok, 'resize request failed');
     await waitFor(async () => {
       const r = (await tree()).rect;
-      return r.w === width && r.h === height ? r : null;
+      return r.w === logicalWidth && r.h === logicalHeight ? r : null;
     }, 10000, 50);
     const path = `${getSessionDir()}/shared-resize-${index}.png`;
     assert((await screenshot(path)).ok, 'resized surface capture failed');
-    const png = decodePng(path), scale = (await stats()).window_scale!;
-    assert(Math.abs(png.width-width*scale)<=1 && Math.abs(png.height-height*scale)<=1,
-      `stale drawable size ${png.width}x${png.height}, expected ${width*scale}x${height*scale}`);
+    const png = decodePng(path);
+    assert(png.width === expectedWidth && png.height === expectedHeight,
+      `stale drawable size ${png.width}x${png.height}, expected ${expectedWidth}x${expectedHeight}`);
     assert((await inputState('input.name')).buffer === value, 'resize lost text');
     const rect = (await query('input.name'))[0].rect;
     // Compare against the input's own top padding. Counting bright pixels
@@ -57,7 +65,7 @@ test('Windows renderer resize preserves pixels, input state and background focus
     await key('end');
     assert((await inputState('input.name')).cursor_pos===new TextEncoder().encode(value).length,
       'End failed after resize');
-    await mouseMove(550, 500);
+    await mouseMove((await tree()).rect.w-10, (await tree()).rect.h-10);
   }
 });
 run();

@@ -19,7 +19,7 @@ cat > "$APP_DIR/Contents/Info.plist" <<'PLIST'
 PLIST
 xcrun clang -fobjc-arc -Wno-deprecated-declarations \
   "$ROOT/native/macos/tests/input_pump_test.m" \
-  -framework Cocoa -framework Metal -framework QuartzCore -framework CoreVideo \
+  -framework Cocoa -framework Metal -framework IOSurface -framework QuartzCore -framework CoreVideo \
   -framework UniformTypeIdentifiers -o "$APP_DIR/Contents/MacOS/input-pump-test"
 codesign --force --sign - "$APP_DIR" >/dev/null 2>&1
 for ((run = 0; run < ${ZENIT_INPUT_TEST_RUNS:-1}; run++)); do

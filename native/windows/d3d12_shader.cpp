@@ -112,6 +112,55 @@ extern "C" int zenit_d12_shader_bindings(ZenitD12Shader *shader, ZenitD12ShaderB
     reflection->Release(); return status;
 }
 
+// Inspect compiler bytecode, not HLSL spelling: only buffer array atomics with
+// a relative descriptor index carrying the SM5.1 nonuniform qualifier require
+// this capability. Reuse the token parser used by the WARP lowering path.
+extern "C" int zenit_d12_shader_non_uniform_buffer_atomics(ZenitD12Shader *shader) {
+    if (!shader) return -1;
+    size_t size=shader->code->GetBufferSize();
+    const auto *data=(const uint32_t *)shader->code->GetBufferPointer();
+    if (size<32 || size%4 || data[0]!=0x43425844 || data[6]!=size || data[7]>(size-32)/4) return -1;
+    for (uint32_t part=0;part<data[7];++part) {
+        size_t offset=data[8+part];
+        if (offset%4 || offset<(8+data[7])*4 || offset>size-8) return -1;
+        const auto *chunk=data+offset/4;
+        if (chunk[1]>size-offset-8) return -1;
+        if (chunk[0]!=0x58454853) continue; // SHEX
+        if (chunk[1]%4) return -1;
+        zenit_warp::Words code(chunk+2,chunk+2+chunk[1]/4);
+        if (code.size()<2 || code[1]!=code.size() || (code[0]&255)!=0x51) return -1;
+        std::vector<uint32_t> arrays;
+        for (size_t at=2,end,payload;at<code.size();at=end) {
+            if (!zenit_warp::instruction(code,at,end,payload)) return -1;
+            uint32_t op=code[at]&2047;
+            if (op!=157 && op!=158) continue; // raw/structured UAV declaration
+            zenit_warp::Operand resource;
+            if (!zenit_warp::operand(code,payload,end,resource) || resource.dimensions!=3 ||
+                resource.immediate[0]==SIZE_MAX || resource.immediate[1]==SIZE_MAX || resource.immediate[2]==SIZE_MAX) return -1;
+            if (code[resource.immediate[1]]<code[resource.immediate[2]]) arrays.push_back(code[resource.immediate[0]]);
+        }
+        if (arrays.empty()) return 0;
+        for (size_t at=2,end,payload;at<code.size();at=end) {
+            if (!zenit_warp::instruction(code,at,end,payload)) return -1;
+            uint32_t op=code[at]&2047;
+            if (op<169 || op>189) continue;
+            while (payload<end) {
+                size_t begin=payload; zenit_warp::Operand resource;
+                if (!zenit_warp::operand(code,payload,end,resource)) return -1;
+                if (resource.type!=30 || resource.dimensions!=2 || resource.immediate[0]==SIZE_MAX || resource.immediate[1]!=SIZE_MAX) continue;
+                bool array=false;
+                for (uint32_t id:arrays) if (id==code[resource.immediate[0]]) array=true;
+                if (!array) continue;
+                bool nonuniform=false;
+                while (code[begin]&0x80000000u) nonuniform|=bool(code[++begin]&(1u<<17));
+                if (nonuniform) return 1;
+            }
+        }
+        return 0;
+    }
+    return -1;
+}
+
 extern "C" int zenit_d12_shader_warp_blob(ZenitD12Shader *shader, void **out) {
     if (!shader || !out) return 1;
     HRESULT hr=zenit_warp::blob(shader->code, (ID3DBlob **)out);
@@ -148,3 +197,24 @@ extern "C" int zenit_d12_test_warp_shader_parser() {
     return FAILED(hr) && !rewritten ? 0 : 6;
 }
 #endif
+
+// Keep the portable compiler/cache blob immutable: the device-specific version
+// is owned only for PSO creation and uses the original reflection and layout.
+extern "C" int zenit_d12_shader_atomic_switch(ZenitD12Shader *shader, ZenitD12Shader **out) {
+    if (!shader || !out) return 1;
+    *out=nullptr;
+    ID3DBlob *code=nullptr;
+    if (FAILED(zenit_warp::blob(shader->code,&code,true))) return 3;
+    if (!code) return 3;
+    auto lowered=(ZenitD12Shader *)calloc(1,sizeof(ZenitD12Shader));
+    if (!lowered) { code->Release(); return 2; }
+    memcpy(lowered->entry,shader->entry,sizeof(lowered->entry));
+    lowered->code=code; lowered->refs=1;
+#ifdef ZENIT_D12_TEST
+    InterlockedIncrement(&live_shaders);
+#endif
+    if (zenit_d12_shader_non_uniform_buffer_atomics(lowered)!=0) {
+        zenit_d12_shader_release(lowered); return 3;
+    }
+    *out=lowered; return 0;
+}

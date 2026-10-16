@@ -1,13 +1,14 @@
-import { clickTestId, resetTiming, scrollAt, sleep, stats, waitForServerReady } from "./client";
+import { clickTestId, resetTiming, scrollAt, sleep, stats, tree, waitForServerReady } from "./client";
 import { assert, run, test } from "./runner";
 
 test("Windows timing reports CPU work and rejects unreliable GPU samples", async () => {
   await waitForServerReady(15000);
   assert((await clickTestId("nav.datatable")).ok, "datatable navigation failed");
   await sleep(700);
+  const viewport = (await tree()).rect;
   await resetTiming();
   for (let i = 0; i < 40; i++) {
-    await scrollAt(700, 400, 0, i < 20 ? -60 : 60);
+    await scrollAt(viewport.w*.7, viewport.h/2, 0, i < 20 ? -60 : 60);
     await sleep(25);
   }
   const measured = await stats();

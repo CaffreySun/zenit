@@ -24,6 +24,7 @@ struct Uniforms {
     uint clip_polygon_end_points[8];
     float2 clip_polygon_points[32];
     uint frame_seed; // Per-frame increment, drives film_grain dynamic noise
+    uint raster_clip_pos; // Raster pixel centers when viewport matches SDF coordinates
 };
 
 /// Instance data (one per primitive) - 176 bytes
@@ -394,6 +395,13 @@ float aa_step(float edge, float x, float aa_width) {
     return smoothstep(edge + aa_width, edge - aa_width, x);
 }
 
+// sdf-clip-shared-begin (also generated into HLSL)
+float2 sdf_clip_screen_pos(float2 raster_pos, float2 screen_pos, uint raster_clip_pos) {
+    // Tiling changes interpolation rounding. Clip derivatives need the same pixel
+    // centers in every entry; retain interpolated coordinates for other viewports.
+    return raster_clip_pos != 0u ? raster_pos : screen_pos;
+}
+
 float rect_clip_alpha(float2 screen_pos, float4 rect_clip, float scale_factor) {
     if (rect_clip.z < 0.0 || rect_clip.w < 0.0) {
         return 1.0;
@@ -405,6 +413,7 @@ float rect_clip_alpha(float2 screen_pos, float4 rect_clip, float scale_factor) {
     const float clip_aa = max(fwidth(clip_sdf) * 0.5, 0.5);
     return smoothstep(clip_aa, -clip_aa, clip_sdf);
 }
+// sdf-clip-shared-end
 
 float shape_clip_alpha(float2 screen_pos, constant Uniforms& uniforms) {
     if (uniforms.clip_shape_kind == 0u) {

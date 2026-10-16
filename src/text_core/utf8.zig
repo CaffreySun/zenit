@@ -26,6 +26,19 @@ pub fn validPrefixLen(bytes: []const u8, limit: usize) usize {
     return i;
 }
 
+/// Complete storage prefix for renderers that explicitly support WTF-8.
+/// Keep protocol/JSON validation on isValid/validPrefix instead.
+pub fn validStoragePrefix(bytes: []const u8) []const u8 {
+    var i: usize = 0;
+    while (i < bytes.len) {
+        const n = std.unicode.utf8ByteSequenceLength(bytes[i]) catch break;
+        if (n > bytes.len - i) break;
+        _ = std.unicode.wtf8Decode(bytes[i..][0..n]) catch break;
+        i += n;
+    }
+    return bytes[0..i];
+}
+
 /// Whole string is valid UTF-8.
 pub fn isValid(bytes: []const u8) bool {
     return validPrefixLen(bytes, bytes.len) == bytes.len;
@@ -103,4 +116,13 @@ test "seqLen: 首字节非法返回 0（供截断循环推进用）" {
     try std.testing.expectEqual(@as(usize, 4), seqLen(0xF0));
     try std.testing.expectEqual(@as(usize, 0), seqLen(0x80)); // isolated continuation
     try std.testing.expectEqual(@as(usize, 0), seqLen(0xFF));
+}
+
+test "storage prefix retains surrogate code units without weakening UTF8 validation" {
+    const text = "A\xed\xa0\x80Z";
+    try std.testing.expectEqualStrings(text, validStoragePrefix(text));
+    try std.testing.expect(!isValid(text));
+    try std.testing.expectEqualStrings("A", validPrefix(text));
+    try std.testing.expectEqualStrings("A", validStoragePrefix("A\xed\xa0"));
+    try std.testing.expectEqualStrings("A", validStoragePrefix("A\xf4\x90\x80\x80"));
 }

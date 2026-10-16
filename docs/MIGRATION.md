@@ -20,6 +20,58 @@ alters a public symbol.
 
 ---
 
+## 2026-10-12: renderers initialize in place (BREAKING)
+
+**What changed**: `AppRenderer.init` and `ImageRenderer.init` now take a
+`self` pointer and return `!void`. Nested `IconRenderer.init` follows the same
+convention; `ImageTextureStore.init` takes a `self` pointer and returns `void`.
+
+**Why**: returning renderers and texture stores by value produced multi-megabyte
+Debug stack frames and could overflow the macOS main-thread stack when opening
+another window. Initialization now writes directly into caller-owned storage and
+rolls back acquired GPU resources on failure. Call `deinit` only after successful
+initialization, and destroy the storage separately.
+
+**Migration**
+
+```zig
+// before
+renderer.* = try AppRenderer.init(allocator, io, device, queue, surface, config);
+var image = try ImageRenderer.init(allocator, device);
+defer image.deinit();
+
+// after (renderer is already allocated)
+try renderer.init(allocator, io, device, queue, surface, config);
+const image = try allocator.create(ImageRenderer);
+defer allocator.destroy(image);
+try image.init(allocator, device);
+defer image.deinit();
+
+// Likewise for IconRenderer and ImageTextureStore:
+try icon.init(allocator, device);
+store.init(allocator, device, true); // shared namespace; no fallible allocation
+```
+
+## 2026-10-12: `ResourcePath.init` takes an `std.Io` (BREAKING)
+
+**What changed**: `zenit_app.ResourcePath.init()` became `init(io: std.Io)`.
+Zig 0.17 removed `std.fs.selfExePath` and the Io-less directory API, so the
+executable path and the `assets/` probe now go through the caller's `Io`. The
+probe uses native path separators, so an `assets/` directory beside a Windows
+`.exe` is found too.
+
+**Why**: the previous body no longer compiled under Zig 0.17; it was only
+analysed by applications that call it.
+
+**Migration**
+
+```zig
+// before
+const res = ResourcePath.init();
+// after
+const res = ResourcePath.init(io); // e.g. init.io from main(init: std.process.Init)
+```
+
 ## 2026-10-03: `ui.view` is the way to build UI; control flow is anchored (BREAKING for child-index code)
 
 **What changed**

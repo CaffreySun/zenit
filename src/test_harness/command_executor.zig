@@ -121,6 +121,17 @@ pub const RecordingStateFn = *const fn () RecordingState;
 
 /// FrameStats snapshot (harness subset of renderer.FrameStats; don't link zenit_app to avoid
 /// cycles).
+/// Cumulative entry attempts only; excluded host polls are counted separately.
+pub const CaretRejections = struct {
+    occluded: u64 = 0,
+    patch_unavailable: u64 = 0,
+    preparation_gpu_failed: u64 = 0,
+    host_transition: u64 = 0,
+    busy: u64 = 0,
+    renderer_disabled: u64 = 0,
+    other: u64 = 0,
+};
+
 pub const FrameStatsSnapshot = struct {
     renderer_backend: ?[]const u8 = null,
     gpu_validation_errors: ?u32 = null,
@@ -147,6 +158,18 @@ pub const FrameStatsSnapshot = struct {
     text_uniform_overflow: u64 = 0,
     path_draw_calls: u32 = 0,
     frame_count: u64 = 0,
+    graphics_footprint_bytes: u64 = 0,
+    caret_flipping: bool = false,
+    caret_visible: bool = false,
+    caret_rect_count: u32 = 0,
+    caret_entries: u64 = 0,
+    caret_attempts: u64 = 0,
+    caret_rejections: CaretRejections = .{},
+    caret_gate_blocked: u64 = 0,
+    caret_admission_failures: u8 = 0,
+    caret_admission_next_ns: i128 = 0,
+    caret_flips: u64 = 0,
+    caret_last_flip_ms: i64 = 0,
     /// Backdrop brightness auto-adapt measured value; -1 = absent (disabled/no glass).
     backdrop_luminance: f32 = -1,
     /// Render invariant: cumulative repeated fill rect count (same node one frame emits identical
@@ -178,6 +201,7 @@ pub const FrameStatsSnapshot = struct {
     texture_creates: u32 = 0,
     render_passes: u32 = 0,
     blit_passes: u32 = 0,
+    compute_passes: u32 = 0,
     pass_native_us: u64 = 0,
     /// Previous frame total time.
     total_frame_us: u64 = 0,
@@ -236,6 +260,16 @@ pub fn setRecordingCallbacks(start: StartRecordingFn, status: RecordingStateFn, 
     g_start_recording_fn = start;
     g_recording_status_fn = status;
     g_stop_recording_fn = stop;
+}
+
+pub fn startRecording(path: []const u8, fps: u32) RecordingState {
+    return if (g_start_recording_fn) |f| f(path, fps) else .{};
+}
+pub fn recordingStatus() RecordingState {
+    return if (g_recording_status_fn) |f| f() else .{};
+}
+pub fn stopRecording() RecordingState {
+    return if (g_stop_recording_fn) |f| f() else .{};
 }
 
 pub fn setGetFrameStatsFn(f: GetFrameStatsFn) void {
@@ -722,6 +756,21 @@ fn executeCommand(queue: *CommandQueue, cmd_in: TestCommand) bool {
                 jw.numberValue(@intCast(st.path_draw_calls));
                 jw.key("frame_count");
                 jw.numberValue(@intCast(st.frame_count));
+                jw.key("caret_flipping");
+                jw.booleanValue(st.caret_flipping);
+                jw.key("caret_visible");
+                jw.booleanValue(st.caret_visible);
+                inline for (.{ "graphics_footprint_bytes", "caret_rect_count", "caret_entries", "caret_flips", "caret_last_flip_ms", "caret_attempts", "caret_gate_blocked", "caret_admission_failures", "caret_admission_next_ns" }) |field| {
+                    jw.key(field);
+                    jw.numberValue(@intCast(@field(st, field)));
+                }
+                jw.key("caret_rejections");
+                jw.beginObject();
+                inline for (@import("zenit_reflection").fields(CaretRejections)) |field| {
+                    jw.key(field.name);
+                    jw.numberValue(@intCast(@field(st.caret_rejections, field.name)));
+                }
+                jw.endObject();
                 jw.key("clock_budget_ms");
                 if (getCtx()) |ctx| (if (ctx.test_clock_budget_ms) |b| jw.floatValue(@floatCast(b)) else jw.nullValue()) else jw.nullValue();
                 jw.key("frame_time_ms");
@@ -773,7 +822,7 @@ fn executeCommand(queue: *CommandQueue, cmd_in: TestCommand) bool {
                     jw.key(field);
                     if (@field(st, field)) |value| jw.numberValue(@intCast(value)) else jw.nullValue();
                 }
-                inline for (.{ "glass_count", "glass_us", "texture_creates", "render_passes", "blit_passes", "pass_native_us" }) |field| {
+                inline for (.{ "glass_count", "glass_us", "texture_creates", "render_passes", "blit_passes", "compute_passes", "pass_native_us" }) |field| {
                     jw.key(field);
                     jw.numberValue(@intCast(@field(st, field)));
                 }

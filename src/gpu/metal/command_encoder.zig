@@ -205,6 +205,17 @@ pub const CommandEncoder = struct {
         return .{ .encoder = encoder, .command_encoder = self, .generation = generation };
     }
 
+    /// A whole render pass with integer source texel addressing. Reject aliasing:
+    /// Metal may not sample its active color attachment (gutter uses shader clamp).
+    pub fn copyTextureRegionRender(self: *CommandEncoder, source: resources.TextureBinding, sx: u32, sy: u32, width: u32, height: u32, destination: resources.TextureBinding, dx: u32, dy: u32, clear: bool) !void {
+        if (self.state != .initial) return error.InvalidEncoderState;
+        if (source.raw == destination.raw or width == 0 or height == 0 or
+            sx > source.width or width > source.width - sx or sy > source.height or height > source.height - sy or
+            dx > destination.width or width > destination.width - dx or dy > destination.height or height > destination.height - dy)
+            return error.InvalidTextureRegion;
+        if (mtl.metal_command_buffer_copy_texture_region_render(self.raw, source.raw, sx, sy, width, height, destination.raw, dx, dy, @intFromBool(clear)) == 0) return error.RenderCopyFailed;
+    }
+
     /// Finish encoding, return CommandBuffer.
     pub fn finish(self: *CommandEncoder) !CommandBuffer {
         if (self.state == .finished) return error.EncoderAlreadyFinished;
@@ -299,6 +310,9 @@ pub const RenderPass = struct {
     encoder: *mtl.MTLRenderCommandEncoder,
     command_encoder: *CommandEncoder,
     generation: u64,
+    /// Root target is a cropped piece of the full scene. Preserve the scene's
+    /// shader coordinates/NDC arithmetic and translate only rasterization.
+    root_crop: ?[4]u32 = null,
 
     fn assertActive(self: *const RenderPass) void {
         self.command_encoder.assertActivePass(.render_pass, self.generation);
@@ -327,8 +341,8 @@ pub const RenderPass = struct {
         self.assertActive();
         mtl.metal_render_encoder_set_viewport(
             self.encoder,
-            x,
-            y,
+            x - if (self.root_crop) |r| @as(f32, @floatFromInt(r[0])) else @as(f32, 0),
+            y - if (self.root_crop) |r| @as(f32, @floatFromInt(r[1])) else @as(f32, 0),
             width,
             height,
             min_depth,
@@ -339,6 +353,14 @@ pub const RenderPass = struct {
     /// Set scissor rectangle.
     pub fn setScissorRect(self: *RenderPass, x: u32, y: u32, width: u32, height: u32) void {
         self.assertActive();
+        if (self.root_crop) |r| {
+            const left = @min(@max(x, r[0]), r[0] + r[2]);
+            const top = @min(@max(y, r[1]), r[1] + r[3]);
+            const right = @max(left, @min(x +| width, r[0] + r[2]));
+            const bottom = @max(top, @min(y +| height, r[1] + r[3]));
+            mtl.metal_render_encoder_set_scissor_rect(self.encoder, left - r[0], top - r[1], right - left, bottom - top);
+            return;
+        }
         mtl.metal_render_encoder_set_scissor_rect(self.encoder, x, y, width, height);
     }
 
@@ -399,9 +421,10 @@ pub const RenderPass = struct {
         mtl.metal_render_encoder_set_fragment_bytes(self.encoder, data.ptr, data.len, slot);
     }
 
-    /// Draw primitives.
-    pub fn draw(
+    /// Draw primitives of the given primitive type (shared by draw/drawTriangleStrip).
+    fn drawPrimitive(
         self: *RenderPass,
+        primitive: mtl.MTLPrimitiveType,
         vertex_count: u32,
         instance_count: u32,
         first_vertex: u32,
@@ -415,14 +438,14 @@ pub const RenderPass = struct {
         if (instance_count == 1 and first_instance == 0) {
             mtl.metal_render_encoder_draw_primitives(
                 self.encoder,
-                @backingInt(mtl.MTLPrimitiveType.Triangle),
+                @backingInt(primitive),
                 first_vertex,
                 vertex_count,
             );
         } else if (first_instance == 0) {
             mtl.metal_render_encoder_draw_primitives_instanced(
                 self.encoder,
-                @backingInt(mtl.MTLPrimitiveType.Triangle),
+                @backingInt(primitive),
                 first_vertex,
                 vertex_count,
                 instance_count,
@@ -430,13 +453,35 @@ pub const RenderPass = struct {
         } else {
             mtl.metal_render_encoder_draw_primitives_instanced_base_instance(
                 self.encoder,
-                @backingInt(mtl.MTLPrimitiveType.Triangle),
+                @backingInt(primitive),
                 first_vertex,
                 vertex_count,
                 instance_count,
                 first_instance,
             );
         }
+    }
+
+    /// Draw primitives (triangle list semantics unchanged).
+    pub fn draw(
+        self: *RenderPass,
+        vertex_count: u32,
+        instance_count: u32,
+        first_vertex: u32,
+        first_instance: u32,
+    ) void {
+        self.drawPrimitive(.Triangle, vertex_count, instance_count, first_vertex, first_instance);
+    }
+
+    /// Draw primitives as a triangle strip.
+    pub fn drawTriangleStrip(
+        self: *RenderPass,
+        vertex_count: u32,
+        instance_count: u32,
+        first_vertex: u32,
+        first_instance: u32,
+    ) void {
+        self.drawPrimitive(.TriangleStrip, vertex_count, instance_count, first_vertex, first_instance);
     }
 
     /// Global frame draw call counter (matrix #5 < 400). Reset at FrameSync.beginFrame; +1

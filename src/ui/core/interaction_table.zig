@@ -1,8 +1,8 @@
 //! InteractionTable: interaction/focus/gesture state split from Node.
 //!
 //! Unlike the Element/Layout/Paint tables it is **sparse**: not every element has interaction.
-//! Inside is an ElementId.index -> InteractionData AutoHashMap; hot lookup uses an ElementId.raw()
-//! tight array (direct index), a miss falls through to hash lookup.
+//! Inside is an ElementId.raw() -> InteractionData hash map with the cheap id hash from
+//! id_hash.zig (looked up for every node on every frame by the world sync pass).
 //!
 //! - don't store hit_test_AABB geometry in the table, hit_runtime AABB tree holds that
 //!   (table stores semantics only: focus_index, scroll_state ref, listened events)
@@ -18,6 +18,7 @@
 const std = @import("std");
 const testing = std.testing;
 const element_id_mod = @import("element_id.zig");
+const id_hash = @import("id_hash.zig");
 
 pub const ElementId = element_id_mod.ElementId;
 
@@ -63,7 +64,7 @@ pub const InteractionData = struct {
 pub const InteractionTable = struct {
     allocator: std.mem.Allocator,
     /// Sparse storage: ElementId.raw() -> InteractionData
-    data: std.AutoHashMapUnmanaged(u32, InteractionData),
+    data: id_hash.U32HashMapUnmanaged(InteractionData),
     /// Successful delete count since last rehash (tombstone generation count lower bound)
     removed_since_rehash: usize = 0,
     /// Live entry count (put new key +1 / remove hit -1; identical to data.count(),
@@ -114,7 +115,7 @@ pub const InteractionTable = struct {
             // Tombstone accumulation over live entry scale triggers full rehash (O(capacity),
             // amortized O(1) per entry). std docs: rehash clears all tombstones.
             if (self.removed_since_rehash > @max(64, self.live_count)) {
-                self.data.rehash(std.hash_map.AutoContext(u32){});
+                self.data.rehash(id_hash.U32Context{});
                 self.removed_since_rehash = 0;
             }
         }

@@ -26,6 +26,8 @@ pub fn run(io: std.Io) !void {
     var dq = try adapters[0].requestDevice(a, .{});
     defer dq.device.deinit();
     defer dq.queue.deinit();
+    try @import("render").drawable_extent_contract.run(a, &dq.device, &dq.queue);
+    std.debug.print("PASS: 175 percent 1900/1901/1907 drawable edges and native UNORM blend=136\n", .{});
     try checkAliasCopies(&dq.device);
     try checkIdleLuminance(io, a, hwnd, &dq.device, &dq.queue);
     try checkRangeProvider(io, a, hwnd, &dq.device, &dq.queue);
@@ -41,13 +43,47 @@ pub fn run(io: std.Io) !void {
     var surface = gpu.Backend.Surface.init(hwnd);
     defer surface.deinit();
     try surface.configure(a, &dq.device, .{ .format = gpu.color_format, .width = 16, .height = 8, .usage = .color_target_and_read, .present_mode = .immediate });
-    var renderer = try AppRenderer.init(a, io, &dq.device, &dq.queue, &surface, .{ .visual_quality = .full });
+    const renderer = try a.create(AppRenderer);
+    defer a.destroy(renderer);
+    try renderer.init(a, io, &dq.device, &dq.queue, &surface, .{ .visual_quality = .full });
     defer renderer.deinit();
     renderer.retain_present_copy = true;
     const cx = try ui.Cx.init(a, io);
     defer cx.deinit();
     cx.setWindowMetrics(16, 8, 1);
     cx.root = try ui.box(cx, .{ .width = .{ .px = 16 }, .height = .{ .px = 8 }, .background = ui.Color.hex(0xff0000) }, .{});
+    // Idle polling must not require another draw to retire completed GPU
+    // resources, nor release any of the three owners ahead of its fence.
+    {
+        const idle_gate = zenit_d12_test_gate_create(dq.device.context.device.raw, dq.device.context.queue.raw);
+        defer {
+            zenit_d12_test_gate_signal(idle_gate);
+            renderer.frame_sync.drain(3);
+            zenit_d12_test_gate_release(idle_gate);
+        }
+        try renderer.frame_sync.waitForNextFrame();
+        var idle_encoder = try gpu.Backend.CommandEncoder.init(&dq.queue);
+        var idle_command = try idle_encoder.finish();
+        defer idle_command.deinit();
+        renderer.frame_sync.signalOnCompletion(&idle_command);
+        try idle_command.submitChecked();
+        renderer.prev_frame_cmd_buffer = idle_command.retained();
+        renderer.gpu_timing_pending[0] = idle_command.retained();
+        _ = renderer.refreshLuminance(cx);
+        if (renderer.frame_sync.pending != 1 or renderer.prev_frame_cmd_buffer == null or renderer.gpu_timing_pending[0] == null)
+            return error.IdlePollReleasedInflightCommand;
+        zenit_d12_test_gate_signal(idle_gate);
+        try idle_command.waitChecked(5000);
+        _ = renderer.refreshLuminance(cx);
+        if (renderer.frame_sync.pending != 0 or renderer.prev_frame_cmd_buffer != null or renderer.gpu_timing_pending[0] != null)
+            return error.IdlePollRetainedCompletedCommand;
+        if (renderer.frame_count != 0) return error.IdlePollRenderedFrame;
+        std.debug.print("PASS: idle poll preserves blocked GPU owners and retires completed frame, presentation and timing references without drawing\n", .{});
+    }
+    // The idle-owner fixture above submits a real timestamped command. Keep
+    // its sample out of the independent seven-frame timestamp assertion.
+    std.debug.print("APP_RENDERER_IDLE_FIXTURE_GPU_SAMPLES={d}\n", .{renderer.gpu_timing_ring.len});
+    renderer.gpu_timing_ring.reset();
     const before = gpu.Backend.CommandBuffer.error_count.load(.monotonic);
     for (0..7) |i| {
         cx.root.?.setBackground(switch (i % 3) {
@@ -173,7 +209,9 @@ fn checkIdleLuminance(io: std.Io, a: std.mem.Allocator, hwnd: *anyopaque, device
     var surface = gpu.Backend.Surface.init(hwnd);
     defer surface.deinit();
     try surface.configure(a, device, .{ .format = gpu.color_format, .width = 64, .height = 64, .usage = .color_target_and_read, .present_mode = .immediate });
-    var renderer = try AppRenderer.init(a, io, device, queue, &surface, .{ .visual_quality = .full });
+    const renderer = try a.create(AppRenderer);
+    defer a.destroy(renderer);
+    try renderer.init(a, io, device, queue, &surface, .{ .visual_quality = .full });
     defer renderer.deinit();
     const cx = try ui.Cx.init(a, io);
     defer cx.deinit();
@@ -257,7 +295,9 @@ fn checkRangeProvider(io: std.Io, a: std.mem.Allocator, hwnd: *anyopaque, device
     var surface = gpu.Backend.Surface.init(hwnd);
     defer surface.deinit();
     try surface.configure(a, device, .{ .format = gpu.color_format, .width = 128, .height = 64, .usage = .color_target_and_read, .present_mode = .immediate });
-    var renderer = try AppRenderer.init(a, io, device, queue, &surface, .{ .visual_quality = .full });
+    const renderer = try a.create(AppRenderer);
+    defer a.destroy(renderer);
+    try renderer.init(a, io, device, queue, &surface, .{ .visual_quality = .full });
     defer renderer.deinit();
     renderer.retain_present_copy = true;
     renderer.setFonts(&selector);
@@ -293,7 +333,9 @@ fn checkFrameDamage(io: std.Io, a: std.mem.Allocator, hwnd: *anyopaque, device: 
     var surface = gpu.Backend.Surface.init(hwnd);
     defer surface.deinit();
     try surface.configure(a, device, .{ .format = gpu.color_format, .width = 256, .height = 128, .usage = .color_target_and_read, .present_mode = .immediate });
-    var renderer = try AppRenderer.init(a, io, device, queue, &surface, .{ .visual_quality = .full });
+    const renderer = try a.create(AppRenderer);
+    defer a.destroy(renderer);
+    try renderer.init(a, io, device, queue, &surface, .{ .visual_quality = .full });
     defer renderer.deinit();
     renderer.retain_present_copy = true;
     renderer.setFonts(&selector);
@@ -378,11 +420,31 @@ fn checkOpaqueTextComposite(io: std.Io, a: std.mem.Allocator, hwnd: *anyopaque, 
     var surface = gpu.Backend.Surface.init(hwnd);
     defer surface.deinit();
     try surface.configure(a, device, .{ .format = gpu.color_format, .width = 448, .height = 224, .usage = .color_target_and_read, .present_mode = .immediate });
-    var renderer = try AppRenderer.init(a, io, device, queue, &surface, .{ .visual_quality = .full });
+    const renderer = try a.create(AppRenderer);
+    defer a.destroy(renderer);
+    try renderer.init(a, io, device, queue, &surface, .{ .visual_quality = .full });
     defer renderer.deinit();
     renderer.retain_present_copy = true;
     renderer.retained_enabled = false;
     renderer.setFonts(&selector);
+    if (renderer.text_renderer.cleartype_enabled) {
+        var backdrop = render.text_render_policy.Backdrop{};
+        backdrop.reset(256, 128, false);
+        backdrop.add(.{ 0, 0, 48, 128 });
+        renderer.text_renderer.beginFrame(256, 128, 1.75);
+        renderer.text_renderer.cleartype_allowed = true;
+        renderer.text_renderer.lcd_backdrop = &backdrop;
+        try renderer.text_renderer.drawTextWithOptions("Consistency", 16, 44, font, render.Color.BLACK, 14, false, null, false, true, 0);
+        if (renderer.text_renderer.instances_nearest.items.len == 0) return error.RunModeFixtureEmpty;
+        for (renderer.text_renderer.instances_nearest.items) |instance| if (instance.metadata.colorMode() != 0) return error.MixedRunAntialiasing;
+        const plain_count = renderer.text_renderer.instances_nearest.items.len;
+        try renderer.text_renderer.drawTextWithSpans("Consistency", 16, 44, font, render.Color.BLACK, 14, false, null, false, true, 0, &.{.{ .start = 1, .end = 6, .color = render.Color.RED }});
+        if (renderer.text_renderer.instances_nearest.items.len == plain_count) return error.SpanModeFixtureEmpty;
+        for (renderer.text_renderer.instances_nearest.items[plain_count..]) |instance| if (instance.metadata.colorMode() != 0) return error.MixedSpanAntialiasing;
+        renderer.text_renderer.lcd_backdrop = null;
+        renderer.text_renderer.cleartype_allowed = false;
+        std.debug.print("PASS: one word crossing the opaque proof boundary uses one grayscale AA mode\n", .{});
+    }
     const cx = try ui.Cx.init(a, io);
     defer cx.deinit();
     cx.setWindowMetrics(256, 128, 1.75);
@@ -394,12 +456,27 @@ fn checkOpaqueTextComposite(io: std.Io, a: std.mem.Allocator, hwnd: *anyopaque, 
     try renderer.frame(cx, 256, 128, 1.75);
     renderer.frame_sync.drain(3);
     try renderer.retained_tex.?.readBgra8(448, 224, &baseline, 1792);
+    const lcd_baseline = baseline;
+    const system_lcd = renderer.text_renderer.cleartype_enabled;
+    if (system_lcd and (renderer.text_renderer.lcd_glyph_count == 0 or renderer.text_renderer.gray_glyph_count != 0)) return error.OpaqueTextNotLCD;
+    if (!system_lcd and renderer.text_renderer.lcd_glyph_count != 0) return error.DisabledClearTypeUsedLCD;
+    if (SetEnvironmentVariableA("ZENIT_TEXT_BASELINE_GRAYSCALE", "1") == 0) return error.EnvironmentUpdateFailed;
+    defer _ = SetEnvironmentVariableA("ZENIT_TEXT_BASELINE_GRAYSCALE", null);
+    cx.root.?.markRenderDirty();
+    cx.needs_redraw = true;
+    try renderer.frame(cx, 256, 128, 1.75);
+    renderer.frame_sync.drain(3);
+    if (renderer.text_renderer.lcd_glyph_count != 0 or renderer.text_renderer.gray_glyph_count == 0) return error.DirectGrayTextWrongMode;
+    try renderer.retained_tex.?.readBgra8(448, 224, &baseline, 1792);
+    _ = SetEnvironmentVariableA("ZENIT_TEXT_BASELINE_GRAYSCALE", null);
     group.style.ensureExtPanic(a).composited_group = true;
     group.markRenderDirty();
     try renderer.frame(cx, 256, 128, 1.75);
     renderer.frame_sync.drain(3);
+    if (renderer.text_renderer.lcd_glyph_count != 0 or renderer.text_renderer.gray_glyph_count == 0) return error.CompositeTextNotGrayscale;
     try renderer.retained_tex.?.readBgra8(448, 224, &composite, 1792);
     var max_diff: u32 = 0;
+    var legacy_cross_mode_diff: u32 = 0;
     var changed: usize = 0;
     var ink: [2]usize = .{ 0, 0 };
     for (0..448 * 224) |pixel| {
@@ -407,6 +484,7 @@ fn checkOpaqueTextComposite(io: std.Io, a: std.mem.Allocator, hwnd: *anyopaque, 
         for (0..3) |c| {
             const x = baseline[pixel * 4 + c];
             const y = composite[pixel * 4 + c];
+            legacy_cross_mode_diff = @max(legacy_cross_mode_diff, @as(u32, @intCast(@abs(@as(i32, lcd_baseline[pixel * 4 + c]) - @as(i32, y)))));
             const d: u32 = @intCast(@abs(@as(i32, x) - @as(i32, y)));
             max_diff = @max(max_diff, d);
             if (d > 1) changed += 1;
@@ -417,6 +495,8 @@ fn checkOpaqueTextComposite(io: std.Io, a: std.mem.Allocator, hwnd: *anyopaque, 
             ink[i] += 1;
         };
     }
-    std.debug.print("TEXT_COMPOSITE_IDENTITY max_diff={d} changed_channels={d} direct_ink={d} composite_ink={d}\n", .{ max_diff, changed, ink[0], ink[1] });
+    std.debug.print("LEGACY_CROSS_MODE_DIFF={d}\n", .{legacy_cross_mode_diff});
+    std.debug.print("TEXT_COMPOSITE_GRAY_IDENTITY max_diff={d} changed_channels={d} direct_ink={d} composite_ink={d}\n", .{ max_diff, changed, ink[0], ink[1] });
     if (max_diff > 1) return error.OpaqueTextCompositeChangedPixels;
+    std.debug.print("PASS: transparent composite text is grayscale, opaque direct text follows system LCD={}; same-mode gray composition max_diff={d}\n", .{ system_lcd, max_diff });
 }

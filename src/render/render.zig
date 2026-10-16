@@ -1,4 +1,5 @@
 const std = @import("std");
+pub const PaintFingerprint = @import("command_encoder/paint_fingerprint.zig");
 pub const visual_quality = @import("visual_quality.zig");
 pub const shader_sources = @import("shader_sources.zig");
 /// Glass shader uniform ABI (backdrop_blur.zig), for backend contract direct use not hand-copied
@@ -72,6 +73,7 @@ pub const RenderCommandEncoder = command_encoder_mod.RenderCommandEncoder;
 pub const FrameDamage = @import("frame_damage.zig").FrameDamage;
 pub const RetainedPlan = @import("command_encoder/retained_plan.zig").Plan;
 pub const OffscreenTexturePool = @import("offscreen_texture.zig").OffscreenTexturePool;
+pub const OffscreenMaintenanceRetry = @import("offscreen_maintenance_retry.zig").MaintenanceRetry;
 /// Cross-frame persistent path/blur/glass GPU resource cache (held by AppRenderer).
 pub const PersistentGpuCache = @import("command_encoder.zig").PersistentGpuCache;
 pub const FontSelector = command_encoder_mod.FontSelector;
@@ -113,3 +115,7 @@ test {
     _ = @import("font_fallback_stack.zig");
     std.testing.refAllDecls(@This());
 }
+
+pub const drawable_extent_contract = @import("drawable_extent_contract.zig");
+
+pub const text_render_policy = @import("text_render_policy.zig");

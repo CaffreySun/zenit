@@ -87,6 +87,31 @@ def stages(include_a11y: bool, renderer: str = "d3d12", full_app_suites: bool = 
     return out
 
 
+ZDOC_ARCH_LABELS = {"aarch64": "arm64", "x86_64": "x64"}
+ZDOC_ARCH_RENDERERS = {"aarch64": "d3d12", "x86_64": "d3d11"}
+
+
+def zdoc_stage(zdoc_bin: Path, suite: Path, arch: str | None = None, renderer: str | None = None, label: str | None = None,
+               minimum_cases: int = 12) -> dict:
+    """zdoc (zeditor) on the worker: its test-mode exe and assets/ from another
+    checkout, an isolated workspace inside the stage directory, and its own
+    smoke suite (zdoc's harness has no renderer/visual-quality endpoints, so
+    the Zenit renderer preflight is skipped). With `arch`, the stage and its
+    exe are named per architecture so several builds share one bundle (and one
+    transfer); assets/ is packed once."""
+    workspace = "{stage_dir}\\workspace"
+    label = (label or ZDOC_ARCH_LABELS[arch]) if arch else None
+    extra = {"arch": arch, "renderer": renderer or ZDOC_ARCH_RENDERERS[arch], "source_exe": "zdoc-e2e.exe"} if arch else {}
+    return {**extra, "name": f"zdoc-smoke-{label}" if label else "zdoc-smoke", "kind": "e2e",
+            "exe_name": f"zdoc-e2e-{label}.exe" if label else "zdoc-e2e.exe", "suite_source": str(suite),
+            "minimum_cases": minimum_cases, "blocking": True, "filter": "", "bin_dir": str(zdoc_bin),
+            "extra_dirs": ["assets"], "preflight": False,
+            "app_env": {"ZDOC_E2E_WORKSPACE": workspace, "ZDOC_E2E_RPC_ONLY": "1",
+                        "ZENIT_SESSION_DB_PATH": workspace + "\\session.sqlite",
+                        "ZDOC_USER_DATA_DIR": workspace + "\\.zdoc-user-data",
+                        "ZENIT_E2E_DISABLE_FILE_TREE_BOUNCE": "1"}}
+
+
 def build(arch: str, prefix: Path, renderer: str = "d3d12") -> None:
     common = [f"-Dwindows-arch={arch}", "--prefix", str(prefix)]
     subprocess.run(["zig", "build", "windows-arm64-storybook", "windows-arm64-text-input", "windows-arm64-render-gallery", "windows-adaptive-window",
@@ -98,13 +123,16 @@ def build(arch: str, prefix: Path, renderer: str = "d3d12") -> None:
                     "-Dwindows-gpu-contract-scope=all", *common], cwd=REPO, check=True)
 
 
-def bundle_suite(suite: str, outfile: Path) -> None:
-    entry = REPO / "e2e" / f".windows-batch-entry-{uuid.uuid4().hex}.ts"
+def bundle_suite(suite: str, outfile: Path, preflight: bool = True) -> None:
+    source = Path(suite) if Path(suite).is_absolute() else REPO / suite
+    entry = source.parent / f".windows-batch-entry-{uuid.uuid4().hex}.ts"
     # Imports evaluate in order: the preflight (startup, renderer checks) completes before the suite.
-    entry.write_text(f'import "./windows-renderer-preflight.ts";\nimport "./{Path(suite).name}";\n')
+    lines = [f'import "{REPO / "e2e/windows-renderer-preflight.ts"}";'] if preflight else []
+    lines.append(f'import "./{source.name}";')
+    entry.write_text("\n".join(lines) + "\n")
     try:
         subprocess.run(["bun", "build", "--target=bun", "--sourcemap=inline", str(entry), "--outfile", str(outfile)],
-                       cwd=REPO, check=True, stdout=subprocess.DEVNULL)
+                       cwd=source.parent, check=True, stdout=subprocess.DEVNULL)
     finally:
         entry.unlink(missing_ok=True)
 
@@ -127,18 +155,34 @@ def make_job(plan: list[dict], bin_dir: Path, arch: str, folder: Path, startup_t
     scratch = Path(tempfile.mkdtemp(prefix="zenit-batch-"))
     manifest = {"arch": arch, "renderer": renderer, "stages": []}
     with zipfile.ZipFile(folder / queue.BATCH_BUNDLE, "w", zipfile.ZIP_DEFLATED) as bundle:
-        for exe_name in sorted({stage["exe_name"] for stage in plan}):
-            exe = bin_dir / exe_name
-            queue.require_pe_arch(exe, arch)
+        # Packed name -> (file, architecture); a per-architecture stage packs
+        # its build under its own name.
+        sources = {stage["exe_name"]: (Path(stage.get("bin_dir") or bin_dir) / stage.get("source_exe", stage["exe_name"]), stage.get("arch") or arch)
+                   for stage in plan}
+        for exe_name in sorted(sources):
+            exe, exe_arch = sources[exe_name]
+            queue.require_pe_arch(exe, exe_arch)
             bundle.write(exe, exe_name)
+        packed_dirs = set()
         for stage in plan:
-            entry = {key: stage.get(key) for key in ("name", "kind", "exe_name", "capture_frames", "trace_frames")}
+            for extra in stage.get("extra_dirs") or []:
+                if extra in packed_dirs:
+                    continue
+                packed_dirs.add(extra)
+                root_dir = Path(stage.get("bin_dir") or bin_dir) / extra
+                if not root_dir.is_dir():
+                    raise SystemExit(f"missing {root_dir} for stage {stage['name']}")
+                for path in sorted(root_dir.rglob("*")):
+                    if path.is_file():
+                        bundle.write(path, f"{extra}/{path.relative_to(root_dir).as_posix()}")
+        for stage in plan:
+            entry = {key: stage.get(key) for key in ("name", "kind", "exe_name", "capture_frames", "trace_frames", "app_env", "extra_dirs", "allow_foreground")}
             if stage["kind"] == "e2e":
                 js = scratch / f"{stage['name']}.js"
-                bundle_suite(stage["suite_source"], js)
+                bundle_suite(stage["suite_source"], js, stage.get("preflight", True))
                 bundle.write(js, f"suites/{stage['name']}.js")
                 entry["suite"] = f"suites/{stage['name']}.js"
-                entry["env"] = {"ZENIT_E2E_TIMEOUT_MS": "40000", "ZENIT_E2E_EXPECT_RENDERER": renderer, "ZENIT_E2E_VISUAL_QUALITY": "full",
+                entry["env"] = {"ZENIT_E2E_TIMEOUT_MS": "40000", "ZENIT_E2E_EXPECT_RENDERER": stage.get("renderer") or renderer, "ZENIT_E2E_VISUAL_QUALITY": "full",
                                 "ZENIT_E2E_STARTUP_TIMEOUT_MS": str(round(startup_timeout * 1000)),
                                 "ZENIT_E2E_SUITE_TIMEOUT_MS": str(round(suite_timeout * 1000))}
                 if stage["filter"]:
@@ -232,6 +276,15 @@ def main() -> int:
     parser.add_argument("--no-a11y", action="store_true", help="skip the UI Automation suites")
     parser.add_argument("--full-app-suites", action="store_true", help="also run all Storybook and text-input cases without filters")
     parser.add_argument("--suite-timeout", type=float, default=900, help="seconds per individual suite")
+    parser.add_argument("--zdoc", type=Path, help="zeditor checkout: add its zdoc-smoke stage (needs a Windows test-mode build in --zdoc-bin)")
+    parser.add_argument("--zdoc-bin", action="append", default=[],
+                        help="directory with zdoc-e2e.exe and assets/ (default: <zdoc>/zig-out/bin); "
+                             "repeat as ARCH=DIR (aarch64=..., x86_64=...) to test several builds from one bundle")
+    parser.add_argument("--zdoc-suite", type=Path,
+                        help="zdoc suite instead of e2e/windows-zdoc-smoke.test.ts (relative to --zdoc), e.g. the manual hold")
+    parser.add_argument("--zdoc-only", action="store_true", help="run only the zdoc stage (no Zenit build or stages)")
+    parser.add_argument("--allow-foreground", action="store_true",
+                        help="let the zdoc stages take the VM's foreground and inject native Windows input (SendInput)")
     parser.add_argument("--startup-timeout", type=float, default=60)
     parser.add_argument("--timeout", type=float, default=3600, help="seconds for the whole batch on the worker")
     parser.add_argument("--wait-worker", type=float, default=0, help="seconds to wait for a fresh worker heartbeat before queuing (the queue is shared; a worker inside another job's stage does not heartbeat)")
@@ -244,12 +297,34 @@ def main() -> int:
     base = args.base.rstrip("/")
     started = time.monotonic()
     bin_dir = args.artifact_dir or REPO / "zig-out/bin"
-    if not args.skip_build:
+    if args.zdoc_only and args.zdoc is None:
+        parser.error("--zdoc-only requires --zdoc")
+    if not args.skip_build and not args.zdoc_only:
         prefix = Path(tempfile.mkdtemp(prefix=f"zenit-win-{args.arch}-"))
         print(f"==> Building {args.arch} apps and GPU contracts into {prefix}", flush=True)
         build(args.arch, prefix, args.renderer)
         bin_dir = prefix / "bin"
-    plan = stages(not args.no_a11y, args.renderer, args.full_app_suites)
+    plan = [] if args.zdoc_only else stages(not args.no_a11y, args.renderer, args.full_app_suites)
+    if args.zdoc is not None:
+        zdoc = args.zdoc.resolve()
+        suite = zdoc / (args.zdoc_suite or "e2e/windows-zdoc-smoke.test.ts")
+        # The smoke suite's case floor guards against silently skipped cases; any other suite sets none.
+        cases = 12 if args.zdoc_suite is None else 1
+        if len(args.zdoc_bin) <= 1 and not any("=" in b for b in args.zdoc_bin):
+            plan.append(zdoc_stage(Path(args.zdoc_bin[0] if args.zdoc_bin else zdoc / "zig-out/bin").resolve(), suite, minimum_cases=cases))
+        else:
+            for spec in args.zdoc_bin:
+                # ARCH[:RENDERER[:LABEL]]=DIR, e.g. aarch64:d3d11:arm64-d3d11-fast=out/bin
+                head, sep, path = spec.partition("=")
+                arch, renderer, label = (head.split(":") + [None, None])[:3]
+                if not sep or arch not in ZDOC_ARCH_LABELS or (renderer and renderer not in ("d3d11", "d3d12")) or \
+                        (label and not re.fullmatch(r"[a-z0-9-]{1,32}", label)):
+                    parser.error(f"--zdoc-bin {spec}: expected ARCH[:RENDERER[:LABEL]]=DIR with ARCH in {', '.join(ZDOC_ARCH_LABELS)}")
+                plan.append(zdoc_stage(Path(path).resolve(), suite, arch, renderer or None, label or None, cases))
+        if args.allow_foreground:
+            for stage in plan:
+                if stage["name"].startswith("zdoc-smoke"):
+                    stage["allow_foreground"] = True
     if args.require_a11y:
         for stage in plan:
             stage["blocking"] = True
@@ -273,7 +348,8 @@ def main() -> int:
         print(f"==> Worker busy (last heartbeat {time.time() - health.get('worker_seen_at', 0):.0f}s ago); waiting", flush=True)
         time.sleep(10)
     queue.require_worker(health)
-    queue.request(base, token, "POST", "/jobs", {"id": job_id, "kind": "batch", "local_suite": {"env": {}, "runtime_sha256": runtime_sha}})
+    queue.request(base, token, "POST", "/jobs", {"id": job_id, "kind": "batch", "local_suite": {"env": {}, "runtime_sha256": runtime_sha},
+                                                 "allow_foreground": args.allow_foreground})
     print(f"==> Batch job {job_id} queued ({size / 1e6:.1f} MB bundle); evidence: {folder}", flush=True)
     deadline = time.monotonic() + args.timeout
     last = ""

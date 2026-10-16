@@ -19,8 +19,25 @@ pub const Device = struct {
     buffer_count: usize = 0,
     texture_count: usize = 0,
     sampler_count: usize = 0,
+    framebuffer_fetch_supported: ?bool = null,
     fail_next_texture_for_testing: if (test_support.enabled) bool else void = if (test_support.enabled) false else {},
     samplers_live_for_testing: if (test_support.enabled) usize else void = if (test_support.enabled) 0 else {},
+
+    /// Programmable color-attachment reads are an Apple GPU capability.
+    pub fn supportsFramebufferFetch(self: *Device) bool {
+        if (comptime test_support.enabled) {
+            if (@import("zenit_environment").has("ZENIT_DEV_NO_FRAMEBUFFER_FETCH")) return false;
+        }
+        if (self.framebuffer_fetch_supported) |supported| return supported;
+        const supported = mtl.metal_device_supports_framebuffer_fetch(self.raw_device);
+        self.framebuffer_fetch_supported = supported;
+        return supported;
+    }
+
+    pub fn failNextBufferForTesting(self: *Device) void {
+        if (comptime !@import("builtin").is_test) @compileError("test-only fault control");
+        test_support.fail_buffer_device = @ptrCast(self.raw_device);
+    }
 
     /// Create Buffer. Note: returned Buffer doesn't need allocator free (Metal objects manage
     /// refcount); allocator parameter reserved for future extension (e.g., auxiliary structure
@@ -30,6 +47,12 @@ pub const Device = struct {
         allocator: std.mem.Allocator,
         desc: gpu.BufferDescriptor,
     ) !resources.Buffer {
+        if (comptime @import("builtin").is_test) {
+            if (test_support.fail_buffer_device == @as(*anyopaque, @ptrCast(self.raw_device))) {
+                test_support.fail_buffer_device = null;
+                return error.OutOfMemory;
+            }
+        }
         var pool = mtl.AutoreleasePool.init();
         defer pool.deinit();
 
@@ -199,6 +222,9 @@ pub const Device = struct {
 
     /// Destroy device
     pub fn deinit(self: *Device) void {
+        if (comptime @import("builtin").is_test) {
+            if (test_support.fail_buffer_device == @as(*anyopaque, @ptrCast(self.raw_device))) test_support.fail_buffer_device = null;
+        }
         mtl.release(self.raw_device);
         // Print statistics (Debug mode)
         if (std.debug.runtime_safety) {

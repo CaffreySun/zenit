@@ -40,8 +40,9 @@ pub const LayoutArtifacts = struct {
     /// Children AABB (relative to own rect, hitTest prune); computed after layout, null if
     /// uncomputed or no children
     children_bbox: ?ComputedRect = null,
-    /// Text wrap cache (filled by layout phase when wrap != .none)
-    text_layout: ?text_layout_mod.TextLayout = null,
+    /// Table-owned cache borrowed until clear, replacement, reuse or teardown.
+    /// Stable across table growth; write only through storeTextLayout.
+    text_layout: ?*const text_layout_mod.TextLayout = null,
 };
 
 pub const NodeLayoutOutput = struct {

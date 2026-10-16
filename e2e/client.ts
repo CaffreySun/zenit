@@ -241,7 +241,7 @@ export async function query(testId: string): Promise<QueryNode[]> {
 }
 
 export interface FrameStats {
-  renderer_backend?: "d3d12" | "d3d11" | "legacy" | null;
+  renderer_backend?: "d3d12" | "d3d11" | "metal" | "null_backend" | "opengl" | "vulkan" | "legacy" | null;
   window_scale?: number | null;
   retained_hits: number;
   retained_misses: number;
@@ -267,6 +267,9 @@ export interface FrameStats {
   encode_us?: number | null;
   flush_us?: number | null;
   total_frame_us: number;
+  render_passes: number;
+  blit_passes: number;
+  compute_passes: number;
 
   // ── Cross-frame P95 (microseconds), perf gate assertion anti-noise statistic ──
   gpu_p95_us: number;

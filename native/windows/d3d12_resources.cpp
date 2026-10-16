@@ -8,8 +8,10 @@
 #include <float.h>
 #include <string.h>
 #include <stdio.h>
+#include "dxgi_driver_info.h"
+#include "d3d12_atomic_probe.h"
 
-struct ZenitD12Device { ID3D12Device *raw; LONG refs; int software; bool vertex_viewport_index; };
+struct ZenitD12Device { ID3D12Device *raw; LONG refs; int software; bool vertex_viewport_index; ZenitD12DriverInfo driver_info; SRWLOCK atomic_lock; volatile LONG atomic_state; ZenitAtomicProbe *pending_probe; };
 struct ZenitD12Texture {
     ID3D12Resource *raw; ZenitD12Device *owner; LONG refs;
     uint32_t dimension, width, height, depth, mips, usage, samples;
@@ -23,6 +25,7 @@ extern "C" int zenit_d12_device_create(int force_warp, ZenitD12Device **out) {
     ID3D12Device *raw = nullptr;
     HRESULT hr = E_FAIL;
     int software = 0;
+    ZenitD12DriverInfo driver_info={};
     IDXGIFactory4 *factory = nullptr;
     hr = CreateDXGIFactory1(IID_IDXGIFactory4, (void **)&factory);
     if (FAILED(hr)) return 2;
@@ -45,6 +48,7 @@ extern "C" int zenit_d12_device_create(int force_warp, ZenitD12Device **out) {
                 fprintf(stderr, "[d3d12-adapter] index=%u name=%s vendor=%04x device=%04x result=0x%08lx\n",
                     index, name, desc.VendorId, desc.DeviceId, (unsigned long)hr);
             }
+            if (raw) driver_info=zenit_dxgi_driver_info(adapter);
             adapter->Release();
             if (raw) break;
         }
@@ -57,7 +61,7 @@ extern "C" int zenit_d12_device_create(int force_warp, ZenitD12Device **out) {
         IDXGIAdapter *adapter = nullptr;
         hr = factory->EnumWarpAdapter(IID_IDXGIAdapter, (void **)&adapter);
         if (SUCCEEDED(hr)) hr = D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_11_0, IID_ID3D12Device, (void **)&raw);
-        if (adapter) adapter->Release();
+        if (adapter) { if (raw) driver_info=zenit_dxgi_driver_info(adapter); adapter->Release(); }
         software = 1;
         fprintf(stderr, "[d3d12-adapter] selected=WARP forced=%d result=0x%08lx\n", force_warp != 0, (unsigned long)hr);
     }
@@ -65,7 +69,7 @@ extern "C" int zenit_d12_device_create(int force_warp, ZenitD12Device **out) {
     if (FAILED(hr)) return 2;
     auto device = (ZenitD12Device *)calloc(1, sizeof(ZenitD12Device));
     if (!device) { raw->Release(); return 2; }
-    device->raw = raw; device->refs = 1; device->software = software;
+    device->raw = raw; device->refs = 1; device->software = software; device->driver_info=driver_info;
     D3D12_FEATURE_DATA_D3D12_OPTIONS options = {};
     HRESULT options_hr = raw->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options));
     device->vertex_viewport_index = SUCCEEDED(options_hr) && options.VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation;
@@ -78,8 +82,92 @@ extern "C" int zenit_d12_device_create(int force_warp, ZenitD12Device **out) {
     return 0;
 }
 extern "C" void zenit_d12_device_release(ZenitD12Device *device) {
-    if (device && InterlockedDecrement(&device->refs) == 0) { device->raw->Release(); free(device); }
+    if (device && InterlockedDecrement(&device->refs) == 0) { if (device->pending_probe) {
+            auto p=device->pending_probe;
+            if (!p->submitted || (p->fence && p->fence->GetCompletedValue()>=1) || FAILED(device->raw->GetDeviceRemovedReason())) delete p;
+            else fprintf(stderr,"[d3d12-atomic-probe] retaining pending GPU resources after timeout\n");
+        }
+        device->raw->Release(); free(device); }
 }
+extern "C" void zenit_d12_device_driver_info(ZenitD12Device *device, ZenitD12DriverInfo *out) { *out=device->driver_info; }
+// State: 0 untested, 1 original path, 2 switch, 3 operational failure.
+// Decided states are published once and read without the probe lock, so a
+// slow or hung probe never blocks capability queries or later pipelines.
+// Failures before submission (allocation, compilation, resource creation)
+// leave the device untested and are retried by the next pipeline; a probe
+// that was submitted and timed out, a removed device or an invalid override
+// is final.
+extern "C" int zenit_d12_device_atomic_workaround(ZenitD12Device *device, int test) {
+    LONG state=InterlockedCompareExchange(&device->atomic_state,0,0);
+    if (state || !test) return (int)state;
+    AcquireSRWLockExclusive(&device->atomic_lock);
+    state=device->atomic_state;
+    if (!state) {
+        LARGE_INTEGER started, ended, frequency;
+        QueryPerformanceFrequency(&frequency); QueryPerformanceCounter(&started);
+        char override_value[16]={};
+        DWORD length=GetEnvironmentVariableA("ZENIT_D3D12_UAV_ATOMIC_SWITCH",override_value,sizeof(override_value));
+        if (length>=sizeof(override_value) || (length && strcmp(override_value,"0") && strcmp(override_value,"1"))) {
+            fprintf(stderr,"[d3d12-atomic-probe] invalid ZENIT_D3D12_UAV_ATOMIC_SWITCH; expected 0 or 1\n");
+            state=3;
+        } else if (length) {
+            state=override_value[0]=='1'?2:1;
+            fprintf(stderr,"[d3d12-atomic-probe] forced switch=%d\n",state==2);
+        } else if (device->software) state=1;
+        else {
+            bool correct=true, transient=false;
+            for (unsigned raw=0;raw<2;++raw) {
+                auto p=new(std::nothrow) ZenitAtomicProbe;
+                if (!p) { fprintf(stderr,"[d3d12-atomic-probe] allocation failed: 0x%08lx\n",(unsigned long)E_OUTOFMEMORY); transient=true; break; }
+                bool result=false;
+                HRESULT hr=zenit_atomic_probe(device->raw,raw,p,&result);
+                fprintf(stderr,"[d3d12-atomic-probe] raw=%d result=0x%08lx correct=%d\n",raw,(unsigned long)hr,result);
+                if (FAILED(hr)) {
+                    bool removed=FAILED(device->raw->GetDeviceRemovedReason());
+                    bool in_flight=p->submitted && !(p->fence && p->fence->GetCompletedValue()>=1);
+                    if (in_flight && !removed) {
+                        // The GPU may still write these resources: keep them
+                        // alive until the device is released.
+                        device->pending_probe=p; state=3;
+                    } else {
+                        delete p;
+                        if (removed) state=3; else transient=true;
+                    }
+                    break;
+                }
+                delete p; correct &= result;
+            }
+            if (!state && !transient) state=correct?1:2;
+            if (transient) fprintf(stderr,"[d3d12-atomic-probe] transient failure; will retry on the next pipeline\n");
+            if (transient) {
+                QueryPerformanceCounter(&ended);
+                ReleaseSRWLockExclusive(&device->atomic_lock);
+                return 3;
+            }
+        }
+        QueryPerformanceCounter(&ended);
+        fprintf(stderr,"[d3d12-atomic-probe] cached-state=%ld elapsed-ms=%.3f\n",state,
+            1000.0*double(ended.QuadPart-started.QuadPart)/double(frequency.QuadPart));
+        InterlockedExchange(&device->atomic_state,state);
+    }
+    ReleaseSRWLockExclusive(&device->atomic_lock);
+    return (int)state;
+}
+#ifdef ZENIT_D12_TEST
+extern "C" int zenit_d12_test_atomic_probe_device_loss() {
+    ZenitD12Device *device=nullptr;
+    if (zenit_d12_device_create(0,&device)) return 1;
+    if (device->software) { zenit_d12_device_release(device); return 4; }
+    ID3D12Device5 *control=nullptr;
+    HRESULT hr=device->raw->QueryInterface(IID_ID3D12Device5,(void**)&control);
+    if (FAILED(hr)) { zenit_d12_device_release(device); return 2; }
+    control->RemoveDevice(); control->Release();
+    int first=zenit_d12_device_atomic_workaround(device,1);
+    int cached=zenit_d12_device_atomic_workaround(device,1);
+    zenit_d12_device_release(device);
+    return first==3 && cached==3 ? 0 : 3;
+}
+#endif
 extern "C" int zenit_d12_device_vertex_viewport_index(ZenitD12Device *device) { return device && device->vertex_viewport_index; }
 extern "C" int zenit_d12_device_is_software(ZenitD12Device *device) { return device->software; }
 extern "C" void *zenit_d12_device_native(ZenitD12Device *device) { return device->raw; }

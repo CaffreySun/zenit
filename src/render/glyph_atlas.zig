@@ -16,13 +16,15 @@ const text_trace = @import("trace").text_flicker;
 pub const PageFormat = enum(u8) {
     /// R8Unorm, 1 byte/pixel, coverage mask.
     gray,
+    /// RGBA8Unorm, RGB channel coverage in monitor pixel order.
+    cleartype,
     /// BGRA8Unorm_sRGB, 4 bytes/pixel, premultiplied color (emoji).
     color,
 
     pub fn bytesPerPixel(self: PageFormat) u32 {
         return switch (self) {
             .gray => 1,
-            .color => 4,
+            .color, .cleartype => 4,
         };
     }
 };
@@ -66,7 +68,10 @@ pub const GlyphAtlas = struct {
     current_frame: u64,
     /// This frame's count of "cache miss AND actual rasterization".
     frame_insert_count: u32,
+    had_transient_failure: bool = false,
     cache: GlyphCache,
+    raster_context: ?*anyopaque = null,
+    failures: @import("raster_failure_cache.zig").Cache(GlyphKey, 256) = .{},
     /// Incremented after GC drains pages, signals render cache invalidation
     /// (prevent cached commands from referencing released texture pages).
     gc_generation: u32 = 0,
@@ -99,6 +104,18 @@ pub const GlyphAtlas = struct {
     const ATLAS_LOG_ENABLED = false;
 
     /// Initialize GlyphAtlas.
+    pub fn resetFrameStats(self: *GlyphAtlas) void {
+        self.frame_insert_count = 0;
+        self.had_transient_failure = false;
+    }
+
+    pub fn invalidateRaster(self: *GlyphAtlas) void {
+        // Old pages may still be in flight; invalidate keys, leave retirement to GC.
+        self.cache.clearRetainingCapacity();
+        self.failures = .{};
+        self.gc_generation +%= 1;
+    }
+
     pub fn init(allocator: std.mem.Allocator, device: *gpu.Backend.Device) !GlyphAtlas {
         // Create sampler, Linear smooths scaling, reduces stroke weight jitter.
         var sampler_linear = device.createSampler(allocator, .{
@@ -181,11 +198,13 @@ pub const GlyphAtlas = struct {
         const texture = self.device.createTexture(self.allocator, .{
             .label = switch (format) {
                 .gray => "Zenit.Text.GlyphAtlas.Gray",
+                .cleartype => "Zenit.Text.GlyphAtlas.ClearType",
                 .color => "Zenit.Text.GlyphAtlas.Color",
             },
             .size = .{ .width = ATLAS_SIZE, .height = ATLAS_SIZE },
             .format = switch (format) {
                 .gray => .r8_unorm,
+                .cleartype => .rgba8_unorm,
                 // _sRGB: CoreGraphics writes emoji pixels as sRGB-encoded values to layer
                 // BGRA8Unorm_sRGB
                 // (sRGB decode on output). Sample without _sRGB = treat encoded value as linear,
@@ -444,10 +463,14 @@ pub const GlyphAtlas = struct {
             return region;
         }
 
-        self.frame_insert_count += 1;
-
         // Cache miss: rasterize and upload.
-        const bitmap = try font.rasterizeGlyph(glyph_index);
+        if (self.failures.contains(key, self.gc_generation, self.current_frame)) return emptyRegion();
+        self.frame_insert_count += 1;
+        const bitmap = if (comptime @import("builtin").os.tag == .windows) font.rasterizeGlyphWithContext(glyph_index, 0, 0, self.raster_context) catch |err| {
+            self.failures.remember(key, self.gc_generation, self.current_frame, err == error.GlyphTooLarge);
+            if (@as(anyerror, err) != error.GlyphTooLarge) self.had_transient_failure = true;
+            return emptyRegion();
+        } else try font.rasterizeGlyph(glyph_index);
         defer bitmap.deinit(self.allocator);
 
         // Empty glyph (e.g., space).
@@ -466,10 +489,16 @@ pub const GlyphAtlas = struct {
             return region;
         }
 
-        const page_format: PageFormat = if (bitmap.is_color) .color else .gray;
+        if (bitmap.width > ATLAS_SIZE - 2 or bitmap.height > ATLAS_SIZE - 2) {
+            self.failures.remember(key, self.gc_generation, self.current_frame, true);
+            return emptyRegion();
+        }
+        const page_format: PageFormat = if (bitmap.is_color) .color else if (bitmap.is_cleartype) .cleartype else .gray;
 
         // Allocate space (multi-page), null = can't allocate (edge case) -> return empty region.
         const alloc_result = self.allocateInPages(bitmap.width, bitmap.height, page_format) orelse {
+            self.failures.remember(key, self.gc_generation, self.current_frame, false);
+            self.had_transient_failure = true;
             text_trace.log(
                 self.current_frame,
                 "atlas-alloc-failed glyph={d} page_count={d} cache={d} bitmap={d}x{d}",
@@ -514,6 +543,7 @@ pub const GlyphAtlas = struct {
             .height = bitmap.height,
             .page_index = alloc_result.page_idx,
             .is_color = bitmap.is_color,
+            .is_cleartype = bitmap.is_cleartype,
         };
 
         try self.cache.put(key, region);
@@ -525,7 +555,7 @@ pub const GlyphAtlas = struct {
         self: *GlyphAtlas,
         font: *Font,
         glyph_index: u32,
-        subpixel_bin_packed: u8,
+        subpixel_bin_packed: u32,
     ) !AtlasRegion {
         // **Check cache first, then hasColorGlyphs.**
         //
@@ -560,15 +590,19 @@ pub const GlyphAtlas = struct {
             return self.getOrInsert(font, glyph_index);
         }
 
-        self.frame_insert_count += 1;
-
         // Extract x/y offset from packed bin.
-        const x_bin: u4 = @intCast(subpixel_bin_packed >> 4);
-        const y_bin: u4 = @intCast(subpixel_bin_packed & 0x0F);
+        const x_bin: u32 = subpixel_bin_packed >> 4;
+        const y_bin: u32 = subpixel_bin_packed & 0x0F;
         const offset_x = subpixelOffset(x_bin);
         const offset_y = subpixelOffset(y_bin);
 
-        const bitmap = try font.rasterizeGlyphSubpixel(glyph_index, offset_x, offset_y);
+        if (self.failures.contains(key, self.gc_generation, self.current_frame)) return emptyRegion();
+        self.frame_insert_count += 1;
+        const bitmap = if (comptime @import("builtin").os.tag == .windows) font.rasterizeGlyphWithContext(glyph_index, offset_x, offset_y, self.raster_context) catch |err| {
+            self.failures.remember(key, self.gc_generation, self.current_frame, err == error.GlyphTooLarge);
+            if (@as(anyerror, err) != error.GlyphTooLarge) self.had_transient_failure = true;
+            return emptyRegion();
+        } else try font.rasterizeGlyphSubpixel(glyph_index, offset_x, offset_y);
         defer bitmap.deinit(self.allocator);
 
         if (bitmap.width == 0 or bitmap.height == 0) {
@@ -586,10 +620,16 @@ pub const GlyphAtlas = struct {
             return region;
         }
 
-        const page_format: PageFormat = if (bitmap.is_color) .color else .gray;
+        if (bitmap.width > ATLAS_SIZE - 2 or bitmap.height > ATLAS_SIZE - 2) {
+            self.failures.remember(key, self.gc_generation, self.current_frame, true);
+            return emptyRegion();
+        }
+        const page_format: PageFormat = if (bitmap.is_color) .color else if (bitmap.is_cleartype) .cleartype else .gray;
 
         // Allocate space (multi-page), null -> return empty region.
         const alloc_result = self.allocateInPages(bitmap.width, bitmap.height, page_format) orelse {
+            self.failures.remember(key, self.gc_generation, self.current_frame, false);
+            self.had_transient_failure = true;
             text_trace.log(
                 self.current_frame,
                 "atlas-subpixel-alloc-failed glyph={d} bin=0x{x} page_count={d} cache={d} bitmap={d}x{d}",
@@ -630,6 +670,8 @@ pub const GlyphAtlas = struct {
             .width = bitmap.width,
             .height = bitmap.height,
             .page_index = alloc_result.page_idx,
+            .is_color = bitmap.is_color,
+            .is_cleartype = bitmap.is_cleartype,
         };
 
         try self.cache.put(key, region);
@@ -673,6 +715,7 @@ pub const GlyphAtlas = struct {
     ///
     /// Safe to removeByPtr during iteration: HashMap deletion only tombstones, never relocates.
     pub fn forgetFont(self: *GlyphAtlas, font_ptr: usize) void {
+        self.failures.forgetFont(font_ptr);
         var iter = self.cache.iterator();
         while (iter.next()) |entry| {
             if (entry.key_ptr.font_ptr == font_ptr) self.cache.removeByPtr(entry.key_ptr);
@@ -730,15 +773,19 @@ pub const AtlasRegion = struct {
     /// true = region on BGRA8 color page, shader must output sampled RGBA directly,
     /// can't multiply by text color (emoji self-colored).
     is_color: bool = false,
+    is_cleartype: bool = false,
 };
+
+fn emptyRegion() AtlasRegion {
+    return .{ .uv_min = .{ 0, 0 }, .uv_max = .{ 0, 0 }, .bearing_x = 0, .bearing_y = 0, .advance = 0, .width = 0, .height = 0, .page_index = 0 };
+}
 
 /// Glyph cache key.
 const GlyphKey = struct {
     font_ptr: usize,
     glyph_index: u32,
-    /// R6: Subpixel bin (high 4 bits = x bin, low 4 bits = y bin, each 0-3).
-    /// 0 = no subpixel offset (backward compatible).
-    subpixel_bin: u8 = 0,
+    /// Packed quarter-pixel phase bins. Zero is an unshifted raster.
+    subpixel_bin: u32 = 0,
     /// HiDPI: quantized `Font.scale_factor` (see quantizeScale).
     ///
     /// Must be in key. `Font.scale_factor` is **in-place mutable**; setScaleFactor doesn't
@@ -786,7 +833,8 @@ pub fn rasterKey(font: anytype) u32 {
     const F = @TypeOf(font.*);
     const honored = @hasField(F, "smooth_fonts") and (!@hasDecl(F, "honors_smoothing") or F.honors_smoothing);
     const smooth: bool = if (honored) font.smooth_fonts else true;
-    return quantizeScale(font.scale_factor) | (if (smooth) @as(u32, 0) else @as(u32, 1) << 31);
+    const lcd: u32 = if (@hasField(F, "cleartype")) (if (font.cleartype) @as(u32, 1) << 30 else 0) else 0;
+    return quantizeScale(font.scale_factor) | lcd | (if (smooth) @as(u32, 0) else @as(u32, 1) << 31);
 }
 
 /// R6: Number of subpixel bins (4 per axis = 16 variants).
@@ -796,9 +844,11 @@ pub const SUBPIXEL_BINS: u32 = 4;
 /// bitmap is placed from and the bin it is rasterized in. Bin 0 is an unshifted raster, so a
 /// pen on the pixel grid gets the hinted glyph exactly (a bin-center offset would move every
 /// hinted stem off the grid by 1/8 px and smear it across two pixels).
-pub const SubpixelPen = struct { pixel: f32, bin: u4 };
+// Windows uses the same bounded quarter-pixel phase grid as Skia.
+pub const SubpixelPen = @import("text_phase.zig").Pen;
 
 pub fn subpixelPen(pen_px: f32) SubpixelPen {
+    if (@import("builtin").os.tag == .windows) return @import("text_phase.zig").windowsPen(pen_px);
     const bins: f32 = @floatFromInt(SUBPIXEL_BINS);
     const quantized = @round(pen_px * bins) / bins;
     const pixel = @floor(quantized);
@@ -807,13 +857,13 @@ pub fn subpixelPen(pen_px: f32) SubpixelPen {
 }
 
 /// R6: Raster offset of a bin. Bin 0 is the unshifted glyph.
-pub fn subpixelOffset(bin: u4) f32 {
+pub fn subpixelOffset(bin: u32) f32 {
     return @as(f32, @floatFromInt(bin)) / @as(f32, @floatFromInt(SUBPIXEL_BINS));
 }
 
 /// R6: Pack x/y bin to u8.
-pub fn packSubpixelBin(x_bin: u4, y_bin: u4) u8 {
-    return (@as(u8, x_bin) << 4) | @as(u8, y_bin);
+pub fn packSubpixelBin(x_bin: u32, y_bin: u32) u32 {
+    return (x_bin << 4) | y_bin;
 }
 
 /// Simple rectangle packer (Shelf packing algorithm).
@@ -1176,4 +1226,13 @@ test "forgetFont 只摘除该 font_ptr 的全部条目（含各 scale / subpixel
     // New font at reused address must miss, not hit old bitmap.
     try testing.expect(atlas.cache.get(.{ .font_ptr = doomed, .glyph_index = 7 }) == null);
     try testing.expect(atlas.cache.get(.{ .font_ptr = survivor, .glyph_index = 7 }) != null);
+}
+
+test "transient raster failure expires at the next frame's prewarm" {
+    var atlas: GlyphAtlas = undefined;
+    atlas.had_transient_failure = true;
+    atlas.frame_insert_count = 12;
+    atlas.resetFrameStats();
+    try std.testing.expect(!atlas.had_transient_failure);
+    try std.testing.expectEqual(@as(u32, 0), atlas.frame_insert_count);
 }

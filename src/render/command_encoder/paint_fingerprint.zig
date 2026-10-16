@@ -223,6 +223,17 @@ pub fn nextFrameSalt() void {
 }
 
 pub fn hashPaintItemInto(hasher: *std.hash.Wyhash, it: anytype) void {
+    hashPaintItem(hasher, it, true);
+}
+
+/// Synchronous caret preparation compares separate lowered frames. Glass
+/// and icon payloads are arena copies, so their addresses are not content.
+/// Retained encoding keeps its existing within-frame identity contract above.
+pub fn hashCaretPaintItemInto(hasher: *std.hash.Wyhash, it: anytype) void {
+    hashPaintItem(hasher, it, false);
+}
+
+fn hashPaintItem(hasher: *std.hash.Wyhash, it: anytype, comptime glass_address: bool) void {
     hasher.update(std.mem.asBytes(&it.kind));
     hasher.update(std.mem.asBytes(&it.control_kind));
     hasher.update(std.mem.asBytes(&it.geom));
@@ -275,6 +286,11 @@ pub fn hashPaintItemInto(hasher: *std.hash.Wyhash, it: anytype) void {
         if (@typeInfo(@TypeOf(g)) == .@"struct") {
             inline for (@import("zenit_reflection").fields(@TypeOf(g))) |f| {
                 hasher.update(std.mem.asBytes(&@field(g, f.name)));
+            }
+            if (!glass_address and @hasField(@TypeOf(g), "group")) {
+                // The group itself has scope lifetime and stable identity, but
+                // its table can mutate in place between the two snapshots.
+                if (g.group) |group| hasher.update(std.mem.asBytes(&group.version));
             }
         }
     }
@@ -382,8 +398,32 @@ pub fn hashPaintItemInto(hasher: *std.hash.Wyhash, it: anytype) void {
     // GPU texture content must be immutable (an animated/video in-place texture-update path would
     // need
     // a version number fed into the fingerprint).
-    hasher.update(std.mem.asBytes(&@intFromPtr(it.glass_ptr)));
-    hasher.update(std.mem.asBytes(&@intFromPtr(it.icon_rep_ptr)));
+    if (glass_address) hasher.update(std.mem.asBytes(&@intFromPtr(it.glass_ptr)));
+    if (glass_address) {
+        hasher.update(std.mem.asBytes(&@intFromPtr(it.icon_rep_ptr)));
+    } else if (it.icon_rep_ptr) |rep| {
+        hasher.update("icon");
+        hasher.update(std.mem.asBytes(&rep.size));
+        hasher.update(std.mem.asBytes(&rep.view_min_x));
+        hasher.update(std.mem.asBytes(&rep.view_min_y));
+        hasher.update(std.mem.asBytes(&rep.view_width));
+        hasher.update(std.mem.asBytes(&rep.view_height));
+        hasher.update(std.mem.asBytes(&rep.shapes.len));
+        for (rep.shapes) |shape| {
+            hasher.update(std.mem.asBytes(&shape.fill));
+            hasher.update(std.mem.asBytes(&shape.stroke_width));
+            hasher.update(std.mem.asBytes(&shape.fill_rule));
+            hasher.update(std.mem.asBytes(&shape.contours.len));
+            for (shape.contours) |contour| {
+                hasher.update(std.mem.asBytes(&contour.closed));
+                hasher.update(std.mem.asBytes(&contour.points.len));
+                for (contour.points) |point| {
+                    hasher.update(std.mem.asBytes(&point.x));
+                    hasher.update(std.mem.asBytes(&point.y));
+                }
+            }
+        }
+    } else hasher.update("no-icon");
 }
 
 pub fn hashOptionalColor(hasher: *std.hash.Wyhash, c: anytype) void {

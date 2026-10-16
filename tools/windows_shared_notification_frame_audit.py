@@ -10,7 +10,39 @@ from pathlib import Path
 import re
 import zipfile
 from windows_modal_frame_audit import bitmap
-from windows_shared_modal_frame_audit import find, LINEAR, srgb
+from windows_shared_modal_frame_audit import find, fade, validate_viewport
+
+
+def body_points(node):
+    """Choose blank top padding from layout, before examining frame pixels."""
+    rect = node['rect']
+    top = rect['y']+rect['h']
+    def visit(n):
+        nonlocal top
+        if n.get('tag') in ('text', 'image') and n.get('visible', True):
+            top = min(top, n['rect']['y'])
+        for child in n.get('children', []):
+            visit(child)
+    visit(node)
+    dy = (top-rect['y'])/2 if top < rect['y']+rect['h'] else rect['h']*.4
+    if dy < 4:
+        raise ValueError('no blank body padding for strict fade oracle')
+    return [(rect['w']*fraction, dy+offset) for fraction in (.2, .25, .3) for offset in (-1, 0, 1)]
+
+
+
+def sample_point(node, dx, dy, scale):
+    rect = node['rect']
+    transform = node.get('world_transform')
+    if transform is not None:
+        if len(transform) != 6 or not all(math.isfinite(v) for v in transform):
+            raise ValueError('invalid notification transform')
+        a,b,c,d,tx,ty = transform
+        return math.floor((a*dx+c*dy+tx)*scale), math.floor((b*dx+d*dy+ty)*scale)
+    # Older frame archives retain the card's scale but not its affine matrix.
+    sx,sy = node.get('scale_x',1),node.get('scale_y',1)
+    return (math.floor((rect['x']+rect['w']/2+(dx-rect['w']/2)*sx)*scale),
+            math.floor((rect['y']+rect['h']/2+(dy-rect['h']/2)*sy)*scale))
 
 
 def audit(folder):
@@ -47,6 +79,7 @@ def audit(folder):
             if (width, height) != (meta['width'], meta['height']) or not math.isfinite(meta['scale']) or meta['scale'] <= 0:
                 raise ValueError('invalid frame dimensions')
             tree = json.loads(archive.read(meta['tree']))
+            validate_viewport(meta, tree)
             node = find(tree, 'story.notify.warning')
             alpha = node.get('effective_opacity') if node else 0
             if not isinstance(alpha, (int, float)) or not math.isfinite(alpha) or not 0 <= alpha <= 1:
@@ -75,11 +108,11 @@ def audit(folder):
         if (bw,bh) != (width,height):
             raise ValueError('baseline size mismatch')
         rect = sn['rect']
-        points = [(dx,dy) for dx in (rect['w']-110,rect['w']-100,rect['w']-90) for dy in (25,27,29)]
+        points = body_points(sn)
         # Select the patch before reading animated pixels. Its bright, locally
         # uniform reference tolerates the notification's small scale transform.
         for dx,dy in points:
-            x,y = math.floor((rect['x']+dx)*scale),math.floor((rect['y']+dy)*scale)
+            x,y = sample_point(sn, dx, dy, scale)
             if not (4 <= x < width-4 and 4 <= y < height-4):
                 raise ValueError('reference patch outside drawable')
             values = [reference(px,py) for px in range(x-4,x+5) for py in range(y-4,y+5)]
@@ -104,12 +137,12 @@ def audit(folder):
                 if any(abs(current[k]-rect[k])>.05 for k in ('w','h')):
                     raise ValueError('card layout changed')
                 for dx,dy in points:
-                    x,y = math.floor((current['x']+dx)*scale),math.floor((current['y']+dy)*scale)
-                    rx,ry = math.floor((rect['x']+dx)*scale),math.floor((rect['y']+dy)*scale)
+                    x,y = sample_point(node, dx, dy, scale)
+                    rx,ry = sample_point(sn, dx, dy, scale)
                     if not (0 <= x < width and 0 <= y < height):
                         raise ValueError('animated patch outside drawable')
                     bg,fg = baseline(x,y),reference(rx,ry)
-                    expected_pixel = [srgb(LINEAR[b]+(LINEAR[f]-LINEAR[b])*alpha) for b,f in zip(bg,fg)]
+                    expected_pixel = [fade(b, f, b, alpha) for b,f in zip(bg,fg)]
                     error = max(error,max(abs(a-e) for a,e in zip(pixel(x,y),expected_pixel)))
             residual = 0
             if alpha == 0:

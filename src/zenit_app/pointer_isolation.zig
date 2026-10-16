@@ -46,6 +46,24 @@ pub fn isOsPointerEvent(event: system_sdk.events.Event) bool {
     };
 }
 
+/// Discarded OS pointer traffic must not reset an idle interval or force GPU
+/// frames. Harness injection still requests its frames directly through Cx.
+pub fn requestsFrame(isolated: bool, input: []const system_sdk.events.Event) bool {
+    for (input) |event| if (!isolated or !isOsPointerEvent(event)) return true;
+    return false;
+}
+
+test "isolated pointer batches do not force frames but native lifecycle events do" {
+    const input = [_]system_sdk.events.Event{
+        .{ .mouse_move = .{ .window_id = 1, .x = 10, .y = 20 } },
+        .{ .frame_requested = {} },
+    };
+    try std.testing.expect(!requestsFrame(true, input[0..1]));
+    try std.testing.expect(requestsFrame(false, input[0..1]));
+    try std.testing.expect(requestsFrame(true, &input));
+    try std.testing.expect(!requestsFrame(false, &.{}));
+}
+
 test "explicit ZENIT_E2E_ISOLATE_POINTER wins over the background default" {
     try std.testing.expect(enabledFrom("1", null, false));
     try std.testing.expect(!enabledFrom("0", "1", true));

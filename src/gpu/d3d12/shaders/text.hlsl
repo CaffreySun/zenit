@@ -1,6 +1,9 @@
 // Windows counterpart of src/render/shaders/text.metal.
 // zenit-entry: vertex text_vertex_main
 // zenit-entry: fragment text_fragment_main
+#define ZENIT_DWRITE_GAMMA uniforms.dwrite_gamma
+#define ZENIT_DWRITE_CONTRAST uniforms.dwrite_settings.x
+#define ZENIT_DWRITE_CT_CONTRAST uniforms.dwrite_settings.y
 struct Uniforms {
     float2 viewport_size; // viewport size (pixels)
     float scale_factor; // DPI scale factor
@@ -12,6 +15,8 @@ struct Uniforms {
     uint clip_contour_count;
     uint4 clip_polygon_end_points[2];
     float4 clip_polygon_points[16];
+    float4 dwrite_gamma;
+    float4 dwrite_settings;
 };
 struct GlyphInstance {
     float2 position; // glyph lower-left position (pixels)
@@ -218,12 +223,30 @@ VertexOutput text_vertex_main(uint vertex_id : SV_VertexID, uint instance_id : S
 // Fragment shader
 // ============================================================================
 
+#ifdef ZENIT_DWRITE_GAMMA
+// Microsoft Windows Terminal's DirectWrite alpha correction (MIT license).
+// Copyright (c) Microsoft Corporation. See native/windows/dwrite_alpha_correction.LICENSE.
+float dwrite_grayscale_alpha(float alpha, float3 foreground) {
+    float lightness = dot(foreground, float3(0.30, 0.59, 0.11));
+    float contrast = ZENIT_DWRITE_CONTRAST * saturate(3.0 - 4.0 * lightness);
+    float a = alpha * (1.0 + contrast) / (1.0 + alpha * contrast);
+    float intensity = dot(foreground, float3(0.25, 0.5, 0.25));
+    float4 g = ZENIT_DWRITE_GAMMA;
+    return saturate(a + a * (1.0 - a) * ((g.x * intensity + g.y) * a + g.z * intensity + g.w));
+}
+#endif
+
+#ifdef ZENIT_DWRITE_GAMMA
+struct TextOutput { float4 color : SV_Target0; float4 weights : SV_Target1; };
+TextOutput text_fragment_main(VertexOutput input) {
+#else
 float4 text_fragment_main(VertexOutput input) : SV_Target {
+#endif
     const GlyphInstance inst = instances[input.instance_id];
     const float clip_a = clip_alpha_text(input.screen_pos, input.rect_clip, uniforms);
 
     float4 result;
-    if (inst.is_color > 0.5) {
+    if (inst.is_color > 0.5 && inst.is_color < 1.5) {
         // color glyphs (emoji): BGRA page already holds premultiplied final color. **cannot
         // multiply by inst.color** -- emoji has own color, multiply by text color re-tints to
         // single color, wasted work. here only layer clip alpha and overall opacity.
@@ -233,12 +256,33 @@ float4 text_fragment_main(VertexOutput input) : SV_Target {
         if (result.a < 0.001) {
             discard;
         }
+#ifdef ZENIT_DWRITE_GAMMA
+        TextOutput output; output.color = result; output.weights = result.aaaa; return output;
+#else
         return result;
+#endif
     }
 
+#ifdef ZENIT_DWRITE_GAMMA
+    if (inst.is_color > 1.5) {
+        float3 mask = glyph_atlas.Sample(atlas_sampler, input.uv).rgb;
+        // D2D has already applied the monitor's pixel geometry and ClearType level.
+        float lightness = dot(inst.color.rgb, float3(0.30, 0.59, 0.11));
+        float contrast = ZENIT_DWRITE_CT_CONTRAST * saturate(3.0 - 4.0 * lightness);
+        float3 a = mask * (1.0 + contrast) / (1.0 + mask * contrast);
+        float4 g = ZENIT_DWRITE_GAMMA;
+        a = saturate(a + a * (1.0 - a) * ((g.x * inst.color.rgb + g.y) * a + g.z * inst.color.rgb + g.w));
+        a *= clip_a * inst.color.a;
+        float coverage = max(a.r, max(a.g, a.b));
+        TextOutput output; output.weights = float4(a, coverage); output.color = float4(inst.color.rgb * a, coverage); return output;
+    }
+#endif
     // grayscale glyph: single channel as coverage, multiply by text color (original logic,
     // unchanged)
     float alpha = glyph_atlas.Sample(atlas_sampler, input.uv).r;
+#ifdef ZENIT_DWRITE_GAMMA
+    alpha = dwrite_grayscale_alpha(alpha, inst.color.rgb);
+#endif
 
     result = inst.color;
     result.a *= alpha * clip_a;
@@ -250,5 +294,9 @@ float4 text_fragment_main(VertexOutput input) : SV_Target {
 
     // output premultiplied alpha, match premultiplied blend state
     result.rgb *= result.a;
+#ifdef ZENIT_DWRITE_GAMMA
+    TextOutput output; output.color = result; output.weights = result.aaaa; return output;
+#else
     return result;
+#endif
 }

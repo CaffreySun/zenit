@@ -16,6 +16,9 @@ pub const State = struct {
     pending_close_len: usize = 0,
     active_window_id: ?WindowId = null,
     quit_requested: bool = false,
+    // A last-close exit is provisional: on_destroy may register a replacement.
+    // Explicit/API and accepted native user quits remain sticky.
+    quit_source: enum { none, last_window, explicit } = .none,
 
     pub fn count(self: *const State) usize {
         return self.len;
@@ -31,6 +34,10 @@ pub const State = struct {
         self.ids[self.len] = window_id;
         self.len += 1;
         self.active_window_id = window_id;
+        if (self.quit_source == .last_window) {
+            self.quit_source = .none;
+            self.quit_requested = false;
+        }
     }
 
     /// Record native focus only for a still-live window. A late focus
@@ -99,7 +106,10 @@ pub const State = struct {
 
         if (self.len == 0) {
             self.active_window_id = null;
-            self.quit_requested = true;
+            if (self.quit_source != .explicit) {
+                self.quit_source = .last_window;
+                self.quit_requested = true;
+            }
         } else if (self.active_window_id == window_id) {
             self.active_window_id = self.ids[self.len - 1];
         }
@@ -107,6 +117,7 @@ pub const State = struct {
     }
 
     pub fn requestQuit(self: *State) void {
+        self.quit_source = .explicit;
         self.quit_requested = true;
     }
 
@@ -212,4 +223,31 @@ test "multi-window lifecycle rejects invalid and excess registrations" {
     try std.testing.expectError(error.InvalidWindowId, state.add(1));
     for (2..MAX_WINDOWS + 1) |id| try state.add(@intCast(id));
     try std.testing.expectError(error.TooManyWindows, state.add(999));
+}
+
+test "last-window destroy callback can add a replacement and resume pumping" {
+    var state = State{};
+    try state.add(1);
+    try std.testing.expect(state.removed(1));
+    try std.testing.expect(state.quit_requested);
+    try state.add(2);
+    try std.testing.expect(!state.quit_requested);
+    try std.testing.expectEqual(@as(?WindowId, 2), state.active_window_id);
+}
+
+test "adding windows cannot withdraw explicit or user quit" {
+    for ([_]bool{ false, true }) |close_last| {
+        var state = State{};
+        try state.add(1);
+        state.requestQuit();
+        if (close_last) try std.testing.expect(state.removed(1));
+        try state.add(2);
+        try std.testing.expect(state.quit_requested);
+    }
+    var state = State{};
+    try state.add(1);
+    _ = state.removed(1);
+    state.requestQuit(); // Explicit quit after the automatic last-close exit.
+    try state.add(2);
+    try std.testing.expect(state.quit_requested);
 }

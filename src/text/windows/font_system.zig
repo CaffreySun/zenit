@@ -24,12 +24,14 @@ extern fn zenit_dwrite_descent(font: *anyopaque) f32;
 extern fn zenit_dwrite_leading(font: *anyopaque) f32;
 extern fn zenit_dwrite_glyph_index(font: *anyopaque, codepoint: u32) u32;
 extern fn zenit_dwrite_font_has_color_glyphs(font: *anyopaque) c_int;
-extern fn zenit_dwrite_rasterize_glyph(
+extern fn zenit_dwrite_rasterize_glyph_context(
+    context: ?*anyopaque,
     font: *anyopaque,
     glyph_index: u32,
     scale: f32,
     offset_x: f32,
     offset_y: f32,
+    cleartype: u32,
     pixels: *?[*]u8,
     width: *u32,
     height: *u32,
@@ -269,7 +271,9 @@ pub const Font = struct {
     /// Platform font smoothing (macOS only; DirectWrite has none to turn off): written by the text
     /// renderer, ignored here and kept out of the glyph atlas key (honors_smoothing).
     smooth_fonts: bool = true,
+    cleartype: bool = false,
     pub const honors_smoothing = false;
+    pub const layout_selects_faces = true;
 
     /// Independently own a shaped run's native fallback face and metadata.
     pub fn fromFallbackRef(allocator: std.mem.Allocator, ref: *anyopaque, prototype: *const Font) !*Font {
@@ -353,6 +357,10 @@ pub const Font = struct {
     }
 
     pub fn rasterizeGlyphSubpixel(self: *Font, glyph_index: u32, offset_x: f32, offset_y: f32) !GlyphBitmap {
+        return self.rasterizeGlyphWithContext(glyph_index, offset_x, offset_y, null);
+    }
+
+    pub fn rasterizeGlyphWithContext(self: *Font, glyph_index: u32, offset_x: f32, offset_y: f32, context: ?*anyopaque) !GlyphBitmap {
         var raw: ?[*]u8 = null;
         var width: u32 = 0;
         var height: u32 = 0;
@@ -360,12 +368,13 @@ pub const Font = struct {
         var bearing_y: i32 = 0;
         var advance: i32 = 0;
         var is_color: u32 = 0;
-        if (zenit_dwrite_rasterize_glyph(self.native, glyph_index, self.scale_factor, offset_x, offset_y, &raw, &width, &height, &bearing_x, &bearing_y, &advance, &is_color) != 0)
-            return error.GlyphRasterizationFailed;
+        const status = zenit_dwrite_rasterize_glyph_context(context, self.native, glyph_index, self.scale_factor, offset_x, offset_y, @intFromBool(self.cleartype), &raw, &width, &height, &bearing_x, &bearing_y, &advance, &is_color);
+        if (status == 2) return error.GlyphTooLarge;
+        if (status != 0) return error.GlyphRasterizationFailed;
         defer zenit_dwrite_free_bitmap(raw);
         const pixels = try self.allocator.alloc(u8, @as(usize, width) * height * @as(usize, if (is_color != 0) 4 else 1));
         if (raw) |source| @memcpy(pixels, source[0..pixels.len]);
-        return .{ .pixels = pixels, .width = width, .height = height, .bearing_x = bearing_x, .bearing_y = bearing_y, .advance = advance, .is_color = is_color != 0 };
+        return .{ .pixels = pixels, .width = width, .height = height, .bearing_x = bearing_x, .bearing_y = bearing_y, .advance = advance, .is_color = is_color == 1, .is_cleartype = is_color == 2 };
     }
 
     pub fn lineCaretStops(self: *const Font, text: []const u8, boundaries: []const u32, out: []types.LineCaretStop) !types.LineMetrics {

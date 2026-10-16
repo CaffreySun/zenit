@@ -1,4 +1,5 @@
 const std = @import("std");
+const owned_window = @import("../owned_window.zig");
 
 /// Win32 window and message-pump adapter. Pixel rendering is still owned by
 /// the GPU backend; the native bridge's GDI paint is only a diagnostic fallback.
@@ -21,6 +22,12 @@ pub const WindowsWindow = struct {
     extern fn zenit_win_pending_open_file(buffer: ?[*]u8, capacity: usize) c_int;
     extern fn zenit_win_send_open_file(target: *anyopaque, path: [*]const u8, size: usize, timeout: u32) c_int;
     extern fn zenit_windows_create(width: u32, height: u32, title: [*:0]const u8) ?*anyopaque;
+    extern fn zenit_windows_create_ex(width: u32, height: u32, title: [*:0]const u8, flags: c_int) ?*anyopaque;
+    extern fn zenit_windows_show(window: *anyopaque) void;
+    const create_hidden: c_int = 1;
+    const create_reveal_on_present: c_int = 2;
+    extern fn zenit_windows_note_presented(window: *anyopaque) void;
+    extern fn zenit_windows_conceal(window: *anyopaque) void;
     extern fn zenit_windows_destroy(window: *anyopaque) void;
     extern fn zenit_windows_app_should_quit() c_int;
     extern fn zenit_windows_poll(window: *anyopaque) c_int;
@@ -35,6 +42,7 @@ pub const WindowsWindow = struct {
         return zenit_windows_menu_consume(self.native) != 0;
     }
     extern fn zenit_windows_pump_timeout(timeout_ms: u32) void;
+    extern fn zenit_windows_post_empty_event() void;
     extern fn zenit_windows_begin_close(window: *anyopaque) c_int;
     extern fn zenit_windows_closed(window: *anyopaque) c_int;
     extern fn zenit_windows_should_close(window: *anyopaque) c_int;
@@ -281,6 +289,40 @@ pub const WindowsWindow = struct {
         return .{ .native = native, .width = width, .height = height };
     }
 
+    /// A window that stays hidden until `show`: owned panels are configured
+    /// (owner, position) before they appear, so they take activation once.
+    pub fn initHidden(width: u32, height: u32, title: [:0]const u8) !WindowsWindow {
+        try initAppWithDelegateChecked();
+        const native = zenit_windows_create_ex(width, height, title.ptr, 1) orelse return error.WindowCreationFailed;
+        return .{ .native = native, .width = width, .height = height };
+    }
+
+    /// Show a window created with `initHidden` (activating it, except in
+    /// background e2e runs). No effect once visible.
+    pub fn show(self: *WindowsWindow) void {
+        zenit_windows_show(self.native);
+    }
+
+    /// An application window: shown cloaked (or hidden, for windows the
+    /// runtime places before showing) and revealed by `notePresented` once its
+    /// first GPU frame exists, so the desktop never shows it without content.
+    pub fn initApplication(width: u32, height: u32, title: [:0]const u8, hidden: bool) !WindowsWindow {
+        try initAppWithDelegateChecked();
+        const flags: c_int = create_reveal_on_present | if (hidden) create_hidden else 0;
+        const native = zenit_windows_create_ex(width, height, title.ptr, flags) orelse return error.WindowCreationFailed;
+        return .{ .native = native, .width = width, .height = height };
+    }
+
+    /// The renderer presented a frame to this window.
+    pub fn notePresented(self: *WindowsWindow) void {
+        zenit_windows_note_presented(self.native);
+    }
+
+    /// Hide the contents before teardown detaches the renderer.
+    pub fn conceal(self: *WindowsWindow) void {
+        zenit_windows_conceal(self.native);
+    }
+
     pub fn deinit(self: *WindowsWindow) void {
         zenit_recording_destroy(self.recording);
         self.recording = null;
@@ -306,6 +348,13 @@ pub const WindowsWindow = struct {
 
     pub fn setSize(self: *WindowsWindow, width: u32, height: u32) void {
         _ = self.setSizeChecked(width, height);
+    }
+
+    /// Exact logical client extent; integer getSize is retained for compatibility.
+    pub fn getLogicalSize(self: *WindowsWindow) [2]f32 {
+        const pixels = self.getDrawableSize();
+        const scale = self.getScaleFactor();
+        return .{ @as(f32, @floatFromInt(pixels[0])) / scale, @as(f32, @floatFromInt(pixels[1])) / scale };
     }
 
     /// Reports native API success. getSize remains authoritative if the OS
@@ -528,6 +577,59 @@ pub const WindowsWindow = struct {
         zenit_windows_activate(self.native);
     }
 
+    extern fn zenit_windows_set_owner(window: *anyopaque, owner: *anyopaque) c_int;
+    extern fn zenit_windows_clear_owner(window: *anyopaque) void;
+    extern fn zenit_windows_owner_geometry(window: *anyopaque, owner: *anyopaque, out: *[10]f64) c_int;
+    extern fn zenit_windows_set_origin(window: *anyopaque, x: f64, y: f64) void;
+    extern fn zenit_windows_take_focus_loss(window: *anyopaque) c_int;
+
+    /// Make this an owned window of `owner`: above the owner, minimised with
+    /// it, no taskbar button. Destroying the owner HWND destroys this one too.
+    pub fn setOwner(self: *WindowsWindow, owner: *WindowsWindow) bool {
+        return zenit_windows_set_owner(self.native, owner.native) != 0;
+    }
+
+    pub fn clearOwner(self: *WindowsWindow, owner: *WindowsWindow) void {
+        _ = owner;
+        zenit_windows_clear_owner(self.native);
+    }
+
+    /// Native outer frame and monitor work area, in virtual-screen pixels.
+    pub fn frameWorkArea(self: *WindowsWindow) ?[10]f64 {
+        var geometry: [10]f64 = undefined;
+        if (zenit_windows_owner_geometry(self.native, self.native, &geometry) == 0) return null;
+        return geometry;
+    }
+
+    /// Centre on `owner` (see owned_window.centerOnOwner), clamped to the
+    /// owner's monitor work area. Must run after the window has its final size.
+    pub fn centerOnOwner(self: *WindowsWindow, owner: *WindowsWindow) bool {
+        var g: [10]f64 = undefined;
+        if (zenit_windows_owner_geometry(self.native, owner.native, &g) == 0) return false;
+        const origin = owned_window.centerOnOwner(
+            .{ .x = g[0], .y = g[1], .w = g[2], .h = g[3] },
+            g[4],
+            g[5],
+            .{ .x = g[6], .y = g[7], .w = g[8], .h = g[9] },
+            .down,
+        );
+        zenit_windows_set_origin(self.native, origin.x, origin.y);
+        return true;
+    }
+
+    /// WM_ACTIVATE records focus loss natively; nothing to arm.
+    pub fn armFocusLossReporting(self: *WindowsWindow) void {
+        _ = self;
+    }
+
+    pub fn takeFocusLoss(self: *WindowsWindow) ?owned_window.FocusLoss {
+        return switch (zenit_windows_take_focus_loss(self.native)) {
+            1 => .same_application,
+            2 => .other_application,
+            else => null,
+        };
+    }
+
     pub fn getScrollDelta(self: *WindowsWindow) ?ScrollEvent {
         var x: f32 = 0;
         var y: f32 = 0;
@@ -582,6 +684,7 @@ pub const WindowsWindow = struct {
 
     extern fn zenit_win_window_drag(owner: *anyopaque) c_int;
     extern fn zenit_win_titlebar_region(owner: *anyopaque, height: f32, right_inset: f32) c_int;
+    extern fn zenit_win_set_title(owner: *anyopaque, title: [*:0]const u8) c_int;
     extern fn zenit_win_titlebar_hit_callback(owner: *anyopaque, callback: ?*const fn (?*anyopaque, f32, f32) callconv(.c) c_int, context: ?*anyopaque) c_int;
 
     pub fn performWindowDrag(self: *WindowsWindow) void {
@@ -596,6 +699,11 @@ pub const WindowsWindow = struct {
         _ = self;
         _ = inset_x;
         _ = inset_y;
+    }
+
+    /// Change the window title after creation.
+    pub fn setTitle(self: *WindowsWindow, title: [:0]const u8) void {
+        _ = zenit_win_set_title(self.getNativeSurfaceHandle(), title.ptr);
     }
 
     pub fn setTitlebarDragHeight(self: *WindowsWindow, height: f32) void {
@@ -638,8 +746,19 @@ pub const WindowsWindow = struct {
         zenit_windows_pump_timeout(timeout_ms);
     }
 
+    /// Wake a pump blocked in pumpAppEventsTimeout from any thread.
+    pub fn postEmptyEvent() void {
+        zenit_windows_post_empty_event();
+    }
+
     pub fn appShouldQuit() bool {
         return zenit_windows_app_should_quit() != 0;
+    }
+
+    extern fn zenit_windows_cancel_app_quit() void;
+    /// Withdraw a pending user quit request after the application vetoed it.
+    pub fn cancelAppQuit() void {
+        zenit_windows_cancel_app_quit();
     }
 
     pub fn checkShouldClose(self: *WindowsWindow) bool {

@@ -5635,6 +5635,7 @@ test "render: legacy overflow cache hit emits the owner's own content once, befo
     try std.testing.expect(cx.perf.render_cache_hit > 0);
 
     var track_fills: usize = 0;
+    var child_fills: usize = 0;
     var track_at: ?usize = null;
     var fill_at: ?usize = null;
     for (cx.display_list.items.items, 0..) |item, i| switch (item) {
@@ -5643,11 +5644,15 @@ test "render: legacy overflow cache hit emits the owner's own content once, befo
                 track_fills += 1;
                 if (track_at == null) track_at = i;
             }
-            if (f.header.node_id == fill.id and fill_at == null) fill_at = i;
+            if (f.header.node_id == fill.id) {
+                child_fills += 1;
+                if (fill_at == null) fill_at = i;
+            }
         },
         else => {},
     };
     try std.testing.expectEqual(@as(usize, 1), track_fills);
+    try std.testing.expectEqual(@as(usize, 1), child_fills);
     try std.testing.expect(track_at.? < fill_at.?);
 }
 
@@ -8134,6 +8139,43 @@ test "Cx: bubbled Tab handler suppresses default focus traversal" {
 
     try std.testing.expectEqual(@as(u32, 1), parent_tab_count);
     try std.testing.expect(cx.focus_manager.current_focus == input1);
+}
+
+test "Cx: inspector chord yields to an application binding for the same keys" {
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    cx.setViewport(300, 120);
+
+    const Ctx = struct { claim: bool = true, seen: u32 = 0 };
+    var ctx = Ctx{};
+    const root = try box(cx, .{ .width = .{ .px = 300 }, .height = .{ .px = 120 } }, .{});
+    root.behavior.events.on_key_down = struct {
+        fn handler(_: ui.KeyCode, _: ui.Modifiers, context: ?*anyopaque) EventResult {
+            const c: *Ctx = @ptrCast(@alignCast(context.?));
+            c.seen += 1;
+            return if (c.claim) .stop else .ignored;
+        }
+    }.handler;
+    root.behavior.events.key_context = &ctx;
+    cx.root = root;
+    cx.layout();
+
+    // Ctrl+Shift+I is "insert image" in an editor on Windows: the app wins.
+    const chord = ui.Modifiers{ .ctrl = true, .shift = true };
+    cx.handleKeyDown(.i, chord);
+    try std.testing.expectEqual(@as(u32, 1), ctx.seen);
+    try std.testing.expect(!cx.inspector.enabled);
+
+    // Unclaimed, the chord opens the inspector.
+    ctx.claim = false;
+    cx.handleKeyDown(.i, chord);
+    try std.testing.expect(cx.inspector.enabled);
+
+    // Closing always works, even where the app would claim the keys.
+    ctx.claim = true;
+    cx.handleKeyDown(.i, chord);
+    try std.testing.expect(!cx.inspector.enabled);
+    try std.testing.expectEqual(@as(u32, 2), ctx.seen);
 }
 
 test "Cx: pointer capture release refreshes hover target" {
@@ -12397,6 +12439,85 @@ test "removeAllChildren unlinks the full ElementTable chain" {
     cx.freeNode(c2);
 }
 
+test "World paint/interaction tables mirror on demand, not on every render" {
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    cx.setViewport(400, 300);
+    const root = try box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
+    cx.root = root;
+    const child = try box(cx, .{
+        .width = .{ .px = 120 },
+        .height = .{ .px = 80 },
+        .background = .{ .r = 255, .g = 0, .b = 0, .a = 255 },
+    }, .{});
+    child.behavior.interaction.focusable = true;
+    try root.appendChild(std.testing.allocator, child);
+    cx.layout();
+    // Off the sampled layout-integrity frame (frame_count % 64 == 1): that Debug
+    // audit reads the tables and therefore mirrors them itself.
+    cx.frame_count = 2;
+    _ = cx.render();
+    const eid = ui.world.ElementId.fromRaw(child.element_id_raw);
+
+    // Rendering alone leaves the mirror pending: chunk never recorded, no interaction entry.
+    try std.testing.expect(cx.world_tables_stale);
+    if (cx.world.paint.get(eid)) |chunk| try std.testing.expectEqual(@as(u64, 0), chunk.paint_epoch);
+    try std.testing.expect(cx.world.interaction.get(eid) == null);
+
+    cx.ensureWorldTablesSynced();
+    try std.testing.expect(!cx.world_tables_stale);
+    const epoch = cx.world.paint.get(eid).?.paint_epoch;
+    try std.testing.expect(cx.world.interaction.get(eid).?.focus.focusable);
+
+    // Idempotent until the next render: no second walk, no re-record.
+    cx.ensureWorldTablesSynced();
+    try std.testing.expectEqual(epoch, cx.world.paint.get(eid).?.paint_epoch);
+
+    // A visual change shows up at the next read after the next render.
+    child.setBackgroundRaw(.{ .r = 0, .g = 0, .b = 255, .a = 255 });
+    child.markRenderDirty();
+    _ = cx.render();
+    try std.testing.expect(cx.world_tables_stale);
+    cx.ensureWorldTablesSynced();
+    try std.testing.expect(cx.world.paint.get(eid).?.paint_epoch > epoch);
+}
+
+test "World paint mirror never keeps items older than the last render" {
+    // A reader between an edit and the next render mirrors the new paint hash with the
+    // old frame's items. The next mirror, after that render, must still replace them.
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    cx.setViewport(400, 300);
+    const root = try box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
+    cx.root = root;
+    const child = try box(cx, .{
+        .width = .{ .px = 120 },
+        .height = .{ .px = 80 },
+        .background = .{ .r = 255, .g = 0, .b = 0, .a = 255 },
+    }, .{});
+    try root.appendChild(std.testing.allocator, child);
+    cx.layout();
+    cx.frame_count = 2; // off the sampled integrity-audit frame, which mirrors by itself
+    _ = cx.render();
+    const eid = ui.world.ElementId.fromRaw(child.element_id_raw);
+
+    child.setBackgroundRaw(.{ .r = 0, .g = 0, .b = 255, .a = 255 });
+    child.markRenderDirty();
+    cx.ensureWorldTablesSynced(); // reader before the next render
+    _ = cx.render();
+    cx.ensureWorldTablesSynced();
+
+    var blue = false;
+    var red = false;
+    for (cx.world.paint.get(eid).?.display_items.items) |item| {
+        if (item.kind != .rect) continue;
+        if (item.color.b == 255 and item.color.r == 0) blue = true;
+        if (item.color.r == 255 and item.color.b == 0) red = true;
+    }
+    try std.testing.expect(blue);
+    try std.testing.expect(!red);
+}
+
 // PaintTable shadow-sync path working
 // after render, PaintTable populates chunks for elements; changing background should
 // trigger hash mismatch and re-recording
@@ -12417,6 +12538,7 @@ test "PaintTable shadow-syncs after render and invalidates on style change" {
 
     cx.layout();
     _ = cx.render();
+    cx.ensureWorldTablesSynced();
 
     try std.testing.expect(child.element_id_raw != 0xFFFFFFFF);
     const eid = ui.world.ElementId.fromRaw(child.element_id_raw);
@@ -12427,6 +12549,7 @@ test "PaintTable shadow-syncs after render and invalidates on style change" {
 
     // render again same frame -> hash hit, paint_epoch unchanged
     _ = cx.render();
+    cx.ensureWorldTablesSynced();
     const chunk2 = cx.world.paint.get(eid).?;
     try std.testing.expectEqual(epoch1, chunk2.paint_epoch);
     try std.testing.expectEqual(hash1, chunk2.content_hash);
@@ -12435,6 +12558,7 @@ test "PaintTable shadow-syncs after render and invalidates on style change" {
     child.setBackgroundRaw(.{ .r = 0, .g = 0, .b = 255, .a = 255 });
     child.markRenderDirty();
     _ = cx.render();
+    cx.ensureWorldTablesSynced();
     const chunk3 = cx.world.paint.get(eid).?;
     try std.testing.expect(chunk3.paint_epoch > epoch1);
     try std.testing.expect(chunk3.content_hash != hash1);
@@ -12517,6 +12641,7 @@ test "PaintTable.DisplayItem 字段无损 (fill_rect geom + color + radii)" {
 
     cx.layout();
     _ = cx.render();
+    cx.ensureWorldTablesSynced();
 
     const eid = ui.world.ElementId.fromRaw(child.element_id_raw);
     const chunk = cx.world.paint.get(eid).?;
@@ -12572,6 +12697,7 @@ test "InteractionTable shadow-syncs focusable/event/a11y nodes" {
 
     cx.layout();
     _ = cx.render();
+    cx.ensureWorldTablesSynced();
 
     const fcb_eid = ui.world.ElementId.fromRaw(fcb.element_id_raw);
     const a11y_eid = ui.world.ElementId.fromRaw(a11y_n.element_id_raw);
@@ -12677,6 +12803,7 @@ test "paintContentHash invalidates on more visual attrs" {
 
     cx.layout();
     _ = cx.render();
+    cx.ensureWorldTablesSynced();
     const eid = ui.world.ElementId.fromRaw(root.element_id_raw);
     const epoch1 = cx.world.paint.get(eid).?.paint_epoch;
 
@@ -12684,6 +12811,7 @@ test "paintContentHash invalidates on more visual attrs" {
     root.setOpacityRaw(0.5);
     root.markRenderDirty();
     _ = cx.render();
+    cx.ensureWorldTablesSynced();
     const epoch2 = cx.world.paint.get(eid).?.paint_epoch;
     try std.testing.expect(epoch2 > epoch1);
 }
@@ -12732,6 +12860,7 @@ test "PaintChunk.property_state populated from SceneRuntime" {
 
     cx.layout();
     _ = cx.render();
+    cx.ensureWorldTablesSynced();
 
     const eid = ui.world.ElementId.fromRaw(root.element_id_raw);
     const chunk = cx.world.paint.get(eid).?;
@@ -12829,6 +12958,7 @@ test "syncInteractionToTable preserves scroll_id across renders" {
 
     // trigger one render -> syncInteractionToTable runs
     _ = cx.render();
+    cx.ensureWorldTablesSynced();
 
     // scroll_id should still be 42, not erased to sentinel
     const data = cx.world.interaction.get(eid).?;
@@ -12978,6 +13108,77 @@ const a11y_bridge_extern = struct {
     extern fn zenit_a11y_actions(window_id: u32, handle: u64) u8;
     extern fn zenit_a11y_perform_action(window_id: u32, handle: u64, action: u8) c_int;
 };
+
+test "a11y on demand: no projection until the first assistive query, then every frame" {
+    if (@import("builtin").os.tag != .macos) return error.SkipZigTest;
+    const bridge = @import("../a11y/macos_bridge.zig");
+    bridge.resetClientsSeenForTesting();
+    defer bridge.resetClientsSeenForTesting();
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    cx.a11y_on_demand = true;
+    cx.setViewport(400, 300);
+    const root = try box(cx, .{ .width = .{ .px = 400 }, .height = .{ .px = 300 } }, .{});
+    cx.root = root;
+    const btn = try box(cx, .{ .width = .{ .px = 80 }, .height = .{ .px = 30 } }, .{});
+    btn.behavior.interaction.a11y = .{ .role = .button, .label = "Save" };
+    try root.appendChild(std.testing.allocator, btn);
+    const eid = ui.world.ElementId.fromRaw(btn.element_id_raw);
+
+    cx.layout();
+    _ = cx.render();
+    _ = cx.render();
+    try std.testing.expect(cx.a11y_projection_stale);
+    try std.testing.expect(cx.accessibility_tree.getNode(eid) == null);
+
+    // First query projects synchronously: the client never sees an empty tree.
+    try std.testing.expectEqual(@as(c_int, 1), a11y_bridge_extern.zenit_a11y_root_count(a11y_bridge_extern.ANY));
+    try std.testing.expect(!cx.a11y_projection_stale);
+    try std.testing.expect(cx.accessibility_tree.getNode(eid) != null);
+
+    // From then on frames project eagerly, so later changes reach the tree
+    // without another query.
+    btn.behavior.interaction.a11y = .{ .role = .checkbox, .label = "Save" };
+    btn.markRenderDirty();
+    _ = cx.render();
+    try std.testing.expect(!cx.a11y_projection_stale);
+    try std.testing.expectEqual(a11y_tree_mod.Role.checkbox, cx.accessibility_tree.getNode(eid).?.role);
+}
+
+test "a11y on demand: a replacement Cx on the same window does not inherit the old demand" {
+    if (@import("builtin").os.tag != .macos) return error.SkipZigTest;
+    const bridge = @import("../a11y/macos_bridge.zig");
+    bridge.resetClientsSeenForTesting();
+    defer bridge.resetClientsSeenForTesting();
+    const W: u32 = 4242;
+    var old = try Cx.init(std.testing.allocator, std.testing.io);
+    var old_alive = true;
+    defer if (old_alive) old.deinit();
+    old.a11y_on_demand = true;
+    old.native_window_id = W;
+    old.setViewport(100, 100);
+    old.root = try box(old, .{ .width = .{ .px = 100 }, .height = .{ .px = 100 } }, .{});
+    old.layout();
+    _ = old.render();
+
+    var new = try Cx.init(std.testing.allocator, std.testing.io);
+    defer new.deinit();
+    new.native_window_id = W;
+    new.setViewport(100, 100);
+    new.root = try box(new, .{ .width = .{ .px = 100 }, .height = .{ .px = 100 } }, .{});
+    const btn = try box(new, .{ .width = .{ .px = 40 }, .height = .{ .px = 20 } }, .{});
+    btn.behavior.interaction.a11y = .{ .role = .button, .label = "OK" };
+    try new.root.?.appendChild(std.testing.allocator, btn);
+    new.layout();
+    _ = new.render();
+
+    // The old Cx goes away while the window slot belongs to the new one. A
+    // query must not run the old Cx's demand handler (testing allocator would
+    // flag the use after free).
+    old.deinit();
+    old_alive = false;
+    try std.testing.expectEqual(@as(c_int, 1), a11y_bridge_extern.zenit_a11y_root_count(W));
+}
 
 test "VoiceOver-style navigation reaches button labels" {
     var cx = try Cx.init(std.testing.allocator, std.testing.io);
@@ -14363,14 +14564,19 @@ test "silent-swallow counters stay zero in normal operation" {
     cx.root = root;
     try root.appendChild(std.testing.allocator, try text(cx, "hello", .{}));
 
-    // run two full frames of layout+render (includes text paint chunk recording,
-    // pushItem path).
+    // run two full frames of layout+render, each followed by the World table mirror (text
+    // paint chunk recording / pushItem path, interaction put path): the mirror runs on
+    // demand, so without the explicit sync these counters could not move at all.
     cx.layout();
     _ = cx.render();
+    cx.ensureWorldTablesSynced();
     root.markRenderDirty();
     cx.frame_time_ms += 16;
     cx.layout();
     _ = cx.render();
+    cx.ensureWorldTablesSynced();
+    // The mirror really ran (otherwise the zero assertions below would be vacuous).
+    try std.testing.expect(cx.perf.synced_node_count > 0);
 
     try std.testing.expectEqual(base_paint, ui.paint_push_failures);
     try std.testing.expectEqual(base_track, graph_mod.reactive_tracking_failures);
@@ -20003,4 +20209,215 @@ test "降低透明度：玻璃变成不透明磨砂（a11y 主体 242、保留 1
     try std.testing.expectEqual(@as(f32, 0), frosted.warp_gain);
     try std.testing.expectEqual(@as(f32, 0), frosted.magnification);
     try std.testing.expectEqual(normal.specular_opacity, frosted.specular_opacity);
+}
+
+// A node freed inside a reactive callback nested in a tick goes to the owner
+// queue; a resource it borrows is queued right behind it (deferDisposalLikeFreeNode,
+// FIFO: node first). When the owner queue drains, the tick is still running, so
+// the node must wait again for the tick queue. Everything queued behind it has to
+// move with it, or the resource is freed while the node's scope still uses it.
+test "deferred node free keeps FIFO order when its completion is deferred again" {
+    const Log = struct {
+        order: [2]u8 = undefined,
+        len: usize = 0,
+        entry: @import("../reactive/deferred_disposal.zig").Entry = .{},
+        fn push(self: *@This(), tag: u8) void {
+            self.order[self.len] = tag;
+            self.len += 1;
+        }
+        fn nodeScopeDisposed(self: *@This()) void {
+            self.push('n');
+        }
+        fn resourceDisposed(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.push('r');
+        }
+    };
+    var log: Log = .{};
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    const node = try box(cx, .{}, .{});
+    const scope = try ui.Scope.init(std.testing.allocator, null, cx.owner);
+    try scope.onCleanup(Log, &log, Log.nodeScopeDisposed);
+    try ui.bindScopeToNode(scope, node);
+
+    cx.tick_depth += 1;
+    cx.owner.beginReactiveCallback();
+    cx.freeNode(node);
+    cx.deferDisposalLikeFreeNode(&log.entry, @ptrCast(&log), Log.resourceDisposed);
+    cx.owner.endReactiveCallback(); // owner queue drains while the tick is still active
+    try std.testing.expectEqual(@as(usize, 0), log.len);
+    cx.tick_depth -= 1;
+    @import("cx_node_lifetime.zig").drainDeferredFrees(cx);
+    try std.testing.expectEqualStrings("nr", log.order[0..log.len]);
+}
+
+test "BulkQuad remount: unmount retires the old tree anchor before render" {
+    var debug_allocator = std.heap.DebugAllocator(.{}){};
+    defer std.testing.expect(debug_allocator.deinit() == .ok) catch @panic("leak");
+    const allocator = debug_allocator.allocator();
+    var cx = try Cx.init(allocator, std.testing.io);
+    defer cx.deinit();
+    cx.setViewport(1200, 800);
+    const root = try ui.box(cx, .{ .width = .fixed(1200), .height = .fixed(800) }, .{});
+    cx.root = root;
+    var quads: std.ArrayListUnmanaged(ui.BulkQuad) = .empty;
+    defer quads.deinit(allocator);
+    try bulkQuadsForScale(&quads, allocator, 0.06);
+    try cx.setBulkQuadsEx(root, quads.items, bulk_overlay_z);
+    cx.layout();
+    _ = cx.render();
+    cx.unmount();
+    // New mount deliberately submits no bulk quads. Render first so Debug
+    // catches the original freed-anchor dereference, before state assertions.
+    cx.root = try ui.box(cx, .{ .width = .fixed(1200), .height = .fixed(800) }, .{});
+    cx.layout();
+    _ = cx.render();
+    try std.testing.expect(cx.bulk_quads_anchor == null);
+    try std.testing.expectEqual(@as(usize, 0), cx.bulk_quads.items.len);
+}
+
+// Per-hook scope (Node.addBeforeRenderScoped): a node whose hooks are all
+// registered with `.self` keeps the paint prefix, like a node-level self-only
+// declaration. Regression anchor: a widget's focus-ring hook on a title-bar
+// button stopped prebuild for the whole window and every clean subtree after
+// it (zero splices) in a downstream editor.
+fn otherSelfOnlyHookForTest(node: *Node) void {
+    node.markRenderDirty();
+}
+
+fn spliceCountWithHookScopes(scopes: []const ui.BeforeRenderScope) !u32 {
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    cx.setViewport(1280, 800);
+    const root = try buildHookedPrefixScene(cx, 200, false);
+    const hooked = root.children.items[0];
+    hooked.meta.per_frame.hooks.before_render.main = null;
+    const fns = [_]*const fn (*Node) void{ selfOnlyHookForTest, otherSelfOnlyHookForTest };
+    for (scopes, 0..) |scope, i| hooked.addBeforeRenderScoped(fns[i], scope);
+    _ = cx.render();
+    cx.perf.subtree_payload_splice_count = 0;
+    root.children.items[root.children.items.len - 1].markRenderDirty();
+    _ = cx.render();
+    return cx.perf.subtree_payload_splice_count;
+}
+
+test "hook scope: 逐 hook 声明 .self 后兄弟子树恢复跨帧复用" {
+    try std.testing.expect(try spliceCountWithHookScopes(&.{ .self, .self }) > 0);
+}
+
+test "hook scope: 混有 .subtree hook 时保持保守语义" {
+    try std.testing.expectEqual(@as(u32, 0), try spliceCountWithHookScopes(&.{ .self, .subtree }));
+}
+
+test "hook scope: removeBeforeRender keeps each remaining hook's scope" {
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    const node = try box(cx, .{}, .{});
+    defer cx.freeNode(node);
+    const H = struct {
+        fn a(_: *Node) void {}
+        fn b(_: *Node) void {}
+        fn c(_: *Node) void {}
+    };
+    node.addBeforeRenderScoped(H.a, .self);
+    node.addBeforeRenderScoped(H.b, .subtree);
+    node.addBeforeRenderScoped(H.c, .self);
+    try std.testing.expect(!node.beforeRenderHooksSelfOnly());
+    node.removeBeforeRender(H.b);
+    try std.testing.expect(node.beforeRenderHooksSelfOnly());
+    node.addBeforeRender(H.b);
+    try std.testing.expect(!node.beforeRenderHooksSelfOnly());
+    node.removeBeforeRender(H.a);
+    try std.testing.expect(!node.beforeRenderHooksSelfOnly());
+    node.removeBeforeRender(H.b);
+    try std.testing.expect(node.beforeRenderHooksSelfOnly());
+    node.removeBeforeRender(H.c);
+    try std.testing.expect(!node.beforeRenderHooksSelfOnly()); // no hooks left
+}
+
+test "hook scope: re-registering a hook resolves to the conservative scope" {
+    var cx = try Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    const node = try box(cx, .{}, .{});
+    defer cx.freeNode(node);
+    const H = struct {
+        fn a(_: *Node) void {}
+    };
+    node.addBeforeRenderScoped(H.a, .subtree);
+    node.addBeforeRenderScoped(H.a, .self);
+    try std.testing.expect(!node.beforeRenderHooksSelfOnly());
+    node.removeBeforeRender(H.a);
+    node.addBeforeRenderScoped(H.a, .self);
+    try std.testing.expect(node.beforeRenderHooksSelfOnly());
+    node.addBeforeRenderScoped(H.a, .subtree);
+    try std.testing.expect(!node.beforeRenderHooksSelfOnly());
+    try std.testing.expectEqual(@as(u8, 1), node.meta.per_frame.hooks.before_render.count);
+}
+
+test "CPU node cache owner probe returns to zero after node destroy" {
+    var counter = @import("counting_allocator.zig").CountingAllocator{ .parent = std.testing.allocator };
+    const cx = try ui.Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    cx.world.render_cache_allocator = counter.allocator();
+    const node = try ui.box(cx, .{}, .{});
+    const commands = [_]@import("display_list.zig").DisplayItem{.{ .fill_rect = .{
+        .header = .{ .transform_id = 0, .node_id = node.id },
+        .x = 0,
+        .y = 0,
+        .w = 10,
+        .h = 10,
+        .color = Color.rgba(255, 0, 0, 255),
+    } }};
+    node.cacheRenderCommands(std.testing.allocator, &commands, 0, 0);
+    try std.testing.expect(counter.live_bytes > 0);
+    cx.freeNode(node);
+    try std.testing.expectEqual(@as(usize, 0), counter.live_bytes);
+}
+
+test "intrinsic measurement cache discards destroyed node IDs during churn" {
+    const cx = try ui.Cx.init(std.testing.allocator, std.testing.io);
+    defer cx.deinit();
+    const root = try ui.box(cx, .{ .width = .{ .px = 100 }, .height = .{ .px = 100 } }, .{});
+    cx.root = root;
+    const engine = @import("layout_engine.zig");
+    cx.layout();
+    const baseline = engine.intrinsicCacheMemoryStats().entries;
+    for (0..2000) |_| {
+        const row = try ui.box(cx, .{ .width = .{ .fit = .{} }, .height = .{ .fit = .{} } }, .{});
+        const leaf = try ui.box(cx, .{ .width = .{ .px = 10 }, .height = .{ .px = 20 } }, .{});
+        try row.appendChild(cx.allocator, leaf);
+        try root.appendChild(cx.allocator, row);
+        cx.layout();
+        try std.testing.expect(engine.intrinsicCacheMemoryStats().entries > baseline);
+        cx.detachChild(root, row);
+        cx.freeNode(row);
+        try std.testing.expectEqual(baseline, engine.intrinsicCacheMemoryStats().entries);
+    }
+}
+
+test "standalone node destruction clears fallback state before address reuse" {
+    const pca = @import("paint_content_accessor.zig");
+    const lifecycle = @import("node_lifecycle.zig");
+    const baseline = pca.standaloneEntryCount();
+    const rect_baseline = lifecycle.standaloneRectCount();
+    var storage: [@sizeOf(ui.Node) + @alignOf(ui.Node)]u8 align(@alignOf(ui.Node)) = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&storage);
+    const first = try ui.Node.create(fba.allocator(), 80001, .box, .{});
+    const address = @intFromPtr(first);
+    first.setOpacityRaw(0);
+    first.setBackgroundRaw(Color.rgba(255, 0, 0, 255));
+    first.setText(.{ .content = "old", .font_size = 16 });
+    first.setLayoutRect(.{ .x = 20, .y = 30, .w = 40, .h = 50 });
+    first.destroy(fba.allocator());
+    fba.reset();
+    const second = try ui.Node.create(fba.allocator(), 80002, .box, .{});
+    defer second.destroy(fba.allocator());
+    try std.testing.expectEqual(address, @intFromPtr(second));
+    try std.testing.expectEqual(@as(f32, 1), second.getOpacity());
+    try std.testing.expectEqual(Color.TRANSPARENT, second.getBackground());
+    try std.testing.expect(second.getText() == null);
+    try std.testing.expectEqual(@as(f32, 0), second.rectFromWorldOrFallback().w);
+    try std.testing.expectEqual(baseline, pca.standaloneEntryCount());
+    try std.testing.expectEqual(rect_baseline, lifecycle.standaloneRectCount());
 }

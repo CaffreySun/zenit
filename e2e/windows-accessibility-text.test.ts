@@ -114,8 +114,8 @@ test("Windows readonly TextPattern selects text while Value remains protected", 
 test("Windows readonly Input accepts pointer and keyboard selection without editing", async () => {
   const before = await request("POST", "/windows/native-input", { action: "status" });
   await clickTestId("nav.input");
-  await scrollAt(700, 400, 0, -900);
   const viewport = await tree();
+  await scrollAt(viewport.rect.w*.7, viewport.rect.h/2, 0, -900);
   await waitFor(async () => {
     const node = (await query("story.input.readonly"))[0];
     return node && node.rect.y >= 60 && node.rect.y + node.rect.h <= viewport.rect.h ? node : null;

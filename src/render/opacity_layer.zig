@@ -317,6 +317,10 @@ fn beginOpacityLayerInto(
     else
         return false;
 
+    if (comptime gpu.backend_kind == .metal and @hasDecl(@TypeOf(encoder.image_renderer.?.*), "setTextureSamplingExtent")) {
+        encoder.image_renderer.?.setTextureSamplingExtent(tex_id, tex_w, tex_h);
+    }
+
     // 6. End current render pass.
     encoder.render_pass.?.end();
     // Ended pass must never stay on encoder.render_pass: Obj-C reuses address for next
@@ -401,7 +405,10 @@ fn beginOpacityLayerInto(
     encoder.text_renderer.setViewport(w, h, s);
     if (encoder.image_renderer) |ir| ir.setViewport(w, h, s);
     if (encoder.icon_renderer) |ir| ir.setViewport(w, h, s);
-    if (encoder.persistent.path_renderer) |*pr| pr.setViewport(w, h, s);
+    if (encoder.persistent.path_renderer) |*pr| {
+        pr.setViewport(w, h, s);
+        pr.setOffscreenViewport();
+    }
     // NDC fills alloc texture by default; the viewport is the content's exact extent (w x s,
     // fractional) so content lands 1:1 on texels in [0, w * s), neither stretched to the bucket
     // nor to the rounded-up texel count (contentUv composites the same extent back).
@@ -526,62 +533,67 @@ pub fn endOpacityLayer(encoder: anytype) !void {
     // between), encoder.render_pass must be null; any early return leaves stale pointer.
     encoder.render_pass = null;
 
-    // 2.5 Fill gutter: copy used edge 1px into adjacent padding to mirror clamp-to-edge,
+    // 2.5 Metal clamps to used texel centers in the image/blend shaders. Other
+    // backends fill the gutter: copy used edge 1px into adjacent padding to mirror clamp-to-edge,
     // else composite bilinear at UV clamp boundary mixes edge content (blur/rounded
     // container to edge) with transparent padding -> <=3/255 dark fringe. 1px enough:
     // bilinear samples adjacent texel only.
     const pad_w = layer.alloc_tex_w > layer.used_tex_w and layer.used_tex_w > 0;
     const pad_h = layer.alloc_tex_h > layer.used_tex_h and layer.used_tex_h > 0;
-    if ((pad_w or pad_h) and layer_binding_opt != null) {
-        const layer_binding = layer_binding_opt.?;
-        if (encoder.gpu_command_encoder.?.beginBlitPass() catch null) |blit_value| {
-            var blit = blit_value;
-            defer blit.end();
-            if (pad_w) {
-                blit.copyTextureRegion(
-                    layer_binding,
-                    layer.used_tex_w - 1,
-                    0,
-                    1,
-                    layer.used_tex_h,
-                    layer_binding,
-                    layer.used_tex_w,
-                    0,
-                ) catch {};
-            }
-            if (pad_h) {
-                blit.copyTextureRegion(
-                    layer_binding,
-                    0,
-                    layer.used_tex_h - 1,
-                    layer.used_tex_w,
-                    1,
-                    layer_binding,
-                    0,
-                    layer.used_tex_h,
-                ) catch {};
-            }
-            if (pad_w and pad_h) {
-                blit.copyTextureRegion(
-                    layer_binding,
-                    layer.used_tex_w - 1,
-                    layer.used_tex_h - 1,
-                    1,
-                    1,
-                    layer_binding,
-                    layer.used_tex_w,
-                    layer.used_tex_h,
-                ) catch {};
+    if (comptime gpu.backend_kind != .metal) {
+        if ((pad_w or pad_h) and layer_binding_opt != null) {
+            const layer_binding = layer_binding_opt.?;
+            if (encoder.gpu_command_encoder.?.beginBlitPass() catch null) |blit_value| {
+                var blit = blit_value;
+                defer blit.end();
+                if (pad_w) {
+                    blit.copyTextureRegion(
+                        layer_binding,
+                        layer.used_tex_w - 1,
+                        0,
+                        1,
+                        layer.used_tex_h,
+                        layer_binding,
+                        layer.used_tex_w,
+                        0,
+                    ) catch {};
+                }
+                if (pad_h) {
+                    blit.copyTextureRegion(
+                        layer_binding,
+                        0,
+                        layer.used_tex_h - 1,
+                        layer.used_tex_w,
+                        1,
+                        layer_binding,
+                        0,
+                        layer.used_tex_h,
+                    ) catch {};
+                }
+                if (pad_w and pad_h) {
+                    blit.copyTextureRegion(
+                        layer_binding,
+                        layer.used_tex_w - 1,
+                        layer.used_tex_h - 1,
+                        1,
+                        1,
+                        layer_binding,
+                        layer.used_tex_w,
+                        layer.used_tex_h,
+                    ) catch {};
+                }
             }
         }
     }
 
-    // 2.7 Non-normal blend: composite must read dst. While restore pass unopened (blit
-    // can't coexist), blit full restore target as backup. Return null if any step fails;
+    // 2.7 Non-normal blend: Apple GPUs read the loaded destination attachment.
+    // Other Metal devices render-copy a backup; other backends keep blit.
+    // Return null if any backup step fails;
     // step 7 falls back to normal composite (semantic downgrade, no error/content loss).
     // Composite rect can be arbitrary affine (rotate/draw_transform): fragment inverts
     // back to layer-local space; only degenerate matrix fails.
     var blend_dst_copy: ?TextureLease = null;
+    var blend_fetch = false;
     var blend_target_w: u32 = 0;
     var blend_target_h: u32 = 0;
     const blend_mode_raw: u8 = @intCast(@backingInt(layer.blend_mode));
@@ -616,28 +628,21 @@ pub fn endOpacityLayer(encoder: anytype) !void {
         const tw = layer.restore_target.width;
         const th = layer.restore_target.height;
         if (tw > 0 and th > 0) {
-            const device2 = encoder.sdf_renderer.device;
-            const max_dim = encoder.sdf_renderer.device.limits.max_texture_dimension_2d;
-            const copy_w = offscreen_texture.bucketDimension(tw, max_dim);
-            const copy_h = offscreen_texture.bucketDimension(th, max_dim);
-            if (encoder.offscreen_pool.acquire(device2, copy_w, copy_h, encoder.frame_index)) |copy| {
-                if (encoder.offscreen_pool.binding(copy)) |copy_binding| {
-                    if (encoder.gpu_command_encoder.?.beginBlitPass() catch null) |blit_value| {
-                        var blit = blit_value;
+            if (blend_composite.usesFramebufferFetch(encoder)) {
+                blend_fetch = true;
+                blend_target_w = tw;
+                blend_target_h = th;
+            } else {
+                const device2 = encoder.sdf_renderer.device;
+                const max_dim = encoder.sdf_renderer.device.limits.max_texture_dimension_2d;
+                const copy_w = offscreen_texture.bucketDimension(tw, max_dim);
+                const copy_h = offscreen_texture.bucketDimension(th, max_dim);
+                if (encoder.offscreen_pool.acquire(device2, copy_w, copy_h, encoder.frame_index)) |copy| {
+                    if (encoder.offscreen_pool.binding(copy)) |copy_binding| {
                         const copied = blk: {
-                            blit.copyTextureRegion(
-                                layer.restore_target,
-                                0,
-                                0,
-                                tw,
-                                th,
-                                copy_binding,
-                                0,
-                                0,
-                            ) catch break :blk false;
+                            encoder.copyTextureRegion(layer.restore_target, 0, 0, tw, th, copy_binding, 0, 0, false) catch break :blk false;
                             break :blk true;
                         };
-                        blit.end();
                         if (copied) {
                             blend_dst_copy = copy;
                             blend_target_w = tw;
@@ -648,8 +653,6 @@ pub fn endOpacityLayer(encoder: anytype) !void {
                     } else {
                         _ = encoder.offscreen_pool.release(copy, encoder.frame_index);
                     }
-                } else {
-                    _ = encoder.offscreen_pool.release(copy, encoder.frame_index);
                 }
             }
         }
@@ -701,7 +704,10 @@ pub fn endOpacityLayer(encoder: anytype) !void {
     encoder.text_renderer.setViewport(encoder.viewport_width, encoder.viewport_height, s);
     if (encoder.image_renderer) |ir| ir.setViewport(encoder.viewport_width, encoder.viewport_height, s);
     if (encoder.icon_renderer) |ir| ir.setViewport(encoder.viewport_width, encoder.viewport_height, s);
-    if (encoder.persistent.path_renderer) |*pr| pr.setViewport(encoder.viewport_width, encoder.viewport_height, s);
+    if (encoder.persistent.path_renderer) |*pr| {
+        pr.setViewport(encoder.viewport_width, encoder.viewport_height, s);
+        if (encoder.offscreen_depth > 0) pr.setOffscreenViewport();
+    }
 
     // Restore target may itself be bucketed offscreen texture -> clip viewport/scissor
     // to its used region.
@@ -715,11 +721,11 @@ pub fn endOpacityLayer(encoder: anytype) !void {
     // 6.5 Non-normal blend: composite via blend pipeline (full-screen triangle,
     // passthrough dst outside rect), skip image pipeline path below.
     var blend_done = false;
-    if (blend_dst_copy) |copy| blend: {
+    if (blend_fetch or blend_dst_copy != null) blend: {
         // copy just validated few lines up, but can't unreachable (ReleaseFast UB): on
         // lookup fail, abandon blend, fall back to normal composite.
-        const copy_binding = encoder.offscreen_pool.binding(copy) orelse {
-            _ = encoder.offscreen_pool.release(copy, encoder.frame_index);
+        const copy_binding = if (blend_fetch) layer.restore_target else encoder.offscreen_pool.binding(blend_dst_copy.?) orelse {
+            _ = encoder.offscreen_pool.release(blend_dst_copy.?, encoder.frame_index);
             std.log.warn("[opacity-layer] blend dst copy binding lost; falling back to normal composite", .{});
             break :blend;
         };
@@ -744,9 +750,10 @@ pub fn endOpacityLayer(encoder: anytype) !void {
             // A warp moves content into the folded clip's 2 pt pad and its square corners, where
             // the padded mask lets it through: mask the true clip rect instead.
             if (warp_active and layer.corner_radius >= 0.5) 2 * encoder.scale else 0,
+            .{ (@as(f32, @floatFromInt(layer.used_tex_w)) - 0.5) / @as(f32, @floatFromInt(layer.alloc_tex_w)), (@as(f32, @floatFromInt(layer.used_tex_h)) - 0.5) / @as(f32, @floatFromInt(layer.alloc_tex_h)) },
         );
         // Copy this frame GPU-sampled, normal return with REUSE_LAG protection.
-        _ = encoder.offscreen_pool.release(copy, encoder.frame_index);
+        if (blend_dst_copy) |copy| _ = encoder.offscreen_pool.release(copy, encoder.frame_index);
     }
     if (blend_done) {
         if (encoder.image_renderer) |ir| ir.unregisterTextureBinding(layer.texture_id);
@@ -1150,6 +1157,7 @@ pub fn compositeRetainedLayer(encoder: anytype) !void {
     const texture_binding = encoder.offscreen_pool.binding(layer.texture) orelse return;
     const tex_id = ir.registerTextureBinding(texture_binding, layer.alloc_tex_w, layer.alloc_tex_h) catch return;
     defer ir.unregisterTextureBinding(tex_id);
+    if (comptime gpu.backend_kind == .metal and @hasDecl(@TypeOf(ir.*), "setTextureSamplingExtent")) ir.setTextureSamplingExtent(tex_id, layer.used_tex_w, layer.used_tex_h);
 
     // retained layers rasterize at the parent scale (no magnification); draw_transform stored
     // **un-localized** original: normal path also localizes after pop; current offscreen

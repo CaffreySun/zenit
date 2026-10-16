@@ -242,14 +242,14 @@ pub const TextContext = struct {
             glyph.y_offset *= scale;
         }
         run.total_advance *= scale;
-        // glyphs/clusters allocated by adapter are copied and managed by cache's arena after
+        // glyphs/clusters allocated by adapter are copied and managed by cache's entry owner after
         // cache.insert;
         // original slice freed.
         defer self.allocator.free(run.glyphs);
         defer self.allocator.free(run.clusters);
 
         try self.shaping_cache.insert(key, run.glyphs, run.clusters, run.metrics, run.direction, run.total_advance);
-        // cache.insert copies slice to arena, then lookup again to get cache's copy. (Avoid
+        // cache.insert copies slices into entry ownership, then lookup again to get cache's copy. (Avoid
         // returning
         // caller-allocator slice already freed.)
         return self.shaping_cache.lookup(key) orelse unreachable;

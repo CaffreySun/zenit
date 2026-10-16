@@ -808,7 +808,7 @@ test "EditableText renders text typed after a hard newline" {
 
     try std.testing.expectEqualStrings("first line\nsecond line", result.getText());
     try std.testing.expectEqualStrings(result.getText(), result.state.text_display_node.?.getText().?.content);
-    const layout = result.state.text_display_node.?.getLayoutOutput().artifacts.text_layout orelse
+    const layout = result.state.text_display_node.?.layoutTextLayout() orelse
         return error.TestExpectedEqual;
     var laid_out_second_line = false;
     for (layout.lines[0..layout.line_count]) |line| {
@@ -863,7 +863,7 @@ test "EditableText renders and positions the caret after consecutive hard newlin
     try std.testing.expectEqual(@as(u32, 3), result.state.textarea_wrap.?.displayLineCount());
     try std.testing.expectApproxEqAbs(result.state.line_height * 3, result.node.style.height.px, 0.001);
 
-    const layout = result.state.text_display_node.?.getLayoutOutput().artifacts.text_layout orelse
+    const layout = result.state.text_display_node.?.layoutTextLayout() orelse
         return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(u16, 3), layout.line_count);
     var laid_out_third_line = false;

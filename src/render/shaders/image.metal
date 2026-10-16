@@ -34,6 +34,9 @@ struct ImageInstanceData {
     float corner_radius; // Corner radius.
     float opacity; // Opacity (0-1).
     float source_premultiplied; // Whether source is premultiplied alpha texture (offscreen layer composite).
+    float sampling_max_u;
+    float sampling_max_v;
+    float sampling_padding;
     float4 rect_clip; // x, y, w, h (logical pixels); zero-size = disabled.
 };
 
@@ -250,7 +253,10 @@ fragment float4 image_fragment_main(
     const float corner_radius = inst.corner_radius * uniforms.scale_factor;
 
     // Sample texture.
-    float4 color = tex.sample(smp, in.uv);
+    float2 uv = in.uv;
+    if (inst.sampling_max_u > 0.0 && inst.sampling_max_v > 0.0)
+        uv = min(uv, float2(inst.sampling_max_u, inst.sampling_max_v));
+    float4 color = tex.sample(smp, uv);
 
     // Apply tint.
     color *= inst.tint_color;

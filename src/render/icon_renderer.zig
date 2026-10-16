@@ -143,7 +143,31 @@ pub const IconRenderer = struct {
     instance_high_water_mark: usize = 0,
     buffer_write_offset: usize = 0,
 
-    pub fn init(allocator: std.mem.Allocator, device: *gpu.Backend.Device) !IconRenderer {
+    pub fn init(self: *IconRenderer, allocator: std.mem.Allocator, device: *gpu.Backend.Device) !void {
+        self.uniform_write_offset = 0;
+        self.uniform_overflow_count = 0;
+        self.current_buffer = 0;
+        @memset(&self.uniform_overflow_buffers, null);
+        @memset(&self.uniform_overflow_capacities, 0);
+        self.uniform_overflow_used = 0;
+        @memset(&self.overflow_buffers, null);
+        @memset(&self.overflow_capacities, 0);
+        self.overflow_write_offset = 0;
+        self.cache_bytes = 0;
+        self.frame_index = 0;
+        self.stats = .{};
+        self.clip_rect = .{ 0, 0, 0, 0 };
+        self.clip_radius = 0;
+        self.clip_shape_kind = 0;
+        self.clip_fill_rule = 0;
+        self.clip_point_count = 0;
+        self.clip_contour_count = 0;
+        @memset(&self.clip_polygon_end_points, 0);
+        @memset(&self.clip_polygon_points, .{ 0, 0 });
+        self.current_rect_clip = .{ 0, 0, -1, -1 };
+        self.instance_high_water_mark = 0;
+        self.buffer_write_offset = 0;
+
         var shader = try gpu.Backend.ShaderModule.initFromSource(device, icon_shader_source);
         defer shader.deinit();
 
@@ -201,22 +225,20 @@ pub const IconRenderer = struct {
             .mag_filter = .linear,
         });
 
-        return .{
-            .allocator = allocator,
-            .device = device,
-            .pipeline = pipeline,
-            .uniform_buffers = uniform_buffers,
-            .instance_buffers = instance_buffers,
-            .sampler = sampler,
-            .textures = @as([MAX_TEXTURES]?TextureSlot, @splat(null)),
-            .texture_count = 0,
-            .cache = std.AutoHashMap(IconMaskKey, CacheEntry).init(allocator),
-            .instances = .empty,
-            .instance_texture_ids = .empty,
-            .viewport_width = 800,
-            .viewport_height = 600,
-            .scale_factor = 1.0,
-        };
+        self.allocator = allocator;
+        self.device = device;
+        self.pipeline = pipeline;
+        self.uniform_buffers = uniform_buffers;
+        self.instance_buffers = instance_buffers;
+        self.sampler = sampler;
+        @memset(&self.textures, null);
+        self.texture_count = 0;
+        self.cache = std.AutoHashMap(IconMaskKey, CacheEntry).init(allocator);
+        self.instances = .empty;
+        self.instance_texture_ids = .empty;
+        self.viewport_width = 800;
+        self.viewport_height = 600;
+        self.scale_factor = 1.0;
     }
 
     pub fn deinit(self: *IconRenderer) void {
@@ -449,12 +471,14 @@ pub const IconRenderer = struct {
         if (self.uniform_overflow_capacities[self.current_buffer] < needed) {
             var new_capacity = @max(self.uniform_overflow_capacities[self.current_buffer], UNIFORM_STRIDE * 64);
             while (new_capacity < needed) new_capacity *= 2;
-            if (self.uniform_overflow_buffers[self.current_buffer]) |*old| old.destroy();
-            self.uniform_overflow_buffers[self.current_buffer] = try self.device.createBuffer(self.allocator, .{
+            // Preserve the owned buffer if replacement allocation fails.
+            const replacement = try self.device.createBuffer(self.allocator, .{
                 .label = "Zenit.Icon.OverflowUniforms",
                 .size = new_capacity,
                 .usage = .{ .vertex = true, .map_write = true },
             });
+            if (self.uniform_overflow_buffers[self.current_buffer]) |*old| old.destroy();
+            self.uniform_overflow_buffers[self.current_buffer] = replacement;
             self.uniform_overflow_capacities[self.current_buffer] = new_capacity;
         }
         return &self.uniform_overflow_buffers[self.current_buffer].?;
@@ -474,8 +498,8 @@ pub const IconRenderer = struct {
             }
             self.uniform_overflow_count += 1;
             const slot = self.uniform_overflow_used;
-            self.uniform_overflow_used += 1;
             const buf = try self.ensureUniformOverflowCapacity(slot + 1);
+            self.uniform_overflow_used += 1;
             break :blk .{ buf, slot * UNIFORM_STRIDE };
         };
         const uniforms = Uniforms{
@@ -520,12 +544,14 @@ pub const IconRenderer = struct {
                 if (self.overflow_capacities[self.current_buffer] < needed) {
                     var new_capacity = @max(self.overflow_capacities[self.current_buffer], chunk_size);
                     while (new_capacity < needed) new_capacity *= 2;
-                    if (self.overflow_buffers[self.current_buffer]) |*old| old.destroy();
-                    self.overflow_buffers[self.current_buffer] = try self.device.createBuffer(self.allocator, .{
+                    // Preserve the owned buffer if replacement allocation fails.
+                    const replacement = try self.device.createBuffer(self.allocator, .{
                         .label = "Zenit.Icon.OverflowInstanceBuffer",
                         .size = new_capacity,
                         .usage = .{ .vertex = true, .map_write = true },
                     });
+                    if (self.overflow_buffers[self.current_buffer]) |*old| old.destroy();
+                    self.overflow_buffers[self.current_buffer] = replacement;
                     self.overflow_capacities[self.current_buffer] = new_capacity;
                 }
                 const overflow_buffer = &self.overflow_buffers[self.current_buffer].?;
@@ -583,7 +609,9 @@ test "evictToFit 不驱逐本帧在用的 mask（待 flush 实例仍按 slot 引
     if (comptime gpu.backend_kind != .null_backend) return error.SkipZigTest;
 
     var device = gpu.Backend.Device{};
-    var r = try IconRenderer.init(std.testing.allocator, &device);
+    const r = try std.testing.allocator.create(IconRenderer);
+    defer std.testing.allocator.destroy(r);
+    try r.init(std.testing.allocator, &device);
     defer r.deinit();
     r.beginFrame(100, 100, 1);
     r.beginFrame(100, 100, 1);

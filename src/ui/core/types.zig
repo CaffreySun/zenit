@@ -2798,6 +2798,10 @@ pub const TextInputClient = struct {
     /// Native sync requires the projected bytes to match its current candidate;
     /// transformed text conservatively keeps the existing native cache.
     marked_range: ?*const fn (context: *anyopaque, start_utf8: *u32, end_utf8: *u32) bool = null,
+    /// Whether an IME session is composing, including overlay-only preedit
+    /// which has no marked projection in the committed text. Read-only query.
+    /// Escape must reach this client before dismissing an enclosing overlay.
+    is_composing: ?*const fn (context: *anyopaque) bool = null,
     set_selection: ?*const fn (context: *anyopaque, start_utf8: u32, end_utf8: u32) bool = null,
     frame_for_range: ?*const fn (context: *anyopaque, start_utf8: u32, end_utf8: u32, out: *A11yRect) bool = null,
     range_at_point: ?*const fn (context: *anyopaque, x: f32, y: f32, start_utf8: *u32, end_utf8: *u32) bool = null,

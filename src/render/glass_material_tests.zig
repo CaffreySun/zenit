@@ -95,6 +95,10 @@ const Fixture = struct {
     }
 
     fn render(self: *Fixture, queue: *gpu.Backend.Queue, u: Uniforms) ![]u8 {
+        return self.renderWithScissor(queue, u, null);
+    }
+
+    fn renderWithScissor(self: *Fixture, queue: *gpu.Backend.Queue, u: Uniforms, scissor: ?[4]u32) ![]u8 {
         var encoder = try gpu.Backend.CommandEncoder.init(queue);
         errdefer encoder.deinit();
         var view = self.output.binding().createView();
@@ -112,6 +116,7 @@ const Fixture = struct {
         pass.setFragmentTextureBinding(2, self.sharp.binding());
         pass.setFragmentTextureBinding(3, self.sharp.binding());
         pass.setFragmentSampler(0, &self.sampler);
+        if (scissor) |sc| pass.setScissorRect(sc[0], sc[1], sc[2], sc[3]);
         pass.draw(3, 1, 0, 0);
         pass.end();
         var command = try encoder.finish();
@@ -162,6 +167,42 @@ const Fixture = struct {
         command.waitUntilCompleted();
     }
 };
+
+test "metal legacy glass: conservative scissor matches the full cleared target byte for byte" {
+    var inst = try gpu.Backend.Instance.init(a, .{});
+    defer inst.deinit();
+    const adapters = try inst.enumerateAdapters();
+    defer a.free(adapters);
+    if (adapters.len == 0) return error.MetalAdapterUnavailable;
+    var adapter = adapters[0];
+    defer adapter.deinit();
+    var dq = try adapter.requestDevice(a, .{});
+    defer dq.device.deinit();
+    defer dq.queue.deinit();
+    var f = try Fixture.init(&dq.device, 131, 127);
+    defer f.deinit();
+    try f.upload(.{ 0, 0, 1, 1 }, null);
+    const cases = [_]struct { rect: [2]f32, uv: [4]f32, radius: f32 }{
+        .{ .rect = .{ 64, 64 }, .uv = .{ 0.25, 0.25, 0.5, 0.5 }, .radius = 16 },
+        .{ .rect = .{ 96, 4 }, .uv = .{ 0.125, 0.375, 0.75, 0.125 }, .radius = 2 },
+        .{ .rect = .{ 4, 96 }, .uv = .{ 0.375, 0.125, 0.125, 0.75 }, .radius = 2 },
+        .{ .rect = .{ 32, 48 }, .uv = .{ -0.125, 0.25, 0.5, 0.5 }, .radius = 12 },
+        .{ .rect = .{ 48, 32 }, .uv = .{ 0.75, 0.125, 0.5, 0.5 }, .radius = 8 },
+        .{ .rect = .{ 0.5, 0.75 }, .uv = .{ 0.375, 0.375, 0.125, 0.125 }, .radius = 8 },
+    };
+    for (cases) |c| {
+        var u = f.uniforms(1);
+        u.rect_size = c.rect;
+        u.content_uv = c.uv;
+        u.corner_radius = c.radius;
+        const sc = blur.legacyGlassScissor(f.width, f.height, &u) orelse return error.ExpectedReducedScissor;
+        const expected = try f.render(&dq.queue, u);
+        defer a.free(expected);
+        const actual = try f.renderWithScissor(&dq.queue, u, sc);
+        defer a.free(actual);
+        try std.testing.expectEqualSlices(u8, expected, actual);
+    }
+}
 
 test "metal glass: blur/capture registration, Fresnel, tint and disabled optics" {
     var inst = try gpu.Backend.Instance.init(a, .{});

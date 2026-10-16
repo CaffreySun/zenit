@@ -94,9 +94,9 @@ pub fn render(self: *Cx) []const display_list_mod.DisplayItem {
 
     // zero-dirty fast-path: root fully-clean + prior frame cache valid return cache.
     // perf #1 matrix: 10k-node zero-dirty < 0.5ms key skip.
-    // safety: root layout/render/composite/subtree_* all clean + overlay_stack no-animation
-    // + inspector off. markDirty bubbles to root, so root all-clean implies tree clean.
-    if (self.root) |r| {
+    // Safety: no pending scene work (including non-bubbling interaction bits
+    // and active animations), and no inspector/virtual pointer paint.
+    if (self.root != null) {
         const time_unchanged = self.frame_time_ms == self.last_render_frame_time_ms;
         if (self.last_render_valid and
             time_unchanged and
@@ -108,8 +108,10 @@ pub fn render(self: *Cx) []const display_list_mod.DisplayItem {
             // static
             // picture return to zero-dirty; for a 20k-quad canvas this is 21.6ms vs ~0 per frame.
             (self.bulk_quads.items.len == 0 or self.bulk_quads_unchanged) and
-            isTreeFullyClean(r) and
-            !self.overlay_stack.hasActiveAnimations() and
+            // Match the host's frame gate. Loose hit/interaction bits do not
+            // bubble into paint/layout flags, but still need before-render
+            // index refresh. Returning the cache leaves that work pending.
+            !self.hasPendingSceneWork() and
             // The automated virtual pointer is **drawn in the real render target**
             // (screenshots/recordings
             // show it) but has no Node tree, so moving it leaves the whole tree clean. Without
@@ -296,14 +298,13 @@ pub fn render(self: *Cx) []const display_list_mod.DisplayItem {
         // showed only as gap between render_node_us and render_us.
         const sync_start = inner_timer.read();
         self.syncLayoutToTable(r);
-        // shadow-sync paint props to PaintTable
-        self.syncPaintToTable(r);
-        // shadow-sync interaction to InteractionTable
-        self.syncInteractionToTable(r);
+        // World.paint / World.interaction mirror this frame on demand
+        // (see cx_world_sync.ensureWorldTablesSynced).
+        self.world_tables_stale = true;
         // Project Node tree a11y metadata to AccessibilityTree. Next step (sec 2.1 ObjC bridge):
         // cx.render() end calls a11y_router.flushToBridge to post dirty queue to macOS
         // NSAccessibility.
-        self.syncA11yTreeFromInteractions(r);
+        self.syncOrDeferA11yProjection(r);
         self.perf.phase_sync_us = (inner_timer.read() - sync_start) / 1000;
         // Debug build validates whole-tree invariants. Downsampled to every 64 frames to avoid
         // ~5ms debug tax per frame; regressions like shadow-sync are continuous and hit within
@@ -358,13 +359,20 @@ pub fn lowerForEncoderPaintTable(self: *Cx) []const paint_table.DisplayItem {
 
 /// Check if entire tree is clean. markDirty bubbles to root, so all of root's
 /// layout/render/composite/subtree_* being clean implies whole tree clean. O(1) check.
-pub fn isTreeFullyClean(root: *Node) bool {
+pub fn isTreeFullyClean(self: *const Cx, root: *Node) bool {
     return !root.frame_state.state_bits.dirty.core.layout and
         !root.frame_state.state_bits.dirty.core.subtree_layout and
         !root.frame_state.state_bits.dirty.core.render and
         !root.frame_state.state_bits.dirty.core.subtree_render and
         !root.frame_state.state_bits.dirty.pipeline.composite and
-        !root.frame_state.state_bits.dirty.pipeline.subtree_composite;
+        !root.frame_state.state_bits.dirty.pipeline.subtree_composite and
+        !root.frame_state.state_bits.dirty.runtime.dirty and
+        !root.frame_state.state_bits.dirty.runtime.subtree_dirty and
+        !root.frame_state.state_bits.dirty.pipeline.order and
+        !root.frame_state.state_bits.dirty.pipeline.subtree_order and
+        !root.frame_state.state_bits.dirty.pipeline.interaction and
+        !root.frame_state.state_bits.dirty.pipeline.subtree_interaction and
+        !cx_runtime_index.subtreeHasLooseInteractionDirty(self, root);
 }
 
 pub fn scheduleRedrawAfterNs(self: *Cx, delay_ns: u64) void {
@@ -406,7 +414,7 @@ pub fn forceTickAndRebuildForHitTest(self: *Cx) void {
     const root_handle = self.node_registry.handleFor(r);
     const viewport_clip = ComputedRect.init(0, 0, self.viewport.width, self.viewport.height);
     const had_initial_layout_dirty = r.frame_state.state_bits.dirty.core.layout or r.frame_state.state_bits.dirty.core.subtree_layout;
-    const had_initial_interaction_dirty = r.frame_state.state_bits.dirty.pipeline.subtree_interaction or cx_runtime_index.subtreeHasLooseInteractionDirty(r);
+    const had_initial_interaction_dirty = r.frame_state.state_bits.dirty.pipeline.subtree_interaction or cx_runtime_index.subtreeHasLooseInteractionDirty(self, r);
     var partial_interaction_roots = PartialInteractionRoots{};
     if ((had_initial_layout_dirty or had_initial_interaction_dirty) and !r.frame_state.state_bits.dirty.runtime.subtree_dirty and !r.frame_state.state_bits.dirty.pipeline.subtree_order) {
         cx_runtime_index.collectPartialInteractionRootsWithFallback(self, r, &partial_interaction_roots);
@@ -447,7 +455,7 @@ pub fn forceTickAndRebuildForHitTest(self: *Cx) void {
     }
     self.overlay_stack.updateAnchors(self.viewport.width, self.viewport.height);
     const had_post_tick_layout_dirty = current_root.frame_state.state_bits.dirty.core.layout or current_root.frame_state.state_bits.dirty.core.subtree_layout;
-    const had_post_tick_interaction_dirty = current_root.frame_state.state_bits.dirty.pipeline.subtree_interaction or cx_runtime_index.subtreeHasLooseInteractionDirty(current_root);
+    const had_post_tick_interaction_dirty = current_root.frame_state.state_bits.dirty.pipeline.subtree_interaction or cx_runtime_index.subtreeHasLooseInteractionDirty(self, current_root);
     if ((had_post_tick_layout_dirty or had_post_tick_interaction_dirty) and !current_root.frame_state.state_bits.dirty.runtime.subtree_dirty and !current_root.frame_state.state_bits.dirty.pipeline.subtree_order) {
         cx_runtime_index.collectPartialInteractionRootsWithFallback(self, current_root, &partial_interaction_roots);
     }
@@ -514,7 +522,7 @@ fn runAfterLayoutHooks(self: *Cx, partial: *PartialInteractionRoots) AfterLayout
         cx_node_lifetime.drainDeferredFrees(self);
         const root = self.root orelse return out;
         const layout_dirty = root.frame_state.state_bits.dirty.core.layout or root.frame_state.state_bits.dirty.core.subtree_layout;
-        const interaction_dirty = root.frame_state.state_bits.dirty.pipeline.subtree_interaction or cx_runtime_index.subtreeHasLooseInteractionDirty(root);
+        const interaction_dirty = root.frame_state.state_bits.dirty.pipeline.subtree_interaction or cx_runtime_index.subtreeHasLooseInteractionDirty(self, root);
         if (interaction_dirty) out.interaction_dirty = true;
         if (layout_dirty) {
             if (!root.frame_state.state_bits.dirty.runtime.subtree_dirty and !root.frame_state.state_bits.dirty.pipeline.subtree_order) {
@@ -545,7 +553,7 @@ fn ensureBeforeRenderTicked(self: *Cx) void {
         // Critical for layers positioned by content size; otherwise first open shows old 0x0 /
         // stale geometry.
         const had_initial_layout_dirty = r.frame_state.state_bits.dirty.core.layout or r.frame_state.state_bits.dirty.core.subtree_layout;
-        const had_initial_interaction_dirty = r.frame_state.state_bits.dirty.pipeline.subtree_interaction or cx_runtime_index.subtreeHasLooseInteractionDirty(r);
+        const had_initial_interaction_dirty = r.frame_state.state_bits.dirty.pipeline.subtree_interaction or cx_runtime_index.subtreeHasLooseInteractionDirty(self, r);
         var partial_interaction_roots = PartialInteractionRoots{};
         if ((had_initial_layout_dirty or had_initial_interaction_dirty) and !r.frame_state.state_bits.dirty.runtime.subtree_dirty and !r.frame_state.state_bits.dirty.pipeline.subtree_order) {
             cx_runtime_index.collectPartialInteractionRootsWithFallback(self, r, &partial_interaction_roots);
@@ -606,7 +614,7 @@ fn ensureBeforeRenderTicked(self: *Cx) void {
         // frame,
         // interaction index must update (children's absolute positions changed).
         const had_post_tick_layout_dirty = current_root.frame_state.state_bits.dirty.core.layout or current_root.frame_state.state_bits.dirty.core.subtree_layout;
-        const had_post_tick_interaction_dirty = current_root.frame_state.state_bits.dirty.pipeline.subtree_interaction or cx_runtime_index.subtreeHasLooseInteractionDirty(current_root);
+        const had_post_tick_interaction_dirty = current_root.frame_state.state_bits.dirty.pipeline.subtree_interaction or cx_runtime_index.subtreeHasLooseInteractionDirty(self, current_root);
         if ((had_post_tick_layout_dirty or had_post_tick_interaction_dirty) and !current_root.frame_state.state_bits.dirty.runtime.subtree_dirty and !current_root.frame_state.state_bits.dirty.pipeline.subtree_order) {
             cx_runtime_index.collectPartialInteractionRootsWithFallback(self, current_root, &partial_interaction_roots);
         }

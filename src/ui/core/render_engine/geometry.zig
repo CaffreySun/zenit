@@ -60,7 +60,7 @@ pub fn computeOpacityLayerBounds(
     var bounds = render_rect;
 
     if (!node.style.overflow_hidden) {
-        if (node.getLayoutOutput().artifacts.children_bbox) |bbox| {
+        if (node.layoutChildrenBbox()) |bbox| {
             bounds = unionRect(bounds, world_transform.transformRect(bbox));
         }
     }

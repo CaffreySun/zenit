@@ -14,6 +14,8 @@ pub const Window = switch (builtin.target.os.tag) {
     else => Backend.UnsupportedWindow,
 };
 
+pub const owned_window = @import("owned_window.zig");
+
 // Re-export common types
 pub const KeyEvent = Window.KeyEvent;
 pub const Modifiers = Window.Modifiers;

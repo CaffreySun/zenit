@@ -319,7 +319,9 @@ fn verifyCommands(device: *vk.renderer_device.Device, a: std.mem.Allocator) !voi
 
 fn verifyImageRenderer(device: *vk.renderer_device.Device, a: std.mem.Allocator) !void {
     const b = r.gpu.Backend;
-    var renderer = try @import("image_renderer").ImageRenderer.init(a, device);
+    const renderer = try a.create(@import("image_renderer").ImageRenderer);
+    defer a.destroy(renderer);
+    try renderer.init(a, device);
     defer renderer.deinit();
     const texels = [_]u8{ 255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255 };
     const texture_id = try renderer.loadTexture(2, 2, &texels);

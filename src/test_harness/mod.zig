@@ -15,6 +15,10 @@ const command_executor = @import("command_executor.zig");
 const http_server = @import("http_server.zig");
 
 var g_queue: CommandQueue = undefined;
+/// Set once init() gives g_queue a value. An application can mount every
+/// window with Config.builtin_test_harness = false, so the runtime's drain
+/// calls may run in a test-mode build whose queue was never initialized.
+var g_queue_ready = false;
 var g_thread: ?std.Thread = null;
 
 /// Queried by submitted-frame capture on the same application thread that
@@ -30,6 +34,10 @@ pub fn setScreenshotCallback(f: command_executor.CaptureScreenshotFn) void {
 }
 
 pub const RecordingState = command_executor.RecordingState;
+/// In-process access to the same app-thread callbacks used by file RPC.
+pub const startRecording = command_executor.startRecording;
+pub const recordingStatus = command_executor.recordingStatus;
+pub const stopRecording = command_executor.stopRecording;
 
 /// Register the app-window recording lifecycle. All callbacks run on the
 /// application thread, just like screenshot capture and UI commands.
@@ -43,6 +51,7 @@ pub fn setRecordingCallbacks(
 }
 
 pub const FrameStatsSnapshot = command_executor.FrameStatsSnapshot;
+pub const CaretRejections = command_executor.CaretRejections;
 pub const AppRouteFn = command_executor.AppRouteFn;
 
 /// Register host-custom routes (`/myapp/...` etc). Handler runs on main thread, can safely
@@ -78,7 +87,10 @@ pub fn setResizeWindowCallback(f: command_executor.ResizeWindowFn) void {
 pub fn init(io: std.Io, get_ctx_fn: command_executor.GetCtxFn, wake_fn: *const fn () void) void {
     if (!enabled) return;
     command_executor.setGetCtxFn(get_ctx_fn);
-    if (g_thread == null) g_queue = .{ .io = io };
+    if (g_thread == null) {
+        g_queue = .{ .io = io };
+        g_queue_ready = true;
+    }
     g_queue.setWakeCallback(wake_fn);
     // App.mount is invoked once per native window. The harness queue and its
     // file-RPC directory are process-global, so MultiWindowApp must keep one
@@ -105,14 +117,14 @@ pub fn afterFrame() void {
 
 /// Main thread each frame: consume and execute test commands from queue
 pub fn drainCommands() void {
-    if (!enabled) return;
+    if (!enabled or !g_queue_ready) return;
     command_executor.drainCommands(&g_queue);
 }
 
 /// Hosts with display-tick coalescing use this one-shot result to keep input
 /// and capture commands immediate while allowing readonly polling to stay idle.
 pub fn drainCommandsRequestFrame() bool {
-    if (!enabled) return false;
+    if (!enabled or !g_queue_ready) return false;
     return command_executor.drainCommandsRequestFrame(&g_queue);
 }
 

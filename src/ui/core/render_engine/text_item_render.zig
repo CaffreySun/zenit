@@ -114,7 +114,7 @@ pub fn appendTextBlobForNode(
     cx: *RenderContext,
     node: *Node,
     t: *const types.TextProps,
-    tl: ?text_layout.TextLayout,
+    tl: ?*const text_layout.TextLayout,
     wrap_width: f32,
     raster_policy: text_blob_mod.TextRasterPolicy,
 ) !u32 {
@@ -1069,7 +1069,7 @@ pub fn appendDisplayTextItem(
     node: *Node,
     exec_state: NodeExecutionState,
     t: *const types.TextProps,
-    tl: ?text_layout.TextLayout,
+    tl: ?*const text_layout.TextLayout,
 ) !void {
     try appendDisplayTextItemBorrowed(cx, node, &exec_state, t, tl);
 }
@@ -1079,7 +1079,7 @@ pub fn appendDisplayTextItemBorrowed(
     node: *Node,
     exec_state: *const NodeExecutionState,
     t: *const types.TextProps,
-    tl: ?text_layout.TextLayout,
+    tl: ?*const text_layout.TextLayout,
 ) !void {
     const header = style_render.makeDisplayItemHeaderBorrowed(exec_state);
     const raster_policy: text_blob_mod.TextRasterPolicy = if (exec_state.subtree_force_linear_text)

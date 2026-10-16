@@ -10,6 +10,8 @@ pub const renderer_resources = @import("renderer_resources.zig");
 pub const ShaderModule = @import("shader.zig").ShaderModule;
 pub const ShaderFunction = @import("shader.zig").ShaderFunction;
 const NativeDevice = opaque {};
+const NativeDriverInfo = extern struct { vendor_id: u32, device_id: u32, driver_version: [4]u16, driver_version_known: u32, software: u32 };
+extern fn zenit_d12_device_driver_info(*NativeDevice, *NativeDriverInfo) void;
 const NativeBuffer = opaque {};
 const NativeQueue = opaque {};
 const NativeCommands = opaque {};
@@ -77,6 +79,7 @@ extern fn zenit_d12_commands_release(*NativeCommands) void;
 extern fn zenit_d12_device_retain(*NativeDevice) void;
 extern fn zenit_d12_texture_retain(*NativeTexture) void;
 extern fn zenit_d12_device_create(c_int, *?*NativeDevice) c_int;
+extern fn zenit_d12_device_atomic_workaround(*NativeDevice, c_int) c_int;
 extern fn zenit_d12_device_release(*NativeDevice) void;
 extern fn zenit_d12_device_vertex_viewport_index(*NativeDevice) c_int;
 extern fn zenit_d12_device_is_software(*NativeDevice) c_int;
@@ -95,6 +98,28 @@ pub const Device = struct {
     pub fn retained(self: *const Device) Device {
         zenit_d12_device_retain(self.raw);
         return self.*;
+    }
+    pub fn driverInfo(self: *const Device) gpu.DriverInfo {
+        var info: NativeDriverInfo = undefined;
+        zenit_d12_device_driver_info(self.raw, &info);
+        return .{ .vendor_id = info.vendor_id, .device_id = info.device_id, .driver_version = if (info.driver_version_known != 0) info.driver_version else null, .software = info.software != 0 };
+    }
+    pub fn driverBugs(self: *const Device) gpu.DriverBugs {
+        return .{ .non_uniform_uav_buffer_array_atomics = gpu.backend_kind == .d3d12 and zenit_d12_device_atomic_workaround(self.raw, 0) == 2 };
+    }
+    pub fn getFeatures(self: *const Device) gpu.Features {
+        _ = self;
+        return .{ .non_uniform_uav_buffer_array_atomics = gpu.backend_kind == .d3d12 };
+    }
+    fn prepareShader(self: *const Device, function: *const ShaderFunction) !ShaderFunction {
+        if (gpu.backend_kind == .d3d12 and try function.requiresNonUniformUavBufferArrayAtomics()) {
+            switch (zenit_d12_device_atomic_workaround(self.raw, 1)) {
+                1 => {},
+                2 => return function.withAtomicSwitch(),
+                else => return error.UavAtomicSelfTestFailed,
+            }
+        }
+        return function.retained();
     }
     pub fn supportsVertexViewportIndex(self: *const Device) bool {
         return zenit_d12_device_vertex_viewport_index(self.raw) != 0;
@@ -180,12 +205,19 @@ pub const Device = struct {
     }
     pub fn createComputePipeline(self: *Device, desc: ComputePipelineDescriptor) !ComputePipeline {
         if (desc.compute_function.stage != .compute) return error.InvalidShaderStage;
+        var function = try self.prepareShader(desc.compute_function);
+        defer function.deinit();
+        const lowered = function.raw != desc.compute_function.raw;
         var raw: ?*NativeComputePipeline = null;
-        try nativeStatus(zenit_d12_compute_pipeline_create(self.raw, desc.layout.raw, desc.compute_function.raw, &raw), error.ShaderLayoutMismatch);
-        return .{ .raw = raw.? };
+        try nativeStatus(zenit_d12_compute_pipeline_create(self.raw, desc.layout.raw, function.raw, &raw), error.ShaderLayoutMismatch);
+        return .{ .raw = raw.?, .atomic_switch_workaround = lowered };
     }
     pub fn createRenderPipeline(self: *Device, desc: RenderPipelineDescriptor) !RenderPipeline {
         if (desc.vertex_function.stage != .vertex or desc.fragment_function.stage != .fragment) return error.InvalidShaderStage;
+        var vertex = try self.prepareShader(desc.vertex_function);
+        defer vertex.deinit();
+        var fragment = try self.prepareShader(desc.fragment_function);
+        defer fragment.deinit();
 
         if (desc.multisample.count == 0 or desc.multisample.count > 32 or !std.math.isPowerOfTwo(desc.multisample.count) or desc.multisample.mask > std.math.maxInt(u32)) return error.UnsupportedMultisampling;
         if (desc.primitive.polygon_mode == .point) return error.UnsupportedPointPolygonMode;
@@ -205,12 +237,19 @@ pub const Device = struct {
             const blend = target.blend orelse gpu.BlendState.REPLACE;
             out.* = .{ .format = try dxgiFormat(target.format), .write_mask = @bitCast(target.write_mask), .blend = @intFromBool(target.blend != null), .color_src = blendFactor(blend.color.src_factor, false), .color_dst = blendFactor(blend.color.dst_factor, false), .color_op = @as(u32, @backingInt(blend.color.operation)) + 1, .alpha_src = blendFactor(blend.alpha.src_factor, true), .alpha_dst = blendFactor(blend.alpha.dst_factor, true), .alpha_op = @as(u32, @backingInt(blend.alpha.operation)) + 1 };
         }
+        if (desc.dual_source_blending) {
+            if (desc.targets.len != 1 or desc.targets[0].blend == null) return error.InvalidRenderPipeline;
+            targets[0].color_src = 2; // ONE
+            targets[0].color_dst = 17; // INV_SRC1_COLOR
+            targets[0].alpha_src = 2;
+            targets[0].alpha_dst = 19; // INV_SRC1_ALPHA
+        }
         const native: NativeRenderDescriptor = .{ .attributes = &attributes, .attribute_count = @intCast(count), .targets = &targets, .target_count = @intCast(desc.targets.len), .topology = @as(u32, @backingInt(desc.primitive.topology)) + 1, .strip_index = if (desc.primitive.strip_index_format) |format| @as(u32, @backingInt(format)) + 1 else 0, .front_ccw = @intFromBool(desc.primitive.front_face == .ccw), .cull = @as(u32, @backingInt(desc.primitive.cull_mode)) + 1, .fill = if (desc.primitive.polygon_mode == .line) 2 else 3, .depth_clip = @intFromBool(!desc.primitive.unclipped_depth), .sample_mask = @intCast(desc.multisample.mask), .samples = desc.multisample.count, .alpha_coverage = @intFromBool(desc.multisample.alpha_to_coverage_enabled), .depth = if (desc.depth_stencil) |d| .{ .format = try dxgiDepthFormat(d.format), .write = @intFromBool(d.depth_write_enabled), .compare = comparisonFunction(d.depth_compare), .read_mask = d.stencil_read_mask & 255, .write_mask = d.stencil_write_mask & 255, .front = stencilFace(d.stencil_front), .back = stencilFace(d.stencil_back), .bias = d.depth_bias, .slope = d.depth_bias_slope_scale, .clamp = d.depth_bias_clamp } else .{} };
         var raw: ?*NativeRenderPipeline = null;
-        try nativeStatus(zenit_d12_render_pipeline_create(self.raw, desc.layout.raw, desc.vertex_function.raw, desc.fragment_function.raw, &native, &raw), error.InvalidRenderPipeline);
+        try nativeStatus(zenit_d12_render_pipeline_create(self.raw, desc.layout.raw, vertex.raw, fragment.raw, &native, &raw), error.InvalidRenderPipeline);
         var slots: u32 = 0;
         for (attributes[0..count]) |attribute| slots |= @as(u32, 1) << @intCast(attribute.slot);
-        return .{ .raw = raw.?, .vertex_slots = slots };
+        return .{ .raw = raw.?, .vertex_slots = slots, .atomic_switch_workaround = vertex.raw != desc.vertex_function.raw or fragment.raw != desc.fragment_function.raw };
     }
     pub fn createShaderModule(self: *Device, allocator: std.mem.Allocator, desc: gpu.ShaderModuleDescriptor) !ShaderModule {
         _ = self; // D3DCompile produces portable bytecode; no device reference needed.
@@ -631,6 +670,7 @@ pub const PipelineLayout = struct {
 pub const ComputePipelineDescriptor = struct { label: ?[]const u8 = null, layout: *const PipelineLayout, compute_function: *const ShaderFunction };
 pub const ComputePipeline = struct {
     raw: *NativeComputePipeline,
+    atomic_switch_workaround: bool = false,
     pub fn deinit(self: *ComputePipeline) void {
         zenit_d12_compute_pipeline_release(self.raw);
         self.* = undefined;
@@ -685,6 +725,7 @@ pub const RenderPipelineDescriptor = struct {
     fragment_function: *const ShaderFunction,
     vertex_buffers: []const gpu.VertexBufferLayout = &.{},
     targets: []const gpu.ColorTargetState,
+    dual_source_blending: bool = false,
     primitive: gpu.PrimitiveState = .{},
     depth_stencil: ?gpu.DepthStencilState = null,
     multisample: gpu.MultisampleState = .{},
@@ -692,6 +733,7 @@ pub const RenderPipelineDescriptor = struct {
 pub const RenderPipeline = struct {
     raw: *NativeRenderPipeline,
     vertex_slots: u32,
+    atomic_switch_workaround: bool = false,
     /// Borrowed: pipeline owns its native layout. Do not deinit this value.
     pub fn bindingLayout(self: *const RenderPipeline) PipelineLayout {
         return .{ .raw = zenit_d12_render_pipeline_layout(self.raw) };

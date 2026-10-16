@@ -6,12 +6,16 @@ const render = @import("render");
 const ui = @import("ui");
 const platform = @import("platform");
 const app_renderer = @import("renderer.zig");
+const SharedGpu = @import("shared_gpu.zig").SharedGpu;
 const legacy = @import("windows_paint.zig");
 const render_pacing = @import("render_pacing.zig");
 
 const State = struct {
-    device: gpu.Backend.Device,
-    queue: gpu.Backend.Queue,
+    owned_device: gpu.Backend.Device,
+    owned_queue: gpu.Backend.Queue,
+    device: *gpu.Backend.Device,
+    queue: *gpu.Backend.Queue,
+    shared_gpu: ?*SharedGpu,
     surface: gpu.Backend.Surface,
     renderer: app_renderer.AppRenderer,
     width: u32,
@@ -45,6 +49,9 @@ pub const Painter = struct {
     trace_window_id: u32 = 0,
 
     pub fn init(a: std.mem.Allocator, io: std.Io, window: *platform.Window, clear: [4]f32) !Painter {
+        return initWithSharedGpu(a, io, window, clear, null);
+    }
+    pub fn initWithSharedGpu(a: std.mem.Allocator, io: std.Io, window: *platform.Window, clear: [4]f32, shared_slot: ?*?*SharedGpu) !Painter {
         const capture_directory = if (@import("test_harness").enabled)
             @import("zenit_environment").getOwned(a, "ZENIT_WINDOWS_FRAME_CAPTURE_DIR") catch |err| switch (err) {
                 error.EnvironmentVariableNotFound => null,
@@ -53,18 +60,33 @@ pub const Painter = struct {
         else
             null;
         errdefer if (capture_directory) |directory| a.free(directory);
-        var instance = try gpu.Backend.Instance.init(a, .{});
-        defer instance.deinit();
-        const adapters = try instance.enumerateAdapters();
-        defer a.free(adapters);
-        defer for (adapters) |*adapter| adapter.deinit();
         const state = try a.create(State);
         errdefer a.destroy(state);
-        const dq = try adapters[0].requestDevice(a, .{});
-        state.device = dq.device;
-        state.queue = dq.queue;
-        errdefer state.device.deinit();
-        errdefer state.queue.deinit();
+        state.shared_gpu = null;
+        state.font_ranges_context = null;
+        state.font_ranges_provider = null;
+        if (shared_slot) |slot| {
+            if (slot.* == null) slot.* = try SharedGpu.init(a, window, false, false);
+            state.shared_gpu = slot.*;
+            state.device = &state.shared_gpu.?.device;
+            state.queue = &state.shared_gpu.?.queue;
+        } else {
+            var instance = try gpu.Backend.Instance.init(a, .{});
+            defer instance.deinit();
+            const adapters = try instance.enumerateAdapters();
+            defer a.free(adapters);
+            defer for (adapters) |*adapter| adapter.deinit();
+            if (adapters.len == 0) return error.NoGPU;
+            const dq = try adapters[0].requestDevice(a, .{});
+            state.owned_device = dq.device;
+            state.owned_queue = dq.queue;
+            state.device = &state.owned_device;
+            state.queue = &state.owned_queue;
+        }
+        errdefer if (state.shared_gpu == null) {
+            state.queue.deinit();
+            state.device.deinit();
+        };
         const size = window.getDrawableSize();
         state.width = size[0];
         state.height = size[1];
@@ -73,10 +95,11 @@ pub const Painter = struct {
         // nevertheless stall the shared queue behind DXGI for hundreds of ms.
         // Sync interval zero lets DWM prefer the latest completed frame; no
         // tearing flag is enabled. Hardware adapters keep FIFO pacing.
-        try state.surface.configure(a, &state.device, .{ .format = gpu.color_format, .width = state.width, .height = state.height, .usage = .color_target_and_read, .present_mode = if (state.device.isSoftware()) .immediate else .fifo });
+        try state.surface.configure(a, state.device, .{ .format = gpu.color_format, .width = state.width, .height = state.height, .usage = .color_target_and_read, .present_mode = if (state.device.isSoftware()) .immediate else .fifo });
         errdefer state.surface.deinit();
-        state.renderer = try app_renderer.AppRenderer.init(a, io, &state.device, &state.queue, &state.surface, .{ .clear_color = .{ .r = clear[0], .g = clear[1], .b = clear[2], .a = clear[3] } });
+        try state.renderer.init(a, io, state.device, state.queue, &state.surface, .{ .clear_color = .{ .r = clear[0], .g = clear[1], .b = clear[2], .a = clear[3] } });
         errdefer state.renderer.deinit();
+        if (state.shared_gpu) |shared| try state.renderer.image_renderer.setSharedTextureStore(&shared.images);
         state.renderer.retain_present_copy = @import("test_harness").enabled;
         const desktop_observer = if (capture_directory != null and @import("zenit_environment").has("ZENIT_WINDOWS_DESKTOP_CAPTURE"))
             zenit_windows_desktop_observer_create(window.getNativeSurfaceHandle()) orelse return error.DesktopObserverUnavailable
@@ -94,8 +117,10 @@ pub const Painter = struct {
         window.setRenderCallback(null, null);
         self.state.renderer.deinit();
         self.state.surface.deinit();
-        self.state.queue.deinit();
-        self.state.device.deinit();
+        if (self.state.shared_gpu == null) {
+            self.state.queue.deinit();
+            self.state.device.deinit();
+        }
         self.allocator.destroy(self.state);
     }
 
@@ -138,12 +163,12 @@ pub const Painter = struct {
         self.recording_window = window;
         self.state.renderer.setRecordingContextCallback(self, recordingFrame);
         self.state.renderer.setRecordingActive(window.windowRecordingStatus().active != 0);
-        const logical = window.getSize();
+        const logical = window.getLogicalSize();
         const size = window.getDrawableSize();
         if (size[0] == 0 or size[1] == 0) return;
         if (size[0] != self.state.width or size[1] != self.state.height) {
             self.state.renderer.prepareSurfaceResize(cx);
-            try self.state.surface.configure(self.allocator, &self.state.device, .{ .format = gpu.color_format, .width = size[0], .height = size[1], .usage = .color_target_and_read, .present_mode = if (self.state.device.isSoftware()) .immediate else .fifo });
+            try self.state.surface.configure(self.allocator, self.state.device, .{ .format = gpu.color_format, .width = size[0], .height = size[1], .usage = .color_target_and_read, .present_mode = if (self.state.device.isSoftware()) .immediate else .fifo });
             self.state.width = size[0];
             self.state.height = size[1];
         }
@@ -151,7 +176,7 @@ pub const Painter = struct {
         // the caller-owned selector (which may be shared by multiple Apps).
         if (self.desktop_observer != null) self.desktop_before = zenit_windows_desktop_observer_clock();
         const render_start = traceNow(self.state.renderer.io, self.trace_frames);
-        try self.state.renderer.frame(cx, @floatFromInt(logical[0]), @floatFromInt(logical[1]), window.getScaleFactor());
+        try self.state.renderer.frame(cx, logical[0], logical[1], window.getScaleFactor());
         const render_end = traceNow(self.state.renderer.io, self.trace_frames);
         @import("windows_accessibility.zig").publish(cx, window) catch |err| {
             @import("windows_accessibility.zig").clear(window);
@@ -207,6 +232,7 @@ pub const Painter = struct {
             .frame_time_ms = cx.frame_time_ms,
             .animation_clock_step_ms = cx.test_frame_step_ms,
             .scale = window.getScaleFactor(),
+            .frame_work_area = window.frameWorkArea(),
             .width = self.state.renderer.retained_w,
             .height = self.state.renderer.retained_h,
             .cursor = .{ .visible = cx.virtual_cursor.visible, .x = cx.virtual_cursor.x, .y = cx.virtual_cursor.y, .shape = @tagName(cx.virtual_cursor.shape) },

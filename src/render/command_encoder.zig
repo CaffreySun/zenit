@@ -12,6 +12,7 @@
 /// try encoder.flush(&render_pass);
 /// ```
 const std = @import("std");
+const text_policy = @import("text_render_policy.zig");
 
 /// Stale texture handle: drop this frame only. Throwing would abort frame encoding, losing all
 /// subsequent content.
@@ -70,6 +71,7 @@ const color_conversion = @import("color_conversion.zig");
 // Extracted module tests must be explicitly imported to be collected (pub const x = @import in this
 // codebase does **not** pull test blocks into runner; see render.zig test block comment).
 test {
+    _ = @import("offscreen_maintenance_retry.zig");
     _ = @import("command_encoder/local_sort_cluster.zig");
     _ = @import("command_encoder/backdrop_capture.zig");
     _ = @import("command_encoder/persistent_gpu_cache.zig");
@@ -360,9 +362,16 @@ pub const RenderCommandEncoder = struct {
     /// parent clip pops incorrectly (push silent / pop unconditional = mismatch).
     clip_overflow_depth: u32 = 0,
     render_pass: ?*gpu.Backend.RenderPass = null,
+    drawable_extent: [2]u32 = .{ 0, 0 },
     viewport_width: f32 = 0,
+    /// Pixel-aligned root crop, used by small caret render targets. Nested
+    /// surfaces still accumulate their own offsets through the same algebra.
+    root_crop_origin: [2]f32 = .{ 0, 0 },
     viewport_height: f32 = 0,
     scale: f32 = 1,
+    main_destination_opaque: bool = false,
+    text_backdrop: text_policy.Backdrop = .{},
+    text_layers: text_policy.State = .{},
     frame_index: u64 = 0,
     /// v0.9-S1D audit (2026-05-13): beginRenderPass call count per frame.
     /// main pass + offscreen opacity_layer + backdrop_blur + clearTexture etc. share counter.
@@ -442,6 +451,10 @@ pub const RenderCommandEncoder = struct {
     /// (pool's only purpose) never happens; each frame with offscreen effects create/release
     /// textures. owner calls pool.deinit() (must be after GPU drain).
     offscreen_pool: *OffscreenTexturePool,
+    pool_session_active: bool = false,
+    /// Manual encoders lack a renderer-registered submission fence. Preserve
+    /// their original frame-age quarantine/retirement between encoding frames.
+    external_pool_aging: bool = false,
 
     /// **Cross-frame persistent** GPU resource cache (borrowed, not owned), same rationale as
     /// offscreen_pool.
@@ -496,6 +509,11 @@ pub const RenderCommandEncoder = struct {
     /// RenderCommandEncoder often used as per-frame local value; if some frame hits path/blur/glass
     /// paths without explicit cleanup, these resources leak when encoder leaves scope.
     pub fn deinit(self: *RenderCommandEncoder) void {
+        defer if (self.pool_session_active) {
+            self.offscreen_pool.releaseTransients();
+            self.offscreen_pool.encoder_active = false;
+            self.pool_session_active = false;
+        };
         // encoder is per-frame local value (AppRenderer.getEncoder creates fresh each frame),
         // deinit is frame end; pass_count here is full-frame final value.
         if (@import("zenit_environment").has("ZENIT_DEBUG_PASSCOUNT")) {
@@ -573,6 +591,8 @@ pub const RenderCommandEncoder = struct {
         gpu.Backend.RenderPass.frame_draw_call_count = 0;
         // reset per-frame pass count audit counter
         self.pass_count = 0;
+        self.text_backdrop.reset(width, height, self.main_destination_opaque);
+        self.text_layers = .{};
         self.pass_sites = @splat(0);
         self.opacity_mode_depth = 0;
         self.opacity_mode_overflow_depth = 0;
@@ -590,17 +610,68 @@ pub const RenderCommandEncoder = struct {
         self.clip_depth = 0;
         self.clip_overflow_depth = 0;
         self.offscreen_depth = 0;
-        self.offscreen_pool.resetFrame();
-        // Reclaim retained textures unclaimed long-term (layer gone, shouldn't pin VRAM).
-        self.offscreen_pool.sweepRetained(self.frame_index);
-        self.offscreen_pool.sweepIdle(self.frame_index);
+        self.beginOffscreenFrame();
+        self.root_crop_origin = .{ 0, 0 };
+        // Idle retirement is performed by the host between frames, using
+        // monotonic deadlines and a completed submission fence.
         backdrop_blur.resetDynamicUniformOffsets(self);
         self.viewport_width = width;
         self.viewport_height = height;
         self.scale = scale;
+        self.drawable_extent = .{ pixel_domain.physicalPixelExtent(width, scale), pixel_domain.physicalPixelExtent(height, scale) };
+        self.applyDrawableViewport();
         self.syncRectClipState();
         self.syncTextClipX();
         self.syncRendererClipMask();
+    }
+
+    fn beginOffscreenFrame(self: *RenderCommandEncoder) void {
+        // Reusing one manual encoder explicitly ends its previous frame.
+        if (self.pool_session_active) self.offscreen_pool.encoder_active = false;
+        std.debug.assert(!self.offscreen_pool.encoder_active);
+        self.offscreen_pool.resetFrame();
+        if (self.external_pool_aging) {
+            self.offscreen_pool.sweepRetained(self.frame_index);
+            self.offscreen_pool.sweepIdle(self.frame_index);
+        }
+        self.offscreen_pool.encoder_active = true;
+        self.pool_session_active = true;
+    }
+
+    test "external encoder ages retained and idle entries between frames" {
+        if (comptime gpu.backend_kind != .null_backend) return error.SkipZigTest;
+        var device = gpu.Backend.Device{};
+        var pool: OffscreenTexturePool = .{};
+        defer pool.deinit();
+        const old = pool.acquireRetained(&device, 17, 1, 64, 64, 1).?;
+        var enc = RenderCommandEncoder.init(undefined, undefined, &pool, undefined);
+        enc.external_pool_aging = true;
+        enc.frame_index = 70;
+        enc.beginOffscreenFrame();
+        try std.testing.expect(pool.resolveTexture(old.lease) == null);
+        try std.testing.expect(pool.encoder_active);
+        enc.frame_index = 200;
+        enc.beginOffscreenFrame();
+        try std.testing.expect(pool.nextMaintenanceDelayNs(0) == null);
+        enc.deinit();
+        try std.testing.expect(!pool.encoder_active);
+    }
+
+    test "encoder teardown releases transient owners even without another frame" {
+        if (comptime gpu.backend_kind != .null_backend) return error.SkipZigTest;
+        var device = gpu.Backend.Device{};
+        var pool: OffscreenTexturePool = .{};
+        defer pool.deinit();
+        var enc = RenderCommandEncoder.init(undefined, undefined, &pool, undefined);
+        enc.beginOffscreenFrame();
+        for (0..OffscreenTexturePool.MAX_POOL) |_| {
+            _ = pool.acquire(&device, 64, 64, 1) orelse return error.TestUnexpectedResult;
+        }
+        const transient = pool.acquire(&device, 64, 64, 1).?;
+        try std.testing.expectEqual(@import("offscreen_texture.zig").TextureLease.Kind.transient, transient.kind);
+        enc.deinit();
+        try std.testing.expect(pool.resolveTexture(transient) == null);
+        try std.testing.expectEqual(@as(u32, 0), pool.memorySnapshot(1).transient);
     }
 
     /// Encode cx's lowered DisplayItem slice to sdf/image/text renderer, flush() sends to GPU once.
@@ -665,19 +736,28 @@ pub const RenderCommandEncoder = struct {
         try self.prewarmTextCommands(cx.lowerForEncoderPaintTable());
     }
 
-    /// prewarm input fingerprint: covers only fields determining which glyphs are needed.
-    ///
-    /// Position / color / clip never in signature; they change every frame scrolling, but glyph set
-    /// stays identical, including them breaks signature hits, optimization fails.
-    /// Conversely, anything changing glyph set must go in: text bytes, font size, weight,
-    /// font_flags (italic/mono/symbol choose fonts), monospace cell width (fixed_advance affects
-    /// ligature split), raster policy (affects subpixel bin key).
+    /// Fingerprint fonts, text, phase positions and raster policy; colors never
+    /// change mask keys. Windows layer geometry also determines raster scale.
     fn prewarmSignature(commands: anytype) u64 {
         var h = std.hash.Wyhash.init(0x9E3779B97F4A7C15);
         for (commands) |it| {
+            if (comptime @import("builtin").os.tag == .windows) {
+                if (it.kind == .control) {
+                    h.update(std.mem.asBytes(&it.control_kind));
+                    h.update(std.mem.asBytes(&it.geom));
+                    h.update(std.mem.asBytes(&it.use_draw_transform));
+                    h.update(std.mem.asBytes(&it.draw_transform));
+                    h.update(std.mem.asBytes(&it.draw_w));
+                    h.update(std.mem.asBytes(&it.draw_h));
+                }
+            }
             if (it.kind != .text) continue;
             if (it.text_content.len == 0 or it.text_font_size <= 0) continue;
             h.update(it.text_content);
+            if (comptime @import("builtin").os.tag == .windows) {
+                h.update(std.mem.asBytes(&it.geom));
+                h.update(std.mem.asBytes(&it.text_font_family));
+            }
             h.update(std.mem.asBytes(&it.text_font_size));
             h.update(std.mem.asBytes(&it.text_font_weight));
             h.update(std.mem.asBytes(&it.text_font_flags));
@@ -690,7 +770,7 @@ pub const RenderCommandEncoder = struct {
     fn prewarmTextCommands(self: *RenderCommandEncoder, commands: anytype) !void {
         // Frame skip: text payload identical to last frame && atlas never evicted pages -> glyphs
         // must all exist, whole prewarm has no output. See TextRenderer.prewarm_signature.
-        const signature = prewarmSignature(commands);
+        const signature = prewarmSignature(commands) ^ @as(u64, @bitCast(@as(f64, self.scale)));
         const gc_gen = self.text_renderer.atlas.gc_generation;
         if (self.text_renderer.prewarm_signature_valid and
             self.text_renderer.prewarm_signature == signature and
@@ -709,6 +789,14 @@ pub const RenderCommandEncoder = struct {
         var offscreen_x: [8]f32 = @as([8]f32, @splat(0));
         var offscreen_y: [8]f32 = @as([8]f32, @splat(0));
         var offscreen_depth: usize = 0;
+        var prewarm_scales: [9]f32 = @splat(self.scale);
+        var prewarm_layer_depth: usize = 0;
+        var prewarm_overflow: usize = 0;
+        defer {
+            self.text_renderer.prewarm_layered = false;
+            self.text_renderer.prewarm_scale_count = 0;
+            self.text_renderer.setViewport(self.viewport_width, self.viewport_height, self.scale);
+        }
 
         for (commands) |it| {
             switch (it.kind) {
@@ -719,6 +807,12 @@ pub const RenderCommandEncoder = struct {
                     for (0..offscreen_depth) |idx| {
                         ox -= offscreen_x[idx];
                         oy -= offscreen_y[idx];
+                    }
+                    if (comptime @import("builtin").os.tag == .windows) {
+                        self.text_renderer.prewarm_layered = prewarm_layer_depth > 0;
+                        self.text_renderer.prewarm_scales = prewarm_scales;
+                        self.text_renderer.prewarm_scale_count = offscreen_depth + 1;
+                        self.text_renderer.setViewport(self.viewport_width, self.viewport_height, prewarm_scales[offscreen_depth]);
                     }
                     const use_italic = (it.text_font_flags & 1) != 0;
                     const use_mono = (it.text_font_flags & 2) != 0;
@@ -763,6 +857,17 @@ pub const RenderCommandEncoder = struct {
                 },
                 .control => switch (it.control_kind) {
                     .begin_opacity_layer, .begin_rounded_clip => {
+                        prewarm_layer_depth += 1;
+                        if (offscreen_depth == offscreen_x.len) {
+                            prewarm_overflow += 1;
+                            continue;
+                        }
+                        if (comptime @import("builtin").os.tag == .windows) {
+                            const parent = prewarm_scales[offscreen_depth];
+                            const candidate = parent * opacity_layer.layerMagnification(it.use_draw_transform, it.draw_transform, it.geom.w, it.geom.h, it.draw_w, it.draw_h);
+                            prewarm_scales[offscreen_depth + 1] = if (computeOffscreenTextureSize(it.geom.w, it.geom.h, candidate, self.sdf_renderer.device.limits.max_texture_dimension_2d) != null) candidate else parent;
+                        }
+
                         if (offscreen_depth < offscreen_x.len) {
                             offscreen_x[offscreen_depth] = it.geom.x;
                             offscreen_y[offscreen_depth] = it.geom.y;
@@ -770,8 +875,16 @@ pub const RenderCommandEncoder = struct {
                         }
                     },
                     .end_opacity_layer, .end_rounded_clip => {
+                        prewarm_layer_depth -|= 1;
+                        if (prewarm_overflow > 0) {
+                            prewarm_overflow -= 1;
+                            continue;
+                        }
+
                         if (offscreen_depth > 0) offscreen_depth -= 1;
                     },
+                    .begin_blur_layer => prewarm_layer_depth += 1,
+                    .end_blur_layer => prewarm_layer_depth -|= 1,
                     else => {},
                 },
                 else => {},
@@ -790,7 +903,7 @@ pub const RenderCommandEncoder = struct {
         // insertion, generation changes, can't use old value as baseline.
         self.text_renderer.prewarm_signature = signature;
         self.text_renderer.prewarm_gc_generation = self.text_renderer.atlas.gc_generation;
-        self.text_renderer.prewarm_signature_valid = true;
+        self.text_renderer.prewarm_signature_valid = !self.text_renderer.atlas.had_transient_failure;
     }
 
     /// Unified encoding loop:
@@ -915,20 +1028,30 @@ pub const RenderCommandEncoder = struct {
     /// Get the current offscreen layer coordinate offset (screen coord -> offscreen local coord).
     /// Returns (0, 0) in the main pass; (-layer.x, -layer.y) in an offscreen layer.
     pub inline fn offscreenOffset(self: *const RenderCommandEncoder) [2]f32 {
-        if (self.offscreen_depth == 0) return .{ 0, 0 };
         // Accumulate all nested layer offsets
         // Note: offscreen_stack[i].x/y is **that layer's outer-local coord within parent surface**
         // (not world).
         // beginOpacityLayer subtracts outer-layer accumulation before pushing (see
         // beginOpacityLayer's outer-local conversion).
         // Thus child paint's world coord minus accumulation = inner-surface-local.
-        var dx: f32 = 0;
-        var dy: f32 = 0;
+        var dx: f32 = -self.root_crop_origin[0];
+        var dy: f32 = -self.root_crop_origin[1];
         for (self.offscreen_stack[0..self.offscreen_depth]) |layer| {
             dx -= layer.x;
             dy -= layer.y;
         }
         return .{ dx, dy };
+    }
+
+    test "root crop composes with nested target coordinates" {
+        var enc = RenderCommandEncoder.init(undefined, undefined, undefined, undefined);
+        enc.root_crop_origin = .{ 20, 40 };
+        try std.testing.expectEqual([2]f32{ -20, -40 }, enc.offscreenOffset());
+        enc.offscreen_stack[0] = undefined;
+        enc.offscreen_stack[0].x = 3;
+        enc.offscreen_stack[0].y = 4;
+        enc.offscreen_depth = 1;
+        try std.testing.expectEqual([2]f32{ -23, -44 }, enc.offscreenOffset());
     }
 
     pub inline fn localizeDrawTransformForCurrentTarget(self: *const RenderCommandEncoder, draw_transform: [6]f32) [6]f32 {
@@ -959,6 +1082,30 @@ pub const RenderCommandEncoder = struct {
         return self.effective_rect_clip_stack[self.clip_depth - 1];
     }
 
+    /// Bind the acquired target's physical extent, including fractional Cocoa bounds.
+    pub fn setDrawableExtent(self: *RenderCommandEncoder, width: u32, height: u32) void {
+        self.drawable_extent = .{ width, height };
+        self.applyDrawableViewport();
+    }
+
+    fn applyDrawableViewport(self: *RenderCommandEncoder) void {
+        const w: f32 = @floatFromInt(self.drawable_extent[0]);
+        const h: f32 = @floatFromInt(self.drawable_extent[1]);
+        self.sdf_renderer.viewport_width = w;
+        self.sdf_renderer.viewport_height = h;
+        self.text_renderer.viewport_width = w;
+        self.text_renderer.viewport_height = h;
+        if (self.image_renderer) |ir| {
+            ir.viewport_width = w;
+            ir.viewport_height = h;
+        }
+        if (self.icon_renderer) |ir| {
+            ir.viewport_width = w;
+            ir.viewport_height = h;
+        }
+        if (self.persistent.path_renderer) |*pr| pr.raster_viewport = .{ w, h };
+    }
+
     /// Unified viewport+scissor setup after render pass re-open: when target is offscreen, clip to
     /// layer's used region (bucket-allocated larger than content, NDC default fills alloc,
     /// stretching); main target, scissor full drawable.
@@ -983,8 +1130,10 @@ pub const RenderCommandEncoder = struct {
                 if (self.persistent.path_renderer) |*pr| pr.damage_scissor = null;
             }
         } else {
-            const vw = physicalPixelExtent(self.viewport_width, self.scale);
-            const vh = physicalPixelExtent(self.viewport_height, self.scale);
+            const vw = self.drawable_extent[0];
+            const vh = self.drawable_extent[1];
+            self.applyDrawableViewport();
+            rp.setViewport(0, 0, @floatFromInt(vw), @floatFromInt(vh), 0, 1);
             const rect = self.frame_damage_scissor orelse [4]u32{ 0, 0, vw, vh };
             rp.setScissorRect(rect[0], rect[1], rect[2], rect[3]);
             if (self.persistent.path_renderer) |*pr| pr.damage_scissor = self.frame_damage_scissor;
@@ -1010,6 +1159,13 @@ pub const RenderCommandEncoder = struct {
     // ambiguity.
     pub const BackdropCaptureRegion = backdrop_capture.BackdropCaptureRegion;
     pub const computeBackdropCaptureRegion = backdrop_capture.computeBackdropCaptureRegion;
+
+    pub fn copyTextureRegion(self: *RenderCommandEncoder, source: gpu.Backend.TextureBinding, sx: u32, sy: u32, width: u32, height: u32, destination: gpu.Backend.TextureBinding, dx: u32, dy: u32, clear: bool) !void {
+        return gpu.copyTextureRegionAudited(self.gpu_command_encoder.?, source, sx, sy, width, height, destination, dx, dy, clear, .{
+            .pass_count = &self.pass_count,
+            .pass_sites = &self.pass_sites,
+        });
+    }
 
     pub fn clearTextureToTransparent(self: *RenderCommandEncoder, texture: gpu.Backend.TextureBinding) bool {
         var view = texture.createView();
@@ -1171,7 +1327,29 @@ pub const RenderCommandEncoder = struct {
     ///   .path: arc (arc_outer_radius>0) / fill_path (path_geometry_ptr stroke_width=0) /
     ///          stroke_path (path_geometry_ptr stroke_width>0)
     ///   .control: 8 control kinds via control_kind enum
+    fn hasOpaqueTextBackdrop(self: *const RenderCommandEncoder, item: anytype) bool {
+        var state = self.text_layers;
+        state.offscreen_depth = self.offscreen_depth;
+        state.transformed = item.use_draw_transform;
+        state.animated = item.text_raster_policy != 0;
+        state.clip_overflow = self.clip_overflow_depth != 0 or self.rounded_clip_overflow_depth != 0;
+        state.alpha = @as(f32, @floatFromInt(item.color.a)) / 255;
+        // The renderer checks the actual raster quad against this frame's proof.
+        return state.allowsLCD(self.text_backdrop.any_opaque);
+    }
+
     fn dispatchCommand(self: *RenderCommandEncoder, it: anytype) !void {
+        if (comptime @import("builtin").os.tag == .windows) {
+            if (it.kind == .control) switch (it.control_kind) {
+                .begin_opacity_layer => self.text_layers.opacity_depth += 1,
+                .end_opacity_layer => self.text_layers.opacity_depth -|= 1,
+                .begin_blur_layer => self.text_layers.blur_depth += 1,
+                .end_blur_layer => self.text_layers.blur_depth -|= 1,
+                .begin_rounded_clip => self.text_layers.rounded_depth += 1,
+                .end_rounded_clip => self.text_layers.rounded_depth -|= 1,
+                .none, .push_clip, .pop_clip => {},
+            };
+        }
         // GPU retained hit: begin..end content already in cached texture, skip all.
         // Just count paired begin/end to find this layer's end position.
         if (self.retained_skip_depth > 0) {
@@ -1225,6 +1403,22 @@ pub const RenderCommandEncoder = struct {
                 if (w <= 0 or h <= 0) return;
                 try self.flushIfTextPending();
                 const radii = it.radii.toArray();
+                if (comptime @import("builtin").os.tag == .windows) {
+                    if (self.text_layers.allowsLCD(true) and self.offscreen_depth == 0 and self.activeRoundedClip() == null and !it.use_draw_transform and it.color.a == 255 and it.shape_kind == 0 and
+                        it.stroke_width == 0 and it.noise_intensity == 0 and it.border_widths[0] == 0 and it.border_widths[1] == 0 and it.border_widths[2] == 0 and it.border_widths[3] == 0)
+                    {
+                        const inset = @max(@max(radii[0], radii[1]), @max(radii[2], radii[3])) + 1 / self.scale;
+                        var rect: [4]f32 = .{ if (inset <= 1 / self.scale and it.geom.x <= 0) 0 else it.geom.x + inset, if (inset <= 1 / self.scale and it.geom.y <= 0) 0 else it.geom.y + inset, if (inset <= 1 / self.scale and it.geom.x + w >= self.viewport_width) self.viewport_width else it.geom.x + w - inset, if (inset <= 1 / self.scale and it.geom.y + h >= self.viewport_height) self.viewport_height else it.geom.y + h - inset };
+                        if (self.currentRectClip()) |clip| {
+                            const r = &rect;
+                            r[0] = @max(r[0], clip[0]);
+                            r[1] = @max(r[1], clip[1]);
+                            r[2] = @min(r[2], clip[0] + clip[2]);
+                            r[3] = @min(r[3], clip[1] + clip[3]);
+                        }
+                        self.text_backdrop.add(rect);
+                    }
+                }
                 // noise_rect: noise_intensity > 0 is condition (even if fill.a == 0, still draw)
                 if (it.noise_intensity > 0 and self.visual_quality != .basic) {
                     try self.sdf_renderer.addNoiseRect(
@@ -1320,6 +1514,13 @@ pub const RenderCommandEncoder = struct {
                 const use_mono = (it.text_font_flags & 2) != 0;
                 const use_sym = (it.text_font_flags & 4) != 0;
                 const raster = wire_types.textRasterControls(it.text_raster_policy);
+                if (comptime @import("builtin").os.tag == .windows) self.text_renderer.cleartype_allowed =
+                    self.hasOpaqueTextBackdrop(it);
+                self.text_renderer.lcd_backdrop = &self.text_backdrop;
+                defer {
+                    self.text_renderer.lcd_backdrop = null;
+                    self.text_renderer.cleartype_allowed = false;
+                }
                 // TextFontFlag.no_smoothing (TextProps.font_smoothing = false)
                 self.text_renderer.smooth_fonts = (it.text_font_flags & 8) == 0;
                 defer self.text_renderer.smooth_fonts = true;
@@ -2003,6 +2204,7 @@ pub const RenderCommandEncoder = struct {
         var tess = &self.persistent.path_tessellator.?;
         var path_rend = &self.persistent.path_renderer.?;
         path_rend.setViewport(self.viewport_width, self.viewport_height, self.scale);
+        if (self.offscreen_depth > 0) path_rend.setOffscreenViewport() else path_rend.setDrawableExtent(self.drawable_extent[0], self.drawable_extent[1]);
 
         const off = self.offscreenOffset();
         const ox = it.geom.x + off[0];
@@ -2086,6 +2288,7 @@ pub const RenderCommandEncoder = struct {
         var tess = &self.persistent.path_tessellator.?;
         var path_rend = &self.persistent.path_renderer.?;
         path_rend.setViewport(self.viewport_width, self.viewport_height, self.scale);
+        if (self.offscreen_depth > 0) path_rend.setOffscreenViewport() else path_rend.setDrawableExtent(self.drawable_extent[0], self.drawable_extent[1]);
 
         const off = self.offscreenOffset();
         const ox = it.geom.x + off[0];
@@ -2492,8 +2695,8 @@ pub const RenderCommandEncoder = struct {
         return .{
             .x = 0,
             .y = 0,
-            .width = physicalPixelExtent(self.viewport_width, self.scale),
-            .height = physicalPixelExtent(self.viewport_height, self.scale),
+            .width = if (self.offscreen_depth > 0) physicalPixelExtent(self.viewport_width, self.scale) else self.drawable_extent[0],
+            .height = if (self.offscreen_depth > 0) physicalPixelExtent(self.viewport_height, self.scale) else self.drawable_extent[1],
         };
     }
 
@@ -2554,3 +2757,32 @@ pub const RenderCommandEncoder = struct {
         self.render_pass = null;
     }
 };
+
+test "non-Windows prewarm skips scrolling while Windows keys raster phases" {
+    const Item = struct {
+        kind: enum { text, control } = .text,
+        control_kind: u8 = 0,
+        use_draw_transform: bool = false,
+        draw_transform: [6]f32 = @splat(0),
+        draw_w: f32 = 0,
+        draw_h: f32 = 0,
+        text_content: []const u8 = "scrolling",
+        geom: [4]f32 = .{ 0, 0, 100, 20 },
+        text_font_family: u16 = 0,
+        text_font_size: f32 = 14,
+        text_font_weight: u16 = 400,
+        text_font_flags: u8 = 0,
+        text_monospace_char_width: f32 = 0,
+        text_raster_policy: u8 = 0,
+    };
+    var items = [_]Item{.{}};
+    const original = RenderCommandEncoder.prewarmSignature(&items);
+    items[0].geom[1] = 100.25;
+    items[0].text_font_family = 1;
+    const moved = RenderCommandEncoder.prewarmSignature(&items);
+    if (@import("builtin").os.tag == .windows) {
+        try std.testing.expect(original != moved);
+    } else try std.testing.expectEqual(original, moved);
+    items[0].text_font_size = 20;
+    try std.testing.expect(moved != RenderCommandEncoder.prewarmSignature(&items));
+}

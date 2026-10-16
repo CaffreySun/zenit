@@ -427,8 +427,26 @@ static void verifyAppliedMarkedOrigin(WindowWrapper *w) {
     fprintf(stderr, "PASS: applied marked origin follows model; unmatched and ended candidates remain untouched\n");
 }
 
+static void testScrollDeltaUnits(void) {
+    const CGScrollEventUnit units[] = { kCGScrollEventUnitLine, kCGScrollEventUnitPixel };
+    for (int i = 0; i < 2; i++) {
+        CGEventRef raw = CGEventCreateScrollWheelEvent(NULL, units[i], 2, 1, -2);
+        assert(raw != NULL);
+        NSEvent *event = [NSEvent eventWithCGEvent:raw];
+        assert(event != nil);
+        assert(event.hasPreciseScrollingDeltas == (i == 1));
+        float dx = 0, dy = 0;
+        zenitScrollDeltas(event, &dx, &dy);
+        assert(dx == (i == 0 ? -80.0f : -2.0f));
+        assert(dy == (i == 0 ? 40.0f : 1.0f));
+        CFRelease(raw);
+    }
+    fprintf(stderr, "PASS: line wheels normalize to logical points; precise deltas pass through\n");
+}
+
 int main(int argc, const char **argv) {
     @autoreleasepool {
+        testScrollDeltaUnits();
         macos_init_app();
         void *ptr = macos_create_window(400, 240, "zenit input pump regression");
         assert(ptr);

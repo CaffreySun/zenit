@@ -2856,6 +2856,18 @@ static uint8_t zenitMomentumPhaseCode(NSEvent *event) {
     }
 }
 
+// Scroll deltas are logical px (scroll_area applies the offset in px). AppKit reports
+// line units for non-precise wheels (~0.1 per detent, up to ~15 on fast flicks) -
+// convert with 40 px/line, shared by Chromium kScrollbarPixelsPerCocoaTick,
+// WebKit Scrollbar::pixelsPerLineStep, Flutter pixelsPerLine ("to match Chromium").
+// Precise devices (trackpads, Magic Mouse) already report points: pass through 1:1.
+// Logical points only - do not multiply by display scale (HiDPI would double speed).
+static void zenitScrollDeltas(NSEvent *event, float *out_dx, float *out_dy) {
+    const double scale = event.hasPreciseScrollingDeltas ? 1.0 : 40.0;
+    *out_dx = (float)(event.scrollingDeltaX * scale);
+    *out_dy = (float)(event.scrollingDeltaY * scale);
+}
+
 typedef struct {
     unsigned long long sequence;
     float x;
@@ -4893,8 +4905,7 @@ int macos_poll_events(void* window_ptr) {
                         packet.sequence = nextInputEventSequence();
                         packet.x = (float)scrollInWindow.x;
                         packet.y = (float)scrollInWindow.y;
-                        packet.dx = (float)event.scrollingDeltaX;
-                        packet.dy = (float)event.scrollingDeltaY;
+                        zenitScrollDeltas(event, &packet.dx, &packet.dy);
                         packet.phase = zenitScrollPhaseCode(event);
                         packet.momentum = zenitMomentumPhaseCode(event);
                         packet.modifiers = (uint32_t)event.modifierFlags;
@@ -6196,8 +6207,7 @@ static void pumpAppEventsWithTimeout(uint32_t timeout_ms) {
                         packet.sequence = nextInputEventSequence();
                         packet.x = (float)scrollInWindow.x;
                         packet.y = (float)scrollInWindow.y;
-                        packet.dx = (float)event.scrollingDeltaX;
-                        packet.dy = (float)event.scrollingDeltaY;
+                        zenitScrollDeltas(event, &packet.dx, &packet.dy);
                         packet.phase = zenitScrollPhaseCode(event);
                         packet.momentum = zenitMomentumPhaseCode(event);
                         packet.modifiers = (uint32_t)event.modifierFlags;

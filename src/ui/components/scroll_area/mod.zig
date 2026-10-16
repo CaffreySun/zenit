@@ -59,7 +59,7 @@ pub const ScrollAreaProps = struct {
     direction: ScrollDirection = .vertical,
     content_height: ?f32 = null,
     content_width: ?f32 = null,
-    /// Scroll speed multiplier (macOS scrollingDelta already in pixels, default 1.0)
+    /// Scroll speed multiplier (scroll dx/dy are logical px, normalized at the event bridge, default 1.0)
     scroll_speed: f32 = 1,
     padding: Padding = Padding.ZERO,
     background: Color = Color.TRANSPARENT,

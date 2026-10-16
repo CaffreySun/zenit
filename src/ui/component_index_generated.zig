@@ -83,7 +83,7 @@ pub const entries = [_]Entry{
     .{ .name = "Modal", .file = "src/ui/components/modal/mod.zig", .line = 144, .col = 36, .label = "zenit" },
     .{ .name = "ModalPanel", .file = "src/ui/components/modal/_modal.yix.zig", .line = 43, .col = 35, .label = "zenit" },
     .{ .name = "ModalPanel", .file = "src/ui/components/modal/modal.yix", .line = 12, .col = 8, .label = "zenit" },
-    .{ .name = "MyCustomTrigger", .file = "src/ui/core/tests.zig", .line = 11967, .col = 34, .label = "zenit" },
+    .{ .name = "MyCustomTrigger", .file = "src/ui/core/tests.zig", .line = 11972, .col = 34, .label = "zenit" },
     .{ .name = "Notification", .file = "src/ui/components/notification/card.zig", .line = 440, .col = 35, .label = "zenit" },
     .{ .name = "Notification.clearAll", .file = "src/ui/components/notification/mod.zig", .line = 285, .col = 38, .label = "zenit" },
     .{ .name = "Notification.close", .file = "src/ui/components/notification/card.zig", .line = 449, .col = 32, .label = "zenit" },

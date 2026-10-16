@@ -49,7 +49,7 @@ jobs:
         run: zig build -Dtarget=x86_64-windows-gnu -Doptimize=debug
 
   oss-boundary:
-    name: zenit OSS boundary
+    name: Framework checks
     runs-on: macos-latest
     timeout-minutes: 20
 

@@ -1239,7 +1239,7 @@ pub const App = struct {
             };
             // Render at least one frame after any input event: hover/cursor paths don't guarantee
             // needs_redraw flip.
-            if (pointer_isolation.requestsFrame(test_harness.enabled and isolateOsPointer(), self.sdk.events()) or pump_result.requested_redraw) force_frame = true;
+            if (pointer_isolation.requestsFrame(test_harness.enabled and isolateOsPointer(), test_harness.enabled and pointer_isolation.keyboardEnabled(), self.sdk.events()) or pump_result.requested_redraw) force_frame = true;
             self.processEvents();
             // E2E test harness: consume command queue (when test-mode=true).
             if (test_harness.enabled) {
@@ -1806,6 +1806,8 @@ pub const App = struct {
         // manual
         // operation of a test-mode app is unaffected.
         if (test_harness.enabled and isolateOsPointer() and pointer_isolation.isOsPointerEvent(evt)) return false;
+        // Optional keyboard isolation for machines shared between an e2e run and a live user.
+        if (test_harness.enabled and pointer_isolation.keyboardEnabled() and pointer_isolation.isOsKeyboardEvent(evt)) return false;
         if (evt != .frame_requested) self.cx.input_epoch +%= 1;
         switch (evt) {
             .quit => self.should_quit = true,
@@ -2399,7 +2401,7 @@ pub const MultiWindowApp = struct {
                 // A window already committed to its native macOS close must not
                 // turn its own pump stop into an application-wide quit.
                 if (!result.should_continue and !hasQuitEvent(managed.app.sdk.events()) and !managed.nativeClosing()) self.lifecycle.requestQuit();
-                if (result.requested_redraw or pointer_isolation.requestsFrame(test_harness.enabled and isolateOsPointer(), managed.app.sdk.events())) {
+                if (result.requested_redraw or pointer_isolation.requestsFrame(test_harness.enabled and isolateOsPointer(), test_harness.enabled and pointer_isolation.keyboardEnabled(), managed.app.sdk.events())) {
                     managed.force_frame = true;
                 }
                 managed.app.sdk.dispatching = true;

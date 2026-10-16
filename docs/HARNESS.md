@@ -70,6 +70,25 @@ ZENIT_E2E_FILE_RPC_DIR="$rpc_dir" bun run e2e/record.ts
 The environment variable must be set independently in both terminals. An
 alternative is to use the default `/tmp/zenit_e2e_rpc_<e2e-port>` directory.
 
+## Input isolation on a shared machine
+
+The harness injects input directly into `ui.Cx`, bypassing the OS. Physical
+input from a person using the same machine would otherwise race the injected
+events: a moved mouse overwrites the injected hover position, and physical
+typing reaches the focused control (space toggles a focused checkbox, Enter
+submits a focused input). Two opt-in environment variables drop OS input in
+test-mode builds only; harness injection and manual operation of a normal
+(non-test-mode) app are unaffected:
+
+```bash
+ZENIT_E2E_ISOLATE_POINTER=1   # drop OS mouse move/button/wheel/magnify (default in run_storybook_e2e.sh)
+ZENIT_E2E_ISOLATE_KEYBOARD=1  # additionally drop OS key / text_input / IME events
+```
+
+Pointer isolation also has a `ZENIT_E2E_BACKGROUND`-driven default on the
+Windows worker; keyboard isolation is explicit-only. Window focus, resize and
+drag-and-drop sessions are never isolated.
+
 ## Record the application surface
 
 ```ts
